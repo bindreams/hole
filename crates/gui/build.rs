@@ -60,21 +60,17 @@ fn build_v2ray_plugin(repo_root: &Path) {
     let source_dir = repo_root.join("external").join("v2ray-plugin");
     let cache_dir = repo_root.join(".cache").join("v2ray-plugin");
     let output_name = v2ray_plugin_output_name();
-    let cache_path = cache_dir.join(output_name);
-    let binaries_dir = Path::new("binaries");
-    let final_path = binaries_dir.join(output_name);
+    let output_path = cache_dir.join(output_name);
 
     // No rerun-if-changed for the source dir: cargo's directory tracking only
     // detects top-level file additions/removals, not modifications inside.
     // Go's own build cache makes repeated builds fast (~instant if unchanged).
 
     std::fs::create_dir_all(&cache_dir).expect("failed to create .cache/v2ray-plugin/");
-    std::fs::create_dir_all(binaries_dir).expect("failed to create binaries/");
 
-    // Run go build (Go caches internally, so this is fast on repeat builds)
     let status = std::process::Command::new("go")
         .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
-        .arg(&cache_path)
+        .arg(&output_path)
         .arg(".")
         .current_dir(&source_dir)
         .env("CGO_ENABLED", "0")
@@ -88,9 +84,6 @@ fn build_v2ray_plugin(repo_root: &Path) {
         }
         Err(e) => panic!("failed to run go build: {e}"),
     }
-
-    // Copy to Tauri's expected sidecar location
-    std::fs::copy(&cache_path, &final_path).expect("failed to copy v2ray-plugin to binaries/");
 }
 
 // wintun download =====
@@ -115,19 +108,15 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(target_os = "windows")]
 fn download_wintun(repo_root: &Path) {
     let cache_dir = repo_root.join(".cache").join("wintun");
-    let cache_path = cache_dir.join("wintun.dll");
-    let binaries_dir = Path::new("binaries");
-    let final_path = binaries_dir.join("wintun.dll");
+    let dll_path = cache_dir.join("wintun.dll");
 
     std::fs::create_dir_all(&cache_dir).expect("failed to create .cache/wintun/");
-    std::fs::create_dir_all(binaries_dir).expect("failed to create binaries/");
 
     // Check cache: verify the hash sentinel written after a successful download
     let hash_sentinel = cache_dir.join("wintun.dll.verified");
-    if cache_path.exists() && hash_sentinel.exists() {
+    if dll_path.exists() && hash_sentinel.exists() {
         let stored_hash = std::fs::read_to_string(&hash_sentinel).unwrap_or_default();
         if stored_hash.trim() == WINTUN_ZIP_SHA256 {
-            std::fs::copy(&cache_path, &final_path).expect("failed to copy wintun.dll to binaries/");
             return;
         }
         // Hash mismatch — stale cache from a different version, re-download
@@ -159,9 +148,8 @@ fn download_wintun(repo_root: &Path) {
     let mut dll_data = Vec::new();
     std::io::Read::read_to_end(&mut dll_file, &mut dll_data).expect("failed to read wintun.dll from zip");
 
-    std::fs::write(&cache_path, &dll_data).expect("failed to write wintun.dll to cache");
+    std::fs::write(&dll_path, &dll_data).expect("failed to write wintun.dll to cache");
     std::fs::write(&hash_sentinel, WINTUN_ZIP_SHA256).expect("failed to write hash sentinel");
-    std::fs::copy(&cache_path, &final_path).expect("failed to copy wintun.dll to binaries/");
     eprintln!("wintun.dll downloaded and verified ({} bytes)", dll_data.len());
 }
 

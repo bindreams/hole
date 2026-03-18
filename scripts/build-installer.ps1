@@ -20,13 +20,13 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 Copy-Item "$Root\target\release\hole.exe" "$Stage\hole.exe" -Force
 
-# v2ray-plugin: built by build.rs into crates/gui/binaries/
-$V2ray = Get-ChildItem "$Root\crates\gui\binaries\v2ray-plugin-*-windows-*.exe" | Select-Object -First 1
-if (-not $V2ray) { throw "v2ray-plugin binary not found in crates\gui\binaries\" }
+# v2ray-plugin: built by build.rs into .cache/
+$V2ray = Get-ChildItem "$Root\.cache\v2ray-plugin\v2ray-plugin-*-windows-*.exe" | Select-Object -First 1
+if (-not $V2ray) { throw "v2ray-plugin binary not found in .cache\v2ray-plugin\" }
 Copy-Item $V2ray.FullName "$Stage\v2ray-plugin.exe" -Force
 
-# wintun.dll: downloaded by build.rs into crates/gui/binaries/
-$Wintun = "$Root\crates\gui\binaries\wintun.dll"
+# wintun.dll: downloaded by build.rs into .cache/
+$Wintun = "$Root\.cache\wintun\wintun.dll"
 if (-not (Test-Path $Wintun)) { throw "wintun.dll not found at $Wintun" }
 Copy-Item $Wintun "$Stage\wintun.dll" -Force
 

@@ -12,7 +12,7 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/v2ray-plugin"
+      "../../.cache/v2ray-plugin/v2ray-plugin"
     ],
     "icon": [
       "icons/32x32.png",
