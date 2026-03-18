@@ -1,0 +1,22 @@
+{
+  "name": "hole",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "test:e2e": "wdio run tests/webdriver/wdio.conf.ts"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2",
+    "@tauri-apps/plugin-dialog": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@wdio/cli": "^9",
+    "@wdio/local-runner": "^9",
+    "@wdio/mocha-framework": "^9",
+    "tauri-driver": "^2",
+    "typescript": "^5",
+    "ts-node": "^10"
+  }
+}

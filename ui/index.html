@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hole Settings</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Hole Settings</h1>
+    <div id="status" class="status disconnected">Daemon: disconnected</div>
+  </header>
+
+  <section id="servers-section">
+    <h2>Servers</h2>
+    <table id="server-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th>Name</th>
+          <th>Address</th>
+          <th>Method</th>
+          <th>Plugin</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="server-list">
+        <!-- rows rendered by JS -->
+      </tbody>
+    </table>
+    <p id="empty-message" class="muted">No servers configured. Import a config to get started.</p>
+    <div class="button-row">
+      <button id="btn-import" type="button">Import...</button>
+    </div>
+  </section>
+
+  <section id="settings-section">
+    <h2>General</h2>
+    <div class="field">
+      <label for="local-port">Local SOCKS5 port</label>
+      <input id="local-port" type="number" min="1" max="65535" value="4073">
+    </div>
+  </section>
+
+  <footer>
+    <button id="btn-save" type="button">Save</button>
+    <span id="save-status"></span>
+  </footer>
+
+  <script src="main.js" type="module"></script>
+</body>
+</html>

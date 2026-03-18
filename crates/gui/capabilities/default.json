@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "windows": ["settings"],
+  "permissions": [
+    "core:default",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "dialog:allow-open"
+  ]
+}

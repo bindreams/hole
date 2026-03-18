@@ -1,0 +1,174 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  margin: 0;
+  padding: 1rem 1.5rem;
+  font-size: 14px;
+  color: #222;
+  background: #fafafa;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+h1 {
+  font-size: 1.3rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 1.2rem 0 0.5rem;
+  border-bottom: 1px solid #ddd;
+  padding-bottom: 0.3rem;
+}
+
+/* Status badge */
+.status {
+  font-size: 0.8rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.status.connected {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status.disconnected {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+/* Server table */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 0.5rem;
+}
+
+thead th {
+  text-align: left;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: #888;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 2px solid #ddd;
+}
+
+tbody td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #eee;
+  vertical-align: middle;
+}
+
+tbody tr:hover {
+  background: #f0f4ff;
+}
+
+tbody tr.selected {
+  background: #e0eaff;
+}
+
+input[type="radio"] {
+  margin: 0;
+}
+
+.muted {
+  color: #999;
+  font-style: italic;
+  font-size: 0.85rem;
+}
+
+.btn-delete {
+  background: none;
+  border: none;
+  color: #c44;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.4rem;
+}
+
+.btn-delete:hover {
+  color: #a00;
+  text-decoration: underline;
+}
+
+/* Buttons */
+.button-row {
+  margin-top: 0.5rem;
+}
+
+button {
+  padding: 0.4rem 1rem;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+button:hover {
+  background: #f0f0f0;
+}
+
+#btn-save {
+  background: #0066cc;
+  color: #fff;
+  border-color: #0055aa;
+  font-weight: 600;
+}
+
+#btn-save:hover {
+  background: #0055aa;
+}
+
+/* Fields */
+.field {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin: 0.5rem 0;
+}
+
+.field label {
+  min-width: 130px;
+  font-weight: 500;
+}
+
+.field input[type="number"] {
+  width: 80px;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+/* Footer */
+footer {
+  margin-top: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+#save-status {
+  font-size: 0.8rem;
+  color: #555;
+}
+
+.plugin-badge {
+  font-size: 0.7rem;
+  background: #e8e0f0;
+  color: #5a3d8a;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+}
