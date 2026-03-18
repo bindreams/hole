@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Create placeholder sidecar binaries
+        shell: bash
+        run: |
+          mkdir -p crates/gui/binaries
+          touch crates/gui/binaries/v2ray-plugin-x86_64-pc-windows-msvc.exe
+
+      - uses: pre-commit/action@v3.0.1
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create placeholder sidecar binaries
+        shell: bash
+        run: |
+          mkdir -p crates/gui/binaries
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            touch crates/gui/binaries/v2ray-plugin-x86_64-pc-windows-msvc.exe
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            if [[ "$(uname -m)" == "arm64" ]]; then
+              touch crates/gui/binaries/v2ray-plugin-aarch64-apple-darwin
+            else
+              touch crates/gui/binaries/v2ray-plugin-x86_64-apple-darwin
+            fi
+          fi
+
+      - name: Test
+        run: cargo test --workspace
