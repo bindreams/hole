@@ -8,7 +8,6 @@ fn main() {
 
     let repo_root = git_repo_root();
     let cache_dir = repo_root.join(".cache").join("gui");
-    ensure_cache_symlink(&cache_dir);
 
     generate_icons(&svg_path, icons_dir);
     build_v2ray_plugin(&repo_root, &cache_dir);
@@ -30,31 +29,6 @@ fn git_repo_root() -> PathBuf {
     assert!(output.status.success(), "git rev-parse --show-toplevel failed");
 
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
-}
-
-// Cache symlink =====
-
-/// Ensure `crates/gui/.cache` is a symlink pointing to `<repo_root>/.cache/gui`.
-///
-/// This lets tauri.conf.json reference `.cache/...` without `../../` paths.
-fn ensure_cache_symlink(cache_dir: &Path) {
-    std::fs::create_dir_all(cache_dir).expect("failed to create .cache/gui/");
-
-    let link_path = Path::new(".cache");
-    if link_path.exists() || link_path.is_symlink() {
-        return; // Already exists (symlink or dir)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::os::windows::fs::symlink_dir(cache_dir, link_path)
-            .expect("failed to create .cache symlink (enable Developer Mode or run as admin)");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::os::unix::fs::symlink(cache_dir, link_path).expect("failed to create .cache symlink");
-    }
 }
 
 // v2ray-plugin build =====

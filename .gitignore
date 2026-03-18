@@ -13,8 +13,7 @@ crates/gui/icons/*.ico
 crates/gui/icons/*.icns
 
 # Build cache (v2ray-plugin Go build, wintun download)
-.cache/
-crates/gui/.cache
+/.cache/
 
 # Claude Code
 CLAUDE.local.md
