@@ -7,12 +7,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", svg_path.display());
 
     let repo_root = git_repo_root();
+    let cache_dir = repo_root.join(".cache").join("gui");
+    ensure_cache_symlink(&cache_dir);
 
     generate_icons(&svg_path, icons_dir);
-    build_v2ray_plugin(&repo_root);
+    build_v2ray_plugin(&repo_root, &cache_dir);
 
     #[cfg(target_os = "windows")]
-    download_wintun(&repo_root);
+    download_wintun(&cache_dir);
 
     tauri_build::build();
 }
@@ -28,6 +30,31 @@ fn git_repo_root() -> PathBuf {
     assert!(output.status.success(), "git rev-parse --show-toplevel failed");
 
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+}
+
+// Cache symlink =====
+
+/// Ensure `crates/gui/.cache` is a symlink pointing to `<repo_root>/.cache/gui`.
+///
+/// This lets tauri.conf.json reference `.cache/...` without `../../` paths.
+fn ensure_cache_symlink(cache_dir: &Path) {
+    std::fs::create_dir_all(cache_dir).expect("failed to create .cache/gui/");
+
+    let link_path = Path::new(".cache");
+    if link_path.exists() || link_path.is_symlink() {
+        return; // Already exists (symlink or dir)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::os::windows::fs::symlink_dir(cache_dir, link_path)
+            .expect("failed to create .cache symlink (enable Developer Mode or run as admin)");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::os::unix::fs::symlink(cache_dir, link_path).expect("failed to create .cache symlink");
+    }
 }
 
 // v2ray-plugin build =====
@@ -56,17 +83,17 @@ fn v2ray_plugin_output_name() -> &'static str {
     compile_error!("unsupported platform for v2ray-plugin sidecar")
 }
 
-fn build_v2ray_plugin(repo_root: &Path) {
+fn build_v2ray_plugin(repo_root: &Path, cache_dir: &Path) {
     let source_dir = repo_root.join("external").join("v2ray-plugin");
-    let cache_dir = repo_root.join(".cache").join("v2ray-plugin");
+    let output_dir = cache_dir.join("v2ray-plugin");
     let output_name = v2ray_plugin_output_name();
-    let output_path = cache_dir.join(output_name);
+    let output_path = output_dir.join(output_name);
 
     // No rerun-if-changed for the source dir: cargo's directory tracking only
     // detects top-level file additions/removals, not modifications inside.
     // Go's own build cache makes repeated builds fast (~instant if unchanged).
 
-    std::fs::create_dir_all(&cache_dir).expect("failed to create .cache/v2ray-plugin/");
+    std::fs::create_dir_all(&output_dir).expect("failed to create cache/v2ray-plugin/");
 
     let status = std::process::Command::new("go")
         .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
@@ -106,14 +133,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn download_wintun(repo_root: &Path) {
-    let cache_dir = repo_root.join(".cache").join("wintun");
-    let dll_path = cache_dir.join("wintun.dll");
+fn download_wintun(cache_dir: &Path) {
+    let wintun_dir = cache_dir.join("wintun");
+    let dll_path = wintun_dir.join("wintun.dll");
 
-    std::fs::create_dir_all(&cache_dir).expect("failed to create .cache/wintun/");
+    std::fs::create_dir_all(&wintun_dir).expect("failed to create cache/wintun/");
 
     // Check cache: verify the hash sentinel written after a successful download
-    let hash_sentinel = cache_dir.join("wintun.dll.verified");
+    let hash_sentinel = wintun_dir.join("wintun.dll.verified");
     if dll_path.exists() && hash_sentinel.exists() {
         let stored_hash = std::fs::read_to_string(&hash_sentinel).unwrap_or_default();
         if stored_hash.trim() == WINTUN_ZIP_SHA256 {
