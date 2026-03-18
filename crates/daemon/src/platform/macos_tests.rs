@@ -2,26 +2,38 @@ use super::*;
 
 #[skuld::test]
 fn plist_contains_label() {
-    let plist = generate_plist("/usr/local/bin/hole-daemon");
+    let plist = generate_plist("/usr/local/bin/hole");
     assert!(plist.contains("com.hole.daemon"), "missing label in plist");
 }
 
 #[skuld::test]
 fn plist_contains_binary_path() {
-    let plist = generate_plist("/opt/hole/hole-daemon");
-    assert!(plist.contains("/opt/hole/hole-daemon"), "missing binary path in plist");
+    let plist = generate_plist("/opt/hole/hole");
+    assert!(plist.contains("/opt/hole/hole"), "missing binary path in plist");
+}
+
+#[skuld::test]
+fn plist_has_daemon_run_args() {
+    let plist = generate_plist("/usr/local/bin/hole");
+    // ProgramArguments should include "daemon" and "run" as separate entries
+    assert!(plist.contains("<string>daemon</string>"), "missing 'daemon' arg");
+    assert!(plist.contains("<string>run</string>"), "missing 'run' arg");
 }
 
 #[skuld::test]
 fn plist_has_run_at_load() {
-    let plist = generate_plist("/usr/local/bin/hole-daemon");
+    let plist = generate_plist("/usr/local/bin/hole");
     assert!(plist.contains("<key>RunAtLoad</key>"), "missing RunAtLoad");
-    // RunAtLoad should be true
     assert!(plist.contains("<true/>"), "RunAtLoad should be true");
 }
 
 #[skuld::test]
 fn plist_has_keep_alive() {
-    let plist = generate_plist("/usr/local/bin/hole-daemon");
+    let plist = generate_plist("/usr/local/bin/hole");
     assert!(plist.contains("<key>KeepAlive</key>"), "missing KeepAlive");
+}
+
+#[skuld::test]
+fn helper_path_is_stable() {
+    assert_eq!(HELPER_PATH, "/Library/PrivilegedHelperTools/com.hole.daemon");
 }

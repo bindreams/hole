@@ -7,10 +7,6 @@ edition = "2021"
 name = "hole_daemon"
 harness = false
 
-[[bin]]
-name = "hole-daemon"
-path = "src/main.rs"
-
 [dependencies]
 hole-common = { path = "../common" }
 shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http"] }

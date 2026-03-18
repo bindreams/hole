@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod ipc;
+pub mod logging;
 pub mod platform;
 pub mod proxy;
 pub mod proxy_manager;

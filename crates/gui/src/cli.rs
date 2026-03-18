@@ -1,0 +1,238 @@
+// CLI subcommand dispatch.
+
+use clap::{Parser, Subcommand};
+
+// CLI structure =====
+
+#[derive(Parser)]
+#[command(name = "hole", about = "Shadowsocks GUI with transparent proxy")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage the privileged daemon service
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Manage PATH integration
+    Path {
+        #[command(subcommand)]
+        action: PathAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run the daemon (invoked by the service manager)
+    Run,
+    /// Install and start the daemon service
+    Install,
+    /// Stop and remove the daemon service
+    Uninstall,
+    /// Print daemon install/running status
+    Status,
+    /// View daemon logs
+    Log {
+        #[command(subcommand)]
+        action: Option<LogAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogAction {
+    /// Print the log file path
+    Path,
+    /// Stream log output (like tail -f)
+    Watch {
+        /// Number of existing lines to print before streaming
+        #[arg(long, default_value_t = 0)]
+        tail: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum PathAction {
+    /// Add hole to the system PATH
+    Add,
+    /// Remove hole from the system PATH
+    Remove,
+}
+
+// Dispatch =====
+
+/// Parse CLI arguments and dispatch to the appropriate handler.
+/// This function exits the process when done.
+pub fn dispatch() -> ! {
+    #[cfg(target_os = "windows")]
+    attach_console();
+
+    let cli = Cli::parse();
+
+    let code = match cli.command {
+        Command::Daemon { action } => handle_daemon(action),
+        Command::Path { action } => handle_path(action),
+    };
+
+    std::process::exit(code)
+}
+
+fn handle_daemon(action: DaemonAction) -> i32 {
+    match action {
+        DaemonAction::Run => {
+            let _guard = hole_daemon::logging::init();
+            tracing::info!("hole daemon starting");
+            hole_daemon::routing::teardown_split_routes().ok();
+
+            if let Err(e) = hole_daemon::platform::os::run() {
+                eprintln!("daemon error: {e}");
+                return 1;
+            }
+
+            0
+        }
+        DaemonAction::Install => {
+            if let Err(e) = crate::setup::install_daemon() {
+                eprintln!("daemon install failed: {e}");
+                return 1;
+            }
+            0
+        }
+        DaemonAction::Uninstall => {
+            if let Err(e) = crate::setup::uninstall_daemon() {
+                eprintln!("daemon uninstall failed: {e}");
+                return 1;
+            }
+            0
+        }
+        DaemonAction::Status => {
+            use crate::setup::DaemonInstallStatus;
+            match crate::setup::daemon_install_status() {
+                DaemonInstallStatus::Running => {
+                    println!("installed (running)");
+                    0
+                }
+                DaemonInstallStatus::Installed => {
+                    println!("installed (stopped)");
+                    1
+                }
+                DaemonInstallStatus::NotInstalled => {
+                    println!("not installed");
+                    2
+                }
+            }
+        }
+        DaemonAction::Log { action } => handle_daemon_log(action),
+    }
+}
+
+fn handle_daemon_log(action: Option<LogAction>) -> i32 {
+    let log_dir = hole_daemon::logging::log_dir();
+    let log_path = log_dir.join("hole-daemon.log");
+
+    match action {
+        None => {
+            // Print entire log file to stdout
+            match std::fs::read_to_string(&log_path) {
+                Ok(contents) => {
+                    print!("{contents}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("cannot read log file {}: {e}", log_path.display());
+                    1
+                }
+            }
+        }
+        Some(LogAction::Path) => {
+            println!("{}", log_path.display());
+            0
+        }
+        Some(LogAction::Watch { tail }) => daemon_log_watch(&log_path, tail),
+    }
+}
+
+/// Tail and follow a log file (like `tail -f`).
+fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("cannot open log file {}: {e}", path.display());
+            return 1;
+        }
+    };
+
+    let mut reader = BufReader::new(file);
+
+    // If tail > 0, read and show the last N lines using the same reader
+    if tail_lines > 0 {
+        let mut all_lines = Vec::new();
+        let mut buf = String::new();
+        while reader.read_line(&mut buf).unwrap_or(0) > 0 {
+            all_lines.push(buf.clone());
+            buf.clear();
+        }
+        let start = all_lines.len().saturating_sub(tail_lines);
+        for line in &all_lines[start..] {
+            print!("{line}");
+        }
+        // Reader is now at the end of the file; continue watching from here.
+    } else {
+        // Start from end
+        let _ = reader.seek(SeekFrom::End(0));
+    }
+
+    // Poll for new content
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Ok(_) => {
+                print!("{line}");
+            }
+            Err(e) => {
+                eprintln!("read error: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
+fn handle_path(action: PathAction) -> i32 {
+    match action {
+        PathAction::Add => {
+            if let Err(e) = crate::path_management::add() {
+                eprintln!("path add failed: {e}");
+                return 1;
+            }
+            0
+        }
+        PathAction::Remove => {
+            if let Err(e) = crate::path_management::remove() {
+                eprintln!("path remove failed: {e}");
+                return 1;
+            }
+            0
+        }
+    }
+}
+
+// Platform helpers =====
+
+#[cfg(target_os = "windows")]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // Best-effort: if we're launched from a terminal, attach to it for stdout/stderr.
+    // If not (e.g. launched from Explorer), this fails silently — that's fine.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}

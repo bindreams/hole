@@ -1,6 +1,7 @@
 // Windows: service management via windows-service crate.
 
 use std::ffi::OsString;
+use std::path::Path;
 use std::time::Duration;
 use tracing::{error, info};
 use windows_service::service::{
@@ -19,9 +20,8 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy daemon for the Hole app
 
 // Service entry =====
 
-/// Register and run as a Windows Service.
-/// Called from main() when running as a service.
-pub fn run_as_service() -> Result<(), windows_service::Error> {
+/// Run as a Windows Service (called by the service control manager).
+pub fn run() -> Result<(), windows_service::Error> {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -112,7 +112,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 // Install/uninstall =====
 
 /// Install the daemon as a Windows Service.
-pub fn install_service(binary_path: &std::path::Path) -> Result<(), windows_service::Error> {
+///
+/// The service is registered to run `<binary_path> daemon run` with auto-start.
+pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
@@ -125,24 +127,93 @@ pub fn install_service(binary_path: &std::path::Path) -> Result<(), windows_serv
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: binary_path.to_path_buf(),
-        launch_arguments: vec![],
+        launch_arguments: vec!["daemon".into(), "run".into()],
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
     };
 
-    let _service = manager.create_service(&service_info, ServiceAccess::empty())?;
+    let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
+
+    service.set_description(SERVICE_DESCRIPTION)?;
     info!("Windows service installed");
     Ok(())
 }
 
-/// Uninstall the daemon Windows Service.
-pub fn uninstall_service() -> Result<(), windows_service::Error> {
+/// Stop and uninstall the daemon Windows Service.
+pub fn uninstall() -> Result<(), windows_service::Error> {
+    // Stop first (ignore errors — service may not be running)
+    let _ = stop();
+
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
     service.delete()?;
     info!("Windows service uninstalled");
     Ok(())
+}
+
+// Start/stop =====
+
+/// Start the Windows Service via SCM.
+pub fn start() -> Result<(), windows_service::Error> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
+    service.start::<&str>(&[])?;
+    info!("Windows service started");
+    Ok(())
+}
+
+/// Send a stop control to the service and wait for it to stop (up to 10s).
+pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+
+    // Check current state before sending stop
+    let status = service.query_status()?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+
+    service.stop()?;
+    info!("stop signal sent, waiting for service to stop");
+
+    // Poll until stopped or timeout
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = service.query_status()?;
+        if status.current_state == ServiceState::Stopped {
+            info!("Windows service stopped");
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("service did not stop within 10s (state: {:?})", status.current_state).into());
+        }
+    }
+}
+
+// Query =====
+
+/// Check whether the service is registered in SCM.
+pub fn is_installed() -> bool {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
+        return false;
+    };
+    manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).is_ok()
+}
+
+/// Check whether the service is registered and currently running.
+pub fn is_running() -> bool {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
+        return false;
+    };
+    let Ok(service) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) else {
+        return false;
+    };
+    let Ok(status) = service.query_status() else {
+        return false;
+    };
+    status.current_state == ServiceState::Running
 }
 
 #[cfg(test)]

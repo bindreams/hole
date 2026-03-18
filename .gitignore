@@ -12,6 +12,9 @@ crates/gui/icons/*.png
 crates/gui/icons/*.ico
 crates/gui/icons/*.icns
 
+# Downloaded sidecar binaries (fetched by scripts/fetch-v2ray-plugin.py)
+crates/gui/binaries/
+
 # Claude Code
 CLAUDE.local.md
 .claude/*.local.*

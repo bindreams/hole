@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  WiX v4 installer for Hole.
+  Installs to [ProgramFilesFolder]\hole\bin\, registers the daemon service,
+  and adds hole to the system PATH.
+
+  Build:   wix build installer\hole.wxs -o target\release\hole.msi
+  Install: msiexec /i hole.msi
+  Silent:  msiexec /i hole.msi /quiet
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Hole"
+    Manufacturer="Hole Project"
+    Version="0.1.0"
+    UpgradeCode="6F2A8C1D-3E4B-4F5A-9D7E-1C2B3A4F5E6D">
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of Hole is already installed." />
+
+    <!-- Installation directory structure -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="hole">
+        <Directory Id="BINDIR" Name="bin" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu shortcut directory -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="HoleMenuFolder" Name="Hole" />
+    </StandardDirectory>
+
+    <!-- Main component: binaries -->
+    <ComponentGroup Id="BinaryComponents" Directory="BINDIR">
+      <Component Id="HoleExe" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
+        <File Id="hole.exe" Source="!(bindpath.BinDir)\hole.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="V2rayPlugin" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
+        <File Id="v2ray_plugin.exe" Source="!(bindpath.BinDir)\v2ray-plugin.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="WintunDll" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
+        <File Id="wintun.dll" Source="!(bindpath.BinDir)\wintun.dll" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Start Menu shortcut -->
+    <ComponentGroup Id="ShortcutComponents" Directory="HoleMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="D4E5F6A7-B8C9-0123-DEF0-234567890123">
+        <Shortcut
+          Id="HoleShortcut"
+          Name="Hole"
+          Target="[BINDIR]hole.exe"
+          WorkingDirectory="BINDIR" />
+        <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Hole"
+          Name="Installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Feature: everything -->
+    <Feature Id="Complete" Level="1">
+      <ComponentGroupRef Id="BinaryComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+    </Feature>
+
+    <!-- Custom actions: daemon install/uninstall + PATH add/remove -->
+    <CustomAction
+      Id="DaemonInstall"
+      Directory="BINDIR"
+      ExeCommand="hole.exe daemon install"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="PathAdd"
+      Directory="BINDIR"
+      ExeCommand="hole.exe path add"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="PathRemove"
+      Directory="BINDIR"
+      ExeCommand="hole.exe path remove"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <CustomAction
+      Id="DaemonUninstall"
+      Directory="BINDIR"
+      ExeCommand="hole.exe daemon uninstall"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Post-install: daemon install then PATH add -->
+      <Custom Action="DaemonInstall" After="InstallFiles">
+        NOT Installed AND NOT REMOVE
+      </Custom>
+      <Custom Action="PathAdd" After="DaemonInstall">
+        NOT Installed AND NOT REMOVE
+      </Custom>
+
+      <!-- Pre-uninstall: PATH remove then daemon uninstall -->
+      <Custom Action="PathRemove" Before="RemoveFiles">
+        REMOVE="ALL"
+      </Custom>
+      <Custom Action="DaemonUninstall" After="PathRemove">
+        REMOVE="ALL"
+      </Custom>
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

@@ -14,6 +14,8 @@ const ID_ENABLE: &str = "enable";
 const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
+#[cfg(target_os = "macos")]
+const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
 
 // Tray creation =====
 
@@ -165,7 +167,70 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 app_handle.exit(0);
             });
         }
+        #[cfg(target_os = "macos")]
+        ID_UNINSTALL_HELPER => {
+            info!("tray: uninstall helper requested");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_uninstall_helper(app_handle).await;
+            });
+        }
         _ => {}
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn handle_uninstall_helper(app: AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    let confirmed = app
+        .dialog()
+        .message("This will stop and remove the Hole daemon service.\n\nContinue?")
+        .title("Uninstall Helper")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Uninstall".into(),
+            "Cancel".into(),
+        ))
+        .blocking_show();
+
+    if !confirmed {
+        return;
+    }
+
+    let exe = match crate::setup::daemon_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("cannot resolve binary path: {e}");
+            return;
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || crate::setup::run_elevated(&exe, &["daemon", "uninstall"])).await;
+
+    match result {
+        Ok(Ok(status)) if status.success() => {
+            app.dialog()
+                .message("Daemon helper has been uninstalled.")
+                .title("Uninstall Helper")
+                .blocking_show();
+        }
+        Ok(Err(crate::setup::SetupError::Cancelled)) => {
+            info!("user cancelled uninstall elevation");
+        }
+        Ok(Err(e)) => {
+            error!("uninstall failed: {e}");
+            app.dialog()
+                .message(format!("Uninstall failed: {e}"))
+                .title("Error")
+                .blocking_show();
+        }
+        Ok(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            error!("uninstall exited with code {code}");
+        }
+        Err(e) => {
+            error!("spawn_blocking failed: {e}");
+        }
     }
 }
 
@@ -176,12 +241,24 @@ fn open_settings_window(app: &AppHandle) {
         return;
     }
 
-    match WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
+    #[allow(unused_mut)]
+    let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
         .title("Hole Settings")
         .inner_size(600.0, 400.0)
-        .resizable(true)
-        .build()
+        .resizable(true);
+
+    // On macOS, add a window menu bar with "Uninstall Helper..." item
+    #[cfg(target_os = "macos")]
     {
+        use tauri::menu::{Menu, Submenu};
+        let uninstall_item = MenuItem::with_id(app, ID_UNINSTALL_HELPER, "Uninstall Helper...", true, None::<&str>)
+            .expect("failed to create menu item");
+        let submenu = Submenu::with_items(app, "Hole", true, &[&uninstall_item]).expect("failed to create submenu");
+        let menu = Menu::with_items(app, &[&submenu]).expect("failed to create menu");
+        builder = builder.menu(menu);
+    }
+
+    match builder.build() {
         Ok(_window) => {
             #[cfg(target_os = "macos")]
             crate::platform::show_dock_icon(app);

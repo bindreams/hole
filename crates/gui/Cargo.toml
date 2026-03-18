@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 hole-common = { path = "../common" }
+hole-daemon = { path = "../daemon" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
@@ -20,11 +21,23 @@ interprocess = { version = "2", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 thiserror = "2"
 dirs = "6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+windows = { version = "0.58", features = [
+    "Win32_UI_Shell",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
