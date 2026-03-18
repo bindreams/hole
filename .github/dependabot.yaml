@@ -10,3 +10,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /external/v2ray-plugin
+    schedule:
+      interval: weekly

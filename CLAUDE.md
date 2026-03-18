@@ -32,6 +32,7 @@ hole path remove                  → remove hole from system PATH
 crates/common/   → hole-common (shared types: protocol, config, import)
 crates/daemon/   → hole-daemon (daemon library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
+external/        → Third-party source (git subrepos)
 installer/       → WiX MSI installer source (Windows)
 scripts/         → Build and utility scripts
 ui/              → Frontend HTML/CSS/JS
@@ -39,8 +40,10 @@ ui/              → Frontend HTML/CSS/JS
 
 ## Build
 
+Requires: Rust toolchain, Go toolchain (for v2ray-plugin).
+
 ```sh
-cargo build --workspace          # all crates
+cargo build --workspace          # all crates (build.rs builds v2ray-plugin + downloads wintun)
 npx tauri dev                    # GUI dev mode (from repo root)
 cargo test --workspace           # all tests
 ```

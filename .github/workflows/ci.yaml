@@ -19,17 +19,15 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
       - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
-      - name: Create placeholder sidecar binaries
-        shell: bash
-        run: |
-          mkdir -p crates/gui/binaries
-          touch crates/gui/binaries/v2ray-plugin-x86_64-pc-windows-msvc.exe
 
       - uses: pre-commit/action@v3.0.1
 
@@ -45,21 +43,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
 
-      - name: Create placeholder sidecar binaries
-        shell: bash
-        run: |
-          mkdir -p crates/gui/binaries
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            touch crates/gui/binaries/v2ray-plugin-x86_64-pc-windows-msvc.exe
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            if [[ "$(uname -m)" == "arm64" ]]; then
-              touch crates/gui/binaries/v2ray-plugin-aarch64-apple-darwin
-            else
-              touch crates/gui/binaries/v2ray-plugin-x86_64-apple-darwin
-            fi
-          fi
+      - uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo test --workspace

@@ -9,29 +9,27 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 - **DNS leak prevention** — all DNS traffic routed through the tunnel
 - **System tray** — Enable/Disable, Start at Login, Settings, Exit
 - **Server import** — import from shadowsocks client config files (single and multi-server)
-- **v2ray-plugin** support (bundled)
+- **v2ray-plugin** support (built from source)
 - **Logging** with daily rotation
 
 ## Architecture
 
-Two-binary design for privilege separation:
+Single-binary design — `hole` serves as both the Tauri GUI and the privileged daemon depending on CLI arguments:
 
-| Binary | Privilege | Role |
+| Mode | Privilege | Role |
 |---|---|---|
-| `hole` | User | Tauri GUI — system tray, settings window, config management |
-| `hole-daemon` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service |
+| `hole` (no args) | User | Tauri GUI — system tray, settings window, config management |
+| `hole daemon run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service |
 
 Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using length-prefixed JSON.
 
 ## Build
 
-Prerequisites: Rust toolchain, Node.js (for Tauri CLI and E2E tests).
+Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E tests).
 
 ```sh
-# Download v2ray-plugin and wintun binaries
-python scripts/fetch-v2ray-plugin.py
-
-# Build all crates
+# Build all crates (build.rs automatically builds v2ray-plugin from source
+# and downloads wintun.dll on Windows)
 cargo build --workspace
 
 # Run GUI in dev mode
@@ -46,8 +44,11 @@ cargo test --workspace
 ```
 crates/
   common/    hole-common — shared types (protocol, config, import)
-  daemon/    hole-daemon — privileged daemon binary
-  gui/       hole-gui    — Tauri app (binary name: "hole")
+  daemon/    hole-daemon — privileged daemon library
+  gui/       hole-gui    — Tauri app + CLI (binary name: "hole")
+external/
+  v2ray-plugin/  v2ray-plugin source (git subrepo)
+installer/   WiX MSI installer source (Windows)
 ui/          Frontend HTML/CSS/JS
 scripts/     Build and maintenance scripts
 tests/       E2E test specs (WebDriverIO)
