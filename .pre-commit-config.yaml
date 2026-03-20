@@ -24,6 +24,13 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: check-version
+        name: check Cargo.toml version vs git tag
+        entry: python scripts/check-version.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:

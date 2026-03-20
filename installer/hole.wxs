@@ -14,7 +14,7 @@
   <Package
     Name="Hole"
     Manufacturer="Hole Project"
-    Version="0.1.0"
+    Version="$(ProductVersion)"
     UpgradeCode="6F2A8C1D-3E4B-4F5A-9D7E-1C2B3A4F5E6D">
 
     <MajorUpgrade

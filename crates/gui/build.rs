@@ -9,6 +9,7 @@ fn main() {
     let repo_root = git_repo_root();
     let cache_dir = repo_root.join(".cache").join("gui");
 
+    emit_version_env(&repo_root);
     generate_icons(&svg_path, icons_dir);
     build_v2ray_plugin(&repo_root, &cache_dir);
 
@@ -29,6 +30,100 @@ fn git_repo_root() -> PathBuf {
     assert!(output.status.success(), "git rev-parse --show-toplevel failed");
 
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+}
+
+// Version =====
+
+fn emit_version_env(repo_root: &Path) {
+    let git_dir = repo_root.join(".git");
+
+    // Rerun triggers: branch ref changes, tag changes, packed-refs.
+    println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
+        if let Some(refpath) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed={}", git_dir.join(refpath).display());
+        }
+    }
+    println!("cargo:rerun-if-changed={}", git_dir.join("refs").join("tags").display());
+    println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+
+    let version = match compute_git_version(repo_root) {
+        Ok(v) => v,
+        Err(msg) => {
+            println!("cargo:warning=failed to compute git version: {msg}");
+            "0.0.0-unknown".to_string()
+        }
+    };
+
+    println!("cargo:rustc-env=HOLE_VERSION={version}");
+}
+
+fn compute_git_version(repo_root: &Path) -> Result<String, String> {
+    // git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --long
+    // Output format: <tag>-<distance>-g<short-hash>
+    let output = std::process::Command::new("git")
+        .args(["describe", "--tags", "--match", "v[0-9]*.[0-9]*.[0-9]*", "--long"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("git describe: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git describe exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let desc = String::from_utf8(output.stdout).map_err(|e| format!("git describe output not utf-8: {e}"))?;
+    let desc = desc.trim();
+
+    // Parse --long format by splitting from the right on '-'.
+    // Safe because we validate the tag contains no hyphens below.
+    let parts: Vec<&str> = desc.rsplitn(3, '-').collect();
+    if parts.len() != 3 {
+        return Err(format!("unexpected git describe output: {desc}"));
+    }
+    let tag = parts[2];
+    let distance: u64 = parts[1].parse().map_err(|e| format!("bad distance in '{desc}': {e}"))?;
+
+    // Validate strict vMAJOR.MINOR.PATCH (no pre-release/build suffixes).
+    let semver = tag
+        .strip_prefix('v')
+        .ok_or_else(|| format!("tag '{tag}' missing 'v' prefix"))?;
+    let semver_parts: Vec<&str> = semver.split('.').collect();
+    if semver_parts.len() != 3 || !semver_parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+        return Err(format!("tag '{tag}' is not strict vMAJOR.MINOR.PATCH"));
+    }
+
+    let mut version = semver.to_string();
+
+    if distance > 0 {
+        // Get full commit hash for the snapshot suffix.
+        let hash_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| format!("git rev-parse HEAD: {e}"))?;
+        let full_hash =
+            String::from_utf8(hash_output.stdout).map_err(|e| format!("git rev-parse output not utf-8: {e}"))?;
+        version = format!("{version}-snapshot+git.{}", full_hash.trim());
+    }
+
+    // Check if worktree is dirty (tracked files only; untracked files are ignored,
+    // matching `git describe --dirty` behavior).
+    let dirty = std::process::Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD", "--"])
+        .current_dir(repo_root)
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    if dirty {
+        version.push_str(".dirty");
+    }
+
+    Ok(version)
 }
 
 // v2ray-plugin build =====

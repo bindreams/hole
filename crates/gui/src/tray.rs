@@ -16,6 +16,7 @@ const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
 #[cfg(target_os = "macos")]
 const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
+const ID_ABOUT: &str = "about";
 
 // Tray creation =====
 
@@ -175,6 +176,14 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 handle_uninstall_helper(app_handle).await;
             });
         }
+        ID_ABOUT => {
+            info!("menu: about dialog");
+            use tauri_plugin_dialog::DialogExt;
+            app.dialog()
+                .message(format!("Hole {}", hole_gui::version::VERSION))
+                .title("About Hole")
+                .blocking_show();
+        }
         _ => {}
     }
 }
@@ -247,15 +256,29 @@ fn open_settings_window(app: &AppHandle) {
         .inner_size(600.0, 400.0)
         .resizable(true);
 
-    // On macOS, add a window menu bar with "Uninstall Helper..." item
-    #[cfg(target_os = "macos")]
+    // Menu bar (all platforms) -----
     {
         use tauri::menu::{Menu, Submenu};
-        let uninstall_item = MenuItem::with_id(app, ID_UNINSTALL_HELPER, "Uninstall Helper...", true, None::<&str>)
-            .expect("failed to create menu item");
-        let submenu = Submenu::with_items(app, "Hole", true, &[&uninstall_item]).expect("failed to create submenu");
-        let menu = Menu::with_items(app, &[&submenu]).expect("failed to create menu");
-        builder = builder.menu(menu);
+
+        let about_item =
+            MenuItem::with_id(app, ID_ABOUT, "About Hole", true, None::<&str>).expect("failed to create menu item");
+        let help_submenu = Submenu::with_items(app, "Help", true, &[&about_item]).expect("failed to create submenu");
+
+        #[cfg(not(target_os = "macos"))]
+        let menu = Menu::with_items(app, &[&help_submenu]).expect("failed to create menu");
+
+        #[cfg(target_os = "macos")]
+        let menu = {
+            let uninstall_item = MenuItem::with_id(app, ID_UNINSTALL_HELPER, "Uninstall Helper...", true, None::<&str>)
+                .expect("failed to create menu item");
+            let hole_submenu =
+                Submenu::with_items(app, "Hole", true, &[&uninstall_item]).expect("failed to create submenu");
+            Menu::with_items(app, &[&hole_submenu, &help_submenu]).expect("failed to create menu")
+        };
+
+        builder = builder.menu(menu).on_menu_event(|window, event| {
+            handle_menu_event(window.app_handle(), event);
+        });
     }
 
     match builder.build() {
