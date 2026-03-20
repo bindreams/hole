@@ -5,7 +5,7 @@ pub fn on_setup(_app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>>
     #[cfg(target_os = "macos")]
     {
         // Hide dock icon on startup (tray-only mode)
-        _app.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+        _app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     }
     Ok(())
 }
