@@ -30,10 +30,19 @@ $Wintun = "$Root\.cache\gui\wintun\wintun.dll"
 if (-not (Test-Path $Wintun)) { throw "wintun.dll not found at $Wintun" }
 Copy-Item $Wintun "$Stage\wintun.dll" -Force
 
-Write-Host "==> Building MSI installer..."
+# Extract version from Cargo.toml
+$CargoToml = Get-Content "$Root\crates\gui\Cargo.toml" -Raw
+if ($CargoToml -match 'version\s*=\s*"(\d+\.\d+\.\d+)"') {
+    $Version = $Matches[1]
+} else {
+    throw "Could not extract version from crates/gui/Cargo.toml"
+}
+
+Write-Host "==> Building MSI installer (version $Version)..."
 $Output = "$Root\target\release\hole.msi"
 wix build "$Root\installer\hole.wxs" `
     -bindpath "BinDir=$Stage" `
+    -d "ProductVersion=$Version" `
     -o $Output
 
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }

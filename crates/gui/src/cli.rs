@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 // CLI structure =====
 
 #[derive(Parser)]
-#[command(name = "hole", about = "Shadowsocks GUI with transparent proxy")]
+#[command(name = "hole", about = "Shadowsocks GUI with transparent proxy", version = env!("HOLE_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -13,6 +13,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print version information
+    Version,
     /// Manage the privileged daemon service
     Daemon {
         #[command(subcommand)]
@@ -73,6 +75,10 @@ pub fn dispatch() -> ! {
     let cli = Cli::parse();
 
     let code = match cli.command {
+        Command::Version => {
+            println!("hole {}", hole_gui::version::VERSION);
+            0
+        }
         Command::Daemon { action } => handle_daemon(action),
         Command::Path { action } => handle_path(action),
     };

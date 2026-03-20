@@ -15,6 +15,7 @@ GUI and daemon communicate over IPC (Unix socket on macOS, named pipe on Windows
 
 ```
 hole                              → GUI (default)
+hole version                      → print version information
 hole daemon run                   → run as service/daemon (invoked by SCM/launchd)
 hole daemon install               → register + start daemon service (needs elevation)
 hole daemon uninstall             → stop + remove daemon service (needs elevation)

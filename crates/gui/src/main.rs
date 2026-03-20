@@ -18,7 +18,12 @@ fn main() {
     // If the first real argument looks like a subcommand, dispatch to CLI.
     // Otherwise, launch the GUI (default behavior with no args).
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && matches!(args[1].as_str(), "daemon" | "path") {
+    if args.len() > 1
+        && matches!(
+            args[1].as_str(),
+            "daemon" | "path" | "version" | "--version" | "-V" | "--help" | "-h" | "help"
+        )
+    {
         cli::dispatch();
     }
 
