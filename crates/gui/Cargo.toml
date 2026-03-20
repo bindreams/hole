@@ -45,7 +45,7 @@ skuld = { git = "https://github.com/bindreams/skuld" }
 [build-dependencies]
 tauri-build = "2"
 resvg = "0.45"
-png = "0.17"
+png = "0.18"
 ico = "0.4"
 ureq = "3"
 zip = "2"
