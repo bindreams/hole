@@ -112,10 +112,12 @@ fn server_accepts_connection() {
     rt().block_on(async {
         let name = "hole-test-accept";
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
-        let _handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
-        let _stream = connect_to(name).await;
+        let stream = connect_to(name).await;
+        drop(stream);
+        let _ = handle.await;
     });
 }
 
@@ -321,5 +323,29 @@ fn start_failure_returns_error() {
 
         drop(stream);
         let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn run_cancellation_cleans_up_connection_tasks() {
+    rt().block_on(async {
+        let name = "hole-test-run-cancel";
+        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        // Connect a client so there's an active connection handler task
+        let mut stream = connect_to(name).await;
+        let resp = send_request(&mut stream, &DaemonRequest::Status).await;
+        assert!(matches!(resp, DaemonResponse::Status { .. }));
+
+        // Cancel the server (simulates shutdown via select!)
+        handle.abort();
+        let _ = handle.await;
+
+        // Drop the stream — if connection handler was orphaned, this would
+        // leave a dangling task until runtime teardown.
+        drop(stream);
     });
 }
