@@ -1,18 +1,17 @@
 module github.com/shadowsocks/v2ray-plugin
 
-go 1.22.0
+go 1.23
 
 toolchain go1.23.2
 
 require (
 	github.com/golang/protobuf v1.5.4
 	github.com/v2fly/v2ray-core/v5 v5.22.0
-	google.golang.org/protobuf v1.35.1
+	google.golang.org/protobuf v1.36.11
 )
 
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
-	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/google/pprof v0.0.0-20241101162523-b92577c0c142 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
