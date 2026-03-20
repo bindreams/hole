@@ -1,7 +1,7 @@
 // Platform-specific behavior (macOS dock icon toggling).
 
 /// Called during Tauri setup.
-pub fn on_setup(_app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+pub fn on_setup(_app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         // Hide dock icon on startup (tray-only mode)
