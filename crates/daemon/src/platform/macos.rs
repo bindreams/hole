@@ -170,7 +170,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
 
-        Ok(())
+        Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
 }
