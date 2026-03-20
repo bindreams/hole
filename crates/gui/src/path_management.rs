@@ -1,8 +1,10 @@
 // PATH management: add/remove hole to/from system PATH.
 
+/// Get the directory containing the current executable.
+#[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
-/// Get the directory containing the current executable.
+#[cfg(target_os = "windows")]
 fn exe_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let dir = exe

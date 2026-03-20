@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "windows")]
 #[skuld::test]
 fn exe_dir_resolves() {
     let dir = exe_dir().expect("should resolve exe directory");
