@@ -327,7 +327,7 @@ fn start_failure_returns_error() {
 }
 
 #[skuld::test]
-fn run_cancellation_cleans_up_connection_tasks() {
+fn run_cancellation_aborts_connection_handlers() {
     rt().block_on(async {
         let name = "hole-test-run-cancel";
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
@@ -341,11 +341,20 @@ fn run_cancellation_cleans_up_connection_tasks() {
         assert!(matches!(resp, DaemonResponse::Status { .. }));
 
         // Cancel the server (simulates shutdown via select!)
+        // With JoinSet, this aborts all connection handler tasks immediately.
+        // Without JoinSet (bare tokio::spawn), handlers would be orphaned.
         handle.abort();
         let _ = handle.await;
 
-        // Drop the stream — if connection handler was orphaned, this would
-        // leave a dangling task until runtime teardown.
-        drop(stream);
+        // The connection handler should have been aborted by JoinSet::drop,
+        // closing the server side of the stream. A subsequent read should
+        // return EOF or error — not block forever waiting for a response.
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf)).await;
+        assert!(result.is_ok(), "read should not block — handler must be aborted");
+        match result.unwrap() {
+            Ok(0) | Err(_) => {} // EOF or error — handler was cleaned up
+            Ok(_) => panic!("unexpected data after server cancellation"),
+        }
     });
 }
