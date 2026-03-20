@@ -14,16 +14,9 @@ mod tray;
 use state::AppState;
 
 fn main() {
-    // Check if we have CLI subcommands (daemon, path, etc.)
-    // If the first real argument looks like a subcommand, dispatch to CLI.
-    // Otherwise, launch the GUI (default behavior with no args).
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1
-        && matches!(
-            args[1].as_str(),
-            "daemon" | "path" | "version" | "--version" | "-V" | "--help" | "-h" | "help"
-        )
-    {
+    // Any argument at all routes to clap (subcommands, --version, --help).
+    // No arguments launches the GUI.
+    if std::env::args().len() > 1 {
         cli::dispatch();
     }
 

@@ -110,7 +110,8 @@ fn compute_git_version(repo_root: &Path) -> Result<String, String> {
         version = format!("{version}-snapshot+git.{}", full_hash.trim());
     }
 
-    // Check if worktree is dirty.
+    // Check if worktree is dirty (tracked files only; untracked files are ignored,
+    // matching `git describe --dirty` behavior).
     let dirty = std::process::Command::new("git")
         .args(["diff-index", "--quiet", "HEAD", "--"])
         .current_dir(repo_root)

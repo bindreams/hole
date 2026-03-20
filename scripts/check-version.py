@@ -23,6 +23,7 @@ def get_nearest_tag_version() -> tuple[int, int, int]:
     )
     if result.returncode != 0:
         print(f"error: git describe failed: {result.stderr.strip()}", file=sys.stderr)
+        print("  hint: is there a version tag (e.g. v0.1.0) reachable from HEAD?", file=sys.stderr)
         sys.exit(1)
 
     tag = result.stdout.strip()
@@ -41,6 +42,16 @@ def get_cargo_versions() -> dict[str, tuple[int, int, int]]:
         root = tomllib.load(f)
 
     members = root.get("workspace", {}).get("members", [])
+    if not members:
+        print("error: no workspace members found in Cargo.toml", file=sys.stderr)
+        sys.exit(1)
+
+    # Only literal paths are supported (no glob patterns).
+    for member in members:
+        if any(c in member for c in "*?["):
+            print(f"error: glob patterns in workspace members are not supported: {member}", file=sys.stderr)
+            sys.exit(1)
+
     versions: dict[str, tuple[int, int, int]] = {}
 
     for member in members:
@@ -117,3 +128,66 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# Tests (run with pytest) =====
+
+
+def test_equal_versions():
+    assert is_valid_next((0, 1, 0), (0, 1, 0))
+
+
+def test_equal_nonzero():
+    assert is_valid_next((2, 3, 4), (2, 3, 4))
+
+
+def test_patch_bump():
+    assert is_valid_next((0, 1, 0), (0, 1, 1))
+
+
+def test_minor_bump():
+    assert is_valid_next((0, 1, 0), (0, 2, 0))
+
+
+def test_major_bump():
+    assert is_valid_next((0, 1, 0), (1, 0, 0))
+
+
+def test_patch_bump_from_nonzero():
+    assert is_valid_next((1, 2, 3), (1, 2, 4))
+
+
+def test_minor_bump_from_nonzero():
+    assert is_valid_next((1, 2, 3), (1, 3, 0))
+
+
+def test_major_bump_from_nonzero():
+    assert is_valid_next((1, 2, 3), (2, 0, 0))
+
+
+def test_double_patch_bump():
+    assert not is_valid_next((0, 1, 0), (0, 1, 2))
+
+
+def test_minor_bump_without_patch_reset():
+    assert not is_valid_next((0, 1, 3), (0, 2, 3))
+
+
+def test_major_bump_without_minor_reset():
+    assert not is_valid_next((1, 2, 0), (2, 2, 0))
+
+
+def test_major_bump_without_patch_reset():
+    assert not is_valid_next((1, 0, 3), (2, 0, 3))
+
+
+def test_downgrade():
+    assert not is_valid_next((1, 0, 0), (0, 9, 0))
+
+
+def test_skip_minor():
+    assert not is_valid_next((1, 0, 0), (1, 2, 0))
+
+
+def test_multi_component_bump():
+    assert not is_valid_next((1, 0, 0), (1, 1, 1))
