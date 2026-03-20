@@ -49,12 +49,20 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
     /// Each connection is handled in a separate task.
     pub async fn run(self) -> std::io::Result<()> {
         info!("IPC server listening");
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
+            // Reap completed tasks to avoid unbounded memory growth
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(e) = result {
+                    error!(error = %e, "connection handler panicked");
+                }
+            }
+
             match self.listener.accept().await {
                 Ok(stream) => {
                     info!("IPC client connected");
                     let proxy = Arc::clone(&self.proxy);
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         handle_connection(stream, proxy).await;
                         info!("IPC client disconnected");
                     });
