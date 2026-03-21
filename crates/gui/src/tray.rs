@@ -17,11 +17,16 @@ const ID_EXIT: &str = "exit";
 #[cfg(target_os = "macos")]
 const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
 const ID_ABOUT: &str = "about";
+const ID_INSTALL_UPDATE: &str = "install_update";
+const ID_CHECK_UPDATE: &str = "check_update";
 
 // Tray creation =====
 
-/// Create and register the system tray icon with its menu.
-pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
+/// Build the tray menu, optionally including an "Install Update" item.
+pub fn build_tray_menu(
+    app: &AppHandle,
+    update: Option<&hole_gui::update::UpdateInfo>,
+) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     let enable = CheckMenuItem::with_id(app, ID_ENABLE, "Enable", true, false, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     let settings = MenuItem::with_id(app, ID_SETTINGS, "Settings...", true, None::<&str>)?;
@@ -29,18 +34,46 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
     let sep2 = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, ID_EXIT, "Exit", true, None::<&str>)?;
 
-    let menu = tauri::menu::Menu::with_items(app, &[&enable, &autostart, &sep1, &settings, &sep2, &exit])?;
+    if let Some(info) = update {
+        let update_item = MenuItem::with_id(
+            app,
+            ID_INSTALL_UPDATE,
+            format!("Install Update (v{})", info.version),
+            true,
+            None::<&str>,
+        )?;
+        let sep3 = PredefinedMenuItem::separator(app)?;
+        tauri::menu::Menu::with_items(
+            app,
+            &[&enable, &autostart, &sep1, &settings, &sep2, &update_item, &sep3, &exit],
+        )
+    } else {
+        tauri::menu::Menu::with_items(app, &[&enable, &autostart, &sep1, &settings, &sep2, &exit])
+    }
+}
 
-    let tray = TrayIconBuilder::new()
+/// Sync tray menu checkbox states from the current config.
+pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().unwrap();
+    if let Some(item) = menu.get(ID_ENABLE) {
+        if let Some(check) = item.as_check_menuitem() {
+            check.set_checked(config.enabled).ok();
+        }
+    }
+}
+
+/// Create and register the system tray icon with its menu.
+pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
+    let menu = build_tray_menu(app.handle(), None)?;
+
+    let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
         .tooltip("Hole")
         .on_menu_event(handle_menu_event)
         .build(app)?;
 
-    // Sync initial state from config
-    let state = app.state::<AppState>();
-    let config = state.config.lock().unwrap();
-    enable.set_checked(config.enabled).ok();
+    sync_menu_state(app.handle(), &menu);
 
     Ok(tray)
 }
@@ -176,6 +209,20 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 handle_uninstall_helper(app_handle).await;
             });
         }
+        ID_INSTALL_UPDATE => {
+            info!("tray: install update requested");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_install_update_from_tray(app_handle).await;
+            });
+        }
+        ID_CHECK_UPDATE => {
+            info!("menu: check for updates");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_check_for_updates(app_handle).await;
+            });
+        }
         ID_ABOUT => {
             info!("menu: about dialog");
             use tauri_plugin_dialog::DialogExt;
@@ -243,6 +290,117 @@ async fn handle_uninstall_helper(app: AppHandle) {
     }
 }
 
+async fn handle_install_update_from_tray(app: AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+
+    // Get update info from update state.
+    let update_state = app.state::<hole_gui::update::UpdateState>();
+    let update_info = update_state.rx.borrow().clone();
+
+    let Some(info) = update_info else {
+        warn!("install update clicked but no update info available");
+        return;
+    };
+
+    let download_dir = std::env::temp_dir().join("hole-update");
+    if let Err(e) = std::fs::create_dir_all(&download_dir) {
+        error!("failed to create temp dir: {e}");
+        return;
+    }
+    let dest = download_dir.join(&info.asset_name);
+    let asset_url = info.asset_url.clone();
+    let dest_for_download = dest.clone();
+
+    // Download on blocking thread.
+    let download_result =
+        tokio::task::spawn_blocking(move || hole_gui::update::download_asset(&asset_url, &dest_for_download)).await;
+
+    match download_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("download failed: {e}");
+            app.dialog()
+                .message(format!("Download failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("download task panicked: {e}");
+            return;
+        }
+    }
+
+    // Run installer (interactive mode).
+    let dest_clone = dest.clone();
+    let install_result = tokio::task::spawn_blocking(move || hole_gui::update::run_installer(&dest_clone, false)).await;
+
+    match install_result {
+        Ok(Ok(())) => {
+            // On Windows, exit app to let MSI complete.
+            // On macOS, the installer already copied the app.
+            let _ = std::fs::remove_file(&dest);
+            app.exit(0);
+        }
+        Ok(Err(e)) => {
+            error!("installation failed: {e}");
+            let _ = std::fs::remove_file(&dest);
+            app.dialog()
+                .message(format!("Installation failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+        }
+        Err(e) => {
+            error!("install task panicked: {e}");
+        }
+    }
+}
+
+async fn handle_check_for_updates(app: AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    let result = tokio::task::spawn_blocking(hole_gui::update::check_for_update).await;
+
+    match result {
+        Ok(Ok(Some(info))) => {
+            let confirmed = app
+                .dialog()
+                .message(format!(
+                    "Version {} is available.\n\nWould you like to install it now?",
+                    info.version
+                ))
+                .title("Update Available")
+                .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
+                .blocking_show();
+
+            if confirmed {
+                // Store the update info and reuse the install handler.
+                let update_state = app.state::<hole_gui::update::UpdateState>();
+                update_state.tx.send_replace(Some(info));
+                handle_install_update_from_tray(app).await;
+            }
+        }
+        Ok(Ok(None)) => {
+            app.dialog()
+                .message(format!(
+                    "You're running the latest version ({}).",
+                    hole_gui::version::VERSION
+                ))
+                .title("No Updates Available")
+                .blocking_show();
+        }
+        Ok(Err(e)) => {
+            app.dialog()
+                .message(format!("Failed to check for updates: {e}"))
+                .title("Update Error")
+                .blocking_show();
+        }
+        Err(e) => {
+            error!("update check task panicked: {e}");
+        }
+    }
+}
+
 fn open_settings_window(app: &AppHandle) {
     // Reuse existing window if it's already open
     if let Some(window) = app.get_webview_window("settings") {
@@ -260,9 +418,12 @@ fn open_settings_window(app: &AppHandle) {
     {
         use tauri::menu::{Menu, Submenu};
 
+        let check_update_item = MenuItem::with_id(app, ID_CHECK_UPDATE, "Check for Updates...", true, None::<&str>)
+            .expect("failed to create menu item");
         let about_item =
             MenuItem::with_id(app, ID_ABOUT, "About Hole", true, None::<&str>).expect("failed to create menu item");
-        let help_submenu = Submenu::with_items(app, "Help", true, &[&about_item]).expect("failed to create submenu");
+        let help_submenu = Submenu::with_items(app, "Help", true, &[&check_update_item, &about_item])
+            .expect("failed to create submenu");
 
         #[cfg(not(target_os = "macos"))]
         let menu = Menu::with_items(app, &[&help_submenu]).expect("failed to create menu");

@@ -23,6 +23,7 @@ hole daemon status                → print install/running status
 hole daemon log                   → print daemon log to stdout
 hole daemon log path              → print log file path
 hole daemon log watch [--tail N]  → stream log output
+hole upgrade                      → check for updates and install latest version (unattended)
 hole path add                     → add hole to system PATH
 hole path remove                  → remove hole from system PATH
 ```
@@ -67,6 +68,15 @@ npx tauri build                  # produces .dmg in target/release/bundle/
 
 Uses [skuld](https://github.com/bindreams/skuld) framework (`#[skuld::test]`), not `#[test]`.
 Unit test files are siblings: `foo.rs` → `foo_tests.rs`.
+
+## Releases
+
+Release assets follow GOOS/GOARCH naming, OS first:
+- `hole-{version}-windows-amd64.msi`
+- `hole-{version}-darwin-arm64.dmg`
+- `hole-{version}-darwin-amd64.dmg`
+
+The auto-updater matches assets by these suffixes.
 
 ## Icons
 

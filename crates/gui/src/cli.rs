@@ -15,6 +15,8 @@ struct Cli {
 enum Command {
     /// Print version information
     Version,
+    /// Check for updates and install the latest version
+    Upgrade,
     /// Manage the privileged daemon service
     Daemon {
         #[command(subcommand)]
@@ -79,11 +81,55 @@ pub fn dispatch() -> ! {
             println!("hole {}", hole_gui::version::VERSION);
             0
         }
+        Command::Upgrade => handle_upgrade(),
         Command::Daemon { action } => handle_daemon(action),
         Command::Path { action } => handle_path(action),
     };
 
     std::process::exit(code)
+}
+
+fn handle_upgrade() -> i32 {
+    eprintln!("checking for updates...");
+    match hole_gui::update::check_for_update() {
+        Ok(Some(info)) => {
+            eprintln!("update available: v{}", info.version);
+
+            let download_dir = std::env::temp_dir().join("hole-update");
+            if let Err(e) = std::fs::create_dir_all(&download_dir) {
+                eprintln!("failed to create temp dir: {e}");
+                return 1;
+            }
+            let dest = download_dir.join(&info.asset_name);
+
+            eprintln!("downloading {}...", info.asset_name);
+            if let Err(e) = hole_gui::update::download_asset(&info.asset_url, &dest) {
+                eprintln!("download failed: {e}");
+                return 1;
+            }
+
+            eprintln!("installing...");
+            if let Err(e) = hole_gui::update::run_installer(&dest, true) {
+                eprintln!("installation failed: {e}");
+                // Best-effort cleanup
+                let _ = std::fs::remove_file(&dest);
+                return 1;
+            }
+
+            // Best-effort cleanup
+            let _ = std::fs::remove_file(&dest);
+            eprintln!("updated to v{}", info.version);
+            0
+        }
+        Ok(None) => {
+            eprintln!("already up to date ({})", hole_gui::version::VERSION);
+            0
+        }
+        Err(e) => {
+            eprintln!("update check failed: {e}");
+            1
+        }
+    }
 }
 
 fn handle_daemon(action: DaemonAction) -> i32 {
