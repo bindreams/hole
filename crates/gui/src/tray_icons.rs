@@ -1,4 +1,4 @@
-/// Tray icon image loading and platform-specific theme handling.
+//! Tray icon image loading and platform-specific theme handling.
 
 use tauri::image::Image;
 
