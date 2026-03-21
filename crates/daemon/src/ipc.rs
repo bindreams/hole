@@ -1,20 +1,24 @@
-// IPC server — local socket listener + request handling.
+// IPC server — HTTP/1.1 REST API over local socket.
 
 use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
-use interprocess::local_socket::{
-    tokio::{Listener, Stream},
-    traits::tokio::Listener as ListenerTrait,
-    ListenerOptions,
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use hole_common::protocol::{
+    EmptyResponse, ErrorResponse, ProxyConfig, StatusResponse, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
 };
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use interprocess::local_socket::{tokio::Listener, traits::tokio::Listener as ListenerTrait, ListenerOptions};
+use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tower::ServiceExt;
+#[cfg(not(test))]
+use tracing::warn;
+use tracing::{debug, error, info};
 
 // Constants =====
-
-const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB
 
 /// Re-export: socket name (Windows) or path (macOS).
 #[cfg(target_os = "windows")]
@@ -24,18 +28,15 @@ pub use hole_common::protocol::DAEMON_SOCKET_PATH as SOCKET_PATH;
 
 // Server =====
 
-pub struct IpcServer<B: ProxyBackend> {
+pub struct IpcServer {
     listener: Listener,
-    proxy: Arc<Mutex<ProxyManager<B>>>,
+    router: axum::Router,
 }
 
-impl<B: ProxyBackend + 'static> IpcServer<B> {
-    /// Bind to the IPC socket/pipe.
-    ///
-    /// On macOS: filesystem Unix domain socket at `path`.
-    /// On Windows: namespaced named pipe with `name`.
+impl IpcServer {
+    /// Bind to the IPC named pipe (Windows).
     #[cfg(target_os = "windows")]
-    pub fn bind(name: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+    pub fn bind<B: ProxyBackend + 'static>(name: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
         use interprocess::local_socket::{GenericNamespaced, ToNsName};
 
         let ns_name = name
@@ -47,14 +48,13 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
         let opts = apply_security_descriptor(opts);
         let listener = opts.create_tokio()?;
 
-        Ok(Self { listener, proxy })
+        let router = build_router(proxy);
+        Ok(Self { listener, router })
     }
 
-    /// Bind to the IPC socket.
-    ///
-    /// Uses a filesystem Unix domain socket. Removes stale socket file before binding.
+    /// Bind to the IPC Unix domain socket (macOS).
     #[cfg(target_os = "macos")]
-    pub fn bind(path: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+    pub fn bind<B: ProxyBackend + 'static>(path: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
         use interprocess::local_socket::{GenericFilePath, ToFsName};
 
         // Remove stale socket (standard practice, same as Docker)
@@ -69,14 +69,27 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
-        Ok(Self { listener, proxy })
+        let router = build_router(proxy);
+        Ok(Self { listener, router })
     }
 
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
         let stream = self.listener.accept().await?;
-        handle_connection(stream, self.proxy).await;
+        let io = TokioIo::new(stream);
+        let router = self.router;
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, Infallible>(resp)
+            }
+        });
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -96,9 +109,22 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
             match self.listener.accept().await {
                 Ok(stream) => {
                     info!("IPC client connected");
-                    let proxy = Arc::clone(&self.proxy);
+                    let router = self.router.clone();
                     tasks.spawn(async move {
-                        handle_connection(stream, proxy).await;
+                        let io = TokioIo::new(stream);
+                        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+                            let router = router.clone();
+                            async move {
+                                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                                Ok::<_, Infallible>(resp)
+                            }
+                        });
+                        if let Err(e) = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await
+                        {
+                            debug!(error = %e, "HTTP connection ended");
+                        }
                         info!("IPC client disconnected");
                     });
                 }
@@ -110,116 +136,71 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
     }
 }
 
-// Connection handler =====
+// Router =====
 
-async fn handle_connection<B: ProxyBackend>(mut stream: Stream, proxy: Arc<Mutex<ProxyManager<B>>>) {
-    loop {
-        // Read length prefix
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("client disconnected (EOF)");
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "error reading from client");
-                return;
-            }
-        }
+fn build_router<B: ProxyBackend + 'static>(proxy: Arc<Mutex<ProxyManager<B>>>) -> axum::Router {
+    axum::Router::new()
+        .route(ROUTE_STATUS, axum::routing::get(handle_status::<B>))
+        .route(ROUTE_START, axum::routing::post(handle_start::<B>))
+        .route(ROUTE_STOP, axum::routing::post(handle_stop::<B>))
+        .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<B>))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .with_state(proxy)
+}
 
-        let msg_len = u32::from_be_bytes(len_buf);
-        if msg_len > MAX_MESSAGE_SIZE {
-            warn!(msg_len, "message too large, dropping connection");
-            let _ = send_error(&mut stream, "message too large").await;
-            return;
-        }
+// Handlers =====
 
-        // Read body
-        let mut body = vec![0u8; msg_len as usize];
-        if let Err(e) = stream.read_exact(&mut body).await {
-            warn!(error = %e, "error reading message body");
-            return;
-        }
+async fn handle_status<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+) -> Json<StatusResponse> {
+    let mut pm = proxy.lock().await;
+    pm.check_health();
+    Json(StatusResponse {
+        running: pm.state() == ProxyState::Running,
+        uptime_secs: pm.uptime_secs(),
+        error: pm.last_error().map(|s| s.to_string()),
+    })
+}
 
-        // Parse request
-        let response = match serde_json::from_slice::<DaemonRequest>(&body) {
-            Ok(req) => {
-                debug!(?req, "received request");
-                dispatch(req, &proxy).await
-            }
-            Err(e) => {
-                warn!(error = %e, "invalid request");
-                DaemonResponse::Error {
-                    message: format!("invalid request: {e}"),
-                }
-            }
-        };
-
-        // Send response
-        if let Err(e) = send_response(&mut stream, &response).await {
-            warn!(error = %e, "error sending response");
-            return;
-        }
+async fn handle_start<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    Json(config): Json<ProxyConfig>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.start(&config).await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
     }
 }
 
-async fn dispatch<B: ProxyBackend>(req: DaemonRequest, proxy: &Mutex<ProxyManager<B>>) -> DaemonResponse {
-    match req {
-        DaemonRequest::Status => {
-            let mut pm = proxy.lock().await;
-            pm.check_health();
-            let running = pm.state() == ProxyState::Running;
-            let uptime_secs = pm.uptime_secs();
-            let error = pm.last_error().map(|s| s.to_string());
-            DaemonResponse::Status {
-                running,
-                uptime_secs,
-                error,
-            }
-        }
-        DaemonRequest::Start { config } => {
-            let mut pm = proxy.lock().await;
-            match pm.start(&config).await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
-        DaemonRequest::Stop => {
-            let mut pm = proxy.lock().await;
-            match pm.stop().await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
-        DaemonRequest::Reload { config } => {
-            let mut pm = proxy.lock().await;
-            match pm.reload(&config).await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
+async fn handle_stop<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.stop().await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
     }
 }
 
-// Wire helpers =====
-
-async fn send_response(stream: &mut Stream, resp: &DaemonResponse) -> std::io::Result<()> {
-    let json = serde_json::to_vec(resp).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let len = (json.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&json).await?;
-    Ok(())
-}
-
-async fn send_error(stream: &mut Stream, message: &str) -> std::io::Result<()> {
-    send_response(
-        stream,
-        &DaemonResponse::Error {
-            message: message.to_string(),
-        },
-    )
-    .await
+async fn handle_reload<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    Json(config): Json<ProxyConfig>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.reload(&config).await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
+    }
 }
 
 // Security =====

@@ -21,6 +21,13 @@ tracing-appender = "0.2"
 thiserror = "2"
 default-net = "0.22"
 tokio-util = "0.7"
+axum = { version = "0.8", default-features = false, features = ["json"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

@@ -1,0 +1,168 @@
+openapi: "3.0.3"
+info:
+  title: Hole Daemon API
+  description: REST API for controlling the Hole daemon over a local socket.
+  version: "1.0.0"
+
+paths:
+  /v1/status:
+    get:
+      summary: Get proxy status
+      operationId: getStatus
+      responses:
+        "200":
+          description: Current proxy status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /v1/start:
+    post:
+      summary: Start the proxy
+      operationId: startProxy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProxyConfig"
+      responses:
+        "200":
+          description: Proxy started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "500":
+          description: Failed to start proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/stop:
+    post:
+      summary: Stop the proxy
+      operationId: stopProxy
+      responses:
+        "200":
+          description: Proxy stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "500":
+          description: Failed to stop proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/reload:
+    post:
+      summary: Reload the proxy with new configuration
+      operationId: reloadProxy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProxyConfig"
+      responses:
+        "200":
+          description: Proxy reloaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "500":
+          description: Failed to reload proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    StatusResponse:
+      type: object
+      required:
+        - running
+        - uptime_secs
+      properties:
+        running:
+          type: boolean
+        uptime_secs:
+          type: integer
+          format: uint64
+          minimum: 0
+        error:
+          type:
+            - string
+            - "null"
+
+    ErrorResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+
+    EmptyResponse:
+      type: object
+      additionalProperties: false
+
+    # Documentation-only schemas (not code-generated; hand-written in Rust)
+    ProxyConfig:
+      type: object
+      description: "Hand-written in protocol.rs — included here for spec completeness."
+      required:
+        - server
+        - local_port
+      properties:
+        server:
+          $ref: "#/components/schemas/ServerEntry"
+        local_port:
+          type: integer
+          format: uint16
+          minimum: 0
+        plugin_path:
+          type:
+            - string
+            - "null"
+
+    ServerEntry:
+      type: object
+      description: "Hand-written in config.rs — included here for spec completeness."
+      required:
+        - id
+        - name
+        - server
+        - server_port
+        - method
+        - password
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        server:
+          type: string
+        server_port:
+          type: integer
+          format: uint16
+          minimum: 0
+        method:
+          type: string
+        password:
+          type: string
+        plugin:
+          type:
+            - string
+            - "null"
+        plugin_opts:
+          type:
+            - string
+            - "null"

@@ -1,22 +1,19 @@
 use crate::config::ServerEntry;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use thiserror::Error;
 
-// Errors =====
-
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error("i/o error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("invalid message: {0}")]
-    InvalidMessage(#[from] serde_json::Error),
-    #[error("message too large: {length} bytes")]
-    MessageTooLarge { length: u32 },
+// Generated from api/openapi.yaml — StatusResponse, ErrorResponse, EmptyResponse, route constants
+#[allow(clippy::derivable_impls)]
+mod api_generated {
+    include!(concat!(env!("OUT_DIR"), "/api_generated.rs"));
 }
+pub use api_generated::*;
 
 // Types =====
 
+/// Client-side request enum. Used by the GUI client API and elevation flow
+/// (base64 CLI serialization). Not part of the wire protocol — the client
+/// maps variants to HTTP endpoints internally.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DaemonRequest {
     Start { config: ProxyConfig },
@@ -25,6 +22,9 @@ pub enum DaemonRequest {
     Reload { config: ProxyConfig },
 }
 
+/// Client-side response enum. Used by the GUI client API and elevation flow.
+/// Not part of the wire protocol — the client maps HTTP responses back to
+/// these variants internally.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum DaemonResponse {
     Ack,
@@ -72,44 +72,6 @@ How to fix:
     Then log out and back in for the change to take effect.
     Or run your terminal as Administrator.
 ";
-
-// Wire format =====
-
-const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB
-
-pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
-    let json = serde_json::to_vec(msg)?;
-    let len = json.len() as u32;
-    if len > MAX_MESSAGE_SIZE {
-        return Err(ProtocolError::MessageTooLarge { length: len });
-    }
-    let mut buf = Vec::with_capacity(4 + json.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&json);
-    Ok(buf)
-}
-
-pub fn decode<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<(T, usize), ProtocolError> {
-    if data.len() < 4 {
-        return Err(ProtocolError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "not enough data for length prefix",
-        )));
-    }
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    if len > MAX_MESSAGE_SIZE {
-        return Err(ProtocolError::MessageTooLarge { length: len });
-    }
-    let total = 4 + len as usize;
-    if data.len() < total {
-        return Err(ProtocolError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "not enough data for message body",
-        )));
-    }
-    let msg: T = serde_json::from_slice(&data[4..total])?;
-    Ok((msg, total))
-}
 
 #[cfg(test)]
 #[path = "protocol_tests.rs"]

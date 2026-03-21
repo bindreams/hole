@@ -9,7 +9,7 @@ Single-binary design:
 - GUI mode (no args): system tray, settings window, config management. Unprivileged.
 - Daemon mode (`hole daemon run`): privileged service running as root/SYSTEM. Manages TUN, routing, shadowsocks-service.
 
-GUI and daemon communicate over IPC (Unix socket on macOS, named pipe on Windows) using length-prefixed JSON.
+GUI and daemon communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
 
 ### CLI
 

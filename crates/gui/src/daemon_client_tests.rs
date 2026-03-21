@@ -1,5 +1,7 @@
 use super::*;
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
+use axum::Json;
+use hole_common::protocol::{DaemonRequest, DaemonResponse, EmptyResponse, StatusResponse};
+use hyper::body::Incoming;
 
 // Helpers =====
 
@@ -18,10 +20,9 @@ fn test_socket_name(suffix: &str) -> String {
     format!("/tmp/hole-gui-test-{suffix}.sock")
 }
 
-/// Spawn a mock daemon that responds to one connection with canned responses.
+/// Spawn a mock HTTP daemon that responds to requests with canned responses.
 async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
     use interprocess::local_socket::{traits::tokio::Listener as ListenerTrait, ListenerOptions};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = {
         #[cfg(target_os = "windows")]
@@ -39,36 +40,44 @@ async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
         }
     };
 
-    tokio::spawn(async move {
-        let mut stream = listener.accept().await.unwrap();
-        loop {
-            // Read length prefix
-            let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(_) => return, // client disconnected
-            }
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-            let mut body = vec![0u8; msg_len];
-            stream.read_exact(&mut body).await.unwrap();
-
-            let req: DaemonRequest = serde_json::from_slice(&body).unwrap();
-            let resp = match req {
-                DaemonRequest::Status => DaemonResponse::Status {
+    let router = axum::Router::new()
+        .route(
+            hole_common::protocol::ROUTE_STATUS,
+            axum::routing::get(|| async {
+                Json(StatusResponse {
                     running: false,
                     uptime_secs: 0,
                     error: None,
-                },
-                DaemonRequest::Start { .. } => DaemonResponse::Ack,
-                DaemonRequest::Stop => DaemonResponse::Ack,
-                DaemonRequest::Reload { .. } => DaemonResponse::Ack,
-            };
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_START,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_STOP,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_RELOAD,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        );
 
-            let resp_json = serde_json::to_vec(&resp).unwrap();
-            let resp_len = (resp_json.len() as u32).to_be_bytes();
-            stream.write_all(&resp_len).await.unwrap();
-            stream.write_all(&resp_json).await.unwrap();
-        }
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                use tower::ServiceExt;
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await;
     })
 }
 
