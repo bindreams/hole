@@ -8,9 +8,11 @@ fn main() {
 
     let repo_root = git_repo_root();
     let cache_dir = repo_root.join(".cache").join("gui");
+    let cache_icons_dir = cache_dir.join("icons");
+    std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/gui/icons/");
 
     emit_version_env(&repo_root);
-    generate_icons(&svg_path, icons_dir);
+    generate_icons(&svg_path, &cache_icons_dir);
     generate_tray_icons(icons_dir);
     build_v2ray_plugin(&repo_root, &cache_dir);
 
@@ -269,13 +271,10 @@ fn generate_icons(svg_path: &Path, out_dir: &Path) {
     let ico_path = out_dir.join("icon.ico");
     render_ico(&tree, &ico_path);
 
-    // Generate ICNS placeholder (Tauri expects it but only uses on macOS)
+    // Generate ICNS (Tauri expects it but only uses on macOS)
     let icns_path = out_dir.join("icon.icns");
-    if !icns_path.exists() {
-        // Write a minimal valid ICNS with the 128x128 PNG embedded
-        let png_data = std::fs::read(out_dir.join("128x128.png")).unwrap();
-        write_icns(&icns_path, &png_data);
-    }
+    let png_data = std::fs::read(out_dir.join("128x128.png")).unwrap();
+    write_icns(&icns_path, &png_data);
 }
 
 fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
