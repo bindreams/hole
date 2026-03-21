@@ -28,6 +28,11 @@ tracing-appender = "0.2"
 thiserror = "2"
 base64 = "0.22"
 dirs = "6"
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
 ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -43,6 +48,8 @@ windows = { version = "0.61", features = [
 
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
+axum = { version = "0.8", default-features = false, features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 tauri-build = "2"

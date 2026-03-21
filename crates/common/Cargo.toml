@@ -13,5 +13,11 @@ semver = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[build-dependencies]
+typify = "0.6"
+schemars = "0.8"
+serde_json = "1"
+yaml_serde = "0.10"
+
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
