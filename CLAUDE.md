@@ -23,6 +23,8 @@ hole daemon status                → print install/running status
 hole daemon log                   → print daemon log to stdout
 hole daemon log path              → print log file path
 hole daemon log watch [--tail N]  → stream log output
+hole daemon grant-access [--then-send B64] → add current user to hole group (needs elevation)
+hole daemon ipc-send --base64 B64          → proxy a single IPC command (needs elevation)
 hole upgrade                      → check for updates and install latest version (unattended)
 hole path add                     → add hole to system PATH
 hole path remove                  → remove hole from system PATH

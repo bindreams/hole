@@ -2,7 +2,11 @@
 
 use crate::daemon_client::{ClientError, DaemonClient};
 use hole_common::config::AppConfig;
-use hole_common::protocol::{DaemonRequest, DaemonResponse, DAEMON_SOCKET_NAME};
+#[cfg(target_os = "windows")]
+use hole_common::protocol::DAEMON_SOCKET_NAME;
+#[cfg(target_os = "macos")]
+use hole_common::protocol::DAEMON_SOCKET_PATH;
+use hole_common::protocol::{DaemonRequest, DaemonResponse};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::warn;
@@ -31,7 +35,12 @@ impl AppState {
 
         // Lazy connect
         if guard.is_none() {
-            match DaemonClient::connect(DAEMON_SOCKET_NAME).await {
+            #[cfg(target_os = "windows")]
+            let connect_result = DaemonClient::connect(DAEMON_SOCKET_NAME).await;
+            #[cfg(target_os = "macos")]
+            let connect_result = DaemonClient::connect(DAEMON_SOCKET_PATH).await;
+
+            match connect_result {
                 Ok(client) => *guard = Some(client),
                 Err(e) => {
                     warn!(error = %e, "failed to connect to daemon");

@@ -3,7 +3,7 @@ use crate::proxy::ProxyError;
 use crate::proxy_manager::{ProxyBackend, ProxyManager};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{encode, DaemonRequest, DaemonResponse, ProxyConfig};
-use interprocess::local_socket::{traits::tokio::Stream as StreamTrait, GenericNamespaced, ToNsName};
+use interprocess::local_socket::traits::tokio::Stream as StreamTrait;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -87,9 +87,35 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
+/// Connect to a test IPC server. On Windows uses namespaced pipes, on macOS uses filesystem sockets.
 async fn connect_to(name: &str) -> interprocess::local_socket::tokio::Stream {
-    let name = name.to_ns_name::<GenericNamespaced>().unwrap();
-    interprocess::local_socket::tokio::Stream::connect(name).await.unwrap()
+    #[cfg(target_os = "windows")]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
+        interprocess::local_socket::tokio::Stream::connect(ns_name)
+            .await
+            .unwrap()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+        let fs_name = name.to_fs_name::<GenericFilePath>().unwrap();
+        interprocess::local_socket::tokio::Stream::connect(fs_name)
+            .await
+            .unwrap()
+    }
+}
+
+/// Generate a test socket name. On macOS, returns a temp file path.
+#[cfg(target_os = "windows")]
+fn test_socket_name(suffix: &str) -> String {
+    format!("hole-test-{suffix}")
+}
+
+#[cfg(target_os = "macos")]
+fn test_socket_name(suffix: &str) -> String {
+    format!("/tmp/hole-test-{suffix}.sock")
 }
 
 async fn send_request(stream: &mut interprocess::local_socket::tokio::Stream, req: &DaemonRequest) -> DaemonResponse {
@@ -110,7 +136,7 @@ async fn send_request(stream: &mut interprocess::local_socket::tokio::Stream, re
 #[skuld::test]
 fn server_accepts_connection() {
     rt().block_on(async {
-        let name = "hole-test-accept";
+        let name = &test_socket_name("accept");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -124,7 +150,7 @@ fn server_accepts_connection() {
 #[skuld::test]
 fn status_when_not_running_returns_false() {
     rt().block_on(async {
-        let name = "hole-test-status";
+        let name = &test_socket_name("status");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -149,7 +175,7 @@ fn status_when_not_running_returns_false() {
 #[skuld::test]
 fn multiple_requests_on_same_connection() {
     rt().block_on(async {
-        let name = "hole-test-multi";
+        let name = &test_socket_name("multi");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -170,7 +196,7 @@ fn multiple_requests_on_same_connection() {
 #[skuld::test]
 fn invalid_request_returns_error_response() {
     rt().block_on(async {
-        let name = "hole-test-invalid";
+        let name = &test_socket_name("invalid");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -202,7 +228,7 @@ fn invalid_request_returns_error_response() {
 #[skuld::test]
 fn server_handles_client_disconnect() {
     rt().block_on(async {
-        let name = "hole-test-disconnect";
+        let name = &test_socket_name("disconnect");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -220,7 +246,7 @@ fn server_handles_client_disconnect() {
 #[skuld::test]
 fn start_request_starts_proxy() {
     rt().block_on(async {
-        let name = "hole-test-start";
+        let name = &test_socket_name("start");
         let pm = mock_proxy();
         let server = IpcServer::bind(name, pm).unwrap();
         let handle = tokio::spawn(async move {
@@ -258,7 +284,7 @@ fn start_request_starts_proxy() {
 #[skuld::test]
 fn stop_request_stops_proxy() {
     rt().block_on(async {
-        let name = "hole-test-stop";
+        let name = &test_socket_name("stop");
         let pm = mock_proxy();
         let server = IpcServer::bind(name, pm).unwrap();
         let handle = tokio::spawn(async move {
@@ -295,7 +321,7 @@ fn stop_request_stops_proxy() {
 #[skuld::test]
 fn start_failure_returns_error() {
     rt().block_on(async {
-        let name = "hole-test-start-fail";
+        let name = &test_socket_name("start-fail");
         let pm = failing_proxy();
         let server = IpcServer::bind(name, pm).unwrap();
         let handle = tokio::spawn(async move {
@@ -329,7 +355,7 @@ fn start_failure_returns_error() {
 #[skuld::test]
 fn run_cancellation_aborts_connection_handlers() {
     rt().block_on(async {
-        let name = "hole-test-run-cancel";
+        let name = &test_socket_name("run-cancel");
         let server = IpcServer::bind(name, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run().await.unwrap();

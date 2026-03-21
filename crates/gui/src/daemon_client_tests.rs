@@ -7,15 +7,37 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// Generate a test socket name. On macOS, returns a temp file path.
+#[cfg(target_os = "windows")]
+fn test_socket_name(suffix: &str) -> String {
+    format!("hole-gui-test-{suffix}")
+}
+
+#[cfg(target_os = "macos")]
+fn test_socket_name(suffix: &str) -> String {
+    format!("/tmp/hole-gui-test-{suffix}.sock")
+}
+
 /// Spawn a mock daemon that responds to one connection with canned responses.
 async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
-    use interprocess::local_socket::{
-        traits::tokio::Listener as ListenerTrait, GenericNamespaced, ListenerOptions, ToNsName,
-    };
+    use interprocess::local_socket::{traits::tokio::Listener as ListenerTrait, ListenerOptions};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
-    let listener = ListenerOptions::new().name(ns_name).create_tokio().unwrap();
+    let listener = {
+        #[cfg(target_os = "windows")]
+        {
+            use interprocess::local_socket::{GenericNamespaced, ToNsName};
+            let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
+            ListenerOptions::new().name(ns_name).create_tokio().unwrap()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use interprocess::local_socket::{GenericFilePath, ToFsName};
+            let _ = std::fs::remove_file(name);
+            let fs_name = name.to_fs_name::<GenericFilePath>().unwrap();
+            ListenerOptions::new().name(fs_name).create_tokio().unwrap()
+        }
+    };
 
     tokio::spawn(async move {
         let mut stream = listener.accept().await.unwrap();
@@ -55,7 +77,7 @@ async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
 #[skuld::test]
 fn send_status_request_receives_response() {
     rt().block_on(async {
-        let name = "hole-gui-test-status";
+        let name = &test_socket_name("status");
         let _mock = spawn_mock_daemon(name).await;
 
         let mut client = DaemonClient::connect(name).await.unwrap();
@@ -75,7 +97,7 @@ fn send_status_request_receives_response() {
 #[skuld::test]
 fn send_start_receives_ack() {
     rt().block_on(async {
-        let name = "hole-gui-test-start";
+        let name = &test_socket_name("start");
         let _mock = spawn_mock_daemon(name).await;
 
         let mut client = DaemonClient::connect(name).await.unwrap();
@@ -105,7 +127,7 @@ fn send_start_receives_ack() {
 #[skuld::test]
 fn multiple_requests_on_same_client() {
     rt().block_on(async {
-        let name = "hole-gui-test-multi";
+        let name = &test_socket_name("multi");
         let _mock = spawn_mock_daemon(name).await;
 
         let mut client = DaemonClient::connect(name).await.unwrap();
@@ -121,7 +143,28 @@ fn multiple_requests_on_same_client() {
 #[skuld::test]
 fn connect_to_nonexistent_returns_error() {
     rt().block_on(async {
-        let result = DaemonClient::connect("hole-gui-test-nonexistent").await;
+        let result = DaemonClient::connect(&test_socket_name("nonexistent")).await;
         assert!(result.is_err());
     });
+}
+
+#[skuld::test]
+fn permission_denied_maps_to_variant() {
+    // Verify that map_connect_error correctly maps PermissionDenied
+    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+    let client_err = super::map_connect_error(io_err);
+    assert!(
+        matches!(client_err, ClientError::PermissionDenied),
+        "expected PermissionDenied, got: {client_err:?}"
+    );
+}
+
+#[skuld::test]
+fn other_io_error_maps_to_connection() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    let client_err = super::map_connect_error(io_err);
+    assert!(
+        matches!(client_err, ClientError::Connection(_)),
+        "expected Connection, got: {client_err:?}"
+    );
 }

@@ -17,7 +17,7 @@ pub enum ProtocolError {
 
 // Types =====
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DaemonRequest {
     Start { config: ProxyConfig },
     Stop,
@@ -47,8 +47,31 @@ pub struct ProxyConfig {
 
 // Constants =====
 
-/// Default socket name for the daemon IPC channel.
+/// macOS: filesystem socket path (like Docker's /var/run/docker.sock).
+#[cfg(target_os = "macos")]
+pub const DAEMON_SOCKET_PATH: &str = "/var/run/hole-daemon.sock";
+
+/// Windows: namespaced pipe name for the daemon IPC channel.
+#[cfg(target_os = "windows")]
 pub const DAEMON_SOCKET_NAME: &str = "hole-daemon";
+
+/// Actionable instructions shown when a client is denied access to the daemon.
+/// Both platform instructions are always printed regardless of the current OS.
+pub const PERMISSION_DENIED_HELP: &str = "\
+error: permission denied — you are not authorized to control the Hole daemon.
+
+How to fix:
+
+  macOS:
+    sudo dseditgroup -o edit -a $(whoami) -t user hole
+    Then log out and back in for the change to take effect.
+    Or prefix your command with: sudo
+
+  Windows:
+    net localgroup hole %USERNAME% /add
+    Then log out and back in for the change to take effect.
+    Or run your terminal as Administrator.
+";
 
 // Wire format =====
 

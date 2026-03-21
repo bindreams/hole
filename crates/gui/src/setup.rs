@@ -158,6 +158,17 @@ pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let log_dir = hole_daemon::logging::log_dir();
     std::fs::create_dir_all(&log_dir)?;
 
+    // Create access group and add installing user (before daemon starts,
+    // so the daemon can set socket/pipe permissions using the group)
+    hole_daemon::group::create_group()?;
+    match hole_daemon::group::installing_username() {
+        Ok(user) => {
+            hole_daemon::group::add_user_to_group(&user)?;
+            eprintln!("added user '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+        }
+        Err(e) => eprintln!("warning: could not detect installing user: {e}"),
+    }
+
     // Idempotent: if already installed, stop and uninstall first
     if hole_daemon::platform::os::is_installed() {
         eprintln!("daemon already installed, reinstalling...");
@@ -184,6 +195,16 @@ pub fn uninstall_daemon() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     hole_daemon::platform::os::uninstall()?;
+
+    // Remove macOS socket file
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::fs::remove_file(hole_common::protocol::DAEMON_SOCKET_PATH);
+    }
+
+    // Best-effort: remove the access group
+    let _ = hole_daemon::group::delete_group();
+
     eprintln!("daemon uninstalled");
     Ok(())
 }
@@ -284,7 +305,12 @@ async fn poll_daemon_ipc() -> bool {
 
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(mut client) = DaemonClient::connect(hole_daemon::ipc::SOCKET_NAME).await {
+        #[cfg(target_os = "windows")]
+        let socket_id = hole_daemon::ipc::SOCKET_NAME;
+        #[cfg(target_os = "macos")]
+        let socket_id = hole_daemon::ipc::SOCKET_PATH;
+
+        if let Ok(mut client) = DaemonClient::connect(socket_id).await {
             if client.send(DaemonRequest::Status).await.is_ok() {
                 return true;
             }
