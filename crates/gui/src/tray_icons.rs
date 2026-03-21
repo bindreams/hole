@@ -11,7 +11,11 @@ pub enum TrayState {
 
 impl From<bool> for TrayState {
     fn from(enabled: bool) -> Self {
-        if enabled { TrayState::Enabled } else { TrayState::Disabled }
+        if enabled {
+            TrayState::Enabled
+        } else {
+            TrayState::Disabled
+        }
     }
 }
 
@@ -57,12 +61,9 @@ fn macos_image(state: TrayState) -> Image<'static> {
 #[cfg(target_os = "windows")]
 fn windows_image(state: TrayState) -> Image<'static> {
     const ENABLED_DARK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-dark.rgba"));
-    const ENABLED_LIGHT: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-light.rgba"));
-    const DISABLED_DARK: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-dark.rgba"));
-    const DISABLED_LIGHT: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-light.rgba"));
+    const ENABLED_LIGHT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-light.rgba"));
+    const DISABLED_DARK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-dark.rgba"));
+    const DISABLED_LIGHT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-light.rgba"));
     const SIZE: u32 = 32;
 
     let is_light = is_light_taskbar();
@@ -84,9 +85,7 @@ fn is_light_taskbar() -> bool {
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) =
-        hkcu.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-    else {
+    let Ok(key) = hkcu.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize") else {
         return false;
     };
     let Ok(val): Result<u32, _> = key.get_value("SystemUsesLightTheme") else {

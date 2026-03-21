@@ -331,8 +331,8 @@ fn generate_tray_icons(icons_dir: &Path) {
         let svg_path = icons_dir.join(format!("{name}.svg"));
         println!("cargo:rerun-if-changed={}", svg_path.display());
 
-        let svg_data = std::fs::read(&svg_path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", svg_path.display()));
+        let svg_data =
+            std::fs::read(&svg_path).unwrap_or_else(|e| panic!("failed to read {}: {e}", svg_path.display()));
         let tree = resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default())
             .unwrap_or_else(|e| panic!("failed to parse {name}.svg: {e}"));
 
@@ -368,7 +368,10 @@ fn generate_tray_icons_windows(tree: &resvg::usvg::Tree, out_dir: &Path, name: &
 
 /// Render an SVG tree into an RGBA buffer of `target_size`, with `padding` px on each side.
 fn render_to_rgba_padded(tree: &resvg::usvg::Tree, target_size: u32, padding: u32) -> Vec<u8> {
-    debug_assert!(2 * padding < target_size, "padding must be less than half of target_size");
+    debug_assert!(
+        2 * padding < target_size,
+        "padding must be less than half of target_size"
+    );
     let content_size = target_size - 2 * padding;
     let mut content_pixmap = resvg::tiny_skia::Pixmap::new(content_size, content_size).unwrap();
     let scale_x = content_size as f32 / tree.size().width();
