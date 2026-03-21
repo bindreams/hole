@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 thiserror = "2"
 dirs = "6"
+ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56"
@@ -44,6 +45,7 @@ skuld = { git = "https://github.com/bindreams/skuld" }
 
 [build-dependencies]
 tauri-build = "2"
+semver = "1"
 resvg = "0.45"
 png = "0.18"
 ico = "0.5"

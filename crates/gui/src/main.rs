@@ -41,6 +41,7 @@ fn launch_gui() {
         ))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new(config_path))
+        .manage(hole_gui::update::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
@@ -61,6 +62,21 @@ fn launch_gui() {
             tray::create_tray(app)?;
             platform::on_setup(app)?;
             setup::check_daemon_on_launch(app.handle().clone());
+            hole_gui::update::start_update_checker(app.handle().clone(), |app, info| {
+                // Rebuild tray menu to include the "Install Update" item.
+                if let Some(tray_icon) = app.tray_by_id("main") {
+                    match tray::build_tray_menu(app, Some(info)) {
+                        Ok(menu) => {
+                            // Re-sync checkbox state from config before applying new menu.
+                            tray::sync_menu_state(app, &menu);
+                            tray_icon.set_menu(Some(menu)).ok();
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to rebuild tray menu with update");
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

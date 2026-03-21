@@ -91,9 +91,11 @@ fn compute_git_version(repo_root: &Path) -> Result<String, String> {
     let semver = tag
         .strip_prefix('v')
         .ok_or_else(|| format!("tag '{tag}' missing 'v' prefix"))?;
-    let semver_parts: Vec<&str> = semver.split('.').collect();
-    if semver_parts.len() != 3 || !semver_parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
-        return Err(format!("tag '{tag}' is not strict vMAJOR.MINOR.PATCH"));
+    let parsed = semver::Version::parse(semver).map_err(|e| format!("tag '{tag}' is not valid semver: {e}"))?;
+    if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+        return Err(format!(
+            "tag '{tag}' must be strict vMAJOR.MINOR.PATCH (no pre-release/build)"
+        ));
     }
 
     let mut version = semver.to_string();
