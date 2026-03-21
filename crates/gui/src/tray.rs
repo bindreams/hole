@@ -3,6 +3,7 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole_common::protocol::{DaemonRequest, DaemonResponse};
+use hole_gui::tray_icons;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -67,15 +68,35 @@ pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
 pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
     let menu = build_tray_menu(app.handle(), None)?;
 
-    let tray = TrayIconBuilder::with_id("main")
+    let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
+    let icon = tray_icons::tray_image(enabled.into());
+
+    #[allow(unused_mut)]
+    let mut builder = TrayIconBuilder::with_id("main")
         .menu(&menu)
         .tooltip("Hole")
-        .on_menu_event(handle_menu_event)
-        .build(app)?;
+        .icon(icon)
+        .on_menu_event(handle_menu_event);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(true);
+    }
+
+    let tray = builder.build(app)?;
 
     sync_menu_state(app.handle(), &menu);
 
     Ok(tray)
+}
+
+/// Update the tray icon to reflect the given enabled/disabled state.
+pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Err(e) = tray.set_icon(Some(tray_icons::tray_image(enabled.into()))) {
+            warn!(error = %e, "failed to set tray icon");
+        }
+    }
 }
 
 // Event handler =====
@@ -96,6 +117,8 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 (enabled, pc)
             };
 
+            set_tray_icon(app, enabled);
+
             if enabled {
                 let Some(proxy_config) = proxy_config else {
                     error!("tray: no server selected, cannot enable");
@@ -103,6 +126,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                     let mut config = state.config.lock().unwrap();
                     config.enabled = false;
                     config.save(&state.config_path).ok();
+                    set_tray_icon(app, false);
                     return;
                 };
 
@@ -140,6 +164,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         let mut config = state.config.lock().unwrap();
                         config.enabled = false;
                         config.save(&state.config_path).ok();
+                        set_tray_icon(&app_handle, false);
                     }
                 });
             } else {
@@ -173,6 +198,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         let mut config = state.config.lock().unwrap();
                         config.enabled = true;
                         config.save(&state.config_path).ok();
+                        set_tray_icon(&app_handle, true);
                     }
                 });
             }
