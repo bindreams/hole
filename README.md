@@ -16,10 +16,10 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 
 Single-binary design — `hole` serves as both the Tauri GUI and the privileged daemon depending on CLI arguments:
 
-| Mode | Privilege | Role |
-|---|---|---|
-| `hole` (no args) | User | Tauri GUI — system tray, settings window, config management |
-| `hole daemon run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service |
+| Mode              | Privilege     | Role                                                        |
+| ----------------- | ------------- | ----------------------------------------------------------- |
+| `hole` (no args)  | User          | Tauri GUI — system tray, settings window, config management |
+| `hole daemon run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service       |
 
 Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using length-prefixed JSON.
 

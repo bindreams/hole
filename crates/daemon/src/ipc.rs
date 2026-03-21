@@ -5,7 +5,7 @@ use hole_common::protocol::{DaemonRequest, DaemonResponse};
 use interprocess::local_socket::{
     tokio::{Listener, Stream},
     traits::tokio::Listener as ListenerTrait,
-    GenericNamespaced, ListenerOptions, ToNsName,
+    ListenerOptions,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,8 +16,11 @@ use tracing::{debug, error, info, warn};
 
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB
 
-/// Re-export for convenience.
+/// Re-export: socket name (Windows) or path (macOS).
+#[cfg(target_os = "windows")]
 pub use hole_common::protocol::DAEMON_SOCKET_NAME as SOCKET_NAME;
+#[cfg(target_os = "macos")]
+pub use hole_common::protocol::DAEMON_SOCKET_PATH as SOCKET_PATH;
 
 // Server =====
 
@@ -27,12 +30,44 @@ pub struct IpcServer<B: ProxyBackend> {
 }
 
 impl<B: ProxyBackend + 'static> IpcServer<B> {
-    /// Bind to the given socket name (namespaced).
+    /// Bind to the IPC socket/pipe.
+    ///
+    /// On macOS: filesystem Unix domain socket at `path`.
+    /// On Windows: namespaced named pipe with `name`.
+    #[cfg(target_os = "windows")]
     pub fn bind(name: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+
         let ns_name = name
             .to_ns_name::<GenericNamespaced>()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let listener = ListenerOptions::new().name(ns_name).create_tokio()?;
+
+        let opts = ListenerOptions::new().name(ns_name);
+        #[cfg(not(test))]
+        let opts = apply_security_descriptor(opts);
+        let listener = opts.create_tokio()?;
+
+        Ok(Self { listener, proxy })
+    }
+
+    /// Bind to the IPC socket.
+    ///
+    /// Uses a filesystem Unix domain socket. Removes stale socket file before binding.
+    #[cfg(target_os = "macos")]
+    pub fn bind(path: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+
+        // Remove stale socket (standard practice, same as Docker)
+        let _ = std::fs::remove_file(path);
+
+        let fs_name = path
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let listener = ListenerOptions::new().name(fs_name).create_tokio()?;
+
+        // Set socket ownership and permissions post-bind
+        #[cfg(not(test))]
+        apply_socket_permissions(path);
 
         Ok(Self { listener, proxy })
     }
@@ -185,6 +220,95 @@ async fn send_error(stream: &mut Stream, message: &str) -> std::io::Result<()> {
         },
     )
     .await
+}
+
+// Security =====
+
+/// Apply a Windows DACL to the named pipe, restricting access to SYSTEM,
+/// Administrators, and the `hole` group.
+#[cfg(all(target_os = "windows", not(test)))]
+fn apply_security_descriptor(opts: ListenerOptions<'_>) -> ListenerOptions<'_> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+
+    let sddl = build_sddl();
+    match security_descriptor_from_sddl(&sddl) {
+        Ok(sd) => opts.security_descriptor(sd),
+        Err(e) => {
+            warn!("failed to set pipe security descriptor: {e}");
+            opts
+        }
+    }
+}
+
+/// Build the SDDL string for the named pipe DACL.
+#[cfg(all(target_os = "windows", not(test)))]
+fn build_sddl() -> String {
+    // Base: SYSTEM + Administrators
+    let base = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+
+    match crate::group::group_sid() {
+        Ok(sid) => {
+            info!(sid = %sid, "restricting IPC to SYSTEM + Administrators + hole group");
+            format!("{base}(A;;GA;;;{sid})")
+        }
+        Err(e) => {
+            warn!("'hole' group not found ({e}), IPC restricted to admin-only");
+            base.to_string()
+        }
+    }
+}
+
+/// Parse an SDDL string into a SecurityDescriptor.
+#[cfg(all(target_os = "windows", not(test)))]
+fn security_descriptor_from_sddl(
+    sddl: &str,
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
+
+    let wide = U16CString::from_str(sddl).map_err(|e| std::io::Error::other(format!("invalid SDDL string: {e}")))?;
+    SecurityDescriptor::deserialize(&wide)
+        .map_err(|e| std::io::Error::other(format!("failed to deserialize SDDL: {e}")))
+}
+
+/// Set socket file ownership to root:hole and mode 0660 on macOS.
+#[cfg(all(target_os = "macos", not(test)))]
+fn apply_socket_permissions(path: &str) {
+    use std::ffi::CString;
+
+    let c_path = match CString::new(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("invalid socket path for permissions: {e}");
+            return;
+        }
+    };
+
+    // Look up the 'hole' group GID
+    let group_name = CString::new(crate::group::GROUP_NAME).unwrap();
+    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
+
+    if grp.is_null() {
+        warn!("'hole' group not found, restricting socket to root-only");
+        unsafe {
+            libc::chmod(c_path.as_ptr(), 0o600);
+        }
+        return;
+    }
+
+    let gid = unsafe { (*grp).gr_gid };
+    info!(gid = gid, "setting socket ownership to root:hole, mode 0660");
+
+    unsafe {
+        if libc::chown(c_path.as_ptr(), 0, gid) != 0 {
+            warn!("chown failed, falling back to root-only socket");
+            libc::chmod(c_path.as_ptr(), 0o600);
+            return;
+        }
+        if libc::chmod(c_path.as_ptr(), 0o660) != 0 {
+            warn!("chmod failed, socket may have incorrect permissions");
+        }
+    }
 }
 
 #[cfg(test)]

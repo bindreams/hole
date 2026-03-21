@@ -4,6 +4,7 @@
 mod cli;
 mod commands;
 mod daemon_client;
+mod elevation;
 mod logging;
 mod path_management;
 mod platform;
