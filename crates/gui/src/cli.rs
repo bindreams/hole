@@ -44,6 +44,18 @@ enum DaemonAction {
         #[command(subcommand)]
         action: Option<LogAction>,
     },
+    /// Add the current user to the hole group (requires elevation)
+    GrantAccess {
+        /// Also send this IPC command after granting access (base64-encoded JSON)
+        #[arg(long)]
+        then_send: Option<String>,
+    },
+    /// Send a single IPC command to the daemon (requires elevation)
+    IpcSend {
+        /// Base64-encoded JSON of the DaemonRequest
+        #[arg(long)]
+        base64: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,6 +190,8 @@ fn handle_daemon(action: DaemonAction) -> i32 {
             }
         }
         DaemonAction::Log { action } => handle_daemon_log(action),
+        DaemonAction::GrantAccess { then_send } => handle_grant_access(then_send),
+        DaemonAction::IpcSend { base64 } => handle_ipc_send(&base64),
     }
 }
 
@@ -256,6 +270,92 @@ fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
             }
         }
     }
+}
+
+fn handle_grant_access(then_send: Option<String>) -> i32 {
+    use hole_common::protocol::PERMISSION_DENIED_HELP;
+
+    // Ensure the group exists (may not if daemon was installed by an older version)
+    if let Err(e) = hole_daemon::group::create_group() {
+        eprintln!("failed to create group: {e}");
+        return 1;
+    }
+
+    // Add current user to the hole group
+    match hole_daemon::group::installing_username() {
+        Ok(user) => {
+            if let Err(e) = hole_daemon::group::add_user_to_group(&user) {
+                eprintln!("failed to add '{user}' to group: {e}");
+                return 1;
+            }
+            eprintln!("added '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+        }
+        Err(e) => {
+            eprintln!("could not determine current user: {e}");
+            eprintln!("{PERMISSION_DENIED_HELP}");
+            return 1;
+        }
+    }
+
+    // Optionally proxy a command to the daemon
+    if let Some(b64) = then_send {
+        return handle_ipc_send(&b64);
+    }
+
+    0
+}
+
+fn handle_ipc_send(base64_request: &str) -> i32 {
+    use base64::Engine;
+    use hole_common::protocol::{DaemonRequest, DaemonResponse};
+
+    // Decode base64
+    let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("invalid base64: {e}");
+            return 1;
+        }
+    };
+
+    // Deserialize request
+    let request: DaemonRequest = match serde_json::from_slice(&json_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("invalid request JSON: {e}");
+            return 1;
+        }
+    };
+
+    // Connect and send
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        #[cfg(target_os = "windows")]
+        let socket_id = hole_common::protocol::DAEMON_SOCKET_NAME;
+        #[cfg(target_os = "macos")]
+        let socket_id = hole_common::protocol::DAEMON_SOCKET_PATH;
+
+        let mut client = match crate::daemon_client::DaemonClient::connect(socket_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to connect to daemon: {e}");
+                return 1;
+            }
+        };
+
+        match client.send(request).await {
+            Ok(DaemonResponse::Ack) => 0,
+            Ok(DaemonResponse::Status { .. }) => 0,
+            Ok(DaemonResponse::Error { message }) => {
+                eprintln!("daemon error: {message}");
+                1
+            }
+            Err(e) => {
+                eprintln!("communication error: {e}");
+                1
+            }
+        }
+    })
 }
 
 fn handle_path(action: PathAction) -> i32 {

@@ -151,7 +151,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        let server = crate::ipc::IpcServer::bind(crate::ipc::SOCKET_NAME, proxy)?;
+        let server = crate::ipc::IpcServer::bind(crate::ipc::SOCKET_PATH, proxy)?;
 
         tokio::select! {
             result = server.run() => {

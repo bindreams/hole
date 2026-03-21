@@ -133,7 +133,8 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<AppState>();
-                    let ok = match state.daemon_send(DaemonRequest::Start { config: proxy_config }).await {
+                    let request = DaemonRequest::Start { config: proxy_config };
+                    let ok = match state.daemon_send(request.clone()).await {
                         Ok(DaemonResponse::Ack) => {
                             info!("proxy started");
                             true
@@ -149,6 +150,9 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         Ok(_) => {
                             warn!("unexpected response from daemon");
                             false
+                        }
+                        Err(crate::daemon_client::ClientError::PermissionDenied) => {
+                            crate::elevation::prompt_elevation(&app_handle, request).await
                         }
                         Err(e) => {
                             error!("failed to send start: {e}");
@@ -167,7 +171,8 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<AppState>();
-                    let ok = match state.daemon_send(DaemonRequest::Stop).await {
+                    let request = DaemonRequest::Stop;
+                    let ok = match state.daemon_send(request.clone()).await {
                         Ok(DaemonResponse::Ack) => {
                             info!("proxy stopped");
                             true
@@ -179,6 +184,9 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         Ok(_) => {
                             warn!("unexpected response from daemon");
                             false
+                        }
+                        Err(crate::daemon_client::ClientError::PermissionDenied) => {
+                            crate::elevation::prompt_elevation(&app_handle, request).await
                         }
                         Err(e) => {
                             error!("failed to send stop: {e}");

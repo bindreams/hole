@@ -1,7 +1,7 @@
 // IPC client to hole-daemon.
 
 use hole_common::protocol::{encode, DaemonRequest, DaemonResponse};
-use interprocess::local_socket::{tokio::Stream, traits::tokio::Stream as StreamTrait, GenericNamespaced, ToNsName};
+use interprocess::local_socket::{tokio::Stream, traits::tokio::Stream as StreamTrait};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11,6 +11,8 @@ const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("permission denied: insufficient privileges to connect to the Hole daemon")]
+    PermissionDenied,
     #[error("connection error: {0}")]
     Connection(#[source] std::io::Error),
     #[error("i/o error: {0}")]
@@ -27,12 +29,27 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
-    /// Connect to the daemon at the given socket name.
+    /// Connect to the daemon at the given socket name (Windows) or path (macOS).
+    #[cfg(target_os = "windows")]
     pub async fn connect(name: &str) -> Result<Self, ClientError> {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+
         let ns_name = name
             .to_ns_name::<GenericNamespaced>()
             .map_err(|e| ClientError::Connection(std::io::Error::other(e.to_string())))?;
-        let stream = Stream::connect(ns_name).await.map_err(ClientError::Connection)?;
+        let stream = Stream::connect(ns_name).await.map_err(map_connect_error)?;
+        Ok(Self { stream })
+    }
+
+    /// Connect to the daemon at the given socket path.
+    #[cfg(target_os = "macos")]
+    pub async fn connect(path: &str) -> Result<Self, ClientError> {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+
+        let fs_name = path
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|e| ClientError::Connection(std::io::Error::other(e.to_string())))?;
+        let stream = Stream::connect(fs_name).await.map_err(map_connect_error)?;
         Ok(Self { stream })
     }
 
@@ -57,6 +74,16 @@ impl DaemonClient {
 
         let resp: DaemonResponse = serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
         Ok(resp)
+    }
+}
+
+// Helpers =====
+
+fn map_connect_error(e: std::io::Error) -> ClientError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        ClientError::PermissionDenied
+    } else {
+        ClientError::Connection(e)
     }
 }
 
