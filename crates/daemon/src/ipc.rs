@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-#[cfg(not(test))]
+#[allow(unused_imports)]
 use tracing::warn;
 use tracing::{debug, error, info};
 
@@ -28,6 +28,7 @@ pub use hole_common::protocol::DAEMON_SOCKET_PATH as SOCKET_PATH;
 
 // Server =====
 
+/// HTTP/1.1 REST server over a local socket (Unix domain socket or named pipe).
 pub struct IpcServer {
     listener: Listener,
     router: axum::Router,
@@ -77,17 +78,7 @@ impl IpcServer {
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
         let stream = self.listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let router = self.router;
-        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
-            let router = router.clone();
-            async move {
-                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
-                Ok::<_, Infallible>(resp)
-            }
-        });
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(io, service)
+        serve_connection(TokioIo::new(stream), self.router)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
@@ -111,18 +102,7 @@ impl IpcServer {
                     info!("IPC client connected");
                     let router = self.router.clone();
                     tasks.spawn(async move {
-                        let io = TokioIo::new(stream);
-                        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
-                            let router = router.clone();
-                            async move {
-                                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
-                                Ok::<_, Infallible>(resp)
-                            }
-                        });
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, service)
-                            .await
-                        {
+                        if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
                             debug!(error = %e, "HTTP connection ended");
                         }
                         info!("IPC client disconnected");
@@ -134,6 +114,23 @@ impl IpcServer {
             }
         }
     }
+}
+
+/// Serve HTTP/1.1 on a single connection using the given axum router.
+async fn serve_connection<I>(io: TokioIo<I>, router: axum::Router) -> Result<(), hyper::Error>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+        let router = router.clone();
+        async move {
+            let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+            Ok::<_, Infallible>(resp)
+        }
+    });
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
 }
 
 // Router =====

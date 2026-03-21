@@ -147,6 +147,13 @@ fn empty_response_serializes_to_empty_object() {
 }
 
 #[skuld::test]
+fn status_response_explicit_null_error() {
+    let json = r#"{"running": false, "uptime_secs": 0, "error": null}"#;
+    let decoded: StatusResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(decoded.error, None);
+}
+
+#[skuld::test]
 fn route_constants_are_correct() {
     assert_eq!(ROUTE_STATUS, "/v1/status");
     assert_eq!(ROUTE_START, "/v1/start");

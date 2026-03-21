@@ -144,8 +144,8 @@ async fn get_status(sender: &mut http1::SendRequest<Full<Bytes>>) -> StatusRespo
     serde_json::from_slice(&body).unwrap()
 }
 
-/// Consume and discard a response body (required before next request on keep-alive).
-async fn drain(resp: http::Response<hyper::body::Incoming>) -> u16 {
+/// Consume the response body and return the status code (required before next request on keep-alive).
+async fn consume(resp: http::Response<hyper::body::Incoming>) -> u16 {
     let status = resp.status().as_u16();
     let _ = resp.into_body().collect().await;
     status
@@ -312,14 +312,14 @@ fn start_request_starts_proxy() {
         let (mut sender, conn_handle) = http_connect(name).await;
 
         // Start
-        assert_eq!(drain(post_start(&mut sender, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut sender, &sample_config()).await).await, 200);
 
         // Status should show running
         let status = get_status(&mut sender).await;
         assert!(status.running, "expected running=true after Start");
 
         // Stop (cleanup)
-        assert_eq!(drain(post_stop(&mut sender).await).await, 200);
+        assert_eq!(consume(post_stop(&mut sender).await).await, 200);
 
         drop(sender);
         let _ = conn_handle.await;
@@ -340,10 +340,10 @@ fn stop_request_stops_proxy() {
         let (mut sender, conn_handle) = http_connect(name).await;
 
         // Start
-        drain(post_start(&mut sender, &sample_config()).await).await;
+        consume(post_start(&mut sender, &sample_config()).await).await;
 
         // Stop
-        assert_eq!(drain(post_stop(&mut sender).await).await, 200);
+        assert_eq!(consume(post_stop(&mut sender).await).await, 200);
 
         // Status should show stopped
         let status = get_status(&mut sender).await;
@@ -396,17 +396,17 @@ fn reload_request_reloads_proxy() {
         let (mut sender, conn_handle) = http_connect(name).await;
 
         // Start first
-        drain(post_start(&mut sender, &sample_config()).await).await;
+        consume(post_start(&mut sender, &sample_config()).await).await;
 
         // Reload
-        assert_eq!(drain(post_reload(&mut sender, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_reload(&mut sender, &sample_config()).await).await, 200);
 
         // Should still be running after reload
         let status = get_status(&mut sender).await;
         assert!(status.running, "expected running=true after Reload");
 
         // Cleanup
-        drain(post_stop(&mut sender).await).await;
+        consume(post_stop(&mut sender).await).await;
 
         drop(sender);
         let _ = conn_handle.await;

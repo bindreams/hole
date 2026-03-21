@@ -9,6 +9,9 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use interprocess::local_socket::{tokio::Stream, traits::tokio::Stream as StreamTrait};
 use thiserror::Error;
+use tracing::debug;
+
+const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MiB
 
 // Errors =====
 
@@ -29,13 +32,14 @@ pub enum ClientError {
 /// IPC client that connects to the daemon's local socket and speaks HTTP/1.1.
 pub struct DaemonClient {
     sender: http1::SendRequest<Full<Bytes>>,
-    _conn_task: tokio::task::JoinHandle<()>,
+    /// Background task driving the HTTP/1.1 connection. Aborted on drop.
+    conn_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for DaemonClient {
     fn drop(&mut self) {
         // abort() is safe from any context — it sets a non-blocking cancellation flag.
-        self._conn_task.abort();
+        self.conn_task.abort();
     }
 }
 
@@ -71,12 +75,11 @@ impl DaemonClient {
             .await
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
         let conn_task = tokio::spawn(async move {
-            let _ = conn.await;
+            if let Err(e) = conn.await {
+                debug!(error = %e, "HTTP client connection ended");
+            }
         });
-        Ok(Self {
-            sender,
-            _conn_task: conn_task,
-        })
+        Ok(Self { sender, conn_task })
     }
 
     /// Send a request and wait for the response.
@@ -97,7 +100,7 @@ impl DaemonClient {
                         error: status.error,
                     })
                 } else {
-                    Ok(parse_error_response(resp).await)
+                    parse_daemon_error(resp).await
                 }
             }
             DaemonRequest::Start { config } => {
@@ -106,7 +109,7 @@ impl DaemonClient {
                 if resp.status().is_success() {
                     Ok(DaemonResponse::Ack)
                 } else {
-                    Ok(parse_error_response(resp).await)
+                    parse_daemon_error(resp).await
                 }
             }
             DaemonRequest::Stop => {
@@ -114,7 +117,7 @@ impl DaemonClient {
                 if resp.status().is_success() {
                     Ok(DaemonResponse::Ack)
                 } else {
-                    Ok(parse_error_response(resp).await)
+                    parse_daemon_error(resp).await
                 }
             }
             DaemonRequest::Reload { config } => {
@@ -123,7 +126,7 @@ impl DaemonClient {
                 if resp.status().is_success() {
                     Ok(DaemonResponse::Ack)
                 } else {
-                    Ok(parse_error_response(resp).await)
+                    parse_daemon_error(resp).await
                 }
             }
         }
@@ -147,14 +150,11 @@ impl DaemonClient {
         path: &str,
         body: Vec<u8>,
     ) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
-        let mut builder = http::Request::builder()
+        let req = http::Request::builder()
             .method("POST")
             .uri(path)
-            .header("host", "localhost");
-        if !body.is_empty() {
-            builder = builder.header("content-type", "application/json");
-        }
-        let req = builder
+            .header("host", "localhost")
+            .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
         self.sender
@@ -174,25 +174,36 @@ fn map_connect_error(e: std::io::Error) -> ClientError {
     }
 }
 
+/// Read the response body, enforcing a size limit.
 async fn read_body(resp: http::Response<hyper::body::Incoming>) -> Result<Bytes, ClientError> {
-    resp.into_body()
+    let limited = http_body_util::Limited::new(resp.into_body(), MAX_RESPONSE_SIZE);
+    limited
         .collect()
         .await
         .map(|c| c.to_bytes())
         .map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
-async fn parse_error_response(resp: http::Response<hyper::body::Incoming>) -> DaemonResponse {
-    match read_body(resp).await {
-        Ok(body) => {
-            let err: ErrorResponse = serde_json::from_slice(&body).unwrap_or(ErrorResponse {
-                message: "unknown error".to_string(),
-            });
-            DaemonResponse::Error { message: err.message }
+/// Map a non-success HTTP response to a `DaemonResponse::Error` (for 5xx)
+/// or a `ClientError::Protocol` (for unexpected status codes like 4xx).
+async fn parse_daemon_error(resp: http::Response<hyper::body::Incoming>) -> Result<DaemonResponse, ClientError> {
+    let status = resp.status();
+    if status.is_server_error() {
+        // 5xx — daemon returned an operational error
+        match read_body(resp).await {
+            Ok(body) => {
+                let err: ErrorResponse = serde_json::from_slice(&body).unwrap_or(ErrorResponse {
+                    message: "unknown error".to_string(),
+                });
+                Ok(DaemonResponse::Error { message: err.message })
+            }
+            Err(_) => Ok(DaemonResponse::Error {
+                message: "failed to read error response".to_string(),
+            }),
         }
-        Err(_) => DaemonResponse::Error {
-            message: "failed to read error response".to_string(),
-        },
+    } else {
+        // 4xx or other — unexpected, treat as protocol error
+        Err(ClientError::Protocol(format!("unexpected HTTP status: {status}")))
     }
 }
 

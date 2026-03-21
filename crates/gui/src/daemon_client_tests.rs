@@ -177,3 +177,132 @@ fn other_io_error_maps_to_connection() {
         "expected Connection, got: {client_err:?}"
     );
 }
+
+#[skuld::test]
+fn send_reload_receives_ack() {
+    rt().block_on(async {
+        let name = &test_socket_name("reload");
+        let _mock = spawn_mock_daemon(name).await;
+
+        let mut client = DaemonClient::connect(name).await.unwrap();
+        let resp = client
+            .send(DaemonRequest::Reload {
+                config: hole_common::protocol::ProxyConfig {
+                    server: hole_common::config::ServerEntry {
+                        id: "id".into(),
+                        name: "S".into(),
+                        server: "1.2.3.4".into(),
+                        server_port: 8388,
+                        method: "aes-256-gcm".into(),
+                        password: "pw".into(),
+                        plugin: None,
+                        plugin_opts: None,
+                    },
+                    local_port: 4073,
+                    plugin_path: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, DaemonResponse::Ack);
+    });
+}
+
+/// Spawn a mock daemon that returns 500 with an ErrorResponse for all POST routes.
+async fn spawn_error_daemon(name: &str) -> tokio::task::JoinHandle<()> {
+    use hole_common::protocol::ErrorResponse;
+    use interprocess::local_socket::{traits::tokio::Listener as ListenerTrait, ListenerOptions};
+
+    let listener = {
+        #[cfg(target_os = "windows")]
+        {
+            use interprocess::local_socket::{GenericNamespaced, ToNsName};
+            let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
+            ListenerOptions::new().name(ns_name).create_tokio().unwrap()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use interprocess::local_socket::{GenericFilePath, ToFsName};
+            let _ = std::fs::remove_file(name);
+            let fs_name = name.to_fs_name::<GenericFilePath>().unwrap();
+            ListenerOptions::new().name(fs_name).create_tokio().unwrap()
+        }
+    };
+
+    let router = axum::Router::new()
+        .route(
+            hole_common::protocol::ROUTE_STATUS,
+            axum::routing::get(|| async {
+                Json(StatusResponse {
+                    running: false,
+                    uptime_secs: 0,
+                    error: None,
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_START,
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        message: "mock start failure".to_string(),
+                    }),
+                )
+            }),
+        );
+
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                use tower::ServiceExt;
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await;
+    })
+}
+
+#[skuld::test]
+fn server_error_maps_to_daemon_response_error() {
+    rt().block_on(async {
+        let name = &test_socket_name("err500");
+        let _mock = spawn_error_daemon(name).await;
+
+        let mut client = DaemonClient::connect(name).await.unwrap();
+        let resp = client
+            .send(DaemonRequest::Start {
+                config: hole_common::protocol::ProxyConfig {
+                    server: hole_common::config::ServerEntry {
+                        id: "id".into(),
+                        name: "S".into(),
+                        server: "1.2.3.4".into(),
+                        server_port: 8388,
+                        method: "aes-256-gcm".into(),
+                        password: "pw".into(),
+                        plugin: None,
+                        plugin_opts: None,
+                    },
+                    local_port: 4073,
+                    plugin_path: None,
+                },
+            })
+            .await
+            .unwrap();
+        match resp {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("mock start failure"),
+                    "expected error message, got: {message}"
+                );
+            }
+            other => panic!("expected Error response, got {other:?}"),
+        }
+    });
+}
