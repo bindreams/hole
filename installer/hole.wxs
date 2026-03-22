@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <!--
-  WiX v4 installer for Hole.
+  WiX installer for Hole.
   Installs to [ProgramFilesFolder]\hole\bin\, registers the daemon service,
   and adds hole to the system PATH.
 
-  Build:   wix build installer\hole.wxs -o target\release\hole.msi
+  Build:   uv run scripts/build-installer.py
   Install: msiexec /i hole.msi
   Silent:  msiexec /i hole.msi /quiet
 -->
@@ -64,12 +64,6 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Feature: everything -->
-    <Feature Id="Complete" Level="1">
-      <ComponentGroupRef Id="BinaryComponents" />
-      <ComponentGroupRef Id="ShortcutComponents" />
-    </Feature>
-
     <!-- Custom actions: daemon install/uninstall + PATH add/remove -->
     <CustomAction
       Id="DaemonInstall"
@@ -105,20 +99,16 @@
 
     <InstallExecuteSequence>
       <!-- Post-install: daemon install then PATH add -->
-      <Custom Action="DaemonInstall" After="InstallFiles">
-        NOT Installed AND NOT REMOVE
-      </Custom>
-      <Custom Action="PathAdd" After="DaemonInstall">
-        NOT Installed AND NOT REMOVE
-      </Custom>
+      <Custom Action="DaemonInstall" After="InstallFiles"
+        Condition="NOT Installed AND NOT REMOVE" />
+      <Custom Action="PathAdd" After="DaemonInstall"
+        Condition="NOT Installed AND NOT REMOVE" />
 
       <!-- Pre-uninstall: PATH remove then daemon uninstall -->
-      <Custom Action="PathRemove" Before="RemoveFiles">
-        REMOVE="ALL"
-      </Custom>
-      <Custom Action="DaemonUninstall" After="PathRemove">
-        REMOVE="ALL"
-      </Custom>
+      <Custom Action="PathRemove" Before="RemoveFiles"
+        Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="DaemonUninstall" After="PathRemove"
+        Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
   </Package>
