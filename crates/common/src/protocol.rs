@@ -47,13 +47,19 @@ pub struct ProxyConfig {
 
 // Constants =====
 
-/// macOS: filesystem socket path (like Docker's /var/run/docker.sock).
-#[cfg(target_os = "macos")]
-pub const DAEMON_SOCKET_PATH: &str = "/var/run/hole-daemon.sock";
-
-/// Windows: namespaced pipe name for the daemon IPC channel.
-#[cfg(target_os = "windows")]
-pub const DAEMON_SOCKET_NAME: &str = "hole-daemon";
+/// Default daemon socket path.
+pub fn default_daemon_socket_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/var/run/hole-daemon.sock")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+            .join("hole")
+            .join("hole-daemon.sock")
+    }
+}
 
 /// Actionable instructions shown when a client is denied access to the daemon.
 /// Both platform instructions are always printed regardless of the current OS.

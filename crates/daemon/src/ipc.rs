@@ -1,6 +1,7 @@
-// IPC server — HTTP/1.1 REST API over local socket.
+// IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
 use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
+use crate::socket::LocalListener;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -9,8 +10,8 @@ use hole_common::protocol::{
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
-use interprocess::local_socket::{tokio::Listener, traits::tokio::Listener as ListenerTrait, ListenerOptions};
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -18,67 +19,42 @@ use tower::ServiceExt;
 use tracing::warn;
 use tracing::{debug, error, info};
 
-// Constants =====
-
-/// Re-export: socket name (Windows) or path (macOS).
-#[cfg(target_os = "windows")]
-pub use hole_common::protocol::DAEMON_SOCKET_NAME as SOCKET_NAME;
-#[cfg(target_os = "macos")]
-pub use hole_common::protocol::DAEMON_SOCKET_PATH as SOCKET_PATH;
-
 // Server =====
 
-/// HTTP/1.1 REST server over a local socket (Unix domain socket or named pipe).
+/// HTTP/1.1 REST server over a local Unix domain socket.
+///
+/// The socket file is removed when the server is dropped (best-effort cleanup).
+/// Stale socket files from previous runs are removed before binding.
 pub struct IpcServer {
-    listener: Listener,
+    listener: LocalListener,
     router: axum::Router,
+    socket_path: PathBuf,
 }
 
 impl IpcServer {
-    /// Bind to the IPC named pipe (Windows).
-    #[cfg(target_os = "windows")]
-    pub fn bind<B: ProxyBackend + 'static>(name: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+    /// Bind to the given Unix domain socket path.
+    ///
+    /// Removes any stale socket file, creates parent directories, binds,
+    /// and applies OS-level access control to the socket file.
+    pub fn bind<B: ProxyBackend + 'static>(path: &Path, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+        let listener = LocalListener::bind(path)?;
 
-        let ns_name = name
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        let opts = ListenerOptions::new().name(ns_name);
-        #[cfg(not(test))]
-        let opts = apply_security_descriptor(opts);
-        let listener = opts.create_tokio()?;
-
-        let router = build_router(proxy);
-        Ok(Self { listener, router })
-    }
-
-    /// Bind to the IPC Unix domain socket (macOS).
-    #[cfg(target_os = "macos")]
-    pub fn bind<B: ProxyBackend + 'static>(path: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
-        use interprocess::local_socket::{GenericFilePath, ToFsName};
-
-        // Remove stale socket (standard practice, same as Docker)
-        let _ = std::fs::remove_file(path);
-
-        let fs_name = path
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let listener = ListenerOptions::new().name(fs_name).create_tokio()?;
-
-        // Set socket ownership and permissions post-bind
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
         let router = build_router(proxy);
-        Ok(Self { listener, router })
+        Ok(Self {
+            listener,
+            router,
+            socket_path: path.to_owned(),
+        })
     }
 
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
         let stream = self.listener.accept().await?;
-        serve_connection(TokioIo::new(stream), self.router)
+        serve_connection(TokioIo::new(stream), self.router.clone())
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
@@ -113,6 +89,12 @@ impl IpcServer {
                 }
             }
         }
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
@@ -202,23 +184,79 @@ async fn handle_reload<B: ProxyBackend + 'static>(
 
 // Security =====
 
-/// Apply a Windows DACL to the named pipe, restricting access to SYSTEM,
-/// Administrators, and the `hole` group.
+/// Apply OS-level access control to the socket file.
+///
+/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
+/// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(all(target_os = "windows", not(test)))]
-fn apply_security_descriptor(opts: ListenerOptions<'_>) -> ListenerOptions<'_> {
-    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+fn apply_socket_permissions(path: &Path) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::LocalFree;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 
     let sddl = build_sddl();
-    match security_descriptor_from_sddl(&sddl) {
-        Ok(sd) => opts.security_descriptor(sd),
-        Err(e) => {
-            warn!("failed to set pipe security descriptor: {e}");
-            opts
+    let sddl_wide = HSTRING::from(&sddl);
+    let path_wide = HSTRING::from(path.as_os_str());
+
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let result = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &sddl_wide, 1, // SDDL_REVISION_1
+            &mut sd, None,
+        )
+    };
+
+    if let Err(e) = result {
+        warn!("failed to parse SDDL for socket permissions: {e}");
+        return;
+    }
+
+    // Extract DACL from the security descriptor
+    let mut dacl_present = false.into();
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = false.into();
+    let result = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
+
+    if let Err(e) = result {
+        warn!("failed to extract DACL from security descriptor: {e}");
+        unsafe {
+            let _ = LocalFree(Some(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                windows::Win32::Foundation::HLOCAL,
+            >(sd.0)));
         }
+        return;
+    }
+
+    // Apply DACL to the socket file
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            &path_wide,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl.cast()),
+            None,
+        )
+    };
+
+    if err.is_err() {
+        warn!("failed to set socket file ACL: {err:?}");
+    }
+
+    unsafe {
+        let _ = LocalFree(Some(std::mem::transmute::<
+            *mut std::ffi::c_void,
+            windows::Win32::Foundation::HLOCAL,
+        >(sd.0)));
     }
 }
 
-/// Build the SDDL string for the named pipe DACL.
+/// Build the SDDL string for the socket file DACL.
 #[cfg(all(target_os = "windows", not(test)))]
 fn build_sddl() -> String {
     // Base: SYSTEM + Administrators
@@ -236,25 +274,20 @@ fn build_sddl() -> String {
     }
 }
 
-/// Parse an SDDL string into a SecurityDescriptor.
-#[cfg(all(target_os = "windows", not(test)))]
-fn security_descriptor_from_sddl(
-    sddl: &str,
-) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
-    use widestring::U16CString;
-
-    let wide = U16CString::from_str(sddl).map_err(|e| std::io::Error::other(format!("invalid SDDL string: {e}")))?;
-    SecurityDescriptor::deserialize(&wide)
-        .map_err(|e| std::io::Error::other(format!("failed to deserialize SDDL: {e}")))
-}
-
 /// Set socket file ownership to root:hole and mode 0660 on macOS.
 #[cfg(all(target_os = "macos", not(test)))]
-fn apply_socket_permissions(path: &str) {
+fn apply_socket_permissions(path: &Path) {
     use std::ffi::CString;
 
-    let c_path = match CString::new(path) {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => {
+            warn!("socket path is not valid UTF-8");
+            return;
+        }
+    };
+
+    let c_path = match CString::new(path_str) {
         Ok(p) => p,
         Err(e) => {
             warn!("invalid socket path for permissions: {e}");

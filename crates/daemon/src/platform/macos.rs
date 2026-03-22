@@ -143,7 +143,7 @@ pub fn is_running() -> bool {
 }
 
 /// Run the daemon directly (called by launchd).
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(socket_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
@@ -151,7 +151,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        let server = crate::ipc::IpcServer::bind(crate::ipc::SOCKET_PATH, proxy)?;
+        let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
 
         tokio::select! {
             result = server.run() => {

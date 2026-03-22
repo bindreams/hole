@@ -196,11 +196,8 @@ pub fn uninstall_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
     hole_daemon::platform::os::uninstall()?;
 
-    // Remove macOS socket file
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::fs::remove_file(hole_common::protocol::DAEMON_SOCKET_PATH);
-    }
+    // Remove socket file
+    let _ = std::fs::remove_file(hole_common::protocol::default_daemon_socket_path());
 
     // Best-effort: remove the access group
     let _ = hole_daemon::group::delete_group();
@@ -303,14 +300,11 @@ async fn poll_daemon_ipc() -> bool {
     use crate::daemon_client::DaemonClient;
     use hole_common::protocol::DaemonRequest;
 
+    let socket_path = hole_common::protocol::default_daemon_socket_path();
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        #[cfg(target_os = "windows")]
-        let socket_id = hole_daemon::ipc::SOCKET_NAME;
-        #[cfg(target_os = "macos")]
-        let socket_id = hole_daemon::ipc::SOCKET_PATH;
 
-        if let Ok(mut client) = DaemonClient::connect(socket_id).await {
+        if let Ok(mut client) = DaemonClient::connect(&socket_path).await {
             if client.send(DaemonRequest::Status).await.is_ok() {
                 return true;
             }

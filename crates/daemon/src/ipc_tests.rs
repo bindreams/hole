@@ -1,14 +1,15 @@
 use super::*;
 use crate::proxy::ProxyError;
 use crate::proxy_manager::{ProxyBackend, ProxyManager};
+use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use interprocess::local_socket::traits::tokio::Stream as StreamTrait;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
@@ -90,45 +91,19 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-/// Generate a test socket name. On macOS, returns a temp file path.
-#[cfg(target_os = "windows")]
-fn test_socket_name(suffix: &str) -> String {
-    format!("hole-test-{suffix}")
-}
-
-#[cfg(target_os = "macos")]
-fn test_socket_name(suffix: &str) -> String {
-    format!("/tmp/hole-test-{suffix}.sock")
+fn test_socket_path(suffix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("hole-ipc-test-{}-{suffix}.sock", std::process::id()))
 }
 
 /// Connect to a test IPC server and perform HTTP/1.1 handshake.
-async fn http_connect(name: &str) -> (http1::SendRequest<Full<Bytes>>, tokio::task::JoinHandle<()>) {
-    let stream = connect_raw(name).await;
+async fn http_connect(path: &Path) -> (http1::SendRequest<Full<Bytes>>, tokio::task::JoinHandle<()>) {
+    let stream = LocalStream::connect(path).await.unwrap();
     let io = TokioIo::new(stream);
     let (sender, conn) = http1::handshake(io).await.unwrap();
     let handle = tokio::spawn(async move {
         let _ = conn.await;
     });
     (sender, handle)
-}
-
-async fn connect_raw(name: &str) -> interprocess::local_socket::tokio::Stream {
-    #[cfg(target_os = "windows")]
-    {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
-        let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
-        interprocess::local_socket::tokio::Stream::connect(ns_name)
-            .await
-            .unwrap()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use interprocess::local_socket::{GenericFilePath, ToFsName};
-        let fs_name = name.to_fs_name::<GenericFilePath>().unwrap();
-        interprocess::local_socket::tokio::Stream::connect(fs_name)
-            .await
-            .unwrap()
-    }
 }
 
 async fn get_status(sender: &mut http1::SendRequest<Full<Bytes>>) -> StatusResponse {
@@ -196,12 +171,12 @@ async fn post_reload(
 #[skuld::test]
 fn server_accepts_connection() {
     rt().block_on(async {
-        let name = &test_socket_name("accept");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("accept");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
-        let stream = connect_raw(name).await;
+        let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
         let _ = handle.await;
     });
@@ -210,13 +185,13 @@ fn server_accepts_connection() {
 #[skuld::test]
 fn status_when_not_running_returns_false() {
     rt().block_on(async {
-        let name = &test_socket_name("status");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("status");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
         let status = get_status(&mut sender).await;
 
         assert_eq!(
@@ -236,13 +211,13 @@ fn status_when_not_running_returns_false() {
 #[skuld::test]
 fn multiple_requests_on_same_connection() {
     rt().block_on(async {
-        let name = &test_socket_name("multi");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("multi");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
         let s1 = get_status(&mut sender).await;
         assert!(!s1.running);
 
@@ -258,13 +233,13 @@ fn multiple_requests_on_same_connection() {
 #[skuld::test]
 fn invalid_request_returns_error_response() {
     rt().block_on(async {
-        let name = &test_socket_name("invalid");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("invalid");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
 
         // Send garbage body to start endpoint
         let req = http::Request::builder()
@@ -286,13 +261,13 @@ fn invalid_request_returns_error_response() {
 #[skuld::test]
 fn server_handles_client_disconnect() {
     rt().block_on(async {
-        let name = &test_socket_name("disconnect");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("disconnect");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let stream = connect_raw(name).await;
+        let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
 
         handle.await.unwrap();
@@ -302,14 +277,14 @@ fn server_handles_client_disconnect() {
 #[skuld::test]
 fn start_request_starts_proxy() {
     rt().block_on(async {
-        let name = &test_socket_name("start");
+        let path = test_socket_path("start");
         let pm = mock_proxy();
-        let server = IpcServer::bind(name, pm).unwrap();
+        let server = IpcServer::bind(&path, pm).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
 
         // Start
         assert_eq!(consume(post_start(&mut sender, &sample_config()).await).await, 200);
@@ -330,14 +305,14 @@ fn start_request_starts_proxy() {
 #[skuld::test]
 fn stop_request_stops_proxy() {
     rt().block_on(async {
-        let name = &test_socket_name("stop");
+        let path = test_socket_path("stop");
         let pm = mock_proxy();
-        let server = IpcServer::bind(name, pm).unwrap();
+        let server = IpcServer::bind(&path, pm).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
 
         // Start
         consume(post_start(&mut sender, &sample_config()).await).await;
@@ -358,14 +333,14 @@ fn stop_request_stops_proxy() {
 #[skuld::test]
 fn start_failure_returns_error() {
     rt().block_on(async {
-        let name = &test_socket_name("start-fail");
+        let path = test_socket_path("start-fail");
         let pm = failing_proxy();
-        let server = IpcServer::bind(name, pm).unwrap();
+        let server = IpcServer::bind(&path, pm).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
         let resp = post_start(&mut sender, &sample_config()).await;
 
         assert_eq!(resp.status(), 500);
@@ -386,14 +361,14 @@ fn start_failure_returns_error() {
 #[skuld::test]
 fn reload_request_reloads_proxy() {
     rt().block_on(async {
-        let name = &test_socket_name("reload");
+        let path = test_socket_path("reload");
         let pm = mock_proxy();
-        let server = IpcServer::bind(name, pm).unwrap();
+        let server = IpcServer::bind(&path, pm).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
 
         // Start first
         consume(post_start(&mut sender, &sample_config()).await).await;
@@ -417,14 +392,14 @@ fn reload_request_reloads_proxy() {
 #[skuld::test]
 fn run_cancellation_aborts_connection_handlers() {
     rt().block_on(async {
-        let name = &test_socket_name("run-cancel");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("run-cancel");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run().await.unwrap();
         });
 
         // Connect a client so there's an active connection handler task
-        let (mut sender, _conn_handle) = http_connect(name).await;
+        let (mut sender, _conn_handle) = http_connect(&path).await;
         let status = get_status(&mut sender).await;
         assert!(!status.running);
 
@@ -434,8 +409,9 @@ fn run_cancellation_aborts_connection_handlers() {
 
         // The connection handler should have been aborted by JoinSet::drop.
         // A subsequent request should fail — not block forever.
+        // Allow up to 3 seconds for the non-blocking accept poll loop to yield.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(3),
             sender.send_request(
                 http::Request::builder()
                     .method("GET")
@@ -457,13 +433,13 @@ fn run_cancellation_aborts_connection_handlers() {
 #[skuld::test]
 fn unknown_route_returns_404() {
     rt().block_on(async {
-        let name = &test_socket_name("404");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("404");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
         let req = http::Request::builder()
             .method("GET")
             .uri("/v1/nonexistent")
@@ -482,13 +458,13 @@ fn unknown_route_returns_404() {
 #[skuld::test]
 fn wrong_method_returns_405() {
     rt().block_on(async {
-        let name = &test_socket_name("405");
-        let server = IpcServer::bind(name, mock_proxy()).unwrap();
+        let path = test_socket_path("405");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(name).await;
+        let (mut sender, conn_handle) = http_connect(&path).await;
         let req = http::Request::builder()
             .method("POST")
             .uri(ROUTE_STATUS)
@@ -501,5 +477,38 @@ fn wrong_method_returns_405() {
         drop(sender);
         let _ = conn_handle.await;
         let _ = handle.await;
+    });
+}
+
+// Socket lifecycle tests =====
+
+#[skuld::test]
+fn socket_recreated_on_bind() {
+    rt().block_on(async {
+        let path = test_socket_path("recreate");
+
+        // First bind
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        assert!(path.exists(), "socket file should exist after bind");
+        drop(server); // Drop removes the file
+        assert!(!path.exists(), "socket file should be removed after drop");
+
+        // Second bind (recreates the socket)
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        assert!(path.exists(), "socket file should exist after second bind");
+        drop(server);
+    });
+}
+
+#[skuld::test]
+fn socket_removed_on_drop() {
+    rt().block_on(async {
+        let path = test_socket_path("drop-cleanup");
+
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        assert!(path.exists(), "socket file should exist after bind");
+
+        drop(server);
+        assert!(!path.exists(), "socket file should be removed after drop");
     });
 }

@@ -6,6 +6,7 @@ pub mod platform;
 pub mod proxy;
 pub mod proxy_manager;
 pub mod routing;
+pub mod socket;
 
 #[cfg(test)]
 fn main() {

@@ -1,4 +1,4 @@
-// IPC client to hole-daemon — HTTP/1.1 over local socket.
+// IPC client to hole-daemon — HTTP/1.1 over local Unix domain socket.
 
 use bytes::Bytes;
 use hole_common::protocol::{
@@ -7,7 +7,7 @@ use hole_common::protocol::{
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use interprocess::local_socket::{tokio::Stream, traits::tokio::Stream as StreamTrait};
+use std::path::Path;
 use thiserror::Error;
 use tracing::debug;
 
@@ -44,32 +44,19 @@ impl Drop for DaemonClient {
 }
 
 impl DaemonClient {
-    /// Connect to the daemon at the given socket name (Windows) or path (macOS).
-    #[cfg(target_os = "windows")]
-    pub async fn connect(name: &str) -> Result<Self, ClientError> {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
-
-        let ns_name = name
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|e| ClientError::Connection(std::io::Error::other(e.to_string())))?;
-        let stream = Stream::connect(ns_name).await.map_err(map_connect_error)?;
+    /// Connect to the daemon at the given Unix domain socket path.
+    pub async fn connect(path: &Path) -> Result<Self, ClientError> {
+        let stream = hole_daemon::socket::LocalStream::connect(path)
+            .await
+            .map_err(map_connect_error)?;
         Self::handshake(stream).await
     }
 
-    /// Connect to the daemon at the given socket path.
-    #[cfg(target_os = "macos")]
-    pub async fn connect(path: &str) -> Result<Self, ClientError> {
-        use interprocess::local_socket::{GenericFilePath, ToFsName};
-
-        let fs_name = path
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|e| ClientError::Connection(std::io::Error::other(e.to_string())))?;
-        let stream = Stream::connect(fs_name).await.map_err(map_connect_error)?;
-        Self::handshake(stream).await
-    }
-
-    /// Perform HTTP/1.1 handshake over the connected stream.
-    async fn handshake(stream: Stream) -> Result<Self, ClientError> {
+    /// Perform HTTP/1.1 handshake over a connected stream.
+    async fn handshake<S>(stream: S) -> Result<Self, ClientError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let io = TokioIo::new(stream);
         let (sender, conn) = http1::handshake(io)
             .await
