@@ -8,8 +8,8 @@ pub enum Error {
     #[error("WiX extraction failed: {0}")]
     ExtractionFailed(String),
 
-    #[error("WiX build failed (exit code {code}): {stderr}")]
-    BuildFailed { code: i32, stderr: String },
+    #[error("WiX build failed (exit code {code})")]
+    BuildFailed { code: i32 },
 
     #[error("hook failed: `{command}` exited with code {code}")]
     HookFailed { command: String, code: i32 },

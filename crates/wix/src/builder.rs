@@ -140,16 +140,14 @@ impl Builder {
                 .join(" ")
         );
 
-        let result = std::process::Command::new(&wix_exe)
+        let status = std::process::Command::new(&wix_exe)
             .args(&args)
             .current_dir(&self.workspace_root)
-            .output()?;
+            .status()?;
 
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        if !status.success() {
             return Err(Error::BuildFailed {
-                code: result.status.code().unwrap_or(-1),
-                stderr,
+                code: status.code().unwrap_or(-1),
             });
         }
 
