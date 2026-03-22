@@ -54,10 +54,10 @@ cargo test --workspace           # all tests
 
 ### Windows installer
 
-```powershell
-.\scripts\build-installer.ps1    # builds hole.msi in target\release\
-msiexec /i target\release\hole.msi          # interactive install
-msiexec /i target\release\hole.msi /quiet   # unattended install
+```sh
+uv run scripts/build-installer.py            # builds hole.msi in target\release\
+msiexec /i target\release\hole.msi           # interactive install
+msiexec /i target\release\hole.msi /quiet    # unattended install
 ```
 
 ### macOS DMG
