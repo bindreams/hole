@@ -10,6 +10,10 @@ pub mod update;
 pub mod version;
 
 #[cfg(test)]
+#[path = "installer_tests.rs"]
+mod installer_tests;
+
+#[cfg(test)]
 fn main() {
     skuld::run_all();
 }
