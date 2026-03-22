@@ -32,7 +32,11 @@ enum Command {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon (invoked by the service manager)
-    Run,
+    Run {
+        /// Override the IPC socket path (for development/testing)
+        #[arg(long)]
+        socket_path: Option<std::path::PathBuf>,
+    },
     /// Install and start the daemon service
     Install,
     /// Stop and remove the daemon service
@@ -146,12 +150,13 @@ fn handle_upgrade() -> i32 {
 
 fn handle_daemon(action: DaemonAction) -> i32 {
     match action {
-        DaemonAction::Run => {
+        DaemonAction::Run { socket_path } => {
             let _guard = hole_daemon::logging::init();
             tracing::info!("hole daemon starting");
             hole_daemon::routing::teardown_split_routes().ok();
 
-            if let Err(e) = hole_daemon::platform::os::run() {
+            let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
+            if let Err(e) = hole_daemon::platform::os::run(&socket_path) {
                 eprintln!("daemon error: {e}");
                 return 1;
             }
@@ -330,12 +335,9 @@ fn handle_ipc_send(base64_request: &str) -> i32 {
     // Connect and send
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        #[cfg(target_os = "windows")]
-        let socket_id = hole_common::protocol::DAEMON_SOCKET_NAME;
-        #[cfg(target_os = "macos")]
-        let socket_id = hole_common::protocol::DAEMON_SOCKET_PATH;
+        let socket_path = hole_common::protocol::default_daemon_socket_path();
 
-        let mut client = match crate::daemon_client::DaemonClient::connect(socket_id).await {
+        let mut client = match crate::daemon_client::DaemonClient::connect(&socket_path).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("failed to connect to daemon: {e}");

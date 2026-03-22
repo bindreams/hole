@@ -12,7 +12,6 @@ hole-common = { path = "../common" }
 shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http"] }
 shadowsocks = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
-interprocess = { version = "2", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -21,6 +20,14 @@ tracing-appender = "0.2"
 thiserror = "2"
 default-net = "0.22"
 tokio-util = "0.7"
+socket2 = "0.5"
+axum = { version = "0.8", default-features = false, features = ["json"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -33,7 +40,6 @@ windows = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_System_RemoteDesktop",
 ] }
-widestring = "1"
 
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }

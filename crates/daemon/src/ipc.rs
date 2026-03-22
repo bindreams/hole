@@ -1,82 +1,61 @@
-// IPC server — local socket listener + request handling.
+// IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
 use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
-use interprocess::local_socket::{
-    tokio::{Listener, Stream},
-    traits::tokio::Listener as ListenerTrait,
-    ListenerOptions,
+use crate::socket::LocalListener;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use hole_common::protocol::{
+    EmptyResponse, ErrorResponse, ProxyConfig, StatusResponse, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
 };
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
-
-// Constants =====
-
-const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1 MiB
-
-/// Re-export: socket name (Windows) or path (macOS).
-#[cfg(target_os = "windows")]
-pub use hole_common::protocol::DAEMON_SOCKET_NAME as SOCKET_NAME;
-#[cfg(target_os = "macos")]
-pub use hole_common::protocol::DAEMON_SOCKET_PATH as SOCKET_PATH;
+use tower::ServiceExt;
+#[allow(unused_imports)]
+use tracing::warn;
+use tracing::{debug, error, info};
 
 // Server =====
 
-pub struct IpcServer<B: ProxyBackend> {
-    listener: Listener,
-    proxy: Arc<Mutex<ProxyManager<B>>>,
+/// HTTP/1.1 REST server over a local Unix domain socket.
+///
+/// The socket file is removed when the server is dropped (best-effort cleanup).
+/// Stale socket files from previous runs are removed before binding.
+pub struct IpcServer {
+    listener: LocalListener,
+    router: axum::Router,
+    socket_path: PathBuf,
 }
 
-impl<B: ProxyBackend + 'static> IpcServer<B> {
-    /// Bind to the IPC socket/pipe.
+impl IpcServer {
+    /// Bind to the given Unix domain socket path.
     ///
-    /// On macOS: filesystem Unix domain socket at `path`.
-    /// On Windows: namespaced named pipe with `name`.
-    #[cfg(target_os = "windows")]
-    pub fn bind(name: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+    /// Removes any stale socket file, creates parent directories, binds,
+    /// and applies OS-level access control to the socket file.
+    pub fn bind<B: ProxyBackend + 'static>(path: &Path, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+        let listener = LocalListener::bind(path)?;
 
-        let ns_name = name
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        let opts = ListenerOptions::new().name(ns_name);
-        #[cfg(not(test))]
-        let opts = apply_security_descriptor(opts);
-        let listener = opts.create_tokio()?;
-
-        Ok(Self { listener, proxy })
-    }
-
-    /// Bind to the IPC socket.
-    ///
-    /// Uses a filesystem Unix domain socket. Removes stale socket file before binding.
-    #[cfg(target_os = "macos")]
-    pub fn bind(path: &str, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
-        use interprocess::local_socket::{GenericFilePath, ToFsName};
-
-        // Remove stale socket (standard practice, same as Docker)
-        let _ = std::fs::remove_file(path);
-
-        let fs_name = path
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let listener = ListenerOptions::new().name(fs_name).create_tokio()?;
-
-        // Set socket ownership and permissions post-bind
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
-        Ok(Self { listener, proxy })
+        let router = build_router(proxy);
+        Ok(Self {
+            listener,
+            router,
+            socket_path: path.to_owned(),
+        })
     }
 
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
         let stream = self.listener.accept().await?;
-        handle_connection(stream, self.proxy).await;
+        // Connection errors (client disconnect, shutdown) are non-fatal.
+        let _ = serve_connection(TokioIo::new(stream), self.router.clone()).await;
         Ok(())
     }
 
@@ -96,9 +75,11 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
             match self.listener.accept().await {
                 Ok(stream) => {
                     info!("IPC client connected");
-                    let proxy = Arc::clone(&self.proxy);
+                    let router = self.router.clone();
                     tasks.spawn(async move {
-                        handle_connection(stream, proxy).await;
+                        if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
+                            debug!(error = %e, "HTTP connection ended");
+                        }
                         info!("IPC client disconnected");
                     });
                 }
@@ -110,137 +91,171 @@ impl<B: ProxyBackend + 'static> IpcServer<B> {
     }
 }
 
-// Connection handler =====
-
-async fn handle_connection<B: ProxyBackend>(mut stream: Stream, proxy: Arc<Mutex<ProxyManager<B>>>) {
-    loop {
-        // Read length prefix
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("client disconnected (EOF)");
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "error reading from client");
-                return;
-            }
-        }
-
-        let msg_len = u32::from_be_bytes(len_buf);
-        if msg_len > MAX_MESSAGE_SIZE {
-            warn!(msg_len, "message too large, dropping connection");
-            let _ = send_error(&mut stream, "message too large").await;
-            return;
-        }
-
-        // Read body
-        let mut body = vec![0u8; msg_len as usize];
-        if let Err(e) = stream.read_exact(&mut body).await {
-            warn!(error = %e, "error reading message body");
-            return;
-        }
-
-        // Parse request
-        let response = match serde_json::from_slice::<DaemonRequest>(&body) {
-            Ok(req) => {
-                debug!(?req, "received request");
-                dispatch(req, &proxy).await
-            }
-            Err(e) => {
-                warn!(error = %e, "invalid request");
-                DaemonResponse::Error {
-                    message: format!("invalid request: {e}"),
-                }
-            }
-        };
-
-        // Send response
-        if let Err(e) = send_response(&mut stream, &response).await {
-            warn!(error = %e, "error sending response");
-            return;
-        }
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
-async fn dispatch<B: ProxyBackend>(req: DaemonRequest, proxy: &Mutex<ProxyManager<B>>) -> DaemonResponse {
-    match req {
-        DaemonRequest::Status => {
-            let mut pm = proxy.lock().await;
-            pm.check_health();
-            let running = pm.state() == ProxyState::Running;
-            let uptime_secs = pm.uptime_secs();
-            let error = pm.last_error().map(|s| s.to_string());
-            DaemonResponse::Status {
-                running,
-                uptime_secs,
-                error,
-            }
+/// Serve HTTP/1.1 on a single connection using the given axum router.
+async fn serve_connection<I>(io: TokioIo<I>, router: axum::Router) -> Result<(), hyper::Error>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+        let router = router.clone();
+        async move {
+            let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+            Ok::<_, Infallible>(resp)
         }
-        DaemonRequest::Start { config } => {
-            let mut pm = proxy.lock().await;
-            match pm.start(&config).await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
-        DaemonRequest::Stop => {
-            let mut pm = proxy.lock().await;
-            match pm.stop().await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
-        DaemonRequest::Reload { config } => {
-            let mut pm = proxy.lock().await;
-            match pm.reload(&config).await {
-                Ok(()) => DaemonResponse::Ack,
-                Err(e) => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
+    });
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+}
+
+// Router =====
+
+fn build_router<B: ProxyBackend + 'static>(proxy: Arc<Mutex<ProxyManager<B>>>) -> axum::Router {
+    axum::Router::new()
+        .route(ROUTE_STATUS, axum::routing::get(handle_status::<B>))
+        .route(ROUTE_START, axum::routing::post(handle_start::<B>))
+        .route(ROUTE_STOP, axum::routing::post(handle_stop::<B>))
+        .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<B>))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .with_state(proxy)
+}
+
+// Handlers =====
+
+async fn handle_status<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+) -> Json<StatusResponse> {
+    let mut pm = proxy.lock().await;
+    pm.check_health();
+    Json(StatusResponse {
+        running: pm.state() == ProxyState::Running,
+        uptime_secs: pm.uptime_secs(),
+        error: pm.last_error().map(|s| s.to_string()),
+    })
+}
+
+async fn handle_start<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    Json(config): Json<ProxyConfig>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.start(&config).await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
     }
 }
 
-// Wire helpers =====
-
-async fn send_response(stream: &mut Stream, resp: &DaemonResponse) -> std::io::Result<()> {
-    let json = serde_json::to_vec(resp).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let len = (json.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&json).await?;
-    Ok(())
+async fn handle_stop<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.stop().await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
+    }
 }
 
-async fn send_error(stream: &mut Stream, message: &str) -> std::io::Result<()> {
-    send_response(
-        stream,
-        &DaemonResponse::Error {
-            message: message.to_string(),
-        },
-    )
-    .await
+async fn handle_reload<B: ProxyBackend + 'static>(
+    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    Json(config): Json<ProxyConfig>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = proxy.lock().await;
+    match pm.reload(&config).await {
+        Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { message: e.to_string() }),
+        )),
+    }
 }
 
 // Security =====
 
-/// Apply a Windows DACL to the named pipe, restricting access to SYSTEM,
-/// Administrators, and the `hole` group.
+/// Apply OS-level access control to the socket file.
+///
+/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
+/// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(all(target_os = "windows", not(test)))]
-fn apply_security_descriptor(opts: ListenerOptions<'_>) -> ListenerOptions<'_> {
-    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+fn apply_socket_permissions(path: &Path) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::LocalFree;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 
     let sddl = build_sddl();
-    match security_descriptor_from_sddl(&sddl) {
-        Ok(sd) => opts.security_descriptor(sd),
-        Err(e) => {
-            warn!("failed to set pipe security descriptor: {e}");
-            opts
+    let sddl_wide = HSTRING::from(&sddl);
+    let path_wide = HSTRING::from(path.as_os_str());
+
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let result = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &sddl_wide, 1, // SDDL_REVISION_1
+            &mut sd, None,
+        )
+    };
+
+    if let Err(e) = result {
+        warn!("failed to parse SDDL for socket permissions: {e}");
+        return;
+    }
+
+    // Extract DACL from the security descriptor
+    let mut dacl_present = false.into();
+    let mut dacl = std::ptr::null_mut();
+    let mut dacl_defaulted = false.into();
+    let result = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
+
+    if let Err(e) = result {
+        warn!("failed to extract DACL from security descriptor: {e}");
+        unsafe {
+            let _ = LocalFree(Some(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                windows::Win32::Foundation::HLOCAL,
+            >(sd.0)));
         }
+        return;
+    }
+
+    // Apply DACL to the socket file
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            &path_wide,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl.cast()),
+            None,
+        )
+    };
+
+    if err.is_err() {
+        warn!("failed to set socket file ACL: {err:?}");
+    }
+
+    unsafe {
+        let _ = LocalFree(Some(std::mem::transmute::<
+            *mut std::ffi::c_void,
+            windows::Win32::Foundation::HLOCAL,
+        >(sd.0)));
     }
 }
 
-/// Build the SDDL string for the named pipe DACL.
+/// Build the SDDL string for the socket file DACL.
 #[cfg(all(target_os = "windows", not(test)))]
 fn build_sddl() -> String {
     // Base: SYSTEM + Administrators
@@ -258,25 +273,20 @@ fn build_sddl() -> String {
     }
 }
 
-/// Parse an SDDL string into a SecurityDescriptor.
-#[cfg(all(target_os = "windows", not(test)))]
-fn security_descriptor_from_sddl(
-    sddl: &str,
-) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
-    use widestring::U16CString;
-
-    let wide = U16CString::from_str(sddl).map_err(|e| std::io::Error::other(format!("invalid SDDL string: {e}")))?;
-    SecurityDescriptor::deserialize(&wide)
-        .map_err(|e| std::io::Error::other(format!("failed to deserialize SDDL: {e}")))
-}
-
 /// Set socket file ownership to root:hole and mode 0660 on macOS.
 #[cfg(all(target_os = "macos", not(test)))]
-fn apply_socket_permissions(path: &str) {
+fn apply_socket_permissions(path: &Path) {
     use std::ffi::CString;
 
-    let c_path = match CString::new(path) {
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => {
+            warn!("socket path is not valid UTF-8");
+            return;
+        }
+    };
+
+    let c_path = match CString::new(path_str) {
         Ok(p) => p,
         Err(e) => {
             warn!("invalid socket path for permissions: {e}");

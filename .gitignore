@@ -13,3 +13,6 @@ crates/gui/gen/
 # Claude Code
 CLAUDE.local.md
 .claude/*.local.*
+
+# Python
+__pycache__/

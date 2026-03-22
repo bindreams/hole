@@ -1,5 +1,8 @@
 use super::*;
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
+use axum::Json;
+use hole_common::protocol::{DaemonRequest, DaemonResponse, EmptyResponse, StatusResponse};
+use hyper::body::Incoming;
+use std::path::PathBuf;
 
 // Helpers =====
 
@@ -7,68 +10,52 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
-/// Generate a test socket name. On macOS, returns a temp file path.
-#[cfg(target_os = "windows")]
-fn test_socket_name(suffix: &str) -> String {
-    format!("hole-gui-test-{suffix}")
+fn test_socket_path(suffix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("hole-gui-test-{}-{suffix}.sock", std::process::id()))
 }
 
-#[cfg(target_os = "macos")]
-fn test_socket_name(suffix: &str) -> String {
-    format!("/tmp/hole-gui-test-{suffix}.sock")
-}
+/// Spawn a mock HTTP daemon that responds to requests with canned responses.
+async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    let listener = hole_daemon::socket::LocalListener::bind(path).unwrap();
 
-/// Spawn a mock daemon that responds to one connection with canned responses.
-async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
-    use interprocess::local_socket::{traits::tokio::Listener as ListenerTrait, ListenerOptions};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = {
-        #[cfg(target_os = "windows")]
-        {
-            use interprocess::local_socket::{GenericNamespaced, ToNsName};
-            let ns_name = name.to_ns_name::<GenericNamespaced>().unwrap();
-            ListenerOptions::new().name(ns_name).create_tokio().unwrap()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use interprocess::local_socket::{GenericFilePath, ToFsName};
-            let _ = std::fs::remove_file(name);
-            let fs_name = name.to_fs_name::<GenericFilePath>().unwrap();
-            ListenerOptions::new().name(fs_name).create_tokio().unwrap()
-        }
-    };
-
-    tokio::spawn(async move {
-        let mut stream = listener.accept().await.unwrap();
-        loop {
-            // Read length prefix
-            let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(_) => return, // client disconnected
-            }
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-            let mut body = vec![0u8; msg_len];
-            stream.read_exact(&mut body).await.unwrap();
-
-            let req: DaemonRequest = serde_json::from_slice(&body).unwrap();
-            let resp = match req {
-                DaemonRequest::Status => DaemonResponse::Status {
+    let router = axum::Router::new()
+        .route(
+            hole_common::protocol::ROUTE_STATUS,
+            axum::routing::get(|| async {
+                Json(StatusResponse {
                     running: false,
                     uptime_secs: 0,
                     error: None,
-                },
-                DaemonRequest::Start { .. } => DaemonResponse::Ack,
-                DaemonRequest::Stop => DaemonResponse::Ack,
-                DaemonRequest::Reload { .. } => DaemonResponse::Ack,
-            };
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_START,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_STOP,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_RELOAD,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        );
 
-            let resp_json = serde_json::to_vec(&resp).unwrap();
-            let resp_len = (resp_json.len() as u32).to_be_bytes();
-            stream.write_all(&resp_len).await.unwrap();
-            stream.write_all(&resp_json).await.unwrap();
-        }
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                use tower::ServiceExt;
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await;
     })
 }
 
@@ -77,10 +64,10 @@ async fn spawn_mock_daemon(name: &str) -> tokio::task::JoinHandle<()> {
 #[skuld::test]
 fn send_status_request_receives_response() {
     rt().block_on(async {
-        let name = &test_socket_name("status");
-        let _mock = spawn_mock_daemon(name).await;
+        let path = test_socket_path("status");
+        let _mock = spawn_mock_daemon(&path).await;
 
-        let mut client = DaemonClient::connect(name).await.unwrap();
+        let mut client = DaemonClient::connect(&path).await.unwrap();
         let resp = client.send(DaemonRequest::Status).await.unwrap();
 
         assert_eq!(
@@ -97,10 +84,10 @@ fn send_status_request_receives_response() {
 #[skuld::test]
 fn send_start_receives_ack() {
     rt().block_on(async {
-        let name = &test_socket_name("start");
-        let _mock = spawn_mock_daemon(name).await;
+        let path = test_socket_path("start");
+        let _mock = spawn_mock_daemon(&path).await;
 
-        let mut client = DaemonClient::connect(name).await.unwrap();
+        let mut client = DaemonClient::connect(&path).await.unwrap();
         let resp = client
             .send(DaemonRequest::Start {
                 config: hole_common::protocol::ProxyConfig {
@@ -127,10 +114,10 @@ fn send_start_receives_ack() {
 #[skuld::test]
 fn multiple_requests_on_same_client() {
     rt().block_on(async {
-        let name = &test_socket_name("multi");
-        let _mock = spawn_mock_daemon(name).await;
+        let path = test_socket_path("multi");
+        let _mock = spawn_mock_daemon(&path).await;
 
-        let mut client = DaemonClient::connect(name).await.unwrap();
+        let mut client = DaemonClient::connect(&path).await.unwrap();
 
         let r1 = client.send(DaemonRequest::Status).await.unwrap();
         assert!(matches!(r1, DaemonResponse::Status { .. }));
@@ -143,14 +130,15 @@ fn multiple_requests_on_same_client() {
 #[skuld::test]
 fn connect_to_nonexistent_returns_error() {
     rt().block_on(async {
-        let result = DaemonClient::connect(&test_socket_name("nonexistent")).await;
+        let path = test_socket_path("nonexistent");
+        let _ = std::fs::remove_file(&path);
+        let result = DaemonClient::connect(&path).await;
         assert!(result.is_err());
     });
 }
 
 #[skuld::test]
 fn permission_denied_maps_to_variant() {
-    // Verify that map_connect_error correctly maps PermissionDenied
     let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
     let client_err = super::map_connect_error(io_err);
     assert!(
@@ -167,4 +155,118 @@ fn other_io_error_maps_to_connection() {
         matches!(client_err, ClientError::Connection(_)),
         "expected Connection, got: {client_err:?}"
     );
+}
+
+#[skuld::test]
+fn send_reload_receives_ack() {
+    rt().block_on(async {
+        let path = test_socket_path("reload");
+        let _mock = spawn_mock_daemon(&path).await;
+
+        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let resp = client
+            .send(DaemonRequest::Reload {
+                config: hole_common::protocol::ProxyConfig {
+                    server: hole_common::config::ServerEntry {
+                        id: "id".into(),
+                        name: "S".into(),
+                        server: "1.2.3.4".into(),
+                        server_port: 8388,
+                        method: "aes-256-gcm".into(),
+                        password: "pw".into(),
+                        plugin: None,
+                        plugin_opts: None,
+                    },
+                    local_port: 4073,
+                    plugin_path: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp, DaemonResponse::Ack);
+    });
+}
+
+/// Spawn a mock daemon that returns 500 with an ErrorResponse for POST /start.
+async fn spawn_error_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    use hole_common::protocol::ErrorResponse;
+
+    let listener = hole_daemon::socket::LocalListener::bind(path).unwrap();
+
+    let router = axum::Router::new()
+        .route(
+            hole_common::protocol::ROUTE_STATUS,
+            axum::routing::get(|| async {
+                Json(StatusResponse {
+                    running: false,
+                    uptime_secs: 0,
+                    error: None,
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_START,
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        message: "mock start failure".to_string(),
+                    }),
+                )
+            }),
+        );
+
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                use tower::ServiceExt;
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await;
+    })
+}
+
+#[skuld::test]
+fn server_error_maps_to_daemon_response_error() {
+    rt().block_on(async {
+        let path = test_socket_path("err500");
+        let _mock = spawn_error_daemon(&path).await;
+
+        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let resp = client
+            .send(DaemonRequest::Start {
+                config: hole_common::protocol::ProxyConfig {
+                    server: hole_common::config::ServerEntry {
+                        id: "id".into(),
+                        name: "S".into(),
+                        server: "1.2.3.4".into(),
+                        server_port: 8388,
+                        method: "aes-256-gcm".into(),
+                        password: "pw".into(),
+                        plugin: None,
+                        plugin_opts: None,
+                    },
+                    local_port: 4073,
+                    plugin_path: None,
+                },
+            })
+            .await
+            .unwrap();
+        match resp {
+            DaemonResponse::Error { message } => {
+                assert!(
+                    message.contains("mock start failure"),
+                    "expected error message, got: {message}"
+                );
+            }
+            other => panic!("expected Error response, got {other:?}"),
+        }
+    });
 }

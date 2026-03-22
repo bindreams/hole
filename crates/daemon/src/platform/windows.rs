@@ -1,7 +1,8 @@
 // Windows: service management via windows-service crate.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info};
 use windows_service::service::{
@@ -20,8 +21,15 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy daemon for the Hole app
 
 // Service entry =====
 
+/// Socket path override set by the CLI before service dispatch.
+static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
 /// Run as a Windows Service (called by the service control manager).
-pub fn run() -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path) -> Result<(), windows_service::Error> {
+    let default = hole_common::protocol::default_daemon_socket_path();
+    if socket_path != default {
+        SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
+    }
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -75,7 +83,11 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        let server = crate::ipc::IpcServer::bind(crate::ipc::SOCKET_NAME, proxy).expect("failed to bind IPC socket");
+        let socket_path = SOCKET_PATH_OVERRIDE
+            .get()
+            .cloned()
+            .unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
+        let server = crate::ipc::IpcServer::bind(&socket_path, proxy).expect("failed to bind IPC socket");
 
         tokio::select! {
             result = server.run() => {

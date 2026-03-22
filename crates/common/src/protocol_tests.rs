@@ -22,121 +22,141 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-// Round-trip tests -----
+// DaemonRequest/DaemonResponse JSON serialization (used by elevation flow) -----
 
 #[skuld::test]
-fn roundtrip_start_request() {
+fn daemon_request_start_json_roundtrip() {
     let req = DaemonRequest::Start {
         config: sample_config(),
     };
-    let bytes = encode(&req).unwrap();
-    let (decoded, consumed): (DaemonRequest, _) = decode(&bytes).unwrap();
-    assert_eq!(consumed, bytes.len());
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn roundtrip_stop_request() {
+fn daemon_request_stop_json_roundtrip() {
     let req = DaemonRequest::Stop;
-    let bytes = encode(&req).unwrap();
-    let (decoded, _): (DaemonRequest, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn roundtrip_status_request() {
+fn daemon_request_status_json_roundtrip() {
     let req = DaemonRequest::Status;
-    let bytes = encode(&req).unwrap();
-    let (decoded, _): (DaemonRequest, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn roundtrip_reload_request() {
+fn daemon_request_reload_json_roundtrip() {
     let req = DaemonRequest::Reload {
         config: sample_config(),
     };
-    let bytes = encode(&req).unwrap();
-    let (decoded, _): (DaemonRequest, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn roundtrip_ack_response() {
+fn daemon_response_ack_json_roundtrip() {
     let resp = DaemonResponse::Ack;
-    let bytes = encode(&resp).unwrap();
-    let (decoded, _): (DaemonResponse, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&resp).unwrap();
+    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
 #[skuld::test]
-fn roundtrip_status_response() {
+fn daemon_response_status_json_roundtrip() {
     let resp = DaemonResponse::Status {
         running: true,
         uptime_secs: 3600,
         error: Some("minor issue".to_string()),
     };
-    let bytes = encode(&resp).unwrap();
-    let (decoded, _): (DaemonResponse, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&resp).unwrap();
+    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
 #[skuld::test]
-fn roundtrip_error_response() {
+fn daemon_response_error_json_roundtrip() {
     let resp = DaemonResponse::Error {
         message: "port in use".to_string(),
     };
-    let bytes = encode(&resp).unwrap();
-    let (decoded, _): (DaemonResponse, _) = decode(&bytes).unwrap();
+    let json = serde_json::to_vec(&resp).unwrap();
+    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
-// Wire format tests -----
-
 #[skuld::test]
-fn encode_produces_4_byte_length_prefix() {
-    let req = DaemonRequest::Stop;
-    let bytes = encode(&req).unwrap();
-    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    assert_eq!(len as usize, bytes.len() - 4);
-}
-
-#[skuld::test]
-fn decode_truncated_length_returns_error() {
-    let data = [0u8, 0]; // only 2 bytes, need 4
-    let result: Result<(DaemonRequest, usize), _> = decode(&data);
-    assert!(result.is_err());
-}
-
-#[skuld::test]
-fn decode_truncated_body_returns_error() {
-    let mut data = vec![0u8, 0, 0, 100]; // claims 100 bytes
-    data.extend_from_slice(b"{}"); // only 2 bytes of body
-    let result: Result<(DaemonRequest, usize), _> = decode(&data);
-    assert!(result.is_err());
-}
-
-#[skuld::test]
-fn decode_invalid_json_returns_error() {
-    let garbage = b"not json!!!";
-    let len = (garbage.len() as u32).to_be_bytes();
-    let mut data = Vec::new();
-    data.extend_from_slice(&len);
-    data.extend_from_slice(garbage);
-    let result: Result<(DaemonRequest, usize), _> = decode(&data);
-    assert!(result.is_err());
-}
-
-#[skuld::test]
-fn proxy_config_with_plugin_path_roundtrips() {
-    let req = DaemonRequest::Start {
-        config: ProxyConfig {
-            server: sample_server(),
-            local_port: 4073,
-            plugin_path: Some("/usr/bin/v2ray-plugin".into()),
-        },
+fn proxy_config_with_plugin_path_json_roundtrip() {
+    let config = ProxyConfig {
+        server: sample_server(),
+        local_port: 4073,
+        plugin_path: Some("/usr/bin/v2ray-plugin".into()),
     };
-    let bytes = encode(&req).unwrap();
-    let (decoded, _): (DaemonRequest, _) = decode(&bytes).unwrap();
-    assert_eq!(decoded, req);
+    let json = serde_json::to_vec(&config).unwrap();
+    let decoded: ProxyConfig = serde_json::from_slice(&json).unwrap();
+    assert_eq!(decoded, config);
+}
+
+// Generated type tests -----
+
+#[skuld::test]
+fn status_response_json_roundtrip() {
+    let resp = StatusResponse {
+        running: true,
+        uptime_secs: 3600,
+        error: Some("minor issue".to_string()),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resp);
+}
+
+#[skuld::test]
+fn status_response_without_error() {
+    let resp = StatusResponse {
+        running: false,
+        uptime_secs: 0,
+        error: None,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    assert!(!json.contains("error"), "None error should be skipped in serialization");
+    let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resp);
+}
+
+#[skuld::test]
+fn error_response_json_roundtrip() {
+    let resp = ErrorResponse {
+        message: "port in use".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let decoded: ErrorResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resp);
+}
+
+#[skuld::test]
+fn empty_response_serializes_to_empty_object() {
+    let resp = EmptyResponse {};
+    let json = serde_json::to_string(&resp).unwrap();
+    assert_eq!(json, "{}");
+}
+
+#[skuld::test]
+fn status_response_explicit_null_error() {
+    let json = r#"{"running": false, "uptime_secs": 0, "error": null}"#;
+    let decoded: StatusResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(decoded.error, None);
+}
+
+#[skuld::test]
+fn route_constants_are_correct() {
+    assert_eq!(ROUTE_STATUS, "/v1/status");
+    assert_eq!(ROUTE_START, "/v1/start");
+    assert_eq!(ROUTE_STOP, "/v1/stop");
+    assert_eq!(ROUTE_RELOAD, "/v1/reload");
 }
