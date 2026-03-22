@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <!--
-  WiX v4 installer for Hole.
+  WiX installer for Hole.
   Installs to [ProgramFilesFolder]\hole\bin\, registers the daemon service,
   and adds hole to the system PATH.
 
@@ -63,12 +63,6 @@
           KeyPath="yes" />
       </Component>
     </ComponentGroup>
-
-    <!-- Feature: everything -->
-    <Feature Id="Complete" Level="1">
-      <ComponentGroupRef Id="BinaryComponents" />
-      <ComponentGroupRef Id="ShortcutComponents" />
-    </Feature>
 
     <!-- Custom actions: daemon install/uninstall + PATH add/remove -->
     <CustomAction
