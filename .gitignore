@@ -7,11 +7,6 @@ node_modules/
 # Tauri generated
 crates/gui/gen/
 
-# Generated icons (built from icon.svg)
-crates/gui/icons/*.png
-crates/gui/icons/*.ico
-crates/gui/icons/*.icns
-
 # Build cache (v2ray-plugin Go build, wintun download)
 /.cache/
 

@@ -82,4 +82,4 @@ The auto-updater matches assets by these suffixes.
 
 ## Icons
 
-Source icon is `crates/gui/icons/icon.svg`. The build script (`build.rs`) converts it to PNG/ICO/ICNS automatically. Do not commit generated raster icons.
+Source icons are `crates/gui/icons/icon.svg` (app icon) and `crates/gui/icons/tray-{enabled,disabled}.svg` (tray icons). The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.
