@@ -50,6 +50,14 @@ skuld = { git = "https://github.com/bindreams/skuld" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 
+[package.metadata.wix]
+wxs = "installer/hole.wxs"
+
+[package.metadata.wix.files.BinDir]
+"hole.exe" = "{target}/hole.exe"
+"v2ray-plugin.exe" = ".cache/gui/v2ray-plugin/v2ray-plugin-{arch}.exe"
+"wintun.dll" = ".cache/gui/wintun/wintun.dll"
+
 [build-dependencies]
 tauri-build = "2"
 semver = "1"

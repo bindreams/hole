@@ -36,6 +36,7 @@ hole path remove                  → remove hole from system PATH
 crates/common/   → hole-common (shared types: protocol, config, import)
 crates/daemon/   → hole-daemon (daemon library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
+crates/wix/      → cargo-wix (cargo subcommand + library for building MSI installers)
 external/        → Third-party source (git subrepos)
 installer/       → WiX MSI installer source (Windows)
 scripts/         → Build and utility scripts
@@ -54,11 +55,14 @@ cargo test --workspace           # all tests
 
 ### Windows installer
 
-```powershell
-.\scripts\build-installer.ps1    # builds hole.msi in target\release\
-msiexec /i target\release\hole.msi          # interactive install
-msiexec /i target\release\hole.msi /quiet   # unattended install
+```sh
+cargo install --path crates/wix   # install cargo-wix subcommand (one-time)
+cargo wix                         # builds hole.msi (runs cargo build + WiX)
+cargo wix --no-build              # WiX only, skip cargo build
 ```
+
+WiX Toolset is bundled in `cargo-wix` at compile time — no external WiX installation needed.
+Installer config is in `crates/gui/Cargo.toml` under `[package.metadata.wix]`.
 
 ### macOS DMG
 

@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/common", "crates/daemon", "crates/gui"]
+members = ["crates/common", "crates/daemon", "crates/gui", "crates/wix"]
 resolver = "2"

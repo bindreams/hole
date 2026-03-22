@@ -1,0 +1,3 @@
+version = "6.0.2"
+url = "https://github.com/wixtoolset/wix/releases/download/v6.0.2/wix-cli-x64.msi"
+sha256 = "a8a5cc7443353cef3ab900c60cd7a3a5ee601746319d104ac7b12ad0ced2345c"

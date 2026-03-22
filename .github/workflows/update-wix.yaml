@@ -1,0 +1,72 @@
+name: Update WiX Toolset
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly, Monday 08:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new WiX release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT=$(grep '^version' crates/wix/wix-toolchain.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "current=$CURRENT"
+
+          LATEST=$(gh api -X GET repos/wixtoolset/wix/releases \
+            --jq '[.[] | select(.prerelease == false and .draft == false and (.tag_name | startswith("v6.")))][0].tag_name' \
+            | sed 's/^v//')
+          echo "latest=$LATEST"
+
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "Already up to date (v$CURRENT)"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Update available: v$CURRENT -> v$LATEST"
+          echo "update=true" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+          # Download MSI and compute SHA256
+          MSI_URL="https://github.com/wixtoolset/wix/releases/download/v${LATEST}/wix-cli-x64.msi"
+          curl -sSL -X GET "$MSI_URL" -o wix.msi
+          SHA=$(sha256sum wix.msi | cut -d' ' -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "url=$MSI_URL" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
+      - name: Update wix-toolchain.toml
+        if: steps.check.outputs.update == 'true'
+        run: |
+          cat > crates/wix/wix-toolchain.toml << 'TOML'
+          version = "${{ steps.check.outputs.latest }}"
+          url = "${{ steps.check.outputs.url }}"
+          sha256 = "${{ steps.check.outputs.sha }}"
+          TOML
+          sed -i 's/^          //' crates/wix/wix-toolchain.toml
+
+      - name: Create Pull Request
+        if: steps.check.outputs.update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "Update WiX Toolset to v${{ steps.check.outputs.latest }}"
+          body: |
+            Automated update of pinned WiX version.
+
+            - **From**: v${{ steps.check.outputs.current }}
+            - **To**: v${{ steps.check.outputs.latest }}
+            - **SHA256**: `${{ steps.check.outputs.sha }}`
+          branch: deps/wix-${{ steps.check.outputs.latest }}
+          commit-message: "Update WiX Toolset to v${{ steps.check.outputs.latest }}"
