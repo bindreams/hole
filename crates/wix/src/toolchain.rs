@@ -46,23 +46,25 @@ pub fn wix_cache_dir() -> PathBuf {
 #[cfg(target_os = "windows")]
 pub fn ensure_wix() -> Result<PathBuf> {
     let cache_dir = wix_cache_dir();
-    // Find wix.exe within the extracted bundle. The MSI installs to a
-    // directory named "WiX Toolset vX.Y" — we search for wix.exe rather
-    // than hardcoding the directory name, so version bumps don't break this.
-    let wix_exe = find_wix_exe(&cache_dir)?;
-
     let sentinel = cache_dir.join("wix.extracted");
     let expected_version = wix_version();
 
-    if wix_exe.exists() && sentinel.exists() {
+    // Check if already extracted and up-to-date
+    let needs_extract = if sentinel.exists() {
         let stored_version = std::fs::read_to_string(&sentinel).unwrap_or_default();
-        if stored_version.trim() == expected_version {
-            return Ok(wix_exe);
-        }
+        stored_version.trim() != expected_version
+    } else {
+        true
+    };
+
+    if needs_extract {
+        extract_bundle(&cache_dir)?;
     }
 
-    extract_bundle(&cache_dir)?;
-    Ok(wix_exe)
+    // Find wix.exe within the extracted bundle. The MSI installs to a
+    // directory named "WiX Toolset vX.Y" — we search for wix.exe rather
+    // than hardcoding the directory name, so version bumps don't break this.
+    find_wix_exe(&cache_dir)
 }
 
 #[cfg(not(target_os = "windows"))]
