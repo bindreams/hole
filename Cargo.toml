@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.metadata.wix]
 wxs = "crates/gui/installer.wxs"
 package = "hole-gui"
-before = ["bash", "scripts/prepare-installer.sh"]
+before = ["cargo", "scripts/prepare-installer.rs"]
 
 [workspace.metadata.wix.bindpaths]
 BinDir = "target/release/installer-stage"
