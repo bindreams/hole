@@ -54,9 +54,8 @@ impl IpcServer {
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
         let stream = self.listener.accept().await?;
-        serve_connection(TokioIo::new(stream), self.router.clone())
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Connection errors (client disconnect, shutdown) are non-fatal.
+        let _ = serve_connection(TokioIo::new(stream), self.router.clone()).await;
         Ok(())
     }
 
