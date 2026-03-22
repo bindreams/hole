@@ -19,28 +19,32 @@ fn main() {
 }
 
 fn run(args: cli::WixArgs) -> cargo_wix::error::Result<()> {
-    // Load config from Cargo.toml
     let (config, info) = config::load_config(None)?;
 
-    // CLI overrides
-    let wxs = args.wxs.unwrap_or(config.wxs);
-    let build_first = if args.no_build { false } else { config.build };
-
-    // Detect target triple from current platform
-    let target_triple = format!("{}-pc-windows-msvc", std::env::consts::ARCH);
+    // Resolve wxs path relative to crate manifest directory
+    let wxs = args.wxs.unwrap_or_else(|| info.manifest_dir.join(&config.wxs));
 
     let mut builder = Builder::new(&wxs)
-        .build_first(build_first)
         .workspace_root(&info.workspace_root)
-        .target_dir(info.target_dir.join("release"))
-        .target_triple(&target_triple)
-        .files(config.files);
+        .target_dir(&info.target_dir)
+        .package_name(&info.name)
+        .package_version(&info.version)
+        .before(config.before)
+        .after(config.after)
+        .skip_before(args.skip_before)
+        .skip_after(args.skip_after);
 
     if let Some(output) = args.output.or(config.output) {
         builder = builder.output(output);
     }
 
-    // Merge defines: config first, then CLI overrides
+    // Bindpaths from config (resolved relative to workspace root)
+    for (name, path) in config.bindpaths {
+        let abs_path = info.workspace_root.join(&path);
+        builder = builder.bindpath(name, abs_path);
+    }
+
+    // Defines from config, then CLI overrides
     for (k, v) in config.defines {
         builder = builder.define(k, v);
     }
@@ -54,7 +58,7 @@ fn run(args: cli::WixArgs) -> cargo_wix::error::Result<()> {
         }
     }
 
-    // CLI bindpaths (added to any staged bindpaths)
+    // CLI bindpaths (added to config bindpaths)
     for bp in &args.bindpaths {
         if let Some((name, path)) = bp.split_once('=') {
             builder = builder.bindpath(name, path);

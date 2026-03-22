@@ -38,7 +38,6 @@ crates/daemon/   → hole-daemon (daemon library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
 crates/wix/      → cargo-wix (cargo subcommand + library for building MSI installers)
 external/        → Third-party source (git subrepos)
-installer/       → WiX MSI installer source (Windows)
 scripts/         → Build and utility scripts
 ui/              → Frontend HTML/CSS/JS
 ```
@@ -57,12 +56,13 @@ cargo test --workspace           # all tests
 
 ```sh
 cargo install --path crates/wix   # install cargo-wix subcommand (one-time)
-cargo wix                         # builds hole.msi (runs cargo build + WiX)
-cargo wix --no-build              # WiX only, skip cargo build
+cargo wix                         # builds hole.msi (runs before hook + WiX)
+cargo wix --skip-before           # WiX only, skip the before hook
 ```
 
 WiX Toolset is bundled in `cargo-wix` at compile time — no external WiX installation needed.
 Installer config is in `crates/gui/Cargo.toml` under `[package.metadata.wix]`.
+WiX source is `crates/gui/installer.wxs`.
 
 ### macOS DMG
 

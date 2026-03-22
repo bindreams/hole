@@ -51,12 +51,11 @@ axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 
 [package.metadata.wix]
-wxs = "installer/hole.wxs"
+wxs = "installer.wxs"
+before = ["bash", "scripts/prepare-installer.sh"]
 
-[package.metadata.wix.files.BinDir]
-"hole.exe" = "{target}/hole.exe"
-"v2ray-plugin.exe" = ".cache/gui/v2ray-plugin/v2ray-plugin-{arch}.exe"
-"wintun.dll" = ".cache/gui/wintun/wintun.dll"
+[package.metadata.wix.bindpaths]
+BinDir = "target/release/installer-stage"
 
 [build-dependencies]
 tauri-build = "2"

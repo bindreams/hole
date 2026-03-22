@@ -1,7 +1,6 @@
 pub mod builder;
 pub mod config;
 pub mod error;
-pub mod staging;
 pub mod toolchain;
 
 pub use builder::Builder;

@@ -11,14 +11,11 @@ pub enum Error {
     #[error("WiX build failed (exit code {code}): {stderr}")]
     BuildFailed { code: i32, stderr: String },
 
-    #[error("cargo build failed (exit code {0})")]
-    CargoBuildFailed(i32),
+    #[error("hook failed: `{command}` exited with code {code}")]
+    HookFailed { command: String, code: i32 },
 
     #[error("configuration error: {0}")]
     Config(String),
-
-    #[error("staging failed: {0}")]
-    StagingFailed(String),
 
     #[error("WiX is only supported on Windows")]
     UnsupportedPlatform,

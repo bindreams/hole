@@ -5,32 +5,32 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize)]
 pub struct WixConfig {
-    /// Path to the `.wxs` source file (required).
+    /// Path to the `.wxs` source file, relative to the crate's manifest directory (required).
     pub wxs: PathBuf,
 
-    /// Whether to run `cargo build --release --workspace` before building the MSI.
-    #[serde(default = "default_true")]
-    pub build: bool,
-
-    /// Output MSI path. Defaults to `target/<profile>/<package-name>.msi`.
+    /// Output MSI path, relative to workspace root.
+    /// Default: `<target_dir>/release/<package_name>.msi`.
     #[serde(default)]
     pub output: Option<PathBuf>,
 
+    /// Command (argv-style) to run before `wix build`.
+    #[serde(default)]
+    pub before: Vec<String>,
+
+    /// Command (argv-style) to run after `wix build`.
+    #[serde(default)]
+    pub after: Vec<String>,
+
     /// WiX preprocessor defines (`-d KEY=VALUE`).
+    /// `ProductVersion` is auto-injected from Cargo.toml version unless overridden here.
     #[serde(default)]
     pub defines: BTreeMap<String, String>,
 
-    /// Files to stage, grouped by bindpath name.
-    /// Each entry maps a destination filename to a source path (relative to workspace root).
-    /// Use `{target}` in source paths to reference `target/<profile>/`.
+    /// WiX bindpaths (`-bindpath NAME=PATH`), resolved relative to workspace root.
     #[serde(default)]
-    pub files: BTreeMap<String, BTreeMap<String, String>>,
+    pub bindpaths: BTreeMap<String, PathBuf>,
 }
 
 /// Package information extracted from Cargo.toml metadata.
@@ -38,6 +38,7 @@ pub struct WixConfig {
 pub struct PackageInfo {
     pub name: String,
     pub version: String,
+    pub manifest_dir: PathBuf,
     pub workspace_root: PathBuf,
     pub target_dir: PathBuf,
 }
@@ -55,7 +56,7 @@ pub fn load_config(manifest_path: Option<&Path>) -> Result<(WixConfig, PackageIn
         .exec()
         .map_err(|e| Error::Config(format!("failed to read cargo metadata: {e}")))?;
 
-    // Find the root package (the one whose manifest is in the workspace root or the specified path).
+    // Find the root package
     let root_manifest = manifest_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         std::env::current_dir()
             .expect("failed to get current directory")
@@ -81,9 +82,17 @@ pub fn load_config(manifest_path: Option<&Path>) -> Result<(WixConfig, PackageIn
     let config: WixConfig = serde_json::from_value(wix_metadata.clone())
         .map_err(|e| Error::Config(format!("failed to parse [package.metadata.wix]: {e}")))?;
 
+    let manifest_dir = package
+        .manifest_path
+        .parent()
+        .expect("manifest_path should have a parent")
+        .as_std_path()
+        .to_path_buf();
+
     let info = PackageInfo {
         name: package.name.clone(),
         version: package.version.to_string(),
+        manifest_dir,
         workspace_root: metadata.workspace_root.clone().into(),
         target_dir: metadata.target_directory.clone().into(),
     };

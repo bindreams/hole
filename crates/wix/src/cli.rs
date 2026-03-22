@@ -25,9 +25,13 @@ pub(crate) struct WixArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
 
-    /// Skip `cargo build --release --workspace` before building the MSI
+    /// Skip the `before` hook
     #[arg(long)]
-    pub no_build: bool,
+    pub skip_before: bool,
+
+    /// Skip the `after` hook
+    #[arg(long)]
+    pub skip_after: bool,
 
     /// Additional bindpath: NAME=PATH (can be repeated)
     #[arg(long = "bindpath", value_name = "NAME=PATH")]

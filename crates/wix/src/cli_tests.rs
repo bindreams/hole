@@ -15,7 +15,8 @@ fn parse_no_args() {
     let args = parse(&[]);
     assert!(args.wxs.is_none());
     assert!(args.output.is_none());
-    assert!(!args.no_build);
+    assert!(!args.skip_before);
+    assert!(!args.skip_after);
     assert!(args.bindpaths.is_empty());
     assert!(args.defines.is_empty());
 }
@@ -33,9 +34,17 @@ fn parse_output_override() {
 }
 
 #[skuld::test]
-fn parse_no_build() {
-    let args = parse(&["--no-build"]);
-    assert!(args.no_build);
+fn parse_skip_before() {
+    let args = parse(&["--skip-before"]);
+    assert!(args.skip_before);
+    assert!(!args.skip_after);
+}
+
+#[skuld::test]
+fn parse_skip_after() {
+    let args = parse(&["--skip-after"]);
+    assert!(!args.skip_before);
+    assert!(args.skip_after);
 }
 
 #[skuld::test]
@@ -57,7 +66,8 @@ fn parse_all_options() {
         "my.wxs",
         "--output",
         "my.msi",
-        "--no-build",
+        "--skip-before",
+        "--skip-after",
         "--bindpath",
         "B=P",
         "-d",
@@ -65,7 +75,8 @@ fn parse_all_options() {
     ]);
     assert_eq!(args.wxs.as_deref(), Some(std::path::Path::new("my.wxs")));
     assert_eq!(args.output.as_deref(), Some(std::path::Path::new("my.msi")));
-    assert!(args.no_build);
+    assert!(args.skip_before);
+    assert!(args.skip_after);
     assert_eq!(args.bindpaths, vec!["B=P"]);
     assert_eq!(args.defines, vec!["K=V"]);
 }
