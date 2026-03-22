@@ -7,8 +7,13 @@ use crate::error::{Error, Result};
 
 #[derive(Debug, Deserialize)]
 pub struct WixConfig {
-    /// Path to the `.wxs` source file, relative to the crate's manifest directory (required).
+    /// Path to the `.wxs` source file, relative to workspace root (required).
     pub wxs: PathBuf,
+
+    /// Workspace member whose name and version are used for the MSI.
+    /// Auto-injects `ProductVersion` define. Default output path uses this name.
+    #[serde(default)]
+    pub package: Option<String>,
 
     /// Output MSI path, relative to workspace root.
     /// Default: `<target_dir>/release/<package_name>.msi`.
@@ -24,7 +29,7 @@ pub struct WixConfig {
     pub after: Vec<String>,
 
     /// WiX preprocessor defines (`-d KEY=VALUE`).
-    /// `ProductVersion` is auto-injected from Cargo.toml version unless overridden here.
+    /// `ProductVersion` is auto-injected from the `package` version unless overridden here.
     #[serde(default)]
     pub defines: BTreeMap<String, String>,
 
@@ -43,8 +48,7 @@ pub struct PackageInfo {
     pub target_dir: PathBuf,
 }
 
-/// Load `[package.metadata.wix]` from the Cargo.toml at the given manifest path
-/// (or the current directory's Cargo.toml if `None`).
+/// Load WiX config from `[workspace.metadata.wix]` in the workspace root Cargo.toml.
 pub fn load_config(manifest_path: Option<&Path>) -> Result<(WixConfig, PackageInfo)> {
     let mut cmd = cargo_metadata::MetadataCommand::new();
     cmd.no_deps();
@@ -56,44 +60,35 @@ pub fn load_config(manifest_path: Option<&Path>) -> Result<(WixConfig, PackageIn
         .exec()
         .map_err(|e| Error::Config(format!("failed to read cargo metadata: {e}")))?;
 
-    // Find the root package
-    let root_manifest = manifest_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-        std::env::current_dir()
-            .expect("failed to get current directory")
-            .join("Cargo.toml")
-    });
-
-    let root_manifest = root_manifest.canonicalize().unwrap_or(root_manifest.clone());
-
-    let package = metadata
-        .packages
-        .iter()
-        .find(|p| {
-            let pkg_manifest = p.manifest_path.as_std_path();
-            pkg_manifest == root_manifest || pkg_manifest.canonicalize().ok().as_deref() == Some(&root_manifest)
-        })
-        .ok_or_else(|| Error::Config(format!("no package found at {}", root_manifest.display())))?;
-
-    let wix_metadata = package
-        .metadata
+    let wix_metadata = metadata
+        .workspace_metadata
         .get("wix")
-        .ok_or_else(|| Error::Config("[package.metadata.wix] not found in Cargo.toml".into()))?;
+        .ok_or_else(|| Error::Config("[workspace.metadata.wix] not found in Cargo.toml".into()))?;
 
     let config: WixConfig = serde_json::from_value(wix_metadata.clone())
-        .map_err(|e| Error::Config(format!("failed to parse [package.metadata.wix]: {e}")))?;
+        .map_err(|e| Error::Config(format!("failed to parse [workspace.metadata.wix]: {e}")))?;
 
-    let manifest_dir = package
-        .manifest_path
-        .parent()
-        .expect("manifest_path should have a parent")
-        .as_std_path()
-        .to_path_buf();
+    let workspace_root: PathBuf = metadata.workspace_root.clone().into();
+
+    // If a package is specified, look up its name and version
+    let (name, version) = if let Some(ref pkg_name) = config.package {
+        let pkg = metadata
+            .packages
+            .iter()
+            .find(|p| p.name == *pkg_name)
+            .ok_or_else(|| Error::Config(format!("package '{pkg_name}' not found in workspace")))?;
+        (pkg.name.to_string(), pkg.version.to_string())
+    } else {
+        // Fall back to workspace directory name, no version
+        let dir_name = metadata.workspace_root.file_name().unwrap_or("project").to_string();
+        (dir_name, String::new())
+    };
 
     let info = PackageInfo {
-        name: package.name.clone(),
-        version: package.version.to_string(),
-        manifest_dir,
-        workspace_root: metadata.workspace_root.clone().into(),
+        name,
+        version,
+        manifest_dir: workspace_root.clone(),
+        workspace_root,
         target_dir: metadata.target_directory.clone().into(),
     };
 

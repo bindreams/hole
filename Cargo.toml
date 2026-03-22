@@ -1,3 +1,11 @@
 [workspace]
 members = ["crates/common", "crates/daemon", "crates/gui", "crates/wix"]
 resolver = "2"
+
+[workspace.metadata.wix]
+wxs = "crates/gui/installer.wxs"
+package = "hole-gui"
+before = ["bash", "scripts/prepare-installer.sh"]
+
+[workspace.metadata.wix.bindpaths]
+BinDir = "target/release/installer-stage"

@@ -5,6 +5,7 @@ fn parse_minimal_config() {
     let toml_str = r#"wxs = "installer.wxs""#;
     let config: WixConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.wxs, std::path::Path::new("installer.wxs"));
+    assert!(config.package.is_none());
     assert!(config.output.is_none());
     assert!(config.before.is_empty());
     assert!(config.after.is_empty());
@@ -16,6 +17,7 @@ fn parse_minimal_config() {
 fn parse_full_config() {
     let toml_str = r#"
 wxs = "installer.wxs"
+package = "hole-gui"
 output = "target/release/hole.msi"
 before = ["cargo", "build", "--release"]
 after = ["echo", "done"]
@@ -33,6 +35,7 @@ DataDir = "data"
         config.output.as_deref(),
         Some(std::path::Path::new("target/release/hole.msi"))
     );
+    assert_eq!(config.package.as_deref(), Some("hole-gui"));
     assert_eq!(config.before, vec!["cargo", "build", "--release"]);
     assert_eq!(config.after, vec!["echo", "done"]);
     assert_eq!(config.defines["ProductName"], "Hole");

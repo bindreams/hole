@@ -13,7 +13,7 @@ WiX v6 is bundled into the `cargo-wix` binary at compile time — no external Wi
 
 2. Add config to your crate's `Cargo.toml`:
    ```toml
-   [package.metadata.wix]
+   [workspace.metadata.wix]
    wxs = "installer.wxs"
    before = ["bash", "scripts/prepare-installer.sh"]
 
@@ -28,11 +28,12 @@ WiX v6 is bundled into the `cargo-wix` binary at compile time — no external Wi
 
 ## Configuration reference
 
-All configuration goes under `[package.metadata.wix]` in your crate's `Cargo.toml`.
+All configuration goes under `[workspace.metadata.wix]` in the workspace root `Cargo.toml`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `wxs` | string | yes | Path to `.wxs` source file, relative to crate root |
+| `wxs` | string | yes | Path to `.wxs` source file, relative to workspace root |
+| `package` | string | no | Workspace member whose name/version are used for the MSI. Auto-injects `ProductVersion` define. |
 | `output` | string | no | Output MSI path, relative to workspace root. Default: `<target_dir>/release/<package_name>.msi` |
 | `before` | array of strings | no | Command (argv-style) to run before `wix build` |
 | `after` | array of strings | no | Command (argv-style) to run after `wix build` |

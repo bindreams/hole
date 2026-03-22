@@ -50,13 +50,6 @@ skuld = { git = "https://github.com/bindreams/skuld" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 
-[package.metadata.wix]
-wxs = "installer.wxs"
-before = ["bash", "scripts/prepare-installer.sh"]
-
-[package.metadata.wix.bindpaths]
-BinDir = "target/release/installer-stage"
-
 [build-dependencies]
 tauri-build = "2"
 semver = "1"

@@ -21,8 +21,8 @@ fn main() {
 fn run(args: cli::WixArgs) -> cargo_wix::error::Result<()> {
     let (config, info) = config::load_config(None)?;
 
-    // Resolve wxs path relative to crate manifest directory
-    let wxs = args.wxs.unwrap_or_else(|| info.manifest_dir.join(&config.wxs));
+    // Resolve wxs path relative to workspace root
+    let wxs = args.wxs.unwrap_or_else(|| info.workspace_root.join(&config.wxs));
 
     let mut builder = Builder::new(&wxs)
         .workspace_root(&info.workspace_root)
