@@ -1,7 +1,7 @@
 """Static validation tests for installer/hole.wxs.
 
 Parse the WiX v6 source and verify structural correctness without building.
-Run with: uv run pytest installer/test_hole_wxs.py -v
+Run with: uv run --with pytest pytest installer/test_hole_wxs.py -v
 """
 # /// script
 # requires-python = ">=3.11"
@@ -10,35 +10,11 @@ Run with: uv run pytest installer/test_hole_wxs.py -v
 
 import re
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
-import pytest
-
-NS = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
-WXS_PATH = Path(__file__).parent / "hole.wxs"
+from conftest import NS
 
 # Known bind path variables passed by build-installer.py via `-bindpath`.
 KNOWN_BINDPATHS = {"BinDir"}
-
-
-# Fixtures =====
-
-
-@pytest.fixture(scope="session")
-def wxs_tree() -> ET.ElementTree:
-    return ET.parse(WXS_PATH)
-
-
-@pytest.fixture(scope="session")
-def root(wxs_tree: ET.ElementTree) -> ET.Element:
-    return wxs_tree.getroot()
-
-
-@pytest.fixture(scope="session")
-def package(root: ET.Element) -> ET.Element:
-    pkg = root.find("wix:Package", NS)
-    assert pkg is not None, "<Package> element not found"
-    return pkg
 
 
 # GUID tests =====
@@ -99,6 +75,21 @@ def test_custom_action_directories_defined(package: ET.Element) -> None:
             )
 
 
+def test_install_dir_is_64bit(package: ET.Element) -> None:
+    """Binary components must install under ProgramFiles64Folder, not ProgramFilesFolder."""
+    std_dirs = [
+        elem.get("Id")
+        for elem in package.iter(f"{{{NS['wix']}}}StandardDirectory")
+    ]
+    assert "ProgramFiles64Folder" in std_dirs, (
+        "Installation root must use ProgramFiles64Folder for 64-bit binaries. "
+        f"Found StandardDirectory IDs: {std_dirs}"
+    )
+    assert "ProgramFilesFolder" not in std_dirs, (
+        "ProgramFilesFolder (32-bit) must not be used; use ProgramFiles64Folder"
+    )
+
+
 # File source tests =====
 
 
@@ -127,12 +118,21 @@ def _get_custom_entries(package: ET.Element) -> list[ET.Element]:
 
 
 def _is_install_condition(condition: str) -> bool:
-    """Install conditions negate REMOVE (e.g. 'NOT REMOVE')."""
-    return "NOT REMOVE" in condition or "REMOVE" not in condition
+    """Install conditions negate REMOVE (e.g. 'NOT REMOVE').
+
+    An empty condition means "always run" and is not classified as install-only.
+    """
+    if not condition:
+        return False
+    return "NOT REMOVE" in condition
 
 
 def _is_uninstall_condition(condition: str) -> bool:
-    """Uninstall conditions test for REMOVE equality (e.g. 'REMOVE="ALL"')."""
+    """Uninstall conditions test for REMOVE equality (e.g. 'REMOVE="ALL"').
+
+    Note: XML entities like &quot; are resolved by the parser, so the
+    condition string contains literal double-quotes at runtime.
+    """
     return 'REMOVE="' in condition or "REMOVE~=" in condition
 
 
@@ -173,12 +173,11 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
-    """Every uninstall CA must have a direct Before='RemoveFiles' constraint.
+    """Every uninstall CA must have a direct Before anchor that leads to RemoveFiles.
 
-    MSI sequence numbers are absolute. Relying on transitive chains (e.g.
-    After='X' where X is Before='RemoveFiles') couples correctness to
-    the constraint solver's implementation. Requiring a direct anchor is
-    a stronger, solver-independent guarantee.
+    Only one hop of indirection is allowed: Before='RemoveFiles' directly,
+    or Before another uninstall CA that itself has Before='RemoveFiles'.
+    This keeps the ordering fully explicit and solver-independent.
     """
     customs = _get_custom_entries(package)
     uninstall_cas = [
@@ -194,10 +193,8 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
         )
 
         # The Before target must be RemoveFiles or another uninstall CA
-        # that is itself directly Before RemoveFiles (i.e., the chain is
-        # fully explicit).
+        # that is itself directly Before RemoveFiles.
         allowed_targets = {"RemoveFiles"}
-        # Also allow Before another uninstall CA that itself has Before="RemoveFiles"
         for other in uninstall_cas:
             other_action = other.get("Action", "")
             if other.get("Before") == "RemoveFiles":
@@ -238,7 +235,7 @@ def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
 
 
 def _ca_map(package: ET.Element) -> dict[str, ET.Element]:
-    """Map CustomAction Id → element."""
+    """Map CustomAction Id -> element."""
     return {
         ca.get("Id", ""): ca
         for ca in package.iter(f"{{{NS['wix']}}}CustomAction")
@@ -269,6 +266,30 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
                 f"Uninstall CA '{action}' should have Return='ignore' "
                 "to avoid blocking uninstall"
             )
+
+
+# Shortcut component tests =====
+
+
+def test_shortcut_registry_uses_hkcu(package: ET.Element) -> None:
+    """Shortcut components must use HKCU for their KeyPath registry value.
+
+    Start Menu shortcuts are per-user artifacts. Using HKLM for the KeyPath
+    triggers ICE38, ICE43, and ICE57 (mixed per-user/per-machine data).
+    """
+    for comp in package.iter(f"{{{NS['wix']}}}Component"):
+        shortcuts = list(comp.iter(f"{{{NS['wix']}}}Shortcut"))
+        if not shortcuts:
+            continue
+
+        comp_id = comp.get("Id", "<anonymous>")
+        for reg in comp.iter(f"{{{NS['wix']}}}RegistryValue"):
+            if reg.get("KeyPath") == "yes":
+                root = reg.get("Root", "")
+                assert root == "HKCU", (
+                    f"Shortcut component '{comp_id}' has KeyPath RegistryValue "
+                    f"with Root='{root}'; must be 'HKCU' to avoid ICE38/ICE43/ICE57"
+                )
 
 
 # Component key path tests =====

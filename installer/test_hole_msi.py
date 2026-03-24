@@ -17,32 +17,14 @@ from pathlib import Path
 
 import pytest
 
+from conftest import NS, WXS_PATH
+
 pytestmark = pytest.mark.skipif(
     platform.system() != "Windows", reason="Windows-only (needs WiX + msiexec)"
 )
 
-NS = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
-REPO_ROOT = Path(__file__).resolve().parent.parent
-WXS_PATH = Path(__file__).parent / "hole.wxs"
-
-
-def _find_wix_exe(base_dir: Path) -> Path | None:
-    return next(base_dir.rglob("wix.exe"), None)
-
 
 # Fixtures =====
-
-
-@pytest.fixture(scope="session")
-def wix_exe() -> Path:
-    cache_dir = REPO_ROOT / ".cache" / "wix"
-    # Try each versioned subdirectory
-    for child in sorted(cache_dir.iterdir()) if cache_dir.exists() else []:
-        if child.is_dir() and child.name.startswith("wix-v"):
-            exe = _find_wix_exe(child)
-            if exe is not None:
-                return exe
-    pytest.skip("WiX toolchain not found in .cache/wix/")
 
 
 @pytest.fixture(scope="session")
@@ -72,7 +54,8 @@ def built_msi(
         capture_output=True, text=True,
     )
     assert result.returncode == 0, (
-        f"wix build failed (exit {result.returncode}):\n{result.stderr}"
+        f"wix build failed (exit {result.returncode}):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     return msi_path
 
@@ -118,7 +101,7 @@ def test_ice_validation_passes(wix_exe: Path, built_msi: Path) -> None:
 # Sequence number tests =====
 
 
-def _get_decompiled_sequence(tree: ET.ElementTree) -> dict[str, dict]:
+def _get_decompiled_sequence_map(tree: ET.ElementTree) -> dict[str, dict]:
     """Extract InstallExecuteSequence entries from decompiled XML.
 
     Returns {action_name: {"before": ..., "after": ..., "condition": ...}}.
@@ -141,14 +124,15 @@ def _get_decompiled_sequence(tree: ET.ElementTree) -> dict[str, dict]:
 
 def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
     """Install CAs must be ordered: InstallFiles < DaemonInstall < PathAdd."""
-    entries = _get_decompiled_sequence(decompiled_tree)
+    entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    # DaemonInstall should be After InstallFiles
+    assert "DaemonInstall" in entries, "DaemonInstall not found in InstallExecuteSequence"
+    assert "PathAdd" in entries, "PathAdd not found in InstallExecuteSequence"
+
     assert entries["DaemonInstall"]["after"] == "InstallFiles", (
         f"DaemonInstall should be After='InstallFiles', "
         f"got After='{entries['DaemonInstall']['after']}'"
     )
-    # PathAdd should be After DaemonInstall
     assert entries["PathAdd"]["after"] == "DaemonInstall", (
         f"PathAdd should be After='DaemonInstall', "
         f"got After='{entries['PathAdd']['after']}'"
@@ -157,14 +141,15 @@ def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
 
 def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
     """Uninstall CAs must be ordered: PathRemove < DaemonUninstall < RemoveFiles."""
-    entries = _get_decompiled_sequence(decompiled_tree)
+    entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    # DaemonUninstall must be Before RemoveFiles
+    assert "DaemonUninstall" in entries, "DaemonUninstall not found in InstallExecuteSequence"
+    assert "PathRemove" in entries, "PathRemove not found in InstallExecuteSequence"
+
     assert entries["DaemonUninstall"]["before"] == "RemoveFiles", (
         f"DaemonUninstall should be Before='RemoveFiles', "
         f"got Before='{entries['DaemonUninstall']['before']}'"
     )
-    # PathRemove must be Before DaemonUninstall
     assert entries["PathRemove"]["before"] == "DaemonUninstall", (
         f"PathRemove should be Before='DaemonUninstall', "
         f"got Before='{entries['PathRemove']['before']}'"
@@ -188,5 +173,5 @@ def test_components_are_64bit(decompiled_tree: ET.ElementTree) -> None:
         bitness = comp.get("Bitness", "")
         assert bitness != "always32", (
             f"Component '{comp_id}' has Bitness='always32' (32-bit). "
-            "Add Platform='x64' to the Package element to build a 64-bit MSI."
+            "Pass '-arch x64' to 'wix build' to build a 64-bit MSI."
         )

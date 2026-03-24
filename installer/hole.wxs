@@ -105,8 +105,8 @@
         Condition="NOT Installed AND NOT REMOVE" />
 
       <!-- Pre-uninstall: PATH remove then daemon uninstall.
-           Each CA must have a direct Before anchor so ordering does not
-           depend on the constraint solver's transitive resolution. -->
+           Each uninstall CA must be transitively anchored Before RemoveFiles
+           via explicit Before attributes, so ordering is fully determined. -->
       <Custom Action="PathRemove" Before="DaemonUninstall"
         Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="DaemonUninstall" Before="RemoveFiles"
