@@ -2,7 +2,7 @@
 
 <!--
   WiX installer for Hole.
-  Installs to [ProgramFilesFolder]\hole\bin\, registers the daemon service,
+  Installs to [ProgramFiles64Folder]\hole\bin\, registers the daemon service,
   and adds hole to the system PATH.
 
   Build:   uv run scripts/build-installer.py
@@ -21,7 +21,7 @@
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
     <!-- Installation directory structure -->
-    <StandardDirectory Id="ProgramFilesFolder">
+    <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="hole">
         <Directory Id="BINDIR" Name="bin" />
       </Directory>
@@ -55,7 +55,7 @@
           WorkingDirectory="BINDIR" />
         <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
         <RegistryValue
-          Root="HKLM"
+          Root="HKCU"
           Key="Software\Hole"
           Name="Installed"
           Type="integer"
@@ -104,10 +104,12 @@
       <Custom Action="PathAdd" After="DaemonInstall"
         Condition="NOT Installed AND NOT REMOVE" />
 
-      <!-- Pre-uninstall: PATH remove then daemon uninstall -->
-      <Custom Action="PathRemove" Before="RemoveFiles"
+      <!-- Pre-uninstall: PATH remove then daemon uninstall.
+           Each CA must have a direct Before anchor so ordering does not
+           depend on the constraint solver's transitive resolution. -->
+      <Custom Action="PathRemove" Before="DaemonUninstall"
         Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="DaemonUninstall" After="PathRemove"
+      <Custom Action="DaemonUninstall" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 

@@ -235,6 +235,7 @@ def wix_build(
             str(wix_exe),
             "build",
             str(wxs),
+            "-arch", "x64",
             "-bindpath",
             f"BinDir={stage_dir}",
             "-d",

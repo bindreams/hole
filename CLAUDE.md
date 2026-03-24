@@ -71,6 +71,12 @@ npx tauri build                  # produces .dmg in target/release/bundle/
 Uses [skuld](https://github.com/bindreams/skuld) framework (`#[skuld::test]`), not `#[test]`.
 Unit test files are siblings: `foo.rs` → `foo_tests.rs`.
 
+### Windows installer
+
+```sh
+uv run --with pytest pytest installer/ -v   # WiX source + MSI build validation
+```
+
 ## Releases
 
 Release assets follow GOOS/GOARCH naming, OS first:
