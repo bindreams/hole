@@ -22,7 +22,7 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-// DaemonRequest/DaemonResponse JSON serialization (used by elevation flow) -----
+// DaemonRequest/DaemonResponse JSON serialization (used by elevation flow) --------------------------------------------
 
 #[skuld::test]
 fn daemon_request_start_json_roundtrip() {
@@ -102,7 +102,7 @@ fn proxy_config_with_plugin_path_json_roundtrip() {
     assert_eq!(decoded, config);
 }
 
-// Generated type tests -----
+// Generated type tests ------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn status_response_json_roundtrip() {

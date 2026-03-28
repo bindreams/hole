@@ -1,6 +1,6 @@
 use super::*;
 
-// parse =====
+// parse ===============================================================================================================
 
 #[skuld::test]
 fn parse_bare_version() {
@@ -55,7 +55,7 @@ fn parse_rejects_garbage() {
     assert!(ReleaseVersion::parse("not-a-version").is_err());
 }
 
-// from_build_version =====
+// from_build_version ==================================================================================================
 
 #[skuld::test]
 fn from_build_version_release() {
@@ -90,7 +90,7 @@ fn from_build_version_rejects_garbage() {
     assert!(ReleaseVersion::from_build_version("not-a-version").is_err());
 }
 
-// Ordering =====
+// Ordering ============================================================================================================
 
 #[skuld::test]
 fn ordering_patch() {
@@ -122,7 +122,7 @@ fn ordering_chain() {
     assert!(b < c);
 }
 
-// Display =====
+// Display =============================================================================================================
 
 #[skuld::test]
 fn display_no_v_prefix() {

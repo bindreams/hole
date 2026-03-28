@@ -5,7 +5,7 @@ use std::ops::Deref;
 
 use thiserror::Error;
 
-// Error =====
+// Error ===============================================================================================================
 
 #[derive(Debug, Error)]
 pub enum VersionError {
@@ -15,7 +15,7 @@ pub enum VersionError {
     Custom(String),
 }
 
-// ReleaseVersion =====
+// ReleaseVersion ======================================================================================================
 
 /// A strict `MAJOR.MINOR.PATCH` version with no pre-release or build metadata.
 ///

@@ -19,7 +19,7 @@ use tower::ServiceExt;
 use tracing::warn;
 use tracing::{debug, error, info};
 
-// Server =====
+// Server ==============================================================================================================
 
 /// HTTP/1.1 REST server over a local Unix domain socket.
 ///
@@ -114,7 +114,7 @@ where
         .await
 }
 
-// Router =====
+// Router ==============================================================================================================
 
 fn build_router<B: ProxyBackend + 'static>(proxy: Arc<Mutex<ProxyManager<B>>>) -> axum::Router {
     axum::Router::new()
@@ -126,7 +126,7 @@ fn build_router<B: ProxyBackend + 'static>(proxy: Arc<Mutex<ProxyManager<B>>>) -
         .with_state(proxy)
 }
 
-// Handlers =====
+// Handlers ============================================================================================================
 
 async fn handle_status<B: ProxyBackend + 'static>(
     State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
@@ -181,7 +181,7 @@ async fn handle_reload<B: ProxyBackend + 'static>(
     }
 }
 
-// Security =====
+// Security ============================================================================================================
 
 /// Apply OS-level access control to the socket file.
 ///

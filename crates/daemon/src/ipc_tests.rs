@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
-// Mock backend =====
+// Mock backend ========================================================================================================
 
 struct MockBackend {
     fail_start: AtomicBool,
@@ -60,7 +60,7 @@ impl ProxyBackend for MockBackend {
     }
 }
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
@@ -166,7 +166,7 @@ async fn post_reload(
     sender.send_request(req).await.unwrap()
 }
 
-// Tests =====
+// Tests ===============================================================================================================
 
 #[skuld::test]
 fn server_accepts_connection() {
@@ -480,7 +480,7 @@ fn wrong_method_returns_405() {
     });
 }
 
-// Socket lifecycle tests =====
+// Socket lifecycle tests ==============================================================================================
 
 #[skuld::test]
 fn socket_recreated_on_bind() {

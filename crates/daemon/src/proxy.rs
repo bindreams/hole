@@ -7,7 +7,7 @@ use shadowsocks_service::config::{
 use std::net::SocketAddr;
 use thiserror::Error;
 
-// Errors =====
+// Errors ==============================================================================================================
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -25,7 +25,7 @@ pub enum ProxyError {
     AlreadyRunning,
 }
 
-// Config builder =====
+// Config builder ======================================================================================================
 
 /// TUN interface subnet (hardcoded, not configurable via IPC).
 pub const TUN_SUBNET: &str = "10.255.0.1/24";

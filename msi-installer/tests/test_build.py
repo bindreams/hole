@@ -7,8 +7,7 @@ import pytest
 
 from msi_installer import BuildError, find_wix_exe, get_version, link_or_copy
 
-
-# link_or_copy tests =====
+# link_or_copy tests ===================================================================================================
 
 
 def test_link_or_copy_hardlink(tmp_path: Path) -> None:
@@ -43,7 +42,7 @@ def test_link_or_copy_fallback_to_copy(tmp_path: Path, monkeypatch: pytest.Monke
     assert dst.read_text() == "hello"
 
 
-# get_version tests =====
+# get_version tests ====================================================================================================
 
 
 def test_get_version(tmp_path: Path) -> None:
@@ -63,7 +62,7 @@ def test_get_version_rejects_invalid(tmp_path: Path) -> None:
         get_version(tmp_path)
 
 
-# find_wix_exe tests =====
+# find_wix_exe tests ===================================================================================================
 
 
 def test_find_wix_exe_found(tmp_path: Path) -> None:
