@@ -14,7 +14,7 @@ fn exe_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
-// Platform implementations =====
+// Platform implementations ============================================================================================
 
 #[cfg(target_os = "windows")]
 pub fn add() -> Result<(), Box<dyn std::error::Error>> {

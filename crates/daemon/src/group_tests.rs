@@ -1,4 +1,4 @@
-// Windows-specific tests =====
+// Windows-specific tests ==============================================================================================
 
 #[cfg(target_os = "windows")]
 mod windows {
@@ -16,7 +16,7 @@ mod windows {
     }
 }
 
-// Cross-platform tests =====
+// Cross-platform tests ================================================================================================
 
 #[skuld::test]
 fn group_name_is_hole() {

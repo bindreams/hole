@@ -39,7 +39,7 @@ pub fn group_sid() -> io::Result<String> {
     os::group_sid()
 }
 
-// macOS implementation =====
+// macOS implementation ================================================================================================
 
 #[cfg(target_os = "macos")]
 mod os {
@@ -136,7 +136,7 @@ mod os {
     }
 }
 
-// Windows implementation =====
+// Windows implementation ==============================================================================================
 
 #[cfg(target_os = "windows")]
 mod os {

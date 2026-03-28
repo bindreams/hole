@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::*;
 
-// Windows msiexec arg construction =====
+// Windows msiexec arg construction ====================================================================================
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
@@ -27,7 +27,7 @@ fn msiexec_args_interactive() {
     assert!(!args.contains(&"/quiet".to_string()));
 }
 
-// macOS hdiutil arg construction =====
+// macOS hdiutil arg construction ======================================================================================
 
 #[cfg(target_os = "macos")]
 #[skuld::test]

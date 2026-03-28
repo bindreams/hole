@@ -9,7 +9,7 @@ mod api_generated {
 }
 pub use api_generated::*;
 
-// Types =====
+// Types ===============================================================================================================
 
 /// Client-side request enum. Used by the GUI client API and elevation flow
 /// (base64 CLI serialization). Not part of the wire protocol — the client
@@ -45,7 +45,7 @@ pub struct ProxyConfig {
     pub plugin_path: Option<PathBuf>,
 }
 
-// Constants =====
+// Constants ===========================================================================================================
 
 /// Default daemon socket path.
 pub fn default_daemon_socket_path() -> PathBuf {

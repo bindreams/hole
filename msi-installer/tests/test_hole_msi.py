@@ -19,7 +19,7 @@ pytestmark = [
 ]
 
 
-# Fixtures =====
+# Fixtures =============================================================================================================
 
 
 @pytest.fixture(scope="session")
@@ -72,7 +72,7 @@ def decompiled_tree(
     return ET.parse(wxs_out)
 
 
-# Build tests =====
+# Build tests ==========================================================================================================
 
 
 def test_wix_build_succeeds(built_msi: Path) -> None:
@@ -93,7 +93,7 @@ def test_ice_validation_passes(wix_exe: Path, built_msi: Path) -> None:
     )
 
 
-# Sequence number tests =====
+# Sequence number tests ================================================================================================
 
 
 def _get_decompiled_sequence_map(tree: ET.ElementTree) -> dict[str, dict]:
@@ -151,7 +151,7 @@ def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
     )
 
 
-# Component bitness tests =====
+# Component bitness tests ==============================================================================================
 
 
 def test_components_are_64bit(decompiled_tree: ET.ElementTree) -> None:

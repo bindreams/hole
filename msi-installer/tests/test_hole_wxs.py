@@ -12,7 +12,7 @@ from conftest import NS
 KNOWN_BINDPATHS = {"BinDir"}
 
 
-# GUID tests =====
+# GUID tests ===========================================================================================================
 
 
 def _collect_component_guids(package: ET.Element) -> list[tuple[str, str]]:
@@ -46,7 +46,7 @@ def test_guids_are_valid_format(package: ET.Element) -> None:
         )
 
 
-# Directory reference tests =====
+# Directory reference tests ============================================================================================
 
 
 def _collect_directory_ids(package: ET.Element) -> set[str]:
@@ -113,7 +113,7 @@ def test_install_dir_is_64bit(package: ET.Element) -> None:
     )
 
 
-# File source tests =====
+# File source tests ====================================================================================================
 
 
 BINDPATH_RE = re.compile(r"!\(bindpath\.(\w+)\)")
@@ -130,7 +130,7 @@ def test_file_sources_use_known_bindpaths(package: ET.Element) -> None:
             )
 
 
-# Custom action sequencing tests =====
+# Custom action sequencing tests =======================================================================================
 
 
 def _get_custom_entries(package: ET.Element) -> list[ET.Element]:
@@ -230,7 +230,7 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
         )
 
 
-# Package attribute tests =====
+# Package attribute tests ==============================================================================================
 
 
 def test_package_version_is_preprocessor_variable(package: ET.Element) -> None:
@@ -245,7 +245,7 @@ def test_major_upgrade_exists(package: ET.Element) -> None:
     assert mu is not None, "MajorUpgrade element is required for upgrade support"
 
 
-# Custom action attribute tests =====
+# Custom action attribute tests ========================================================================================
 
 
 def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
@@ -291,7 +291,7 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
             )
 
 
-# Shortcut component tests =====
+# Shortcut component tests =============================================================================================
 
 
 def test_shortcut_registry_uses_hkcu(package: ET.Element) -> None:
@@ -315,7 +315,7 @@ def test_shortcut_registry_uses_hkcu(package: ET.Element) -> None:
                 )
 
 
-# Component key path tests =====
+# Component key path tests =============================================================================================
 
 
 def test_every_component_has_key_path(package: ET.Element) -> None:

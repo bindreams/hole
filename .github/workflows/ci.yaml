@@ -38,7 +38,13 @@ jobs:
         with:
           python-version: "3.x"
 
-      - uses: pre-commit/action@v3.0.1
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install prek
+        run: uv tool install prek
+
+      - name: Run linters
+        run: prek run --all-files
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})

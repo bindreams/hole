@@ -50,7 +50,7 @@ def link_or_copy(src: Path, dst: Path) -> str:
         return "copied"
 
 
-# Build =====
+# Build ================================================================================================================
 
 
 def cargo_build(console: Console) -> None:
@@ -60,7 +60,7 @@ def cargo_build(console: Console) -> None:
         raise BuildError("cargo build failed")
 
 
-# Stage =====
+# Stage ================================================================================================================
 
 
 def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
@@ -90,7 +90,7 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     console.print(f"  wintun.dll ({method})")
 
 
-# Version =====
+# Version ==============================================================================================================
 
 
 def get_version(root: Path) -> str:
@@ -104,7 +104,7 @@ def get_version(root: Path) -> str:
     return version
 
 
-# WiX toolchain =====
+# WiX toolchain ========================================================================================================
 
 
 def ensure_wix(root: Path, console: Console) -> Path:
@@ -233,7 +233,7 @@ def find_wix_exe(base_dir: Path) -> Path | None:
     return next(base_dir.rglob("wix.exe"), None)
 
 
-# WiX build =====
+# WiX build ============================================================================================================
 
 
 def wix_build(
@@ -258,7 +258,7 @@ def wix_build(
         raise BuildError("wix build failed")
 
 
-# WiX toolchain upgrade =====
+# WiX toolchain upgrade ================================================================================================
 
 
 _WIX_URL_TEMPLATE = "https://github.com/wixtoolset/wix/releases/download/v{version}/wix-cli-x64.msi"
@@ -307,7 +307,7 @@ def upgrade_wix() -> None:
         sys.exit(1)
 
 
-# Main =====
+# Main =================================================================================================================
 
 
 def main() -> None:

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-// Mock backend =====
+// Mock backend ========================================================================================================
 
 struct MockBackend {
     start_called: Arc<AtomicU32>,
@@ -71,7 +71,7 @@ impl ProxyBackend for MockBackend {
     }
 }
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
@@ -94,7 +94,7 @@ fn test_config() -> ProxyConfig {
     }
 }
 
-// Tests =====
+// Tests ===============================================================================================================
 
 #[skuld::test]
 fn start_transitions_to_running() {

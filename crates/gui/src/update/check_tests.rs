@@ -28,7 +28,7 @@ fn release(tag: &str, draft: bool, prerelease: bool, assets: Vec<GitHubAsset>) -
     }
 }
 
-// candidate_tags =====
+// candidate_tags ======================================================================================================
 
 #[skuld::test]
 fn candidate_tags_filters_non_semver() {
@@ -76,7 +76,7 @@ fn candidate_tags_empty_when_no_newer() {
     assert!(result.is_empty());
 }
 
-// release_qualifies =====
+// release_qualifies ===================================================================================================
 
 #[skuld::test]
 fn release_qualifies_valid() {
@@ -128,7 +128,7 @@ fn release_qualifies_no_assets_returns_none() {
     assert!(release_qualifies(&r).is_none());
 }
 
-// parse_next_link =====
+// parse_next_link =====================================================================================================
 
 #[skuld::test]
 fn parse_next_link_standard() {

@@ -4,7 +4,7 @@ use hole_common::protocol::{DaemonRequest, DaemonResponse, EmptyResponse, Status
 use hyper::body::Incoming;
 use std::path::PathBuf;
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
@@ -59,7 +59,7 @@ async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()
     })
 }
 
-// Tests =====
+// Tests ===============================================================================================================
 
 #[skuld::test]
 fn send_status_request_receives_response() {

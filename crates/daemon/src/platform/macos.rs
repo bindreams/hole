@@ -3,13 +3,13 @@
 use std::path::Path;
 use tracing::info;
 
-// Constants =====
+// Constants ===========================================================================================================
 
 pub const LAUNCHD_LABEL: &str = "com.hole.daemon";
 pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.daemon.plist";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.daemon";
 
-// Plist generation =====
+// Plist generation ====================================================================================================
 
 /// Generate the launchd plist XML for the daemon.
 pub fn generate_plist(binary_path: &str) -> String {
@@ -42,7 +42,7 @@ pub fn generate_plist(binary_path: &str) -> String {
     )
 }
 
-// Install/uninstall =====
+// Install/uninstall ===================================================================================================
 
 /// Install the daemon: copy binary to a stable location and register with launchd.
 ///
@@ -96,7 +96,7 @@ pub fn uninstall() -> std::io::Result<()> {
     Ok(())
 }
 
-// Start/stop =====
+// Start/stop ==========================================================================================================
 
 /// Start the daemon (bootstrap the plist if not already loaded).
 pub fn start() -> std::io::Result<()> {
@@ -124,7 +124,7 @@ pub fn stop() -> std::io::Result<()> {
     Ok(())
 }
 
-// Query =====
+// Query ===============================================================================================================
 
 /// Check whether the daemon plist is installed.
 pub fn is_installed() -> bool {
