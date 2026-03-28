@@ -69,15 +69,6 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
-      - name: Provision WiX toolchain
-        shell: bash
-        run: |
-          uv run --with httpx --with rich python -c "
-          import importlib.util; from pathlib import Path; from rich.console import Console
-          spec = importlib.util.spec_from_file_location('bi', 'scripts/build-installer.py')
-          mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-          mod.ensure_wix(Path('.'), Console(stderr=True))
-          "
-
       - name: Test
-        run: uv run --with pytest pytest installer/ -v
+        working-directory: msi-installer
+        run: uv run --group dev pytest -v

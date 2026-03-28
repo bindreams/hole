@@ -1,14 +1,8 @@
-"""Build + validation tests for installer/hole.wxs.
+"""Build + validation tests for hole.wxs.
 
 Builds an MSI with dummy binaries, then validates it via ICE checks and
-table inspection. Windows-only (requires WiX toolchain and msiexec).
-
-Run with: uv run pytest installer/test_hole_msi.py -v
+table inspection. Windows-only, requires WiX toolchain.
 """
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pytest"]
-# ///
 
 import platform
 import subprocess
@@ -19,9 +13,10 @@ import pytest
 
 from conftest import NS, WXS_PATH
 
-pytestmark = pytest.mark.skipif(
-    platform.system() != "Windows", reason="Windows-only (needs WiX + msiexec)"
-)
+pytestmark = [
+    pytest.mark.skipif(platform.system() != "Windows", reason="Windows-only (needs WiX + msiexec)"),
+    pytest.mark.wix,
+]
 
 
 # Fixtures =====

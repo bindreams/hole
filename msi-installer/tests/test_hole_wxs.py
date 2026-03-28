@@ -1,12 +1,7 @@
-"""Static validation tests for installer/hole.wxs.
+"""Static validation tests for hole.wxs.
 
 Parse the WiX v6 source and verify structural correctness without building.
-Run with: uv run --with pytest pytest installer/test_hole_wxs.py -v
 """
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["pytest"]
-# ///
 
 import re
 import xml.etree.ElementTree as ET

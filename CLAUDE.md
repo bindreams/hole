@@ -37,8 +37,8 @@ crates/common/   → hole-common (shared types: protocol, config, import)
 crates/daemon/   → hole-daemon (daemon library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
 external/        → Third-party source (git subrepos)
-installer/       → WiX MSI installer source (Windows)
-scripts/         → Build and utility scripts
+msi-installer/   → WiX MSI installer (Python project: source, build script, tests)
+scripts/         → Utility scripts
 ui/              → Frontend HTML/CSS/JS
 ```
 
@@ -55,7 +55,7 @@ cargo test --workspace           # all tests
 ### Windows installer
 
 ```sh
-uv run scripts/build-installer.py            # builds hole.msi in target\release\
+uv run --directory msi-installer build       # builds hole.msi in target\release\
 msiexec /i target\release\hole.msi           # interactive install
 msiexec /i target\release\hole.msi /quiet    # unattended install
 ```
@@ -74,7 +74,7 @@ Unit test files are siblings: `foo.rs` → `foo_tests.rs`.
 ### Windows installer
 
 ```sh
-uv run --with pytest pytest installer/ -v   # WiX source + MSI build validation
+cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build validation
 ```
 
 ## Releases

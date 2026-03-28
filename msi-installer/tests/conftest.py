@@ -4,10 +4,28 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from rich.console import Console
+
+import msi_installer
 
 NS = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
-WXS_PATH = Path(__file__).parent / "hole.wxs"
-REPO_ROOT = Path(__file__).resolve().parent.parent
+WXS_PATH = msi_installer.WXS_PATH
+
+
+def _find_repo_root() -> Path:
+    """Walk parents until finding the repo root (.git/)."""
+    p = Path(__file__).resolve().parent
+    while p != p.parent:
+        if (p / ".git").exists():
+            return p
+        p = p.parent
+    raise RuntimeError("could not find repo root (no .git/ directory found)")
+
+
+REPO_ROOT = _find_repo_root()
+
+
+# XML fixtures =====
 
 
 @pytest.fixture(scope="session")
@@ -27,17 +45,11 @@ def package(root: ET.Element) -> ET.Element:
     return pkg
 
 
+# WiX toolchain fixture =====
+
+
 @pytest.fixture(scope="session")
 def wix_exe() -> Path:
-    """Locate the cached WiX toolchain. Skips tests if not available."""
-    cache_dir = REPO_ROOT / ".cache" / "wix"
-    if not cache_dir.exists():
-        pytest.skip("WiX toolchain not found in .cache/wix/")
-
-    for child in sorted(cache_dir.iterdir()):
-        if child.is_dir() and child.name.startswith("wix-v"):
-            exe = next(child.rglob("wix.exe"), None)
-            if exe is not None:
-                return exe
-
-    pytest.skip("wix.exe not found in .cache/wix/")
+    """Download/locate WiX toolchain. Fails if unavailable."""
+    console = Console(stderr=True)
+    return msi_installer.ensure_wix(REPO_ROOT, console)

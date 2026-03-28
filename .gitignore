@@ -16,3 +16,5 @@ CLAUDE.local.md
 
 # Python
 __pycache__/
+.venv/
+.pytest_cache/

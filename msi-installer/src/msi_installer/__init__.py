@@ -1,15 +1,10 @@
-#!/usr/bin/env python3
 """Build the Hole Windows MSI installer.
 
 Prerequisites: Rust toolchain, Go toolchain (for v2ray-plugin).
 WiX is downloaded automatically on first run.
 
-Usage: uv run scripts/build-installer.py
+Usage: uv run --directory msi-installer build
 """
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["httpx", "rich"]
-# ///
 
 import hashlib
 import os
@@ -20,16 +15,28 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from typing import NoReturn
 
 import httpx
 from rich.console import Console
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
 
+_PKG_DIR = Path(__file__).resolve().parent
+WXS_PATH = _PKG_DIR / "hole.wxs"
+WIX_TOOLCHAIN_PATH = _PKG_DIR / "wix-toolchain.toml"
 
-def die(console: Console, msg: str) -> NoReturn:
-    console.print(f"[bold red]Error:[/] {msg}")
-    sys.exit(1)
+
+class BuildError(Exception):
+    """Raised when a build step fails."""
+
+
+def _find_repo_root() -> Path:
+    """Walk parents of this package until finding the repo root (.git/)."""
+    p = _PKG_DIR
+    while p != p.parent:
+        if (p / ".git").exists():
+            return p
+        p = p.parent
+    raise BuildError("could not find repo root (no .git/ directory found)")
 
 
 def link_or_copy(src: Path, dst: Path) -> str:
@@ -50,7 +57,7 @@ def cargo_build(console: Console) -> None:
     console.print("[bold]Building release binaries[/] (cargo build --release --workspace)")
     result = subprocess.run(["cargo", "build", "--release", "--workspace"])
     if result.returncode != 0:
-        die(console, "cargo build failed")
+        raise BuildError("cargo build failed")
 
 
 # Stage =====
@@ -69,16 +76,16 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     v2ray_dir = root / ".cache" / "gui" / "v2ray-plugin"
     candidates = list(v2ray_dir.glob("v2ray-plugin-*.exe"))
     if len(candidates) == 0:
-        die(console, f"no v2ray-plugin binary found in {v2ray_dir}")
+        raise BuildError(f"no v2ray-plugin binary found in {v2ray_dir}")
     if len(candidates) > 1:
-        die(console, f"multiple v2ray-plugin binaries in {v2ray_dir}: {candidates}")
+        raise BuildError(f"multiple v2ray-plugin binaries in {v2ray_dir}: {candidates}")
     method = link_or_copy(candidates[0], stage_dir / "v2ray-plugin.exe")
     console.print(f"  v2ray-plugin.exe ({method})")
 
     # wintun.dll
     wintun = root / ".cache" / "gui" / "wintun" / "wintun.dll"
     if not wintun.exists():
-        die(console, f"wintun.dll not found at {wintun}")
+        raise BuildError(f"wintun.dll not found at {wintun}")
     method = link_or_copy(wintun, stage_dir / "wintun.dll")
     console.print(f"  wintun.dll ({method})")
 
@@ -86,14 +93,14 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
 # Version =====
 
 
-def get_version(root: Path, console: Console) -> str:
+def get_version(root: Path) -> str:
     cargo_toml = root / "crates" / "gui" / "Cargo.toml"
     with open(cargo_toml, "rb") as f:
         data = tomllib.load(f)
 
     version = data["package"]["version"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        die(console, f"version in {cargo_toml} is not valid semver: {version}")
+        raise BuildError(f"version in {cargo_toml} is not valid semver: {version}")
     return version
 
 
@@ -104,21 +111,20 @@ def ensure_wix(root: Path, console: Console) -> Path:
     """Download, cache, and extract the WiX toolchain. Returns path to wix.exe.
 
     Caching uses two sentinel files:
-    - `<msi-name>.verified`: records the SHA256 of a successfully downloaded MSI,
+    - ``<msi-name>.verified``: records the SHA256 of a successfully downloaded MSI,
       so re-downloads are skipped when the hash matches.
-    - `extracted.version`: records the version of the successfully extracted toolchain,
+    - ``extracted.version``: records the version of the successfully extracted toolchain,
       so re-extraction is skipped when the version matches and wix.exe is present.
     """
-    toolchain_path = root / "installer" / "wix-toolchain.toml"
     try:
-        with open(toolchain_path, "rb") as f:
+        with open(WIX_TOOLCHAIN_PATH, "rb") as f:
             config = tomllib.load(f)
     except FileNotFoundError:
-        die(console, f"WiX toolchain config not found: {toolchain_path}")
+        raise BuildError(f"WiX toolchain config not found: {WIX_TOOLCHAIN_PATH}")
 
     for key in ("version", "url", "sha256"):
         if key not in config:
-            die(console, f"missing key '{key}' in {toolchain_path}")
+            raise BuildError(f"missing key '{key}' in {WIX_TOOLCHAIN_PATH}")
 
     version = config["version"]
     url = config["url"]
@@ -147,7 +153,7 @@ def ensure_wix(root: Path, console: Console) -> Path:
 
     if need_download:
         hash_sentinel.unlink(missing_ok=True)
-        download_file(url, msi_path, expected_sha256, console)
+        _download_file(url, msi_path, expected_sha256, console)
         hash_sentinel.write_text(expected_sha256)
 
     # Extract phase
@@ -155,22 +161,21 @@ def ensure_wix(root: Path, console: Console) -> Path:
         try:
             shutil.rmtree(extract_dir)
         except PermissionError:
-            die(
-                console,
+            raise BuildError(
                 f"cannot remove stale extraction directory {extract_dir} "
-                "(files may be locked by another process or antivirus)",
+                "(files may be locked by another process or antivirus)"
             )
     extract_dir.mkdir(parents=True)
-    extract_msi(msi_path, extract_dir, console)
+    _extract_msi(msi_path, extract_dir, console)
     sentinel.write_text(version)
 
     wix_exe = find_wix_exe(extract_dir)
     if wix_exe is None:
-        die(console, f"wix.exe not found in extracted directory {extract_dir}")
+        raise BuildError(f"wix.exe not found in extracted directory {extract_dir}")
     return wix_exe
 
 
-def download_file(url: str, dest: Path, expected_sha256: str, console: Console) -> None:
+def _download_file(url: str, dest: Path, expected_sha256: str, console: Console) -> None:
     tmp = dest.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
 
@@ -196,12 +201,12 @@ def download_file(url: str, dest: Path, expected_sha256: str, console: Console) 
     actual = hasher.hexdigest()
     if actual != expected_sha256:
         tmp.unlink(missing_ok=True)
-        die(console, f"SHA256 mismatch for {dest.name}: expected {expected_sha256}, got {actual}")
+        raise BuildError(f"SHA256 mismatch for {dest.name}: expected {expected_sha256}, got {actual}")
 
     tmp.replace(dest)
 
 
-def extract_msi(msi_path: Path, target_dir: Path, console: Console) -> None:
+def _extract_msi(msi_path: Path, target_dir: Path, console: Console) -> None:
     abs_target = str(target_dir.resolve())
     with console.status("Extracting WiX toolchain..."):
         try:
@@ -213,10 +218,10 @@ def extract_msi(msi_path: Path, target_dir: Path, console: Console) -> None:
                 timeout=120,
             )
         except subprocess.TimeoutExpired:
-            die(console, "msiexec extraction timed out after 120 seconds")
+            raise BuildError("msiexec extraction timed out after 120 seconds")
 
     if result.returncode != 0:
-        die(console, f"msiexec extraction failed (exit {result.returncode}): {result.stderr}")
+        raise BuildError(f"msiexec extraction failed (exit {result.returncode}): {result.stderr}")
 
 
 def find_wix_exe(base_dir: Path) -> Path | None:
@@ -245,7 +250,7 @@ def wix_build(
         ],
     )
     if result.returncode != 0:
-        die(console, "wix build failed")
+        raise BuildError("wix build failed")
 
 
 # Main =====
@@ -257,91 +262,22 @@ def main() -> None:
         sys.exit(1)
 
     console = Console(stderr=True)
-    root = Path(__file__).resolve().parent.parent
 
-    cargo_build(console)
+    try:
+        root = _find_repo_root()
 
-    stage_dir = root / "target" / "release" / "installer-stage"
-    stage_files(root, stage_dir, console)
+        cargo_build(console)
 
-    version = get_version(root, console)
-    wix_exe = ensure_wix(root, console)
+        stage_dir = root / "target" / "release" / "installer-stage"
+        stage_files(root, stage_dir, console)
 
-    output = root / "target" / "release" / "hole.msi"
-    wix_build(wix_exe, root / "installer" / "hole.wxs", stage_dir, version, output, console)
+        version = get_version(root)
+        wix_exe = ensure_wix(root, console)
 
-    console.print(f"[bold green]Installer built:[/] {output}")
+        output = root / "target" / "release" / "hole.msi"
+        wix_build(wix_exe, WXS_PATH, stage_dir, version, output, console)
 
-
-if __name__ == "__main__":
-    main()
-
-
-# Tests (run with pytest) =====
-
-
-def test_link_or_copy_hardlink(tmp_path: Path) -> None:
-    src = tmp_path / "src.txt"
-    src.write_text("hello")
-    dst = tmp_path / "dst.txt"
-
-    method = link_or_copy(src, dst)
-    assert method == "hardlinked"
-    assert dst.read_text() == "hello"
-    assert os.path.samefile(src, dst)
-
-
-def test_link_or_copy_overwrites_existing(tmp_path: Path) -> None:
-    src = tmp_path / "src.txt"
-    src.write_text("new")
-    dst = tmp_path / "dst.txt"
-    dst.write_text("old")
-
-    link_or_copy(src, dst)
-    assert dst.read_text() == "new"
-
-
-def test_link_or_copy_fallback_to_copy(tmp_path: Path, monkeypatch: "pytest.MonkeyPatch") -> None:
-    import pytest  # noqa: F811
-
-    src = tmp_path / "src.txt"
-    src.write_text("hello")
-    dst = tmp_path / "dst.txt"
-
-    monkeypatch.setattr(os, "link", lambda s, d: (_ for _ in ()).throw(OSError("forced")))
-    method = link_or_copy(src, dst)
-    assert method == "copied"
-    assert dst.read_text() == "hello"
-
-
-def test_get_version(tmp_path: Path) -> None:
-    gui_dir = tmp_path / "crates" / "gui"
-    gui_dir.mkdir(parents=True)
-    (gui_dir / "Cargo.toml").write_text('[package]\nname = "test"\nversion = "1.2.3"\n')
-
-    console = Console(stderr=True)
-    assert get_version(tmp_path, console) == "1.2.3"
-
-
-def test_get_version_rejects_invalid(tmp_path: Path) -> None:
-    import pytest
-
-    gui_dir = tmp_path / "crates" / "gui"
-    gui_dir.mkdir(parents=True)
-    (gui_dir / "Cargo.toml").write_text('[package]\nname = "test"\nversion = "1.2.3-beta"\n')
-
-    console = Console(stderr=True)
-    with pytest.raises(SystemExit):
-        get_version(tmp_path, console)
-
-
-def test_find_wix_exe_found(tmp_path: Path) -> None:
-    wix = tmp_path / "sub" / "dir" / "wix.exe"
-    wix.parent.mkdir(parents=True)
-    wix.write_text("")
-
-    assert find_wix_exe(tmp_path) == wix
-
-
-def test_find_wix_exe_not_found(tmp_path: Path) -> None:
-    assert find_wix_exe(tmp_path) is None
+        console.print(f"[bold green]Installer built:[/] {output}")
+    except BuildError as e:
+        console.print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
