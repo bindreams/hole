@@ -81,7 +81,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
 
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok.is_err() {
-        let err = windows::core::Error::from_win32();
+        let err = windows::core::Error::from_thread();
         // ERROR_CANCELLED = 1223 → HRESULT 0x800704C7
         if err.code() == windows::core::HRESULT(0x800704C7_u32 as i32) {
             return Err(SetupError::Cancelled);
