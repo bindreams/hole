@@ -1,6 +1,6 @@
 name: Dependabot auto-merge
 
-on: pull_request
+on: pull_request_target
 
 permissions:
   contents: write
@@ -11,8 +11,10 @@ jobs:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - run: gh pr merge --auto --squash "$PR_URL"
+      - uses: dependabot/fetch-metadata@v2
+        id: meta
+      - if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
