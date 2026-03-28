@@ -6,6 +6,7 @@ dependencies = ["httpx", "rich"]
 
 [project.scripts]
 build = "msi_installer:main"
+upgrade-wix = "msi_installer:upgrade_wix"
 
 [build-system]
 requires = ["hatchling"]

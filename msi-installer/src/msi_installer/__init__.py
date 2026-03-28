@@ -175,7 +175,8 @@ def ensure_wix(root: Path, console: Console) -> Path:
     return wix_exe
 
 
-def _download_file(url: str, dest: Path, expected_sha256: str, console: Console) -> None:
+def _download_and_hash(url: str, dest: Path, console: Console) -> str:
+    """Download a file and return its SHA256 hex digest."""
     tmp = dest.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)
 
@@ -198,12 +199,16 @@ def _download_file(url: str, dest: Path, expected_sha256: str, console: Console)
                     hasher.update(chunk)
                     progress.advance(task, len(chunk))
 
-    actual = hasher.hexdigest()
-    if actual != expected_sha256:
-        tmp.unlink(missing_ok=True)
-        raise BuildError(f"SHA256 mismatch for {dest.name}: expected {expected_sha256}, got {actual}")
-
     tmp.replace(dest)
+    return hasher.hexdigest()
+
+
+def _download_file(url: str, dest: Path, expected_sha256: str, console: Console) -> None:
+    """Download a file and verify its SHA256."""
+    actual = _download_and_hash(url, dest, console)
+    if actual != expected_sha256:
+        dest.unlink(missing_ok=True)
+        raise BuildError(f"SHA256 mismatch for {dest.name}: expected {expected_sha256}, got {actual}")
 
 
 def _extract_msi(msi_path: Path, target_dir: Path, console: Console) -> None:
@@ -251,6 +256,55 @@ def wix_build(
     )
     if result.returncode != 0:
         raise BuildError("wix build failed")
+
+
+# WiX toolchain upgrade =====
+
+
+_WIX_URL_TEMPLATE = "https://github.com/wixtoolset/wix/releases/download/v{version}/wix-cli-x64.msi"
+
+
+def upgrade_wix() -> None:
+    """Update wix-toolchain.toml with the correct URL and SHA256 for the current version."""
+    import tempfile
+
+    console = Console(stderr=True)
+
+    try:
+        with open(WIX_TOOLCHAIN_PATH, "rb") as f:
+            config = tomllib.load(f)
+
+        version = config["version"]
+        url = _WIX_URL_TEMPLATE.format(version=version)
+        console.print(f"[bold]Updating WiX toolchain for v{version}[/]")
+
+        # Download and compute SHA256
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / f"wix-cli-x64-v{version}.msi"
+            sha256 = _download_and_hash(url, dest, console)
+
+        # Check if anything changed
+        old_url = config.get("url", "")
+        old_sha256 = config.get("sha256", "")
+
+        if url == old_url and sha256 == old_sha256:
+            console.print("[green]Already up to date[/]")
+            return
+
+        # Update the TOML file
+        text = WIX_TOOLCHAIN_PATH.read_text()
+        text = re.sub(r'(url\s*=\s*")[^"]+(")', rf"\g<1>{url}\2", text)
+        text = re.sub(r'(sha256\s*=\s*")[^"]+(")', rf"\g<1>{sha256}\2", text)
+        WIX_TOOLCHAIN_PATH.write_text(text)
+
+        if url != old_url:
+            console.print(f"  url: {old_url} → {url}")
+        if sha256 != old_sha256:
+            console.print(f"  sha256: {old_sha256[:12]}… → {sha256[:12]}…")
+        console.print("[bold green]Updated[/] wix-toolchain.toml")
+    except BuildError as e:
+        console.print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
 
 
 # Main =====
