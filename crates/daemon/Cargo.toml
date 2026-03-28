@@ -33,7 +33,7 @@ tower = { version = "0.5", features = ["util"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-service = "0.7"
+windows-service = "0.8"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
