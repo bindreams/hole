@@ -18,7 +18,6 @@ pytestmark = [
     pytest.mark.wix,
 ]
 
-
 # Fixtures =============================================================================================================
 
 
@@ -32,21 +31,26 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def built_msi(
-    wix_exe: Path, staged_dir: Path, tmp_path_factory: pytest.TempPathFactory
-) -> Path:
+def built_msi(wix_exe: Path, staged_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build an MSI from hole.wxs with dummy binaries."""
     out_dir = tmp_path_factory.mktemp("msi")
     msi_path = out_dir / "hole.msi"
     result = subprocess.run(
         [
-            str(wix_exe), "build", str(WXS_PATH),
-            "-arch", "x64",
-            "-bindpath", f"BinDir={staged_dir}",
-            "-d", "ProductVersion=1.0.0",
-            "-o", str(msi_path),
+            str(wix_exe),
+            "build",
+            str(WXS_PATH),
+            "-arch",
+            "x64",
+            "-bindpath",
+            f"BinDir={staged_dir}",
+            "-d",
+            "ProductVersion=1.0.0",
+            "-o",
+            str(msi_path),
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, (
         f"wix build failed (exit {result.returncode}):\n"
@@ -56,19 +60,17 @@ def built_msi(
 
 
 @pytest.fixture(scope="session")
-def decompiled_tree(
-    wix_exe: Path, built_msi: Path, tmp_path_factory: pytest.TempPathFactory
-) -> ET.ElementTree:
+def decompiled_tree(wix_exe: Path, built_msi: Path, tmp_path_factory: pytest.TempPathFactory) -> ET.ElementTree:
     """Decompile the built MSI back to XML for table inspection."""
     out_dir = tmp_path_factory.mktemp("decompiled")
     wxs_out = out_dir / "decompiled.wxs"
     result = subprocess.run(
-        [str(wix_exe), "msi", "decompile", str(built_msi), "-o", str(wxs_out)],
-        capture_output=True, text=True,
+        [str(wix_exe), "msi", "decompile", str(built_msi), "-o",
+         str(wxs_out)],
+        capture_output=True,
+        text=True,
     )
-    assert result.returncode == 0, (
-        f"wix msi decompile failed (exit {result.returncode}):\n{result.stderr}"
-    )
+    assert result.returncode == 0, (f"wix msi decompile failed (exit {result.returncode}):\n{result.stderr}")
     return ET.parse(wxs_out)
 
 
@@ -85,7 +87,8 @@ def test_ice_validation_passes(wix_exe: Path, built_msi: Path) -> None:
     """wix msi validate should pass all ICE checks."""
     result = subprocess.run(
         [str(wix_exe), "msi", "validate", str(built_msi)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, (
         f"ICE validation failed (exit {result.returncode}):\n"

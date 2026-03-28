@@ -174,7 +174,6 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 
-
 # Tests ================================================================================================================
 # run manually with `uv run --with pytest pytest scripts/format-section-comments.py`
 

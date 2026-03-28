@@ -67,7 +67,7 @@ hooks = [
 repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
 rev = "3.2.1"
 hooks = [
-  { id = "editorconfig-checker", exclude_types = ["rust", "markdown"] },
+  { id = "editorconfig-checker", exclude_types = ["rust", "markdown", "python"] },
 ]
 
 [[repos]]

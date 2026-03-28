@@ -236,30 +236,26 @@ def find_wix_exe(base_dir: Path) -> Path | None:
 # WiX build ============================================================================================================
 
 
-def wix_build(
-    wix_exe: Path, wxs: Path, stage_dir: Path, version: str, output: Path, console: Console
-) -> None:
+def wix_build(wix_exe: Path, wxs: Path, stage_dir: Path, version: str, output: Path, console: Console) -> None:
     console.print(f"[bold]Building MSI installer[/] (version {version})")
-    result = subprocess.run(
-        [
-            str(wix_exe),
-            "build",
-            str(wxs),
-            "-arch", "x64",
-            "-bindpath",
-            f"BinDir={stage_dir}",
-            "-d",
-            f"ProductVersion={version}",
-            "-o",
-            str(output),
-        ],
-    )
+    result = subprocess.run([
+        str(wix_exe),
+        "build",
+        str(wxs),
+        "-arch",
+        "x64",
+        "-bindpath",
+        f"BinDir={stage_dir}",
+        "-d",
+        f"ProductVersion={version}",
+        "-o",
+        str(output),
+    ], )
     if result.returncode != 0:
         raise BuildError("wix build failed")
 
 
 # WiX toolchain upgrade ================================================================================================
-
 
 _WIX_URL_TEMPLATE = "https://github.com/wixtoolset/wix/releases/download/v{version}/wix-cli-x64.msi"
 

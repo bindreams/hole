@@ -44,7 +44,7 @@ jobs:
         run: uv tool install prek
 
       - name: Run linters
-        run: prek run --all-files
+        run: prek run --all-files --show-diff-on-failure
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})

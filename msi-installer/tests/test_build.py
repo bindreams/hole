@@ -7,7 +7,6 @@ import pytest
 
 from msi_installer import BuildError, find_wix_exe, get_version, link_or_copy
 
-
 # link_or_copy tests ===================================================================================================
 
 

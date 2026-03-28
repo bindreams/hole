@@ -5,6 +5,7 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 ## Architecture
 
 Single-binary design:
+
 - **`hole`** — the only binary, serves as both the Tauri GUI and the privileged daemon depending on CLI arguments.
 - GUI mode (no args): system tray, settings window, config management. Unprivileged.
 - Daemon mode (`hole daemon run`): privileged service running as root/SYSTEM. Manages TUN, routing, shadowsocks-service.
@@ -80,6 +81,7 @@ cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build vali
 ## Releases
 
 Release assets follow GOOS/GOARCH naming, OS first:
+
 - `hole-{version}-windows-amd64.msi`
 - `hole-{version}-darwin-arm64.dmg`
 - `hole-{version}-darwin-amd64.dmg`
