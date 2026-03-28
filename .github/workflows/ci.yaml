@@ -41,7 +41,7 @@ jobs:
         with:
           python-version: "3.x"
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install prek
         run: uv tool install prek
@@ -109,7 +109,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       - name: Test
         working-directory: msi-installer
