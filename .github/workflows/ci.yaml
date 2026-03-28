@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
   lint:
@@ -25,7 +27,12 @@ jobs:
         with:
           go-version: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/setup-python@v6
         with:
@@ -56,7 +63,12 @@ jobs:
         with:
           go-version: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -76,7 +88,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: astral-sh/setup-uv@v6
 
       - name: Test
