@@ -20,6 +20,7 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
         with:
           components: clippy, rustfmt
 
@@ -29,9 +30,11 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/setup-python@v6
@@ -56,6 +59,7 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
         with:
           components: clippy
 
@@ -65,9 +69,11 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Clippy
@@ -85,14 +91,17 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
       - uses: actions/setup-go@v6
         with:
           go-version: stable
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: astral-sh/setup-uv@v6
 
