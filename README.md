@@ -21,7 +21,7 @@ Single-binary design — `hole` serves as both the Tauri GUI and the privileged 
 | `hole` (no args)  | User          | Tauri GUI — system tray, settings window, config management |
 | `hole daemon run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service       |
 
-Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using length-prefixed JSON.
+Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON).
 
 ## Build
 
@@ -48,9 +48,9 @@ crates/
   gui/       hole-gui    — Tauri app + CLI (binary name: "hole")
 external/
   v2ray-plugin/  v2ray-plugin source (git subrepo)
-installer/   WiX MSI installer source (Windows)
-ui/          Frontend HTML/CSS/JS
-scripts/     Build and maintenance scripts
+msi-installer/  WiX MSI installer (Python project: source, build script, tests)
+ui/             Frontend HTML/CSS/JS
+scripts/        Utility scripts
 tests/       E2E test specs (WebDriverIO)
 ```
 
