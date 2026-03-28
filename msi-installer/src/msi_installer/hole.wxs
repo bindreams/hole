@@ -5,7 +5,7 @@
   Installs to [ProgramFiles64Folder]\hole\bin\, registers the daemon service,
   and adds hole to the system PATH.
 
-  Build:   uv run scripts/build-installer.py
+  Build:   cd msi-installer && uv run build
   Install: msiexec /i hole.msi
   Silent:  msiexec /i hole.msi /quiet
 -->

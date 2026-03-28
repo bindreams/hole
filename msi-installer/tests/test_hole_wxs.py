@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 
 from conftest import NS
 
-# Known bind path variables passed by build-installer.py via `-bindpath`.
+# Known bind path variables passed via `-bindpath` to `wix build`.
 KNOWN_BINDPATHS = {"BinDir"}
 
 

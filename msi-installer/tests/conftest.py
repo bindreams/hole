@@ -10,19 +10,7 @@ import msi_installer
 
 NS = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
 WXS_PATH = msi_installer.WXS_PATH
-
-
-def _find_repo_root() -> Path:
-    """Walk parents until finding the repo root (.git/)."""
-    p = Path(__file__).resolve().parent
-    while p != p.parent:
-        if (p / ".git").exists():
-            return p
-        p = p.parent
-    raise RuntimeError("could not find repo root (no .git/ directory found)")
-
-
-REPO_ROOT = _find_repo_root()
+REPO_ROOT = msi_installer._find_repo_root()
 
 
 # XML fixtures =====

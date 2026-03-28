@@ -119,8 +119,8 @@ def ensure_wix(root: Path, console: Console) -> Path:
     try:
         with open(WIX_TOOLCHAIN_PATH, "rb") as f:
             config = tomllib.load(f)
-    except FileNotFoundError:
-        raise BuildError(f"WiX toolchain config not found: {WIX_TOOLCHAIN_PATH}")
+    except FileNotFoundError as e:
+        raise BuildError(f"WiX toolchain config not found: {WIX_TOOLCHAIN_PATH}") from e
 
     for key in ("version", "url", "sha256"):
         if key not in config:
@@ -160,11 +160,11 @@ def ensure_wix(root: Path, console: Console) -> Path:
     if extract_dir.exists():
         try:
             shutil.rmtree(extract_dir)
-        except PermissionError:
+        except PermissionError as e:
             raise BuildError(
                 f"cannot remove stale extraction directory {extract_dir} "
                 "(files may be locked by another process or antivirus)"
-            )
+            ) from e
     extract_dir.mkdir(parents=True)
     _extract_msi(msi_path, extract_dir, console)
     sentinel.write_text(version)
@@ -217,8 +217,8 @@ def _extract_msi(msi_path: Path, target_dir: Path, console: Console) -> None:
                 text=True,
                 timeout=120,
             )
-        except subprocess.TimeoutExpired:
-            raise BuildError("msiexec extraction timed out after 120 seconds")
+        except subprocess.TimeoutExpired as e:
+            raise BuildError("msiexec extraction timed out after 120 seconds") from e
 
     if result.returncode != 0:
         raise BuildError(f"msiexec extraction failed (exit {result.returncode}): {result.stderr}")
