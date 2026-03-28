@@ -34,12 +34,15 @@ jobs:
       - uses: pre-commit/action@v3.0.1
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
     steps:
       - uses: actions/checkout@v6
         with:
@@ -62,7 +65,7 @@ jobs:
         run: cargo test --workspace
 
   test-installer:
-    name: Test installer
+    name: Test installer (windows/amd64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
