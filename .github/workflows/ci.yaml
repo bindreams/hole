@@ -84,7 +84,14 @@ jobs:
         run: uv run --directory msi-installer build
 
       - name: Install
-        run: msiexec /i target\release\hole.msi /quiet /norestart
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-install.log"
+          $proc = Start-Process msiexec -ArgumentList "/i","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 50
+            throw "msiexec /i failed with exit code $($proc.ExitCode)"
+          }
 
       - name: Verify install
         shell: pwsh
@@ -98,9 +105,23 @@ jobs:
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
 
+      - name: Dump install log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-install.log"
+          if (Test-Path $log) { Get-Content $log -Tail 200 }
+
       - name: Uninstall
         if: always()
-        run: msiexec /x target\release\hole.msi /quiet /norestart
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-uninstall.log"
+          $proc = Start-Process msiexec -ArgumentList "/x","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 50
+            Write-Warning "msiexec /x failed with exit code $($proc.ExitCode)"
+          }
 
       - name: Verify uninstall
         if: always()
