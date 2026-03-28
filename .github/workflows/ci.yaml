@@ -60,3 +60,79 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  test-installer:
+    name: Test installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Test
+        working-directory: msi-installer
+        run: uv run --group dev pytest -v
+
+      - name: Build MSI
+        run: uv run --directory msi-installer build
+
+      - name: Smoke-test binary
+        run: target\release\hole.exe version
+
+      - name: Install
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-install.log"
+          $proc = Start-Process msiexec -ArgumentList "/i","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 50
+            throw "msiexec /i failed with exit code $($proc.ExitCode)"
+          }
+
+      - name: Verify install
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          foreach ($f in @("hole.exe", "v2ray-plugin.exe", "wintun.dll")) {
+            if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
+          }
+          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
+          if (!$svc) { throw "HoleDaemon service not registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
+
+      - name: Dump install log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-install.log"
+          if (Test-Path $log) { Get-Content $log -Tail 200 }
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-uninstall.log"
+          $proc = Start-Process msiexec -ArgumentList "/x","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 50
+            Write-Warning "msiexec /x failed with exit code $($proc.ExitCode)"
+          }
+
+      - name: Verify uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          if (Test-Path $binDir) { throw "$binDir still exists" }
+          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
+          if ($svc) { throw "HoleDaemon service still registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
