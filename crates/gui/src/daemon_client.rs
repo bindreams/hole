@@ -127,6 +127,11 @@ impl DaemonClient {
             .body(Full::new(Bytes::new()))
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
         self.sender
+            .ready()
+            .await
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        #[allow(clippy::disallowed_methods)] // ready() called above
+        self.sender
             .send_request(req)
             .await
             .map_err(|e| ClientError::Protocol(e.to_string()))
@@ -144,6 +149,11 @@ impl DaemonClient {
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        self.sender
+            .ready()
+            .await
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        #[allow(clippy::disallowed_methods)] // ready() called above
         self.sender
             .send_request(req)
             .await
