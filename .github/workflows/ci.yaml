@@ -83,6 +83,9 @@ jobs:
       - name: Build MSI
         run: uv run --directory msi-installer build
 
+      - name: Smoke-test binary
+        run: target\release\hole.exe version
+
       - name: Install
         shell: pwsh
         run: |
