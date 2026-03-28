@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
-// CLI structure =====
+// CLI structure =======================================================================================================
 
 #[derive(Parser)]
 #[command(name = "hole", about = "Shadowsocks GUI with transparent proxy", version = env!("HOLE_VERSION"))]
@@ -82,7 +82,7 @@ enum PathAction {
     Remove,
 }
 
-// Dispatch =====
+// Dispatch ============================================================================================================
 
 /// Parse CLI arguments and dispatch to the appropriate handler.
 /// This function exits the process when done.
@@ -379,7 +379,7 @@ fn handle_path(action: PathAction) -> i32 {
     }
 }
 
-// Platform helpers =====
+// Platform helpers ====================================================================================================
 
 #[cfg(target_os = "windows")]
 fn attach_console() {

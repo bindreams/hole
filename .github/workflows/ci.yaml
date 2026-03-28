@@ -31,7 +31,6 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
@@ -42,7 +41,13 @@ jobs:
         with:
           python-version: "3.x"
 
-      - uses: pre-commit/action@v3.0.1
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install prek
+        run: uv tool install prek
+
+      - name: Run linters
+        run: prek run --all-files --show-diff-on-failure
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -71,7 +76,6 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
@@ -100,13 +104,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       - name: Test
         working-directory: msi-installer

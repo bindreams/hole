@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use thiserror::Error;
 
-// Status detection =====
+// Status detection ====================================================================================================
 
 /// Installation state of the daemon service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub fn daemon_install_status() -> DaemonInstallStatus {
     }
 }
 
-// Elevation =====
+// Elevation ===========================================================================================================
 
 #[derive(Debug, Error)]
 pub enum SetupError {
@@ -148,7 +148,7 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-// Install/uninstall orchestration =====
+// Install/uninstall orchestration =====================================================================================
 
 /// Run `daemon install` — idempotent, handles upgrades.
 pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
@@ -206,7 +206,7 @@ pub fn uninstall_daemon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// GUI launch check =====
+// GUI launch check ====================================================================================================
 
 /// Check daemon status at GUI launch and prompt for installation if needed.
 ///

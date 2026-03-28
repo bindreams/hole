@@ -9,7 +9,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
 
-// Menu IDs =====
+// Menu IDs ============================================================================================================
 
 const ID_ENABLE: &str = "enable";
 const ID_AUTOSTART: &str = "autostart";
@@ -21,7 +21,7 @@ const ID_ABOUT: &str = "about";
 const ID_INSTALL_UPDATE: &str = "install_update";
 const ID_CHECK_UPDATE: &str = "check_update";
 
-// Tray creation =====
+// Tray creation =======================================================================================================
 
 /// Build the tray menu, optionally including an "Install Update" item.
 pub fn build_tray_menu(
@@ -99,7 +99,7 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
     }
 }
 
-// Event handler =====
+// Event handler =======================================================================================================
 
 fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
@@ -448,7 +448,7 @@ fn open_settings_window(app: &AppHandle) {
         .inner_size(600.0, 400.0)
         .resizable(true);
 
-    // Menu bar (all platforms) -----
+    // Menu bar (all platforms) ----------------------------------------------------------------------------------------
     {
         use tauri::menu::{Menu, Submenu};
 

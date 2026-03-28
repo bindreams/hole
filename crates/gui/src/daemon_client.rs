@@ -13,7 +13,7 @@ use tracing::debug;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MiB
 
-// Errors =====
+// Errors ==============================================================================================================
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -27,7 +27,7 @@ pub enum ClientError {
     Protocol(String),
 }
 
-// Client =====
+// Client ==============================================================================================================
 
 /// IPC client that connects to the daemon's local socket and speaks HTTP/1.1.
 pub struct DaemonClient {
@@ -151,7 +151,7 @@ impl DaemonClient {
     }
 }
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn map_connect_error(e: std::io::Error) -> ClientError {
     if e.kind() == std::io::ErrorKind::PermissionDenied {

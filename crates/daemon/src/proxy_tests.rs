@@ -2,7 +2,7 @@ use super::*;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn sample_server() -> ServerEntry {
     ServerEntry {
@@ -25,7 +25,7 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-// Server config tests =====
+// Server config tests =================================================================================================
 
 #[skuld::test]
 fn builds_one_server_entry() {
@@ -62,7 +62,7 @@ fn invalid_method_returns_error() {
     assert!(matches!(err, ProxyError::InvalidMethod(_)));
 }
 
-// Local instances tests =====
+// Local instances tests ===============================================================================================
 
 #[skuld::test]
 fn creates_two_local_instances() {
@@ -106,7 +106,7 @@ fn socks5_uses_custom_port() {
     assert_eq!(addr.port(), 9999);
 }
 
-// Plugin tests =====
+// Plugin tests ========================================================================================================
 
 #[skuld::test]
 fn no_plugin_when_absent() {

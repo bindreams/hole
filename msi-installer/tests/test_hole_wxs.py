@@ -11,8 +11,7 @@ from conftest import NS
 # Known bind path variables passed via `-bindpath` to `wix build`.
 KNOWN_BINDPATHS = {"BinDir"}
 
-
-# GUID tests =====
+# GUID tests ===========================================================================================================
 
 
 def _collect_component_guids(package: ET.Element) -> list[tuple[str, str]]:
@@ -26,27 +25,21 @@ def _collect_component_guids(package: ET.Element) -> list[tuple[str, str]]:
     return result
 
 
-UUID_RE = re.compile(
-    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
-)
+UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
 
 
 def test_guids_are_unique(package: ET.Element) -> None:
     pairs = _collect_component_guids(package)
     guids = [g for _, g in pairs]
-    assert len(guids) == len(set(guids)), (
-        f"Duplicate component GUIDs: {[g for g in guids if guids.count(g) > 1]}"
-    )
+    assert len(guids) == len(set(guids)), (f"Duplicate component GUIDs: {[g for g in guids if guids.count(g) > 1]}")
 
 
 def test_guids_are_valid_format(package: ET.Element) -> None:
     for comp_id, guid in _collect_component_guids(package):
-        assert UUID_RE.match(guid), (
-            f"Component '{comp_id}' has invalid GUID format: {guid}"
-        )
+        assert UUID_RE.match(guid), (f"Component '{comp_id}' has invalid GUID format: {guid}")
 
 
-# Directory reference tests =====
+# Directory reference tests ============================================================================================
 
 
 def _collect_directory_ids(package: ET.Element) -> set[str]:
@@ -65,17 +58,12 @@ def test_custom_action_directories_defined(package: ET.Element) -> None:
     for ca in package.iter(f"{{{NS['wix']}}}CustomAction"):
         dir_ref = ca.get("Directory")
         if dir_ref is not None:
-            assert dir_ref in defined, (
-                f"CustomAction '{ca.get('Id')}' references undefined directory '{dir_ref}'"
-            )
+            assert dir_ref in defined, (f"CustomAction '{ca.get('Id')}' references undefined directory '{dir_ref}'")
 
 
 def _collect_file_ids(package: ET.Element) -> set[str]:
     """Collect all File IDs defined in the WXS."""
-    return {
-        f.get("Id", "")
-        for f in package.iter(f"{{{NS['wix']}}}File")
-    }
+    return {f.get("Id", "") for f in package.iter(f"{{{NS['wix']}}}File")}
 
 
 def test_custom_actions_use_fileref(package: ET.Element) -> None:
@@ -93,17 +81,12 @@ def test_custom_actions_use_fileref(package: ET.Element) -> None:
         )
         file_ref = ca.get("FileRef")
         if file_ref is not None:
-            assert file_ref in file_ids, (
-                f"CustomAction '{ca_id}' references undefined File '{file_ref}'"
-            )
+            assert file_ref in file_ids, (f"CustomAction '{ca_id}' references undefined File '{file_ref}'")
 
 
 def test_install_dir_is_64bit(package: ET.Element) -> None:
     """Binary components must install under ProgramFiles64Folder, not ProgramFilesFolder."""
-    std_dirs = [
-        elem.get("Id")
-        for elem in package.iter(f"{{{NS['wix']}}}StandardDirectory")
-    ]
+    std_dirs = [elem.get("Id") for elem in package.iter(f"{{{NS['wix']}}}StandardDirectory")]
     assert "ProgramFiles64Folder" in std_dirs, (
         "Installation root must use ProgramFiles64Folder for 64-bit binaries. "
         f"Found StandardDirectory IDs: {std_dirs}"
@@ -113,8 +96,7 @@ def test_install_dir_is_64bit(package: ET.Element) -> None:
     )
 
 
-# File source tests =====
-
+# File source tests ====================================================================================================
 
 BINDPATH_RE = re.compile(r"!\(bindpath\.(\w+)\)")
 
@@ -130,7 +112,7 @@ def test_file_sources_use_known_bindpaths(package: ET.Element) -> None:
             )
 
 
-# Custom action sequencing tests =====
+# Custom action sequencing tests =======================================================================================
 
 
 def _get_custom_entries(package: ET.Element) -> list[ET.Element]:
@@ -171,9 +153,7 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
         if after:
             after_map[action] = after
 
-    install_cas = [
-        c for c in customs if _is_install_condition(c.get("Condition", ""))
-    ]
+    install_cas = [c for c in customs if _is_install_condition(c.get("Condition", ""))]
 
     for custom in install_cas:
         action = custom.get("Action", "")
@@ -203,9 +183,7 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
     This keeps the ordering fully explicit and solver-independent.
     """
     customs = _get_custom_entries(package)
-    uninstall_cas = [
-        c for c in customs if _is_uninstall_condition(c.get("Condition", ""))
-    ]
+    uninstall_cas = [c for c in customs if _is_uninstall_condition(c.get("Condition", ""))]
 
     for custom in uninstall_cas:
         action = custom.get("Action", "")
@@ -230,14 +208,12 @@ def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> Non
         )
 
 
-# Package attribute tests =====
+# Package attribute tests ==============================================================================================
 
 
 def test_package_version_is_preprocessor_variable(package: ET.Element) -> None:
     version = package.get("Version")
-    assert version == "$(ProductVersion)", (
-        f"Package Version should be '$(ProductVersion)', got '{version}'"
-    )
+    assert version == "$(ProductVersion)", (f"Package Version should be '$(ProductVersion)', got '{version}'")
 
 
 def test_major_upgrade_exists(package: ET.Element) -> None:
@@ -245,7 +221,7 @@ def test_major_upgrade_exists(package: ET.Element) -> None:
     assert mu is not None, "MajorUpgrade element is required for upgrade support"
 
 
-# Custom action attribute tests =====
+# Custom action attribute tests ========================================================================================
 
 
 def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
@@ -259,10 +235,7 @@ def test_deferred_cas_not_impersonated(package: ET.Element) -> None:
 
 def _ca_map(package: ET.Element) -> dict[str, ET.Element]:
     """Map CustomAction Id -> element."""
-    return {
-        ca.get("Id", ""): ca
-        for ca in package.iter(f"{{{NS['wix']}}}CustomAction")
-    }
+    return {ca.get("Id", ""): ca for ca in package.iter(f"{{{NS['wix']}}}CustomAction")}
 
 
 def test_install_cas_return_check(package: ET.Element) -> None:
@@ -291,7 +264,7 @@ def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
             )
 
 
-# Shortcut component tests =====
+# Shortcut component tests =============================================================================================
 
 
 def test_shortcut_registry_uses_hkcu(package: ET.Element) -> None:
@@ -315,16 +288,13 @@ def test_shortcut_registry_uses_hkcu(package: ET.Element) -> None:
                 )
 
 
-# Component key path tests =====
+# Component key path tests =============================================================================================
 
 
 def test_every_component_has_key_path(package: ET.Element) -> None:
     for comp in package.iter(f"{{{NS['wix']}}}Component"):
         comp_id = comp.get("Id", "<anonymous>")
-        key_path_children = [
-            child for child in comp
-            if child.get("KeyPath") == "yes"
-        ]
+        key_path_children = [child for child in comp if child.get("KeyPath") == "yes"]
         assert len(key_path_children) == 1, (
             f"Component '{comp_id}' must have exactly one child with KeyPath='yes', "
             f"found {len(key_path_children)}"

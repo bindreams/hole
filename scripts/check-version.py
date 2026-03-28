@@ -129,8 +129,7 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-# Tests (run with pytest) =====
+# Tests (run with pytest) ==============================================================================================
 
 
 def test_equal_versions():
