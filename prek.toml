@@ -38,6 +38,14 @@ pass_filenames = false
 always_run = true
 
 [[repos.hooks]]
+id = "check-workspace-lints"
+name = "check workspace lints inheritance"
+entry = "python scripts/check-workspace-lints.py"
+language = "system"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
 id = "format-section-comments"
 name = "format section comments"
 entry = "python scripts/format-section-comments.py"
