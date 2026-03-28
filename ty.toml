@@ -1,0 +1,11 @@
+[rules]
+# PEP 723 inline script dependencies are not visible to ty's module resolver.
+unresolved-import = "ignore"
+
+# xml.etree type stubs are incomplete; these are false positives.
+[[overrides]]
+include = ["msi-installer/tests/**"]
+
+[overrides.rules]
+invalid-return-type = "ignore"
+unresolved-attribute = "ignore"

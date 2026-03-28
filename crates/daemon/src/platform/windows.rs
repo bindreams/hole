@@ -13,13 +13,13 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-// Constants =====
+// Constants ===========================================================================================================
 
 pub const SERVICE_NAME: &str = "HoleDaemon";
 pub const SERVICE_DISPLAY_NAME: &str = "Hole Daemon";
 pub const SERVICE_DESCRIPTION: &str = "Transparent proxy daemon for the Hole application";
 
-// Service entry =====
+// Service entry =======================================================================================================
 
 /// Socket path override set by the CLI before service dispatch.
 static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -121,7 +121,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Install/uninstall =====
+// Install/uninstall ===================================================================================================
 
 /// Install the daemon as a Windows Service.
 ///
@@ -164,7 +164,7 @@ pub fn uninstall() -> Result<(), windows_service::Error> {
     Ok(())
 }
 
-// Start/stop =====
+// Start/stop ==========================================================================================================
 
 /// Start the Windows Service via SCM.
 pub fn start() -> Result<(), windows_service::Error> {
@@ -204,7 +204,7 @@ pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-// Query =====
+// Query ===============================================================================================================
 
 /// Check whether the service is registered in SCM.
 pub fn is_installed() -> bool {

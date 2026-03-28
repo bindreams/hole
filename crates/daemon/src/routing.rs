@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::process::Command;
 use tracing::{info, warn};
 
-// Command builders =====
+// Command builders ====================================================================================================
 
 /// Build the shell commands to set up split routing.
 ///
@@ -21,7 +21,7 @@ pub fn build_teardown_commands(server_ip: IpAddr) -> Vec<Vec<String>> {
     platform_teardown_commands(server_ip)
 }
 
-// Execution =====
+// Execution ===========================================================================================================
 
 /// Execute route setup commands. Logs each command and its result.
 pub fn setup_routes(tun_name: &str, server_ip: IpAddr, original_gateway: IpAddr) -> std::io::Result<()> {
@@ -58,7 +58,7 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// Route guard =====
+// Route guard =========================================================================================================
 
 /// RAII guard that tears down routes on drop. Provides crash safety.
 pub struct RouteGuard {
@@ -79,7 +79,7 @@ impl Drop for RouteGuard {
     }
 }
 
-// Platform-specific command builders =====
+// Platform-specific command builders ==================================================================================
 
 #[cfg(target_os = "windows")]
 fn platform_setup_commands(tun_name: &str, server_ip: IpAddr, original_gateway: IpAddr) -> Vec<Vec<String>> {

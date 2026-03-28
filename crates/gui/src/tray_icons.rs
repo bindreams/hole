@@ -41,7 +41,7 @@ pub fn tray_image(state: TrayState) -> Image<'static> {
     }
 }
 
-// macOS =====
+// macOS ===============================================================================================================
 
 #[cfg(target_os = "macos")]
 fn macos_image(state: TrayState) -> Image<'static> {
@@ -56,7 +56,7 @@ fn macos_image(state: TrayState) -> Image<'static> {
     Image::new(rgba, SIZE, SIZE)
 }
 
-// Windows =====
+// Windows =============================================================================================================
 
 #[cfg(target_os = "windows")]
 fn windows_image(state: TrayState) -> Image<'static> {

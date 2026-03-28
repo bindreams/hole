@@ -2,7 +2,7 @@ use crate::config::ServerEntry;
 use thiserror::Error;
 use uuid::Uuid;
 
-// Errors =====
+// Errors ==============================================================================================================
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -14,7 +14,7 @@ pub enum ImportError {
     InvalidValue(String),
 }
 
-// Import logic =====
+// Import logic ========================================================================================================
 
 pub fn import_servers(json: &str) -> Result<Vec<ServerEntry>, ImportError> {
     let value: serde_json::Value = serde_json::from_str(json)?;
