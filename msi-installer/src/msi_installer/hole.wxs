@@ -2,10 +2,10 @@
 
 <!--
   WiX installer for Hole.
-  Installs to [ProgramFilesFolder]\hole\bin\, registers the daemon service,
+  Installs to [ProgramFiles64Folder]\hole\bin\, registers the daemon service,
   and adds hole to the system PATH.
 
-  Build:   uv run scripts/build-installer.py
+  Build:   cd msi-installer && uv run build
   Install: msiexec /i hole.msi
   Silent:  msiexec /i hole.msi /quiet
 -->
@@ -21,7 +21,7 @@
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
     <!-- Installation directory structure -->
-    <StandardDirectory Id="ProgramFilesFolder">
+    <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="hole">
         <Directory Id="BINDIR" Name="bin" />
       </Directory>
@@ -55,7 +55,7 @@
           WorkingDirectory="BINDIR" />
         <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
         <RegistryValue
-          Root="HKLM"
+          Root="HKCU"
           Key="Software\Hole"
           Name="Installed"
           Type="integer"
@@ -64,35 +64,37 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Custom actions: daemon install/uninstall + PATH add/remove -->
+    <!-- Custom actions: daemon install/uninstall + PATH add/remove.
+         Uses FileRef (Type 18) to reference hole.exe by its File ID,
+         not Directory (Type 34) which fails to launch the exe. -->
     <CustomAction
       Id="DaemonInstall"
-      Directory="BINDIR"
-      ExeCommand="hole.exe daemon install"
+      FileRef="hole.exe"
+      ExeCommand="daemon install"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <CustomAction
       Id="PathAdd"
-      Directory="BINDIR"
-      ExeCommand="hole.exe path add"
+      FileRef="hole.exe"
+      ExeCommand="path add"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <CustomAction
       Id="PathRemove"
-      Directory="BINDIR"
-      ExeCommand="hole.exe path remove"
+      FileRef="hole.exe"
+      ExeCommand="path remove"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
 
     <CustomAction
       Id="DaemonUninstall"
-      Directory="BINDIR"
-      ExeCommand="hole.exe daemon uninstall"
+      FileRef="hole.exe"
+      ExeCommand="daemon uninstall"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
@@ -104,10 +106,12 @@
       <Custom Action="PathAdd" After="DaemonInstall"
         Condition="NOT Installed AND NOT REMOVE" />
 
-      <!-- Pre-uninstall: PATH remove then daemon uninstall -->
-      <Custom Action="PathRemove" Before="RemoveFiles"
+      <!-- Pre-uninstall: PATH remove then daemon uninstall.
+           Each uninstall CA must be transitively anchored Before RemoveFiles
+           via explicit Before attributes, so ordering is fully determined. -->
+      <Custom Action="PathRemove" Before="DaemonUninstall"
         Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="DaemonUninstall" After="PathRemove"
+      <Custom Action="DaemonUninstall" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 

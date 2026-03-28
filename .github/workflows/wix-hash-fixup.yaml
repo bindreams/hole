@@ -1,0 +1,29 @@
+name: Update WiX hash
+
+on:
+  push:
+    branches: ["renovate/**"]
+    paths: ["msi-installer/src/msi_installer/wix-toolchain.toml"]
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Update WiX URL and SHA256
+        run: uv run --directory msi-installer upgrade-wix
+
+      - name: Commit if changed
+        run: |
+          git diff --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add msi-installer/src/msi_installer/wix-toolchain.toml
+          git commit -m "Update WiX toolchain URL and SHA256"
+          git push
