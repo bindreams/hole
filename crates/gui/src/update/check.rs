@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::error::UpdateError;
 
-// GitHub API types =====
+// GitHub API types ====================================================================================================
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GitHubTag {
@@ -32,7 +32,7 @@ pub(crate) struct GitHubAsset {
     pub browser_download_url: String,
 }
 
-// Platform asset suffix =====
+// Platform asset suffix ===============================================================================================
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const ASSET_SUFFIX: &str = "windows-amd64.msi";
@@ -50,7 +50,7 @@ const ASSET_SUFFIX: &str = "darwin-amd64.dmg";
 )))]
 compile_error!("unsupported platform for auto-update asset matching");
 
-// Public API =====
+// Public API ==========================================================================================================
 
 /// Information about an available update.
 #[derive(Debug, Clone)]
@@ -94,7 +94,7 @@ pub fn check_for_update() -> Result<Option<UpdateInfo>, UpdateError> {
     Ok(None)
 }
 
-// Internal helpers =====
+// Internal helpers ====================================================================================================
 
 /// Fetch all tags from GitHub, transparently paginating.
 fn fetch_all_tags() -> Result<Vec<GitHubTag>, UpdateError> {

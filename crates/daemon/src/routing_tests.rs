@@ -1,7 +1,7 @@
 use super::*;
 use std::net::IpAddr;
 
-// Command generation tests =====
+// Command generation tests ============================================================================================
 
 #[skuld::test]
 fn setup_generates_three_commands() {
@@ -77,7 +77,7 @@ fn teardown_includes_server_bypass() {
     assert!(joined.contains("9.8.7.6"), "missing server bypass in:\n{joined}");
 }
 
-// RouteGuard tests =====
+// RouteGuard tests ====================================================================================================
 
 #[skuld::test]
 fn route_guard_stores_server_ip() {

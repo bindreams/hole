@@ -9,7 +9,7 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-// State =====
+// State ===============================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProxyState {
@@ -17,7 +17,7 @@ pub enum ProxyState {
     Running,
 }
 
-// Backend trait =====
+// Backend trait =======================================================================================================
 
 pub trait ProxyBackend: Send + Sync {
     fn start_ss(
@@ -30,7 +30,7 @@ pub trait ProxyBackend: Send + Sync {
     fn default_gateway(&self) -> Result<IpAddr, ProxyError>;
 }
 
-// Real backend =====
+// Real backend ========================================================================================================
 
 pub struct RealBackend;
 
@@ -55,7 +55,7 @@ impl ProxyBackend for RealBackend {
     }
 }
 
-// ProxyManager =====
+// ProxyManager ========================================================================================================
 
 pub struct ProxyManager<B: ProxyBackend = RealBackend> {
     backend: B,
@@ -175,7 +175,7 @@ impl<B: ProxyBackend> ProxyManager<B> {
     }
 }
 
-// DNS resolution =====
+// DNS resolution ======================================================================================================
 
 async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> {
     // Try parsing as IP address first

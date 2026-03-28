@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::error::UpdateError;
 
-// Windows =====
+// Windows =============================================================================================================
 
 #[cfg(target_os = "windows")]
 pub fn run_installer(path: &Path, quiet: bool) -> Result<(), UpdateError> {
@@ -45,7 +45,7 @@ pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
     args
 }
 
-// macOS =====
+// macOS ===============================================================================================================
 
 #[cfg(target_os = "macos")]
 pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {

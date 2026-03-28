@@ -12,8 +12,7 @@ NS = {"wix": "http://wixtoolset.org/schemas/v4/wxs"}
 WXS_PATH = msi_installer.WXS_PATH
 REPO_ROOT = msi_installer._find_repo_root()
 
-
-# XML fixtures =====
+# XML fixtures =========================================================================================================
 
 
 @pytest.fixture(scope="session")
@@ -33,7 +32,7 @@ def package(root: ET.Element) -> ET.Element:
     return pkg
 
 
-# WiX toolchain fixture =====
+# WiX toolchain fixture ================================================================================================
 
 
 @pytest.fixture(scope="session")

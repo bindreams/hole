@@ -22,7 +22,7 @@ fn main() {
     tauri_build::build();
 }
 
-// Repo root =====
+// Repo root ===========================================================================================================
 
 fn git_repo_root() -> PathBuf {
     let output = std::process::Command::new("git")
@@ -35,7 +35,7 @@ fn git_repo_root() -> PathBuf {
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
 }
 
-// Version =====
+// Version =============================================================================================================
 
 fn emit_version_env(repo_root: &Path) {
     let git_dir = repo_root.join(".git");
@@ -131,7 +131,7 @@ fn compute_git_version(repo_root: &Path) -> Result<String, String> {
     Ok(version)
 }
 
-// v2ray-plugin build =====
+// v2ray-plugin build ==================================================================================================
 
 fn v2ray_plugin_output_name() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -187,7 +187,7 @@ fn build_v2ray_plugin(repo_root: &Path, cache_dir: &Path) {
     }
 }
 
-// wintun download =====
+// wintun download =====================================================================================================
 
 #[cfg(target_os = "windows")]
 const WINTUN_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";
@@ -254,7 +254,7 @@ fn download_wintun(cache_dir: &Path) {
     eprintln!("wintun.dll downloaded and verified ({} bytes)", dll_data.len());
 }
 
-// Icons =====
+// Icons ===============================================================================================================
 
 fn generate_icons(svg_path: &Path, out_dir: &Path) {
     let svg_data = std::fs::read(svg_path).expect("failed to read icon.svg");
@@ -320,7 +320,7 @@ fn write_icns(path: &Path, png_data: &[u8]) {
     std::fs::write(path, buf).unwrap();
 }
 
-// Tray icons =====
+// Tray icons ==========================================================================================================
 
 fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

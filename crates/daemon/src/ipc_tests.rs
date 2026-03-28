@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
-// Mock backend =====
+// Mock backend ========================================================================================================
 
 struct MockBackend {
     fail_start: AtomicBool,
@@ -60,7 +60,7 @@ impl ProxyBackend for MockBackend {
     }
 }
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
@@ -95,25 +95,39 @@ fn test_socket_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hole-ipc-test-{}-{suffix}.sock", std::process::id()))
 }
 
-/// Connect to a test IPC server and perform HTTP/1.1 handshake.
-async fn http_connect(path: &Path) -> (http1::SendRequest<Full<Bytes>>, tokio::task::JoinHandle<()>) {
-    let stream = LocalStream::connect(path).await.unwrap();
-    let io = TokioIo::new(stream);
-    let (sender, conn) = http1::handshake(io).await.unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    (sender, handle)
+/// Test HTTP client that enforces the tower::Service `ready()` contract.
+struct TestClient {
+    sender: http1::SendRequest<Full<Bytes>>,
+    _conn: tokio::task::JoinHandle<()>,
 }
 
-async fn get_status(sender: &mut http1::SendRequest<Full<Bytes>>) -> StatusResponse {
+impl TestClient {
+    /// Connect to a test IPC server and perform HTTP/1.1 handshake.
+    async fn connect(path: &Path) -> Self {
+        let stream = LocalStream::connect(path).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (sender, conn) = http1::handshake(io).await.unwrap();
+        let _conn = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Self { sender, _conn }
+    }
+
+    async fn send(&mut self, req: http::Request<Full<Bytes>>) -> http::Response<hyper::body::Incoming> {
+        self.sender.ready().await.unwrap();
+        #[allow(clippy::disallowed_methods)] // ready() called above
+        self.sender.send_request(req).await.unwrap()
+    }
+}
+
+async fn get_status(client: &mut TestClient) -> StatusResponse {
     let req = http::Request::builder()
         .method("GET")
         .uri(ROUTE_STATUS)
         .header("host", "localhost")
         .body(Full::new(Bytes::new()))
         .unwrap();
-    let resp = sender.send_request(req).await.unwrap();
+    let resp = client.send(req).await;
     assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body).unwrap()
@@ -126,10 +140,7 @@ async fn consume(resp: http::Response<hyper::body::Incoming>) -> u16 {
     status
 }
 
-async fn post_start(
-    sender: &mut http1::SendRequest<Full<Bytes>>,
-    config: &ProxyConfig,
-) -> http::Response<hyper::body::Incoming> {
+async fn post_start(client: &mut TestClient, config: &ProxyConfig) -> http::Response<hyper::body::Incoming> {
     let body_bytes = serde_json::to_vec(config).unwrap();
     let req = http::Request::builder()
         .method("POST")
@@ -138,23 +149,20 @@ async fn post_start(
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap();
-    sender.send_request(req).await.unwrap()
+    client.send(req).await
 }
 
-async fn post_stop(sender: &mut http1::SendRequest<Full<Bytes>>) -> http::Response<hyper::body::Incoming> {
+async fn post_stop(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
     let req = http::Request::builder()
         .method("POST")
         .uri(ROUTE_STOP)
         .header("host", "localhost")
         .body(Full::new(Bytes::new()))
         .unwrap();
-    sender.send_request(req).await.unwrap()
+    client.send(req).await
 }
 
-async fn post_reload(
-    sender: &mut http1::SendRequest<Full<Bytes>>,
-    config: &ProxyConfig,
-) -> http::Response<hyper::body::Incoming> {
+async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Response<hyper::body::Incoming> {
     let body_bytes = serde_json::to_vec(config).unwrap();
     let req = http::Request::builder()
         .method("POST")
@@ -163,10 +171,10 @@ async fn post_reload(
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap();
-    sender.send_request(req).await.unwrap()
+    client.send(req).await
 }
 
-// Tests =====
+// Tests ===============================================================================================================
 
 #[skuld::test]
 fn server_accepts_connection() {
@@ -191,8 +199,8 @@ fn status_when_not_running_returns_false() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
-        let status = get_status(&mut sender).await;
+        let mut client = TestClient::connect(&path).await;
+        let status = get_status(&mut client).await;
 
         assert_eq!(
             status,
@@ -202,8 +210,7 @@ fn status_when_not_running_returns_false() {
                 error: None,
             }
         );
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -217,15 +224,14 @@ fn multiple_requests_on_same_connection() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
-        let s1 = get_status(&mut sender).await;
+        let mut client = TestClient::connect(&path).await;
+        let s1 = get_status(&mut client).await;
         assert!(!s1.running);
 
-        let s2 = get_status(&mut sender).await;
+        let s2 = get_status(&mut client).await;
         assert!(!s2.running);
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -239,7 +245,7 @@ fn invalid_request_returns_error_response() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
 
         // Send garbage body to start endpoint
         let req = http::Request::builder()
@@ -249,11 +255,10 @@ fn invalid_request_returns_error_response() {
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from("not valid json!!")))
             .unwrap();
-        let resp = sender.send_request(req).await.unwrap();
+        let resp = client.send(req).await;
         assert!(resp.status().is_client_error());
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -284,20 +289,19 @@ fn start_request_starts_proxy() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
 
         // Start
-        assert_eq!(consume(post_start(&mut sender, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
 
         // Status should show running
-        let status = get_status(&mut sender).await;
+        let status = get_status(&mut client).await;
         assert!(status.running, "expected running=true after Start");
 
         // Stop (cleanup)
-        assert_eq!(consume(post_stop(&mut sender).await).await, 200);
+        assert_eq!(consume(post_stop(&mut client).await).await, 200);
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -312,20 +316,19 @@ fn stop_request_stops_proxy() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
 
         // Start
-        consume(post_start(&mut sender, &sample_config()).await).await;
+        consume(post_start(&mut client, &sample_config()).await).await;
 
         // Stop
-        assert_eq!(consume(post_stop(&mut sender).await).await, 200);
+        assert_eq!(consume(post_stop(&mut client).await).await, 200);
 
         // Status should show stopped
-        let status = get_status(&mut sender).await;
+        let status = get_status(&mut client).await;
         assert!(!status.running, "expected running=false after Stop");
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -340,8 +343,8 @@ fn start_failure_returns_error() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
-        let resp = post_start(&mut sender, &sample_config()).await;
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_start(&mut client, &sample_config()).await;
 
         assert_eq!(resp.status(), 500);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -352,8 +355,7 @@ fn start_failure_returns_error() {
             err.message
         );
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -368,23 +370,22 @@ fn reload_request_reloads_proxy() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
 
         // Start first
-        consume(post_start(&mut sender, &sample_config()).await).await;
+        consume(post_start(&mut client, &sample_config()).await).await;
 
         // Reload
-        assert_eq!(consume(post_reload(&mut sender, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_reload(&mut client, &sample_config()).await).await, 200);
 
         // Should still be running after reload
-        let status = get_status(&mut sender).await;
+        let status = get_status(&mut client).await;
         assert!(status.running, "expected running=true after Reload");
 
         // Cleanup
-        consume(post_stop(&mut sender).await).await;
+        consume(post_stop(&mut client).await).await;
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -399,8 +400,8 @@ fn run_cancellation_aborts_connection_handlers() {
         });
 
         // Connect a client so there's an active connection handler task
-        let (mut sender, _conn_handle) = http_connect(&path).await;
-        let status = get_status(&mut sender).await;
+        let mut client = TestClient::connect(&path).await;
+        let status = get_status(&mut client).await;
         assert!(!status.running);
 
         // Cancel the server (simulates shutdown via select!)
@@ -410,17 +411,20 @@ fn run_cancellation_aborts_connection_handlers() {
         // The connection handler should have been aborted by JoinSet::drop.
         // A subsequent request should fail — not block forever.
         // Allow up to 3 seconds for the non-blocking accept poll loop to yield.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            sender.send_request(
+        //
+        // ready() is intentionally omitted: the server is already dead, so we're
+        // testing that send_request on a broken connection fails promptly.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), {
+            #[allow(clippy::disallowed_methods)]
+            client.sender.send_request(
                 http::Request::builder()
                     .method("GET")
                     .uri(ROUTE_STATUS)
                     .header("host", "localhost")
                     .body(Full::new(Bytes::new()))
                     .unwrap(),
-            ),
-        )
+            )
+        })
         .await;
         assert!(result.is_ok(), "request should not block — handler must be aborted");
         assert!(
@@ -439,18 +443,17 @@ fn unknown_route_returns_404() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
         let req = http::Request::builder()
             .method("GET")
             .uri("/v1/nonexistent")
             .header("host", "localhost")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = sender.send_request(req).await.unwrap();
+        let resp = client.send(req).await;
         assert_eq!(resp.status(), 404);
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
@@ -464,23 +467,22 @@ fn wrong_method_returns_405() {
             server.run_once().await.unwrap();
         });
 
-        let (mut sender, conn_handle) = http_connect(&path).await;
+        let mut client = TestClient::connect(&path).await;
         let req = http::Request::builder()
             .method("POST")
             .uri(ROUTE_STATUS)
             .header("host", "localhost")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = sender.send_request(req).await.unwrap();
+        let resp = client.send(req).await;
         assert_eq!(resp.status(), 405);
 
-        drop(sender);
-        let _ = conn_handle.await;
+        drop(client);
         let _ = handle.await;
     });
 }
 
-// Socket lifecycle tests =====
+// Socket lifecycle tests ==============================================================================================
 
 #[skuld::test]
 fn socket_recreated_on_bind() {

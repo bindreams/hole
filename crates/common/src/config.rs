@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
-// Errors =====
+// Errors ==============================================================================================================
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -12,7 +12,7 @@ pub enum ConfigError {
     Parse(#[from] serde_json::Error),
 }
 
-// Types =====
+// Types ===============================================================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -48,7 +48,7 @@ pub struct ServerEntry {
     pub plugin_opts: Option<String>,
 }
 
-// Methods =====
+// Methods =============================================================================================================
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
