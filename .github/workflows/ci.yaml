@@ -66,9 +66,49 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
 
       - name: Test
         working-directory: msi-installer
         run: uv run --group dev pytest -v
+
+      - name: Build MSI
+        run: uv run --directory msi-installer build
+
+      - name: Install
+        run: msiexec /i target\release\hole.msi /quiet /norestart
+
+      - name: Verify install
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          foreach ($f in @("hole.exe", "v2ray-plugin.exe", "wintun.dll")) {
+            if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
+          }
+          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
+          if (!$svc) { throw "HoleDaemon service not registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
+
+      - name: Uninstall
+        if: always()
+        run: msiexec /x target\release\hole.msi /quiet /norestart
+
+      - name: Verify uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          if (Test-Path $binDir) { throw "$binDir still exists" }
+          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
+          if ($svc) { throw "HoleDaemon service still registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
