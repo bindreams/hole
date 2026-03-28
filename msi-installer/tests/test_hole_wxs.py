@@ -70,6 +70,34 @@ def test_custom_action_directories_defined(package: ET.Element) -> None:
             )
 
 
+def _collect_file_ids(package: ET.Element) -> set[str]:
+    """Collect all File IDs defined in the WXS."""
+    return {
+        f.get("Id", "")
+        for f in package.iter(f"{{{NS['wix']}}}File")
+    }
+
+
+def test_custom_actions_use_fileref(package: ET.Element) -> None:
+    """Custom actions must use FileRef (Type 18), not Directory (Type 34).
+
+    Type 34 fails to launch the exe from deferred custom actions (error 1721).
+    Type 18 references the installed file directly by its File ID.
+    """
+    file_ids = _collect_file_ids(package)
+    for ca in package.iter(f"{{{NS['wix']}}}CustomAction"):
+        ca_id = ca.get("Id", "")
+        assert ca.get("Directory") is None, (
+            f"CustomAction '{ca_id}' uses Directory (Type 34) which fails in "
+            "deferred execution. Use FileRef (Type 18) instead."
+        )
+        file_ref = ca.get("FileRef")
+        if file_ref is not None:
+            assert file_ref in file_ids, (
+                f"CustomAction '{ca_id}' references undefined File '{file_ref}'"
+            )
+
+
 def test_install_dir_is_64bit(package: ET.Element) -> None:
     """Binary components must install under ProgramFiles64Folder, not ProgramFilesFolder."""
     std_dirs = [

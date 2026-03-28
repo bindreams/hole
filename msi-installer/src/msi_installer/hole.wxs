@@ -64,35 +64,37 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Custom actions: daemon install/uninstall + PATH add/remove -->
+    <!-- Custom actions: daemon install/uninstall + PATH add/remove.
+         Uses FileRef (Type 18) to reference hole.exe by its File ID,
+         not Directory (Type 34) which fails to launch the exe. -->
     <CustomAction
       Id="DaemonInstall"
-      Directory="BINDIR"
-      ExeCommand="hole.exe daemon install"
+      FileRef="hole.exe"
+      ExeCommand="daemon install"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <CustomAction
       Id="PathAdd"
-      Directory="BINDIR"
-      ExeCommand="hole.exe path add"
+      FileRef="hole.exe"
+      ExeCommand="path add"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <CustomAction
       Id="PathRemove"
-      Directory="BINDIR"
-      ExeCommand="hole.exe path remove"
+      FileRef="hole.exe"
+      ExeCommand="path remove"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
 
     <CustomAction
       Id="DaemonUninstall"
-      Directory="BINDIR"
-      ExeCommand="hole.exe daemon uninstall"
+      FileRef="hole.exe"
+      ExeCommand="daemon uninstall"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
