@@ -55,31 +55,43 @@ def reset_macos() -> None:
 
 def reset_windows() -> None:
     print("Removing split routes...")
-    run(["powershell", "-Command", 'Remove-NetRoute -DestinationPrefix "0.0.0.0/1" -Confirm:$false -ErrorAction SilentlyContinue'])
-    run(["powershell", "-Command", 'Remove-NetRoute -DestinationPrefix "128.0.0.0/1" -Confirm:$false -ErrorAction SilentlyContinue'])
+    run([
+        "powershell", "-Command",
+        'Remove-NetRoute -DestinationPrefix "0.0.0.0/1" -Confirm:$false -ErrorAction SilentlyContinue'
+    ])
+    run([
+        "powershell", "-Command",
+        'Remove-NetRoute -DestinationPrefix "128.0.0.0/1" -Confirm:$false -ErrorAction SilentlyContinue'
+    ])
 
     print("Removing /32 bypass routes...")
-    run(["powershell", "-Command", """
+    run([
+        "powershell", "-Command", """
         Get-NetRoute -DestinationPrefix "*/32" -ErrorAction SilentlyContinue |
             Where-Object { $_.InterfaceAlias -notlike "Loopback*" } |
             ForEach-Object {
                 Write-Host "  Removing: $($_.DestinationPrefix)"
                 Remove-NetRoute -DestinationPrefix $_.DestinationPrefix -Confirm:$false -ErrorAction SilentlyContinue
             }
-    """])
+    """
+    ])
 
     print("Stopping HoleDaemon service...")
     run(["powershell", "-Command", 'Stop-Service -Name "HoleDaemon" -Force -ErrorAction SilentlyContinue'])
-    run(["powershell", "-Command", 'Get-Process -Name "hole-daemon" -ErrorAction SilentlyContinue | Stop-Process -Force'])
+    run([
+        "powershell", "-Command", 'Get-Process -Name "hole-daemon" -ErrorAction SilentlyContinue | Stop-Process -Force'
+    ])
 
     print("Removing wintun adapters...")
-    run(["powershell", "-Command", """
+    run([
+        "powershell", "-Command", """
         Get-NetAdapter -Name "hole-tun*" -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Write-Host "  Removing: $($_.Name)"
                 Remove-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue
             }
-    """])
+    """
+    ])
 
     print("Flushing DNS...")
     run(["ipconfig", "/flushdns"])

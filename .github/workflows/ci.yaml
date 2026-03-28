@@ -20,6 +20,7 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
         with:
           components: clippy, rustfmt
 
@@ -29,16 +30,24 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
-      - uses: pre-commit/action@v3.0.1
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install prek
+        run: uv tool install prek
+
+      - name: Run linters
+        run: prek run --all-files --show-diff-on-failure
 
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
@@ -56,6 +65,7 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
         with:
           components: clippy
 
@@ -65,9 +75,11 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Clippy
@@ -85,16 +97,19 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
       - uses: actions/setup-go@v6
         with:
           go-version: stable
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       - name: Test
         working-directory: msi-installer

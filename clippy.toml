@@ -1,0 +1,3 @@
+[[disallowed-methods]]
+path = "hyper::client::conn::http1::SendRequest::send_request"
+reason = "Must call sender.ready().await before send_request() (tower::Service contract). Use a wrapper type that enforces this."
