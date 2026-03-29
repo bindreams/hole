@@ -11,14 +11,19 @@ use tracing::{error, info, warn};
 
 // Menu IDs ============================================================================================================
 
+// Tray menu -----------------------------------------------------------------------------------------------------------
 const ID_ENABLE: &str = "enable";
 const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
+const ID_INSTALL_UPDATE: &str = "install_update";
+
+// Window menu ---------------------------------------------------------------------------------------------------------
+const ID_WINDOW_IMPORT: &str = "window_import";
+const ID_WINDOW_EXIT: &str = "window_exit";
 #[cfg(target_os = "macos")]
 const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
 const ID_ABOUT: &str = "about";
-const ID_INSTALL_UPDATE: &str = "install_update";
 const ID_CHECK_UPDATE: &str = "check_update";
 
 // Tray creation =======================================================================================================
@@ -99,12 +104,12 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
     }
 }
 
-// Tray event handler ==================================================================================================
+// Proxy state management ==============================================================================================
 
 /// Rebuild the tray menu to sync checkbox state with the current config.
 ///
 /// Preserves the "Install Update" item if an update is available.
-fn rebuild_tray_menu(app: &AppHandle) {
+pub fn rebuild_tray_menu(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
         let update_state = app.state::<hole_gui::update::UpdateState>();
         let update_info = update_state.rx.borrow().clone();
@@ -118,6 +123,119 @@ fn rebuild_tray_menu(app: &AppHandle) {
     }
 }
 
+/// Send a best-effort Stop to the daemon and exit the application.
+async fn exit_app(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let _ = state.daemon_send(DaemonRequest::Stop).await;
+    app.exit(0);
+}
+
+/// Revert config.enabled and sync the tray icon + menu.
+fn revert_proxy_state(app: &AppHandle, enabled: bool) {
+    let state = app.state::<AppState>();
+    {
+        let mut config = state.config.lock().unwrap();
+        config.enabled = enabled;
+        config.save(&state.config_path).ok();
+    }
+    set_tray_icon(app, enabled);
+    rebuild_tray_menu(app);
+}
+
+/// Set the proxy to the given enabled state. Returns the new state on success.
+///
+/// On failure, reverts config + tray state and returns an error message.
+/// Used by both the tray Enable checkbox and the frontend toggle button.
+pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+
+    let proxy_config = {
+        let mut config = state.config.lock().unwrap();
+        if config.enabled == enabled {
+            return Ok(enabled); // Already in the desired state (concurrent toggle)
+        }
+        config.enabled = enabled;
+        config.save(&state.config_path).ok();
+        build_proxy_config(&config)
+    };
+
+    set_tray_icon(app, enabled);
+
+    let result = if enabled {
+        let Some(proxy_config) = proxy_config else {
+            revert_proxy_state(app, false);
+            return Err("No server is selected. Open Settings and select a server before enabling.".into());
+        };
+
+        let request = DaemonRequest::Start { config: proxy_config };
+        match state.daemon_send(request.clone()).await {
+            Ok(DaemonResponse::Ack) => {
+                info!("proxy started");
+                Ok(true)
+            }
+            Ok(DaemonResponse::Error { message }) if message.contains("already running") => {
+                info!("proxy already running");
+                Ok(true)
+            }
+            Ok(DaemonResponse::Error { message }) => {
+                error!("daemon error: {message}");
+                Err(format!("Daemon error: {message}"))
+            }
+            Ok(_) => {
+                warn!("unexpected response from daemon");
+                Err("Unexpected response from daemon".into())
+            }
+            Err(crate::daemon_client::ClientError::PermissionDenied) => {
+                if crate::elevation::prompt_elevation(app, request).await {
+                    Ok(true)
+                } else {
+                    Err("Elevation was denied or failed".into())
+                }
+            }
+            Err(e) => {
+                error!("failed to send start: {e}");
+                Err(format!("Failed to connect to daemon: {e}"))
+            }
+        }
+    } else {
+        let request = DaemonRequest::Stop;
+        match state.daemon_send(request.clone()).await {
+            Ok(DaemonResponse::Ack) => {
+                info!("proxy stopped");
+                Ok(false)
+            }
+            Ok(DaemonResponse::Error { message }) => {
+                error!("daemon error: {message}");
+                Err(format!("Daemon error: {message}"))
+            }
+            Ok(_) => {
+                warn!("unexpected response from daemon");
+                Err("Unexpected response from daemon".into())
+            }
+            Err(crate::daemon_client::ClientError::PermissionDenied) => {
+                if crate::elevation::prompt_elevation(app, request).await {
+                    Ok(false)
+                } else {
+                    Err("Elevation was denied or failed".into())
+                }
+            }
+            Err(e) => {
+                error!("failed to send stop: {e}");
+                Err(format!("Failed to connect to daemon: {e}"))
+            }
+        }
+    };
+
+    match &result {
+        Ok(_) => rebuild_tray_menu(app),
+        Err(_) => revert_proxy_state(app, !enabled),
+    }
+
+    result
+}
+
+// Tray event handler ==================================================================================================
+
 /// Handle events from the tray menu.
 ///
 /// Separated from `handle_window_menu_event` because Tauri v2 dispatches menu events globally
@@ -127,118 +245,15 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         ID_ENABLE => {
             info!("tray: enable toggled");
-            let state = app.state::<AppState>();
-
-            // Toggle enabled flag and build proxy config
-            let (enabled, proxy_config) = {
-                let mut config = state.config.lock().unwrap();
-                config.enabled = !config.enabled;
-                config.save(&state.config_path).ok();
-                let enabled = config.enabled;
-                let pc = build_proxy_config(&config);
-                (enabled, pc)
-            };
-
-            set_tray_icon(app, enabled);
-
-            if enabled {
-                let Some(proxy_config) = proxy_config else {
-                    error!("tray: no server selected, cannot enable");
-                    // Revert the toggle
-                    {
-                        let mut config = state.config.lock().unwrap();
-                        config.enabled = false;
-                        config.save(&state.config_path).ok();
-                    }
-                    set_tray_icon(app, false);
-                    rebuild_tray_menu(app);
-                    // Show error dialog so the user knows what happened
-                    let app_handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        use tauri_plugin_dialog::DialogExt;
-                        app_handle
-                            .dialog()
-                            .message("No server is selected. Open Settings and select a server before enabling.")
-                            .title("Cannot Enable")
-                            .blocking_show();
-                    });
-                    return;
-                };
-
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let request = DaemonRequest::Start { config: proxy_config };
-                    let ok = match state.daemon_send(request.clone()).await {
-                        Ok(DaemonResponse::Ack) => {
-                            info!("proxy started");
-                            true
-                        }
-                        Ok(DaemonResponse::Error { message }) if message.contains("already running") => {
-                            info!("proxy already running");
-                            true
-                        }
-                        Ok(DaemonResponse::Error { message }) => {
-                            error!("daemon error: {message}");
-                            false
-                        }
-                        Ok(_) => {
-                            warn!("unexpected response from daemon");
-                            false
-                        }
-                        Err(crate::daemon_client::ClientError::PermissionDenied) => {
-                            crate::elevation::prompt_elevation(&app_handle, request).await
-                        }
-                        Err(e) => {
-                            error!("failed to send start: {e}");
-                            false
-                        }
-                    };
-                    if !ok {
-                        // Revert config on failure
-                        let mut config = state.config.lock().unwrap();
-                        config.enabled = false;
-                        config.save(&state.config_path).ok();
-                        set_tray_icon(&app_handle, false);
-                        rebuild_tray_menu(&app_handle);
-                    }
-                });
-            } else {
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let request = DaemonRequest::Stop;
-                    let ok = match state.daemon_send(request.clone()).await {
-                        Ok(DaemonResponse::Ack) => {
-                            info!("proxy stopped");
-                            true
-                        }
-                        Ok(DaemonResponse::Error { message }) => {
-                            error!("daemon error: {message}");
-                            false
-                        }
-                        Ok(_) => {
-                            warn!("unexpected response from daemon");
-                            false
-                        }
-                        Err(crate::daemon_client::ClientError::PermissionDenied) => {
-                            crate::elevation::prompt_elevation(&app_handle, request).await
-                        }
-                        Err(e) => {
-                            error!("failed to send stop: {e}");
-                            false
-                        }
-                    };
-                    if !ok {
-                        // Revert config on failure
-                        let mut config = state.config.lock().unwrap();
-                        config.enabled = true;
-                        config.save(&state.config_path).ok();
-                        set_tray_icon(&app_handle, true);
-                        rebuild_tray_menu(&app_handle);
-                    }
-                });
-            }
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                let enabled = !state.config.lock().unwrap().enabled;
+                if let Err(msg) = set_proxy_enabled(&app_handle, enabled).await {
+                    use tauri_plugin_dialog::DialogExt;
+                    app_handle.dialog().message(msg).title("Error").blocking_show();
+                }
+            });
         }
         ID_AUTOSTART => {
             info!("tray: autostart toggled");
@@ -265,12 +280,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
         ID_EXIT => {
             info!("tray: exit requested");
             let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let state = app_handle.state::<AppState>();
-                // Best-effort stop
-                let _ = state.daemon_send(DaemonRequest::Stop).await;
-                app_handle.exit(0);
-            });
+            tauri::async_runtime::spawn(async move { exit_app(app_handle).await });
         }
         ID_INSTALL_UPDATE => {
             info!("tray: install update requested");
@@ -288,6 +298,18 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
 /// Handle events from the settings window menu bar. See `handle_tray_event` for why this is separate.
 fn handle_window_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
+        ID_WINDOW_IMPORT => {
+            info!("menu: import requested");
+            use tauri::Emitter;
+            if let Some(w) = app.get_webview_window("settings") {
+                w.emit("import-requested", ()).ok();
+            }
+        }
+        ID_WINDOW_EXIT => {
+            info!("menu: exit requested");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move { exit_app(app_handle).await });
+        }
         ID_CHECK_UPDATE => {
             info!("menu: check for updates");
             let app_handle = app.clone();
@@ -525,6 +547,16 @@ fn open_settings_window(app: &AppHandle) {
     {
         use tauri::menu::{Menu, Submenu};
 
+        // File menu
+        let import_item = MenuItem::with_id(app, ID_WINDOW_IMPORT, "Import...", true, Some("CmdOrCtrl+O"))
+            .expect("failed to create menu item");
+        let file_sep = PredefinedMenuItem::separator(app).expect("failed to create separator");
+        let exit_item = MenuItem::with_id(app, ID_WINDOW_EXIT, "Exit", true, Some("CmdOrCtrl+Q"))
+            .expect("failed to create menu item");
+        let file_submenu = Submenu::with_items(app, "File", true, &[&import_item, &file_sep, &exit_item])
+            .expect("failed to create submenu");
+
+        // Help menu
         let check_update_item = MenuItem::with_id(app, ID_CHECK_UPDATE, "Check for Updates...", true, None::<&str>)
             .expect("failed to create menu item");
         let about_item =
@@ -533,7 +565,7 @@ fn open_settings_window(app: &AppHandle) {
             .expect("failed to create submenu");
 
         #[cfg(not(target_os = "macos"))]
-        let menu = Menu::with_items(app, &[&help_submenu]).expect("failed to create menu");
+        let menu = Menu::with_items(app, &[&file_submenu, &help_submenu]).expect("failed to create menu");
 
         #[cfg(target_os = "macos")]
         let menu = {
@@ -541,7 +573,7 @@ fn open_settings_window(app: &AppHandle) {
                 .expect("failed to create menu item");
             let hole_submenu =
                 Submenu::with_items(app, "Hole", true, &[&uninstall_item]).expect("failed to create submenu");
-            Menu::with_items(app, &[&hole_submenu, &help_submenu]).expect("failed to create menu")
+            Menu::with_items(app, &[&hole_submenu, &file_submenu, &help_submenu]).expect("failed to create menu")
         };
 
         builder = builder.menu(menu).on_menu_event(|window, event| {
@@ -558,6 +590,15 @@ fn open_settings_window(app: &AppHandle) {
             error!(error = %e, "failed to open settings window");
         }
     }
+}
+
+// Tauri commands ======================================================================================================
+
+/// Toggle the proxy on/off. Returns `true` if proxy is now enabled, `false` if disabled.
+#[tauri::command]
+pub async fn toggle_proxy(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let enabled = !state.config.lock().unwrap().enabled;
+    set_proxy_enabled(&app, enabled).await
 }
 
 #[cfg(test)]
