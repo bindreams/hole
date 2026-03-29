@@ -86,7 +86,14 @@ Release assets follow GOOS/GOARCH naming, OS first:
 - `hole-{version}-darwin-arm64.dmg`
 - `hole-{version}-darwin-amd64.dmg`
 
-The auto-updater matches assets by these suffixes.
+Each release also includes `SHA256SUMS` (hash manifest) and `SHA256SUMS.minisig` (minisign signature). The auto-updater matches assets by these suffixes and verifies integrity via the signed manifest.
+
+### Release workflow
+
+1. Trigger the **Draft Release** workflow with the version (e.g. `1.0.0`)
+1. CI builds all platforms, creates a draft release with `SHA256SUMS`
+1. Sign: `uv run scripts/sign-release.py v1.0.0`
+1. Trigger the **Publish Release** workflow — verifies the signature, publishes the release (creates the git tag)
 
 ## Icons
 

@@ -1,0 +1,63 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify draft release exists with signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
+
+          IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is not a draft"
+            exit 1
+          fi
+
+          HAS_MINISIG=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name == "SHA256SUMS.minisig") | .name')
+          if [ -z "$HAS_MINISIG" ]; then
+            echo "::error::SHA256SUMS.minisig not found on release $TAG. Run sign-release.py first."
+            exit 1
+          fi
+
+      - name: Download verification files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          gh release download "$TAG" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+
+      - name: Install minisign
+        run: |
+          curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          tar xzf minisign.tar.gz
+          rm minisign.tar.gz
+
+      - name: Verify signature
+        run: ./minisign -Vm SHA256SUMS -P 'RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z' -x SHA256SUMS.minisig
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          gh release edit "$TAG" --draft=false
+          echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"
