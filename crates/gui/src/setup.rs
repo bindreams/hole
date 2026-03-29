@@ -79,6 +79,10 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
         ..Default::default()
     };
 
+    // SAFETY: `info` is fully initialized with correct `cbSize`. The HSTRING
+    // values (`verb`, `file`, `params`) remain alive for the duration of the call,
+    // keeping the PCWSTR pointers valid. SEE_MASK_NOCLOSEPROCESS requests a process
+    // handle in `info.hProcess` which we check and close below.
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok.is_err() {
         let err = windows::core::Error::from_win32();
@@ -96,7 +100,11 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
         )));
     }
 
-    // Wait for the elevated process to finish
+    // SAFETY: `handle` was obtained from a successful ShellExecuteExW call with
+    // SEE_MASK_NOCLOSEPROCESS and validated as non-invalid above, so it is a valid
+    // process handle. WaitForSingleObject blocks until the process exits.
+    // GetExitCodeProcess reads the exit code into a stack-local u32.
+    // CloseHandle is called exactly once on all paths, releasing the handle.
     unsafe {
         let wait_result = WaitForSingleObject(handle, INFINITE);
         if wait_result != WAIT_OBJECT_0 {

@@ -77,7 +77,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build and run the tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
             crate::proxy_manager::RealBackend,
         )));
@@ -87,7 +87,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
-        let server = crate::ipc::IpcServer::bind(&socket_path, proxy).expect("failed to bind IPC socket");
+        let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
 
         tokio::select! {
             result = server.run() => {
@@ -105,20 +105,28 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = pm.stop().await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
+
+        Ok(())
     });
 
-    // Report stopped
-    status_handle.set_service_status(ServiceStatus {
+    if let Err(e) = &run_result {
+        error!(error = %e, "daemon runtime error");
+    }
+
+    // Always report stopped to SCM, even on error.
+    // Use a non-zero exit code if the runtime failed.
+    let exit_code = if run_result.is_err() { 1 } else { 0 };
+    let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: ServiceExitCode::Win32(exit_code),
         checkpoint: 0,
         wait_hint: Duration::ZERO,
         process_id: None,
-    })?;
+    });
 
-    Ok(())
+    run_result
 }
 
 // Install/uninstall ===================================================================================================

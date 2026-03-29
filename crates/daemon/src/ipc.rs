@@ -105,7 +105,10 @@ where
     let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
         let router = router.clone();
         async move {
-            let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+            let resp = match router.oneshot(req.map(axum::body::Body::new)).await {
+                Ok(resp) => resp,
+                Err(e) => match e {},
+            };
             Ok::<_, Infallible>(resp)
         }
     });
@@ -201,6 +204,9 @@ fn apply_socket_permissions(path: &Path) {
     let path_wide = HSTRING::from(path.as_os_str());
 
     let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl_wide` is a valid HSTRING kept alive for the call.
+    // `sd` is an out-parameter that Windows allocates via LocalAlloc on success;
+    // we free it with LocalFree at the end of this function on all paths.
     let result = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             &sddl_wide, 1, // SDDL_REVISION_1
@@ -217,10 +223,16 @@ fn apply_socket_permissions(path: &Path) {
     let mut dacl_present = false.into();
     let mut dacl = std::ptr::null_mut();
     let mut dacl_defaulted = false.into();
+    // SAFETY: `sd` was successfully returned by ConvertStringSecurityDescriptorToSecurityDescriptorW
+    // and has not been freed. The out-parameters are stack locals with correct types.
+    // `dacl` points into `sd`'s memory and remains valid until `sd` is freed.
     let result = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
 
     if let Err(e) = result {
         warn!("failed to extract DACL from security descriptor: {e}");
+        // SAFETY: `sd.0` was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW
+        // via LocalAlloc. Transmute converts the opaque PSECURITY_DESCRIPTOR pointer to
+        // HLOCAL, which is the same pointer type — no bits change.
         unsafe {
             let _ = LocalFree(Some(std::mem::transmute::<
                 *mut std::ffi::c_void,
@@ -231,6 +243,9 @@ fn apply_socket_permissions(path: &Path) {
     }
 
     // Apply DACL to the socket file
+    // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
+    // `sd` allocation. We pass only DACL_SECURITY_INFORMATION, so owner/group
+    // pointers are correctly None.
     let err = unsafe {
         SetNamedSecurityInfoW(
             &path_wide,
@@ -247,6 +262,8 @@ fn apply_socket_permissions(path: &Path) {
         warn!("failed to set socket file ACL: {err:?}");
     }
 
+    // SAFETY: same as the early-return LocalFree above — `sd.0` was allocated by
+    // Windows via LocalAlloc and is freed exactly once here.
     unsafe {
         let _ = LocalFree(Some(std::mem::transmute::<
             *mut std::ffi::c_void,
@@ -294,21 +311,42 @@ fn apply_socket_permissions(path: &Path) {
         }
     };
 
+    // Compile-time check: GROUP_NAME must not contain interior null bytes.
+    const _: () = {
+        let bytes = crate::group::GROUP_NAME.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i] != 0, "GROUP_NAME must not contain null bytes");
+            i += 1;
+        }
+    };
+
     // Look up the 'hole' group GID
-    let group_name = CString::new(crate::group::GROUP_NAME).unwrap();
+    let group_name = CString::new(crate::group::GROUP_NAME).expect("GROUP_NAME verified at compile time");
+    // SAFETY: `group_name` is a valid null-terminated CString kept alive for the
+    // call. getgrnam returns a pointer to static (thread-local) storage which we
+    // read immediately and do not cache.
     let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
 
     if grp.is_null() {
         warn!("'hole' group not found, restricting socket to root-only");
+        // SAFETY: `c_path` is a valid null-terminated CString. chmod on a valid
+        // path is always safe to call.
         unsafe {
             libc::chmod(c_path.as_ptr(), 0o600);
         }
         return;
     }
 
+    // SAFETY: `grp` was checked non-null above and points to valid static storage
+    // from getgrnam. We read `gr_gid` immediately before any call that could
+    // invalidate the static buffer.
     let gid = unsafe { (*grp).gr_gid };
     info!(gid = gid, "setting socket ownership to root:hole, mode 0660");
 
+    // SAFETY: `c_path` is a valid null-terminated CString for the path argument.
+    // `gid` is a valid group ID obtained from getgrnam. chown/chmod return 0 on
+    // success and -1 on failure; we check the return value.
     unsafe {
         if libc::chown(c_path.as_ptr(), 0, gid) != 0 {
             warn!("chown failed, falling back to root-only socket");

@@ -74,7 +74,11 @@ pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
     };
 
     let app_src = app_entry.path();
-    let app_name = app_src.file_name().unwrap().to_string_lossy().to_string();
+    let app_name = app_src
+        .file_name()
+        .expect("read_dir entry always has a filename")
+        .to_string_lossy()
+        .to_string();
     let app_dest = format!("/Applications/{app_name}");
 
     // Copy to /Applications via elevated cp
