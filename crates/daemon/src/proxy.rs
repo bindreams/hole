@@ -77,12 +77,14 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
 
     // Local 1: TUN
     let mut tun_local = LocalConfig::new(ProtocolType::Tun);
-    tun_local.tun_interface_address = Some(TUN_SUBNET.parse().unwrap());
+    tun_local.tun_interface_address = Some(TUN_SUBNET.parse().expect("TUN_SUBNET is a valid CIDR literal"));
     tun_local.tun_interface_name = Some(TUN_DEVICE_NAME.to_owned());
     ss_config.local.push(LocalInstanceConfig::with_local_config(tun_local));
 
     // Local 2: SOCKS5
-    let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port).parse().unwrap();
+    let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port)
+        .parse()
+        .expect("127.0.0.1:{u16} is always a valid SocketAddr");
     let socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
     ss_config
         .local

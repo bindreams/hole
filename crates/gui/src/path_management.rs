@@ -111,6 +111,11 @@ fn broadcast_env_change() {
     };
 
     let env_str = w!("Environment");
+    // SAFETY: `env_str` is a compile-time wide string literal with static lifetime,
+    // so the LPARAM pointer remains valid for the duration of the call.
+    // HWND_BROADCAST + WM_SETTINGCHANGE is the documented way to notify running
+    // processes of environment changes. SMTO_ABORTIFHUNG prevents hangs from
+    // unresponsive windows.
     unsafe {
         let mut _result = 0usize;
         let _ = SendMessageTimeoutW(

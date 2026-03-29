@@ -384,6 +384,9 @@ fn attach_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     // Best-effort: if we're launched from a terminal, attach to it for stdout/stderr.
     // If not (e.g. launched from Explorer), this fails silently — that's fine.
+    // SAFETY: AttachConsole has no preconditions beyond a valid PID constant.
+    // ATTACH_PARENT_PROCESS is a well-known sentinel. The result is intentionally
+    // ignored — failure simply means no console is available.
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }

@@ -214,6 +214,8 @@ mod os {
             WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSUserName,
         };
 
+        // SAFETY: WTSGetActiveConsoleSessionId has no preconditions. Returns
+        // 0xFFFFFFFF if no session is attached, which we check below.
         let session_id = unsafe { WTSGetActiveConsoleSessionId() };
         if session_id == 0xFFFFFFFF {
             return Err(io::Error::other(
@@ -224,6 +226,9 @@ mod os {
         let mut buffer = PWSTR::null();
         let mut bytes_returned: u32 = 0;
 
+        // SAFETY: `session_id` is a valid session (checked != 0xFFFFFFFF above).
+        // `buffer` and `bytes_returned` are out-parameters; Windows allocates the
+        // buffer via WTSFreeMemory-compatible allocator. We free it below.
         unsafe {
             WTSQuerySessionInformationW(
                 None, // local server
@@ -235,7 +240,12 @@ mod os {
         }
         .map_err(|e| io::Error::other(format!("WTSQuerySessionInformationW failed: {e}")))?;
 
+        // SAFETY: The successful WTSQuerySessionInformationW call guarantees
+        // `buffer.0` points to a valid UTF-16 string of `bytes_returned` bytes.
+        // Windows always returns an even byte count for UTF-16 data (including the
+        // null terminator). We convert to `len` u16 code units via from_raw_parts.
         let username = unsafe {
+            debug_assert_eq!(bytes_returned % 2, 0, "WTS returned odd byte count");
             let len = (bytes_returned as usize) / 2;
             let slice = std::slice::from_raw_parts(buffer.0, len);
             // Trim trailing null
@@ -243,6 +253,8 @@ mod os {
             String::from_utf16_lossy(&slice[..end])
         };
 
+        // SAFETY: `buffer.0` was allocated by WTSQuerySessionInformationW and must
+        // be freed with WTSFreeMemory. We have finished reading the data above.
         unsafe {
             WTSFreeMemory(buffer.0 as *mut _);
         }
@@ -266,6 +278,11 @@ mod os {
         let mut domain_size: u32 = 0;
         let mut sid_type = SID_NAME_USE::default();
 
+        // SAFETY: First call to get required buffer sizes. `group_name` is a valid
+        // null-terminated UTF-16 string kept alive for the call. Output buffer
+        // pointers are None (size query only). `sid_size` and `domain_size` are
+        // out-parameters filled with required sizes. Expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER.
         let _ = unsafe {
             LookupAccountNameW(
                 None,
@@ -283,10 +300,21 @@ mod os {
         }
 
         // Second call: fill buffers
+        // The global allocator guarantees alignment >= align_of::<usize>() (8 on
+        // 64-bit, 4 on 32-bit), which satisfies PSID's DWORD alignment requirement.
         let mut sid_buf = vec![0u8; sid_size as usize];
+        debug_assert_eq!(
+            sid_buf.as_ptr() as usize % std::mem::align_of::<u32>(),
+            0,
+            "SID buffer must be DWORD-aligned"
+        );
         let mut domain_buf = vec![0u16; domain_size as usize];
         let sid_ptr = windows::Win32::Security::PSID(sid_buf.as_mut_ptr() as *mut _);
 
+        // SAFETY: Second call with correctly sized buffers. `sid_buf` is at least
+        // `sid_size` bytes (allocated above). `domain_buf` is at least `domain_size`
+        // u16 elements. `group_name` remains alive. `sid_ptr` wraps `sid_buf`'s
+        // pointer. The result is checked with `?`.
         unsafe {
             LookupAccountNameW(
                 None,
@@ -301,15 +329,23 @@ mod os {
         .map_err(|e| io::Error::other(format!("LookupAccountNameW failed: {e}")))?;
 
         // Convert SID to string
+        // SAFETY: `sid_ptr` contains a valid SID written by the successful
+        // LookupAccountNameW call. `string_sid` is an out-parameter that Windows
+        // allocates via LocalAlloc; we free it with LocalFree below.
         let mut string_sid = PWSTR::null();
         unsafe { ConvertSidToStringSidW(sid_ptr, &mut string_sid) }
             .map_err(|e| io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
 
+        // SAFETY: `string_sid.0` is a valid null-terminated UTF-16 string allocated
+        // by ConvertSidToStringSidW. The pointer walk terminates at the null
+        // terminator. from_raw_parts reads exactly `len` elements.
         let sid_string = unsafe {
             let len = (0..).take_while(|&i| *string_sid.0.add(i) != 0).count();
             String::from_utf16_lossy(std::slice::from_raw_parts(string_sid.0, len))
         };
 
+        // SAFETY: `string_sid.0` was allocated by ConvertSidToStringSidW via
+        // LocalAlloc. Freed exactly once here after we have finished reading it.
         unsafe {
             windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(string_sid.0 as *mut _)));
         }
