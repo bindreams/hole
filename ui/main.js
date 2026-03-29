@@ -37,9 +37,14 @@ function renderServers() {
     radio.type = "radio";
     radio.name = "selected-server";
     radio.checked = server.id === config.selected_server;
-    radio.addEventListener("change", () => {
+    radio.addEventListener("change", async () => {
       config.selected_server = server.id;
       renderServers();
+      try {
+        await invoke("save_config", { config });
+      } catch (e) {
+        saveStatus.textContent = `Error: ${e}`;
+      }
     });
     tdRadio.appendChild(radio);
     tr.appendChild(tdRadio);
@@ -74,12 +79,17 @@ function renderServers() {
     const btnDel = document.createElement("button");
     btnDel.className = "btn-delete";
     btnDel.textContent = "Delete";
-    btnDel.addEventListener("click", () => {
+    btnDel.addEventListener("click", async () => {
       config.servers = config.servers.filter((s) => s.id !== server.id);
       if (config.selected_server === server.id) {
         config.selected_server = null;
       }
       renderServers();
+      try {
+        await invoke("save_config", { config });
+      } catch (e) {
+        saveStatus.textContent = `Error: ${e}`;
+      }
     });
     tdDelete.appendChild(btnDel);
     tr.appendChild(tdDelete);
