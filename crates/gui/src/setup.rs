@@ -67,7 +67,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
 
     let verb = HSTRING::from("runas");
     let file = HSTRING::from(program.as_os_str());
-    let params = HSTRING::from(args.join(" "));
+    let params = HSTRING::from(build_cmdline(args));
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -118,6 +118,85 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
 
         Ok(ExitStatus::from_raw(exit_code))
     }
+}
+
+/// Quote a single argument per the MSDN `CommandLineToArgvW` specification.
+#[cfg(target_os = "windows")]
+fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+
+    let mut backslash_count: usize = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslash_count += 1,
+            '"' => {
+                // Double the backslashes preceding this quote, then escape the quote itself.
+                for _ in 0..(backslash_count * 2 + 1) {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+                backslash_count = 0;
+            }
+            _ => {
+                for _ in 0..backslash_count {
+                    quoted.push('\\');
+                }
+                quoted.push(ch);
+                backslash_count = 0;
+            }
+        }
+    }
+
+    // Double trailing backslashes (they precede the closing quote).
+    for _ in 0..(backslash_count * 2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+
+    quoted
+}
+
+/// Join an argument slice into a single command line string with `CommandLineToArgvW`-compatible
+/// quoting. In debug builds, every call roundtrips through the real `CommandLineToArgvW` API to
+/// verify correctness.
+#[cfg(target_os = "windows")]
+#[contracts::debug_ensures(cmdline_roundtrips(ret.as_str(), args))]
+fn build_cmdline(args: &[&str]) -> String {
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse `cmdline` back through `CommandLineToArgvW` and check it matches `expected`.
+#[cfg(target_os = "windows")]
+fn cmdline_roundtrips(cmdline: &str, expected: &[&str]) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::UI::Shell::CommandLineToArgvW;
+
+    // CommandLineToArgvW expects a full command line with argv[0].
+    let full = format!("cmd.exe {cmdline}");
+    let wide = HSTRING::from(full.as_str());
+
+    let mut argc: i32 = 0;
+    let argv = unsafe { CommandLineToArgvW(&wide, &mut argc) };
+    if argv.is_null() {
+        return false;
+    }
+
+    let parsed: Vec<String> = (0..argc as isize)
+        .map(|i| unsafe { (*argv.offset(i)).to_string().unwrap() })
+        .collect();
+
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(argv as *mut _)));
+    }
+
+    let parsed_args = &parsed[1..]; // skip argv[0]
+    parsed_args.len() == expected.len() && parsed_args.iter().zip(expected).all(|(got, exp)| got == *exp)
 }
 
 /// Run a command with elevated privileges.
