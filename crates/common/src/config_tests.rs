@@ -130,3 +130,79 @@ fn deserialize_with_extra_unknown_fields_succeeds() {
     let config: AppConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.local_port, 4073);
 }
+
+// macOS permission tests -----
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_creates_file_with_owner_only_permissions(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("hole").join("config.json");
+    AppConfig::default().save(&path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "config file should be 0600, got {mode:o}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_creates_directory_with_owner_only_permissions(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = dir.join("hole");
+    let path = config_dir.join("config.json");
+    AppConfig::default().save(&path).unwrap();
+
+    let mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "config dir should be 0700, got {mode:o}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_fixes_existing_file_permissions(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("config.json");
+    // Simulate old behavior: world-readable file
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    AppConfig::default().save(&path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "config file should be tightened to 0600, got {mode:o}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_fixes_existing_directory_permissions(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = dir.join("hole");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = config_dir.join("config.json");
+    AppConfig::default().save(&path).unwrap();
+
+    let mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "config dir should be tightened to 0700, got {mode:o}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_preserves_permissions_on_repeated_saves(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = dir.join("hole");
+    let path = config_dir.join("config.json");
+
+    AppConfig::default().save(&path).unwrap();
+    AppConfig::default().save(&path).unwrap();
+
+    let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600, "file permissions should stay 0600 after repeated saves");
+    assert_eq!(dir_mode, 0o700, "dir permissions should stay 0700 after repeated saves");
+}
