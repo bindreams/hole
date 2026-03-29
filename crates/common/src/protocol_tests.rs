@@ -18,7 +18,6 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
-        plugin_path: None,
     }
 }
 
@@ -90,16 +89,20 @@ fn daemon_response_error_json_roundtrip() {
     assert_eq!(decoded, resp);
 }
 
+/// Ensure old clients that still send `plugin_path` in JSON don't break deserialization.
+/// Guards against a future `deny_unknown_fields` accidentally breaking backward compatibility.
 #[skuld::test]
-fn proxy_config_with_plugin_path_json_roundtrip() {
-    let config = ProxyConfig {
-        server: sample_server(),
-        local_port: 4073,
-        plugin_path: Some("/usr/bin/v2ray-plugin".into()),
-    };
-    let json = serde_json::to_vec(&config).unwrap();
-    let decoded: ProxyConfig = serde_json::from_slice(&json).unwrap();
-    assert_eq!(decoded, config);
+fn proxy_config_ignores_unknown_plugin_path_field() {
+    let json = r#"{
+        "server": {
+            "id": "test-id", "name": "Test", "server": "1.2.3.4",
+            "server_port": 8388, "method": "aes-256-gcm", "password": "pw"
+        },
+        "local_port": 4073,
+        "plugin_path": "/usr/bin/evil"
+    }"#;
+    let config: ProxyConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.local_port, 4073);
 }
 
 // Generated type tests ------------------------------------------------------------------------------------------------

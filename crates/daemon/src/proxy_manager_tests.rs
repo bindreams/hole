@@ -100,7 +100,6 @@ fn test_config() -> ProxyConfig {
             plugin_opts: None,
         },
         local_port: 1080,
-        plugin_path: None,
     }
 }
 

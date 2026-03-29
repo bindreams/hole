@@ -18,7 +18,6 @@ fn encode_request_roundtrips() {
                 plugin_opts: None,
             },
             local_port: 4073,
-            plugin_path: None,
         },
     };
 

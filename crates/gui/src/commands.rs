@@ -4,8 +4,12 @@ use crate::state::AppState;
 use hole_common::config::{AppConfig, ServerEntry};
 use hole_common::import;
 use hole_common::protocol::{DaemonRequest, DaemonResponse, ProxyConfig};
+use std::io::Read;
+use std::path::Path;
 use tauri::State;
-use tracing::warn;
+use tracing::{debug, warn};
+
+const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 #[tauri::command]
 pub fn get_config(state: State<AppState>) -> AppConfig {
@@ -19,11 +23,54 @@ pub fn save_config(state: State<AppState>, config: AppConfig) -> Result<(), Stri
     Ok(())
 }
 
+/// Validate a file path, read it, and parse server entries from it.
+fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, String> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("json") => {}
+        _ => return Err("only .json files can be imported".to_string()),
+    }
+
+    // Open once, then fstat the fd to avoid TOCTOU races.
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        debug!("failed to open import file: {e}");
+        "file not found or not accessible".to_string()
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        debug!("failed to read file metadata: {e}");
+        "file not found or not accessible".to_string()
+    })?;
+    if !metadata.is_file() {
+        return Err("path is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_IMPORT_FILE_SIZE {
+        return Err("file is too large to import".to_string());
+    }
+
+    let mut json = String::new();
+    file.read_to_string(&mut json).map_err(|e| {
+        debug!("failed to read import file: {e}");
+        "failed to read file".to_string()
+    })?;
+    import::import_servers(&json).map_err(|e| sanitize_import_error(&e))
+}
+
+/// Convert an ImportError to a user-facing message without leaking file content.
+fn sanitize_import_error(err: &import::ImportError) -> String {
+    match err {
+        import::ImportError::MissingField(field) => {
+            format!("missing required field: {field}")
+        }
+        // Parse and InvalidValue can contain fragments of file content.
+        import::ImportError::Parse(_) | import::ImportError::InvalidValue(_) => {
+            "file does not contain valid server configuration".to_string()
+        }
+    }
+}
+
 /// Import servers from a config file path. Reads the file and parses it.
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
-    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let new_servers = import::import_servers(&json).map_err(|e| e.to_string())?;
+    let new_servers = validate_and_read_import(Path::new(&path))?;
 
     let mut config = state.config.lock().unwrap();
     for server in &new_servers {
@@ -85,7 +132,6 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     Some(ProxyConfig {
         server: entry.clone(),
         local_port: config.local_port,
-        plugin_path: None,
     })
 }
 

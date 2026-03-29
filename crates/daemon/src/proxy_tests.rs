@@ -21,7 +21,6 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
-        plugin_path: None,
     }
 }
 
@@ -126,21 +125,121 @@ fn plugin_set_when_present() {
 }
 
 #[skuld::test]
-fn plugin_uses_plugin_path_when_provided() {
+fn plugin_resolves_to_bare_name_in_test() {
+    // In test environment, no sibling binary exists next to the test runner,
+    // so resolve_plugin_path falls back to the bare name.
     let mut cfg = sample_config();
     cfg.server.plugin = Some("v2ray-plugin".to_string());
-    cfg.plugin_path = Some("/usr/local/bin/v2ray-plugin".into());
-    let ss = build_ss_config(&cfg).unwrap();
-    let plugin = ss.server[0].config.plugin().unwrap();
-    assert_eq!(plugin.plugin, "/usr/local/bin/v2ray-plugin");
-}
-
-#[skuld::test]
-fn plugin_falls_back_to_plugin_name_without_path() {
-    let mut cfg = sample_config();
-    cfg.server.plugin = Some("v2ray-plugin".to_string());
-    cfg.plugin_path = None;
     let ss = build_ss_config(&cfg).unwrap();
     let plugin = ss.server[0].config.plugin().unwrap();
     assert_eq!(plugin.plugin, "v2ray-plugin");
+}
+
+// Plugin name validation tests ========================================================================================
+
+#[skuld::test]
+fn plugin_name_with_forward_slash_rejected() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("/usr/bin/evil".to_string());
+    let err = build_ss_config(&cfg).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPluginName(_)));
+}
+
+#[skuld::test]
+fn plugin_name_with_backslash_rejected() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("..\\evil".to_string());
+    let err = build_ss_config(&cfg).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPluginName(_)));
+}
+
+#[skuld::test]
+fn plugin_name_with_null_byte_rejected() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("evil\0".to_string());
+    let err = build_ss_config(&cfg).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPluginName(_)));
+}
+
+#[skuld::test]
+fn plugin_name_empty_rejected() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("".to_string());
+    let err = build_ss_config(&cfg).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPluginName(_)));
+}
+
+#[skuld::test]
+fn plugin_name_with_space_rejected() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("evil plugin".to_string());
+    let err = build_ss_config(&cfg).unwrap_err();
+    assert!(matches!(err, ProxyError::InvalidPluginName(_)));
+}
+
+#[skuld::test]
+fn plugin_name_bare_name_accepted() {
+    let mut cfg = sample_config();
+    cfg.server.plugin = Some("v2ray-plugin".to_string());
+    assert!(build_ss_config(&cfg).is_ok());
+}
+
+// Plugin path resolution tests ========================================================================================
+
+#[skuld::test]
+fn resolve_falls_back_to_bare_name_when_not_found() {
+    let nonexistent = std::path::PathBuf::from("/nonexistent/dir/hole");
+    let result = resolve_plugin_path_inner("v2ray-plugin", Some(nonexistent));
+    assert_eq!(result, "v2ray-plugin");
+}
+
+#[skuld::test]
+fn resolve_falls_back_when_exe_unknown() {
+    let result = resolve_plugin_path_inner("v2ray-plugin", None);
+    assert_eq!(result, "v2ray-plugin");
+}
+
+#[skuld::test]
+fn resolve_finds_sibling_binary() {
+    let dir = std::env::temp_dir().join(format!("hole-resolve-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let plugin_name = if cfg!(windows) {
+        "test-plugin.exe"
+    } else {
+        "test-plugin"
+    };
+    let plugin_file = dir.join(plugin_name);
+    std::fs::write(&plugin_file, b"fake").unwrap();
+
+    let fake_exe = dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
+    std::fs::write(&fake_exe, b"fake").unwrap();
+
+    let result = resolve_plugin_path_inner("test-plugin", Some(fake_exe));
+
+    let canonical = std::fs::canonicalize(&plugin_file).unwrap();
+    assert_eq!(result, canonical.to_string_lossy());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[skuld::test]
+fn resolve_finds_sibling_when_name_has_exe_suffix() {
+    let dir = std::env::temp_dir().join(format!("hole-resolve-exe-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Create "test-plugin.exe" as a sibling — same name on all platforms for this test.
+    let plugin_file = dir.join("test-plugin.exe");
+    std::fs::write(&plugin_file, b"fake").unwrap();
+
+    let fake_exe = dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
+    std::fs::write(&fake_exe, b"fake").unwrap();
+
+    // Name already has .exe — should NOT double-append on Windows
+    let result = resolve_plugin_path_inner("test-plugin.exe", Some(fake_exe));
+
+    let canonical = std::fs::canonicalize(&plugin_file).unwrap();
+    assert_eq!(result, canonical.to_string_lossy());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

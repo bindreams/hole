@@ -1,5 +1,6 @@
 use super::*;
 use std::path::PathBuf;
+#[allow(unused_imports)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn rt() -> tokio::runtime::Runtime {
@@ -70,4 +71,105 @@ fn connect_nonexistent_fails() {
         let result = LocalStream::connect(&path).await;
         assert!(result.is_err());
     });
+}
+
+// Security ------------------------------------------------------------------------------------------------------------
+
+/// Verify that `bind_restricted` applies mode 0600 to the socket file.
+/// The final permissions (0660/root:hole) are applied later by
+/// `apply_socket_permissions()`, which is disabled in tests.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn socket_created_with_restrictive_permissions() {
+    use std::os::unix::fs::MetadataExt;
+
+    // tokio::net::UnixListener::bind requires a tokio reactor context.
+    let rt = rt();
+    let _guard = rt.enter();
+
+    let path = test_socket_path("perms");
+    let _listener = LocalListener::bind_restricted(&path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "socket should be owner-only (0600) before apply_socket_permissions"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Verify that `bind_restricted` applies a protected restrictive DACL
+/// (SYSTEM + Administrators only) between `bind()` and `listen()`.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn socket_created_with_restrictive_dacl() {
+    use windows::core::HSTRING;
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let path = test_socket_path("dacl");
+    let _listener = LocalListener::bind_restricted(&path).unwrap();
+
+    let path_wide = HSTRING::from(path.as_os_str());
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            &path_wide,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+    };
+    assert!(err.is_ok(), "GetNamedSecurityInfoW failed: {err:?}");
+
+    let mut sddl_ptr = windows::core::PWSTR::null();
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            1, // SDDL_REVISION_1
+            DACL_SECURITY_INFORMATION,
+            &mut sddl_ptr,
+            None,
+        )
+    }
+    .expect("ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+
+    // SAFETY: sddl_ptr is a valid wide string allocated by the Win32 API.
+    let sddl = unsafe { sddl_ptr.to_string() }.unwrap();
+    unsafe {
+        let _ = windows::Win32::Foundation::LocalFree(Some(std::mem::transmute::<
+            *mut u16,
+            windows::Win32::Foundation::HLOCAL,
+        >(sddl_ptr.0)));
+        // Free the security descriptor allocated by GetNamedSecurityInfoW.
+        let _ = windows::Win32::Foundation::LocalFree(Some(std::mem::transmute::<
+            *mut std::ffi::c_void,
+            windows::Win32::Foundation::HLOCAL,
+        >(sd.0)));
+    }
+
+    // The DACL should be protected (P flag) with only SYSTEM and BA ACEs.
+    assert!(
+        sddl.starts_with("D:P"),
+        "DACL should be protected (D:P...), got: {sddl}"
+    );
+    assert!(
+        !sddl.contains(";ID;"),
+        "DACL should not contain inherited ACEs (ID flag), got: {sddl}"
+    );
+    assert!(sddl.contains(";;;SY)"), "DACL should grant SYSTEM access, got: {sddl}");
+    assert!(
+        sddl.contains(";;;BA)"),
+        "DACL should grant Administrators access, got: {sddl}"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
