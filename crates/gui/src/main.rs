@@ -48,6 +48,7 @@ fn launch_gui() {
             commands::save_config,
             commands::import_servers_from_file,
             commands::get_proxy_status,
+            tray::toggle_proxy,
         ])
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
