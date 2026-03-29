@@ -296,7 +296,9 @@ pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std:
         >(sd.0)));
     }
 
-    result.ok().map_err(|e| std::io::Error::other(format!("failed to set ACL: {e}")))
+    result
+        .ok()
+        .map_err(|e| std::io::Error::other(format!("failed to set ACL: {e}")))
 }
 
 /// Apply OS-level access control to the socket file.

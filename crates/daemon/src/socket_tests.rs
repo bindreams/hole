@@ -84,18 +84,27 @@ fn connect_nonexistent_fails() {
 fn socket_created_with_restrictive_permissions() {
     use std::os::unix::fs::MetadataExt;
 
+    // tokio::net::UnixListener::bind requires a tokio runtime context.
+    let _rt = rt();
+
     let path = test_socket_path("perms");
     let _listener = LocalListener::bind(&path).unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
-    assert_eq!(mode, 0o600, "socket should be owner-only (0600) before apply_socket_permissions");
+    assert_eq!(
+        mode, 0o600,
+        "socket should be owner-only (0600) before apply_socket_permissions"
+    );
 
     // Verify the umask was restored: a regular file should get default permissions.
     let probe = path.with_extension("probe");
     std::fs::write(&probe, "").unwrap();
     let probe_mode = std::fs::metadata(&probe).unwrap().mode() & 0o777;
     let _ = std::fs::remove_file(&probe);
-    assert_ne!(probe_mode, 0o600, "umask should be restored after bind — probe file got {probe_mode:o}");
+    assert_ne!(
+        probe_mode, 0o600,
+        "umask should be restored after bind — probe file got {probe_mode:o}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -118,7 +127,16 @@ fn socket_created_with_restrictive_dacl() {
     let mut sd = PSECURITY_DESCRIPTOR::default();
 
     let err = unsafe {
-        GetNamedSecurityInfoW(&path_wide, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None, None, None, &mut sd)
+        GetNamedSecurityInfoW(
+            &path_wide,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        )
     };
     assert!(err.is_ok(), "GetNamedSecurityInfoW failed: {err:?}");
 
@@ -158,7 +176,10 @@ fn socket_created_with_restrictive_dacl() {
         "DACL should not contain inherited ACEs (ID flag), got: {sddl}"
     );
     assert!(sddl.contains(";;;SY)"), "DACL should grant SYSTEM access, got: {sddl}");
-    assert!(sddl.contains(";;;BA)"), "DACL should grant Administrators access, got: {sddl}");
+    assert!(
+        sddl.contains(";;;BA)"),
+        "DACL should grant Administrators access, got: {sddl}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
