@@ -367,6 +367,32 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
+    // Verify integrity and authenticity.
+    let dest_for_verify = dest.clone();
+    let asset_name = info.asset_name.clone();
+    let sha256sums_url = info.sha256sums_url.clone();
+    let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
+    let verify_result = tokio::task::spawn_blocking(move || {
+        hole_gui::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
+    })
+    .await;
+
+    match verify_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("verification failed: {e}");
+            app.dialog()
+                .message(format!("Update verification failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("verify task panicked: {e}");
+            return;
+        }
+    }
+
     // Run installer (interactive mode).
     let dest_clone = dest.clone();
     let install_result = tokio::task::spawn_blocking(move || hole_gui::update::run_installer(&dest_clone, false)).await;

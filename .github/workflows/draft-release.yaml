@@ -1,0 +1,164 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs: *inputs
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Create local tag for build
+        run: git tag "v${{ steps.version.outputs.version }}"
+
+      - name: Validate Cargo.toml matches version
+        run: python scripts/check-version.py --exact
+
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest, ext: msi }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   ext: dmg }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel, ext: dmg }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create local tag for build
+        run: git tag "v${{ needs.validate.outputs.version }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Windows build
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.os == 'windows'
+      - name: Build MSI
+        if: matrix.os == 'windows'
+        run: uv run --directory msi-installer build
+
+      # macOS build
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'darwin'
+        with:
+          node-version: "lts/*"
+      - name: Install npm dependencies
+        if: matrix.os == 'darwin'
+        run: npm install
+      - name: Build DMG
+        if: matrix.os == 'darwin'
+        run: npx tauri build
+
+      # Rename and hash
+      - name: Rename artifact and compute SHA-256
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ASSET="hole-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.ext }}"
+
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            mv target/release/hole.msi "$ASSET"
+          else
+            mv target/release/bundle/dmg/*.dmg "$ASSET"
+          fi
+
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256line"
+          echo "Artifact: $ASSET"
+          cat "${ASSET}.sha256line"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            hole-*.${{ matrix.ext }}
+            hole-*.${{ matrix.ext }}.sha256line
+
+  release:
+    name: Create draft release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          cat *.sha256line > SHA256SUMS
+          rm *.sha256line
+
+          lines=$(wc -l < SHA256SUMS)
+          if [ "$lines" -ne 3 ]; then
+            echo "::error::Expected 3 entries in SHA256SUMS, got $lines"
+            exit 1
+          fi
+
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --draft \
+            --generate-notes \
+            --title "v${VERSION}" \
+            --target "${{ github.sha }}" \
+            hole-* SHA256SUMS
+          echo "Draft release created: https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"

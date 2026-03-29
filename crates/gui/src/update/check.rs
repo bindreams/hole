@@ -58,6 +58,8 @@ pub struct UpdateInfo {
     pub version: ReleaseVersion,
     pub asset_url: String,
     pub asset_name: String,
+    pub sha256sums_url: String,
+    pub sha256sums_minisig_url: String,
     pub release_notes: Option<String>,
     pub html_url: String,
 }
@@ -160,7 +162,8 @@ pub(crate) fn candidate_tags(
     candidates
 }
 
-/// Check if a release qualifies as an update: not draft, not prerelease, has a matching platform asset.
+/// Check if a release qualifies as an update: not draft, not prerelease, has a matching platform
+/// asset with both `SHA256SUMS` and `SHA256SUMS.minisig` manifest files.
 pub(crate) fn release_qualifies(release: &GitHubRelease) -> Option<UpdateInfo> {
     if release.draft || release.prerelease {
         return None;
@@ -168,12 +171,18 @@ pub(crate) fn release_qualifies(release: &GitHubRelease) -> Option<UpdateInfo> {
 
     let asset = release.assets.iter().find(|a| a.name.ends_with(ASSET_SUFFIX))?;
 
+    // Both manifest files must be present for the release to qualify.
+    let sha256sums = release.assets.iter().find(|a| a.name == "SHA256SUMS")?;
+    let sha256sums_minisig = release.assets.iter().find(|a| a.name == "SHA256SUMS.minisig")?;
+
     let version = ReleaseVersion::parse(&release.tag_name).ok()?;
 
     Some(UpdateInfo {
         version,
         asset_url: asset.browser_download_url.clone(),
         asset_name: asset.name.clone(),
+        sha256sums_url: sha256sums.browser_download_url.clone(),
+        sha256sums_minisig_url: sha256sums_minisig.browser_download_url.clone(),
         release_notes: release.body.clone(),
         html_url: release.html_url.clone(),
     })
