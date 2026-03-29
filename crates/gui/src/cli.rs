@@ -53,12 +53,18 @@ enum DaemonAction {
         /// Also send this IPC command after granting access (base64-encoded JSON)
         #[arg(long)]
         then_send: Option<String>,
+        /// Read the IPC command from this file instead of --then-send
+        #[arg(long, conflicts_with = "then_send")]
+        then_send_file: Option<std::path::PathBuf>,
     },
     /// Send a single IPC command to the daemon (requires elevation)
     IpcSend {
         /// Base64-encoded JSON of the DaemonRequest
-        #[arg(long)]
-        base64: String,
+        #[arg(long, required_unless_present = "request_file")]
+        base64: Option<String>,
+        /// Read the JSON request from this file
+        #[arg(long, conflicts_with = "base64")]
+        request_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -199,8 +205,21 @@ fn handle_daemon(action: DaemonAction) -> i32 {
             }
         }
         DaemonAction::Log { action } => handle_daemon_log(action),
-        DaemonAction::GrantAccess { then_send } => handle_grant_access(then_send),
-        DaemonAction::IpcSend { base64 } => handle_ipc_send(&base64),
+        DaemonAction::GrantAccess {
+            then_send,
+            then_send_file,
+        } => handle_grant_access(then_send, then_send_file),
+        DaemonAction::IpcSend { base64, request_file } => match (base64, request_file) {
+            (Some(b64), _) => handle_ipc_send_b64(&b64),
+            (_, Some(path)) => match crate::elevation::read_request_file(&path) {
+                Ok(request) => send_daemon_request(request),
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            },
+            (None, None) => unreachable!("clap ensures one is present"),
+        },
     }
 }
 
@@ -281,7 +300,7 @@ fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     }
 }
 
-fn handle_grant_access(then_send: Option<String>) -> i32 {
+fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
     use hole_common::protocol::PERMISSION_DENIED_HELP;
 
     // Ensure the group exists (may not if daemon was installed by an older version)
@@ -307,16 +326,22 @@ fn handle_grant_access(then_send: Option<String>) -> i32 {
     }
 
     // Optionally proxy a command to the daemon
-    if let Some(b64) = then_send {
-        return handle_ipc_send(&b64);
+    match (then_send, then_send_file) {
+        (Some(b64), _) => handle_ipc_send_b64(&b64),
+        (_, Some(path)) => match crate::elevation::read_request_file(&path) {
+            Ok(request) => send_daemon_request(request),
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        (None, None) => 0,
     }
-
-    0
 }
 
-fn handle_ipc_send(base64_request: &str) -> i32 {
+fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     use base64::Engine;
-    use hole_common::protocol::{DaemonRequest, DaemonResponse};
+    use hole_common::protocol::DaemonRequest;
 
     // Decode base64
     let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
@@ -336,7 +361,12 @@ fn handle_ipc_send(base64_request: &str) -> i32 {
         }
     };
 
-    // Connect and send
+    send_daemon_request(request)
+}
+
+fn send_daemon_request(request: hole_common::protocol::DaemonRequest) -> i32 {
+    use hole_common::protocol::DaemonResponse;
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let socket_path = hole_common::protocol::default_daemon_socket_path();
