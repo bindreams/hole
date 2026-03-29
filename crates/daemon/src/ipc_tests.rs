@@ -1,4 +1,5 @@
 use super::*;
+use crate::gateway::GatewayInfo;
 use crate::proxy::ProxyError;
 use crate::proxy_manager::{ProxyBackend, ProxyManager};
 use crate::socket::LocalStream;
@@ -47,16 +48,30 @@ impl ProxyBackend for MockBackend {
         }))
     }
 
-    fn setup_routes(&self, _tun: &str, _server: IpAddr, _gw: IpAddr) -> Result<(), ProxyError> {
+    fn setup_routes(
+        &self,
+        _tun: &str,
+        _server: IpAddr,
+        _gw: IpAddr,
+        _interface_name: &str,
+    ) -> Result<(), ProxyError> {
         Ok(())
     }
 
-    fn teardown_routes(&self, _server: IpAddr) -> Result<(), ProxyError> {
+    fn teardown_routes(
+        &self,
+        _tun: &str,
+        _server: IpAddr,
+        _interface_name: &str,
+    ) -> Result<(), ProxyError> {
         Ok(())
     }
 
-    fn default_gateway(&self) -> Result<IpAddr, ProxyError> {
-        Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        Ok(GatewayInfo {
+            gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            interface_name: "MockEthernet".into(),
+        })
     }
 }
 

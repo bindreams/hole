@@ -1,5 +1,6 @@
 // Proxy lifecycle manager — start/stop/reload orchestration.
 
+use crate::gateway::GatewayInfo;
 use crate::proxy::{build_ss_config, ProxyError, TUN_DEVICE_NAME};
 use crate::routing::RouteGuard;
 use hole_common::protocol::ProxyConfig;
@@ -25,9 +26,20 @@ pub trait ProxyBackend: Send + Sync {
         config: Config,
     ) -> impl std::future::Future<Output = Result<JoinHandle<std::io::Result<()>>, ProxyError>> + Send;
 
-    fn setup_routes(&self, tun_name: &str, server_ip: IpAddr, gateway: IpAddr) -> Result<(), ProxyError>;
-    fn teardown_routes(&self, server_ip: IpAddr) -> Result<(), ProxyError>;
-    fn default_gateway(&self) -> Result<IpAddr, ProxyError>;
+    fn setup_routes(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        gateway: IpAddr,
+        interface_name: &str,
+    ) -> Result<(), ProxyError>;
+    fn teardown_routes(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        interface_name: &str,
+    ) -> Result<(), ProxyError>;
+    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
 }
 
 // Real backend ========================================================================================================
@@ -42,16 +54,29 @@ impl ProxyBackend for RealBackend {
         Ok(tokio::spawn(async move { server.run().await }))
     }
 
-    fn setup_routes(&self, tun_name: &str, server_ip: IpAddr, gateway: IpAddr) -> Result<(), ProxyError> {
-        crate::routing::setup_routes(tun_name, server_ip, gateway).map_err(|e| ProxyError::RouteSetup(e.to_string()))
+    fn setup_routes(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        gateway: IpAddr,
+        interface_name: &str,
+    ) -> Result<(), ProxyError> {
+        crate::routing::setup_routes(tun_name, server_ip, gateway, interface_name)
+            .map_err(|e| ProxyError::RouteSetup(e.to_string()))
     }
 
-    fn teardown_routes(&self, server_ip: IpAddr) -> Result<(), ProxyError> {
-        crate::routing::teardown_routes(server_ip).map_err(|e| ProxyError::RouteSetup(e.to_string()))
+    fn teardown_routes(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        interface_name: &str,
+    ) -> Result<(), ProxyError> {
+        crate::routing::teardown_routes(tun_name, server_ip, interface_name)
+            .map_err(|e| ProxyError::RouteSetup(e.to_string()))
     }
 
-    fn default_gateway(&self) -> Result<IpAddr, ProxyError> {
-        crate::gateway::get_default_gateway().map_err(|e| ProxyError::Gateway(e.to_string()))
+    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        crate::gateway::get_default_gateway_info().map_err(|e| ProxyError::Gateway(e.to_string()))
     }
 }
 
@@ -103,8 +128,8 @@ impl<B: ProxyBackend> ProxyManager<B> {
         // Resolve server hostname to IP
         let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
 
-        // Detect default gateway
-        let gateway = self.backend.default_gateway()?;
+        // Detect default gateway and interface
+        let gw_info = self.backend.default_gateway()?;
 
         // Start shadowsocks-service
         let handle = self.backend.start_ss(ss_config).await.inspect_err(|e| {
@@ -112,14 +137,23 @@ impl<B: ProxyBackend> ProxyManager<B> {
         })?;
 
         // Set up routes — if this fails, abort the ss task
-        if let Err(e) = self.backend.setup_routes(TUN_DEVICE_NAME, server_ip, gateway) {
+        if let Err(e) = self.backend.setup_routes(
+            TUN_DEVICE_NAME,
+            server_ip,
+            gw_info.gateway_ip,
+            &gw_info.interface_name,
+        ) {
             handle.abort();
             self.last_error = Some(e.to_string());
             return Err(e);
         }
 
         self.task_handle = Some(handle);
-        self.route_guard = Some(RouteGuard::new(server_ip));
+        self.route_guard = Some(RouteGuard::new(
+            TUN_DEVICE_NAME.to_owned(),
+            server_ip,
+            gw_info.interface_name,
+        ));
         self.server_ip = Some(server_ip);
         self.started_at = Some(Instant::now());
         self.last_error = None;
@@ -178,19 +212,24 @@ impl<B: ProxyBackend> ProxyManager<B> {
 // DNS resolution ======================================================================================================
 
 async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> {
-    // Try parsing as IP address first
+    // Try parsing as IP address first (return as-is, including IPv6 literals)
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(ip);
     }
 
-    // DNS lookup
-    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
+    // DNS lookup — prefer IPv4 to ensure bypass route compatibility with IPv4 gateway
+    let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
         .await
         .map_err(|e| ProxyError::DnsResolution {
             host: host.to_owned(),
             source: e,
         })?
-        .next()
+        .collect();
+
+    let addr = addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
         .ok_or_else(|| ProxyError::DnsResolution {
             host: host.to_owned(),
             source: std::io::Error::other("no addresses returned"),
