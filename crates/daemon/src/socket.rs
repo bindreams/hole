@@ -35,6 +35,26 @@ mod imp {
             Ok(Self { inner })
         }
 
+        /// Bind with restrictive permissions (mode 0600) applied immediately
+        /// after `bind()`. This minimizes the TOCTOU window: the socket is
+        /// only accessible with default permissions for the duration of a
+        /// single `chmod()` syscall. The final permissions (0660/root:hole)
+        /// are applied later by `apply_socket_permissions()` in `ipc.rs`.
+        pub fn bind_restricted(path: &Path) -> io::Result<Self> {
+            let listener = Self::bind(path)?;
+            // SAFETY: path is a valid, NUL-free UTF-8 string (same as used by bind).
+            let c_path = std::ffi::CString::new(
+                path.to_str()
+                    .ok_or_else(|| io::Error::other("socket path is not valid UTF-8"))?,
+            )
+            .map_err(|e| io::Error::other(format!("invalid socket path: {e}")))?;
+            // SAFETY: c_path is a valid C string pointing to the just-created socket.
+            if unsafe { libc::chmod(c_path.as_ptr(), 0o600) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(listener)
+        }
+
         pub async fn accept(&self) -> io::Result<LocalStream> {
             let (stream, _addr) = self.inner.accept().await?;
             Ok(LocalStream { inner: stream })
@@ -95,6 +115,20 @@ mod imp {
 
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
+            Self::bind_inner(path, false)
+        }
+
+        /// Bind with a restrictive DACL (SYSTEM + Administrators only) applied
+        /// between `bind()` and `listen()`. No connections are possible before
+        /// `listen()`, so this eliminates the TOCTOU race where the socket
+        /// inherits a permissive DACL from the parent directory. The final
+        /// DACL (adding the `hole` group) is applied later by
+        /// `apply_socket_permissions()` in `ipc.rs`.
+        pub fn bind_restricted(path: &Path) -> io::Result<Self> {
+            Self::bind_inner(path, true)
+        }
+
+        fn bind_inner(path: &Path, restrict: bool) -> io::Result<Self> {
             // Remove stale socket file (ignore "not found"; warn on other errors)
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -111,6 +145,15 @@ mod imp {
             let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
             let addr = SockAddr::unix(path)?;
             socket.bind(&addr)?;
+            if restrict {
+                // Use the shared base SDDL with P (protected) prefix to block
+                // inherited ACEs from the parent directory.
+                let sddl = crate::ipc::SDDL_BASE.replacen("D:", "D:P", 1);
+                if let Err(e) = crate::ipc::set_dacl_from_sddl(path, &sddl, true) {
+                    let _ = std::fs::remove_file(path);
+                    return Err(e);
+                }
+            }
             socket.listen(128)?;
             // Non-blocking so accept() returns immediately with WouldBlock
             // when no connection is pending. This prevents spawn_blocking
@@ -198,6 +241,16 @@ pub use imp::{LocalListener, LocalStream};
 /// Creates parent directories if they don't exist.
 pub fn bind(path: &Path) -> io::Result<LocalListener> {
     LocalListener::bind(path)
+}
+
+/// Like [`bind`], but applies restrictive OS-level permissions during creation.
+///
+/// On macOS, identical to `bind()` (umask guard is always applied).
+/// On Windows, applies a protected DACL (SYSTEM + Administrators only) between
+/// `bind()` and `listen()` to prevent a TOCTOU race on socket permissions.
+#[allow(dead_code)]
+pub(crate) fn bind_restricted(path: &Path) -> io::Result<LocalListener> {
+    LocalListener::bind_restricted(path)
 }
 
 /// Connect to a listener at the given path.
