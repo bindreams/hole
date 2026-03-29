@@ -69,10 +69,7 @@ fn sanitize_import_error(err: &import::ImportError) -> String {
 
 /// Import servers from a config file path. Reads the file and parses it.
 #[tauri::command]
-pub fn import_servers_from_file(
-    state: State<AppState>,
-    path: String,
-) -> Result<Vec<ServerEntry>, String> {
+pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
     let new_servers = validate_and_read_import(Path::new(&path))?;
 
     let mut config = state.config.lock().unwrap();

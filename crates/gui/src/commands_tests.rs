@@ -57,8 +57,7 @@ fn build_proxy_config_invalid_selection() {
 
 // validate_and_read_import tests =====
 
-const VALID_SERVER_JSON: &str =
-    r#"{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm"}"#;
+const VALID_SERVER_JSON: &str = r#"{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm"}"#;
 
 #[skuld::test]
 fn import_rejects_non_json_extension(#[fixture(temp_dir)] dir: &Path) {
@@ -133,7 +132,10 @@ fn import_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
     let result = validate_and_read_import(&file);
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(!err.contains("SUPER_SECRET"), "error message leaked file content: {err}");
+    assert!(
+        !err.contains("SUPER_SECRET"),
+        "error message leaked file content: {err}"
+    );
 }
 
 #[skuld::test]
