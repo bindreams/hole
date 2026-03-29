@@ -34,7 +34,7 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerEntry {
     pub id: String,
     pub name: String,
@@ -46,6 +46,21 @@ pub struct ServerEntry {
     pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_opts: Option<String>,
+}
+
+impl std::fmt::Debug for ServerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerEntry")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("server", &self.server)
+            .field("server_port", &self.server_port)
+            .field("method", &self.method)
+            .field("password", &"<redacted>")
+            .field("plugin", &self.plugin)
+            .field("plugin_opts", &self.plugin_opts)
+            .finish()
+    }
 }
 
 // Methods =============================================================================================================
