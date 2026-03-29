@@ -1,4 +1,5 @@
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 // State =====
 
@@ -11,6 +12,7 @@ const emptyMessage = document.getElementById("empty-message");
 const localPortInput = document.getElementById("local-port");
 const btnImport = document.getElementById("btn-import");
 const btnSave = document.getElementById("btn-save");
+const btnToggle = document.getElementById("btn-toggle");
 const saveStatus = document.getElementById("save-status");
 const statusBadge = document.getElementById("status");
 
@@ -98,11 +100,18 @@ function renderServers() {
   }
 }
 
+function updateToggleButton(enabled) {
+  btnToggle.textContent = enabled ? "Disconnect" : "Connect";
+  btnToggle.className = enabled ? "btn-disconnect" : "btn-connect";
+  btnToggle.disabled = false;
+}
+
 // Actions =====
 
 async function loadConfig() {
   config = await invoke("get_config");
   localPortInput.value = config.local_port;
+  updateToggleButton(config.enabled);
   renderServers();
 }
 
@@ -134,6 +143,22 @@ async function importServers() {
   }
 }
 
+async function toggleProxy() {
+  btnToggle.disabled = true;
+  try {
+    const enabled = await invoke("toggle_proxy");
+    updateToggleButton(enabled);
+    await checkDaemonStatus();
+  } catch (e) {
+    saveStatus.textContent = `Error: ${e}`;
+    setTimeout(() => { saveStatus.textContent = ""; }, 4000);
+    // Reload config to get the reverted state
+    try { await loadConfig(); } catch { /* best-effort */ }
+  } finally {
+    btnToggle.disabled = false;
+  }
+}
+
 async function checkDaemonStatus() {
   try {
     const status = await invoke("get_proxy_status");
@@ -143,12 +168,24 @@ async function checkDaemonStatus() {
     statusBadge.textContent = "Daemon: disconnected";
     statusBadge.className = "status disconnected";
   }
+  // Sync toggle button with current config state
+  try {
+    const cfg = await invoke("get_config");
+    updateToggleButton(cfg.enabled);
+  } catch { /* best-effort */ }
 }
 
 // Events =====
 
 btnSave.addEventListener("click", saveConfig);
 btnImport.addEventListener("click", importServers);
+btnToggle.addEventListener("click", toggleProxy);
+
+// Listen for import requests from the File > Import menu
+listen("import-requested", importServers);
+
+// Poll daemon status periodically
+setInterval(checkDaemonStatus, 5000);
 
 // Init =====
 

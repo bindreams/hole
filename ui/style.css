@@ -30,6 +30,42 @@ h2 {
   padding-bottom: 0.3rem;
 }
 
+/* Header controls */
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* Connect/Disconnect button */
+.btn-connect {
+  background: #28a745;
+  color: #fff;
+  border-color: #218838;
+  font-weight: 600;
+}
+
+.btn-connect:hover:not(:disabled) {
+  background: #218838;
+}
+
+.btn-disconnect {
+  background: #dc3545;
+  color: #fff;
+  border-color: #c82333;
+  font-weight: 600;
+}
+
+.btn-disconnect:hover:not(:disabled) {
+  background: #c82333;
+}
+
+.btn-connect:disabled,
+.btn-disconnect:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 /* Status badge */
 .status {
   font-size: 0.8rem;
