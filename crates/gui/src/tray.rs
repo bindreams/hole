@@ -25,6 +25,7 @@ const ID_WINDOW_EXIT: &str = "window_exit";
 const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
 const ID_ABOUT: &str = "about";
 const ID_CHECK_UPDATE: &str = "check_update";
+const ID_COLLECT_LOGS: &str = "window_collect_logs";
 
 // Tray creation =======================================================================================================
 
@@ -317,6 +318,13 @@ fn handle_window_menu_event(app: &AppHandle, event: MenuEvent) {
                 handle_check_for_updates(app_handle).await;
             });
         }
+        ID_COLLECT_LOGS => {
+            info!("menu: collect logs");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_collect_logs(app_handle).await;
+            });
+        }
         ID_ABOUT => {
             info!("menu: about dialog");
             use tauri_plugin_dialog::DialogExt;
@@ -485,6 +493,47 @@ async fn handle_install_update_from_tray(app: AppHandle) {
     }
 }
 
+async fn handle_collect_logs(app: AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+
+    let zip_result = tokio::task::spawn_blocking(crate::log_collector::collect_logs_to_zip).await;
+
+    let zip_path = match zip_result {
+        Ok(Ok(path)) => path,
+        Ok(Err(e)) => {
+            app.dialog().message(e).title("Collect Logs").blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("collect logs task panicked: {e}");
+            return;
+        }
+    };
+
+    // Show a save dialog so the user can choose where to save
+    let dest = app
+        .dialog()
+        .file()
+        .set_file_name("hole-logs.zip")
+        .add_filter("ZIP Archive", &["zip"])
+        .blocking_save_file();
+
+    if let Some(dest) = dest {
+        if let Err(e) = std::fs::copy(&zip_path, dest.as_path().unwrap()) {
+            app.dialog()
+                .message(format!("Failed to save: {e}"))
+                .title("Collect Logs")
+                .blocking_show();
+        }
+    }
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&zip_path);
+    if let Some(parent) = zip_path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 async fn handle_check_for_updates(app: AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
@@ -560,10 +609,17 @@ fn open_settings_window(app: &AppHandle) {
         // Help menu
         let check_update_item = MenuItem::with_id(app, ID_CHECK_UPDATE, "Check for Updates...", true, None::<&str>)
             .expect("failed to create menu item");
+        let collect_logs_item = MenuItem::with_id(app, ID_COLLECT_LOGS, "Collect Logs...", true, None::<&str>)
+            .expect("failed to create menu item");
         let about_item =
             MenuItem::with_id(app, ID_ABOUT, "About Hole", true, None::<&str>).expect("failed to create menu item");
-        let help_submenu = Submenu::with_items(app, "Help", true, &[&check_update_item, &about_item])
-            .expect("failed to create submenu");
+        let help_submenu = Submenu::with_items(
+            app,
+            "Help",
+            true,
+            &[&check_update_item, &collect_logs_item, &about_item],
+        )
+        .expect("failed to create submenu");
 
         #[cfg(not(target_os = "macos"))]
         let menu = Menu::with_items(app, &[&file_submenu, &help_submenu]).expect("failed to create menu");

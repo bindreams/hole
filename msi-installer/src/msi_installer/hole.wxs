@@ -99,6 +99,18 @@
       Impersonate="no"
       Return="ignore" />
 
+    <!-- Launch the app after a fresh interactive install.
+         Runs as the installing user (Impersonate=yes), non-blocking (asyncNoWait).
+         Skipped on upgrades (WIX_UPGRADE_DETECTED), uninstalls, and silent installs
+         (pass SUPPRESS_LAUNCH=1 on the msiexec command line). -->
+    <CustomAction
+      Id="LaunchApp"
+      FileRef="hole.exe"
+      ExeCommand=""
+      Execute="immediate"
+      Impersonate="yes"
+      Return="asyncNoWait" />
+
     <InstallExecuteSequence>
       <!-- Post-install: daemon install then PATH add -->
       <Custom Action="DaemonInstall" After="InstallFiles"
@@ -113,6 +125,10 @@
         Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="DaemonUninstall" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
+
+      <!-- Launch app after fresh install (not upgrades, not silent) -->
+      <Custom Action="LaunchApp" After="InstallFinalize"
+        Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT SUPPRESS_LAUNCH" />
     </InstallExecuteSequence>
 
   </Package>
