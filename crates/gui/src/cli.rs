@@ -111,12 +111,14 @@ fn handle_upgrade() -> i32 {
         Ok(Some(info)) => {
             eprintln!("update available: v{}", info.version);
 
-            let download_dir = std::env::temp_dir().join("hole-update");
-            if let Err(e) = std::fs::create_dir_all(&download_dir) {
-                eprintln!("failed to create temp dir: {e}");
-                return 1;
-            }
-            let dest = download_dir.join(&info.asset_name);
+            let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("failed to create temp dir: {e}");
+                    return 1;
+                }
+            };
+            let dest = download_dir.path().join(&info.asset_name);
 
             eprintln!("downloading {}...", info.asset_name);
             if let Err(e) = hole_gui::update::download_asset(&info.asset_url, &dest) {
@@ -127,13 +129,9 @@ fn handle_upgrade() -> i32 {
             eprintln!("installing...");
             if let Err(e) = hole_gui::update::run_installer(&dest, true) {
                 eprintln!("installation failed: {e}");
-                // Best-effort cleanup
-                let _ = std::fs::remove_file(&dest);
                 return 1;
             }
 
-            // Best-effort cleanup
-            let _ = std::fs::remove_file(&dest);
             eprintln!("updated to v{}", info.version);
             0
         }
@@ -386,6 +384,9 @@ fn attach_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     // Best-effort: if we're launched from a terminal, attach to it for stdout/stderr.
     // If not (e.g. launched from Explorer), this fails silently — that's fine.
+    // SAFETY: AttachConsole has no preconditions beyond a valid PID constant.
+    // ATTACH_PARENT_PROCESS is a well-known sentinel. The result is intentionally
+    // ignored — failure simply means no console is available.
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
