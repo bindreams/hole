@@ -48,10 +48,11 @@ jobs:
         run: |
           curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
           tar xzf minisign.tar.gz
-          rm minisign.tar.gz
+          install minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          rm -rf minisign.tar.gz minisign-linux
 
       - name: Verify signature
-        run: ./minisign -Vm SHA256SUMS -P 'RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z' -x SHA256SUMS.minisig
+        run: minisign -Vm SHA256SUMS -P 'RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z' -x SHA256SUMS.minisig
 
       - name: Publish release
         env:

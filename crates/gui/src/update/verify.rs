@@ -94,11 +94,21 @@ pub(crate) fn find_hash_in_sha256sums<'a>(content: &'a str, asset_name: &str) ->
 
 // Helpers =============================================================================================================
 
-/// Compute the SHA-256 hex digest of a file.
+/// Compute the SHA-256 hex digest of a file by streaming through the hasher.
 pub(crate) fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    let data = std::fs::read(path)?;
-    let hash = sha2::Sha256::digest(&data);
-    Ok(hex_encode(&hash))
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 /// Encode bytes as lowercase hex.

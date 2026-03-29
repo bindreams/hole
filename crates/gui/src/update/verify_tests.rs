@@ -35,6 +35,14 @@ fn find_hash_in_sha256sums_invalid_hash_length() {
     assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
 }
 
+#[skuld::test]
+fn find_hash_in_sha256sums_non_hex_chars() {
+    // 64 characters but contains non-hex 'g'
+    let manifest = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  file.msi\n";
+    let result = find_hash_in_sha256sums(manifest, "file.msi");
+    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
+}
+
 // hex_encode ==========================================================================================================
 
 #[skuld::test]
