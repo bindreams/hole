@@ -5,7 +5,6 @@
 // grant permanent access (add user to hole group) or proxy a single command.
 
 use crate::setup;
-use base64::Engine;
 use hole_common::protocol::DaemonRequest;
 use tauri::AppHandle;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -16,8 +15,6 @@ use tracing::{error, info};
 /// Called when a user-initiated tray action fails with PermissionDenied.
 /// Returns `true` if the action was successfully proxied via elevation.
 pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
-    let b64_request = encode_request(&request);
-
     // Dialog 1: Offer permanent access
     let grant = app
         .dialog()
@@ -35,7 +32,7 @@ pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
 
     if grant {
         // Grant access + proxy command in one elevated invocation
-        return run_grant_access_elevated(app, &b64_request).await;
+        return run_grant_access_elevated(app, &request).await;
     }
 
     // Dialog 2: Offer one-time elevation
@@ -47,20 +44,45 @@ pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
         .blocking_show();
 
     if elevate {
-        return run_ipc_send_elevated(app, &b64_request).await;
+        return run_ipc_send_elevated(app, &request).await;
     }
 
     false
 }
 
-/// Base64-encode a DaemonRequest for passing through CLI args.
+/// Base64-encode a DaemonRequest (test helper for the legacy `--base64` CLI flag).
+#[cfg(test)]
 pub fn encode_request(request: &DaemonRequest) -> String {
+    use base64::Engine;
     let json = serde_json::to_vec(request).expect("DaemonRequest serialization cannot fail");
     base64::engine::general_purpose::STANDARD.encode(&json)
 }
 
-/// Spawn `hole daemon grant-access --then-send <b64>` elevated.
-async fn run_grant_access_elevated(app: &AppHandle, b64_request: &str) -> bool {
+/// Write a DaemonRequest as JSON to a temp file with restrictive permissions.
+///
+/// Returns a [`TempPath`] that auto-deletes the file on drop. The file handle is
+/// closed so the elevated subprocess can open it (required on Windows).
+fn write_request_file(request: &DaemonRequest) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new()?;
+    serde_json::to_writer(&mut file, request).map_err(std::io::Error::other)?;
+    file.flush()?;
+    Ok(file.into_temp_path())
+}
+
+/// Read a DaemonRequest from a JSON file and delete it.
+///
+/// The file is deleted after reading as defense-in-depth (the writer's [`TempPath`]
+/// also deletes on drop, but the writer process may crash before cleanup).
+pub fn read_request_file(path: &std::path::Path) -> Result<DaemonRequest, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read request file {}: {e}", path.display()))?;
+    let _ = std::fs::remove_file(path);
+    serde_json::from_str(&content).map_err(|e| format!("invalid request JSON in {}: {e}", path.display()))
+}
+
+/// Spawn `hole daemon grant-access --then-send-file <path>` elevated.
+async fn run_grant_access_elevated(app: &AppHandle, request: &DaemonRequest) -> bool {
     let exe = match setup::daemon_binary_path() {
         Ok(p) => p,
         Err(e) => {
@@ -69,9 +91,18 @@ async fn run_grant_access_elevated(app: &AppHandle, b64_request: &str) -> bool {
         }
     };
 
-    let b64_owned = b64_request.to_string();
+    let request_file = match write_request_file(request) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("failed to write request file: {e}");
+            return false;
+        }
+    };
+
+    let file_path = request_file.to_string_lossy().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        setup::run_elevated(&exe, &["daemon", "grant-access", "--then-send", &b64_owned])
+        let _keep_alive = request_file;
+        setup::run_elevated(&exe, &["daemon", "grant-access", "--then-send-file", &file_path])
     })
     .await;
 
@@ -108,8 +139,8 @@ async fn run_grant_access_elevated(app: &AppHandle, b64_request: &str) -> bool {
     }
 }
 
-/// Spawn `hole daemon ipc-send --base64 <b64>` elevated.
-async fn run_ipc_send_elevated(_app: &AppHandle, b64_request: &str) -> bool {
+/// Spawn `hole daemon ipc-send --request-file <path>` elevated.
+async fn run_ipc_send_elevated(_app: &AppHandle, request: &DaemonRequest) -> bool {
     let exe = match setup::daemon_binary_path() {
         Ok(p) => p,
         Err(e) => {
@@ -118,10 +149,20 @@ async fn run_ipc_send_elevated(_app: &AppHandle, b64_request: &str) -> bool {
         }
     };
 
-    let b64_owned = b64_request.to_string();
-    let result =
-        tokio::task::spawn_blocking(move || setup::run_elevated(&exe, &["daemon", "ipc-send", "--base64", &b64_owned]))
-            .await;
+    let request_file = match write_request_file(request) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("failed to write request file: {e}");
+            return false;
+        }
+    };
+
+    let file_path = request_file.to_string_lossy().to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let _keep_alive = request_file;
+        setup::run_elevated(&exe, &["daemon", "ipc-send", "--request-file", &file_path])
+    })
+    .await;
 
     match result {
         Ok(Ok(status)) if status.success() => {

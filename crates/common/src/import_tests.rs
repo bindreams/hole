@@ -127,3 +127,16 @@ fn empty_object_without_required_fields_returns_error() {
     let result = import_servers(json);
     assert!(result.is_err());
 }
+
+#[skuld::test]
+fn import_rejects_plugin_with_path_separators() {
+    let json = r#"{
+        "server": "1.2.3.4",
+        "server_port": 8388,
+        "password": "pw",
+        "method": "aes-256-gcm",
+        "plugin": "/usr/bin/evil"
+    }"#;
+    let err = import_servers(json).unwrap_err();
+    assert!(err.to_string().contains("plugin name"));
+}

@@ -102,7 +102,6 @@ fn send_start_receives_ack() {
                         plugin_opts: None,
                     },
                     local_port: 4073,
-                    plugin_path: None,
                 },
             })
             .await
@@ -178,7 +177,6 @@ fn send_reload_receives_ack() {
                         plugin_opts: None,
                     },
                     local_port: 4073,
-                    plugin_path: None,
                 },
             })
             .await
@@ -254,7 +252,6 @@ fn server_error_maps_to_daemon_response_error() {
                         plugin_opts: None,
                     },
                     local_port: 4073,
-                    plugin_path: None,
                 },
             })
             .await

@@ -132,7 +132,6 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     Some(ProxyConfig {
         server: entry.clone(),
         local_port: config.local_port,
-        plugin_path: None,
     })
 }
 

@@ -256,3 +256,59 @@ fn server_entry_debug_shows_non_sensitive_fields() {
     assert!(debug_output.contains("v2ray-plugin"), "should contain plugin");
     assert!(debug_output.contains("server;tls"), "should contain plugin_opts");
 }
+
+// Plugin name validation ==============================================================================================
+
+#[skuld::test]
+fn valid_plugin_names_accepted() {
+    assert!(is_valid_plugin_name("v2ray-plugin"));
+    assert!(is_valid_plugin_name("kcptun"));
+    assert!(is_valid_plugin_name("simple-obfs"));
+    assert!(is_valid_plugin_name("xray-plugin"));
+    assert!(is_valid_plugin_name("plugin_v2"));
+    assert!(is_valid_plugin_name("plugin.exe"));
+}
+
+#[skuld::test]
+fn plugin_name_with_forward_slash_rejected() {
+    assert!(!is_valid_plugin_name("/usr/bin/evil"));
+    assert!(!is_valid_plugin_name("../evil"));
+}
+
+#[skuld::test]
+fn plugin_name_with_backslash_rejected() {
+    assert!(!is_valid_plugin_name("..\\evil"));
+    assert!(!is_valid_plugin_name("C:\\Windows\\evil.exe"));
+}
+
+#[skuld::test]
+fn plugin_name_with_null_byte_rejected() {
+    assert!(!is_valid_plugin_name("evil\0"));
+}
+
+#[skuld::test]
+fn plugin_name_empty_rejected() {
+    assert!(!is_valid_plugin_name(""));
+}
+
+#[skuld::test]
+fn plugin_name_with_space_rejected() {
+    assert!(!is_valid_plugin_name("evil plugin"));
+}
+
+#[skuld::test]
+fn plugin_name_dot_and_dotdot_rejected() {
+    assert!(!is_valid_plugin_name("."));
+    assert!(!is_valid_plugin_name(".."));
+    assert!(!is_valid_plugin_name("..."));
+}
+
+#[skuld::test]
+fn plugin_name_shell_metacharacters_rejected() {
+    assert!(!is_valid_plugin_name("evil;rm"));
+    assert!(!is_valid_plugin_name("evil|cat"));
+    assert!(!is_valid_plugin_name("evil$PATH"));
+    assert!(!is_valid_plugin_name("evil`id`"));
+    assert!(!is_valid_plugin_name("evil(1)"));
+    assert!(!is_valid_plugin_name("evil{1}"));
+}
