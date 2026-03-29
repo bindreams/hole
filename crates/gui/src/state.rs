@@ -44,7 +44,12 @@ impl AppState {
         }
 
         // Send request
-        match guard.as_mut().unwrap().send(req).await {
+        match guard
+            .as_mut()
+            .expect("guaranteed Some after lazy-connect block")
+            .send(req)
+            .await
+        {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 // Connection broken — clear so next call reconnects
