@@ -2,11 +2,13 @@ name: Publish Release
 
 on:
   workflow_dispatch:
-    inputs:
+    inputs: &inputs
       version:
         description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
+  workflow_call:
+    inputs: *inputs
 
 permissions:
   contents: write
@@ -15,13 +17,21 @@ jobs:
   publish:
     name: Verify and publish
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Verify draft release exists with signature
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Normalize and validate version
+        id: version
         run: |
-          TAG="v${{ inputs.version }}"
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists with signature
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
           RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
 
           IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
@@ -37,12 +47,7 @@ jobs:
           fi
 
       - name: Download verification files
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          TAG="v${{ inputs.version }}"
-          gh release download "$TAG" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+        run: gh release download "${{ steps.version.outputs.tag }}" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
 
       - name: Install minisign
         run: |
@@ -55,10 +60,7 @@ jobs:
         run: minisign -Vm SHA256SUMS -P 'RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z' -x SHA256SUMS.minisig
 
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          TAG="v${{ inputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
           gh release edit "$TAG" --draft=false
           echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"

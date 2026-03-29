@@ -22,10 +22,13 @@ REPO = "bindreams/hole"
 EXPECTED_INSTALLER_COUNT = 3
 
 
-def validate_tag(tag: str) -> None:
-    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-        print(f"error: invalid tag format: {tag!r} (expected vMAJOR.MINOR.PATCH)", file=sys.stderr)
+def normalize_tag(tag: str) -> str:
+    """Strip optional 'v' prefix and validate semver format. Returns 'v'-prefixed tag."""
+    version = tag.removeprefix("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        print(f"error: invalid version: {tag!r} (expected MAJOR.MINOR.PATCH)", file=sys.stderr)
         sys.exit(1)
+    return f"v{version}"
 
 
 def validate_sha256sums(path: Path) -> None:
@@ -52,21 +55,21 @@ def main() -> None:
     parser.add_argument("--secret-key", "-s", help="path to minisign secret key file")
     args = parser.parse_args()
 
-    validate_tag(args.tag)
+    tag = normalize_tag(args.tag)
 
     # Verify draft release exists with expected assets.
     result = subprocess.run(
-        ["gh", "release", "view", args.tag, "--repo", REPO, "--json", "isDraft,assets"],
+        ["gh", "release", "view", tag, "--repo", REPO, "--json", "isDraft,assets"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        print(f"error: failed to fetch release {args.tag}: {result.stderr.strip()}", file=sys.stderr)
+        print(f"error: failed to fetch release {tag}: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
 
     release = json.loads(result.stdout)
     if not release["isDraft"]:
-        print(f"error: release {args.tag} is not a draft", file=sys.stderr)
+        print(f"error: release {tag} is not a draft", file=sys.stderr)
         sys.exit(1)
 
     asset_names = {a["name"] for a in release["assets"]}
@@ -84,7 +87,7 @@ def main() -> None:
         tmpdir = Path(tmpdir)
 
         subprocess.run(
-            ["gh", "release", "download", args.tag, "--repo", REPO, "--pattern", "SHA256SUMS", "--dir",
+            ["gh", "release", "download", tag, "--repo", REPO, "--pattern", "SHA256SUMS", "--dir",
              str(tmpdir)],
             check=True,
         )
@@ -103,12 +106,12 @@ def main() -> None:
             sys.exit(1)
 
         subprocess.run(
-            ["gh", "release", "upload", args.tag, "--repo", REPO,
+            ["gh", "release", "upload", tag, "--repo", REPO,
              str(minisig_path)],
             check=True,
         )
 
-    print(f"\nSignature uploaded to {args.tag}.")
+    print(f"\nSignature uploaded to {tag}.")
     print("Run the 'Publish Release' workflow to finalize.")
 
 
@@ -118,20 +121,27 @@ if __name__ == "__main__":
 # Tests (run with pytest) ==============================================================================================
 
 
-def test_valid_tag():
-    validate_tag("v1.0.0")
-    validate_tag("v10.20.30")
+def test_normalize_tag_with_prefix():
+    assert normalize_tag("v1.0.0") == "v1.0.0"
 
 
-def test_invalid_tag():
+def test_normalize_tag_without_prefix():
+    assert normalize_tag("1.0.0") == "v1.0.0"
+
+
+def test_normalize_tag_large_numbers():
+    assert normalize_tag("v10.20.30") == "v10.20.30"
+
+
+def test_normalize_tag_invalid():
     import pytest
 
     with pytest.raises(SystemExit):
-        validate_tag("1.0.0")
+        normalize_tag("v1.0")
     with pytest.raises(SystemExit):
-        validate_tag("v1.0")
+        normalize_tag("v1.0.0-rc1")
     with pytest.raises(SystemExit):
-        validate_tag("v1.0.0-rc1")
+        normalize_tag("abc")
 
 
 def test_validate_sha256sums_valid(tmp_path: Path):

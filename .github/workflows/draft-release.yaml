@@ -2,11 +2,13 @@ name: Draft Release
 
 on:
   workflow_dispatch:
-    inputs:
+    inputs: &inputs
       version:
         description: "Release version (e.g. 1.0.0)"
         required: true
         type: string
+  workflow_call:
+    inputs: *inputs
 
 permissions:
   contents: write
@@ -31,15 +33,19 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
       - name: Create local tag for build
-        run: git tag "v${{ inputs.version }}"
+        run: git tag "v${{ steps.version.outputs.version }}"
 
       - name: Validate Cargo.toml matches version
         run: python scripts/check-version.py --exact
-
-      - name: Set version output
-        id: version
-        run: echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
