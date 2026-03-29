@@ -13,8 +13,7 @@ pub struct GatewayInfo {
 
 /// Detect the system's default gateway IP and original interface name.
 pub fn get_default_gateway_info() -> std::io::Result<GatewayInfo> {
-    let iface =
-        default_net::get_default_interface().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let iface = default_net::get_default_interface().map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let gateway_ip = iface
         .gateway

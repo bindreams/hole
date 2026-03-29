@@ -48,22 +48,11 @@ impl ProxyBackend for MockBackend {
         }))
     }
 
-    fn setup_routes(
-        &self,
-        _tun: &str,
-        _server: IpAddr,
-        _gw: IpAddr,
-        _interface_name: &str,
-    ) -> Result<(), ProxyError> {
+    fn setup_routes(&self, _tun: &str, _server: IpAddr, _gw: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
         Ok(())
     }
 
-    fn teardown_routes(
-        &self,
-        _tun: &str,
-        _server: IpAddr,
-        _interface_name: &str,
-    ) -> Result<(), ProxyError> {
+    fn teardown_routes(&self, _tun: &str, _server: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
         Ok(())
     }
 

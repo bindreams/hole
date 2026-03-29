@@ -33,12 +33,7 @@ pub trait ProxyBackend: Send + Sync {
         gateway: IpAddr,
         interface_name: &str,
     ) -> Result<(), ProxyError>;
-    fn teardown_routes(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        interface_name: &str,
-    ) -> Result<(), ProxyError>;
+    fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError>;
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
 }
 
@@ -65,12 +60,7 @@ impl ProxyBackend for RealBackend {
             .map_err(|e| ProxyError::RouteSetup(e.to_string()))
     }
 
-    fn teardown_routes(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        interface_name: &str,
-    ) -> Result<(), ProxyError> {
+    fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError> {
         crate::routing::teardown_routes(tun_name, server_ip, interface_name)
             .map_err(|e| ProxyError::RouteSetup(e.to_string()))
     }
@@ -137,12 +127,10 @@ impl<B: ProxyBackend> ProxyManager<B> {
         })?;
 
         // Set up routes — if this fails, abort the ss task
-        if let Err(e) = self.backend.setup_routes(
-            TUN_DEVICE_NAME,
-            server_ip,
-            gw_info.gateway_ip,
-            &gw_info.interface_name,
-        ) {
+        if let Err(e) =
+            self.backend
+                .setup_routes(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)
+        {
             handle.abort();
             self.last_error = Some(e.to_string());
             return Err(e);

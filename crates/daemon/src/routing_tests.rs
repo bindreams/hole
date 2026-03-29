@@ -54,7 +54,10 @@ fn setup_includes_ipv6_low_half_route() {
 #[skuld::test]
 fn setup_includes_ipv6_high_half_route() {
     let joined = setup_cmds_joined(ipv4_server(), ipv4_gateway());
-    assert!(joined.contains("8000::/1"), "missing IPv6 high-half route in:\n{joined}");
+    assert!(
+        joined.contains("8000::/1"),
+        "missing IPv6 high-half route in:\n{joined}"
+    );
 }
 
 #[skuld::test]
@@ -69,7 +72,10 @@ fn setup_bypass_uses_original_gateway() {
     let server_ip: IpAddr = "5.6.7.8".parse().unwrap();
     let gateway: IpAddr = "10.0.0.1".parse().unwrap();
     let joined = setup_cmds_joined(server_ip, gateway);
-    assert!(joined.contains("10.0.0.1"), "missing gateway in bypass route:\n{joined}");
+    assert!(
+        joined.contains("10.0.0.1"),
+        "missing gateway in bypass route:\n{joined}"
+    );
 }
 
 // Setup tests — IPv6 server ==============================================================================================
@@ -133,7 +139,10 @@ fn teardown_includes_ipv6_low_half_route() {
 #[skuld::test]
 fn teardown_includes_ipv6_high_half_route() {
     let joined = teardown_cmds_joined(ipv4_server());
-    assert!(joined.contains("8000::/1"), "missing IPv6 high-half route in:\n{joined}");
+    assert!(
+        joined.contains("8000::/1"),
+        "missing IPv6 high-half route in:\n{joined}"
+    );
 }
 
 #[skuld::test]
@@ -178,14 +187,20 @@ fn split_teardown_generates_four_commands() {
 fn split_teardown_includes_ipv4_low_half() {
     let cmds = build_split_route_teardown_commands("utun7");
     let joined = cmds.iter().map(|c| c.join(" ")).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("0.0.0.0/1"), "missing IPv4 low-half route in:\n{joined}");
+    assert!(
+        joined.contains("0.0.0.0/1"),
+        "missing IPv4 low-half route in:\n{joined}"
+    );
 }
 
 #[skuld::test]
 fn split_teardown_includes_ipv4_high_half() {
     let cmds = build_split_route_teardown_commands("utun7");
     let joined = cmds.iter().map(|c| c.join(" ")).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("128.0.0.0/1"), "missing IPv4 high-half route in:\n{joined}");
+    assert!(
+        joined.contains("128.0.0.0/1"),
+        "missing IPv4 high-half route in:\n{joined}"
+    );
 }
 
 #[skuld::test]
@@ -199,7 +214,10 @@ fn split_teardown_includes_ipv6_low_half() {
 fn split_teardown_includes_ipv6_high_half() {
     let cmds = build_split_route_teardown_commands("utun7");
     let joined = cmds.iter().map(|c| c.join(" ")).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("8000::/1"), "missing IPv6 high-half route in:\n{joined}");
+    assert!(
+        joined.contains("8000::/1"),
+        "missing IPv6 high-half route in:\n{joined}"
+    );
 }
 
 // Interface name with spaces ==============================================================================================

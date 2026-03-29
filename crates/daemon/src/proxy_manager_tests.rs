@@ -69,12 +69,7 @@ impl ProxyBackend for MockBackend {
         Ok(())
     }
 
-    fn teardown_routes(
-        &self,
-        _tun_name: &str,
-        _server_ip: IpAddr,
-        _interface_name: &str,
-    ) -> Result<(), ProxyError> {
+    fn teardown_routes(&self, _tun_name: &str, _server_ip: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
         Ok(())
     }
 

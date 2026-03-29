@@ -27,11 +27,7 @@ pub fn build_setup_commands(
 }
 
 /// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and server bypass).
-pub fn build_teardown_commands(
-    tun_name: &str,
-    server_ip: IpAddr,
-    interface_name: &str,
-) -> Vec<Vec<String>> {
+pub fn build_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec<Vec<String>> {
     platform_teardown_commands(tun_name, server_ip, interface_name)
 }
 
@@ -49,11 +45,7 @@ pub fn setup_routes(
 }
 
 /// Execute route teardown commands. Idempotent — safe to call even if routes don't exist.
-pub fn teardown_routes(
-    tun_name: &str,
-    server_ip: IpAddr,
-    interface_name: &str,
-) -> std::io::Result<()> {
+pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> std::io::Result<()> {
     let commands = build_teardown_commands(tun_name, server_ip, interface_name);
     run_commands(&commands, "teardown")
 }
@@ -185,11 +177,7 @@ fn platform_setup_commands(
 }
 
 #[cfg(target_os = "windows")]
-fn platform_teardown_commands(
-    tun_name: &str,
-    server_ip: IpAddr,
-    interface_name: &str,
-) -> Vec<Vec<String>> {
+fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec<Vec<String>> {
     let mut cmds = vec![
         vec![
             "netsh".into(),
@@ -327,11 +315,7 @@ fn platform_setup_commands(
 }
 
 #[cfg(target_os = "macos")]
-fn platform_teardown_commands(
-    _tun_name: &str,
-    server_ip: IpAddr,
-    _interface_name: &str,
-) -> Vec<Vec<String>> {
+fn platform_teardown_commands(_tun_name: &str, server_ip: IpAddr, _interface_name: &str) -> Vec<Vec<String>> {
     let mut cmds = vec![
         vec![
             "route".into(),
