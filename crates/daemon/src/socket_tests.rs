@@ -73,7 +73,7 @@ fn connect_nonexistent_fails() {
     });
 }
 
-// Security -----
+// Security ------------------------------------------------------------------------------------------------------------
 
 /// Verify the socket file is created with restrictive permissions (mode 0600)
 /// due to the umask guard in `LocalListener::bind()`. The final permissions
@@ -84,8 +84,9 @@ fn connect_nonexistent_fails() {
 fn socket_created_with_restrictive_permissions() {
     use std::os::unix::fs::MetadataExt;
 
-    // tokio::net::UnixListener::bind requires a tokio runtime context.
-    let _rt = rt();
+    // tokio::net::UnixListener::bind requires a tokio reactor context.
+    let rt = rt();
+    let _guard = rt.enter();
 
     let path = test_socket_path("perms");
     let _listener = LocalListener::bind(&path).unwrap();
