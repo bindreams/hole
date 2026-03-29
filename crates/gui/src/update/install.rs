@@ -49,27 +49,34 @@ pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
-    let mount_dir = std::env::temp_dir().join("hole-dmg-mount");
-    std::fs::create_dir_all(&mount_dir)?;
+    let mount_dir = tempfile::TempDir::with_prefix("hole-dmg-mount-")?;
 
     // Mount the DMG
-    let attach_args = hdiutil_attach_args(path, &mount_dir);
+    let attach_args = hdiutil_attach_args(path, mount_dir.path());
     let attach_args_ref: Vec<&str> = attach_args.iter().map(|s| s.as_str()).collect();
     let status = std::process::Command::new("hdiutil").args(&attach_args_ref).status()?;
     if !status.success() {
         return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
     }
 
-    // Find the .app bundle inside the mount
-    let app_entry = std::fs::read_dir(&mount_dir)?
+    // Everything after a successful attach must go through detach.
+    let result = install_from_mount(mount_dir.path());
+
+    // Always unmount
+    let _ = std::process::Command::new("hdiutil")
+        .args(["detach", &mount_dir.path().to_string_lossy()])
+        .status();
+
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn install_from_mount(mount_dir: &Path) -> Result<(), UpdateError> {
+    let app_entry = std::fs::read_dir(mount_dir)?
         .filter_map(|e| e.ok())
         .find(|e| e.path().extension().is_some_and(|ext| ext == "app"));
 
     let Some(app_entry) = app_entry else {
-        // Unmount before returning error
-        let _ = std::process::Command::new("hdiutil")
-            .args(["detach", &mount_dir.to_string_lossy()])
-            .status();
         return Err(UpdateError::Io(std::io::Error::other("no .app bundle found in DMG")));
     };
 
@@ -81,18 +88,11 @@ pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
         .to_string();
     let app_dest = format!("/Applications/{app_name}");
 
-    // Copy to /Applications via elevated cp
     let cp_path = Path::new("/bin/cp");
     let src_str = app_src.to_string_lossy().to_string();
     let cp_args = ["-R", &src_str, &app_dest];
-    let result = crate::setup::run_elevated(cp_path, &cp_args);
-
-    // Always unmount
-    let _ = std::process::Command::new("hdiutil")
-        .args(["detach", &mount_dir.to_string_lossy()])
-        .status();
-
-    let status = result.map_err(|e| UpdateError::Io(std::io::Error::other(e.to_string())))?;
+    let status = crate::setup::run_elevated(cp_path, &cp_args)
+        .map_err(|e| UpdateError::Io(std::io::Error::other(e.to_string())))?;
     if !status.success() {
         return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
     }
