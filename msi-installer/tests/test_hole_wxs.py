@@ -141,8 +141,12 @@ def _is_uninstall_condition(condition: str) -> bool:
     return 'REMOVE="' in condition or "REMOVE~=" in condition
 
 
+# CAs that launch the app after install — exempt from Return=check and After=InstallFiles rules.
+_LAUNCH_CAS = {"LaunchApp"}
+
+
 def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
-    """Every install CA must be transitively After='InstallFiles'."""
+    """Every install CA (except launch CAs) must be transitively After='InstallFiles'."""
     customs = _get_custom_entries(package)
 
     # Build a map: action -> what it's After
@@ -157,6 +161,8 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
 
     for custom in install_cas:
         action = custom.get("Action", "")
+        if action in _LAUNCH_CAS:
+            continue
         # Walk the After chain to verify it reaches InstallFiles
         visited: set[str] = set()
         current = action
@@ -173,6 +179,22 @@ def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
             f"Install CA '{action}' is not transitively After='InstallFiles'. "
             f"Chain: {' -> '.join(visited)}"
         )
+
+
+def test_launch_ca_after_install_finalize(package: ET.Element) -> None:
+    """Launch CAs must be After='InstallFinalize' and Return='asyncNoWait'."""
+    cas = _ca_map(package)
+    customs = _get_custom_entries(package)
+
+    for custom in customs:
+        action = custom.get("Action", "")
+        if action not in _LAUNCH_CAS:
+            continue
+        assert custom.get("After") == "InstallFinalize", (f"Launch CA '{action}' must be After='InstallFinalize'")
+        ca = cas[action]
+        assert ca.get("Return") == "asyncNoWait", (f"Launch CA '{action}' must have Return='asyncNoWait'")
+        assert ca.get("Impersonate"
+                      ) == "yes", (f"Launch CA '{action}' must have Impersonate='yes' to run as the installing user")
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
@@ -243,6 +265,8 @@ def test_install_cas_return_check(package: ET.Element) -> None:
     for custom in _get_custom_entries(package):
         if _is_install_condition(custom.get("Condition", "")):
             action = custom.get("Action", "")
+            if action in _LAUNCH_CAS:
+                continue
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
             assert ca.get("Return") == "check", (
