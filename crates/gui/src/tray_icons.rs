@@ -1,5 +1,8 @@
 //! Tray icon image loading and platform-specific theme handling.
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+compile_error!("tray icons not yet supported on this platform");
+
 use tauri::image::Image;
 
 /// Which visual state the tray icon should display.
@@ -32,12 +35,6 @@ pub fn tray_image(state: TrayState) -> Image<'static> {
     #[cfg(target_os = "windows")]
     {
         windows_image(state)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = state;
-        unimplemented!("tray icons not yet supported on this platform")
     }
 }
 

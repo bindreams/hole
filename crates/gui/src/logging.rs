@@ -16,7 +16,9 @@ pub fn init(log_dir: &Path) -> WorkerGuard {
 
     // Use try_init to avoid panicking if a global subscriber is already set (e.g. in tests).
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("hole_gui=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("hole_gui=info".parse().expect("valid tracing directive")),
+        )
         .with_writer(non_blocking)
         .try_init();
 

@@ -336,12 +336,14 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         return;
     };
 
-    let download_dir = std::env::temp_dir().join("hole-update");
-    if let Err(e) = std::fs::create_dir_all(&download_dir) {
-        error!("failed to create temp dir: {e}");
-        return;
-    }
-    let dest = download_dir.join(&info.asset_name);
+    let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
+        Ok(d) => d,
+        Err(e) => {
+            error!("failed to create temp dir: {e}");
+            return;
+        }
+    };
+    let dest = download_dir.path().join(&info.asset_name);
     let asset_url = info.asset_url.clone();
     let dest_for_download = dest.clone();
 
@@ -373,12 +375,11 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         Ok(Ok(())) => {
             // On Windows, exit app to let MSI complete.
             // On macOS, the installer already copied the app.
-            let _ = std::fs::remove_file(&dest);
+            drop(download_dir);
             app.exit(0);
         }
         Ok(Err(e)) => {
             error!("installation failed: {e}");
-            let _ = std::fs::remove_file(&dest);
             app.dialog()
                 .message(format!("Installation failed: {e}"))
                 .title("Update Error")

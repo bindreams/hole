@@ -63,6 +63,7 @@ fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
 
 fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
     for cmd in commands {
+        debug_assert!(!cmd.is_empty(), "route command must not be empty");
         info!(phase, cmd = cmd.join(" "), "running route command");
         let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
         if !output.status.success() {

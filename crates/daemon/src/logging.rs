@@ -26,7 +26,9 @@ pub fn init() -> WorkerGuard {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("hole_daemon=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("hole_daemon=info".parse().expect("valid tracing directive")),
+        )
         .with_writer(non_blocking)
         .init();
 
