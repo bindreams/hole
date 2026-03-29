@@ -42,7 +42,6 @@ pub enum DaemonResponse {
 pub struct ProxyConfig {
     pub server: ServerEntry,
     pub local_port: u16,
-    pub plugin_path: Option<PathBuf>,
 }
 
 // Constants ===========================================================================================================

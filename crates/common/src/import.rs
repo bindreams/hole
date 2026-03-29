@@ -1,4 +1,4 @@
-use crate::config::ServerEntry;
+use crate::config::{is_valid_plugin_name, ServerEntry};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -54,6 +54,14 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
 
     let plugin = value.get("plugin").and_then(|v| v.as_str()).map(String::from);
     let plugin_opts = value.get("plugin_opts").and_then(|v| v.as_str()).map(String::from);
+
+    if let Some(ref name) = plugin {
+        if !is_valid_plugin_name(name) {
+            return Err(ImportError::InvalidValue(format!(
+                "plugin name must be a simple identifier (got \"{name}\")"
+            )));
+        }
+    }
 
     Ok(ServerEntry {
         id: Uuid::new_v4().to_string(),

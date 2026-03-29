@@ -28,7 +28,6 @@ fn build_proxy_config_with_selected_server() {
     let pc = build_proxy_config(&config).expect("should return Some");
     assert_eq!(pc.server.id, "b");
     assert_eq!(pc.local_port, 4073);
-    assert!(pc.plugin_path.is_none());
 }
 
 #[skuld::test]

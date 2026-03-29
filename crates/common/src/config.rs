@@ -63,6 +63,20 @@ impl std::fmt::Debug for ServerEntry {
     }
 }
 
+// Validation ==========================================================================================================
+
+/// Check whether a plugin name is a simple identifier (not a path).
+///
+/// Only allows ASCII alphanumerics, dots, underscores, and hyphens (`[a-zA-Z0-9._-]+`).
+/// Rejects path separators, null bytes, spaces, shell metacharacters, and empty strings.
+pub fn is_valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.bytes().all(|b| b == b'.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 // Methods =============================================================================================================
 
 impl AppConfig {
