@@ -149,7 +149,13 @@ fn handle_upgrade() -> i32 {
 fn handle_daemon(action: DaemonAction) -> i32 {
     match action {
         DaemonAction::Run { socket_path } => {
-            let _guard = hole_daemon::logging::init();
+            let _guard = match hole_daemon::logging::init() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    eprintln!("failed to initialize logging: {e}");
+                    return 1;
+                }
+            };
             tracing::info!("hole daemon starting");
             hole_daemon::routing::teardown_split_routes().ok();
 
