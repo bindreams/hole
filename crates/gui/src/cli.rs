@@ -157,7 +157,7 @@ fn handle_daemon(action: DaemonAction) -> i32 {
                 }
             };
             tracing::info!("hole daemon starting");
-            hole_daemon::routing::teardown_split_routes().ok();
+            hole_daemon::routing::teardown_split_routes(hole_daemon::proxy::TUN_DEVICE_NAME).ok();
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
             if let Err(e) = hole_daemon::platform::os::run(&socket_path) {

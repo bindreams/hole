@@ -1,4 +1,5 @@
 use super::*;
+use crate::gateway::GatewayInfo;
 use crate::proxy::ProxyError;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
@@ -55,19 +56,28 @@ impl ProxyBackend for MockBackend {
         }))
     }
 
-    fn setup_routes(&self, _tun_name: &str, _server_ip: IpAddr, _gateway: IpAddr) -> Result<(), ProxyError> {
+    fn setup_routes(
+        &self,
+        _tun_name: &str,
+        _server_ip: IpAddr,
+        _gateway: IpAddr,
+        _interface_name: &str,
+    ) -> Result<(), ProxyError> {
         if self.fail_routes.load(Ordering::SeqCst) {
             return Err(ProxyError::RouteSetup("mock route failure".into()));
         }
         Ok(())
     }
 
-    fn teardown_routes(&self, _server_ip: IpAddr) -> Result<(), ProxyError> {
+    fn teardown_routes(&self, _tun_name: &str, _server_ip: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
         Ok(())
     }
 
-    fn default_gateway(&self) -> Result<IpAddr, ProxyError> {
-        Ok(self.gateway)
+    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        Ok(GatewayInfo {
+            gateway_ip: self.gateway,
+            interface_name: "MockEthernet".into(),
+        })
     }
 }
 
