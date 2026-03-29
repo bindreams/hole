@@ -76,7 +76,7 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
         .menu(&menu)
         .tooltip("Hole")
         .icon(icon)
-        .on_menu_event(handle_menu_event);
+        .on_menu_event(handle_tray_event);
 
     #[cfg(target_os = "macos")]
     {
@@ -99,9 +99,31 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
     }
 }
 
-// Event handler =======================================================================================================
+// Tray event handler ==================================================================================================
 
-fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
+/// Rebuild the tray menu to sync checkbox state with the current config.
+///
+/// Preserves the "Install Update" item if an update is available.
+fn rebuild_tray_menu(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let update_state = app.state::<hole_gui::update::UpdateState>();
+        let update_info = update_state.rx.borrow().clone();
+        match build_tray_menu(app, update_info.as_ref()) {
+            Ok(menu) => {
+                sync_menu_state(app, &menu);
+                tray.set_menu(Some(menu)).ok();
+            }
+            Err(e) => warn!(error = %e, "failed to rebuild tray menu"),
+        }
+    }
+}
+
+/// Handle events from the tray menu.
+///
+/// Separated from `handle_window_menu_event` because Tauri v2 dispatches menu events globally
+/// to all registered `on_menu_event` handlers. Without the split, clicking a tray item would
+/// also invoke the window's handler (and vice versa), causing actions to fire twice.
+fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         ID_ENABLE => {
             info!("tray: enable toggled");
@@ -123,10 +145,23 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 let Some(proxy_config) = proxy_config else {
                     error!("tray: no server selected, cannot enable");
                     // Revert the toggle
-                    let mut config = state.config.lock().unwrap();
-                    config.enabled = false;
-                    config.save(&state.config_path).ok();
+                    {
+                        let mut config = state.config.lock().unwrap();
+                        config.enabled = false;
+                        config.save(&state.config_path).ok();
+                    }
                     set_tray_icon(app, false);
+                    rebuild_tray_menu(app);
+                    // Show error dialog so the user knows what happened
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        use tauri_plugin_dialog::DialogExt;
+                        app_handle
+                            .dialog()
+                            .message("No server is selected. Open Settings and select a server before enabling.")
+                            .title("Cannot Enable")
+                            .blocking_show();
+                    });
                     return;
                 };
 
@@ -165,6 +200,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         config.enabled = false;
                         config.save(&state.config_path).ok();
                         set_tray_icon(&app_handle, false);
+                        rebuild_tray_menu(&app_handle);
                     }
                 });
             } else {
@@ -199,6 +235,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                         config.enabled = true;
                         config.save(&state.config_path).ok();
                         set_tray_icon(&app_handle, true);
+                        rebuild_tray_menu(&app_handle);
                     }
                 });
             }
@@ -235,14 +272,6 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 app_handle.exit(0);
             });
         }
-        #[cfg(target_os = "macos")]
-        ID_UNINSTALL_HELPER => {
-            info!("tray: uninstall helper requested");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                handle_uninstall_helper(app_handle).await;
-            });
-        }
         ID_INSTALL_UPDATE => {
             info!("tray: install update requested");
             let app_handle = app.clone();
@@ -250,6 +279,15 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 handle_install_update_from_tray(app_handle).await;
             });
         }
+        _ => {}
+    }
+}
+
+// Window event handler ================================================================================================
+
+/// Handle events from the settings window menu bar. See `handle_tray_event` for why this is separate.
+fn handle_window_menu_event(app: &AppHandle, event: MenuEvent) {
+    match event.id().as_ref() {
         ID_CHECK_UPDATE => {
             info!("menu: check for updates");
             let app_handle = app.clone();
@@ -264,6 +302,14 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
                 .message(format!("Hole {}", hole_gui::version::VERSION))
                 .title("About Hole")
                 .blocking_show();
+        }
+        #[cfg(target_os = "macos")]
+        ID_UNINSTALL_HELPER => {
+            info!("menu: uninstall helper requested");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_uninstall_helper(app_handle).await;
+            });
         }
         _ => {}
     }
@@ -499,7 +545,7 @@ fn open_settings_window(app: &AppHandle) {
         };
 
         builder = builder.menu(menu).on_menu_event(|window, event| {
-            handle_menu_event(window.app_handle(), event);
+            handle_window_menu_event(window.app_handle(), event);
         });
     }
 

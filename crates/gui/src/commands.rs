@@ -67,6 +67,20 @@ fn sanitize_import_error(err: &import::ImportError) -> String {
     }
 }
 
+/// Select the first server if no valid server is currently selected.
+///
+/// Handles both `None` and stale selections (pointing to a server ID that no longer exists).
+fn auto_select_first_server(config: &mut AppConfig) {
+    let has_valid_selection = config
+        .selected_server
+        .as_ref()
+        .is_some_and(|id| config.servers.iter().any(|s| &s.id == id));
+
+    if !has_valid_selection {
+        config.selected_server = config.servers.first().map(|s| s.id.clone());
+    }
+}
+
 /// Import servers from a config file path. Reads the file and parses it.
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
@@ -84,6 +98,7 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
             config.servers.push(server.clone());
         }
     }
+    auto_select_first_server(&mut config);
     config.save(&state.config_path).map_err(|e| e.to_string())?;
 
     Ok(new_servers)

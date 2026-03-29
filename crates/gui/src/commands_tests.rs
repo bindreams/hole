@@ -54,6 +54,60 @@ fn build_proxy_config_invalid_selection() {
     assert!(build_proxy_config(&config).is_none());
 }
 
+// auto_select_first_server tests ======================================================================================
+
+#[skuld::test]
+fn auto_select_first_server_when_none_selected() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: None,
+        local_port: 4073,
+        enabled: false,
+    };
+
+    auto_select_first_server(&mut config);
+    assert_eq!(config.selected_server.as_deref(), Some("a"));
+}
+
+#[skuld::test]
+fn auto_select_preserves_existing_selection() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("b".to_string()),
+        local_port: 4073,
+        enabled: false,
+    };
+
+    auto_select_first_server(&mut config);
+    assert_eq!(config.selected_server.as_deref(), Some("b"));
+}
+
+#[skuld::test]
+fn auto_select_fixes_stale_selection() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("deleted-id".to_string()),
+        local_port: 4073,
+        enabled: false,
+    };
+
+    auto_select_first_server(&mut config);
+    assert_eq!(config.selected_server.as_deref(), Some("a"));
+}
+
+#[skuld::test]
+fn auto_select_noop_on_empty_servers() {
+    let mut config = AppConfig {
+        servers: vec![],
+        selected_server: None,
+        local_port: 4073,
+        enabled: false,
+    };
+
+    auto_select_first_server(&mut config);
+    assert!(config.selected_server.is_none());
+}
+
 // validate_and_read_import tests ======================================================================================
 
 const VALID_SERVER_JSON: &str = r#"{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm"}"#;
