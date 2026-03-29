@@ -128,10 +128,6 @@ components:
           type: integer
           format: uint16
           minimum: 0
-        plugin_path:
-          type:
-            - string
-            - "null"
 
     ServerEntry:
       type: object

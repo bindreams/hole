@@ -1,3 +1,4 @@
+use hole_common::config::is_valid_plugin_name;
 use hole_common::protocol::ProxyConfig;
 use shadowsocks::config::ServerAddr;
 use shadowsocks::ServerConfig;
@@ -5,6 +6,7 @@ use shadowsocks_service::config::{
     Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
 };
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use thiserror::Error;
 
 // Errors ==============================================================================================================
@@ -13,6 +15,8 @@ use thiserror::Error;
 pub enum ProxyError {
     #[error("invalid cipher method: {0}")]
     InvalidMethod(String),
+    #[error("invalid plugin name: {0}")]
+    InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
     Runtime(#[from] std::io::Error),
     #[error("gateway detection failed: {0}")]
@@ -54,11 +58,10 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
 
     // Configure v2ray-plugin if present
     if let Some(ref plugin) = entry.plugin {
-        let plugin_path = config
-            .plugin_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| plugin.clone());
+        if !is_valid_plugin_name(plugin) {
+            return Err(ProxyError::InvalidPluginName(plugin.clone()));
+        }
+        let plugin_path = resolve_plugin_path(plugin);
 
         server_config.set_plugin(shadowsocks::plugin::PluginConfig {
             plugin: plugin_path,
@@ -91,6 +94,41 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
         .push(LocalInstanceConfig::with_local_config(socks_local));
 
     Ok(ss_config)
+}
+
+// Plugin resolution ===================================================================================================
+
+/// Resolve a plugin binary path by looking next to the daemon executable.
+fn resolve_plugin_path(name: &str) -> String {
+    resolve_plugin_path_inner(name, std::env::current_exe().ok())
+}
+
+/// Inner implementation that accepts an explicit exe path for testability.
+///
+/// Looks for the plugin binary in the same directory as the daemon executable.
+/// On Windows, appends `.exe` if the name doesn't already end with it.
+/// Falls back to the bare name so that shadowsocks does a PATH lookup.
+///
+/// The PATH fallback is safe because `is_valid_plugin_name()` ensures the name
+/// contains no path separators — PATH lookup can only find binaries in directories
+/// that an administrator placed on PATH (standard system-level trust model).
+fn resolve_plugin_path_inner(name: &str, daemon_exe: Option<PathBuf>) -> String {
+    if let Some(exe) = daemon_exe {
+        // Canonicalize to resolve symlinks — the daemon may be registered via symlink,
+        // but the sibling plugin binary is next to the real binary.
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(dir) = exe.parent() {
+            let candidate = if cfg!(windows) && !name.ends_with(".exe") {
+                dir.join(format!("{name}.exe"))
+            } else {
+                dir.join(name)
+            };
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    name.to_string()
 }
 
 #[cfg(test)]

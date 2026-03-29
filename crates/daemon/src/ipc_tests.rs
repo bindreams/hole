@@ -87,7 +87,6 @@ fn sample_config() -> ProxyConfig {
             plugin_opts: None,
         },
         local_port: 4073,
-        plugin_path: None,
     }
 }
 
