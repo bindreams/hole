@@ -209,3 +209,50 @@ fn save_preserves_permissions_on_repeated_saves(#[fixture(temp_dir)] dir: &Path)
     );
     assert_eq!(dir_mode, 0o700, "dir permissions should stay 0700 after repeated saves");
 }
+
+// Debug redaction tests -----------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn server_entry_debug_redacts_password() {
+    let entry = ServerEntry {
+        id: "test-id".to_string(),
+        name: "Test".to_string(),
+        server: "1.2.3.4".to_string(),
+        server_port: 8388,
+        method: "aes-256-gcm".to_string(),
+        password: "super-secret-do-not-leak".to_string(),
+        plugin: None,
+        plugin_opts: None,
+    };
+    let debug_output = format!("{:?}", entry);
+    assert!(
+        !debug_output.contains("super-secret-do-not-leak"),
+        "Debug output must not contain the actual password: {debug_output}"
+    );
+    assert!(
+        debug_output.contains("<redacted>"),
+        "Debug output must contain redacted placeholder: {debug_output}"
+    );
+}
+
+#[skuld::test]
+fn server_entry_debug_shows_non_sensitive_fields() {
+    let entry = ServerEntry {
+        id: "unique-id-123".to_string(),
+        name: "MyServer".to_string(),
+        server: "10.20.30.40".to_string(),
+        server_port: 9999,
+        method: "chacha20-ietf-poly1305".to_string(),
+        password: "do-not-show-this".to_string(),
+        plugin: Some("v2ray-plugin".to_string()),
+        plugin_opts: Some("server;tls".to_string()),
+    };
+    let debug_output = format!("{:?}", entry);
+    assert!(debug_output.contains("unique-id-123"), "should contain id");
+    assert!(debug_output.contains("MyServer"), "should contain name");
+    assert!(debug_output.contains("10.20.30.40"), "should contain server");
+    assert!(debug_output.contains("9999"), "should contain server_port");
+    assert!(debug_output.contains("chacha20-ietf-poly1305"), "should contain method");
+    assert!(debug_output.contains("v2ray-plugin"), "should contain plugin");
+    assert!(debug_output.contains("server;tls"), "should contain plugin_opts");
+}
