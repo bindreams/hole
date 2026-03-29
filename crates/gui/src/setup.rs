@@ -242,8 +242,7 @@ pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = daemon_binary_path()?;
 
     // Create data directories
-    let log_dir = hole_daemon::logging::log_dir();
-    std::fs::create_dir_all(&log_dir)?;
+    hole_daemon::logging::ensure_log_dir()?;
 
     // Create access group and add installing user (before daemon starts,
     // so the daemon can set socket/pipe permissions using the group)
