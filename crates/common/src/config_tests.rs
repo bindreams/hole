@@ -131,7 +131,7 @@ fn deserialize_with_extra_unknown_fields_succeeds() {
     assert_eq!(config.local_port, 4073);
 }
 
-// macOS permission tests -----
+// macOS permission tests ----------------------------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
 #[skuld::test]
@@ -203,6 +203,9 @@ fn save_preserves_permissions_on_repeated_saves(#[fixture(temp_dir)] dir: &Path)
 
     let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
-    assert_eq!(file_mode, 0o600, "file permissions should stay 0600 after repeated saves");
+    assert_eq!(
+        file_mode, 0o600,
+        "file permissions should stay 0600 after repeated saves"
+    );
     assert_eq!(dir_mode, 0o700, "dir permissions should stay 0700 after repeated saves");
 }
