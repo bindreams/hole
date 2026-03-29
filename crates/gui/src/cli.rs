@@ -111,12 +111,14 @@ fn handle_upgrade() -> i32 {
         Ok(Some(info)) => {
             eprintln!("update available: v{}", info.version);
 
-            let download_dir = std::env::temp_dir().join("hole-update");
-            if let Err(e) = std::fs::create_dir_all(&download_dir) {
-                eprintln!("failed to create temp dir: {e}");
-                return 1;
-            }
-            let dest = download_dir.join(&info.asset_name);
+            let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("failed to create temp dir: {e}");
+                    return 1;
+                }
+            };
+            let dest = download_dir.path().join(&info.asset_name);
 
             eprintln!("downloading {}...", info.asset_name);
             if let Err(e) = hole_gui::update::download_asset(&info.asset_url, &dest) {
@@ -127,13 +129,9 @@ fn handle_upgrade() -> i32 {
             eprintln!("installing...");
             if let Err(e) = hole_gui::update::run_installer(&dest, true) {
                 eprintln!("installation failed: {e}");
-                // Best-effort cleanup
-                let _ = std::fs::remove_file(&dest);
                 return 1;
             }
 
-            // Best-effort cleanup
-            let _ = std::fs::remove_file(&dest);
             eprintln!("updated to v{}", info.version);
             0
         }
