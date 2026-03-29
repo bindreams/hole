@@ -59,12 +59,47 @@ impl AppConfig {
         }
     }
 
+    // Restrict config file permissions on macOS — the config contains plaintext
+    // passwords and must not be world-readable (default umask 0022 yields 0644).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::fs::{DirBuilder, OpenOptions, Permissions};
+            use std::io::Write;
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+            // Only the leaf directory (e.g. `hole/`) is created by us — ancestor directories
+            // like `~/Library/Application Support/` are system-managed and already exist.
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+                std::fs::set_permissions(parent, Permissions::from_mode(0o700))?;
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            file.write_all(json.as_bytes())?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, json)?;
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = json;
+            compile_error!("save() is not implemented for this platform");
+        }
+
         Ok(())
     }
 
