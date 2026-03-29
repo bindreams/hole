@@ -541,6 +541,7 @@ fn open_settings_window(app: &AppHandle) {
     let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
         .title("Hole Settings")
         .inner_size(600.0, 400.0)
+        .min_inner_size(450.0, 300.0)
         .resizable(true);
 
     // Menu bar (all platforms) ----------------------------------------------------------------------------------------
