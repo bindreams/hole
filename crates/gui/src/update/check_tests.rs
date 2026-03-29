@@ -28,6 +28,19 @@ fn release(tag: &str, draft: bool, prerelease: bool, assets: Vec<GitHubAsset>) -
     }
 }
 
+/// Build the standard set of release assets (main + .sha256 + .minisig) for the given version.
+fn full_asset_set(version: &str) -> Vec<GitHubAsset> {
+    let name = platform_asset_name(version);
+    vec![
+        asset(&name, &format!("https://example.com/{name}")),
+        asset(&format!("{name}.sha256"), &format!("https://example.com/{name}.sha256")),
+        asset(
+            &format!("{name}.minisig"),
+            &format!("https://example.com/{name}.minisig"),
+        ),
+    ]
+}
+
 // candidate_tags ======================================================================================================
 
 #[skuld::test]
@@ -81,29 +94,24 @@ fn candidate_tags_empty_when_no_newer() {
 #[skuld::test]
 fn release_qualifies_valid() {
     let name = platform_asset_name("1.0.0");
-    let r = release(
-        "v1.0.0",
-        false,
-        false,
-        vec![asset(&name, "https://example.com/hole-asset")],
-    );
+    let r = release("v1.0.0", false, false, full_asset_set("1.0.0"));
     let info = release_qualifies(&r).unwrap();
     assert_eq!(info.version, ReleaseVersion::parse("1.0.0").unwrap());
-    assert_eq!(info.asset_url, "https://example.com/hole-asset");
+    assert_eq!(info.asset_url, format!("https://example.com/{name}"));
     assert_eq!(info.asset_name, name);
+    assert_eq!(info.sha256_url, format!("https://example.com/{name}.sha256"));
+    assert_eq!(info.minisig_url, format!("https://example.com/{name}.minisig"));
 }
 
 #[skuld::test]
 fn release_qualifies_draft_returns_none() {
-    let name = platform_asset_name("1.0.0");
-    let r = release("v1.0.0", true, false, vec![asset(&name, "https://example.com/hole")]);
+    let r = release("v1.0.0", true, false, full_asset_set("1.0.0"));
     assert!(release_qualifies(&r).is_none());
 }
 
 #[skuld::test]
 fn release_qualifies_prerelease_returns_none() {
-    let name = platform_asset_name("1.0.0");
-    let r = release("v1.0.0", false, true, vec![asset(&name, "https://example.com/hole")]);
+    let r = release("v1.0.0", false, true, full_asset_set("1.0.0"));
     assert!(release_qualifies(&r).is_none());
 }
 
@@ -125,6 +133,36 @@ fn release_qualifies_no_matching_asset_returns_none() {
 #[skuld::test]
 fn release_qualifies_no_assets_returns_none() {
     let r = release("v1.0.0", false, false, vec![]);
+    assert!(release_qualifies(&r).is_none());
+}
+
+#[skuld::test]
+fn release_qualifies_missing_sha256_returns_none() {
+    let name = platform_asset_name("1.0.0");
+    let r = release(
+        "v1.0.0",
+        false,
+        false,
+        vec![
+            asset(&name, "https://example.com/hole-asset"),
+            asset(&format!("{name}.minisig"), "https://example.com/hole-asset.minisig"),
+        ],
+    );
+    assert!(release_qualifies(&r).is_none());
+}
+
+#[skuld::test]
+fn release_qualifies_missing_minisig_returns_none() {
+    let name = platform_asset_name("1.0.0");
+    let r = release(
+        "v1.0.0",
+        false,
+        false,
+        vec![
+            asset(&name, "https://example.com/hole-asset"),
+            asset(&format!("{name}.sha256"), "https://example.com/hole-asset.sha256"),
+        ],
+    );
     assert!(release_qualifies(&r).is_none());
 }
 

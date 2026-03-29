@@ -126,6 +126,12 @@ fn handle_upgrade() -> i32 {
                 return 1;
             }
 
+            eprintln!("verifying...");
+            if let Err(e) = hole_gui::update::verify_asset(&dest, &info.sha256_url, &info.minisig_url) {
+                eprintln!("verification failed: {e}");
+                return 1;
+            }
+
             eprintln!("installing...");
             if let Err(e) = hole_gui::update::run_installer(&dest, true) {
                 eprintln!("installation failed: {e}");

@@ -58,6 +58,8 @@ pub struct UpdateInfo {
     pub version: ReleaseVersion,
     pub asset_url: String,
     pub asset_name: String,
+    pub sha256_url: String,
+    pub minisig_url: String,
     pub release_notes: Option<String>,
     pub html_url: String,
 }
@@ -160,7 +162,8 @@ pub(crate) fn candidate_tags(
     candidates
 }
 
-/// Check if a release qualifies as an update: not draft, not prerelease, has a matching platform asset.
+/// Check if a release qualifies as an update: not draft, not prerelease, has a matching platform
+/// asset with both `.sha256` and `.minisig` sidecar files.
 pub(crate) fn release_qualifies(release: &GitHubRelease) -> Option<UpdateInfo> {
     if release.draft || release.prerelease {
         return None;
@@ -168,12 +171,21 @@ pub(crate) fn release_qualifies(release: &GitHubRelease) -> Option<UpdateInfo> {
 
     let asset = release.assets.iter().find(|a| a.name.ends_with(ASSET_SUFFIX))?;
 
+    // Both sidecar files must be present for the release to qualify.
+    let sha256_name = format!("{}.sha256", asset.name);
+    let sha256_asset = release.assets.iter().find(|a| a.name == sha256_name)?;
+
+    let minisig_name = format!("{}.minisig", asset.name);
+    let minisig_asset = release.assets.iter().find(|a| a.name == minisig_name)?;
+
     let version = ReleaseVersion::parse(&release.tag_name).ok()?;
 
     Some(UpdateInfo {
         version,
         asset_url: asset.browser_download_url.clone(),
         asset_name: asset.name.clone(),
+        sha256_url: sha256_asset.browser_download_url.clone(),
+        minisig_url: minisig_asset.browser_download_url.clone(),
         release_notes: release.body.clone(),
         html_url: release.html_url.clone(),
     })
