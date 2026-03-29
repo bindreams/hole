@@ -25,14 +25,51 @@ mod imp {
         inner: tokio::net::UnixStream,
     }
 
+    /// RAII guard that sets a restrictive umask and restores the original on drop.
+    /// Panic-safe: the original umask is restored even if the guarded code panics.
+    ///
+    /// # Thread safety
+    /// `umask()` is process-wide (POSIX). While the guard is active, any other
+    /// thread creating files will inherit the restrictive mask. This is acceptable
+    /// because `bind()` is called once during daemon startup before the async
+    /// server loop starts, and the window is limited to a single `bind()` syscall.
+    struct UmaskGuard(libc::mode_t);
+
+    impl UmaskGuard {
+        fn set(mask: libc::mode_t) -> Self {
+            // SAFETY: umask is a simple process-wide bitmask with no failure mode.
+            Self(unsafe { libc::umask(mask) })
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring the previously saved umask value.
+            unsafe { libc::umask(self.0); }
+        }
+    }
+
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
             let _ = std::fs::remove_file(path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // Set restrictive umask so the socket is created with mode 0600
+            // (owner-only). This prevents a TOCTOU race: without the umask,
+            // the socket would be world-accessible until apply_socket_permissions()
+            // runs in ipc.rs. The guard restores the original umask on drop.
+            let _guard = UmaskGuard::set(0o177);
             let inner = tokio::net::UnixListener::bind(path)?;
             Ok(Self { inner })
+        }
+
+        /// On macOS, identical to `bind()` — the umask guard is always applied.
+        /// This method exists for cross-platform API parity with the Windows
+        /// implementation, where `bind_restricted` applies a DACL between
+        /// `bind()` and `listen()`.
+        pub fn bind_restricted(path: &Path) -> io::Result<Self> {
+            Self::bind(path)
         }
 
         pub async fn accept(&self) -> io::Result<LocalStream> {
@@ -95,6 +132,20 @@ mod imp {
 
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
+            Self::bind_inner(path, false)
+        }
+
+        /// Bind with a restrictive DACL (SYSTEM + Administrators only) applied
+        /// between `bind()` and `listen()`. No connections are possible before
+        /// `listen()`, so this eliminates the TOCTOU race where the socket
+        /// inherits a permissive DACL from the parent directory. The final
+        /// DACL (adding the `hole` group) is applied later by
+        /// `apply_socket_permissions()` in `ipc.rs`.
+        pub fn bind_restricted(path: &Path) -> io::Result<Self> {
+            Self::bind_inner(path, true)
+        }
+
+        fn bind_inner(path: &Path, restrict: bool) -> io::Result<Self> {
             // Remove stale socket file (ignore "not found"; warn on other errors)
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -111,6 +162,15 @@ mod imp {
             let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
             let addr = SockAddr::unix(path)?;
             socket.bind(&addr)?;
+            if restrict {
+                // Use the shared base SDDL with P (protected) prefix to block
+                // inherited ACEs from the parent directory.
+                let sddl = crate::ipc::SDDL_BASE.replacen("D:", "D:P", 1);
+                if let Err(e) = crate::ipc::set_dacl_from_sddl(path, &sddl, true) {
+                    let _ = std::fs::remove_file(path);
+                    return Err(e);
+                }
+            }
             socket.listen(128)?;
             // Non-blocking so accept() returns immediately with WouldBlock
             // when no connection is pending. This prevents spawn_blocking
@@ -198,6 +258,16 @@ pub use imp::{LocalListener, LocalStream};
 /// Creates parent directories if they don't exist.
 pub fn bind(path: &Path) -> io::Result<LocalListener> {
     LocalListener::bind(path)
+}
+
+/// Like [`bind`], but applies restrictive OS-level permissions during creation.
+///
+/// On macOS, identical to `bind()` (umask guard is always applied).
+/// On Windows, applies a protected DACL (SYSTEM + Administrators only) between
+/// `bind()` and `listen()` to prevent a TOCTOU race on socket permissions.
+#[allow(dead_code)]
+pub(crate) fn bind_restricted(path: &Path) -> io::Result<LocalListener> {
+    LocalListener::bind_restricted(path)
 }
 
 /// Connect to a listener at the given path.

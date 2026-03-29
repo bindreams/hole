@@ -34,9 +34,13 @@ pub struct IpcServer {
 impl IpcServer {
     /// Bind to the given Unix domain socket path.
     ///
-    /// Removes any stale socket file, creates parent directories, binds,
-    /// and applies OS-level access control to the socket file.
+    /// Removes any stale socket file, creates parent directories, binds with
+    /// restrictive initial permissions (umask on macOS, DACL on Windows), and
+    /// then applies the final OS-level access control (adding the `hole` group).
     pub fn bind<B: ProxyBackend + 'static>(path: &Path, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+        #[cfg(not(test))]
+        let listener = LocalListener::bind_restricted(path)?;
+        #[cfg(test)]
         let listener = LocalListener::bind(path)?;
 
         #[cfg(not(test))]
@@ -186,40 +190,47 @@ async fn handle_reload<B: ProxyBackend + 'static>(
 
 // Security ============================================================================================================
 
-/// Apply OS-level access control to the socket file.
+/// Base SDDL for socket access control: SYSTEM + Administrators only.
+/// Used as the restrictive initial DACL (with `P` flag) in `socket.rs`,
+/// and as the base for the final DACL (with `hole` group appended) here.
+#[cfg(target_os = "windows")]
+pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+
+/// Apply a DACL defined by an SDDL string to a filesystem object.
 ///
-/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
-/// On macOS: sets ownership to root:hole with mode 0660.
-#[cfg(all(target_os = "windows", not(test)))]
-fn apply_socket_permissions(path: &Path) {
+/// When `protect` is true, the DACL is set as protected, blocking inherited
+/// ACEs from the parent directory. This is used for the initial restrictive
+/// DACL in `socket.rs` (SYSTEM + Administrators only, before `listen()`).
+///
+/// When `protect` is false, inherited ACEs are preserved. This is used for
+/// the final DACL in `apply_socket_permissions` (adding the `hole` group).
+#[cfg(target_os = "windows")]
+pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
-    use windows::Win32::Security::{GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
 
-    let sddl = build_sddl();
-    let sddl_wide = HSTRING::from(&sddl);
+    let sddl_wide = HSTRING::from(sddl);
     let path_wide = HSTRING::from(path.as_os_str());
 
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl_wide` is a valid HSTRING kept alive for the call.
     // `sd` is an out-parameter that Windows allocates via LocalAlloc on success;
     // we free it with LocalFree at the end of this function on all paths.
-    let result = unsafe {
+    unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             &sddl_wide, 1, // SDDL_REVISION_1
             &mut sd, None,
         )
-    };
-
-    if let Err(e) = result {
-        warn!("failed to parse SDDL for socket permissions: {e}");
-        return;
     }
+    .map_err(|e| std::io::Error::other(format!("failed to parse SDDL: {e}")))?;
 
-    // Extract DACL from the security descriptor
     let mut dacl_present = false.into();
     let mut dacl = std::ptr::null_mut();
     let mut dacl_defaulted = false.into();
@@ -229,7 +240,6 @@ fn apply_socket_permissions(path: &Path) {
     let result = unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted) };
 
     if let Err(e) = result {
-        warn!("failed to extract DACL from security descriptor: {e}");
         // SAFETY: `sd.0` was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW
         // via LocalAlloc. Transmute converts the opaque PSECURITY_DESCRIPTOR pointer to
         // HLOCAL, which is the same pointer type — no bits change.
@@ -239,28 +249,43 @@ fn apply_socket_permissions(path: &Path) {
                 windows::Win32::Foundation::HLOCAL,
             >(sd.0)));
         }
-        return;
+        return Err(std::io::Error::other(format!("failed to extract DACL: {e}")));
     }
 
-    // Apply DACL to the socket file
+    if !bool::from(dacl_present) {
+        // SAFETY: same LocalFree pattern as above.
+        unsafe {
+            let _ = LocalFree(Some(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                windows::Win32::Foundation::HLOCAL,
+            >(sd.0)));
+        }
+        return Err(std::io::Error::other("SDDL security descriptor has no DACL"));
+    }
+
+    // When protect is true, block inherited ACEs from the parent directory.
+    // When false, explicitly re-enable inheritance (needed to undo a prior
+    // protected DACL set during socket creation).
+    let security_info = DACL_SECURITY_INFORMATION
+        | if protect {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+
     // SAFETY: `path_wide` is alive for the call. `dacl` points into the still-live
-    // `sd` allocation. We pass only DACL_SECURITY_INFORMATION, so owner/group
-    // pointers are correctly None.
-    let err = unsafe {
+    // `sd` allocation. Owner/group pointers are correctly None.
+    let result = unsafe {
         SetNamedSecurityInfoW(
             &path_wide,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            security_info,
             None,
             None,
             Some(dacl.cast()),
             None,
         )
     };
-
-    if err.is_err() {
-        warn!("failed to set socket file ACL: {err:?}");
-    }
 
     // SAFETY: same as the early-return LocalFree above — `sd.0` was allocated by
     // Windows via LocalAlloc and is freed exactly once here.
@@ -270,13 +295,31 @@ fn apply_socket_permissions(path: &Path) {
             windows::Win32::Foundation::HLOCAL,
         >(sd.0)));
     }
+
+    result.ok().map_err(|e| std::io::Error::other(format!("failed to set ACL: {e}")))
+}
+
+/// Apply OS-level access control to the socket file.
+///
+/// This is the second phase of socket permission setup. The first phase
+/// (in `socket.rs`) applies a restrictive DACL/umask during socket creation
+/// to prevent a TOCTOU race. This function then sets the final permissions,
+/// adding the `hole` group on both platforms.
+///
+/// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
+/// On macOS: sets ownership to root:hole with mode 0660.
+#[cfg(all(target_os = "windows", not(test)))]
+fn apply_socket_permissions(path: &Path) {
+    let sddl = build_sddl();
+    if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
+        warn!("failed to set socket permissions: {e}");
+    }
 }
 
 /// Build the SDDL string for the socket file DACL.
 #[cfg(all(target_os = "windows", not(test)))]
 fn build_sddl() -> String {
-    // Base: SYSTEM + Administrators
-    let base = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+    let base = SDDL_BASE;
 
     match crate::group::group_sid() {
         Ok(sid) => {
@@ -291,6 +334,10 @@ fn build_sddl() -> String {
 }
 
 /// Set socket file ownership to root:hole and mode 0660 on macOS.
+///
+/// This is the second phase of socket permission setup. The first phase
+/// (umask guard in `socket.rs`) creates the socket with mode 0600. This
+/// function then sets ownership to root:hole and widens the mode to 0660.
 #[cfg(all(target_os = "macos", not(test)))]
 fn apply_socket_permissions(path: &Path) {
     use std::ffi::CString;
