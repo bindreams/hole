@@ -1,7 +1,7 @@
 use super::*;
 use std::net::IpAddr;
 
-// Helpers =================================================================================================================
+// Helpers =============================================================================================================
 
 fn ipv4_server() -> IpAddr {
     "1.2.3.4".parse().unwrap()
@@ -25,7 +25,7 @@ fn teardown_cmds_joined(server_ip: IpAddr) -> String {
     cmds.iter().map(|c| c.join(" ")).collect::<Vec<_>>().join("\n")
 }
 
-// Setup tests — IPv4 server ==============================================================================================
+// Setup tests — IPv4 server ===========================================================================================
 
 #[skuld::test]
 fn setup_generates_five_commands() {
@@ -78,7 +78,7 @@ fn setup_bypass_uses_original_gateway() {
     );
 }
 
-// Setup tests — IPv6 server ==============================================================================================
+// Setup tests — IPv6 server ===========================================================================================
 
 #[skuld::test]
 fn setup_with_ipv6_server_generates_five_commands() {
@@ -110,7 +110,7 @@ fn setup_with_ipv6_server_has_no_ipv4_bypass() {
     );
 }
 
-// Teardown tests — IPv4 server ============================================================================================
+// Teardown tests — IPv4 server ========================================================================================
 
 #[skuld::test]
 fn teardown_generates_five_commands() {
@@ -153,7 +153,7 @@ fn teardown_includes_server_bypass() {
     assert!(joined.contains("9.8.7.6"), "missing server bypass in:\n{joined}");
 }
 
-// Teardown tests — IPv6 server ============================================================================================
+// Teardown tests — IPv6 server ========================================================================================
 
 #[skuld::test]
 fn teardown_with_ipv6_server_includes_ipv6_bypass() {
@@ -175,7 +175,7 @@ fn teardown_with_ipv6_server_has_no_ipv4_bypass() {
     );
 }
 
-// Split route teardown (crash recovery) ===================================================================================
+// Split route teardown (crash recovery) ===============================================================================
 
 #[skuld::test]
 fn split_teardown_generates_four_commands() {
@@ -220,7 +220,7 @@ fn split_teardown_includes_ipv6_high_half() {
     );
 }
 
-// Interface name with spaces ==============================================================================================
+// Interface name with spaces ==========================================================================================
 
 #[skuld::test]
 fn setup_with_spaced_interface_name_includes_full_name() {
@@ -232,7 +232,7 @@ fn setup_with_spaced_interface_name_includes_full_name() {
     );
 }
 
-// RouteGuard tests ========================================================================================================
+// RouteGuard tests ====================================================================================================
 
 #[skuld::test]
 fn route_guard_stores_server_ip() {
