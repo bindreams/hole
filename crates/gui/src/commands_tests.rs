@@ -55,7 +55,7 @@ fn build_proxy_config_invalid_selection() {
     assert!(build_proxy_config(&config).is_none());
 }
 
-// validate_and_read_import tests =====
+// validate_and_read_import tests ======================================================================================
 
 const VALID_SERVER_JSON: &str = r#"{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm"}"#;
 
