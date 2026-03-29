@@ -25,53 +25,34 @@ mod imp {
         inner: tokio::net::UnixStream,
     }
 
-    /// RAII guard that sets a restrictive umask and restores the original on drop.
-    /// Panic-safe: the original umask is restored even if the guarded code panics.
-    ///
-    /// # Thread safety
-    /// `umask()` is process-wide (POSIX). While the guard is active, any other
-    /// thread creating files will inherit the restrictive mask. This is acceptable
-    /// because `bind()` is called once during daemon startup before the async
-    /// server loop starts, and the window is limited to a single `bind()` syscall.
-    struct UmaskGuard(libc::mode_t);
-
-    impl UmaskGuard {
-        fn set(mask: libc::mode_t) -> Self {
-            // SAFETY: umask is a simple process-wide bitmask with no failure mode.
-            Self(unsafe { libc::umask(mask) })
-        }
-    }
-
-    impl Drop for UmaskGuard {
-        fn drop(&mut self) {
-            // SAFETY: restoring the previously saved umask value.
-            unsafe {
-                libc::umask(self.0);
-            }
-        }
-    }
-
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
             let _ = std::fs::remove_file(path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Set restrictive umask so the socket is created with mode 0600
-            // (owner-only). This prevents a TOCTOU race: without the umask,
-            // the socket would be world-accessible until apply_socket_permissions()
-            // runs in ipc.rs. The guard restores the original umask on drop.
-            let _guard = UmaskGuard::set(0o177);
             let inner = tokio::net::UnixListener::bind(path)?;
             Ok(Self { inner })
         }
 
-        /// On macOS, identical to `bind()` — the umask guard is always applied.
-        /// This method exists for cross-platform API parity with the Windows
-        /// implementation, where `bind_restricted` applies a DACL between
-        /// `bind()` and `listen()`.
+        /// Bind with restrictive permissions (mode 0600) applied immediately
+        /// after `bind()`. This minimizes the TOCTOU window: the socket is
+        /// only accessible with default permissions for the duration of a
+        /// single `chmod()` syscall. The final permissions (0660/root:hole)
+        /// are applied later by `apply_socket_permissions()` in `ipc.rs`.
         pub fn bind_restricted(path: &Path) -> io::Result<Self> {
-            Self::bind(path)
+            let listener = Self::bind(path)?;
+            // SAFETY: path is a valid, NUL-free UTF-8 string (same as used by bind).
+            let c_path = std::ffi::CString::new(
+                path.to_str()
+                    .ok_or_else(|| io::Error::other("socket path is not valid UTF-8"))?,
+            )
+            .map_err(|e| io::Error::other(format!("invalid socket path: {e}")))?;
+            // SAFETY: c_path is a valid C string pointing to the just-created socket.
+            if unsafe { libc::chmod(c_path.as_ptr(), 0o600) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(listener)
         }
 
         pub async fn accept(&self) -> io::Result<LocalStream> {

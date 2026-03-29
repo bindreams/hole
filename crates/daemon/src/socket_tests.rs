@@ -75,10 +75,9 @@ fn connect_nonexistent_fails() {
 
 // Security ------------------------------------------------------------------------------------------------------------
 
-/// Verify the socket file is created with restrictive permissions (mode 0600)
-/// due to the umask guard in `LocalListener::bind()`. The final permissions
-/// (0660/root:hole) are applied later by `apply_socket_permissions()`, which
-/// is disabled in tests.
+/// Verify that `bind_restricted` applies mode 0600 to the socket file.
+/// The final permissions (0660/root:hole) are applied later by
+/// `apply_socket_permissions()`, which is disabled in tests.
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn socket_created_with_restrictive_permissions() {
@@ -89,17 +88,13 @@ fn socket_created_with_restrictive_permissions() {
     let _guard = rt.enter();
 
     let path = test_socket_path("perms");
-    let _listener = LocalListener::bind(&path).unwrap();
+    let _listener = LocalListener::bind_restricted(&path).unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
     assert_eq!(
         mode, 0o600,
         "socket should be owner-only (0600) before apply_socket_permissions"
     );
-
-    // Note: umask restoration (UmaskGuard drop) is correct by RAII, but cannot
-    // be reliably tested here because umask() is process-wide and other tests
-    // calling bind() concurrently can race with the probe file creation.
 
     let _ = std::fs::remove_file(&path);
 }
