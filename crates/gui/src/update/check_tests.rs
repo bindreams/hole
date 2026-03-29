@@ -28,16 +28,13 @@ fn release(tag: &str, draft: bool, prerelease: bool, assets: Vec<GitHubAsset>) -
     }
 }
 
-/// Build the standard set of release assets (main + .sha256 + .minisig) for the given version.
+/// Build the standard set of release assets (main + SHA256SUMS + SHA256SUMS.minisig) for the given version.
 fn full_asset_set(version: &str) -> Vec<GitHubAsset> {
     let name = platform_asset_name(version);
     vec![
         asset(&name, &format!("https://example.com/{name}")),
-        asset(&format!("{name}.sha256"), &format!("https://example.com/{name}.sha256")),
-        asset(
-            &format!("{name}.minisig"),
-            &format!("https://example.com/{name}.minisig"),
-        ),
+        asset("SHA256SUMS", "https://example.com/SHA256SUMS"),
+        asset("SHA256SUMS.minisig", "https://example.com/SHA256SUMS.minisig"),
     ]
 }
 
@@ -99,8 +96,8 @@ fn release_qualifies_valid() {
     assert_eq!(info.version, ReleaseVersion::parse("1.0.0").unwrap());
     assert_eq!(info.asset_url, format!("https://example.com/{name}"));
     assert_eq!(info.asset_name, name);
-    assert_eq!(info.sha256_url, format!("https://example.com/{name}.sha256"));
-    assert_eq!(info.minisig_url, format!("https://example.com/{name}.minisig"));
+    assert_eq!(info.sha256sums_url, "https://example.com/SHA256SUMS");
+    assert_eq!(info.sha256sums_minisig_url, "https://example.com/SHA256SUMS.minisig");
 }
 
 #[skuld::test]
@@ -117,15 +114,15 @@ fn release_qualifies_prerelease_returns_none() {
 
 #[skuld::test]
 fn release_qualifies_no_matching_asset_returns_none() {
-    // Use an asset name that will never match any platform's ASSET_SUFFIX.
     let r = release(
         "v1.0.0",
         false,
         false,
-        vec![asset(
-            "hole-1.0.0-linux-amd64.tar.gz",
-            "https://example.com/hole.tar.gz",
-        )],
+        vec![
+            asset("hole-1.0.0-linux-amd64.tar.gz", "https://example.com/hole.tar.gz"),
+            asset("SHA256SUMS", "https://example.com/SHA256SUMS"),
+            asset("SHA256SUMS.minisig", "https://example.com/SHA256SUMS.minisig"),
+        ],
     );
     assert!(release_qualifies(&r).is_none());
 }
@@ -137,7 +134,7 @@ fn release_qualifies_no_assets_returns_none() {
 }
 
 #[skuld::test]
-fn release_qualifies_missing_sha256_returns_none() {
+fn release_qualifies_missing_sha256sums_returns_none() {
     let name = platform_asset_name("1.0.0");
     let r = release(
         "v1.0.0",
@@ -145,14 +142,14 @@ fn release_qualifies_missing_sha256_returns_none() {
         false,
         vec![
             asset(&name, "https://example.com/hole-asset"),
-            asset(&format!("{name}.minisig"), "https://example.com/hole-asset.minisig"),
+            asset("SHA256SUMS.minisig", "https://example.com/SHA256SUMS.minisig"),
         ],
     );
     assert!(release_qualifies(&r).is_none());
 }
 
 #[skuld::test]
-fn release_qualifies_missing_minisig_returns_none() {
+fn release_qualifies_missing_sha256sums_minisig_returns_none() {
     let name = platform_asset_name("1.0.0");
     let r = release(
         "v1.0.0",
@@ -160,7 +157,7 @@ fn release_qualifies_missing_minisig_returns_none() {
         false,
         vec![
             asset(&name, "https://example.com/hole-asset"),
-            asset(&format!("{name}.sha256"), "https://example.com/hole-asset.sha256"),
+            asset("SHA256SUMS", "https://example.com/SHA256SUMS"),
         ],
     );
     assert!(release_qualifies(&r).is_none());

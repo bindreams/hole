@@ -369,10 +369,11 @@ async fn handle_install_update_from_tray(app: AppHandle) {
 
     // Verify integrity and authenticity.
     let dest_for_verify = dest.clone();
-    let sha256_url = info.sha256_url.clone();
-    let minisig_url = info.minisig_url.clone();
+    let asset_name = info.asset_name.clone();
+    let sha256sums_url = info.sha256sums_url.clone();
+    let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
     let verify_result = tokio::task::spawn_blocking(move || {
-        hole_gui::update::verify_asset(&dest_for_verify, &sha256_url, &minisig_url)
+        hole_gui::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
     })
     .await;
 

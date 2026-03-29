@@ -16,6 +16,8 @@ pub enum UpdateError {
     HashMismatch { expected: String, actual: String },
     #[error("signature verification failed: {0}")]
     SignatureInvalid(String),
+    #[error("asset {0} not found in SHA256SUMS")]
+    AssetNotInManifest(String),
 }
 
 impl From<ureq::Error> for UpdateError {

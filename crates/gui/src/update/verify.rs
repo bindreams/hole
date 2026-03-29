@@ -16,22 +16,31 @@ const SIDECAR_SIZE_LIMIT: u64 = 1024 * 1024;
 
 /// Verify a downloaded asset's integrity (SHA-256) and authenticity (minisign).
 ///
-/// Both checks are mandatory. SHA-256 is verified first (short-circuits on failure).
+/// Downloads the release-level `SHA256SUMS` manifest and its minisign signature,
+/// verifies the signature first (authenticity), then looks up and verifies the
+/// asset's hash (integrity). Both checks must pass.
+///
 /// This is a blocking function — call from `spawn_blocking`.
-pub fn verify_asset(asset_path: &Path, sha256_url: &str, minisig_url: &str) -> Result<(), UpdateError> {
-    verify_sha256(asset_path, sha256_url)?;
-    verify_minisig(asset_path, minisig_url)?;
+pub fn verify_asset(
+    asset_path: &Path,
+    asset_name: &str,
+    sha256sums_url: &str,
+    sha256sums_minisig_url: &str,
+) -> Result<(), UpdateError> {
+    let sha256sums = download_text(sha256sums_url)?;
+    let minisig = download_text(sha256sums_minisig_url)?;
+
+    // Verify signature on the manifest first — if tampered, no point checking hashes.
+    verify_minisig_data(sha256sums.as_bytes(), &minisig, MINISIGN_PUBLIC_KEY)?;
+
+    // Look up this asset's expected hash and verify.
+    let expected_hex = find_hash_in_sha256sums(&sha256sums, asset_name)?;
+    verify_sha256_hash(asset_path, expected_hex)?;
+
     Ok(())
 }
 
 // SHA-256 verification ================================================================================================
-
-/// Download the `.sha256` file and verify the asset's hash.
-fn verify_sha256(asset_path: &Path, sha256_url: &str) -> Result<(), UpdateError> {
-    let content = download_text(sha256_url)?;
-    let expected_hex = parse_sha256_file(&content);
-    verify_sha256_hash(asset_path, expected_hex)
-}
 
 /// Verify a file's SHA-256 hash against an expected hex digest. Pure function (no network).
 pub(crate) fn verify_sha256_hash(asset_path: &Path, expected_hex: &str) -> Result<(), UpdateError> {
@@ -47,13 +56,6 @@ pub(crate) fn verify_sha256_hash(asset_path: &Path, expected_hex: &str) -> Resul
 
 // Minisign verification ===============================================================================================
 
-/// Download the `.minisig` file and verify the asset's signature.
-fn verify_minisig(asset_path: &Path, minisig_url: &str) -> Result<(), UpdateError> {
-    let sig_text = download_text(minisig_url)?;
-    let data = std::fs::read(asset_path)?;
-    verify_minisig_data(&data, &sig_text, MINISIGN_PUBLIC_KEY)
-}
-
 /// Verify a minisign signature against data and a public key. Pure function (no network).
 pub(crate) fn verify_minisig_data(data: &[u8], signature_text: &str, public_key_str: &str) -> Result<(), UpdateError> {
     use minisign_verify::{PublicKey, Signature};
@@ -67,6 +69,29 @@ pub(crate) fn verify_minisig_data(data: &[u8], signature_text: &str, public_key_
         .map_err(|e| UpdateError::SignatureInvalid(e.to_string()))
 }
 
+// SHA256SUMS parsing ==================================================================================================
+
+/// Look up an asset's hash in a SHA256SUMS manifest.
+///
+/// Expects `sha256sum`-compatible format: `<64-hex-chars>  <filename>` per line.
+/// Matches `asset_name` exactly against the filename field.
+pub(crate) fn find_hash_in_sha256sums<'a>(content: &'a str, asset_name: &str) -> Result<&'a str, UpdateError> {
+    for line in content.lines() {
+        let line = line.trim_end_matches('\r');
+        // sha256sum format: "<hash>  <filename>" (two-space separator).
+        // split_whitespace handles both single and double spaces.
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+
+        if name == asset_name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(hash);
+        }
+    }
+
+    Err(UpdateError::AssetNotInManifest(asset_name.to_string()))
+}
+
 // Helpers =============================================================================================================
 
 /// Compute the SHA-256 hex digest of a file.
@@ -74,17 +99,6 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String, UpdateError> {
     let data = std::fs::read(path)?;
     let hash = sha2::Sha256::digest(&data);
     Ok(hex_encode(&hash))
-}
-
-/// Parse a `.sha256` file, extracting the hex hash.
-///
-/// Handles both formats:
-/// - `<hash>  <filename>` (sha256sum output)
-/// - `<hash>` (bare hex)
-///
-/// Trims `\n` and `\r\n` before parsing.
-pub(crate) fn parse_sha256_file(content: &str) -> &str {
-    content.split_whitespace().next().unwrap_or("")
 }
 
 /// Encode bytes as lowercase hex.

@@ -2,48 +2,37 @@ use std::path::Path;
 
 use super::*;
 
-// parse_sha256_file ===================================================================================================
+// find_hash_in_sha256sums =============================================================================================
+
+const SAMPLE_MANIFEST: &str = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  hole-1.0.0-windows-amd64.msi\n\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  hole-1.0.0-darwin-arm64.dmg\n\
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  hole-1.0.0-darwin-amd64.dmg\n";
 
 #[skuld::test]
-fn parse_sha256_file_bare_hash() {
-    let content = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n";
-    assert_eq!(
-        parse_sha256_file(content),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
+fn find_hash_in_sha256sums_found() {
+    let hash = find_hash_in_sha256sums(SAMPLE_MANIFEST, "hole-1.0.0-darwin-arm64.dmg").unwrap();
+    assert_eq!(hash, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 }
 
 #[skuld::test]
-fn parse_sha256_file_with_filename() {
-    let content = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  hole-1.0.0-windows-amd64.msi\n";
-    assert_eq!(
-        parse_sha256_file(content),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
+fn find_hash_in_sha256sums_not_found() {
+    let result = find_hash_in_sha256sums(SAMPLE_MANIFEST, "hole-1.0.0-linux-amd64.tar.gz");
+    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
 }
 
 #[skuld::test]
-fn parse_sha256_file_no_trailing_newline() {
-    let content = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    assert_eq!(
-        parse_sha256_file(content),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
+fn find_hash_in_sha256sums_crlf() {
+    let manifest = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234  file.msi\r\n";
+    let hash = find_hash_in_sha256sums(manifest, "file.msi").unwrap();
+    assert_eq!(hash, "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234");
 }
 
 #[skuld::test]
-fn parse_sha256_file_crlf() {
-    let content = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n";
-    assert_eq!(
-        parse_sha256_file(content),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
-}
-
-#[skuld::test]
-fn parse_sha256_file_empty() {
-    assert_eq!(parse_sha256_file(""), "");
-    assert_eq!(parse_sha256_file("  \n"), "");
+fn find_hash_in_sha256sums_invalid_hash_length() {
+    let manifest = "shorthash  file.msi\n";
+    let result = find_hash_in_sha256sums(manifest, "file.msi");
+    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
 }
 
 // hex_encode ==========================================================================================================
