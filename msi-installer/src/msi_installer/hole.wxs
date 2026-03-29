@@ -18,6 +18,7 @@
     UpgradeCode="6F2A8C1D-3E4B-4F5A-9D7E-1C2B3A4F5E6D">
 
     <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
     <!-- Installation directory structure -->
