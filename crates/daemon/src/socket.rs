@@ -45,7 +45,9 @@ mod imp {
     impl Drop for UmaskGuard {
         fn drop(&mut self) {
             // SAFETY: restoring the previously saved umask value.
-            unsafe { libc::umask(self.0); }
+            unsafe {
+                libc::umask(self.0);
+            }
         }
     }
 
