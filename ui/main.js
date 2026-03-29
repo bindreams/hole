@@ -4,17 +4,24 @@ const { listen } = window.__TAURI__.event;
 // State =====
 
 let config = null;
+let dirty = false;
 
 // DOM refs =====
 
 const serverList = document.getElementById("server-list");
-const emptyMessage = document.getElementById("empty-message");
+const emptyState = document.getElementById("empty-state");
 const localPortInput = document.getElementById("local-port");
-const btnImport = document.getElementById("btn-import");
-const btnSave = document.getElementById("btn-save");
+const btnApply = document.getElementById("btn-apply");
 const btnToggle = document.getElementById("btn-toggle");
 const saveStatus = document.getElementById("save-status");
 const statusBadge = document.getElementById("status");
+
+// Dirty tracking =====
+
+function setDirty(value) {
+  dirty = value;
+  btnApply.disabled = !dirty;
+}
 
 // Rendering =====
 
@@ -22,10 +29,10 @@ function renderServers() {
   serverList.innerHTML = "";
 
   if (!config || config.servers.length === 0) {
-    emptyMessage.style.display = "";
+    emptyState.style.display = "";
     return;
   }
-  emptyMessage.style.display = "none";
+  emptyState.style.display = "none";
 
   for (const server of config.servers) {
     const tr = document.createElement("tr");
@@ -111,15 +118,17 @@ function updateToggleButton(enabled) {
 async function loadConfig() {
   config = await invoke("get_config");
   localPortInput.value = config.local_port;
+  setDirty(false);
   updateToggleButton(config.enabled);
   renderServers();
 }
 
-async function saveConfig() {
+async function applyConfig() {
   config.local_port = parseInt(localPortInput.value, 10) || 4073;
   try {
     await invoke("save_config", { config });
-    saveStatus.textContent = "Saved.";
+    setDirty(false);
+    saveStatus.textContent = "Applied.";
     setTimeout(() => { saveStatus.textContent = ""; }, 2000);
   } catch (e) {
     saveStatus.textContent = `Error: ${e}`;
@@ -143,6 +152,17 @@ async function importServers() {
   }
 }
 
+async function importFromPath(path) {
+  try {
+    await invoke("import_servers_from_file", { path });
+    await loadConfig();
+    saveStatus.textContent = "Servers imported.";
+    setTimeout(() => { saveStatus.textContent = ""; }, 2000);
+  } catch (e) {
+    saveStatus.textContent = `Import error: ${e}`;
+  }
+}
+
 async function toggleProxy() {
   btnToggle.disabled = true;
   try {
@@ -152,7 +172,6 @@ async function toggleProxy() {
   } catch (e) {
     saveStatus.textContent = `Error: ${e}`;
     setTimeout(() => { saveStatus.textContent = ""; }, 4000);
-    // Reload config to get the reverted state
     try { await loadConfig(); } catch { /* best-effort */ }
   } finally {
     btnToggle.disabled = false;
@@ -168,7 +187,6 @@ async function checkDaemonStatus() {
     statusBadge.textContent = "Daemon: disconnected";
     statusBadge.className = "status disconnected";
   }
-  // Sync toggle button with current config state
   try {
     const cfg = await invoke("get_config");
     updateToggleButton(cfg.enabled);
@@ -177,12 +195,24 @@ async function checkDaemonStatus() {
 
 // Events =====
 
-btnSave.addEventListener("click", saveConfig);
-btnImport.addEventListener("click", importServers);
+btnApply.addEventListener("click", applyConfig);
 btnToggle.addEventListener("click", toggleProxy);
+localPortInput.addEventListener("input", () => setDirty(true));
+
+// Empty state click-to-import
+emptyState.addEventListener("click", importServers);
 
 // Listen for import requests from the File > Import menu
 listen("import-requested", importServers);
+
+// Drag-and-drop via Tauri's built-in file drop event
+listen("tauri://drag-drop", (event) => {
+  const paths = event.payload.paths || [];
+  const jsonFile = paths.find((p) => p.toLowerCase().endsWith(".json"));
+  if (jsonFile) {
+    importFromPath(jsonFile);
+  }
+});
 
 // Poll daemon status periodically
 setInterval(checkDaemonStatus, 5000);

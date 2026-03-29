@@ -32,9 +32,9 @@
         <!-- rows rendered by JS -->
       </tbody>
     </table>
-    <p id="empty-message" class="muted">No servers configured. Import a config to get started.</p>
-    <div class="button-row">
-      <button id="btn-import" type="button">Import...</button>
+    <div id="empty-state" class="drop-zone" style="display: none;">
+      <p>No servers configured</p>
+      <p class="muted">Drag and drop a JSON config file here, or use File &gt; Import</p>
     </div>
   </section>
 
@@ -47,7 +47,7 @@
   </section>
 
   <footer>
-    <button id="btn-save" type="button">Save</button>
+    <button id="btn-apply" type="button" disabled>Apply</button>
     <span id="save-status"></span>
   </footer>
 

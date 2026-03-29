@@ -156,15 +156,21 @@ button:hover {
   background: #f0f0f0;
 }
 
-#btn-save {
+#btn-apply {
   background: #0066cc;
   color: #fff;
   border-color: #0055aa;
   font-weight: 600;
 }
 
-#btn-save:hover {
+#btn-apply:hover:not(:disabled) {
   background: #0055aa;
+}
+
+#btn-apply:disabled {
+  background: #99bbdd;
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* Fields */
@@ -199,6 +205,25 @@ footer {
 #save-status {
   font-size: 0.8rem;
   color: #555;
+}
+
+/* Drop zone (empty state) */
+.drop-zone {
+  border: 2px dashed #ccc;
+  border-radius: 8px;
+  padding: 2rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.drop-zone:hover {
+  border-color: #999;
+  background: #f5f5f5;
+}
+
+.drop-zone p {
+  margin: 0.3rem 0;
 }
 
 .plugin-badge {
