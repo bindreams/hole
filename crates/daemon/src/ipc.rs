@@ -205,7 +205,7 @@ pub(crate) const SDDL_BASE: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 /// When `protect` is false, inherited ACEs are preserved. This is used for
 /// the final DACL in `apply_socket_permissions` (adding the `hole` group).
 #[cfg(target_os = "windows")]
-pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
+pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Result<()> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::LocalFree;
     use windows::Win32::Security::Authorization::{
@@ -309,21 +309,70 @@ pub(crate) fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std:
 /// adding the `hole` group on both platforms.
 ///
 /// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
+/// If an `installer-user-sid` file exists (written by `install_daemon` in `setup.rs`),
+/// the SID it contains is also added to the DACL, then the file is deleted. This is a
+/// workaround for the Windows token snapshot limitation: process tokens are immutable
+/// snapshots of group memberships captured at logon time, so a newly-added group
+/// membership is not reflected in any running process's token until the user logs out
+/// and back in. Adding the user's own SID directly to the DACL provides immediate
+/// access without requiring re-login. The per-user SID is cleaned up on the next
+/// daemon restart (when the group membership will have taken effect after re-login).
+///
 /// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(all(target_os = "windows", not(test)))]
 fn apply_socket_permissions(path: &Path) {
-    let sddl = build_sddl();
+    let mut extra_sids = Vec::new();
+    let sid_file = installer_user_sid_path();
+    if let Ok(sid) = std::fs::read_to_string(&sid_file) {
+        let sid = sid.trim().to_string();
+        if !sid.is_empty() {
+            info!(sid = %sid, "including installer user SID in socket DACL");
+            extra_sids.push(sid);
+        }
+        // Delete the file after reading — the per-user SID is a temporary bridge
+        // that is no longer needed after the daemon restarts (group membership
+        // will be in the token after re-login).
+        let _ = std::fs::remove_file(&sid_file);
+    }
+    let extra_refs: Vec<&str> = extra_sids.iter().map(|s| s.as_str()).collect();
+    let sddl = build_sddl(&extra_refs);
     if let Err(e) = set_dacl_from_sddl(path, &sddl, false) {
         warn!("failed to set socket permissions: {e}");
     }
 }
 
+/// Path to the file where the installing user's SID is stored temporarily.
+///
+/// Written by `install_daemon()` in `setup.rs`, read and deleted by
+/// `apply_socket_permissions()` on daemon startup.
+#[cfg(target_os = "windows")]
+pub fn installer_user_sid_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+        .join("hole")
+        .join("installer-user-sid")
+}
+
+/// Check that a string looks like a valid Windows SID (e.g. `S-1-5-21-...`).
+///
+/// Only allows the pattern `S-` followed by dash-separated decimal numbers. This prevents
+/// SDDL injection via crafted strings containing `)` or other SDDL metacharacters.
+#[cfg(target_os = "windows")]
+pub(crate) fn is_valid_sid_string(s: &str) -> bool {
+    s.starts_with("S-") && s.len() > 3 && s[2..].bytes().all(|b| b.is_ascii_digit() || b == b'-')
+}
+
 /// Build the SDDL string for the socket file DACL.
-#[cfg(all(target_os = "windows", not(test)))]
-fn build_sddl() -> String {
+///
+/// Always includes SYSTEM + Administrators + the `hole` group (if it exists).
+/// Additional per-user SIDs can be appended via `extra_sids` — this is used
+/// as a temporary workaround for the Windows token snapshot limitation (see
+/// [`apply_socket_permissions`] and the doc comment on `handle_grant_access`
+/// in `cli.rs`).
+#[cfg(target_os = "windows")]
+pub fn build_sddl(extra_sids: &[&str]) -> String {
     let base = SDDL_BASE;
 
-    match crate::group::group_sid() {
+    let mut sddl = match crate::group::group_sid() {
         Ok(sid) => {
             info!(sid = %sid, "restricting IPC to SYSTEM + Administrators + hole group");
             format!("{base}(A;;GA;;;{sid})")
@@ -332,7 +381,17 @@ fn build_sddl() -> String {
             warn!("'hole' group not found ({e}), IPC restricted to admin-only");
             base.to_string()
         }
+    };
+
+    for sid in extra_sids {
+        if is_valid_sid_string(sid) {
+            sddl.push_str(&format!("(A;;GA;;;{sid})"));
+        } else {
+            warn!(sid = %sid, "ignoring malformed SID string in DACL");
+        }
     }
+
+    sddl
 }
 
 /// Set socket file ownership to root:hole and mode 0660 on macOS.

@@ -28,6 +28,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
         selected_server: Some("abc-123".to_string()),
         local_port: 5555,
         enabled: true,
+        ..Default::default()
     };
     original.save(&path).unwrap();
     let loaded = AppConfig::load(&path).unwrap();
@@ -129,6 +130,28 @@ fn deserialize_with_extra_unknown_fields_succeeds() {
     let json = r#"{"servers": [], "future_field": 42, "another": "hi"}"#;
     let config: AppConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.local_port, 4073);
+}
+
+// elevation_prompt_shown tests ----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn deserialize_without_elevation_prompt_shown_defaults_to_false() {
+    let json = r#"{"servers": [], "local_port": 4073}"#;
+    let config: AppConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.elevation_prompt_shown);
+}
+
+#[skuld::test]
+fn elevation_prompt_shown_roundtrips(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config.json");
+    let config = AppConfig {
+        elevation_prompt_shown: true,
+        ..Default::default()
+    };
+    config.save(&path).unwrap();
+
+    let loaded = AppConfig::load(&path).unwrap();
+    assert!(loaded.elevation_prompt_shown);
 }
 
 // macOS permission tests ----------------------------------------------------------------------------------------------

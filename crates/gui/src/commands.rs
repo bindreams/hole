@@ -17,9 +17,13 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn save_config(state: State<AppState>, config: AppConfig) -> Result<(), String> {
+pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), String> {
+    let mut current = state.config.lock().unwrap();
+    // The frontend doesn't know about elevation_prompt_shown — preserve the
+    // in-memory value so a save from the Settings UI doesn't reset it.
+    config.elevation_prompt_shown = current.elevation_prompt_shown;
     config.save(&state.config_path).map_err(|e| e.to_string())?;
-    *state.config.lock().unwrap() = config;
+    *current = config;
     Ok(())
 }
 

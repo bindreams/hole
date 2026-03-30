@@ -485,6 +485,80 @@ fn wrong_method_returns_405() {
     });
 }
 
+// SDDL tests (Windows only) ===========================================================================================
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn build_sddl_without_extra_sids() {
+    let sddl = crate::ipc::build_sddl(&[]);
+    // Must start with the base SDDL (SYSTEM + Administrators)
+    assert!(
+        sddl.starts_with(crate::ipc::SDDL_BASE),
+        "SDDL should start with base: {sddl}"
+    );
+    // The hole group SID ACE may or may not be present depending on whether
+    // the group exists on this machine. Either way, no extra user SIDs.
+    // Count ACE entries: each starts with "(A;;"
+    let ace_count = sddl.matches("(A;;").count();
+    // Base has 2 (SYSTEM + BA), group adds 0 or 1
+    assert!(
+        ace_count == 2 || ace_count == 3,
+        "expected 2 or 3 ACEs (base + optional group), got {ace_count} in: {sddl}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn build_sddl_with_extra_sids() {
+    let fake_sid = "S-1-5-21-1234567890-1234567890-1234567890-1001";
+    let sddl = crate::ipc::build_sddl(&[fake_sid]);
+    assert!(
+        sddl.contains(&format!("(A;;GA;;;{fake_sid})")),
+        "SDDL should contain extra SID ACE: {sddl}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn build_sddl_with_multiple_extra_sids() {
+    let sid1 = "S-1-5-21-1111111111-1111111111-1111111111-1001";
+    let sid2 = "S-1-5-21-2222222222-2222222222-2222222222-1002";
+    let sddl = crate::ipc::build_sddl(&[sid1, sid2]);
+    assert!(
+        sddl.contains(&format!("(A;;GA;;;{sid1})")),
+        "SDDL should contain first extra SID: {sddl}"
+    );
+    assert!(
+        sddl.contains(&format!("(A;;GA;;;{sid2})")),
+        "SDDL should contain second extra SID: {sddl}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn build_sddl_rejects_malformed_sid() {
+    // A malformed SID with SDDL metacharacters should be ignored
+    let malformed = "S-1-1-0)(A;;GA;;;S-1-1-0";
+    let sddl = crate::ipc::build_sddl(&[malformed]);
+    assert!(!sddl.contains(malformed), "malformed SID should be rejected: {sddl}");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn is_valid_sid_string_accepts_valid() {
+    assert!(crate::ipc::is_valid_sid_string("S-1-5-21-1234567890-1001"));
+    assert!(crate::ipc::is_valid_sid_string("S-1-1-0"));
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn is_valid_sid_string_rejects_invalid() {
+    assert!(!crate::ipc::is_valid_sid_string(""));
+    assert!(!crate::ipc::is_valid_sid_string("not-a-sid"));
+    assert!(!crate::ipc::is_valid_sid_string("S-1-1-0)(A;;GA;;;S-1-1-0"));
+    assert!(!crate::ipc::is_valid_sid_string("S-1-1-0 "));
+}
+
 // Socket lifecycle tests ==============================================================================================
 
 #[skuld::test]

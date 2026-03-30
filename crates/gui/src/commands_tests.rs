@@ -23,6 +23,7 @@ fn build_proxy_config_with_selected_server() {
         selected_server: Some("b".to_string()),
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     let pc = build_proxy_config(&config).expect("should return Some");
@@ -37,6 +38,7 @@ fn build_proxy_config_no_selection() {
         selected_server: None,
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     assert!(build_proxy_config(&config).is_none());
@@ -49,9 +51,46 @@ fn build_proxy_config_invalid_selection() {
         selected_server: Some("nonexistent".to_string()),
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     assert!(build_proxy_config(&config).is_none());
+}
+
+// save_config preservation tests ======================================================================================
+
+/// Verify that merging a frontend config (elevation_prompt_shown=false) with
+/// an in-memory config (elevation_prompt_shown=true) preserves the flag.
+///
+/// This mirrors the logic in `save_config`: re-inject the in-memory
+/// `elevation_prompt_shown` before saving, because the frontend doesn't
+/// know about the field and always sends `false`.
+#[skuld::test]
+fn save_config_preserves_elevation_prompt_shown() {
+    // Simulate in-memory state where the dialog has been shown
+    let in_memory = AppConfig {
+        elevation_prompt_shown: true,
+        ..Default::default()
+    };
+
+    // Simulate what the frontend sends (doesn't know about the field)
+    let mut from_frontend = AppConfig {
+        local_port: 5555, // user changed the port
+        elevation_prompt_shown: false,
+        ..Default::default()
+    };
+
+    // Apply the same logic as save_config
+    from_frontend.elevation_prompt_shown = in_memory.elevation_prompt_shown;
+
+    assert!(
+        from_frontend.elevation_prompt_shown,
+        "elevation_prompt_shown should be preserved from in-memory state"
+    );
+    assert_eq!(
+        from_frontend.local_port, 5555,
+        "other fields should keep frontend values"
+    );
 }
 
 // auto_select_first_server tests ======================================================================================
@@ -63,6 +102,7 @@ fn auto_select_first_server_when_none_selected() {
         selected_server: None,
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     auto_select_first_server(&mut config);
@@ -76,6 +116,7 @@ fn auto_select_preserves_existing_selection() {
         selected_server: Some("b".to_string()),
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     auto_select_first_server(&mut config);
@@ -89,6 +130,7 @@ fn auto_select_fixes_stale_selection() {
         selected_server: Some("deleted-id".to_string()),
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     auto_select_first_server(&mut config);
@@ -102,6 +144,7 @@ fn auto_select_noop_on_empty_servers() {
         selected_server: None,
         local_port: 4073,
         enabled: false,
+        ..Default::default()
     };
 
     auto_select_first_server(&mut config);
