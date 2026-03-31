@@ -14,6 +14,7 @@ mod state;
 mod tray;
 
 use state::AppState;
+use tauri::Manager;
 
 fn main() {
     // Any argument at all routes to clap (subcommands, --version, --help).
@@ -54,7 +55,6 @@ fn launch_gui() {
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
             if matches!(event, tauri::WindowEvent::Destroyed) {
-                use tauri::Manager;
                 if window.app_handle().webview_windows().is_empty() {
                     platform::hide_dock_icon(window.app_handle());
                 }
@@ -68,7 +68,8 @@ fn launch_gui() {
             hole_gui::update::start_update_checker(app.handle().clone(), |app, info| {
                 // Rebuild tray menu to include the "Install Update" item.
                 if let Some(tray_icon) = app.tray_by_id("main") {
-                    match tray::build_tray_menu(app, Some(info)) {
+                    let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
+                    match tray::build_tray_menu(app, Some(info), enabled) {
                         Ok(menu) => {
                             // Re-sync checkbox state from config before applying new menu.
                             tray::sync_menu_state(app, &menu);
