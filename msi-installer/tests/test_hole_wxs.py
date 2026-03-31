@@ -243,6 +243,16 @@ def test_major_upgrade_exists(package: ET.Element) -> None:
     assert mu is not None, "MajorUpgrade element is required for upgrade support"
 
 
+def test_major_upgrade_allows_same_version(package: ET.Element) -> None:
+    """Reinstalling the same version must not create duplicate uninstall entries."""
+    mu = package.find("wix:MajorUpgrade", NS)
+    assert mu is not None
+    assert mu.get("AllowSameVersionUpgrades") == "yes", (
+        "MajorUpgrade must have AllowSameVersionUpgrades='yes' to handle "
+        "reinstalls of the same version without creating duplicate entries"
+    )
+
+
 # Custom action attribute tests ========================================================================================
 
 
