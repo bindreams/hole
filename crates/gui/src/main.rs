@@ -54,10 +54,8 @@ fn launch_gui() {
         ])
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                if window.app_handle().webview_windows().is_empty() {
-                    platform::hide_dock_icon(window.app_handle());
-                }
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.app_handle().webview_windows().is_empty() {
+                platform::hide_dock_icon(window.app_handle());
             }
             let _ = (window, event); // suppress unused on non-macOS
         })
