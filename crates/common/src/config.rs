@@ -21,6 +21,13 @@ pub struct AppConfig {
     pub selected_server: Option<String>,
     pub local_port: u16,
     pub enabled: bool,
+
+    /// Whether the elevation explanation dialog has been shown to the user.
+    ///
+    /// This is a GUI-only field stored in the shared config to avoid a second
+    /// config file. Once set to `true`, subsequent PermissionDenied errors
+    /// skip the explanation dialog and go directly to a UAC prompt.
+    pub elevation_prompt_shown: bool,
 }
 
 impl Default for AppConfig {
@@ -30,6 +37,7 @@ impl Default for AppConfig {
             selected_server: None,
             local_port: 4073,
             enabled: false,
+            elevation_prompt_shown: false,
         }
     }
 }

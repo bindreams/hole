@@ -311,6 +311,23 @@ fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     }
 }
 
+/// Handle the `daemon grant-access` command.
+///
+/// Adds the current user to the `hole` group and, on Windows, immediately
+/// updates the daemon socket DACL to include the user's SID. This is a
+/// workaround for the Windows token snapshot limitation:
+///
+/// 1. Windows process tokens are immutable snapshots of group memberships
+///    captured at logon time. There is no Win32 API to refresh a process's
+///    token to pick up new group memberships.
+/// 2. `klist purge` / `nltest` only affect Kerberos/AD tickets, not local
+///    group tokens.
+/// 3. Adding the user's own SID directly to the socket DACL provides
+///    immediate access — a user's own SID is always present in their token.
+/// 4. The per-user SID is cleaned up on daemon restart (when the group
+///    membership will have taken effect after re-login), because
+///    `apply_socket_permissions` rebuilds the DACL from scratch with only
+///    SYSTEM + Administrators + the `hole` group.
 fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
     use hole_common::protocol::PERMISSION_DENIED_HELP;
 
@@ -321,20 +338,45 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
     }
 
     // Add current user to the hole group
-    match hole_daemon::group::installing_username() {
+    let username = match hole_daemon::group::installing_username() {
         Ok(user) => {
             if let Err(e) = hole_daemon::group::add_user_to_group(&user) {
                 eprintln!("failed to add '{user}' to group: {e}");
                 return 1;
             }
             eprintln!("added '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+            user
         }
         Err(e) => {
             eprintln!("could not determine current user: {e}");
             eprintln!("{PERMISSION_DENIED_HELP}");
             return 1;
         }
+    };
+
+    // On Windows, immediately update the daemon socket DACL with the user's SID
+    // so the unprivileged GUI can connect without re-login.
+    #[cfg(target_os = "windows")]
+    {
+        let socket_path = hole_common::protocol::default_daemon_socket_path();
+        if socket_path.exists() {
+            match hole_daemon::group::lookup_sid(&username) {
+                Ok(user_sid) => {
+                    let sddl = hole_daemon::ipc::build_sddl(&[&user_sid]);
+                    if let Err(e) = hole_daemon::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
+                        eprintln!("warning: failed to update socket DACL: {e}");
+                    } else {
+                        eprintln!("updated socket DACL with user SID for immediate access");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: could not look up user SID: {e}");
+                }
+            }
+        }
     }
+
+    drop(username); // used on Windows for DACL update, suppress unused warning on macOS
 
     // Optionally proxy a command to the daemon
     match (then_send, then_send_file) {

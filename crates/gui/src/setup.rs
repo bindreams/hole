@@ -251,6 +251,27 @@ pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
         Ok(user) => {
             hole_daemon::group::add_user_to_group(&user)?;
             eprintln!("added user '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+
+            // Write the installing user's SID so the daemon can add it to the
+            // socket DACL on first startup. This works around the Windows token
+            // snapshot limitation: group membership changes are not reflected in
+            // running processes until re-login, but a user's own SID is always
+            // present in their token.
+            #[cfg(target_os = "windows")]
+            match hole_daemon::group::lookup_sid(&user) {
+                Ok(sid) => {
+                    let sid_path = hole_daemon::ipc::installer_user_sid_path();
+                    if let Some(parent) = sid_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&sid_path, &sid) {
+                        eprintln!("warning: could not write installer user SID: {e}");
+                    } else {
+                        eprintln!("wrote installer user SID ({sid}) for immediate access");
+                    }
+                }
+                Err(e) => eprintln!("warning: could not look up installer user SID: {e}"),
+            }
         }
         Err(e) => eprintln!("warning: could not detect installing user: {e}"),
     }

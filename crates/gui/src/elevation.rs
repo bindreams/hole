@@ -3,51 +3,77 @@
 // When the daemon rejects a connection due to insufficient permissions,
 // this module shows a dialog and spawns a privileged helper to either
 // grant permanent access (add user to hole group) or proxy a single command.
+//
+// Windows token limitation background:
+//
+// Windows process tokens are immutable snapshots of group memberships captured
+// at logon time. There is no Win32 API to refresh a process's token to pick up
+// new group memberships — `klist purge` and `nltest` only affect Kerberos/AD
+// tickets, not local group tokens.
+//
+// When the user is first added to the `hole` group (either at install time or
+// via `grant-access`), no running process will reflect that membership until
+// the user logs out and back in. To provide immediate access, the elevated
+// `grant-access` command adds the user's own SID directly to the daemon
+// socket's DACL (a user's own SID is always present in their token). The
+// per-user SID is cleaned up on daemon restart, when the group membership
+// will have taken effect after re-login.
 
 use crate::setup;
+use crate::state::AppState;
 use hole_common::protocol::DaemonRequest;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Show the elevation dialog flow and handle the user's choice.
 ///
 /// Called when a user-initiated tray action fails with PermissionDenied.
 /// Returns `true` if the action was successfully proxied via elevation.
+///
+/// If this is the first time PermissionDenied is encountered, shows a single
+/// dialog explaining the situation and offering permanent access. On subsequent
+/// encounters (`elevation_prompt_shown` is `true` in config), skips the dialog
+/// and goes directly to a UAC prompt via `ipc-send`.
 pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
-    // Dialog 1: Offer permanent access
-    let grant = app
-        .dialog()
-        .message(
-            "You don't have permission to control the Hole daemon.\n\n\
-             Grant yourself permanent access?\n\
-             (Requires administrator privileges)",
-        )
-        .title("Hole — Permission Denied")
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Grant Access".into(),
-            "Not Now".into(),
-        ))
-        .blocking_show();
+    let state = app.state::<AppState>();
 
-    if grant {
-        // Grant access + proxy command in one elevated invocation
-        return run_grant_access_elevated(app, &request).await;
-    }
+    let already_shown = state.config.lock().unwrap().elevation_prompt_shown;
 
-    // Dialog 2: Offer one-time elevation
-    let elevate = app
-        .dialog()
-        .message("Run this action with one-time elevation?")
-        .title("Hole — One-Time Elevation")
-        .buttons(MessageDialogButtons::OkCancelCustom("Elevate".into(), "Cancel".into()))
-        .blocking_show();
-
-    if elevate {
+    if already_shown {
+        // User has already seen the explanation — just UAC-elevate the command.
         return run_ipc_send_elevated(app, &request).await;
     }
 
-    false
+    // First encounter: show the explanation dialog.
+    let grant = app
+        .dialog()
+        .message(
+            "Hole requires administrator permissions to enable the VPN.\n\n\
+             Grant yourself permanent access?",
+        )
+        .title("Hole — Permission Required")
+        .buttons(MessageDialogButtons::OkCancelCustom("Yes".into(), "No".into()))
+        .blocking_show();
+
+    // Mark dialog as shown BEFORE calling elevated processes — once the user
+    // has seen the explanation, we don't show it again regardless of outcome.
+    {
+        let mut config = state.config.lock().unwrap();
+        config.elevation_prompt_shown = true;
+        if let Err(e) = config.save(&state.config_path) {
+            warn!(error = %e, "failed to persist elevation_prompt_shown");
+        }
+    }
+
+    if grant {
+        // Grant permanent access + send the command in one elevated invocation
+        // (single UAC prompt). Uses --then-send-file to combine both operations.
+        return run_grant_access_elevated(app, &request).await;
+    }
+
+    // User declined permanent access — one-time elevated send
+    run_ipc_send_elevated(app, &request).await
 }
 
 /// Base64-encode a DaemonRequest (test helper for the legacy `--base64` CLI flag).
@@ -82,6 +108,9 @@ pub fn read_request_file(path: &std::path::Path) -> Result<DaemonRequest, String
 }
 
 /// Spawn `hole daemon grant-access --then-send-file <path>` elevated.
+///
+/// Combines group membership grant, DACL update, and IPC command proxy in a single
+/// elevated invocation (one UAC prompt).
 async fn run_grant_access_elevated(app: &AppHandle, request: &DaemonRequest) -> bool {
     let exe = match setup::daemon_binary_path() {
         Ok(p) => p,

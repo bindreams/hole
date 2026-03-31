@@ -33,10 +33,16 @@ pub fn installing_username() -> io::Result<String> {
     os::installing_username()
 }
 
+/// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`).
+#[cfg(target_os = "windows")]
+pub fn lookup_sid(name: &str) -> io::Result<String> {
+    os::lookup_sid(name)
+}
+
 /// Look up the SID of the `hole` group as a string (e.g. `S-1-5-21-...`).
 #[cfg(target_os = "windows")]
 pub fn group_sid() -> io::Result<String> {
-    os::group_sid()
+    lookup_sid(GROUP_NAME)
 }
 
 // macOS implementation ================================================================================================
@@ -266,19 +272,20 @@ mod os {
         Ok(username)
     }
 
-    pub fn group_sid() -> io::Result<String> {
+    /// Look up any account name (user or group) and return its SID as a string.
+    pub fn lookup_sid(name: &str) -> io::Result<String> {
         use windows::core::PWSTR;
         use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
         use windows::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
-        let group_name: Vec<u16> = GROUP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let account_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
         // First call: get required buffer sizes
         let mut sid_size: u32 = 0;
         let mut domain_size: u32 = 0;
         let mut sid_type = SID_NAME_USE::default();
 
-        // SAFETY: First call to get required buffer sizes. `group_name` is a valid
+        // SAFETY: First call to get required buffer sizes. `account_name` is a valid
         // null-terminated UTF-16 string kept alive for the call. Output buffer
         // pointers are None (size query only). `sid_size` and `domain_size` are
         // out-parameters filled with required sizes. Expected to fail with
@@ -286,7 +293,7 @@ mod os {
         let _ = unsafe {
             LookupAccountNameW(
                 None,
-                windows::core::PCWSTR(group_name.as_ptr()),
+                windows::core::PCWSTR(account_name.as_ptr()),
                 None,
                 &mut sid_size,
                 None,
@@ -296,7 +303,7 @@ mod os {
         };
 
         if sid_size == 0 {
-            return Err(io::Error::other(format!("group '{}' not found", GROUP_NAME)));
+            return Err(io::Error::other(format!("account '{name}' not found")));
         }
 
         // Second call: fill buffers
@@ -313,12 +320,12 @@ mod os {
 
         // SAFETY: Second call with correctly sized buffers. `sid_buf` is at least
         // `sid_size` bytes (allocated above). `domain_buf` is at least `domain_size`
-        // u16 elements. `group_name` remains alive. `sid_ptr` wraps `sid_buf`'s
+        // u16 elements. `account_name` remains alive. `sid_ptr` wraps `sid_buf`'s
         // pointer. The result is checked with `?`.
         unsafe {
             LookupAccountNameW(
                 None,
-                windows::core::PCWSTR(group_name.as_ptr()),
+                windows::core::PCWSTR(account_name.as_ptr()),
                 Some(sid_ptr),
                 &mut sid_size,
                 Some(PWSTR(domain_buf.as_mut_ptr())),
