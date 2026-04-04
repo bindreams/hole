@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard — Sidebar v11</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: light dark; }
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg-base: #0e0e1a; --bg-surface: #0a0a16; --bg-elevated: #161628;
+    --bg-hover: #1c1c36; --bg-input: #161628;
+    --border: #1a1a2a; --border-strong: #2a2a4a;
+    --text-primary: #e0e0e0; --text-secondary: #ccc; --text-tertiary: #888;
+    --text-muted: #666; --text-faint: #555; --text-ghost: #444;
+    --accent: #6c63ff; --accent-bg: #1a1a35; --accent-border: #6c63ff;
+    --green: #22c55e; --green-glow: rgba(34,197,94,0.35);
+    --green-bg: #1a2e1a; --green-text: #4ade80;
+    --red: #ef4444; --red-glow: rgba(239,68,68,0.35);
+    --red-bg: #2e1a1a; --red-text: #f87171;
+    --amber: #f59e0b; --amber-bg: #2e2a1a; --amber-text: #facc15;
+    --plugin-bg: #1e1e35; --plugin-text: #8b7cc8;
+    --graph-fill-rx: rgba(34,197,94,0.1); --graph-fill-tx: rgba(245,158,11,0.1);
+    --graph-midline: rgba(255,255,255,0.06);
+    --country-bg: #1e1e35; --country-text: #aaa;
+    --scrollbar: #2a2a4a;
+    --toggle-track: #333; --toggle-track-on: #22c55e; --toggle-knob: #fff;
+    --select-bg: #161628; --select-border: #2a2a4a;
+    --select-option-bg: #161628; --select-option-hover: #1e1e3a;
+    --drag-handle: #444;
+    --tbl-col-border: #1e1e30;
+    --action-proxy-bg: rgba(34,197,94,0.08); --action-bypass-bg: rgba(245,158,11,0.08);
+    --action-block-bg: rgba(239,68,68,0.08);
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg-base: #f5f5f8; --bg-surface: #ffffff; --bg-elevated: #f0f0f5;
+    --bg-hover: #e8e8f0; --bg-input: #ffffff;
+    --border: #e0e0e8; --border-strong: #ccc;
+    --text-primary: #1a1a2a; --text-secondary: #333; --text-tertiary: #666;
+    --text-muted: #888; --text-faint: #aaa; --text-ghost: #bbb;
+    --accent: #5b52e0; --accent-bg: #eeeeff; --accent-border: #5b52e0;
+    --green: #16a34a; --green-glow: rgba(22,163,74,0.25);
+    --green-bg: #e8f5e9; --green-text: #15803d;
+    --red: #dc2626; --red-glow: rgba(220,38,38,0.25);
+    --red-bg: #fef2f2; --red-text: #b91c1c;
+    --amber: #d97706; --amber-bg: #fff8e1; --amber-text: #92400e;
+    --plugin-bg: #ede9fe; --plugin-text: #6d28d9;
+    --graph-fill-rx: rgba(22,163,74,0.12); --graph-fill-tx: rgba(217,119,6,0.12);
+    --graph-midline: rgba(0,0,0,0.06);
+    --country-bg: #e8e8f0; --country-text: #555;
+    --scrollbar: #ccc;
+    --toggle-track: #ccc; --toggle-track-on: #16a34a; --toggle-knob: #fff;
+    --select-bg: #fff; --select-border: #ccc;
+    --select-option-bg: #fff; --select-option-hover: #f0f0f5;
+    --drag-handle: #bbb;
+    --tbl-col-border: #e0e0e8;
+    --action-proxy-bg: rgba(22,163,74,0.06); --action-bypass-bg: rgba(217,119,6,0.06);
+    --action-block-bg: rgba(220,38,38,0.06);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: #111; color: var(--text-primary); padding: 2rem; line-height: 1.5;
+  }
+  h1 { font-size: 1.3rem; text-align: center; color: #fff; margin-bottom: 0.3rem; }
+  .page-sub { text-align: center; color: #888; margin-bottom: 2rem; font-size: 0.85rem; }
+  .wrapper { display: flex; justify-content: center; }
+
+  .wf {
+    width: 800px; height: 600px; background: var(--bg-base);
+    border-radius: 8px; overflow: hidden;
+    border: 2px solid var(--border-strong); display: flex; flex-direction: column;
+  }
+  .wtb {
+    height: 32px; background: var(--bg-surface);
+    display: flex; align-items: center; padding: 0 12px; gap: 7px;
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #ffbd2e; } .dot.g { background: #28c840; }
+  .wt { flex:1; text-align:center; color: var(--text-muted); font-size:0.7rem; }
+  .wb { flex: 1; display: flex; overflow: hidden; }
+
+  /* Sections =====  */
+  .section-hdr {
+    display: flex; align-items: center; gap: 0.4rem;
+    cursor: pointer; user-select: none;
+    padding-bottom: 0.3rem; border-bottom: 1px solid var(--border);
+    position: relative; z-index: 1;
+  }
+  .section-hdr:hover .tri { color: var(--text-tertiary); }
+  .tri {
+    font-size: 0.6rem; color: var(--text-faint);
+    transition: transform 0.2s ease;
+    display: inline-block; width: 0.8rem; text-align: center;
+  }
+  .tri.collapsed { transform: rotate(-90deg); }
+  .section-label {
+    font-size: 0.72rem; font-weight: 600; color: var(--text-tertiary);
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .section-clip { overflow: hidden; }
+  .section-body { padding-top: 0.5rem; }
+
+  /* Sidebar =====  */
+  .sidebar {
+    width: 220px; background: var(--bg-surface);
+    border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; flex-shrink: 0;
+  }
+  .sb-header {
+    display: flex; align-items: center; padding: 0.6rem 1rem; gap: 0.7rem;
+    border-bottom: 1px solid var(--border); flex-shrink: 0; min-height: 56px;
+  }
+  .power-btn {
+    width: 40px; height: 40px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0;
+    transition: background 0.2s, box-shadow 0.2s; border: none;
+  }
+  .power-btn.on { background: var(--green); box-shadow: 0 0 12px var(--green-glow); }
+  .power-btn.off { background: var(--red); box-shadow: 0 0 12px var(--red-glow); }
+  .power-btn svg { width: 18px; height: 18px; }
+  .sb-status-block { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+  .sb-status { font-size: 0.85rem; color: var(--text-secondary); }
+  .sb-status strong { font-weight: 700; }
+  .sb-status strong.on { color: var(--green); }
+  .sb-status strong.off { color: var(--red); }
+  .sb-ip { display: flex; align-items: center; gap: 0.25rem; font-size: 0.7rem; color: var(--text-muted); }
+  .sb-ip .copy-btn {
+    color: var(--text-ghost); font-size: 0.7rem; cursor: pointer;
+    opacity: 0; transition: opacity 0.15s; line-height: 1;
+  }
+  .sb-ip:hover .copy-btn { opacity: 1; color: var(--text-tertiary); }
+  .country {
+    display: inline-block; font-size: 0.55rem; font-weight: 700;
+    background: var(--country-bg); color: var(--country-text);
+    padding: 0.05rem 0.3rem; border-radius: 3px;
+    letter-spacing: 0.5px; vertical-align: middle; margin-right: 0.2rem;
+  }
+  .sb-content {
+    flex: 1; padding: 0.6rem 1rem;
+    display: flex; flex-direction: column; gap: 0.5rem; overflow-y: auto;
+  }
+  .sb-content::-webkit-scrollbar { width: 4px; }
+  .sb-content::-webkit-scrollbar-track { background: transparent; }
+  .sb-content::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 2px; }
+
+  .graph-wrap { margin: 0 -1rem; position: relative; }
+  .graph-top-label { font-size: 0.5rem; color: var(--text-faint); padding: 0 0.3rem 0.15rem; font-family: 'Fira Code', monospace; }
+  .graph-canvas { width: 100%; height: 90px; position: relative; }
+  .graph-svg { width: 100%; height: 100%; display: block; }
+  .graph-midline { position: absolute; left: 0; right: 0; top: 50%; border-top: 1px dashed var(--graph-midline); }
+  .graph-x { display: flex; justify-content: space-between; font-size: 0.5rem; color: var(--text-faint); padding: 0.1rem 0.3rem 0; font-family: 'Fira Code', monospace; }
+  .stats-tbl { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  .stats-tbl td { padding: 0.2rem 0; }
+  .stats-tbl .k { color: var(--text-muted); text-align: left; }
+  .stats-tbl .v { color: var(--text-primary); font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; font-family: 'Fira Code', monospace; font-size: 0.7rem; }
+  .v-rx { color: var(--green) !important; }
+  .v-tx { color: var(--amber) !important; }
+  .sb-divider { margin: 0.3rem -1rem; border: none; border-top: 1px solid var(--border); }
+  .lbl { color: var(--text-faint); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  .chain { display: flex; flex-direction: column; }
+  .chain-row { display: flex; align-items: center; gap: 0.6rem; }
+  .chain .nd { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+  .chain .nd.ok { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
+  .chain .nlbl { font-size: 0.75rem; color: var(--text-secondary); }
+  .chain .vwire { width: 2px; height: 8px; background: var(--border-strong); margin-left: 6px; }
+  .sb-footer { padding: 0.4rem 1rem; border-top: 1px solid var(--border); flex-shrink: 0; font-size: 0.6rem; color: var(--text-ghost); text-align: center; font-family: 'Fira Code', monospace; }
+
+  /* Main =====  */
+  .main { flex: 1; overflow-y: auto; padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: 1.2rem; }
+  .main::-webkit-scrollbar { width: 6px; }
+  .main::-webkit-scrollbar-track { background: transparent; }
+  .main::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+
+  /* Servers =====  */
+  .srv { display: flex; align-items: center; gap: 0.6rem; background: var(--bg-elevated); border-radius: 6px; padding: 0.5rem 0.8rem; border: 1px solid var(--border); font-size: 0.8rem; cursor: default; }
+  .srv.active { border-color: var(--accent-border); background: var(--accent-bg); }
+  .srv .radio { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--text-ghost); flex-shrink: 0; }
+  .srv.active .radio { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 2.5px var(--accent-bg); }
+  .srv .sname { color: var(--text-primary); font-weight: 500; }
+  .srv .saddr { color: var(--text-muted); margin-left: 0.5rem; font-family: 'Fira Code', monospace; font-size: 0.7rem; }
+  .srv .srv-del { margin-left: auto; color: var(--text-ghost); font-size: 0.7rem; cursor: pointer; line-height: 1; }
+  .srv .srv-del:hover { color: var(--red); }
+  .plugin-badge { font-size: 0.6rem; background: var(--plugin-bg); padding: 0.1rem 0.35rem; border-radius: 3px; color: var(--plugin-text); margin-left: 0.3rem; font-family: 'Fira Code', monospace; }
+  .add-zone { display: flex; align-items: center; justify-content: center; gap: 0.5rem; color: var(--text-faint); font-size: 0.75rem; cursor: pointer; padding: 0.5rem 0.8rem; border: 1px dashed var(--border-strong); border-radius: 4px; transition: border-color 0.15s, color 0.15s; }
+  .add-zone:hover { color: var(--text-tertiary); border-color: var(--text-muted); }
+
+  /* Filters table =====  */
+  .filters-tbl { width: 100%; border-collapse: collapse; font-size: 0.75rem; table-layout: fixed; }
+  .filters-tbl col.col-addr { width: 48%; }
+  .filters-tbl col.col-match { width: 22%; }
+  .filters-tbl col.col-action { width: 22%; }
+  .filters-tbl col.col-del { width: 8%; }
+  .filters-tbl thead th {
+    text-align: left; color: var(--text-faint); font-size: 0.62rem; text-transform: uppercase;
+    padding: 0.25rem 0.5rem; border-bottom: 2px solid var(--border); font-weight: 600; letter-spacing: 0.3px;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .filters-tbl thead th:first-child { padding-left: 1.8rem; }
+  .filters-tbl th + th, .filters-tbl td + td { border-left: 1px solid var(--tbl-col-border); }
+  .filters-tbl tbody td { padding: 0; border-bottom: 1px solid var(--border); vertical-align: middle; position: relative; overflow: hidden; text-overflow: ellipsis; }
+  .filters-tbl tbody tr:hover { background: var(--bg-hover); }
+
+  .cp { padding: 0.25rem 0.5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cp-addr { padding: 0.25rem 0.5rem; display: flex; align-items: center; }
+
+  .filter-addr { color: var(--text-secondary); font-family: 'Fira Code', monospace; font-size: 0.72rem; }
+  .filter-match { color: var(--text-tertiary); font-size: 0.72rem; }
+
+  td.action-cell { padding: 0; }
+  td.action-cell.proxy { background: var(--action-proxy-bg); }
+  td.action-cell.proxy .cp { color: var(--green-text); font-weight: 600; }
+  td.action-cell.bypass { background: var(--action-bypass-bg); }
+  td.action-cell.bypass .cp { color: var(--amber-text); font-weight: 600; }
+  td.action-cell.block { background: var(--action-block-bg); }
+  td.action-cell.block .cp { color: var(--red-text); font-weight: 600; }
+
+  .drag-handle { color: var(--drag-handle); cursor: grab; font-size: 0.8rem; line-height: 1; padding-right: 0.4rem; user-select: none; flex-shrink: 0; }
+  .drag-handle:active { cursor: grabbing; }
+  .drag-handle:hover { color: var(--text-tertiary); }
+  .no-drag .drag-handle { visibility: hidden; }
+
+  td.del-cell { text-align: center; padding: 0; }
+  .filter-del { color: var(--text-ghost); cursor: pointer; font-size: 0.72rem; line-height: 1; }
+  .filter-del:hover { color: var(--red); }
+
+  /* Editable cells =====  */
+  .editable-cell { cursor: pointer; position: relative; }
+
+  /* Chevron: visible on hover, bigger */
+  .chev {
+    display: none; color: var(--text-ghost); font-size: 0.7rem;
+    margin-left: 0.25rem; vertical-align: middle;
+  }
+  .editable-cell:hover .chev { display: inline; color: var(--text-tertiary); }
+
+  /* Address: highlight bottom border on hover to indicate editable */
+  .editable-addr { cursor: text; }
+  .editable-addr:hover .filter-addr { color: var(--text-primary); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 2px; }
+
+  .inline-input {
+    background: transparent; border: none; border-bottom: 1px solid var(--accent);
+    color: var(--text-primary); font-size: 0.72rem;
+    font-family: 'Fira Code', monospace; outline: none;
+    padding: 0; width: 100%;
+  }
+
+  /* Inline dropdown */
+  .inline-dropdown {
+    display: none; position: absolute; top: 100%; left: -1px; z-index: 20;
+    background: var(--select-option-bg); border: 1px solid var(--select-border);
+    border-radius: 4px; overflow: hidden;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25); min-width: 130px;
+  }
+  .inline-dropdown.open { display: block; }
+  .inline-dropdown-opt {
+    padding: 0.3rem 0.6rem; font-size: 0.75rem;
+    color: var(--text-primary); cursor: pointer; transition: background 0.1s;
+  }
+  .inline-dropdown-opt:hover { background: var(--select-option-hover); }
+  .inline-dropdown-opt.selected { color: var(--accent); font-weight: 600; }
+
+  .filter-add-row { display: flex; align-items: center; gap: 0.5rem; color: var(--text-faint); font-size: 0.75rem; cursor: pointer; padding: 0.4rem 0.5rem; border: 1px dashed var(--border-strong); border-radius: 4px; margin-top: 0.3rem; }
+  .filter-add-row:hover { color: var(--text-tertiary); border-color: var(--text-muted); }
+  .test-filter { margin-top: 0.6rem; padding-top: 0.5rem; border-top: 1px solid var(--border); }
+  .test-filter-label { font-size: 0.7rem; color: var(--text-tertiary); margin-bottom: 0.3rem; }
+  .test-filter-row { display: flex; gap: 0.5rem; }
+  .test-filter-input { flex: 1; background: var(--bg-input); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.3rem 0.5rem; color: var(--text-primary); font-size: 0.72rem; font-family: 'Fira Code', monospace; outline: none; }
+  .test-filter-input:focus { border-color: var(--accent); }
+  .test-filter-input::placeholder { color: var(--text-ghost); }
+  .test-result { font-size: 0.7rem; margin-top: 0.3rem; min-height: 1.2em; }
+  .test-result .match-proxy { color: var(--green-text); font-weight: 600; }
+  .test-result .match-bypass { color: var(--amber-text); font-weight: 600; }
+  .test-result .match-block { color: var(--red-text); font-weight: 600; }
+  .test-result .match-rule { color: var(--text-muted); }
+  .hint { color: var(--text-ghost); font-size: 0.65rem; font-style: italic; margin-top: 0.4rem; }
+
+  /* Settings =====  */
+  .settings-group { display: flex; flex-direction: column; gap: 0.15rem; }
+  .setting-row { display: flex; align-items: center; gap: 0.6rem; font-size: 0.8rem; padding: 0.3rem 0; }
+  .setting-label { color: var(--text-secondary); white-space: nowrap; }
+  .setting-control { margin-left: auto; flex-shrink: 0; }
+  .toggle { width: 36px; height: 20px; background: var(--toggle-track); border-radius: 10px; position: relative; cursor: pointer; transition: background 0.2s; flex-shrink: 0; }
+  .toggle.on { background: var(--toggle-track-on); }
+  .toggle::after { content: ''; position: absolute; top: 50%; left: 2px; transform: translateY(-50%); width: 16px; height: 16px; background: var(--toggle-knob); border-radius: 50%; transition: transform 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+  .toggle.on::after { transform: translateY(-50%) translateX(16px); }
+  .custom-select-wrap { position: relative; display: inline-block; }
+  .custom-select-btn {
+    background: var(--select-bg); border: 1px solid var(--select-border); border-radius: 4px;
+    color: var(--text-primary); font-size: 0.75rem; padding: 0.25rem 1.8rem 0.25rem 0.5rem;
+    cursor: pointer; outline: none; white-space: nowrap; user-select: none; position: relative;
+  }
+  .custom-select-btn::after {
+    content: '▾'; position: absolute; right: 0.5rem; top: 50%;
+    transform: translateY(-50%); font-size: 0.7rem; color: var(--text-muted); pointer-events: none;
+  }
+  .custom-select-menu {
+    display: none; position: absolute; top: calc(100% + 2px); left: 0; right: 0;
+    background: var(--select-option-bg); border: 1px solid var(--select-border);
+    border-radius: 4px; overflow: hidden; z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2); min-width: 100%;
+  }
+  .custom-select-menu.open { display: block; }
+  .custom-select-opt { padding: 0.3rem 0.6rem; font-size: 0.75rem; color: var(--text-primary); cursor: pointer; transition: background 0.1s; }
+  .custom-select-opt:hover { background: var(--select-option-hover); }
+  .custom-select-opt.selected { color: var(--accent); font-weight: 600; }
+  .setting-nested { padding-left: 1.5rem; display: flex; flex-direction: column; gap: 0.15rem; transition: opacity 0.2s; }
+  .setting-nested.muted { opacity: 0.4; }
+  .field-input { background: var(--bg-input); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.3rem 0.5rem; color: var(--text-primary); font-size: 0.8rem; width: 70px; text-align: center; outline: none; font-family: 'Fira Code', monospace; }
+  .field-input:focus { border-color: var(--accent); }
+  .setting-divider { border: none; border-top: 1px solid var(--border); margin: 0.3rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Sidebar Layout — v11</h1>
+<p class="page-sub">Bigger chevrons, toggle-close dropdowns, underline edit hint, fixed drag ordering, smooth row slide.</p>
+
+<div class="wrapper">
+  <div class="wf">
+    <div class="wtb"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div><div class="wt">Hole Dashboard</div></div>
+    <div class="wb">
+      <div class="main">
+
+        <!-- Servers -->
+        <div>
+          <div class="section-hdr" onclick="toggleSection(this)"><span class="tri">&#x25BC;</span><span class="section-label">Servers</span></div>
+          <div class="section-clip"><div class="section-body">
+            <div style="display:flex;flex-direction:column;gap:0.4rem;">
+              <div class="srv active"><div class="radio"></div><span class="sname">Frankfurt DE</span><span class="saddr">fra1.example.com:8388</span><span class="plugin-badge">v2ray</span><span class="srv-del">&#x2715;</span></div>
+              <div class="srv"><div class="radio"></div><span class="sname">Tokyo JP</span><span class="saddr">tok1.example.com:8388</span><span class="srv-del">&#x2715;</span></div>
+              <div class="srv"><div class="radio"></div><span class="sname">New York US</span><span class="saddr">nyc1.example.com:8388</span><span class="plugin-badge">v2ray</span><span class="srv-del">&#x2715;</span></div>
+              <div class="srv"><div class="radio"></div><span class="sname">Singapore SG</span><span class="saddr">sg1.example.com:8388</span><span class="srv-del">&#x2715;</span></div>
+              <div class="add-zone">+ Import servers from file</div>
+            </div>
+          </div></div>
+        </div>
+
+        <!-- Filters -->
+        <div>
+          <div class="section-hdr" onclick="toggleSection(this)"><span class="tri">&#x25BC;</span><span class="section-label">Filters</span></div>
+          <div class="section-clip"><div class="section-body">
+            <table class="filters-tbl">
+              <colgroup>
+                <col class="col-addr"><col class="col-match"><col class="col-action"><col class="col-del">
+              </colgroup>
+              <thead><tr>
+                <th style="padding-left:1.8rem;">Address</th><th>Matching</th><th>Action</th><th></th>
+              </tr></thead>
+              <tbody id="filter-tbody">
+                <tr class="no-drag" data-id="0" data-fixed="true">
+                  <td><div class="cp-addr"><span class="drag-handle">⠿</span><span class="filter-addr">*</span></div></td>
+                  <td><div class="cp"><span class="filter-match">wildcard</span></div></td>
+                  <td class="action-cell proxy"><div class="cp">Proxy</div></td>
+                  <td class="del-cell"></td>
+                </tr>
+                <tr data-id="1">
+                  <td class="editable-addr" onclick="editAddr(this)"><div class="cp-addr"><span class="drag-handle">⠿</span><span class="filter-addr">google.com</span></div></td>
+                  <td class="editable-cell" onclick="toggleDropdown(this,'matching')"><div class="cp"><span class="filter-match">with subdomains</span><span class="chev">▾</span></div></td>
+                  <td class="action-cell bypass editable-cell" onclick="toggleDropdown(this,'action')"><div class="cp">Bypass<span class="chev">▾</span></div></td>
+                  <td class="del-cell"><span class="filter-del">&#x2715;</span></td>
+                </tr>
+                <tr data-id="2">
+                  <td class="editable-addr" onclick="editAddr(this)"><div class="cp-addr"><span class="drag-handle">⠿</span><span class="filter-addr">ads.tracker.net</span></div></td>
+                  <td class="editable-cell" onclick="toggleDropdown(this,'matching')"><div class="cp"><span class="filter-match">exactly</span><span class="chev">▾</span></div></td>
+                  <td class="action-cell block editable-cell" onclick="toggleDropdown(this,'action')"><div class="cp">Block<span class="chev">▾</span></div></td>
+                  <td class="del-cell"><span class="filter-del">&#x2715;</span></td>
+                </tr>
+                <tr data-id="3">
+                  <td class="editable-addr" onclick="editAddr(this)"><div class="cp-addr"><span class="drag-handle">⠿</span><span class="filter-addr">*.cdn.example.com</span></div></td>
+                  <td class="editable-cell" onclick="toggleDropdown(this,'matching')"><div class="cp"><span class="filter-match">wildcard</span><span class="chev">▾</span></div></td>
+                  <td class="action-cell bypass editable-cell" onclick="toggleDropdown(this,'action')"><div class="cp">Bypass<span class="chev">▾</span></div></td>
+                  <td class="del-cell"><span class="filter-del">&#x2715;</span></td>
+                </tr>
+                <tr data-id="4">
+                  <td class="editable-addr" onclick="editAddr(this)"><div class="cp-addr"><span class="drag-handle">⠿</span><span class="filter-addr">192.168.0.0/16</span></div></td>
+                  <td class="editable-cell" onclick="toggleDropdown(this,'matching')"><div class="cp"><span class="filter-match">subnet</span><span class="chev">▾</span></div></td>
+                  <td class="action-cell bypass editable-cell" onclick="toggleDropdown(this,'action')"><div class="cp">Bypass<span class="chev">▾</span></div></td>
+                  <td class="del-cell"><span class="filter-del">&#x2715;</span></td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="filter-add-row">+ Add rule</div>
+            <div class="test-filter">
+              <div class="test-filter-label">Test filtering</div>
+              <div class="test-filter-row"><input class="test-filter-input" id="test-input" type="text" placeholder="Enter a domain or IP to test..." oninput="testFilter()"></div>
+              <div class="test-result" id="test-result"></div>
+              <div class="hint">Rules are evaluated top-to-bottom. Later rules override earlier ones.</div>
+            </div>
+          </div></div>
+        </div>
+
+        <!-- Settings -->
+        <div>
+          <div class="section-hdr" onclick="toggleSection(this)"><span class="tri">&#x25BC;</span><span class="section-label">Settings</span></div>
+          <div class="section-clip"><div class="section-body">
+            <div class="settings-group">
+              <div class="setting-row"><span class="setting-label">Start Hole on login</span><div class="setting-control"><div class="toggle on" onclick="this.classList.toggle('on')"></div></div></div>
+              <div class="setting-row"><span class="setting-label">On startup</span><div class="setting-control"><div class="custom-select-wrap"><div class="custom-select-btn" onclick="toggleMenu(this)">Restore last state</div><div class="custom-select-menu"><div class="custom-select-opt" onclick="pickOpt(this)">Do not connect</div><div class="custom-select-opt selected" onclick="pickOpt(this)">Restore last state</div><div class="custom-select-opt" onclick="pickOpt(this)">Always connect</div></div></div></div></div>
+              <div class="setting-row"><span class="setting-label">Theme</span><div class="setting-control"><div class="custom-select-wrap"><div class="custom-select-btn" onclick="toggleMenu(this)">Dark</div><div class="custom-select-menu"><div class="custom-select-opt" onclick="pickTheme(this,'light')">Light</div><div class="custom-select-opt selected" onclick="pickTheme(this,'dark')">Dark</div></div></div></div></div>
+              <hr class="setting-divider">
+              <div class="setting-row"><span class="setting-label">Local proxy server</span><div class="setting-control"><div class="toggle on" id="proxy-toggle" onclick="toggleProxy(this)"></div></div></div>
+              <div class="setting-nested" id="proxy-nested">
+                <div class="setting-row"><span class="setting-label">SOCKS5</span><div class="setting-control"><div class="toggle on" onclick="this.classList.toggle('on')"></div></div></div>
+                <div class="setting-row"><span class="setting-label">HTTP</span><div class="setting-control"><div class="toggle" onclick="this.classList.toggle('on')"></div></div></div>
+                <div class="setting-row"><span class="setting-label">Serving port</span><div class="setting-control"><input class="field-input" type="text" value="4073"></div></div>
+              </div>
+            </div>
+          </div></div>
+        </div>
+
+      </div>
+
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <div class="sb-header">
+          <button class="power-btn on" id="power-btn" onclick="togglePower()"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"><path d="M12 3v8"/><path d="M5.6 6.6a9 9 0 1 0 12.8 0"/></svg></button>
+          <div class="sb-status-block">
+            <div class="sb-status">You are <strong class="on" id="status-word">Connected</strong></div>
+            <div class="sb-ip"><span class="ip-text" id="ip-text"><span class="country">DE</span> 185.xx.xx.42</span><span class="copy-btn" title="Copy to clipboard">&#x2398;</span></div>
+          </div>
+        </div>
+        <div class="sb-content">
+          <div class="graph-wrap">
+            <div class="graph-top-label">68 Mbps</div>
+            <div class="graph-canvas"><div class="graph-midline"></div>
+              <svg class="graph-svg" viewBox="0 0 220 80" preserveAspectRatio="none">
+                <polyline fill="none" stroke="var(--green)" stroke-width="1.5" opacity="0.85" points="0,60 11,55 22,50 33,45 44,40 55,38 66,30 77,25 88,28 99,22 110,18 121,20 132,15 143,18 154,12 165,15 176,10 187,14 198,8 209,12 220,10"/>
+                <polyline fill="var(--graph-fill-rx)" stroke="none" points="0,80 0,60 11,55 22,50 33,45 44,40 55,38 66,30 77,25 88,28 99,22 110,18 121,20 132,15 143,18 154,12 165,15 176,10 187,14 198,8 209,12 220,10 220,80"/>
+                <polyline fill="none" stroke="var(--amber)" stroke-width="1.5" opacity="0.85" points="0,72 11,70 22,68 33,65 44,63 55,60 66,58 77,55 88,57 99,52 110,50 121,53 132,48 143,50 154,45 165,48 176,42 187,46 198,40 209,43 220,41"/>
+                <polyline fill="var(--graph-fill-tx)" stroke="none" points="0,80 0,72 11,70 22,68 33,65 44,63 55,60 66,58 77,55 88,57 99,52 110,50 121,53 132,48 143,50 154,45 165,48 176,42 187,46 198,40 209,43 220,41 220,80"/>
+              </svg>
+            </div>
+            <div class="graph-x"><span>1m ago</span><span>now</span></div>
+          </div>
+          <table class="stats-tbl">
+            <tr><td class="k">Downloaded</td><td class="v">1.24 GB</td></tr>
+            <tr><td class="k">Uploaded</td><td class="v">340 MB</td></tr>
+            <tr><td class="k">Download speed</td><td class="v v-rx">42 Mbps</td></tr>
+            <tr><td class="k">Upload speed</td><td class="v v-tx">8.3 Mbps</td></tr>
+            <tr><td class="k">Uptime</td><td class="v">2h 14m</td></tr>
+          </table>
+          <hr class="sb-divider">
+          <div>
+            <div class="lbl" style="margin-bottom:0.4rem;">Diagnostics</div>
+            <div class="chain">
+              <div class="chain-row"><div class="nd ok"></div><div class="nlbl">App</div></div><div class="vwire"></div>
+              <div class="chain-row"><div class="nd ok"></div><div class="nlbl">Daemon</div></div><div class="vwire"></div>
+              <div class="chain-row"><div class="nd ok"></div><div class="nlbl">Network</div></div><div class="vwire"></div>
+              <div class="chain-row"><div class="nd ok"></div><div class="nlbl">VPN Server</div></div><div class="vwire"></div>
+              <div class="chain-row"><div class="nd ok"></div><div class="nlbl">Internet</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="sb-footer">Hole v1.2.0</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Sections =====
+  function toggleSection(hdr) {
+    const tri = hdr.querySelector('.tri');
+    const clip = hdr.nextElementSibling;
+    const body = clip.querySelector('.section-body');
+    if (clip.classList.contains('collapsed')) {
+      clip.classList.remove('collapsed');
+      clip.style.overflow = 'hidden';
+      const h = body.scrollHeight;
+      clip.style.maxHeight = '0px';
+      body.style.transform = 'translateY(-100%)'; body.style.opacity = '0';
+      clip.offsetHeight;
+      clip.style.transition = 'max-height 0.3s ease';
+      body.style.transition = 'transform 0.3s ease, opacity 0.2s ease';
+      clip.style.maxHeight = h + 'px';
+      body.style.transform = 'translateY(0)'; body.style.opacity = '1';
+      tri.classList.remove('collapsed');
+      const done = () => { clip.style.maxHeight = ''; clip.style.overflow = ''; clip.style.transition = ''; body.style.transition = ''; clip.removeEventListener('transitionend', done); };
+      clip.addEventListener('transitionend', done);
+    } else {
+      const h = body.scrollHeight;
+      clip.style.overflow = 'hidden'; clip.style.maxHeight = h + 'px';
+      clip.offsetHeight;
+      clip.style.transition = 'max-height 0.3s ease';
+      body.style.transition = 'transform 0.3s ease, opacity 0.2s ease';
+      clip.style.maxHeight = '0px';
+      body.style.transform = 'translateY(-100%)'; body.style.opacity = '0';
+      tri.classList.add('collapsed');
+      const done = () => { clip.classList.add('collapsed'); clip.style.transition = ''; body.style.transition = ''; clip.removeEventListener('transitionend', done); };
+      clip.addEventListener('transitionend', done);
+    }
+  }
+
+  // Power =====
+  let connected = true;
+  function togglePower() {
+    connected = !connected;
+    document.getElementById('power-btn').className = connected ? 'power-btn on' : 'power-btn off';
+    const w = document.getElementById('status-word');
+    w.className = connected ? 'on' : 'off';
+    w.textContent = connected ? 'Connected' : 'Disconnected';
+    document.getElementById('ip-text').innerHTML = connected
+      ? '<span class="country">DE</span> 185.xx.xx.42'
+      : '<span class="country">US</span> 73.xx.xx.15';
+  }
+
+  // Settings selects =====
+  function toggleMenu(btn) {
+    const m = btn.nextElementSibling;
+    document.querySelectorAll('.custom-select-menu.open').forEach(x => { if (x !== m) x.classList.remove('open'); });
+    m.classList.toggle('open');
+  }
+  function pickOpt(o) {
+    const m = o.parentElement;
+    m.querySelectorAll('.custom-select-opt').forEach(x => x.classList.remove('selected'));
+    o.classList.add('selected'); m.previousElementSibling.textContent = o.textContent; m.classList.remove('open');
+  }
+  function pickTheme(o, t) { pickOpt(o); document.documentElement.setAttribute('data-theme', t); }
+  function toggleProxy(el) { el.classList.toggle('on'); document.getElementById('proxy-nested').classList.toggle('muted', !el.classList.contains('on')); }
+
+  // Close all dropdowns on outside click
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.custom-select-wrap')) document.querySelectorAll('.custom-select-menu.open').forEach(m => m.classList.remove('open'));
+    if (!e.target.closest('.editable-cell')) closeAllInlineDropdowns();
+  });
+  function closeAllInlineDropdowns() { document.querySelectorAll('.inline-dropdown.open').forEach(d => d.classList.remove('open')); }
+
+  // Address edit =====
+  function editAddr(td) {
+    if (td.querySelector('.inline-input')) return;
+    const s = td.querySelector('.filter-addr');
+    const old = s.textContent;
+    const inp = document.createElement('input');
+    inp.className = 'inline-input'; inp.value = old;
+    s.replaceWith(inp); inp.focus(); inp.select();
+    const commit = () => { const sp = document.createElement('span'); sp.className = 'filter-addr'; sp.textContent = inp.value || old; inp.replaceWith(sp); };
+    inp.addEventListener('blur', commit);
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } if (e.key === 'Escape') { inp.value = old; inp.blur(); } });
+  }
+
+  // Inline dropdown — toggle on click =====
+  function toggleDropdown(td, type) {
+    let dd = td.querySelector('.inline-dropdown');
+    if (dd) {
+      if (dd.classList.contains('open')) { dd.classList.remove('open'); return; }
+      closeAllInlineDropdowns();
+      dd.classList.add('open');
+      return;
+    }
+    closeAllInlineDropdowns();
+    const opts = type === 'matching' ? ['exactly', 'with subdomains', 'wildcard', 'subnet'] : ['Proxy', 'Bypass', 'Block'];
+    const cur = (td.querySelector('.filter-match') || td.querySelector('.cp')).textContent.replace('▾','').trim();
+    dd = document.createElement('div');
+    dd.className = 'inline-dropdown open';
+    for (const o of opts) {
+      const el = document.createElement('div');
+      el.className = 'inline-dropdown-opt' + (o === cur ? ' selected' : '');
+      el.textContent = o;
+      el.addEventListener('click', e => {
+        e.stopPropagation();
+        if (type === 'matching') { td.querySelector('.filter-match').textContent = o; }
+        else { td.className = 'action-cell editable-cell ' + o.toLowerCase(); td.querySelector('.cp').innerHTML = o + '<span class="chev">▾</span>'; }
+        dd.classList.remove('open');
+      });
+      dd.appendChild(el);
+    }
+    td.appendChild(dd);
+  }
+
+  // Material drag =====
+  (function() {
+    const tbody = document.getElementById('filter-tbody');
+    let dragEl = null, placeholder = null, offsetY = 0;
+    let rowRects = [];
+
+    function movableRows() { return [...tbody.querySelectorAll('tr[data-id]:not([data-fixed])')]; }
+    function allRows() { return [...tbody.querySelectorAll('tr[data-id]')]; }
+    function fixedRow() { return tbody.querySelector('tr[data-fixed]'); }
+
+    tbody.addEventListener('pointerdown', e => {
+      const handle = e.target.closest('.drag-handle');
+      if (!handle) return;
+      const tr = handle.closest('tr[data-id]:not(.no-drag)');
+      if (!tr) return;
+      e.preventDefault();
+      dragEl = tr;
+      const rect = tr.getBoundingClientRect();
+      offsetY = e.clientY - rect.top;
+
+      // Snapshot positions of all movable rows for animated reorder
+      rowRects = movableRows().map(r => ({ el: r, top: r.getBoundingClientRect().top }));
+
+      // Create placeholder
+      placeholder = document.createElement('tr');
+      placeholder.setAttribute('data-placeholder', 'true');
+      const td = document.createElement('td');
+      td.colSpan = 4; td.style.padding = '0'; td.style.height = rect.height + 'px';
+      td.style.borderBottom = '2px solid var(--accent)';
+      placeholder.appendChild(td);
+
+      // Fix cell widths
+      tr.querySelectorAll('td').forEach(c => { c.style.width = c.offsetWidth + 'px'; });
+
+      // Lift the row
+      tr.style.position = 'fixed';
+      tr.style.top = rect.top + 'px'; tr.style.left = rect.left + 'px';
+      tr.style.width = rect.width + 'px'; tr.style.zIndex = '100';
+      tr.style.background = getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated');
+      tr.style.boxShadow = '0 6px 20px rgba(0,0,0,0.35)';
+      tr.style.borderRadius = '4px'; tr.style.pointerEvents = 'none';
+
+      tr.parentNode.insertBefore(placeholder, tr);
+
+      document.addEventListener('pointermove', onMove);
+      document.addEventListener('pointerup', onUp);
+    });
+
+    function onMove(e) {
+      if (!dragEl) return;
+      dragEl.style.top = (e.clientY - offsetY) + 'px';
+
+      const fixed = fixedRow();
+      const rows = movableRows().filter(r => r !== dragEl);
+
+      // Find insert position — never before the fixed row
+      let insertBefore = null;
+      for (const row of rows) {
+        const rect = row.getBoundingClientRect();
+        if (e.clientY < rect.top + rect.height / 2) { insertBefore = row; break; }
+      }
+
+      const currentNext = placeholder.nextElementSibling;
+      if (insertBefore) {
+        if (currentNext !== insertBefore) {
+          // Snapshot before
+          const before = movableRows().filter(r => r !== dragEl).map(r => ({ el: r, top: r.getBoundingClientRect().top }));
+          tbody.insertBefore(placeholder, insertBefore);
+          // Animate with FLIP
+          animateRows(before, movableRows().filter(r => r !== dragEl));
+        }
+      } else {
+        // After all rows (but check if placeholder is already there)
+        const last = rows[rows.length - 1];
+        if (last && currentNext !== last.nextElementSibling) {
+          const before = movableRows().filter(r => r !== dragEl).map(r => ({ el: r, top: r.getBoundingClientRect().top }));
+          if (last.nextElementSibling) tbody.insertBefore(placeholder, last.nextElementSibling);
+          else tbody.appendChild(placeholder);
+          animateRows(before, movableRows().filter(r => r !== dragEl));
+        }
+      }
+    }
+
+    function animateRows(beforeSnap, currentRows) {
+      for (const row of currentRows) {
+        const b = beforeSnap.find(s => s.el === row);
+        if (!b) continue;
+        const after = row.getBoundingClientRect().top;
+        const delta = b.top - after;
+        if (Math.abs(delta) < 1) continue;
+        row.style.transition = 'none';
+        row.style.transform = `translateY(${delta}px)`;
+        row.offsetHeight; // force reflow
+        row.style.transition = 'transform 0.25s ease';
+        row.style.transform = 'translateY(0)';
+      }
+    }
+
+    function onUp() {
+      if (!dragEl) return;
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      tbody.insertBefore(dragEl, placeholder);
+      placeholder.remove(); placeholder = null;
+      dragEl.style.cssText = '';
+      dragEl.querySelectorAll('td').forEach(c => { c.style.width = ''; });
+      // Clean up any leftover transforms
+      movableRows().forEach(r => { r.style.transition = ''; r.style.transform = ''; });
+      dragEl = null;
+    }
+  })();
+
+  // Test filtering =====
+  const rules = [
+    { addr: '*', matching: 'wildcard', action: 'Proxy' },
+    { addr: 'google.com', matching: 'with subdomains', action: 'Bypass' },
+    { addr: 'ads.tracker.net', matching: 'exactly', action: 'Block' },
+    { addr: '*.cdn.example.com', matching: 'wildcard', action: 'Bypass' },
+    { addr: '192.168.0.0/16', matching: 'subnet', action: 'Bypass' },
+  ];
+  function ipToInt(ip) { return ip.split('.').reduce((a,o) => (a<<8)+parseInt(o),0)>>>0; }
+  function testFilter() {
+    const input = document.getElementById('test-input').value.trim().toLowerCase();
+    const result = document.getElementById('test-result');
+    if (!input) { result.innerHTML = ''; return; }
+    let ma = 'Proxy', mr = '*';
+    const isIp = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(input);
+    for (const r of rules) {
+      const a = r.addr.toLowerCase(); let m = false;
+      if (r.matching==='subnet'&&isIp){const[n,b]=a.split('/');const mask=b?(~0<<(32-parseInt(b)))>>>0:0xFFFFFFFF;m=(ipToInt(input)&mask)===(ipToInt(n)&mask);}
+      else if(r.matching==='exactly')m=input===a;
+      else if(r.matching==='with subdomains')m=input===a||input.endsWith('.'+a);
+      else if(r.matching==='wildcard'){if(a==='*')m=true;else{const p=a.replace(/\./g,'\\.').replace(/\*/g,'.*');m=new RegExp('^'+p+'$').test(input);}}
+      if(m){ma=r.action;mr=r.addr;}
+    }
+    const c=ma==='Proxy'?'match-proxy':ma==='Bypass'?'match-bypass':'match-block';
+    result.innerHTML=`<span class="${c}">${ma}</span> <span class="match-rule">(matched: ${mr})</span>`;
+  }
+</script>
+</body>
+</html>

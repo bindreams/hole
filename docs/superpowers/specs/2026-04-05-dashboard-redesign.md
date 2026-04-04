@@ -8,7 +8,7 @@ This redesign replaces the dashboard with a modern, dark-themed (with light opti
 
 ## Window and Layout
 
-- **Size**: 800x600, resizable (min 600x450)
+- **Size**: 800x600 minimum, resizable vertically only (fixed width 800px)
 - **Layout**: Two-panel — scrollable main area (left), fixed sidebar (right, 220px)
 - **Fonts**: Inter (UI text), Fira Code (addresses, stats values, port numbers, version)
 - **Theming**: CSS custom properties on `[data-theme]` with `color-scheme: light dark`. Dark by default, Light available, System option follows OS preference. No hacks — all colors via `--var` tokens
@@ -246,7 +246,8 @@ pub proxy_port: u16,
 
 ## Reference
 
-- Prototype mockups: `.superpowers/brainstorm/` (v7-v11 are most current)
+- **Reference implementation**: `docs/superpowers/specs/2026-04-05-dashboard-mockup.html` — the final prototype (v11) with CSS theme tokens, layout, and interaction JS. Open directly in a browser. Some interactions have prototype bugs (dropdown toggle, drag after collapse) — treat as visual/structural reference, not production code.
+- Prototype iteration history: `.superpowers/brainstorm/` (v7-v11 are most current)
 - Current UI files: `ui/index.html`, `ui/style.css`, `ui/main.js`
 - Tauri config: `crates/gui/tauri.conf.json`
 - Tray/window code: `crates/gui/src/tray.rs`
