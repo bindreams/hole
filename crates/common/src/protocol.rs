@@ -20,6 +20,9 @@ pub enum DaemonRequest {
     Stop,
     Status,
     Reload { config: ProxyConfig },
+    Metrics,
+    Diagnostics,
+    PublicIp,
 }
 
 /// Client-side response enum. Used by the GUI client API and elevation flow.
@@ -35,6 +38,24 @@ pub enum DaemonResponse {
     },
     Error {
         message: String,
+    },
+    Metrics {
+        bytes_in: u64,
+        bytes_out: u64,
+        speed_in_bps: u64,
+        speed_out_bps: u64,
+        uptime_secs: u64,
+    },
+    Diagnostics {
+        app: String,
+        daemon: String,
+        network: String,
+        vpn_server: String,
+        internet: String,
+    },
+    PublicIp {
+        ip: String,
+        country_code: String,
     },
 }
 

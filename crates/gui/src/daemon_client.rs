@@ -116,6 +116,9 @@ impl DaemonClient {
                     parse_daemon_error(resp).await
                 }
             }
+            DaemonRequest::Metrics | DaemonRequest::Diagnostics | DaemonRequest::PublicIp => {
+                Err(ClientError::Protocol("not yet implemented".to_string()))
+            }
         }
     }
 

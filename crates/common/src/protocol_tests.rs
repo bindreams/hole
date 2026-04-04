@@ -211,3 +211,68 @@ fn route_constants_for_new_endpoints_exist() {
     assert_eq!(ROUTE_DIAGNOSTICS, "/v1/diagnostics");
     assert_eq!(ROUTE_PUBLIC_IP, "/v1/public-ip");
 }
+
+// Protocol variant roundtrips -----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn daemon_request_metrics_roundtrips() {
+    let req = DaemonRequest::Metrics;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_request_diagnostics_roundtrips() {
+    let req = DaemonRequest::Diagnostics;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_request_public_ip_roundtrips() {
+    let req = DaemonRequest::PublicIp;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_metrics_roundtrips() {
+    let resp = DaemonResponse::Metrics {
+        bytes_in: 100,
+        bytes_out: 50,
+        speed_in_bps: 1024,
+        speed_out_bps: 512,
+        uptime_secs: 60,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_diagnostics_roundtrips() {
+    let resp = DaemonResponse::Diagnostics {
+        app: "ok".to_string(),
+        daemon: "ok".to_string(),
+        network: "error".to_string(),
+        vpn_server: "unknown".to_string(),
+        internet: "unknown".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_public_ip_roundtrips() {
+    let resp = DaemonResponse::PublicIp {
+        ip: "1.2.3.4".to_string(),
+        country_code: "US".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
