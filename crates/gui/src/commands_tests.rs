@@ -1,4 +1,5 @@
 use super::*;
+use crate::daemon_client::ClientError;
 use hole_common::config::{AppConfig, ServerEntry};
 use skuld::temp_dir;
 use std::path::Path;
@@ -149,6 +150,119 @@ fn auto_select_noop_on_empty_servers() {
 
     auto_select_first_server(&mut config);
     assert!(config.selected_server.is_none());
+}
+
+// get_metrics / get_diagnostics / get_public_ip response mapping tests ================================================
+
+/// Verify that a Metrics DaemonResponse maps to the expected JSON.
+#[skuld::test]
+fn get_metrics_returns_json() {
+    let resp = DaemonResponse::Metrics {
+        bytes_in: 1024,
+        bytes_out: 512,
+        speed_in_bps: 2048,
+        speed_out_bps: 1024,
+        uptime_secs: 120,
+    };
+    let json = map_metrics_response(Ok(resp));
+    assert_eq!(json["bytes_in"], 1024);
+    assert_eq!(json["bytes_out"], 512);
+    assert_eq!(json["speed_in_bps"], 2048);
+    assert_eq!(json["speed_out_bps"], 1024);
+    assert_eq!(json["uptime_secs"], 120);
+}
+
+/// Verify that a failed metrics request returns zero defaults.
+#[skuld::test]
+fn get_metrics_fallback_on_error() {
+    let err = ClientError::Connection(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "daemon unreachable",
+    ));
+    let json = map_metrics_response(Err(err));
+    assert_eq!(json["bytes_in"], 0);
+    assert_eq!(json["bytes_out"], 0);
+    assert_eq!(json["speed_in_bps"], 0);
+    assert_eq!(json["speed_out_bps"], 0);
+    assert_eq!(json["uptime_secs"], 0);
+}
+
+/// Verify that an unexpected response type falls back to zero defaults.
+#[skuld::test]
+fn get_metrics_unexpected_response_falls_back() {
+    let json = map_metrics_response(Ok(DaemonResponse::Ack));
+    assert_eq!(json["bytes_in"], 0);
+    assert_eq!(json["uptime_secs"], 0);
+}
+
+/// Verify that a Diagnostics DaemonResponse maps to the expected JSON.
+#[skuld::test]
+fn get_diagnostics_returns_json() {
+    let resp = DaemonResponse::Diagnostics {
+        app: "ok".into(),
+        daemon: "ok".into(),
+        network: "degraded".into(),
+        vpn_server: "ok".into(),
+        internet: "ok".into(),
+    };
+    let json = map_diagnostics_response(Ok(resp));
+    assert_eq!(json["app"], "ok");
+    assert_eq!(json["daemon"], "ok");
+    assert_eq!(json["network"], "degraded");
+    assert_eq!(json["vpn_server"], "ok");
+    assert_eq!(json["internet"], "ok");
+}
+
+/// Verify that a failed diagnostics request returns unknown defaults.
+#[skuld::test]
+fn get_diagnostics_fallback_on_error() {
+    let err = ClientError::Connection(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "daemon unreachable",
+    ));
+    let json = map_diagnostics_response(Err(err));
+    assert_eq!(json["app"], "ok");
+    assert_eq!(json["daemon"], "unknown");
+    assert_eq!(json["network"], "unknown");
+    assert_eq!(json["vpn_server"], "unknown");
+    assert_eq!(json["internet"], "unknown");
+}
+
+/// Verify that an unexpected response type falls back to unknown defaults.
+#[skuld::test]
+fn get_diagnostics_unexpected_response_falls_back() {
+    let json = map_diagnostics_response(Ok(DaemonResponse::Ack));
+    assert_eq!(json["app"], "ok");
+    assert_eq!(json["daemon"], "unknown");
+}
+
+/// Verify that a PublicIp DaemonResponse maps to the expected JSON.
+#[skuld::test]
+fn get_public_ip_daemon_success_returns_json() {
+    let resp: Result<DaemonResponse, ClientError> = Ok(DaemonResponse::PublicIp {
+        ip: "203.0.113.42".into(),
+        country_code: "DE".into(),
+    });
+    let json = map_public_ip_daemon_response(resp).expect("should return Some for PublicIp");
+    assert_eq!(json["ip"], "203.0.113.42");
+    assert_eq!(json["country_code"], "DE");
+}
+
+/// Verify that a failed PublicIp daemon request returns None (triggers fallback).
+#[skuld::test]
+fn get_public_ip_daemon_failure_returns_none() {
+    let err: Result<DaemonResponse, ClientError> = Err(ClientError::Connection(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "daemon unreachable",
+    )));
+    assert!(map_public_ip_daemon_response(err).is_none());
+}
+
+/// Verify that an unexpected DaemonResponse for PublicIp returns None.
+#[skuld::test]
+fn get_public_ip_unexpected_response_returns_none() {
+    let resp: Result<DaemonResponse, ClientError> = Ok(DaemonResponse::Ack);
+    assert!(map_public_ip_daemon_response(resp).is_none());
 }
 
 // validate_and_read_import tests ======================================================================================

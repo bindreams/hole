@@ -50,6 +50,9 @@ fn launch_gui() {
             commands::save_config,
             commands::import_servers_from_file,
             commands::get_proxy_status,
+            commands::get_metrics,
+            commands::get_diagnostics,
+            commands::get_public_ip,
             tray::toggle_proxy,
         ])
         .on_window_event(|window, event| {
