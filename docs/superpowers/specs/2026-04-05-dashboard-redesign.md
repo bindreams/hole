@@ -186,7 +186,7 @@ The current daemon API provides only `running`, `uptime_secs`, and `error`. The 
   "app": "ok",
   "daemon": "ok",
   "network": "ok",
-  "vpn_server": { "status": "ok", "ip": "185.x.x.42" },
+  "vpn_server": "ok",
   "internet": "ok"
 }
 ```
@@ -229,7 +229,7 @@ pub theme: Theme,                 // Light, Dark, System
 pub proxy_server_enabled: bool,
 pub proxy_socks5: bool,
 pub proxy_http: bool,
-pub proxy_port: u16,
+// proxy_port: reuses existing `local_port` field
 ```
 
 ## Verification
