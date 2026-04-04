@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,49 +7,205 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header>
-    <h1>Hole Dashboard</h1>
-    <div class="header-controls">
-      <button id="btn-toggle" type="button" class="btn-connect" disabled>Connect</button>
-      <div id="status" class="status disconnected">Daemon: disconnected</div>
-    </div>
-  </header>
+  <div class="app">
+    <!-- Main area (left, scrollable) -->
+    <div class="main">
 
-  <section id="servers-section">
-    <h2>Servers</h2>
-    <table id="server-table">
-      <thead>
-        <tr>
-          <th></th>
-          <th>Name</th>
-          <th>Address</th>
-          <th>Method</th>
-          <th>Plugin</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="server-list">
-        <!-- rows rendered by JS -->
-      </tbody>
-    </table>
-    <div id="empty-state" class="drop-zone" style="display: none;">
-      <p>No servers configured</p>
-      <p class="muted">Drag and drop a JSON config file here, or use File &gt; Import</p>
-    </div>
-  </section>
+      <!-- Servers section -->
+      <div>
+        <div class="section-hdr" id="section-servers-hdr">
+          <span class="tri">&#x25BC;</span>
+          <span class="section-label">Servers</span>
+        </div>
+        <div class="section-clip">
+          <div class="section-body">
+            <div class="server-list" id="server-list">
+              <!-- Server cards rendered by JS -->
+            </div>
+            <div class="add-zone" id="import-zone">+ Import servers from file</div>
+          </div>
+        </div>
+      </div>
 
-  <section id="settings-section">
-    <h2>General</h2>
-    <div class="field">
-      <label for="local-port">Local SOCKS5 port</label>
-      <input id="local-port" type="number" min="1" max="65535" value="4073">
-    </div>
-  </section>
+      <!-- Filters section -->
+      <div>
+        <div class="section-hdr" id="section-filters-hdr">
+          <span class="tri">&#x25BC;</span>
+          <span class="section-label">Filters</span>
+        </div>
+        <div class="section-clip">
+          <div class="section-body">
+            <table class="filters-tbl">
+              <colgroup>
+                <col class="col-addr">
+                <col class="col-match">
+                <col class="col-action">
+                <col class="col-del">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th>Matching</th>
+                  <th>Action</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="filter-tbody">
+                <!-- Filter rows rendered by JS -->
+              </tbody>
+            </table>
+            <div class="filter-add-row" id="filter-add-btn">+ Add rule</div>
+            <div class="test-filter">
+              <div class="test-filter-label">Test filtering</div>
+              <div class="test-filter-row">
+                <input class="test-filter-input" id="test-input" type="text" placeholder="Enter a domain or IP to test...">
+              </div>
+              <div class="test-result" id="test-result"></div>
+              <div class="hint">Rules are evaluated top-to-bottom. Later rules override earlier ones.</div>
+            </div>
+          </div>
+        </div>
+      </div>
 
-  <footer>
-    <button id="btn-apply" type="button" disabled>Apply</button>
-    <span id="save-status"></span>
-  </footer>
+      <!-- Settings section -->
+      <div>
+        <div class="section-hdr" id="section-settings-hdr">
+          <span class="tri">&#x25BC;</span>
+          <span class="section-label">Settings</span>
+        </div>
+        <div class="section-clip">
+          <div class="section-body">
+            <div class="settings-group">
+              <div class="setting-row">
+                <span class="setting-label">Start Hole on login</span>
+                <div class="setting-control">
+                  <div class="toggle" id="toggle-start-on-login"></div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">On startup</span>
+                <div class="setting-control">
+                  <div class="custom-select-wrap">
+                    <div class="custom-select-btn" id="select-on-startup">Do not connect</div>
+                    <div class="custom-select-menu" id="menu-on-startup">
+                      <div class="custom-select-opt selected" data-value="do-not-connect">Do not connect</div>
+                      <div class="custom-select-opt" data-value="restore-last-state">Restore last state</div>
+                      <div class="custom-select-opt" data-value="always-connect">Always connect</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Theme</span>
+                <div class="setting-control">
+                  <div class="custom-select-wrap">
+                    <div class="custom-select-btn" id="select-theme">Dark</div>
+                    <div class="custom-select-menu" id="menu-theme">
+                      <div class="custom-select-opt" data-value="light">Light</div>
+                      <div class="custom-select-opt selected" data-value="dark">Dark</div>
+                      <div class="custom-select-opt" data-value="system">System</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <hr class="setting-divider">
+              <div class="setting-row">
+                <span class="setting-label">Local proxy server</span>
+                <div class="setting-control">
+                  <div class="toggle" id="toggle-proxy-server"></div>
+                </div>
+              </div>
+              <div class="setting-nested" id="proxy-nested">
+                <div class="setting-row">
+                  <span class="setting-label">SOCKS5</span>
+                  <div class="setting-control">
+                    <div class="toggle" id="toggle-socks5"></div>
+                  </div>
+                </div>
+                <div class="setting-row">
+                  <span class="setting-label">HTTP</span>
+                  <div class="setting-control">
+                    <div class="toggle" id="toggle-http"></div>
+                  </div>
+                </div>
+                <div class="setting-row">
+                  <span class="setting-label">Serving port</span>
+                  <div class="setting-control">
+                    <input class="field-input" id="input-port" type="text" value="4073">
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Sidebar (right, fixed 220px) -->
+    <div class="sidebar">
+      <!-- Status header -->
+      <div class="sb-header">
+        <button class="power-btn off" id="power-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round">
+            <path d="M12 3v8"/>
+            <path d="M5.6 6.6a9 9 0 1 0 12.8 0"/>
+          </svg>
+        </button>
+        <div class="sb-status-block">
+          <div class="sb-status">You are <strong class="off" id="status-word">Disconnected</strong></div>
+          <div class="sb-ip">
+            <span class="ip-text" id="ip-text"><span class="country" id="country-badge">--</span> --</span>
+            <span class="copy-btn" id="copy-ip-btn" title="Copy to clipboard">&#x2398;</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sidebar content -->
+      <div class="sb-content">
+        <!-- Throughput graph -->
+        <div class="graph-wrap">
+          <div class="graph-top-label" id="graph-scale-label">0 Mbps</div>
+          <div class="graph-canvas">
+            <div class="graph-midline"></div>
+            <svg class="graph-svg" id="graph-svg" viewBox="0 0 220 80" preserveAspectRatio="none">
+              <!-- Graph lines rendered by JS -->
+            </svg>
+          </div>
+          <div class="graph-x"><span>1m ago</span><span>now</span></div>
+        </div>
+
+        <!-- Stats table -->
+        <table class="stats-tbl" id="stats-table">
+          <tr><td class="k">Downloaded</td><td class="v" id="stat-downloaded">--</td></tr>
+          <tr><td class="k">Uploaded</td><td class="v" id="stat-uploaded">--</td></tr>
+          <tr><td class="k">Download speed</td><td class="v v-rx" id="stat-download-speed">--</td></tr>
+          <tr><td class="k">Upload speed</td><td class="v v-tx" id="stat-upload-speed">--</td></tr>
+          <tr><td class="k">Uptime</td><td class="v" id="stat-uptime">--</td></tr>
+        </table>
+
+        <!-- Diagnostics -->
+        <hr class="sb-divider">
+        <div>
+          <div class="lbl diag-lbl">Diagnostics</div>
+          <div class="chain" id="diagnostics-chain">
+            <div class="chain-row"><div class="nd unknown" id="diag-app"></div><div class="nlbl">App</div></div>
+            <div class="vwire"></div>
+            <div class="chain-row"><div class="nd unknown" id="diag-daemon"></div><div class="nlbl">Daemon</div></div>
+            <div class="vwire"></div>
+            <div class="chain-row"><div class="nd unknown" id="diag-network"></div><div class="nlbl">Network</div></div>
+            <div class="vwire"></div>
+            <div class="chain-row"><div class="nd unknown" id="diag-vpn-server"></div><div class="nlbl">VPN Server</div></div>
+            <div class="vwire"></div>
+            <div class="chain-row"><div class="nd unknown" id="diag-internet"></div><div class="nlbl">Internet</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Version footer -->
+      <div class="sb-footer" id="version-footer">Hole v--</div>
+    </div>
+  </div>
 
   <script src="main.js" type="module"></script>
 </body>
