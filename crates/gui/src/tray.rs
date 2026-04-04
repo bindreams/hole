@@ -12,7 +12,8 @@ use tracing::{error, info, warn};
 // Menu IDs ============================================================================================================
 
 // Tray menu -----------------------------------------------------------------------------------------------------------
-const ID_ENABLE: &str = "enable";
+const ID_STATUS: &str = "status";
+const ID_CONNECT: &str = "connect";
 const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
@@ -33,10 +34,15 @@ const ID_COLLECT_LOGS: &str = "window_collect_logs";
 pub fn build_tray_menu(
     app: &AppHandle,
     update: Option<&hole_gui::update::UpdateInfo>,
+    enabled: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
-    let enable = CheckMenuItem::with_id(app, ID_ENABLE, "Enable", true, false, None::<&str>)?;
+    let status_text = if enabled { "Connected" } else { "Disconnected" };
+    let connect_text = if enabled { "Disconnect" } else { "Connect" };
+
+    let status = MenuItem::with_id(app, ID_STATUS, status_text, false, None::<&str>)?;
+    let connect = MenuItem::with_id(app, ID_CONNECT, connect_text, true, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
-    let settings = MenuItem::with_id(app, ID_SETTINGS, "Settings...", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, ID_SETTINGS, "Dashboard...", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, ID_EXIT, "Exit", true, None::<&str>)?;
@@ -52,29 +58,58 @@ pub fn build_tray_menu(
         let sep3 = PredefinedMenuItem::separator(app)?;
         tauri::menu::Menu::with_items(
             app,
-            &[&enable, &autostart, &sep1, &settings, &sep2, &update_item, &sep3, &exit],
+            &[
+                &status,
+                &connect,
+                &sep1,
+                &autostart,
+                &settings,
+                &sep2,
+                &update_item,
+                &sep3,
+                &exit,
+            ],
         )
     } else {
-        tauri::menu::Menu::with_items(app, &[&enable, &autostart, &sep1, &settings, &sep2, &exit])
+        tauri::menu::Menu::with_items(app, &[&status, &connect, &sep1, &autostart, &settings, &sep2, &exit])
     }
 }
 
-/// Sync tray menu checkbox states from the current config.
+/// Sync tray menu item text and checkbox states from the current config.
 pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
     let state = app.state::<AppState>();
     let config = state.config.lock().unwrap();
-    if let Some(item) = menu.get(ID_ENABLE) {
+
+    // Sync status text
+    if let Some(item) = menu.get(ID_STATUS) {
+        if let Some(menu_item) = item.as_menuitem() {
+            let text = if config.enabled { "Connected" } else { "Disconnected" };
+            menu_item.set_text(text).ok();
+        }
+    }
+
+    // Sync connect/disconnect text
+    if let Some(item) = menu.get(ID_CONNECT) {
+        if let Some(menu_item) = item.as_menuitem() {
+            let text = if config.enabled { "Disconnect" } else { "Connect" };
+            menu_item.set_text(text).ok();
+        }
+    }
+
+    // Sync autostart checkbox
+    if let Some(item) = menu.get(ID_AUTOSTART) {
         if let Some(check) = item.as_check_menuitem() {
-            check.set_checked(config.enabled).ok();
+            use tauri_plugin_autostart::ManagerExt;
+            let is_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            check.set_checked(is_enabled).ok();
         }
     }
 }
 
 /// Create and register the system tray icon with its menu.
 pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
-    let menu = build_tray_menu(app.handle(), None)?;
-
     let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
+    let menu = build_tray_menu(app.handle(), None, enabled)?;
     let icon = tray_icons::tray_image(enabled.into());
 
     #[allow(unused_mut)]
@@ -107,14 +142,15 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
 
 // Proxy state management ==============================================================================================
 
-/// Rebuild the tray menu to sync checkbox state with the current config.
+/// Rebuild the tray menu to sync state with the current config.
 ///
 /// Preserves the "Install Update" item if an update is available.
 pub fn rebuild_tray_menu(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
         let update_state = app.state::<hole_gui::update::UpdateState>();
         let update_info = update_state.rx.borrow().clone();
-        match build_tray_menu(app, update_info.as_ref()) {
+        let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
+        match build_tray_menu(app, update_info.as_ref(), enabled) {
             Ok(menu) => {
                 sync_menu_state(app, &menu);
                 tray.set_menu(Some(menu)).ok();
@@ -165,7 +201,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
     let result = if enabled {
         let Some(proxy_config) = proxy_config else {
             revert_proxy_state(app, false);
-            return Err("No server is selected. Open Settings and select a server before enabling.".into());
+            return Err("No server is selected. Open the Dashboard and select a server before connecting.".into());
         };
 
         let request = DaemonRequest::Start { config: proxy_config };
@@ -244,8 +280,8 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
 /// also invoke the window's handler (and vice versa), causing actions to fire twice.
 fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
-        ID_ENABLE => {
-            info!("tray: enable toggled");
+        ID_CONNECT => {
+            info!("tray: connect toggled");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
@@ -588,7 +624,7 @@ fn open_settings_window(app: &AppHandle) {
 
     #[allow(unused_mut)]
     let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
-        .title("Hole Settings")
+        .title("Hole Dashboard")
         .inner_size(600.0, 400.0)
         .min_inner_size(450.0, 300.0)
         .resizable(true);
