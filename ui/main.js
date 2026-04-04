@@ -3,6 +3,7 @@
 // State management, Tauri IPC integration, polling setup, and event listeners.
 
 import { initSections } from "./sections.js";
+import { initServers, renderServers } from "./servers.js";
 import {
   initSidebar,
   updateMetrics,
@@ -29,7 +30,7 @@ export async function loadConfig() {
   try {
     config = await invoke("get_config");
     dirty = false;
-    // Future modules (servers, filters, settings) will consume `config` here.
+    renderServers();
   } catch (err) {
     console.error("loadConfig failed:", err);
   }
@@ -127,6 +128,7 @@ function setupEventListeners() {
 async function init() {
   // Initialize UI modules.
   initSections();
+  initServers();
   initSidebar();
 
   // Load config from backend.
