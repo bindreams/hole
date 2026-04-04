@@ -83,6 +83,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/metrics:
+    get:
+      summary: Get connection metrics
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Current traffic metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsResponse"
+
+  /v1/diagnostics:
+    get:
+      summary: Get diagnostic chain status
+      operationId: getDiagnostics
+      responses:
+        "200":
+          description: Health status of each component
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagnosticsResponse"
+
+  /v1/public-ip:
+    get:
+      summary: Get public IP address
+      operationId: getPublicIp
+      responses:
+        "200":
+          description: Current public IP and country
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicIpResponse"
+
 components:
   schemas:
     StatusResponse:
@@ -113,6 +149,67 @@ components:
     EmptyResponse:
       type: object
       additionalProperties: false
+
+    MetricsResponse:
+      type: object
+      required:
+        - bytes_in
+        - bytes_out
+        - speed_in_bps
+        - speed_out_bps
+        - uptime_secs
+      properties:
+        bytes_in:
+          type: integer
+          format: uint64
+          minimum: 0
+        bytes_out:
+          type: integer
+          format: uint64
+          minimum: 0
+        speed_in_bps:
+          type: integer
+          format: uint64
+          minimum: 0
+        speed_out_bps:
+          type: integer
+          format: uint64
+          minimum: 0
+        uptime_secs:
+          type: integer
+          format: uint64
+          minimum: 0
+
+    DiagnosticsResponse:
+      type: object
+      required:
+        - app
+        - daemon
+        - network
+        - vpn_server
+        - internet
+      properties:
+        app:
+          type: string
+        daemon:
+          type: string
+        network:
+          type: string
+        vpn_server:
+          type: string
+        internet:
+          type: string
+
+    PublicIpResponse:
+      type: object
+      required:
+        - ip
+        - country_code
+      properties:
+        ip:
+          type: string
+        country_code:
+          type: string
 
     # Documentation-only schemas (not code-generated; hand-written in Rust)
     ProxyConfig:
