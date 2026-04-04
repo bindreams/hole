@@ -280,6 +280,97 @@ fn server_entry_debug_shows_non_sensitive_fields() {
     assert!(debug_output.contains("server;tls"), "should contain plugin_opts");
 }
 
+// Filter types --------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn filter_rule_roundtrips_via_json() {
+    let rule = FilterRule {
+        address: "google.com".to_string(),
+        matching: MatchType::WithSubdomains,
+        action: FilterAction::Bypass,
+    };
+    let json = serde_json::to_string(&rule).unwrap();
+    let parsed: FilterRule = serde_json::from_str(&json).unwrap();
+    assert_eq!(rule, parsed);
+}
+
+#[skuld::test]
+fn match_type_serializes_as_lowercase() {
+    let json = serde_json::to_string(&MatchType::WithSubdomains).unwrap();
+    assert_eq!(json, r#""with_subdomains""#);
+}
+
+#[skuld::test]
+fn filter_action_serializes_as_lowercase() {
+    let json = serde_json::to_string(&FilterAction::Bypass).unwrap();
+    assert_eq!(json, r#""bypass""#);
+}
+
+// New AppConfig fields ------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn deserialize_old_config_without_new_fields_uses_defaults() {
+    let json = r#"{"servers": [], "local_port": 4073, "enabled": false}"#;
+    let config: AppConfig = serde_json::from_str(json).unwrap();
+    assert!(config.filters.is_empty());
+    assert!(!config.start_on_login);
+    assert_eq!(config.on_startup, StartupBehavior::RestoreLastState);
+    assert_eq!(config.theme, Theme::Dark);
+    assert!(config.proxy_server_enabled);
+    assert!(config.proxy_socks5);
+    assert!(!config.proxy_http);
+}
+
+#[skuld::test]
+fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config.json");
+    let config = AppConfig {
+        filters: vec![FilterRule {
+            address: "*.example.com".to_string(),
+            matching: MatchType::Wildcard,
+            action: FilterAction::Block,
+        }],
+        start_on_login: true,
+        on_startup: StartupBehavior::AlwaysConnect,
+        theme: Theme::Light,
+        proxy_server_enabled: false,
+        proxy_socks5: false,
+        proxy_http: true,
+        ..Default::default()
+    };
+    config.save(&path).unwrap();
+    let loaded = AppConfig::load(&path).unwrap();
+    assert_eq!(config.filters, loaded.filters);
+    assert_eq!(config.start_on_login, loaded.start_on_login);
+    assert_eq!(config.on_startup, loaded.on_startup);
+    assert_eq!(config.theme, loaded.theme);
+    assert_eq!(config.proxy_server_enabled, loaded.proxy_server_enabled);
+    assert_eq!(config.proxy_socks5, loaded.proxy_socks5);
+    assert_eq!(config.proxy_http, loaded.proxy_http);
+}
+
+#[skuld::test]
+fn startup_behavior_all_variants_roundtrip() {
+    for variant in [
+        StartupBehavior::DoNotConnect,
+        StartupBehavior::RestoreLastState,
+        StartupBehavior::AlwaysConnect,
+    ] {
+        let json = serde_json::to_string(&variant).unwrap();
+        let parsed: StartupBehavior = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, parsed);
+    }
+}
+
+#[skuld::test]
+fn theme_all_variants_roundtrip() {
+    for variant in [Theme::Light, Theme::Dark, Theme::System] {
+        let json = serde_json::to_string(&variant).unwrap();
+        let parsed: Theme = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, parsed);
+    }
+}
+
 // Plugin name validation ==============================================================================================
 
 #[skuld::test]
