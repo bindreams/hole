@@ -52,7 +52,7 @@ Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 ```sh
 npm install                      # install frontend dependencies (first time only)
 cargo build --workspace          # all crates (build.rs builds v2ray-plugin + downloads wintun)
-npx tauri dev                    # GUI dev mode (Vite dev server starts automatically)
+uv run scripts/dev.py            # dev mode (see CONTRIBUTING.md)
 cargo test --workspace           # all tests
 ```
 

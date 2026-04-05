@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Launch daemon and GUI in dev mode with multiplexed logs.
 
-Builds the workspace once, then runs:
-  1. The daemon in foreground/no-tun mode
-  2. npx tauri dev for the GUI with Vite HMR (frontend-only hot reload)
+Builds the workspace, then runs three processes:
+  1. Vite dev server (frontend HMR on port 1420)
+  2. Daemon in foreground/no-tun mode
+  3. GUI (Tauri webview loading from Vite)
 
-Rust code changes (daemon or GUI) require Ctrl+C and re-run.
-Frontend changes (ui/) are picked up instantly via Vite HMR.
+Frontend changes (ui/) hot-reload instantly. Rust changes need Ctrl+C and re-run.
 
 Usage:
   uv run scripts/dev.py
@@ -15,6 +15,7 @@ Usage:
 # requires-python = ">=3.9"
 # ///
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -31,85 +32,166 @@ YELLOW = "\033[33m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+VITE_READY_TIMEOUT = 30
 
-def prefix_stream(stream, label: str, color: str) -> None:
-    """Read lines from a stream and print them with a colored prefix."""
-    prefix = f"{color}{BOLD}[{label}]{RESET} "
-    try:
-        for line in iter(stream.readline, ""):
-            print(f"{prefix}{line}", end="", flush=True)
-    except ValueError:
-        pass  # stream closed
+# Prerequisites ========================================================================================================
 
 
-def check_prerequisites() -> None:
-    if not Path("node_modules/.bin/tauri").exists() and not Path("node_modules/.bin/tauri.cmd").exists():
-        print(f"{YELLOW}node_modules not found. Run:{RESET}")
-        print("  npm install")
+def resolve_tool(name: str) -> str:
+    """Resolve executable path via shutil.which (handles .cmd on Windows)."""
+    path = shutil.which(name)
+    if not path:
+        print(f"{YELLOW}{name} not found on PATH{RESET}")
         sys.exit(1)
+    return path
 
 
-def main() -> None:
-    # Ensure we're at the project root
-    if not Path("Cargo.toml").exists() or not Path("crates/gui").exists():
-        print("Error: run this script from the project root")
-        sys.exit(1)
+def ensure_node_modules(npm: str) -> None:
+    if Path("node_modules").exists():
+        return
+    print(f"{BOLD}Installing npm dependencies...{RESET}")
+    result = subprocess.run([npm, "install"], stdout=sys.stdout, stderr=sys.stderr)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
-    check_prerequisites()
 
-    socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
-
-    # Resolve executables explicitly — on Windows, .cmd/.bat files (like npx.cmd)
-    # are not found by subprocess.Popen without shell=True.
-    cargo = shutil.which("cargo")
-    npx = shutil.which("npx")
-    if not cargo or not npx:
-        missing = [name for name, path in [("cargo", cargo), ("npx", npx)] if not path]
-        print(f"{YELLOW}Not found on PATH: {', '.join(missing)}{RESET}")
-        sys.exit(1)
-
-    # Build the workspace once up front. Both the daemon and tauri dev need the
-    # built binary, and building first avoids races between the two.
+def cargo_build(cargo: str) -> None:
     print(f"{BOLD}Building workspace...{RESET}")
     result = subprocess.run([cargo, "build"], stdout=sys.stdout, stderr=sys.stderr)
     if result.returncode != 0:
         sys.exit(result.returncode)
 
-    # Find the built daemon binary
-    daemon_bin = Path("target/debug/hole.exe") if sys.platform == "win32" else Path("target/debug/hole")
-    if not daemon_bin.exists():
-        print(f"{YELLOW}Binary not found at {daemon_bin}{RESET}")
+
+# Process management ===================================================================================================
+
+
+def prefix_stream(
+    stream,
+    label: str,
+    color: str,
+    ready_event: threading.Event | None = None,
+    ready_marker: str | None = None
+) -> None:
+    """Read lines from a stream and print them with a colored prefix.
+
+    If ready_marker is set, signals ready_event when a line containing it appears.
+    """
+    prefix = f"{color}{BOLD}[{label}]{RESET} "
+    try:
+        for line in iter(stream.readline, ""):
+            print(f"{prefix}{line}", end="", flush=True)
+            if ready_event and ready_marker and ready_marker in line:
+                ready_event.set()
+    except ValueError:
+        pass  # stream closed
+
+
+def wait_for_exit(proc: subprocess.Popen, done: threading.Event) -> None:
+    """Wait for a process to exit, then signal the done event."""
+    proc.wait()
+    done.set()
+
+
+def shutdown(procs: list[subprocess.Popen]) -> None:
+    print(f"\n{BOLD}Shutting down...{RESET}")
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in procs:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# Main =================================================================================================================
+
+
+def main() -> None:
+    if not Path("Cargo.toml").exists() or not Path("crates/gui").exists():
+        print("Error: run this script from the project root")
         sys.exit(1)
 
-    daemon_cmd = [str(daemon_bin), "daemon", "run", "--foreground", "--no-tun", "--socket-path", str(socket_path)]
+    cargo = resolve_tool("cargo")
+    npm = resolve_tool("npm")
 
-    # tauri dev with --no-watch: skip Rust rebuild (we built already), only run
-    # the Vite dev server for frontend HMR.
-    gui_cmd = [npx, "tauri", "dev", "--no-watch"]
-    gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
+    ensure_node_modules(npm)
+    cargo_build(cargo)
 
-    print(f"{BOLD}Starting dev environment...{RESET}")
+    # Locate built binary
+    bin_name = "hole.exe" if sys.platform == "win32" else "hole"
+    built_bin = Path("target/debug") / bin_name
+    if not built_bin.exists():
+        print(f"{YELLOW}Binary not found at {built_bin}{RESET}")
+        sys.exit(1)
+
+    # Copy daemon binary to temp dir — the running daemon holds a file lock on the
+    # binary, which would block a subsequent cargo build. The GUI runs from the
+    # original path (unlocked after it starts, since the OS loads it into memory).
+    daemon_bin = Path(
+        tempfile.gettempdir()
+    ) / f"hole-dev-daemon-{os.getpid()}{'.exe' if sys.platform == 'win32' else ''}"
+    shutil.copy2(built_bin, daemon_bin)
+    atexit.register(lambda: daemon_bin.unlink(missing_ok=True))
+
+    socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
+
+    print(f"\n{BOLD}Starting dev environment...{RESET}")
     print(f"  Socket: {socket_path}")
-    print(f"  {CYAN}[daemon]{RESET} {daemon_bin} → foreground --no-tun")
-    print(f"  {MAGENTA}[client]{RESET} npx tauri dev --no-watch")
-    print(f"  Frontend changes (ui/) hot-reload. Rust changes need restart.")
+    print(f"  {CYAN}[daemon]{RESET} {daemon_bin.name} → foreground --no-tun")
+    print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI)")
+    print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420")
+    print(f"  Frontend changes hot-reload. Rust changes need Ctrl+C and re-run.")
     print()
 
     procs: list[subprocess.Popen] = []
-    threads: list[threading.Thread] = []
+    done = threading.Event()
 
     try:
+        # Start Vite first — GUI needs it listening before the webview opens.
+        vite_ready = threading.Event()
+        vite_proc = subprocess.Popen(
+            [npm, "run", "dev"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        procs.append(vite_proc)
+
+        vite_reader = threading.Thread(
+            target=prefix_stream,
+            args=(vite_proc.stdout, "  vite", YELLOW, vite_ready, "ready in"),
+            daemon=True,
+        )
+        vite_reader.start()
+        threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
+
+        if not vite_ready.wait(timeout=VITE_READY_TIMEOUT):
+            if vite_proc.poll() is not None:
+                print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
+            else:
+                print(f"{YELLOW}Vite did not start within {VITE_READY_TIMEOUT}s{RESET}")
+            shutdown(procs)
+            sys.exit(1)
+
+        # Start daemon
         daemon_proc = subprocess.Popen(
-            daemon_cmd,
+            [str(daemon_bin), "daemon", "run", "--foreground", "--no-tun", "--socket-path",
+             str(socket_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
         procs.append(daemon_proc)
+        threading.Thread(target=prefix_stream, args=(daemon_proc.stdout, "daemon", CYAN), daemon=True).start()
+        threading.Thread(target=wait_for_exit, args=(daemon_proc, done), daemon=True).start()
 
+        # Start GUI
+        gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
         gui_proc = subprocess.Popen(
-            gui_cmd,
+            [str(built_bin)],
             env=gui_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -117,36 +199,16 @@ def main() -> None:
             bufsize=1,
         )
         procs.append(gui_proc)
+        threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()
+        threading.Thread(target=wait_for_exit, args=(gui_proc, done), daemon=True).start()
 
-        for proc, label, color in [
-            (daemon_proc, "daemon", CYAN),
-            (gui_proc, "client", MAGENTA),
-        ]:
-            t = threading.Thread(target=prefix_stream, args=(proc.stdout, label, color), daemon=True)
-            t.start()
-            threads.append(t)
-
-        # Wait for either process to exit
-        while all(p.poll() is None for p in procs):
-            for t in threads:
-                t.join(timeout=0.5)
-                if not any(p.poll() is None for p in procs):
-                    break
+        # Block until any process exits or Ctrl+C
+        done.wait()
 
     except KeyboardInterrupt:
         pass
     finally:
-        # On Ctrl+C, the OS already sends the signal to all console processes.
-        # terminate() is a safety net for any stragglers.
-        print(f"\n{BOLD}Shutting down...{RESET}")
-        for proc in procs:
-            if proc.poll() is None:
-                proc.terminate()
-        for proc in procs:
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        shutdown(procs)
 
 
 if __name__ == "__main__":

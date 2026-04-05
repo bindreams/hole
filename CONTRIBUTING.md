@@ -33,42 +33,40 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ## Development
 
-### First-time setup
-
-```sh
-npm install
-```
-
 ### Running in dev mode
 
 ```sh
 uv run scripts/dev.py
 ```
 
-This builds the workspace, then launches the daemon and GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
+This builds the workspace, starts Vite, and launches the daemon + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
 
-Alternatively, run them in separate terminals:
+### Manual workflow
+
+If you prefer separate terminals or need more control:
 
 **Terminal 1 — Daemon:**
 
 ```sh
 cargo build
-cargo run -- daemon run --foreground --no-tun --socket-path $TEMP/hole-dev.sock
+cp target/debug/hole $TEMP/hole-dev-daemon   # copy to avoid file lock (see below)
+$TEMP/hole-dev-daemon daemon run --foreground --no-tun --socket-path $TEMP/hole-dev.sock
 ```
 
-- `--foreground`: bypasses the Windows Service / launchd dispatcher, runs directly in terminal
-- `--no-tun`: skips TUN device and routing setup (no elevation needed)
-- The daemon logs to stderr at debug level in foreground mode
-
-**Terminal 2 — GUI + Frontend** (Vite HMR):
+**Terminal 2 — Vite + GUI:**
 
 ```sh
-HOLE_DAEMON_SOCKET=$TEMP/hole-dev.sock npx tauri dev --no-watch
+npm run dev &                                          # Vite on port 1420
+HOLE_DAEMON_SOCKET=$TEMP/hole-dev.sock target/debug/hole
 ```
 
-- `HOLE_DAEMON_SOCKET` tells the GUI to connect to the dev daemon instead of the production one
-- Vite serves the frontend with hot module replacement
-- `--no-watch` skips Rust file watching (rebuild manually when needed)
+The daemon binary must be copied because it holds a file lock while running. Without the copy, `cargo build` would fail with "Access is denied" when you try to rebuild.
+
+### Flags
+
+- `--foreground`: bypasses the Windows Service / launchd dispatcher, runs directly in terminal with stderr logging at debug level
+- `--no-tun`: skips TUN device and routing setup (no elevation needed, requires `--foreground`)
+- `HOLE_DAEMON_SOCKET`: tells the GUI to connect to a dev daemon at a custom socket path
 
 ### Notes
 
