@@ -4,6 +4,7 @@
 
 import { initSections } from "./sections.js";
 import { initServers, renderServers } from "./servers.js";
+import { initFilters, renderFilters } from "./filters.js";
 import {
   initSidebar,
   updateMetrics,
@@ -31,6 +32,7 @@ export async function loadConfig() {
     config = await invoke("get_config");
     dirty = false;
     renderServers();
+    renderFilters();
   } catch (err) {
     console.error("loadConfig failed:", err);
   }
@@ -129,6 +131,7 @@ async function init() {
   // Initialize UI modules.
   initSections();
   initServers();
+  initFilters();
   initSidebar();
 
   // Load config from backend.

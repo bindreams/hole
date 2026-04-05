@@ -621,6 +621,14 @@ body {
   background: var(--bg-hover);
 }
 
+.filters-tbl tbody tr.drag-placeholder:hover {
+  background: transparent;
+}
+
+.filters-tbl tbody tr.drag-placeholder td {
+  border-bottom: none;
+}
+
 /* Filter table: cell padding -----  */
 .cp {
   padding: 0.25rem 0.5rem;
