@@ -30,7 +30,6 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 - Rust toolchain
 - Go toolchain (for v2ray-plugin, built automatically by `build.rs`)
 - Node.js (for frontend tooling)
-- `cargo install cargo-watch` (for daemon auto-rebuild during development)
 
 ## Development
 
@@ -42,45 +41,34 @@ npm install
 
 ### Running in dev mode
 
-The quickest way to start everything:
-
 ```sh
 uv run scripts/dev.py
 ```
 
-This launches both daemon and GUI with multiplexed, color-coded logs in a single terminal.
+This builds the workspace, then launches the daemon and GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
 
-Alternatively, run them in separate terminals for independent control:
+Alternatively, run them in separate terminals:
 
-**Terminal 1 — Daemon** (auto-rebuilds on Rust changes):
+**Terminal 1 — Daemon:**
 
 ```sh
-cargo watch -x "run -- daemon run --foreground --no-tun --socket-path $TEMP/hole-dev.sock" \
-    -w crates/daemon -w crates/common
+cargo build
+cargo run -- daemon run --foreground --no-tun --socket-path $TEMP/hole-dev.sock
 ```
 
 - `--foreground`: bypasses the Windows Service / launchd dispatcher, runs directly in terminal
 - `--no-tun`: skips TUN device and routing setup (no elevation needed)
 - The daemon logs to stderr at debug level in foreground mode
 
-**Terminal 2 — GUI + Frontend** (Vite HMR + Rust auto-rebuild):
+**Terminal 2 — GUI + Frontend** (Vite HMR):
 
 ```sh
-HOLE_DAEMON_SOCKET=$TEMP/hole-dev.sock npx tauri dev
+HOLE_DAEMON_SOCKET=$TEMP/hole-dev.sock npx tauri dev --no-watch
 ```
 
 - `HOLE_DAEMON_SOCKET` tells the GUI to connect to the dev daemon instead of the production one
 - Vite serves the frontend with hot module replacement
-- Tauri watches Rust source and auto-rebuilds the GUI binary on changes
-
-### What reloads when
-
-| Changed             | Reloads via         | Latency |
-| ------------------- | ------------------- | ------- |
-| `ui/**/*.ts/css`    | Vite HMR            | \<1s    |
-| `crates/gui/src/**` | `tauri dev` rebuild | ~5-10s  |
-| `crates/daemon/**`  | `cargo-watch`       | ~5-10s  |
-| `crates/common/**`  | Both rebuild        | ~5-10s  |
+- `--no-watch` skips Rust file watching (rebuild manually when needed)
 
 ### Notes
 

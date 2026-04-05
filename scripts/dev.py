@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Launch daemon and GUI in dev mode with multiplexed logs.
 
-Starts two processes:
-  1. cargo-watch rebuilding the daemon in foreground/no-tun mode
-  2. npx tauri dev for the GUI with Vite HMR
+Builds the workspace once, then runs:
+  1. The daemon in foreground/no-tun mode
+  2. npx tauri dev for the GUI with Vite HMR (frontend-only hot reload)
 
-Both processes' output is prefixed and color-coded in a single terminal.
-Ctrl+C shuts down both.
+Rust code changes (daemon or GUI) require Ctrl+C and re-run.
+Frontend changes (ui/) are picked up instantly via Vite HMR.
 
 Usage:
   uv run scripts/dev.py
@@ -43,11 +43,6 @@ def prefix_stream(stream, label: str, color: str) -> None:
 
 
 def check_prerequisites() -> None:
-    if not shutil.which("cargo-watch"):
-        print(f"{YELLOW}cargo-watch not found. Install it:{RESET}")
-        print("  cargo install cargo-watch")
-        sys.exit(1)
-
     if not Path("node_modules/.bin/tauri").exists() and not Path("node_modules/.bin/tauri.cmd").exists():
         print(f"{YELLOW}node_modules not found. Run:{RESET}")
         print("  npm install")
@@ -73,31 +68,31 @@ def main() -> None:
         print(f"{YELLOW}Not found on PATH: {', '.join(missing)}{RESET}")
         sys.exit(1)
 
-    # The daemon and GUI are the same binary (hole.exe). cargo-watch holds the
-    # running binary locked, which blocks tauri dev from replacing it. Use a
-    # separate target directory for the daemon to avoid the conflict.
-    daemon_target = str(Path("target") / "dev-daemon")
+    # Build the workspace once up front. Both the daemon and tauri dev need the
+    # built binary, and building first avoids races between the two.
+    print(f"{BOLD}Building workspace...{RESET}")
+    result = subprocess.run([cargo, "build"], stdout=sys.stdout, stderr=sys.stderr)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
-    daemon_cmd = [
-        cargo,
-        "watch",
-        "-x",
-        f"run -- daemon run --foreground --no-tun --socket-path {socket_path}",
-        "-w",
-        "crates/daemon",
-        "-w",
-        "crates/common",
-    ]
-    daemon_env = {**os.environ, "CARGO_TARGET_DIR": daemon_target}
+    # Find the built daemon binary
+    daemon_bin = Path("target/debug/hole.exe") if sys.platform == "win32" else Path("target/debug/hole")
+    if not daemon_bin.exists():
+        print(f"{YELLOW}Binary not found at {daemon_bin}{RESET}")
+        sys.exit(1)
 
-    gui_cmd = [npx, "tauri", "dev"]
+    daemon_cmd = [str(daemon_bin), "daemon", "run", "--foreground", "--no-tun", "--socket-path", str(socket_path)]
+
+    # tauri dev with --no-watch: skip Rust rebuild (we built already), only run
+    # the Vite dev server for frontend HMR.
+    gui_cmd = [npx, "tauri", "dev", "--no-watch"]
     gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
 
     print(f"{BOLD}Starting dev environment...{RESET}")
-    print(f"  Socket:       {socket_path}")
-    print(f"  Daemon target: {daemon_target}")
-    print(f"  {CYAN}[daemon]{RESET} cargo watch → foreground --no-tun")
-    print(f"  {MAGENTA}[client]{RESET} npx tauri dev")
+    print(f"  Socket: {socket_path}")
+    print(f"  {CYAN}[daemon]{RESET} {daemon_bin} → foreground --no-tun")
+    print(f"  {MAGENTA}[client]{RESET} npx tauri dev --no-watch")
+    print(f"  Frontend changes (ui/) hot-reload. Rust changes need restart.")
     print()
 
     procs: list[subprocess.Popen] = []
@@ -106,7 +101,6 @@ def main() -> None:
     try:
         daemon_proc = subprocess.Popen(
             daemon_cmd,
-            env=daemon_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
