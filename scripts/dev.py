@@ -64,8 +64,17 @@ def main() -> None:
 
     socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
 
+    # Resolve executables explicitly — on Windows, .cmd/.bat files (like npx.cmd)
+    # are not found by subprocess.Popen without shell=True.
+    cargo = shutil.which("cargo")
+    npx = shutil.which("npx")
+    if not cargo or not npx:
+        missing = [name for name, path in [("cargo", cargo), ("npx", npx)] if not path]
+        print(f"{YELLOW}Not found on PATH: {', '.join(missing)}{RESET}")
+        sys.exit(1)
+
     daemon_cmd = [
-        "cargo",
+        cargo,
         "watch",
         "-x",
         f"run -- daemon run --foreground --no-tun --socket-path {socket_path}",
@@ -75,7 +84,7 @@ def main() -> None:
         "crates/common",
     ]
 
-    gui_cmd = ["npx", "tauri", "dev"]
+    gui_cmd = [npx, "tauri", "dev"]
     gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
 
     print(f"{BOLD}Starting dev environment...{RESET}")
