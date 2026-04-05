@@ -1,0 +1,43 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 9am on monday"],
+  "minimumReleaseAge": "7 days",
+  "packageRules": [
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "automerge": true,
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+    },
+    {
+      "description": "Group Cargo updates",
+      "matchManagers": ["cargo"],
+      "groupName": "cargo",
+      "automerge": true,
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+    },
+    {
+      "description": "Group Go module updates",
+      "matchManagers": ["gomod"],
+      "groupName": "gomod",
+      "automerge": true,
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "postUpdateOptions": ["gomodTidy"]
+    },
+    {
+      "description": "Group Python (PEP 621) updates",
+      "matchManagers": ["pep621"],
+      "groupName": "python",
+      "automerge": true,
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+    },
+    {
+      "description": "Disable npm (no lockfile committed, not managed by Dependabot today)",
+      "matchManagers": ["npm"],
+      "enabled": false
+    }
+  ],
+  "platformAutomerge": true
+}
