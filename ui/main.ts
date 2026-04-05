@@ -2,19 +2,19 @@
 //
 // State management, Tauri IPC integration, polling setup, and event listeners.
 
-import { initFilters, renderFilters } from "./filters.js";
-import { initSections } from "./sections.js";
-import { importFromDialog, initServers, renderServers } from "./servers.js";
-import { initSettings, renderSettings } from "./settings.js";
-import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar.js";
-
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { initFilters, renderFilters } from "./filters";
+import { initSections } from "./sections";
+import { importFromDialog, initServers, renderServers } from "./servers";
+import { initSettings, renderSettings } from "./settings";
+import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
+import type { Config, DiagnosticsData, Metrics, ProxyStatus } from "./types";
 
 // State ===============================================================================================================
 
 /** The current application config, loaded from the backend. */
-export let config = null;
+export let config: Config | null = null;
 
 /** Whether the config has unsaved changes. */
 let dirty = false;
@@ -24,7 +24,7 @@ let dirty = false;
 /** Fetch the config from the backend and broadcast it to all UI sections. */
 export async function loadConfig() {
   try {
-    config = await invoke("get_config");
+    config = await invoke<Config>("get_config");
     dirty = false;
     renderServers();
     renderFilters();
@@ -60,7 +60,7 @@ export function isDirty() {
 /** Poll proxy status every 5 seconds. */
 async function pollProxyStatus() {
   try {
-    const status = await invoke("get_proxy_status");
+    const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
     if (result.changed) {
       // Connection state changed — refresh IP.
@@ -74,7 +74,7 @@ async function pollProxyStatus() {
 /** Poll metrics every 1 second. */
 async function pollMetrics() {
   try {
-    const metrics = await invoke("get_metrics");
+    const metrics = await invoke<Metrics>("get_metrics");
     updateMetrics(metrics);
   } catch (err) {
     console.error("get_metrics failed:", err);
@@ -84,7 +84,7 @@ async function pollMetrics() {
 /** Poll diagnostics every 5 seconds. */
 async function pollDiagnostics() {
   try {
-    const data = await invoke("get_diagnostics");
+    const data = await invoke<DiagnosticsData>("get_diagnostics");
     updateDiagnostics(data);
   } catch (err) {
     console.error("get_diagnostics failed:", err);
@@ -94,7 +94,7 @@ async function pollDiagnostics() {
 // Event listeners =====================================================================================================
 
 /** Handle file import (from menu or drag-and-drop). */
-async function importFile(path) {
+async function importFile(path: string) {
   try {
     await invoke("import_servers_from_file", { path });
     // Reload config so the UI picks up the new servers.
@@ -109,7 +109,7 @@ function setupEventListeners() {
   listen("import-requested", () => importFromDialog());
 
   // Drag-and-drop file import.
-  listen("tauri://drag-drop", async (event) => {
+  listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
     const paths = event.payload?.paths;
     if (paths && paths.length > 0) {
       // Import the first dropped file.

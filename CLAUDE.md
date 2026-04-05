@@ -40,16 +40,17 @@ crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
 external/        → Third-party source (git subrepos)
 msi-installer/   → WiX MSI installer (Python project: source, build script, tests)
 scripts/         → Utility scripts
-ui/              → Frontend HTML/CSS/JS
+ui/              → Frontend HTML/CSS/TypeScript (Vite)
 ```
 
 ## Build
 
-Requires: Rust toolchain, Go toolchain (for v2ray-plugin).
+Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 
 ```sh
+npm install                      # install frontend dependencies (first time only)
 cargo build --workspace          # all crates (build.rs builds v2ray-plugin + downloads wintun)
-npx tauri dev                    # GUI dev mode (from repo root)
+npx tauri dev                    # GUI dev mode (Vite dev server starts automatically)
 cargo test --workspace           # all tests
 ```
 

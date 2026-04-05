@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
   "files": {
-    "includes": ["ui/**", "tests/**"],
+    "includes": ["ui/**", "!!ui/dist/**", "tests/**"],
     "experimentalScannerIgnores": ["external/**", "target/**", ".worktrees/**", ".superpowers/**"]
   },
   "formatter": {
@@ -12,6 +12,9 @@
   "linter": {
     "rules": {
       "recommended": true,
+      "style": {
+        "noNonNullAssertion": "off"
+      },
       "suspicious": {
         "noExplicitAny": "off"
       }
