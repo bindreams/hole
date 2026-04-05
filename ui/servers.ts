@@ -1,13 +1,13 @@
 // Servers section: rendering server cards, selection, deletion, file import.
 
-import { config, loadConfig, saveConfig } from "./main.js";
-
-const { invoke } = window.__TAURI__.core;
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { config, loadConfig, saveConfig } from "./main";
 
 // DOM references ======================================================================================================
 
-const serverList = document.getElementById("server-list");
-const importZone = document.getElementById("import-zone");
+const serverList = document.getElementById("server-list")!;
+const importZone = document.getElementById("import-zone")!;
 
 // Rendering ===========================================================================================================
 
@@ -79,7 +79,7 @@ export function renderServers() {
 // Actions =============================================================================================================
 
 /** Select a server by ID — updates config, re-renders, and saves. */
-async function selectServer(id) {
+async function selectServer(id: string) {
   if (!config) return;
   config.selected_server = id;
   renderServers();
@@ -87,7 +87,7 @@ async function selectServer(id) {
 }
 
 /** Delete a server by ID — removes it from config, clears selection if needed, re-renders, saves. */
-async function deleteServer(id) {
+async function deleteServer(id: string) {
   if (!config) return;
   config.servers = config.servers.filter((s) => s.id !== id);
   if (config.selected_server === id) {
@@ -103,7 +103,7 @@ async function deleteServer(id) {
 /** Open a file dialog and import servers from the selected JSON file. */
 export async function importFromDialog() {
   try {
-    const path = await window.__TAURI__.dialog.open({
+    const path = await open({
       filters: [{ name: "JSON", extensions: ["json"] }],
       multiple: false,
     });
@@ -117,7 +117,7 @@ export async function importFromDialog() {
 
 // Initialization ======================================================================================================
 
-/** Set up event listeners for the servers section. Called once from main.js. */
+/** Set up event listeners for the servers section. Called once from main.ts. */
 export function initServers() {
   importZone.addEventListener("click", importFromDialog);
 }

@@ -1,12 +1,14 @@
 // Sidebar functionality: power button, IP display, throughput graph,
 // stats table, diagnostics chain, version footer.
 
-const { invoke } = window.__TAURI__.core;
+import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+import type { DiagnosticsData, Metrics, ProxyStatus, PublicIpData } from "./types";
 
 // Formatting helpers ==================================================================================================
 
 /** Format a byte count to a human-readable string (e.g. "1.24 GB"). */
-function formatBytes(bytes) {
+function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -14,7 +16,7 @@ function formatBytes(bytes) {
 }
 
 /** Format a bits-per-second value to a human-readable speed string. */
-function formatSpeed(bps) {
+function formatSpeed(bps: number): string {
   const mbps = bps / 1_000_000;
   if (mbps >= 100) return `${Math.round(mbps)} Mbps`;
   if (mbps >= 10) return `${mbps.toFixed(0)} Mbps`;
@@ -25,7 +27,7 @@ function formatSpeed(bps) {
 }
 
 /** Format seconds to a human-readable uptime string (e.g. "2h 14m"). */
-function formatUptime(totalSecs) {
+function formatUptime(totalSecs: number): string {
   if (totalSecs <= 0) return "--";
   const h = Math.floor(totalSecs / 3600);
   const m = Math.floor((totalSecs % 3600) / 60);
@@ -37,19 +39,19 @@ function formatUptime(totalSecs) {
 
 // DOM references ======================================================================================================
 
-const powerBtn = document.getElementById("power-btn");
-const statusWord = document.getElementById("status-word");
-const ipText = document.getElementById("ip-text");
-const countryBadge = document.getElementById("country-badge");
-const copyIpBtn = document.getElementById("copy-ip-btn");
-const graphSvg = document.getElementById("graph-svg");
-const graphScaleLabel = document.getElementById("graph-scale-label");
-const statDownloaded = document.getElementById("stat-downloaded");
-const statUploaded = document.getElementById("stat-uploaded");
-const statDownloadSpeed = document.getElementById("stat-download-speed");
-const statUploadSpeed = document.getElementById("stat-upload-speed");
-const statUptime = document.getElementById("stat-uptime");
-const versionFooter = document.getElementById("version-footer");
+const powerBtn = document.getElementById("power-btn")!;
+const statusWord = document.getElementById("status-word")!;
+const ipText = document.getElementById("ip-text")!;
+const countryBadge = document.getElementById("country-badge")!;
+const copyIpBtn = document.getElementById("copy-ip-btn")!;
+const graphSvg = document.getElementById("graph-svg")!;
+const graphScaleLabel = document.getElementById("graph-scale-label")!;
+const statDownloaded = document.getElementById("stat-downloaded")!;
+const statUploaded = document.getElementById("stat-uploaded")!;
+const statDownloadSpeed = document.getElementById("stat-download-speed")!;
+const statUploadSpeed = document.getElementById("stat-upload-speed")!;
+const statUptime = document.getElementById("stat-uptime")!;
+const versionFooter = document.getElementById("version-footer")!;
 
 // State ===============================================================================================================
 
@@ -59,7 +61,7 @@ let currentIp = "";
 
 // Throughput graph data — circular buffer of 60 data points.
 const GRAPH_POINTS = 60;
-const graphData = [];
+const graphData: { speedIn: number; speedOut: number }[] = [];
 for (let i = 0; i < GRAPH_POINTS; i++) {
   graphData.push({ speedIn: 0, speedOut: 0 });
 }
@@ -104,7 +106,7 @@ async function handlePowerClick() {
   powerBtn.style.opacity = "0.6";
 
   try {
-    const newState = await invoke("toggle_proxy");
+    const newState = await invoke<boolean>("toggle_proxy");
     connected = newState;
     updateConnectionUI();
     // Refresh IP on connection state change.
@@ -127,7 +129,7 @@ function updateConnectionUI() {
 
 export async function updatePublicIp() {
   try {
-    const data = await invoke("get_public_ip");
+    const data = await invoke<PublicIpData>("get_public_ip");
     const ip = data.ip || "unknown";
     const cc = data.country_code || "??";
     currentIp = ip;
@@ -160,7 +162,7 @@ function handleCopyIp() {
 
 // Throughput graph ====================================================================================================
 
-function pushGraphData(speedIn, speedOut) {
+function pushGraphData(speedIn: number, speedOut: number) {
   graphData.shift();
   graphData.push({ speedIn, speedOut });
 }
@@ -206,7 +208,7 @@ function renderGraph() {
 
 // Stats table =========================================================================================================
 
-function updateStats(metrics) {
+function updateStats(metrics: Metrics) {
   statDownloaded.textContent = formatBytes(metrics.bytes_in);
   statUploaded.textContent = formatBytes(metrics.bytes_out);
   statDownloadSpeed.textContent = formatSpeed(metrics.speed_in_bps);
@@ -216,8 +218,8 @@ function updateStats(metrics) {
 
 // Diagnostics chain ===================================================================================================
 
-const DIAG_NODES = ["app", "daemon", "network", "vpn_server", "internet"];
-const DIAG_ELEMENTS = {
+const DIAG_NODES = ["app", "daemon", "network", "vpn_server", "internet"] as const;
+const DIAG_ELEMENTS: Record<string, HTMLElement | null> = {
   app: document.getElementById("diag-app"),
   daemon: document.getElementById("diag-daemon"),
   network: document.getElementById("diag-network"),
@@ -226,13 +228,13 @@ const DIAG_ELEMENTS = {
 };
 
 // Map API status strings to CSS classes.
-function diagStatusClass(status) {
+function diagStatusClass(status: string): string {
   if (status === "ok") return "ok";
   if (status === "error") return "error";
   return "unknown";
 }
 
-export function updateDiagnostics(data) {
+export function updateDiagnostics(data: DiagnosticsData) {
   for (const key of DIAG_NODES) {
     // The API uses snake_case; the element IDs use kebab-case.
     const el = DIAG_ELEMENTS[key];
@@ -246,7 +248,7 @@ export function updateDiagnostics(data) {
 
 async function initVersion() {
   try {
-    const version = await window.__TAURI__.app.getVersion();
+    const version = await getVersion();
     versionFooter.textContent = `Hole v${version}`;
   } catch {
     versionFooter.textContent = "Hole";
@@ -256,10 +258,10 @@ async function initVersion() {
 // Public update functions =============================================================================================
 
 /**
- * Called from main.js every 1 second with fresh metrics data.
+ * Called from main.ts every 1 second with fresh metrics data.
  * Pushes graph data, re-renders the graph, and updates stats.
  */
-export function updateMetrics(metrics) {
+export function updateMetrics(metrics: Metrics) {
   pushGraphData(metrics.speed_in_bps, metrics.speed_out_bps);
   renderGraph();
   updateStats(metrics);
@@ -267,9 +269,9 @@ export function updateMetrics(metrics) {
 
 /**
  * Update the connection state from a proxy status poll.
- * Returns the `running` boolean so main.js can track state changes.
+ * Returns the `running` boolean so main.ts can track state changes.
  */
-export function updateProxyStatus(status) {
+export function updateProxyStatus(status: ProxyStatus) {
   const wasConnected = connected;
   connected = !!status.running;
   updateConnectionUI();

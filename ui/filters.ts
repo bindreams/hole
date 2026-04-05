@@ -1,7 +1,8 @@
 // Filters section: filter rules table with in-place editing, drag reorder,
 // test filtering, add/delete rules.
 
-import { config, saveConfig } from "./main.js";
+import { config, saveConfig } from "./main";
+import type { FilterRule } from "./types";
 
 // Constants ===========================================================================================================
 
@@ -19,27 +20,27 @@ const ACTION_TYPES = [
 ];
 
 /** Map internal values to display labels. */
-function matchLabel(value) {
+function matchLabel(value: string): string {
   const entry = MATCH_TYPES.find((m) => m.value === value);
   return entry ? entry.label : value;
 }
 
-function actionLabel(value) {
+function actionLabel(value: string): string {
   const entry = ACTION_TYPES.find((a) => a.value === value);
   return entry ? entry.label : value;
 }
 
 // DOM references ======================================================================================================
 
-const tbody = document.getElementById("filter-tbody");
-const addBtn = document.getElementById("filter-add-btn");
-const testInput = document.getElementById("test-input");
-const testResult = document.getElementById("test-result");
+const tbody = document.getElementById("filter-tbody")!;
+const addBtn = document.getElementById("filter-add-btn")!;
+const testInput = document.getElementById("test-input") as HTMLInputElement;
+const testResult = document.getElementById("test-result")!;
 
 // State ===============================================================================================================
 
 /** Currently open dropdown element, or null. */
-let openDropdown = null;
+let openDropdown: (HTMLDivElement & { _td?: HTMLTableCellElement }) | null = null;
 
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
@@ -48,6 +49,7 @@ let editingIndex = -1;
 
 /** Ensure config.filters has the default wildcard rule at index 0. */
 function ensureDefaultRule() {
+  if (!config) return;
   if (!config.filters) {
     config.filters = [];
   }
@@ -83,7 +85,7 @@ export function renderFilters() {
     const isDefault = i === 0;
 
     const tr = document.createElement("tr");
-    tr.dataset.index = i;
+    tr.dataset.index = String(i);
     if (isDefault) tr.classList.add("no-drag");
 
     // Address cell ----------------------------------------------------------------------------------------------------
@@ -174,7 +176,7 @@ export function renderFilters() {
  * @param {HTMLTableCellElement} td - The `.editable-addr` cell.
  * @param {number} index - The filter rule index.
  */
-function startAddressEdit(td, index) {
+function startAddressEdit(td: HTMLTableCellElement, index: number) {
   if (editingIndex === index) return; // Already editing this cell.
   commitOrCancelEditing(); // Close any other active edit.
 
@@ -200,10 +202,10 @@ function startAddressEdit(td, index) {
     const newValue = input.value.trim();
     if (!newValue) {
       // Empty address — remove the rule (it was never valid).
-      config.filters.splice(index, 1);
+      config?.filters.splice(index, 1);
       saveConfig();
     } else if (newValue !== original) {
-      config.filters[index].address = newValue;
+      if (config) config.filters[index].address = newValue;
       saveConfig();
     }
     renderFilters();
@@ -213,7 +215,7 @@ function startAddressEdit(td, index) {
     if (editingIndex !== index) return;
     editingIndex = -1;
     // If the original address was empty (new rule), remove it.
-    if (!original && config.filters[index]) {
+    if (!original && config?.filters[index]) {
       config.filters.splice(index, 1);
     }
     renderFilters();
@@ -242,9 +244,9 @@ function startAddressEdit(td, index) {
 function commitOrCancelEditing() {
   if (editingIndex < 0) return;
   const index = editingIndex;
-  const input = tbody.querySelector(".inline-input");
+  const input = tbody.querySelector<HTMLInputElement>(".inline-input");
   editingIndex = -1; // Clear first so the blur handler becomes a no-op.
-  if (input && config.filters[index]) {
+  if (input && config?.filters[index]) {
     const value = input.value.trim();
     if (value && value !== config.filters[index].address) {
       config.filters[index].address = value;
@@ -269,7 +271,7 @@ function closeDropdown() {
  * @param {HTMLTableCellElement} td - The `.editable-cell` that was clicked.
  * @param {number} index - The filter rule index.
  */
-function toggleDropdown(td, index) {
+function toggleDropdown(td: HTMLTableCellElement, index: number) {
   const field = td.dataset.field; // "matching" or "action"
   if (!field) return;
 
@@ -281,10 +283,13 @@ function toggleDropdown(td, index) {
 
   closeDropdown();
 
-  const options = field === "matching" ? MATCH_TYPES : ACTION_TYPES;
-  const currentValue = config.filters[index][field];
+  if (!config) return;
 
-  const dropdown = document.createElement("div");
+  const options = field === "matching" ? MATCH_TYPES : ACTION_TYPES;
+  const rule = config.filters[index];
+  const currentValue = field === "matching" ? rule.matching : rule.action;
+
+  const dropdown = document.createElement("div") as HTMLDivElement & { _td?: HTMLTableCellElement };
   dropdown.className = "inline-dropdown open";
   dropdown._td = td; // Tag so we can detect toggle clicks.
 
@@ -296,7 +301,12 @@ function toggleDropdown(td, index) {
 
     div.addEventListener("click", (e) => {
       e.stopPropagation();
-      config.filters[index][field] = opt.value;
+      if (!config) return;
+      if (field === "matching") {
+        config.filters[index].matching = opt.value as FilterRule["matching"];
+      } else {
+        config.filters[index].action = opt.value as FilterRule["action"];
+      }
       saveConfig();
       closeDropdown();
       renderFilters();
@@ -311,8 +321,17 @@ function toggleDropdown(td, index) {
 
 // Drag reorder ========================================================================================================
 
+interface DragState {
+  row: HTMLTableRowElement;
+  index: number;
+  currentIndex: number;
+  placeholder: HTMLTableRowElement;
+  offsetY: number;
+  tbodyTop: number;
+}
+
 /** Active drag state, or null. */
-let dragState = null;
+let dragState: DragState | null = null;
 
 /**
  * Start dragging a row.
@@ -320,7 +339,7 @@ let dragState = null;
  * @param {HTMLTableRowElement} row - The row being dragged.
  * @param {number} index - The filter rule index.
  */
-function startDrag(e, row, index) {
+function startDrag(e: PointerEvent, row: HTMLTableRowElement, index: number) {
   e.preventDefault();
   closeDropdown();
   commitOrCancelEditing();
@@ -341,7 +360,7 @@ function startDrag(e, row, index) {
   placeholder.innerHTML = `<td colspan="4" style="height:${rect.height}px; border-bottom: 2px solid var(--accent); padding:0;"></td>`;
 
   // Insert placeholder where the row was.
-  row.parentNode.insertBefore(placeholder, row);
+  row.parentNode!.insertBefore(placeholder, row);
 
   // Lift the row.
   for (let i = 0; i < cells.length; i++) {
@@ -376,7 +395,7 @@ function startDrag(e, row, index) {
 }
 
 /** Handle pointer move during drag. */
-function onDragMove(e) {
+function onDragMove(e: PointerEvent) {
   if (!dragState) return;
 
   const { row, placeholder, offsetY } = dragState;
@@ -478,15 +497,17 @@ function onDragEnd() {
   }
 
   // Update config.filters to match new DOM order.
-  const newFilters = [];
-  for (const tr of tbody.querySelectorAll("tr")) {
-    const idx = parseInt(tr.dataset.index, 10);
-    if (!Number.isNaN(idx) && config.filters[idx]) {
-      newFilters.push(config.filters[idx]);
+  if (config) {
+    const newFilters: FilterRule[] = [];
+    for (const tr of tbody.querySelectorAll("tr")) {
+      const idx = parseInt(tr.dataset.index ?? "", 10);
+      if (!Number.isNaN(idx) && config.filters[idx]) {
+        newFilters.push(config.filters[idx]);
+      }
     }
+    config.filters = newFilters;
+    saveConfig();
   }
-  config.filters = newFilters;
-  saveConfig();
 
   document.removeEventListener("pointermove", onDragMove);
   document.removeEventListener("pointerup", onDragEnd);
@@ -516,7 +537,7 @@ function addRule() {
   // Focus the new row's address cell for immediate editing.
   const lastRow = tbody.querySelector("tr:last-child");
   if (lastRow) {
-    const addrTd = lastRow.querySelector(".editable-addr");
+    const addrTd = lastRow.querySelector(".editable-addr") as HTMLTableCellElement | null;
     if (addrTd) {
       const newIndex = config.filters.length - 1;
       startAddressEdit(addrTd, newIndex);
@@ -530,8 +551,8 @@ function addRule() {
  * Delete a filter rule by index.
  * @param {number} index - The filter rule index (cannot be 0).
  */
-function deleteRule(index) {
-  if (index <= 0 || !config) return; // Cannot delete default rule.
+function deleteRule(index: number) {
+  if (index <= 0 || !config?.filters) return; // Cannot delete default rule.
   config.filters.splice(index, 1);
   saveConfig();
   renderFilters();
@@ -557,8 +578,8 @@ function evaluateTestFilter() {
   }
 
   // Evaluate rules top-to-bottom; later rules override.
-  let matchedAction = null;
-  let matchedRule = null;
+  let matchedAction: string | null = null;
+  let matchedRule: FilterRule | null = null;
   let matchedIndex = -1;
 
   for (let i = 0; i < config.filters.length; i++) {
@@ -577,7 +598,7 @@ function evaluateTestFilter() {
 
   const actionClass = `match-${matchedAction}`;
   const actionText = actionLabel(matchedAction);
-  const ruleDesc = matchedIndex === 0 ? "default rule" : `rule #${matchedIndex + 1}: ${matchedRule.address}`;
+  const ruleDesc = matchedIndex === 0 ? "default rule" : `rule #${matchedIndex + 1}: ${matchedRule!.address}`;
 
   testResult.textContent = "";
   const actionSpan = document.createElement("span");
@@ -595,7 +616,7 @@ function evaluateTestFilter() {
  * @param {string} input - The domain or IP to test.
  * @returns {boolean}
  */
-function ruleMatches(rule, input) {
+function ruleMatches(rule: FilterRule, input: string): boolean {
   const addr = rule.address;
 
   switch (rule.matching) {
@@ -632,7 +653,7 @@ function ruleMatches(rule, input) {
  * @param {string} cidr - The CIDR notation string.
  * @returns {boolean}
  */
-function cidrMatch(ip, cidr) {
+function cidrMatch(ip: string, cidr: string): boolean {
   const parts = cidr.split("/");
   if (parts.length !== 2) return false;
 
@@ -657,7 +678,7 @@ function cidrMatch(ip, cidr) {
  * @param {string} ip - e.g. "192.168.1.1"
  * @returns {number|null} The 32-bit integer, or null if invalid.
  */
-function parseIpv4(ip) {
+function parseIpv4(ip: string): number | null {
   const parts = ip.split(".");
   if (parts.length !== 4) return null;
 
@@ -674,22 +695,23 @@ function parseIpv4(ip) {
 // Event handling ======================================================================================================
 
 /** Handle clicks on the tbody (delegated). */
-function onTbodyClick(e) {
-  const target = e.target;
+function onTbodyClick(e: MouseEvent) {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
 
   // Delete button.
   if (target.classList.contains("filter-del")) {
     const tr = target.closest("tr");
-    if (tr) deleteRule(parseInt(tr.dataset.index, 10));
+    if (tr) deleteRule(parseInt(tr.dataset.index ?? "", 10));
     return;
   }
 
   // Editable address cell.
-  const addrTd = target.closest(".editable-addr");
+  const addrTd = target.closest(".editable-addr") as HTMLTableCellElement | null;
   if (addrTd) {
     const tr = addrTd.closest("tr");
     if (tr) {
-      startAddressEdit(addrTd, parseInt(tr.dataset.index, 10));
+      startAddressEdit(addrTd, parseInt(tr.dataset.index ?? "", 10));
     }
     return;
   }
@@ -698,44 +720,45 @@ function onTbodyClick(e) {
   // (those handle their own clicks).
   if (target.closest(".inline-dropdown")) return;
 
-  const editableTd = target.closest(".editable-cell");
+  const editableTd = target.closest(".editable-cell") as HTMLTableCellElement | null;
   if (editableTd) {
     const tr = editableTd.closest("tr");
     if (tr) {
-      toggleDropdown(editableTd, parseInt(tr.dataset.index, 10));
+      toggleDropdown(editableTd, parseInt(tr.dataset.index ?? "", 10));
     }
     return;
   }
 }
 
 /** Handle pointerdown on the tbody (delegated) for drag. */
-function onTbodyPointerDown(e) {
-  const handle = e.target.closest(".drag-handle");
+function onTbodyPointerDown(e: PointerEvent) {
+  const handle = (e.target as HTMLElement | null)?.closest(".drag-handle");
   if (!handle) return;
 
   const tr = handle.closest("tr");
   if (!tr || tr.classList.contains("no-drag")) return;
 
-  const index = parseInt(tr.dataset.index, 10);
+  const index = parseInt(tr.dataset.index ?? "", 10);
   if (Number.isNaN(index) || index <= 0) return; // Cannot drag default rule.
 
   startDrag(e, tr, index);
 }
 
 /** Close dropdown when clicking outside. */
-function onDocumentClick(e) {
+function onDocumentClick(e: MouseEvent) {
   if (!openDropdown) return;
+  const target = e.target as HTMLElement | null;
   // If the click was inside the dropdown or on its parent cell, let the
   // cell/option click handlers deal with it.
-  if (e.target.closest(".inline-dropdown")) return;
-  if (e.target.closest(".editable-cell") === openDropdown._td) return;
+  if (target?.closest(".inline-dropdown")) return;
+  if (target?.closest(".editable-cell") === openDropdown._td) return;
   closeDropdown();
 }
 
 // Initialization ======================================================================================================
 
 /**
- * Set up event listeners for the filters section. Called once from main.js.
+ * Set up event listeners for the filters section. Called once from main.ts.
  */
 export function initFilters() {
   tbody.addEventListener("click", onTbodyClick);

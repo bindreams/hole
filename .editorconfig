@@ -23,7 +23,7 @@ trim_trailing_whitespace = false
 indent_style = space
 indent_size = 4
 
-[*.{js,css,html}]
+[*.{js,ts,css,html}]
 indent_style = space
 indent_size = 2
 

@@ -1,18 +1,18 @@
 // Settings section: toggle switches, custom dropdowns, theme switching, proxy config.
 
-import { config, saveConfig } from "./main.js";
+import { config, saveConfig } from "./main";
 
 // Theme management ====================================================================================================
 
 const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-let systemThemeListener = null;
+let systemThemeListener: (() => void) | null = null;
 
 /**
  * Apply a theme to the document. When `value` is "system", a media-query
  * listener is installed so the theme follows the OS preference live.
  * @param {string} value - "light", "dark", or "system"
  */
-function applyTheme(value) {
+function applyTheme(value: string) {
   // Always clean up a previous system-theme listener first.
   if (systemThemeListener) {
     systemThemeQuery.removeEventListener("change", systemThemeListener);
@@ -33,7 +33,7 @@ function applyTheme(value) {
 
 // Proxy muting ========================================================================================================
 
-const proxyNested = document.getElementById("proxy-nested");
+const proxyNested = document.getElementById("proxy-nested")!;
 
 function updateProxyMuting() {
   if (!config) return;
@@ -52,8 +52,8 @@ function updateProxyMuting() {
  * @param {string} configKey - Key in `config` to read/write (boolean).
  * @param {Function} [onToggle] - Optional callback after state changes.
  */
-function wireToggle(id, configKey, onToggle) {
-  const el = document.getElementById(id);
+function wireToggle(id: string, configKey: string, onToggle?: (on: boolean) => void) {
+  const el = document.getElementById(id)!;
   el.addEventListener("click", () => {
     if (!config) return;
     const on = !el.classList.contains("on");
@@ -71,7 +71,7 @@ function wireToggle(id, configKey, onToggle) {
  * @param {string} kebab - e.g. "do-not-connect"
  * @returns {string} e.g. "do_not_connect"
  */
-function kebabToSnake(kebab) {
+function kebabToSnake(kebab: string): string {
   return kebab.replace(/-/g, "_");
 }
 
@@ -80,7 +80,7 @@ function kebabToSnake(kebab) {
  * @param {string} snake - e.g. "do_not_connect"
  * @returns {string} e.g. "do-not-connect"
  */
-function snakeToKebab(snake) {
+function snakeToKebab(snake: string): string {
   return snake.replace(/_/g, "-");
 }
 
@@ -91,9 +91,9 @@ function snakeToKebab(snake) {
  * @param {string} configKey - Key in `config` to read/write (string).
  * @param {Function} [onChange] - Optional callback after selection changes.
  */
-function wireDropdown(btnId, menuId, configKey, onChange) {
-  const btn = document.getElementById(btnId);
-  const menu = document.getElementById(menuId);
+function wireDropdown(btnId: string, menuId: string, configKey: string, onChange?: (value: string) => void) {
+  const btn = document.getElementById(btnId)!;
+  const menu = document.getElementById(menuId)!;
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -104,7 +104,7 @@ function wireDropdown(btnId, menuId, configKey, onChange) {
     menu.classList.toggle("open");
   });
 
-  for (const opt of menu.querySelectorAll(".custom-select-opt")) {
+  for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
     opt.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!config) return;
@@ -120,7 +120,7 @@ function wireDropdown(btnId, menuId, configKey, onChange) {
       menu.classList.remove("open");
 
       // Update config.
-      const value = kebabToSnake(opt.dataset.value);
+      const value = kebabToSnake(opt.dataset.value ?? "");
       config[configKey] = value;
       if (onChange) onChange(value);
       saveConfig();
@@ -130,7 +130,7 @@ function wireDropdown(btnId, menuId, configKey, onChange) {
 
 // Port input ==========================================================================================================
 
-const portInput = document.getElementById("input-port");
+const portInput = document.getElementById("input-port") as HTMLInputElement;
 
 function wirePortInput() {
   portInput.addEventListener("change", () => {
@@ -141,7 +141,7 @@ function wirePortInput() {
       saveConfig();
     } else {
       // Revert to current config value on invalid input.
-      portInput.value = config.local_port ?? "";
+      portInput.value = String(config.local_port ?? "");
     }
   });
 }
@@ -159,7 +159,7 @@ function handleClickOutside() {
 // Public API ==========================================================================================================
 
 /**
- * Wire up all settings event listeners. Called once from main.js.
+ * Wire up all settings event listeners. Called once from main.ts.
  */
 export function initSettings() {
   // Toggles.
@@ -184,24 +184,24 @@ export function initSettings() {
 }
 
 /**
- * Sync all settings controls to match the current config. Called from main.js
+ * Sync all settings controls to match the current config. Called from main.ts
  * whenever the config is loaded or reloaded.
  */
 export function renderSettings() {
   if (!config) return;
 
   // Toggles.
-  document.getElementById("toggle-start-on-login").classList.toggle("on", !!config.start_on_login);
-  document.getElementById("toggle-proxy-server").classList.toggle("on", !!config.proxy_server_enabled);
-  document.getElementById("toggle-socks5").classList.toggle("on", !!config.proxy_socks5);
-  document.getElementById("toggle-http").classList.toggle("on", !!config.proxy_http);
+  document.getElementById("toggle-start-on-login")!.classList.toggle("on", !!config.start_on_login);
+  document.getElementById("toggle-proxy-server")!.classList.toggle("on", !!config.proxy_server_enabled);
+  document.getElementById("toggle-socks5")!.classList.toggle("on", !!config.proxy_socks5);
+  document.getElementById("toggle-http")!.classList.toggle("on", !!config.proxy_http);
 
   // Dropdowns.
   syncDropdown("select-on-startup", "menu-on-startup", config.on_startup ?? "do_not_connect");
   syncDropdown("select-theme", "menu-theme", config.theme ?? "dark");
 
   // Port input.
-  portInput.value = config.local_port ?? "";
+  portInput.value = String(config.local_port ?? "");
 
   // Proxy muting.
   updateProxyMuting();
@@ -216,12 +216,12 @@ export function renderSettings() {
  * @param {string} menuId    - Element ID of `.custom-select-menu`.
  * @param {string} configVal - Current config value (snake_case).
  */
-function syncDropdown(btnId, menuId, configVal) {
-  const btn = document.getElementById(btnId);
-  const menu = document.getElementById(menuId);
+function syncDropdown(btnId: string, menuId: string, configVal: string) {
+  const btn = document.getElementById(btnId)!;
+  const menu = document.getElementById(menuId)!;
   const dataVal = snakeToKebab(configVal);
 
-  for (const opt of menu.querySelectorAll(".custom-select-opt")) {
+  for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
     if (opt.dataset.value === dataVal) {
       opt.classList.add("selected");
       btn.textContent = opt.textContent;

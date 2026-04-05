@@ -8,11 +8,11 @@
  * Toggle a single section between expanded and collapsed states.
  * @param {HTMLElement} hdr - The `.section-hdr` element that was clicked.
  */
-function toggleSection(hdr) {
+function toggleSection(hdr: HTMLElement) {
   const tri = hdr.querySelector(".tri");
-  const clip = hdr.nextElementSibling;
+  const clip = hdr.nextElementSibling as HTMLElement | null;
   if (!clip?.classList.contains("section-clip")) return;
-  const body = clip.querySelector(".section-body");
+  const body = clip.querySelector(".section-body") as HTMLElement | null;
   if (!body) return;
 
   const isCollapsed = clip.classList.contains("collapsed");
@@ -35,9 +35,9 @@ function toggleSection(hdr) {
     clip.style.maxHeight = `${h}px`;
     body.style.transform = "translateY(0)";
     body.style.opacity = "1";
-    tri.classList.remove("collapsed");
+    tri?.classList.remove("collapsed");
 
-    const cleanup = (e) => {
+    const cleanup = (e: Event) => {
       // Only react to the max-height transition (not child transitions).
       if (e.target !== clip) return;
       clip.style.maxHeight = "";
@@ -62,9 +62,9 @@ function toggleSection(hdr) {
     clip.style.maxHeight = "0px";
     body.style.transform = "translateY(-100%)";
     body.style.opacity = "0";
-    tri.classList.add("collapsed");
+    tri?.classList.add("collapsed");
 
-    const cleanup = (e) => {
+    const cleanup = (e: Event) => {
       if (e.target !== clip) return;
       clip.classList.add("collapsed");
       clip.style.maxHeight = "";
@@ -81,7 +81,7 @@ function toggleSection(hdr) {
 
 /** Attach click handlers to all section headers. */
 export function initSections() {
-  for (const hdr of document.querySelectorAll(".section-hdr")) {
+  for (const hdr of document.querySelectorAll<HTMLElement>(".section-hdr")) {
     hdr.addEventListener("click", () => toggleSection(hdr));
   }
 }
