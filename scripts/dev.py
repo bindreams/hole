@@ -97,7 +97,7 @@ def main() -> None:
     print(f"  Socket:       {socket_path}")
     print(f"  Daemon target: {daemon_target}")
     print(f"  {CYAN}[daemon]{RESET} cargo watch → foreground --no-tun")
-    print(f"  {MAGENTA}[gui]{RESET}    npx tauri dev")
+    print(f"  {MAGENTA}[client]{RESET} npx tauri dev")
     print()
 
     procs: list[subprocess.Popen] = []
@@ -126,7 +126,7 @@ def main() -> None:
 
         for proc, label, color in [
             (daemon_proc, "daemon", CYAN),
-            (gui_proc, "gui", MAGENTA),
+            (gui_proc, "client", MAGENTA),
         ]:
             t = threading.Thread(target=prefix_stream, args=(proc.stdout, label, color), daemon=True)
             t.start()

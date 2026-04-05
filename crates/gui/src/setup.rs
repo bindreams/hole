@@ -319,6 +319,13 @@ pub fn uninstall_daemon() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// This runs asynchronously to avoid blocking the Tauri event loop.
 pub fn check_daemon_on_launch(app: tauri::AppHandle) {
+    // In dev mode (HOLE_DAEMON_SOCKET set), the daemon runs in foreground
+    // rather than as an installed service. Skip the install check.
+    if std::env::var("HOLE_DAEMON_SOCKET").is_ok() {
+        tracing::info!("HOLE_DAEMON_SOCKET set, skipping daemon install check");
+        return;
+    }
+
     let status = daemon_install_status();
 
     match status {
