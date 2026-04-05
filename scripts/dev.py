@@ -73,6 +73,11 @@ def main() -> None:
         print(f"{YELLOW}Not found on PATH: {', '.join(missing)}{RESET}")
         sys.exit(1)
 
+    # The daemon and GUI are the same binary (hole.exe). cargo-watch holds the
+    # running binary locked, which blocks tauri dev from replacing it. Use a
+    # separate target directory for the daemon to avoid the conflict.
+    daemon_target = str(Path("target") / "dev-daemon")
+
     daemon_cmd = [
         cargo,
         "watch",
@@ -83,12 +88,14 @@ def main() -> None:
         "-w",
         "crates/common",
     ]
+    daemon_env = {**os.environ, "CARGO_TARGET_DIR": daemon_target}
 
     gui_cmd = [npx, "tauri", "dev"]
     gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
 
     print(f"{BOLD}Starting dev environment...{RESET}")
-    print(f"  Socket: {socket_path}")
+    print(f"  Socket:       {socket_path}")
+    print(f"  Daemon target: {daemon_target}")
     print(f"  {CYAN}[daemon]{RESET} cargo watch → foreground --no-tun")
     print(f"  {MAGENTA}[gui]{RESET}    npx tauri dev")
     print()
@@ -99,6 +106,7 @@ def main() -> None:
     try:
         daemon_proc = subprocess.Popen(
             daemon_cmd,
+            env=daemon_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
