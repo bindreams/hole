@@ -704,6 +704,41 @@ fn is_valid_sid_string_rejects_invalid() {
     assert!(!crate::ipc::is_valid_sid_string("S-1-1-0 "));
 }
 
+// bind_dev tests ======================================================================================================
+
+#[skuld::test]
+fn bind_dev_accepts_connection() {
+    rt().block_on(async {
+        let path = test_socket_path("bind-dev-accept");
+        let server = IpcServer::bind_dev(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let stream = LocalStream::connect(&path).await.unwrap();
+        drop(stream);
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn bind_dev_status_query() {
+    rt().block_on(async {
+        let path = test_socket_path("bind-dev-status");
+        let server = IpcServer::bind_dev(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let status = get_status(&mut client).await;
+        assert!(!status.running);
+        assert_eq!(status.uptime_secs, 0);
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
 // Socket lifecycle tests ==============================================================================================
 
 #[skuld::test]

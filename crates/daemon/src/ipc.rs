@@ -71,6 +71,25 @@ impl IpcServer {
         })
     }
 
+    /// Bind without restrictive permissions (for development).
+    /// Skips DACL setup and group permission checks.
+    pub fn bind_dev<B: ProxyBackend + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<B>>>,
+    ) -> std::io::Result<Self> {
+        let listener = LocalListener::bind(path)?;
+        let state = Arc::new(IpcState {
+            proxy,
+            ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let router = build_router(state);
+        Ok(Self {
+            listener,
+            router,
+            socket_path: path.to_owned(),
+        })
+    }
+
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {

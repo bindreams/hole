@@ -70,6 +70,36 @@ impl ProxyBackend for RealBackend {
     }
 }
 
+// No-TUN backend (development) ========================================================================================
+
+/// Development backend that skips TUN/routing/shadowsocks.
+/// All operations succeed with no side effects.
+pub struct NoTunBackend;
+
+impl ProxyBackend for NoTunBackend {
+    async fn start_ss(&self, _config: Config) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
+        Ok(tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        }))
+    }
+
+    fn setup_routes(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<(), ProxyError> {
+        Ok(())
+    }
+
+    fn teardown_routes(&self, _: &str, _: IpAddr, _: &str) -> Result<(), ProxyError> {
+        Ok(())
+    }
+
+    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        Ok(GatewayInfo {
+            gateway_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            interface_name: "none".into(),
+        })
+    }
+}
+
 // ProxyManager ========================================================================================================
 
 pub struct ProxyManager<B: ProxyBackend = RealBackend> {

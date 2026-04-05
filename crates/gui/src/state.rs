@@ -31,7 +31,10 @@ impl AppState {
 
         // Lazy connect
         if guard.is_none() {
-            let socket_path = hole_common::protocol::default_daemon_socket_path();
+            let socket_path = std::env::var("HOLE_DAEMON_SOCKET")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
             let connect_result = DaemonClient::connect(&socket_path).await;
 
             match connect_result {

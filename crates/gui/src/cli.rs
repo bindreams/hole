@@ -36,6 +36,12 @@ enum DaemonAction {
         /// Override the IPC socket path (for development/testing)
         #[arg(long)]
         socket_path: Option<std::path::PathBuf>,
+        /// Run in foreground (bypass service manager, log to stderr)
+        #[arg(long)]
+        foreground: bool,
+        /// Disable TUN/routing (IPC-only mode, no elevation needed). Requires --foreground
+        #[arg(long, requires = "foreground")]
+        no_tun: bool,
     },
     /// Install and start the daemon service
     Install,
@@ -165,23 +171,47 @@ fn handle_upgrade() -> i32 {
 
 fn handle_daemon(action: DaemonAction) -> i32 {
     match action {
-        DaemonAction::Run { socket_path } => {
-            let _guard = match hole_daemon::logging::init() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    eprintln!("failed to initialize logging: {e}");
-                    return 1;
+        DaemonAction::Run {
+            socket_path,
+            foreground,
+            no_tun,
+        } => {
+            let _guard = if foreground {
+                hole_daemon::logging::init_foreground()
+            } else {
+                match hole_daemon::logging::init() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        eprintln!("failed to initialize logging: {e}");
+                        return 1;
+                    }
                 }
             };
             tracing::info!("hole daemon starting");
-            hole_daemon::routing::teardown_split_routes(hole_daemon::proxy::TUN_DEVICE_NAME).ok();
+
+            if !no_tun {
+                hole_daemon::routing::teardown_split_routes(hole_daemon::proxy::TUN_DEVICE_NAME).ok();
+            }
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
-            if let Err(e) = hole_daemon::platform::os::run(&socket_path) {
+
+            let result: Result<(), Box<dyn std::error::Error>> = if foreground {
+                hole_daemon::foreground::run(&socket_path, no_tun)
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    hole_daemon::platform::os::run(&socket_path)
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    hole_daemon::platform::os::run(&socket_path).map_err(|e| Box::new(e) as _)
+                }
+            };
+
+            if let Err(e) = result {
                 eprintln!("daemon error: {e}");
                 return 1;
             }
-
             0
         }
         DaemonAction::Install => {

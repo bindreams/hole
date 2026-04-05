@@ -241,3 +241,33 @@ fn uptime_increases_while_running() {
         assert_eq!(pm.uptime_secs(), 0);
     });
 }
+
+// NoTunBackend tests ==================================================================================================
+
+#[skuld::test]
+fn no_tun_backend_start_stop_cycle() {
+    rt().block_on(async {
+        let mut pm = ProxyManager::new(NoTunBackend);
+        assert_eq!(pm.state(), ProxyState::Stopped);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        pm.stop().await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Stopped);
+    });
+}
+
+#[skuld::test]
+fn no_tun_backend_health_check() {
+    rt().block_on(async {
+        let mut pm = ProxyManager::new(NoTunBackend);
+        pm.start(&test_config()).await.unwrap();
+
+        // Health check should not detect a crash (task is pending forever)
+        pm.check_health();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        pm.stop().await.unwrap();
+    });
+}

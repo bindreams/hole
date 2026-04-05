@@ -55,6 +55,22 @@ pub fn init() -> io::Result<WorkerGuard> {
     Ok(guard)
 }
 
+/// Initialize daemon logging for foreground/dev mode (log to stderr).
+///
+/// The returned `WorkerGuard` must be held for the lifetime of the process;
+/// dropping it flushes pending writes. Callers should bind it in the same
+/// scope that calls the foreground runner, not inside the runner itself.
+pub fn init_foreground() -> WorkerGuard {
+    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("hole_daemon=debug".parse().expect("valid tracing directive")),
+        )
+        .with_writer(non_blocking)
+        .init();
+    guard
+}
+
 // Restrict log directory permissions on macOS -------------------------------------------------------------------------
 
 /// Restrict the log directory to `root:hole 0750`, falling back to `root 0700`.
