@@ -146,8 +146,8 @@
     <div class="sidebar">
       <!-- Status header -->
       <div class="sb-header">
-        <button class="power-btn off" id="power-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round">
+        <button type="button" class="power-btn off" id="power-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
             <path d="M12 3v8"/>
             <path d="M5.6 6.6a9 9 0 1 0 12.8 0"/>
           </svg>
@@ -168,7 +168,7 @@
           <div class="graph-top-label" id="graph-scale-label">0 Mbps</div>
           <div class="graph-canvas">
             <div class="graph-midline"></div>
-            <svg class="graph-svg" id="graph-svg" viewBox="0 0 220 80" preserveAspectRatio="none">
+            <svg class="graph-svg" id="graph-svg" viewBox="0 0 220 80" preserveAspectRatio="none" aria-hidden="true">
               <!-- Graph lines rendered by JS -->
             </svg>
           </div>
