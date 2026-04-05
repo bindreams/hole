@@ -91,7 +91,8 @@ async function deleteServer(id) {
   if (!config) return;
   config.servers = config.servers.filter((s) => s.id !== id);
   if (config.selected_server === id) {
-    config.selected_server = null;
+    // Auto-select the first remaining server, or null if none left.
+    config.selected_server = config.servers.length > 0 ? config.servers[0].id : null;
   }
   renderServers();
   await saveConfig();
@@ -100,7 +101,7 @@ async function deleteServer(id) {
 // File import =====
 
 /** Open a file dialog and import servers from the selected JSON file. */
-async function importFromDialog() {
+export async function importFromDialog() {
   try {
     const path = await window.__TAURI__.dialog.open({
       filters: [{ name: "JSON", extensions: ["json"] }],

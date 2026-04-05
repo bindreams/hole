@@ -62,6 +62,7 @@ function ensureDefaultRule() {
       matching: "wildcard",
       action: "proxy",
     });
+    saveConfig();
   }
 }
 
@@ -200,7 +201,11 @@ function startAddressEdit(td, index) {
     editingIndex = -1;
 
     const newValue = input.value.trim();
-    if (newValue && newValue !== original) {
+    if (!newValue) {
+      // Empty address — remove the rule (it was never valid).
+      config.filters.splice(index, 1);
+      saveConfig();
+    } else if (newValue !== original) {
       config.filters[index].address = newValue;
       saveConfig();
     }
@@ -210,6 +215,10 @@ function startAddressEdit(td, index) {
   function cancel() {
     if (editingIndex !== index) return;
     editingIndex = -1;
+    // If the original address was empty (new rule), remove it.
+    if (!original && config.filters[index]) {
+      config.filters.splice(index, 1);
+    }
     renderFilters();
   }
 
@@ -507,7 +516,7 @@ function addRule() {
     matching: "wildcard",
     action: "proxy",
   });
-  saveConfig();
+  // Do not saveConfig() yet — wait until the user commits a non-empty address.
   renderFilters();
 
   // Focus the new row's address cell for immediate editing.

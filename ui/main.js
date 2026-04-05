@@ -3,7 +3,7 @@
 // State management, Tauri IPC integration, polling setup, and event listeners.
 
 import { initSections } from "./sections.js";
-import { initServers, renderServers } from "./servers.js";
+import { initServers, renderServers, importFromDialog } from "./servers.js";
 import { initFilters, renderFilters } from "./filters.js";
 import { initSettings, renderSettings } from "./settings.js";
 import {
@@ -111,11 +111,8 @@ async function importFile(path) {
 }
 
 function setupEventListeners() {
-  // File > Import menu action.
-  listen("import-requested", async (event) => {
-    const path = event.payload;
-    if (path) await importFile(path);
-  });
+  // File > Import menu action (tray emits () as payload — open dialog).
+  listen("import-requested", () => importFromDialog());
 
   // Drag-and-drop file import.
   listen("tauri://drag-drop", async (event) => {
