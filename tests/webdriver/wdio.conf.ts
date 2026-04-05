@@ -1,6 +1,6 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import path from "node:path";
 import type { Options } from "@wdio/types";
-import { spawn, ChildProcess } from "child_process";
-import path from "path";
 
 let tauriDriver: ChildProcess;
 
@@ -16,10 +16,7 @@ export const config: Options.Testrunner = {
   capabilities: [
     {
       "tauri:options": {
-        application: path.resolve(
-          __dirname,
-          "../../target/release/hole.exe"
-        ),
+        application: path.resolve(__dirname, "../../target/release/hole.exe"),
       },
     } as any,
   ],

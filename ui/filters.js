@@ -3,7 +3,7 @@
 
 import { config, saveConfig } from "./main.js";
 
-// Constants =====
+// Constants ===========================================================================================================
 
 const MATCH_TYPES = [
   { value: "exactly", label: "exactly" },
@@ -29,14 +29,14 @@ function actionLabel(value) {
   return entry ? entry.label : value;
 }
 
-// DOM references =====
+// DOM references ======================================================================================================
 
 const tbody = document.getElementById("filter-tbody");
 const addBtn = document.getElementById("filter-add-btn");
 const testInput = document.getElementById("test-input");
 const testResult = document.getElementById("test-result");
 
-// State =====
+// State ===============================================================================================================
 
 /** Currently open dropdown element, or null. */
 let openDropdown = null;
@@ -44,7 +44,7 @@ let openDropdown = null;
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
 
-// Rendering =====
+// Rendering ===========================================================================================================
 
 /** Ensure config.filters has the default wildcard rule at index 0. */
 function ensureDefaultRule() {
@@ -86,7 +86,7 @@ export function renderFilters() {
     tr.dataset.index = i;
     if (isDefault) tr.classList.add("no-drag");
 
-    // Address cell -----
+    // Address cell ----------------------------------------------------------------------------------------------------
     const tdAddr = document.createElement("td");
     tdAddr.className = isDefault ? "" : "editable-addr";
 
@@ -106,7 +106,7 @@ export function renderFilters() {
     tdAddr.appendChild(divAddr);
     tr.appendChild(tdAddr);
 
-    // Matching cell -----
+    // Matching cell ---------------------------------------------------------------------------------------------------
     const tdMatch = document.createElement("td");
     tdMatch.className = isDefault ? "" : "editable-cell";
     tdMatch.dataset.field = "matching";
@@ -129,12 +129,9 @@ export function renderFilters() {
     tdMatch.appendChild(divMatch);
     tr.appendChild(tdMatch);
 
-    // Action cell -----
+    // Action cell -----------------------------------------------------------------------------------------------------
     const tdAction = document.createElement("td");
-    tdAction.className =
-      (isDefault ? "action-cell" : "action-cell editable-cell") +
-      " " +
-      rule.action;
+    tdAction.className = `${isDefault ? "action-cell" : "action-cell editable-cell"} ${rule.action}`;
     tdAction.dataset.field = "action";
 
     const divAction = document.createElement("div");
@@ -151,7 +148,7 @@ export function renderFilters() {
     tdAction.appendChild(divAction);
     tr.appendChild(tdAction);
 
-    // Delete cell -----
+    // Delete cell -----------------------------------------------------------------------------------------------------
     const tdDel = document.createElement("td");
     tdDel.className = "del-cell";
 
@@ -170,7 +167,7 @@ export function renderFilters() {
   evaluateTestFilter();
 }
 
-// In-place address editing =====
+// In-place address editing ============================================================================================
 
 /**
  * Start inline editing of an address cell.
@@ -257,7 +254,7 @@ function commitOrCancelEditing() {
   renderFilters();
 }
 
-// Inline dropdowns =====
+// Inline dropdowns ====================================================================================================
 
 /** Close the currently open dropdown. */
 function closeDropdown() {
@@ -293,8 +290,7 @@ function toggleDropdown(td, index) {
 
   for (const opt of options) {
     const div = document.createElement("div");
-    div.className =
-      "inline-dropdown-opt" + (opt.value === currentValue ? " selected" : "");
+    div.className = `inline-dropdown-opt${opt.value === currentValue ? " selected" : ""}`;
     div.textContent = opt.label;
     div.dataset.value = opt.value;
 
@@ -313,7 +309,7 @@ function toggleDropdown(td, index) {
   openDropdown = dropdown;
 }
 
-// Drag reorder =====
+// Drag reorder ========================================================================================================
 
 /** Active drag state, or null. */
 let dragState = null;
@@ -349,12 +345,12 @@ function startDrag(e, row, index) {
 
   // Lift the row.
   for (let i = 0; i < cells.length; i++) {
-    cells[i].style.width = cellWidths[i] + "px";
+    cells[i].style.width = `${cellWidths[i]}px`;
   }
   row.style.position = "fixed";
-  row.style.top = rect.top + "px";
-  row.style.left = rect.left + "px";
-  row.style.width = rect.width + "px";
+  row.style.top = `${rect.top}px`;
+  row.style.left = `${rect.left}px`;
+  row.style.width = `${rect.width}px`;
   row.style.zIndex = "100";
   row.style.background = "var(--bg-elevated)";
   row.style.boxShadow = "0 4px 16px rgba(0,0,0,0.3)";
@@ -384,12 +380,10 @@ function onDragMove(e) {
   if (!dragState) return;
 
   const { row, placeholder, offsetY } = dragState;
-  row.style.top = e.clientY - offsetY + "px";
+  row.style.top = `${e.clientY - offsetY}px`;
 
   // Determine where the placeholder should go.
-  const rows = Array.from(tbody.querySelectorAll("tr")).filter(
-    (r) => r !== row && r !== placeholder
-  );
+  const rows = Array.from(tbody.querySelectorAll("tr")).filter((r) => r !== row && r !== placeholder);
 
   // Snapshot positions BEFORE any DOM move.
   const beforePositions = new Map();
@@ -487,7 +481,7 @@ function onDragEnd() {
   const newFilters = [];
   for (const tr of tbody.querySelectorAll("tr")) {
     const idx = parseInt(tr.dataset.index, 10);
-    if (!isNaN(idx) && config.filters[idx]) {
+    if (!Number.isNaN(idx) && config.filters[idx]) {
       newFilters.push(config.filters[idx]);
     }
   }
@@ -504,7 +498,7 @@ function onDragEnd() {
   renderFilters();
 }
 
-// Add rule =====
+// Add rule ============================================================================================================
 
 /** Add a new empty filter rule and focus it for editing. */
 function addRule() {
@@ -530,7 +524,7 @@ function addRule() {
   }
 }
 
-// Delete rule =====
+// Delete rule =========================================================================================================
 
 /**
  * Delete a filter rule by index.
@@ -543,7 +537,7 @@ function deleteRule(index) {
   renderFilters();
 }
 
-// Test filtering =====
+// Test filtering ======================================================================================================
 
 /**
  * Evaluate a test input against all filter rules and display the result.
@@ -557,7 +551,7 @@ function evaluateTestFilter() {
     return;
   }
 
-  if (!config || !config.filters || config.filters.length === 0) {
+  if (!config?.filters || config.filters.length === 0) {
     testResult.innerHTML = "";
     return;
   }
@@ -577,17 +571,13 @@ function evaluateTestFilter() {
   }
 
   if (matchedAction === null) {
-    testResult.innerHTML =
-      '<span class="match-rule">No matching rule</span>';
+    testResult.innerHTML = '<span class="match-rule">No matching rule</span>';
     return;
   }
 
-  const actionClass = "match-" + matchedAction;
+  const actionClass = `match-${matchedAction}`;
   const actionText = actionLabel(matchedAction);
-  const ruleDesc =
-    matchedIndex === 0
-      ? "default rule"
-      : `rule #${matchedIndex + 1}: ${matchedRule.address}`;
+  const ruleDesc = matchedIndex === 0 ? "default rule" : `rule #${matchedIndex + 1}: ${matchedRule.address}`;
 
   testResult.textContent = "";
   const actionSpan = document.createElement("span");
@@ -613,7 +603,7 @@ function ruleMatches(rule, input) {
       return input === addr;
 
     case "with_subdomains":
-      return input === addr || input.endsWith("." + addr);
+      return input === addr || input.endsWith(`.${addr}`);
 
     case "wildcard":
       if (addr === "*") return true;
@@ -621,7 +611,7 @@ function ruleMatches(rule, input) {
       // replace literal * with .* for glob semantics.
       try {
         const escaped = addr.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-        const pattern = "^" + escaped.replace(/\*/g, ".*") + "$";
+        const pattern = `^${escaped.replace(/\*/g, ".*")}$`;
         return new RegExp(pattern, "i").test(input);
       } catch {
         return false;
@@ -651,7 +641,7 @@ function cidrMatch(ip, cidr) {
   const testIp = parseIpv4(ip);
 
   if (cidrIp === null || testIp === null) return false;
-  if (isNaN(prefixLen) || prefixLen < 0 || prefixLen > 32) return false;
+  if (Number.isNaN(prefixLen) || prefixLen < 0 || prefixLen > 32) return false;
 
   if (prefixLen === 0) return true;
 
@@ -674,14 +664,14 @@ function parseIpv4(ip) {
   let result = 0;
   for (let i = 0; i < 4; i++) {
     const n = parseInt(parts[i], 10);
-    if (isNaN(n) || n < 0 || n > 255) return null;
+    if (Number.isNaN(n) || n < 0 || n > 255) return null;
     // Use unsigned arithmetic via >>> to avoid sign issues.
     result = ((result << 8) | n) >>> 0;
   }
   return result;
 }
 
-// Event handling =====
+// Event handling ======================================================================================================
 
 /** Handle clicks on the tbody (delegated). */
 function onTbodyClick(e) {
@@ -727,7 +717,7 @@ function onTbodyPointerDown(e) {
   if (!tr || tr.classList.contains("no-drag")) return;
 
   const index = parseInt(tr.dataset.index, 10);
-  if (isNaN(index) || index <= 0) return; // Cannot drag default rule.
+  if (Number.isNaN(index) || index <= 0) return; // Cannot drag default rule.
 
   startDrag(e, tr, index);
 }
@@ -742,7 +732,7 @@ function onDocumentClick(e) {
   closeDropdown();
 }
 
-// Initialization =====
+// Initialization ======================================================================================================
 
 /**
  * Set up event listeners for the filters section. Called once from main.js.

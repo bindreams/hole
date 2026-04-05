@@ -3,24 +3,24 @@
 
 const { invoke } = window.__TAURI__.core;
 
-// Formatting helpers =====
+// Formatting helpers ==================================================================================================
 
 /** Format a byte count to a human-readable string (e.g. "1.24 GB"). */
 function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 /** Format a bits-per-second value to a human-readable speed string. */
 function formatSpeed(bps) {
   const mbps = bps / 1_000_000;
-  if (mbps >= 100) return Math.round(mbps) + " Mbps";
-  if (mbps >= 10) return mbps.toFixed(0) + " Mbps";
-  if (mbps >= 1) return mbps.toFixed(1) + " Mbps";
+  if (mbps >= 100) return `${Math.round(mbps)} Mbps`;
+  if (mbps >= 10) return `${mbps.toFixed(0)} Mbps`;
+  if (mbps >= 1) return `${mbps.toFixed(1)} Mbps`;
   const kbps = bps / 1_000;
-  if (kbps >= 1) return kbps.toFixed(0) + " Kbps";
+  if (kbps >= 1) return `${kbps.toFixed(0)} Kbps`;
   return "0 Kbps";
 }
 
@@ -30,12 +30,12 @@ function formatUptime(totalSecs) {
   const h = Math.floor(totalSecs / 3600);
   const m = Math.floor((totalSecs % 3600) / 60);
   const s = totalSecs % 60;
-  if (h > 0) return h + "h " + m + "m";
-  if (m > 0) return m + "m " + s + "s";
-  return s + "s";
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
-// DOM references =====
+// DOM references ======================================================================================================
 
 const powerBtn = document.getElementById("power-btn");
 const statusWord = document.getElementById("status-word");
@@ -51,7 +51,7 @@ const statUploadSpeed = document.getElementById("stat-upload-speed");
 const statUptime = document.getElementById("stat-uptime");
 const versionFooter = document.getElementById("version-footer");
 
-// State =====
+// State ===============================================================================================================
 
 let connected = false;
 let toggling = false;
@@ -96,7 +96,7 @@ graphSvg.appendChild(txFill);
 graphSvg.appendChild(rxLine);
 graphSvg.appendChild(txLine);
 
-// Power button =====
+// Power button ========================================================================================================
 
 async function handlePowerClick() {
   if (toggling) return;
@@ -123,7 +123,7 @@ function updateConnectionUI() {
   statusWord.textContent = connected ? "Connected" : "Disconnected";
 }
 
-// IP display =====
+// IP display ==========================================================================================================
 
 export async function updatePublicIp() {
   try {
@@ -143,13 +143,13 @@ export async function updatePublicIp() {
         existing[i].remove();
       }
     }
-    ipText.appendChild(document.createTextNode(" " + ip));
+    ipText.appendChild(document.createTextNode(` ${ip}`));
   } catch (err) {
     console.error("get_public_ip failed:", err);
   }
 }
 
-// Copy to clipboard =====
+// Copy to clipboard ===================================================================================================
 
 function handleCopyIp() {
   if (!currentIp) return;
@@ -158,7 +158,7 @@ function handleCopyIp() {
   });
 }
 
-// Throughput graph =====
+// Throughput graph ====================================================================================================
 
 function pushGraphData(speedIn, speedOut) {
   graphData.shift();
@@ -204,7 +204,7 @@ function renderGraph() {
   txFill.setAttribute("d", txFillD);
 }
 
-// Stats table =====
+// Stats table =========================================================================================================
 
 function updateStats(metrics) {
   statDownloaded.textContent = formatBytes(metrics.bytes_in);
@@ -214,7 +214,7 @@ function updateStats(metrics) {
   statUptime.textContent = formatUptime(metrics.uptime_secs);
 }
 
-// Diagnostics chain =====
+// Diagnostics chain ===================================================================================================
 
 const DIAG_NODES = ["app", "daemon", "network", "vpn_server", "internet"];
 const DIAG_ELEMENTS = {
@@ -238,22 +238,22 @@ export function updateDiagnostics(data) {
     const el = DIAG_ELEMENTS[key];
     if (!el) continue;
     const status = data[key] || "unknown";
-    el.className = "nd " + diagStatusClass(status);
+    el.className = `nd ${diagStatusClass(status)}`;
   }
 }
 
-// Version footer =====
+// Version footer ======================================================================================================
 
 async function initVersion() {
   try {
     const version = await window.__TAURI__.app.getVersion();
-    versionFooter.textContent = "Hole v" + version;
+    versionFooter.textContent = `Hole v${version}`;
   } catch {
     versionFooter.textContent = "Hole";
   }
 }
 
-// Public update functions =====
+// Public update functions =============================================================================================
 
 /**
  * Called from main.js every 1 second with fresh metrics data.
@@ -281,7 +281,7 @@ export function isConnected() {
   return connected;
 }
 
-// Initialization =====
+// Initialization ======================================================================================================
 
 export function initSidebar() {
   powerBtn.addEventListener("click", handlePowerClick);

@@ -2,22 +2,16 @@
 //
 // State management, Tauri IPC integration, polling setup, and event listeners.
 
-import { initSections } from "./sections.js";
-import { initServers, renderServers, importFromDialog } from "./servers.js";
 import { initFilters, renderFilters } from "./filters.js";
+import { initSections } from "./sections.js";
+import { importFromDialog, initServers, renderServers } from "./servers.js";
 import { initSettings, renderSettings } from "./settings.js";
-import {
-  initSidebar,
-  updateMetrics,
-  updateDiagnostics,
-  updateProxyStatus,
-  updatePublicIp,
-} from "./sidebar.js";
+import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-// State =====
+// State ===============================================================================================================
 
 /** The current application config, loaded from the backend. */
 export let config = null;
@@ -25,7 +19,7 @@ export let config = null;
 /** Whether the config has unsaved changes. */
 let dirty = false;
 
-// Config management =====
+// Config management ===================================================================================================
 
 /** Fetch the config from the backend and broadcast it to all UI sections. */
 export async function loadConfig() {
@@ -61,7 +55,7 @@ export function isDirty() {
   return dirty;
 }
 
-// Polling =====
+// Polling =============================================================================================================
 
 /** Poll proxy status every 5 seconds. */
 async function pollProxyStatus() {
@@ -97,7 +91,7 @@ async function pollDiagnostics() {
   }
 }
 
-// Event listeners =====
+// Event listeners =====================================================================================================
 
 /** Handle file import (from menu or drag-and-drop). */
 async function importFile(path) {
@@ -124,7 +118,7 @@ function setupEventListeners() {
   });
 }
 
-// Initialization =====
+// Initialization ======================================================================================================
 
 async function init() {
   // Initialize UI modules.
@@ -138,12 +132,7 @@ async function init() {
   await loadConfig();
 
   // Initial data fetches (all in parallel).
-  await Promise.allSettled([
-    pollProxyStatus(),
-    pollMetrics(),
-    pollDiagnostics(),
-    updatePublicIp(),
-  ]);
+  await Promise.allSettled([pollProxyStatus(), pollMetrics(), pollDiagnostics(), updatePublicIp()]);
 
   // Start polling intervals.
   setInterval(pollProxyStatus, 5000);

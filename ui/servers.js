@@ -4,12 +4,12 @@ import { config, loadConfig, saveConfig } from "./main.js";
 
 const { invoke } = window.__TAURI__.core;
 
-// DOM references =====
+// DOM references ======================================================================================================
 
 const serverList = document.getElementById("server-list");
 const importZone = document.getElementById("import-zone");
 
-// Rendering =====
+// Rendering ===========================================================================================================
 
 /**
  * Re-render all server cards based on the current config.
@@ -45,7 +45,7 @@ export function renderServers() {
 
       const saddr = document.createElement("span");
       saddr.className = "saddr";
-      saddr.textContent = server.server + ":" + server.server_port;
+      saddr.textContent = `${server.server}:${server.server_port}`;
       card.appendChild(saddr);
 
       if (server.plugin) {
@@ -76,7 +76,7 @@ export function renderServers() {
   }
 }
 
-// Actions =====
+// Actions =============================================================================================================
 
 /** Select a server by ID — updates config, re-renders, and saves. */
 async function selectServer(id) {
@@ -98,7 +98,7 @@ async function deleteServer(id) {
   await saveConfig();
 }
 
-// File import =====
+// File import =========================================================================================================
 
 /** Open a file dialog and import servers from the selected JSON file. */
 export async function importFromDialog() {
@@ -115,7 +115,7 @@ export async function importFromDialog() {
   }
 }
 
-// Initialization =====
+// Initialization ======================================================================================================
 
 /** Set up event listeners for the servers section. Called once from main.js. */
 export function initServers() {

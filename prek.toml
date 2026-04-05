@@ -1,7 +1,7 @@
 exclude = "^external/"
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
-# Local hooks =====
+# Local hooks ==========================================================================================================
 
 [[repos]]
 repo = "local"
@@ -33,7 +33,7 @@ pass_filenames = false
 id = "check-version"
 name = "check Cargo.toml version vs git tag"
 entry = "python scripts/check-version.py"
-language = "system"
+language = "python"
 pass_filenames = false
 always_run = true
 
@@ -41,7 +41,7 @@ always_run = true
 id = "check-workspace-lints"
 name = "check workspace lints inheritance"
 entry = "python scripts/check-workspace-lints.py"
-language = "system"
+language = "python"
 pass_filenames = false
 always_run = true
 
@@ -49,18 +49,19 @@ always_run = true
 id = "format-section-comments"
 name = "format section comments"
 entry = "python scripts/format-section-comments.py"
-language = "system"
-types_or = ["rust", "python"]
+language = "python"
+types_or = ["rust", "python", "toml", "javascript", "ts", "jsx", "tsx"]
 
 [[repos.hooks]]
 id = "ty"
 name = "ty check"
-entry = "uvx ty check"
-language = "system"
+entry = "ty check"
+language = "python"
 types = ["python"]
 pass_filenames = false
+additional_dependencies = ["ty"]
 
-# External hooks =====
+# External hooks =======================================================================================================
 
 [[repos]]
 repo = "https://github.com/pre-commit/pre-commit-hooks"
@@ -90,4 +91,11 @@ repo = "https://github.com/hukkin/mdformat"
 rev = "1.0.0"
 hooks = [
   { id = "mdformat", additional_dependencies = ["mdformat-gfm"] },
+]
+
+[[repos]]
+repo = "https://github.com/biomejs/pre-commit"
+rev = "v2.4.10"
+hooks = [
+  { id = "biome-check", additional_dependencies = ["@biomejs/biome@2.1.1"] },
 ]
