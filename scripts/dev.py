@@ -18,10 +18,12 @@ Usage:
 import atexit
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 # ANSI colors ==========================================================================================================
@@ -32,6 +34,7 @@ YELLOW = "\033[33m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+VITE_PORT = 1420
 VITE_READY_TIMEOUT = 30
 
 # Prerequisites ========================================================================================================
@@ -65,25 +68,26 @@ def cargo_build(cargo: str) -> None:
 # Process management ===================================================================================================
 
 
-def prefix_stream(
-    stream,
-    label: str,
-    color: str,
-    ready_event: threading.Event | None = None,
-    ready_marker: str | None = None
-) -> None:
-    """Read lines from a stream and print them with a colored prefix.
-
-    If ready_marker is set, signals ready_event when a line containing it appears.
-    """
+def prefix_stream(stream, label: str, color: str) -> None:
+    """Read lines from a stream and print them with a colored prefix."""
     prefix = f"{color}{BOLD}[{label}]{RESET} "
     try:
         for line in iter(stream.readline, ""):
             print(f"{prefix}{line}", end="", flush=True)
-            if ready_event and ready_marker and ready_marker in line:
-                ready_event.set()
     except ValueError:
         pass  # stream closed
+
+
+def wait_for_port(port: int, timeout: float) -> bool:
+    """Poll until a TCP port is accepting connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
 
 
 def wait_for_exit(proc: subprocess.Popen, done: threading.Event) -> None:
@@ -149,7 +153,6 @@ def main() -> None:
 
     try:
         # Start Vite first — GUI needs it listening before the webview opens.
-        vite_ready = threading.Event()
         vite_proc = subprocess.Popen(
             [npm, "run", "dev"],
             stdout=subprocess.PIPE,
@@ -158,20 +161,14 @@ def main() -> None:
             bufsize=1,
         )
         procs.append(vite_proc)
-
-        vite_reader = threading.Thread(
-            target=prefix_stream,
-            args=(vite_proc.stdout, "  vite", YELLOW, vite_ready, "ready in"),
-            daemon=True,
-        )
-        vite_reader.start()
+        threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
         threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
 
-        if not vite_ready.wait(timeout=VITE_READY_TIMEOUT):
+        if not wait_for_port(VITE_PORT, timeout=VITE_READY_TIMEOUT):
             if vite_proc.poll() is not None:
                 print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
             else:
-                print(f"{YELLOW}Vite did not start within {VITE_READY_TIMEOUT}s{RESET}")
+                print(f"{YELLOW}Vite did not start on port {VITE_PORT} within {VITE_READY_TIMEOUT}s{RESET}")
             shutdown(procs)
             sys.exit(1)
 
