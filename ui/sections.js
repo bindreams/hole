@@ -11,14 +11,14 @@
 function toggleSection(hdr) {
   const tri = hdr.querySelector(".tri");
   const clip = hdr.nextElementSibling;
-  if (!clip || !clip.classList.contains("section-clip")) return;
+  if (!clip?.classList.contains("section-clip")) return;
   const body = clip.querySelector(".section-body");
   if (!body) return;
 
   const isCollapsed = clip.classList.contains("collapsed");
 
   if (isCollapsed) {
-    // Expand -----
+    // Expand ----------------------------------------------------------------------------------------------------------
     clip.classList.remove("collapsed");
     clip.style.overflow = "hidden";
 
@@ -32,7 +32,7 @@ function toggleSection(hdr) {
 
     clip.style.transition = "max-height 0.3s ease";
     body.style.transition = "transform 0.3s ease, opacity 0.2s ease";
-    clip.style.maxHeight = h + "px";
+    clip.style.maxHeight = `${h}px`;
     body.style.transform = "translateY(0)";
     body.style.opacity = "1";
     tri.classList.remove("collapsed");
@@ -50,10 +50,10 @@ function toggleSection(hdr) {
     };
     clip.addEventListener("transitionend", cleanup);
   } else {
-    // Collapse -----
+    // Collapse --------------------------------------------------------------------------------------------------------
     const h = body.scrollHeight;
     clip.style.overflow = "hidden";
-    clip.style.maxHeight = h + "px";
+    clip.style.maxHeight = `${h}px`;
 
     clip.offsetHeight; // eslint-disable-line no-unused-expressions
 

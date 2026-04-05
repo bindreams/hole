@@ -2,7 +2,7 @@
 
 import { config, saveConfig } from "./main.js";
 
-// Theme management =====
+// Theme management ====================================================================================================
 
 const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 let systemThemeListener = null;
@@ -21,9 +21,7 @@ function applyTheme(value) {
 
   if (value === "system") {
     const setFromOs = () => {
-      document.documentElement.dataset.theme = systemThemeQuery.matches
-        ? "dark"
-        : "light";
+      document.documentElement.dataset.theme = systemThemeQuery.matches ? "dark" : "light";
     };
     setFromOs();
     systemThemeListener = setFromOs;
@@ -33,7 +31,7 @@ function applyTheme(value) {
   }
 }
 
-// Proxy muting =====
+// Proxy muting ========================================================================================================
 
 const proxyNested = document.getElementById("proxy-nested");
 
@@ -46,7 +44,7 @@ function updateProxyMuting() {
   }
 }
 
-// Toggle component =====
+// Toggle component ====================================================================================================
 
 /**
  * Wire a toggle switch element.
@@ -66,7 +64,7 @@ function wireToggle(id, configKey, onToggle) {
   });
 }
 
-// Dropdown component =====
+// Dropdown component ==================================================================================================
 
 /**
  * Convert a kebab-case data-value from the DOM to the snake_case config value.
@@ -130,7 +128,7 @@ function wireDropdown(btnId, menuId, configKey, onChange) {
   }
 }
 
-// Port input =====
+// Port input ==========================================================================================================
 
 const portInput = document.getElementById("input-port");
 
@@ -138,7 +136,7 @@ function wirePortInput() {
   portInput.addEventListener("change", () => {
     if (!config) return;
     const parsed = parseInt(portInput.value, 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed <= 65535) {
+    if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
       config.local_port = parsed;
       saveConfig();
     } else {
@@ -148,7 +146,7 @@ function wirePortInput() {
   });
 }
 
-// Click-outside handler =====
+// Click-outside handler ===============================================================================================
 
 function handleClickOutside() {
   document.addEventListener("click", () => {
@@ -158,7 +156,7 @@ function handleClickOutside() {
   });
 }
 
-// Public API =====
+// Public API ==========================================================================================================
 
 /**
  * Wire up all settings event listeners. Called once from main.js.
@@ -193,25 +191,13 @@ export function renderSettings() {
   if (!config) return;
 
   // Toggles.
-  document
-    .getElementById("toggle-start-on-login")
-    .classList.toggle("on", !!config.start_on_login);
-  document
-    .getElementById("toggle-proxy-server")
-    .classList.toggle("on", !!config.proxy_server_enabled);
-  document
-    .getElementById("toggle-socks5")
-    .classList.toggle("on", !!config.proxy_socks5);
-  document
-    .getElementById("toggle-http")
-    .classList.toggle("on", !!config.proxy_http);
+  document.getElementById("toggle-start-on-login").classList.toggle("on", !!config.start_on_login);
+  document.getElementById("toggle-proxy-server").classList.toggle("on", !!config.proxy_server_enabled);
+  document.getElementById("toggle-socks5").classList.toggle("on", !!config.proxy_socks5);
+  document.getElementById("toggle-http").classList.toggle("on", !!config.proxy_http);
 
   // Dropdowns.
-  syncDropdown(
-    "select-on-startup",
-    "menu-on-startup",
-    config.on_startup ?? "do_not_connect",
-  );
+  syncDropdown("select-on-startup", "menu-on-startup", config.on_startup ?? "do_not_connect");
   syncDropdown("select-theme", "menu-theme", config.theme ?? "dark");
 
   // Port input.
