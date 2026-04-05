@@ -42,7 +42,15 @@ npm install
 
 ### Running in dev mode
 
-Development uses two terminals: one for the daemon, one for the GUI.
+The quickest way to start everything:
+
+```sh
+uv run scripts/dev.py
+```
+
+This launches both daemon and GUI with multiplexed, color-coded logs in a single terminal.
+
+Alternatively, run them in separate terminals for independent control:
 
 **Terminal 1 — Daemon** (auto-rebuilds on Rust changes):
 
