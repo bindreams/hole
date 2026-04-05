@@ -37,6 +37,11 @@ RESET = "\033[0m"
 VITE_PORT = 1420
 VITE_READY_TIMEOUT = 30
 
+# On Windows, prevent child processes from inheriting the parent console. Without this,
+# WebView2 (inside the Tauri GUI) modifies the console mode and corrupts the terminal
+# (broken arrow keys, double keypresses). Since we pipe stdout/stderr, no console needed.
+_POPEN_KWARGS: dict = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
 # Prerequisites ========================================================================================================
 
 
@@ -159,6 +164,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_POPEN_KWARGS,
         )
         procs.append(vite_proc)
         threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
@@ -180,6 +186,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_POPEN_KWARGS,
         )
         procs.append(daemon_proc)
         threading.Thread(target=prefix_stream, args=(daemon_proc.stdout, "daemon", CYAN), daemon=True).start()
@@ -194,6 +201,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_POPEN_KWARGS,
         )
         procs.append(gui_proc)
         threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()
