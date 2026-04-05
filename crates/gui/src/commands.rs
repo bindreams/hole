@@ -1,5 +1,6 @@
 // Tauri IPC commands (frontend ↔ Rust).
 
+use crate::daemon_client::ClientError;
 use crate::state::AppState;
 use hole_common::config::{AppConfig, ServerEntry};
 use hole_common::import;
@@ -142,6 +143,112 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
             }))
         }
     }
+}
+
+// Response mappers (extracted for testability) ========================================================================
+
+fn map_metrics_response(result: Result<DaemonResponse, ClientError>) -> serde_json::Value {
+    match result {
+        Ok(DaemonResponse::Metrics {
+            bytes_in,
+            bytes_out,
+            speed_in_bps,
+            speed_out_bps,
+            uptime_secs,
+        }) => serde_json::json!({
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+            "speed_in_bps": speed_in_bps,
+            "speed_out_bps": speed_out_bps,
+            "uptime_secs": uptime_secs,
+        }),
+        _ => serde_json::json!({
+            "bytes_in": 0,
+            "bytes_out": 0,
+            "speed_in_bps": 0,
+            "speed_out_bps": 0,
+            "uptime_secs": 0,
+        }),
+    }
+}
+
+fn map_diagnostics_response(result: Result<DaemonResponse, ClientError>) -> serde_json::Value {
+    match result {
+        Ok(DaemonResponse::Diagnostics {
+            app,
+            daemon,
+            network,
+            vpn_server,
+            internet,
+        }) => serde_json::json!({
+            "app": app,
+            "daemon": daemon,
+            "network": network,
+            "vpn_server": vpn_server,
+            "internet": internet,
+        }),
+        _ => serde_json::json!({
+            "app": "ok",
+            "daemon": "unknown",
+            "network": "unknown",
+            "vpn_server": "unknown",
+            "internet": "unknown",
+        }),
+    }
+}
+
+/// Try to extract a public IP response from the daemon result.
+/// Returns `Some(json)` on success, `None` if fallback is needed.
+fn map_public_ip_daemon_response(result: Result<DaemonResponse, ClientError>) -> Option<serde_json::Value> {
+    match result {
+        Ok(DaemonResponse::PublicIp { ip, country_code }) => {
+            Some(serde_json::json!({ "ip": ip, "country_code": country_code }))
+        }
+        _ => None,
+    }
+}
+
+// Tauri commands ======================================================================================================
+
+#[tauri::command]
+pub async fn get_metrics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(map_metrics_response(state.daemon_send(DaemonRequest::Metrics).await))
+}
+
+#[tauri::command]
+pub async fn get_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(map_diagnostics_response(
+        state.daemon_send(DaemonRequest::Diagnostics).await,
+    ))
+}
+
+#[tauri::command]
+pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    // Try daemon first (fetches through VPN when connected)
+    if let Some(json) = map_public_ip_daemon_response(state.daemon_send(DaemonRequest::PublicIp).await) {
+        return Ok(json);
+    }
+
+    // Daemon unreachable — fetch directly (shows ISP IP)
+    // Uses ureq v3 API (Agent-based, NOT free functions)
+    let result = tokio::task::spawn_blocking(|| {
+        let agent = ureq::Agent::new_with_defaults();
+        let body: serde_json::Value = agent
+            .get("https://ipinfo.io/json")
+            .call()
+            .map_err(|e| format!("IP lookup failed: {e}"))?
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("parse error: {e}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "ip": body["ip"].as_str().unwrap_or("unknown"),
+            "country_code": body["country"].as_str().unwrap_or("??"),
+        }))
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?;
+
+    result
 }
 
 /// Build a `ProxyConfig` from the currently selected server in app config.

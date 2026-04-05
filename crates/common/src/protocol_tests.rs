@@ -163,3 +163,116 @@ fn route_constants_are_correct() {
     assert_eq!(ROUTE_STOP, "/v1/stop");
     assert_eq!(ROUTE_RELOAD, "/v1/reload");
 }
+
+// New response types --------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn metrics_response_roundtrips() {
+    let resp = MetricsResponse {
+        bytes_in: 1_000_000,
+        bytes_out: 500_000,
+        speed_in_bps: 1_048_576,
+        speed_out_bps: 524_288,
+        uptime_secs: 3600,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: MetricsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn diagnostics_response_roundtrips() {
+    let resp = DiagnosticsResponse {
+        app: "ok".to_string(),
+        daemon: "ok".to_string(),
+        network: "ok".to_string(),
+        vpn_server: "ok".to_string(),
+        internet: "unknown".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DiagnosticsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn public_ip_response_roundtrips() {
+    let resp = PublicIpResponse {
+        ip: "185.0.0.42".to_string(),
+        country_code: "DE".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: PublicIpResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn route_constants_for_new_endpoints_exist() {
+    assert_eq!(ROUTE_METRICS, "/v1/metrics");
+    assert_eq!(ROUTE_DIAGNOSTICS, "/v1/diagnostics");
+    assert_eq!(ROUTE_PUBLIC_IP, "/v1/public-ip");
+}
+
+// Protocol variant roundtrips -----------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn daemon_request_metrics_roundtrips() {
+    let req = DaemonRequest::Metrics;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_request_diagnostics_roundtrips() {
+    let req = DaemonRequest::Diagnostics;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_request_public_ip_roundtrips() {
+    let req = DaemonRequest::PublicIp;
+    let json = serde_json::to_string(&req).unwrap();
+    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(req, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_metrics_roundtrips() {
+    let resp = DaemonResponse::Metrics {
+        bytes_in: 100,
+        bytes_out: 50,
+        speed_in_bps: 1024,
+        speed_out_bps: 512,
+        uptime_secs: 60,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_diagnostics_roundtrips() {
+    let resp = DaemonResponse::Diagnostics {
+        app: "ok".to_string(),
+        daemon: "ok".to_string(),
+        network: "error".to_string(),
+        vpn_server: "unknown".to_string(),
+        internet: "unknown".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn daemon_response_public_ip_roundtrips() {
+    let resp = DaemonResponse::PublicIp {
+        ip: "1.2.3.4".to_string(),
+        country_code: "US".to_string(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}

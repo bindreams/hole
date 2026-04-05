@@ -1,223 +1,157 @@
+// Hole Dashboard — main entry point.
+//
+// State management, Tauri IPC integration, polling setup, and event listeners.
+
+import { initSections } from "./sections.js";
+import { initServers, renderServers, importFromDialog } from "./servers.js";
+import { initFilters, renderFilters } from "./filters.js";
+import { initSettings, renderSettings } from "./settings.js";
+import {
+  initSidebar,
+  updateMetrics,
+  updateDiagnostics,
+  updateProxyStatus,
+  updatePublicIp,
+} from "./sidebar.js";
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 // State =====
 
-let config = null;
+/** The current application config, loaded from the backend. */
+export let config = null;
+
+/** Whether the config has unsaved changes. */
 let dirty = false;
 
-// DOM refs =====
+// Config management =====
 
-const serverList = document.getElementById("server-list");
-const emptyState = document.getElementById("empty-state");
-const localPortInput = document.getElementById("local-port");
-const btnApply = document.getElementById("btn-apply");
-const btnToggle = document.getElementById("btn-toggle");
-const saveStatus = document.getElementById("save-status");
-const statusBadge = document.getElementById("status");
-
-// Dirty tracking =====
-
-function setDirty(value) {
-  dirty = value;
-  btnApply.disabled = !dirty;
-}
-
-// Rendering =====
-
-function renderServers() {
-  serverList.innerHTML = "";
-
-  if (!config || config.servers.length === 0) {
-    emptyState.style.display = "";
-    return;
-  }
-  emptyState.style.display = "none";
-
-  for (const server of config.servers) {
-    const tr = document.createElement("tr");
-    if (server.id === config.selected_server) {
-      tr.classList.add("selected");
-    }
-
-    // Radio
-    const tdRadio = document.createElement("td");
-    const radio = document.createElement("input");
-    radio.type = "radio";
-    radio.name = "selected-server";
-    radio.checked = server.id === config.selected_server;
-    radio.addEventListener("change", async () => {
-      config.selected_server = server.id;
-      renderServers();
-      try {
-        await invoke("save_config", { config });
-      } catch (e) {
-        saveStatus.textContent = `Error: ${e}`;
-      }
-    });
-    tdRadio.appendChild(radio);
-    tr.appendChild(tdRadio);
-
-    // Name
-    const tdName = document.createElement("td");
-    tdName.textContent = server.name;
-    tr.appendChild(tdName);
-
-    // Address
-    const tdAddr = document.createElement("td");
-    tdAddr.textContent = `${server.server}:${server.server_port}`;
-    tr.appendChild(tdAddr);
-
-    // Method
-    const tdMethod = document.createElement("td");
-    tdMethod.textContent = server.method;
-    tr.appendChild(tdMethod);
-
-    // Plugin
-    const tdPlugin = document.createElement("td");
-    if (server.plugin) {
-      const badge = document.createElement("span");
-      badge.className = "plugin-badge";
-      badge.textContent = server.plugin;
-      tdPlugin.appendChild(badge);
-    }
-    tr.appendChild(tdPlugin);
-
-    // Delete
-    const tdDelete = document.createElement("td");
-    const btnDel = document.createElement("button");
-    btnDel.className = "btn-delete";
-    btnDel.textContent = "Delete";
-    btnDel.addEventListener("click", async () => {
-      config.servers = config.servers.filter((s) => s.id !== server.id);
-      if (config.selected_server === server.id) {
-        config.selected_server = null;
-      }
-      renderServers();
-      try {
-        await invoke("save_config", { config });
-      } catch (e) {
-        saveStatus.textContent = `Error: ${e}`;
-      }
-    });
-    tdDelete.appendChild(btnDel);
-    tr.appendChild(tdDelete);
-
-    serverList.appendChild(tr);
+/** Fetch the config from the backend and broadcast it to all UI sections. */
+export async function loadConfig() {
+  try {
+    config = await invoke("get_config");
+    dirty = false;
+    renderServers();
+    renderFilters();
+    renderSettings();
+  } catch (err) {
+    console.error("loadConfig failed:", err);
   }
 }
 
-function updateToggleButton(enabled) {
-  btnToggle.textContent = enabled ? "Disconnect" : "Connect";
-  btnToggle.className = enabled ? "btn-disconnect" : "btn-connect";
-  btnToggle.disabled = false;
-}
-
-// Actions =====
-
-async function loadConfig() {
-  config = await invoke("get_config");
-  localPortInput.value = config.local_port;
-  setDirty(false);
-  updateToggleButton(config.enabled);
-  renderServers();
-}
-
-async function applyConfig() {
-  config.local_port = parseInt(localPortInput.value, 10) || 4073;
+/** Save the current config to the backend. */
+export async function saveConfig() {
+  if (!config) return;
   try {
     await invoke("save_config", { config });
-    setDirty(false);
-    saveStatus.textContent = "Applied.";
-    setTimeout(() => { saveStatus.textContent = ""; }, 2000);
-  } catch (e) {
-    saveStatus.textContent = `Error: ${e}`;
+    dirty = false;
+  } catch (err) {
+    console.error("saveConfig failed:", err);
   }
 }
 
-async function importServers() {
-  try {
-    const result = await window.__TAURI__.dialog.open({
-      filters: [{ name: "JSON", extensions: ["json"] }],
-      multiple: false,
-    });
-    if (!result) return;
-
-    await invoke("import_servers_from_file", { path: result });
-    await loadConfig();
-    saveStatus.textContent = "Servers imported.";
-    setTimeout(() => { saveStatus.textContent = ""; }, 2000);
-  } catch (e) {
-    saveStatus.textContent = `Import error: ${e}`;
-  }
+/** Mark the config as having unsaved changes. */
+export function setDirty() {
+  dirty = true;
 }
 
-async function importFromPath(path) {
-  try {
-    await invoke("import_servers_from_file", { path });
-    await loadConfig();
-    saveStatus.textContent = "Servers imported.";
-    setTimeout(() => { saveStatus.textContent = ""; }, 2000);
-  } catch (e) {
-    saveStatus.textContent = `Import error: ${e}`;
-  }
+/** Whether the config has unsaved changes. */
+export function isDirty() {
+  return dirty;
 }
 
-async function toggleProxy() {
-  btnToggle.disabled = true;
-  try {
-    const enabled = await invoke("toggle_proxy");
-    updateToggleButton(enabled);
-    await checkDaemonStatus();
-  } catch (e) {
-    saveStatus.textContent = `Error: ${e}`;
-    setTimeout(() => { saveStatus.textContent = ""; }, 4000);
-    try { await loadConfig(); } catch { /* best-effort */ }
-  } finally {
-    btnToggle.disabled = false;
-  }
-}
+// Polling =====
 
-async function checkDaemonStatus() {
+/** Poll proxy status every 5 seconds. */
+async function pollProxyStatus() {
   try {
     const status = await invoke("get_proxy_status");
-    statusBadge.textContent = status.running ? "Daemon: running" : "Daemon: stopped";
-    statusBadge.className = `status ${status.running ? "connected" : "disconnected"}`;
-  } catch {
-    statusBadge.textContent = "Daemon: disconnected";
-    statusBadge.className = "status disconnected";
+    const result = updateProxyStatus(status);
+    if (result.changed) {
+      // Connection state changed — refresh IP.
+      updatePublicIp();
+    }
+  } catch (err) {
+    console.error("get_proxy_status failed:", err);
   }
-  try {
-    const cfg = await invoke("get_config");
-    updateToggleButton(cfg.enabled);
-  } catch { /* best-effort */ }
 }
 
-// Events =====
-
-btnApply.addEventListener("click", applyConfig);
-btnToggle.addEventListener("click", toggleProxy);
-localPortInput.addEventListener("input", () => setDirty(true));
-
-// Empty state click-to-import
-emptyState.addEventListener("click", importServers);
-
-// Listen for import requests from the File > Import menu
-listen("import-requested", importServers);
-
-// Drag-and-drop via Tauri's built-in file drop event
-listen("tauri://drag-drop", (event) => {
-  const paths = event.payload.paths || [];
-  const jsonFile = paths.find((p) => p.toLowerCase().endsWith(".json"));
-  if (jsonFile) {
-    importFromPath(jsonFile);
+/** Poll metrics every 1 second. */
+async function pollMetrics() {
+  try {
+    const metrics = await invoke("get_metrics");
+    updateMetrics(metrics);
+  } catch (err) {
+    console.error("get_metrics failed:", err);
   }
-});
+}
 
-// Poll daemon status periodically
-setInterval(checkDaemonStatus, 5000);
+/** Poll diagnostics every 5 seconds. */
+async function pollDiagnostics() {
+  try {
+    const data = await invoke("get_diagnostics");
+    updateDiagnostics(data);
+  } catch (err) {
+    console.error("get_diagnostics failed:", err);
+  }
+}
 
-// Init =====
+// Event listeners =====
 
-loadConfig();
-checkDaemonStatus();
+/** Handle file import (from menu or drag-and-drop). */
+async function importFile(path) {
+  try {
+    await invoke("import_servers_from_file", { path });
+    // Reload config so the UI picks up the new servers.
+    await loadConfig();
+  } catch (err) {
+    console.error("import failed:", err);
+  }
+}
+
+function setupEventListeners() {
+  // File > Import menu action (tray emits () as payload — open dialog).
+  listen("import-requested", () => importFromDialog());
+
+  // Drag-and-drop file import.
+  listen("tauri://drag-drop", async (event) => {
+    const paths = event.payload?.paths;
+    if (paths && paths.length > 0) {
+      // Import the first dropped file.
+      await importFile(paths[0]);
+    }
+  });
+}
+
+// Initialization =====
+
+async function init() {
+  // Initialize UI modules.
+  initSections();
+  initServers();
+  initFilters();
+  initSettings();
+  initSidebar();
+
+  // Load config from backend.
+  await loadConfig();
+
+  // Initial data fetches (all in parallel).
+  await Promise.allSettled([
+    pollProxyStatus(),
+    pollMetrics(),
+    pollDiagnostics(),
+    updatePublicIp(),
+  ]);
+
+  // Start polling intervals.
+  setInterval(pollProxyStatus, 5000);
+  setInterval(pollMetrics, 1000);
+  setInterval(pollDiagnostics, 5000);
+
+  // Wire up event listeners.
+  setupEventListeners();
+}
+
+init();

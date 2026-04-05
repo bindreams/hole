@@ -1,6 +1,9 @@
 use super::*;
 use axum::Json;
-use hole_common::protocol::{DaemonRequest, DaemonResponse, EmptyResponse, StatusResponse};
+use hole_common::protocol::{
+    DaemonRequest, DaemonResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, PublicIpResponse,
+    StatusResponse,
+};
 use hyper::body::Incoming;
 use std::path::PathBuf;
 
@@ -40,6 +43,39 @@ async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()
         .route(
             hole_common::protocol::ROUTE_RELOAD,
             axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_METRICS,
+            axum::routing::get(|| async {
+                Json(MetricsResponse {
+                    bytes_in: 1024,
+                    bytes_out: 512,
+                    speed_in_bps: 2048,
+                    speed_out_bps: 1024,
+                    uptime_secs: 120,
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_DIAGNOSTICS,
+            axum::routing::get(|| async {
+                Json(DiagnosticsResponse {
+                    app: "ok".to_string(),
+                    daemon: "ok".to_string(),
+                    network: "ok".to_string(),
+                    vpn_server: "ok".to_string(),
+                    internet: "ok".to_string(),
+                })
+            }),
+        )
+        .route(
+            hole_common::protocol::ROUTE_PUBLIC_IP,
+            axum::routing::get(|| async {
+                Json(PublicIpResponse {
+                    ip: "203.0.113.42".to_string(),
+                    country_code: "DE".to_string(),
+                })
+            }),
         );
 
     tokio::spawn(async move {
@@ -265,5 +301,68 @@ fn server_error_maps_to_daemon_response_error() {
             }
             other => panic!("expected Error response, got {other:?}"),
         }
+    });
+}
+
+#[skuld::test]
+fn send_metrics_returns_response() {
+    rt().block_on(async {
+        let path = test_socket_path("metrics");
+        let _mock = spawn_mock_daemon(&path).await;
+
+        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let resp = client.send(DaemonRequest::Metrics).await.unwrap();
+
+        assert_eq!(
+            resp,
+            DaemonResponse::Metrics {
+                bytes_in: 1024,
+                bytes_out: 512,
+                speed_in_bps: 2048,
+                speed_out_bps: 1024,
+                uptime_secs: 120,
+            }
+        );
+    });
+}
+
+#[skuld::test]
+fn send_diagnostics_returns_response() {
+    rt().block_on(async {
+        let path = test_socket_path("diagnostics");
+        let _mock = spawn_mock_daemon(&path).await;
+
+        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let resp = client.send(DaemonRequest::Diagnostics).await.unwrap();
+
+        assert_eq!(
+            resp,
+            DaemonResponse::Diagnostics {
+                app: "ok".to_string(),
+                daemon: "ok".to_string(),
+                network: "ok".to_string(),
+                vpn_server: "ok".to_string(),
+                internet: "ok".to_string(),
+            }
+        );
+    });
+}
+
+#[skuld::test]
+fn send_public_ip_returns_response() {
+    rt().block_on(async {
+        let path = test_socket_path("publicip");
+        let _mock = spawn_mock_daemon(&path).await;
+
+        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let resp = client.send(DaemonRequest::PublicIp).await.unwrap();
+
+        assert_eq!(
+            resp,
+            DaemonResponse::PublicIp {
+                ip: "203.0.113.42".to_string(),
+                country_code: "DE".to_string(),
+            }
+        );
     });
 }

@@ -14,6 +14,48 @@ pub enum ConfigError {
 
 // Types ===============================================================================================================
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchType {
+    Exactly,
+    WithSubdomains,
+    Wildcard,
+    Subnet,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterAction {
+    Proxy,
+    Bypass,
+    Block,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilterRule {
+    pub address: String,
+    pub matching: MatchType,
+    pub action: FilterAction,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupBehavior {
+    DoNotConnect,
+    #[default]
+    RestoreLastState,
+    AlwaysConnect,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    Light,
+    #[default]
+    Dark,
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
@@ -28,6 +70,14 @@ pub struct AppConfig {
     /// config file. Once set to `true`, subsequent PermissionDenied errors
     /// skip the explanation dialog and go directly to a UAC prompt.
     pub elevation_prompt_shown: bool,
+
+    pub filters: Vec<FilterRule>,
+    pub start_on_login: bool,
+    pub on_startup: StartupBehavior,
+    pub theme: Theme,
+    pub proxy_server_enabled: bool,
+    pub proxy_socks5: bool,
+    pub proxy_http: bool,
 }
 
 impl Default for AppConfig {
@@ -38,6 +88,13 @@ impl Default for AppConfig {
             local_port: 4073,
             enabled: false,
             elevation_prompt_shown: false,
+            filters: Vec::new(),
+            start_on_login: false,
+            on_startup: StartupBehavior::default(),
+            theme: Theme::default(),
+            proxy_server_enabled: true,
+            proxy_socks5: true,
+            proxy_http: false,
         }
     }
 }
