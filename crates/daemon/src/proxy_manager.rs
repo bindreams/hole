@@ -99,6 +99,10 @@ impl<B: ProxyBackend> ProxyManager<B> {
         self.state
     }
 
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }

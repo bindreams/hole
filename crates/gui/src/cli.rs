@@ -435,6 +435,9 @@ fn send_daemon_request(request: hole_common::protocol::DaemonRequest) -> i32 {
         match client.send(request).await {
             Ok(DaemonResponse::Ack) => 0,
             Ok(DaemonResponse::Status { .. }) => 0,
+            Ok(DaemonResponse::Metrics { .. }) => 0,
+            Ok(DaemonResponse::Diagnostics { .. }) => 0,
+            Ok(DaemonResponse::PublicIp { .. }) => 0,
             Ok(DaemonResponse::Error { message }) => {
                 eprintln!("daemon error: {message}");
                 1

@@ -2,7 +2,9 @@
 
 use bytes::Bytes;
 use hole_common::protocol::{
-    DaemonRequest, DaemonResponse, ErrorResponse, StatusResponse, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    DaemonRequest, DaemonResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, PublicIpResponse,
+    StatusResponse, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS,
+    ROUTE_STOP,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -112,6 +114,54 @@ impl DaemonClient {
                 let resp = self.http_post(ROUTE_RELOAD, body).await?;
                 if resp.status().is_success() {
                     Ok(DaemonResponse::Ack)
+                } else {
+                    parse_daemon_error(resp).await
+                }
+            }
+            DaemonRequest::Metrics => {
+                let resp = self.http_get(ROUTE_METRICS).await?;
+                if resp.status().is_success() {
+                    let body = read_body(resp).await?;
+                    let metrics: MetricsResponse =
+                        serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
+                    Ok(DaemonResponse::Metrics {
+                        bytes_in: metrics.bytes_in,
+                        bytes_out: metrics.bytes_out,
+                        speed_in_bps: metrics.speed_in_bps,
+                        speed_out_bps: metrics.speed_out_bps,
+                        uptime_secs: metrics.uptime_secs,
+                    })
+                } else {
+                    parse_daemon_error(resp).await
+                }
+            }
+            DaemonRequest::Diagnostics => {
+                let resp = self.http_get(ROUTE_DIAGNOSTICS).await?;
+                if resp.status().is_success() {
+                    let body = read_body(resp).await?;
+                    let diag: DiagnosticsResponse =
+                        serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
+                    Ok(DaemonResponse::Diagnostics {
+                        app: diag.app,
+                        daemon: diag.daemon,
+                        network: diag.network,
+                        vpn_server: diag.vpn_server,
+                        internet: diag.internet,
+                    })
+                } else {
+                    parse_daemon_error(resp).await
+                }
+            }
+            DaemonRequest::PublicIp => {
+                let resp = self.http_get(ROUTE_PUBLIC_IP).await?;
+                if resp.status().is_success() {
+                    let body = read_body(resp).await?;
+                    let pip: PublicIpResponse =
+                        serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
+                    Ok(DaemonResponse::PublicIp {
+                        ip: pip.ip,
+                        country_code: pip.country_code,
+                    })
                 } else {
                     parse_daemon_error(resp).await
                 }

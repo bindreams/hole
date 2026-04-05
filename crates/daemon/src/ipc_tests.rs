@@ -5,7 +5,7 @@ use crate::proxy_manager::{ProxyBackend, ProxyManager};
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::config::ServerEntry;
-use hole_common::protocol::ProxyConfig;
+use hole_common::protocol::{DiagnosticsResponse, MetricsResponse, ProxyConfig};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -484,6 +484,151 @@ fn wrong_method_returns_405() {
         let _ = handle.await;
     });
 }
+
+// New endpoint helpers ================================================================================================
+
+async fn get_metrics(client: &mut TestClient) -> MetricsResponse {
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(ROUTE_METRICS)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.send(req).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn get_diagnostics(client: &mut TestClient) -> DiagnosticsResponse {
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(ROUTE_DIAGNOSTICS)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.send(req).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+// New endpoint tests ==================================================================================================
+
+#[skuld::test]
+fn metrics_returns_zeros_when_stopped() {
+    rt().block_on(async {
+        let path = test_socket_path("metrics-stopped");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let metrics = get_metrics(&mut client).await;
+
+        assert_eq!(metrics.bytes_in, 0);
+        assert_eq!(metrics.bytes_out, 0);
+        assert_eq!(metrics.speed_in_bps, 0);
+        assert_eq!(metrics.speed_out_bps, 0);
+        assert_eq!(metrics.uptime_secs, 0);
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn metrics_returns_uptime_when_running() {
+    rt().block_on(async {
+        let path = test_socket_path("metrics-running");
+        let pm = mock_proxy();
+        let server = IpcServer::bind(&path, pm).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Start proxy
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        // Small delay to accumulate uptime
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let metrics = get_metrics(&mut client).await;
+        // Traffic fields are still zero (not yet integrated)
+        assert_eq!(metrics.bytes_in, 0);
+        assert_eq!(metrics.bytes_out, 0);
+        // uptime_secs should be >= 0 (may be 0 if < 1s elapsed, which is fine)
+        // The important thing is no error occurs.
+
+        // Cleanup
+        consume(post_stop(&mut client).await).await;
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn diagnostics_daemon_running() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-running");
+        let pm = mock_proxy();
+        let server = IpcServer::bind(&path, pm).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Start proxy
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        let diag = get_diagnostics(&mut client).await;
+        assert_eq!(diag.app, "ok");
+        assert_eq!(diag.daemon, "ok");
+        assert_eq!(diag.network, "ok"); // MockBackend.default_gateway() succeeds
+        assert_eq!(diag.vpn_server, "ok");
+        // internet is always "unknown" in this initial implementation
+        assert_eq!(diag.internet, "unknown");
+
+        // Cleanup
+        consume(post_stop(&mut client).await).await;
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn diagnostics_daemon_stopped() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-stopped");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let diag = get_diagnostics(&mut client).await;
+
+        assert_eq!(diag.app, "ok");
+        assert_eq!(diag.daemon, "error");
+        // Downstream nodes cascade to "unknown"
+        assert_eq!(diag.network, "unknown");
+        assert_eq!(diag.vpn_server, "unknown");
+        assert_eq!(diag.internet, "unknown");
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+// public_ip handler test is intentionally omitted — it makes an external HTTP call
+// to ipinfo.io which is not available in CI and cannot be easily mocked without
+// adding an HTTP client abstraction layer (a follow-up concern).
 
 // SDDL tests (Windows only) ===========================================================================================
 

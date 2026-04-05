@@ -6,18 +6,31 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
-    EmptyResponse, ErrorResponse, ProxyConfig, StatusResponse, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, PublicIpResponse, StatusResponse,
+    ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 #[allow(unused_imports)]
 use tracing::warn;
 use tracing::{debug, error, info};
+
+// IPC state ===========================================================================================================
+
+/// Shared state for IPC handlers, holding the proxy manager and an IP cache.
+pub struct IpcState<B: ProxyBackend> {
+    pub proxy: Arc<Mutex<ProxyManager<B>>>,
+    pub ip_cache: Arc<tokio::sync::Mutex<Option<(PublicIpResponse, Instant)>>>,
+}
+
+/// IP cache time-to-live.
+const IP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Server ==============================================================================================================
 
@@ -46,7 +59,11 @@ impl IpcServer {
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
-        let router = build_router(proxy);
+        let state = Arc::new(IpcState {
+            proxy,
+            ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let router = build_router(state);
         Ok(Self {
             listener,
             router,
@@ -123,22 +140,23 @@ where
 
 // Router ==============================================================================================================
 
-fn build_router<B: ProxyBackend + 'static>(proxy: Arc<Mutex<ProxyManager<B>>>) -> axum::Router {
+fn build_router<B: ProxyBackend + 'static>(state: Arc<IpcState<B>>) -> axum::Router {
     axum::Router::new()
         .route(ROUTE_STATUS, axum::routing::get(handle_status::<B>))
         .route(ROUTE_START, axum::routing::post(handle_start::<B>))
         .route(ROUTE_STOP, axum::routing::post(handle_stop::<B>))
         .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<B>))
+        .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<B>))
+        .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<B>))
+        .route(ROUTE_PUBLIC_IP, axum::routing::get(handle_public_ip::<B>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
-        .with_state(proxy)
+        .with_state(state)
 }
 
 // Handlers ============================================================================================================
 
-async fn handle_status<B: ProxyBackend + 'static>(
-    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
-) -> Json<StatusResponse> {
-    let mut pm = proxy.lock().await;
+async fn handle_status<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<StatusResponse> {
+    let mut pm = state.proxy.lock().await;
     pm.check_health();
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
@@ -148,10 +166,10 @@ async fn handle_status<B: ProxyBackend + 'static>(
 }
 
 async fn handle_start<B: ProxyBackend + 'static>(
-    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    State(state): State<Arc<IpcState<B>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = proxy.lock().await;
+    let mut pm = state.proxy.lock().await;
     match pm.start(&config).await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => Err((
@@ -162,9 +180,9 @@ async fn handle_start<B: ProxyBackend + 'static>(
 }
 
 async fn handle_stop<B: ProxyBackend + 'static>(
-    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    State(state): State<Arc<IpcState<B>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = proxy.lock().await;
+    let mut pm = state.proxy.lock().await;
     match pm.stop().await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => Err((
@@ -175,10 +193,10 @@ async fn handle_stop<B: ProxyBackend + 'static>(
 }
 
 async fn handle_reload<B: ProxyBackend + 'static>(
-    State(proxy): State<Arc<Mutex<ProxyManager<B>>>>,
+    State(state): State<Arc<IpcState<B>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = proxy.lock().await;
+    let mut pm = state.proxy.lock().await;
     match pm.reload(&config).await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => Err((
@@ -186,6 +204,124 @@ async fn handle_reload<B: ProxyBackend + 'static>(
             Json(ErrorResponse { message: e.to_string() }),
         )),
     }
+}
+
+// New handlers ========================================================================================================
+
+async fn handle_metrics<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<MetricsResponse> {
+    let mut pm = state.proxy.lock().await;
+    pm.check_health();
+    Json(MetricsResponse {
+        bytes_in: 0,
+        bytes_out: 0,
+        speed_in_bps: 0,
+        speed_out_bps: 0,
+        uptime_secs: pm.uptime_secs(),
+    })
+}
+
+async fn handle_diagnostics<B: ProxyBackend + 'static>(
+    State(state): State<Arc<IpcState<B>>>,
+) -> Json<DiagnosticsResponse> {
+    let mut pm = state.proxy.lock().await;
+    pm.check_health();
+
+    // App is always ok — we are responding to the request.
+    let app = "ok".to_string();
+
+    // Daemon is ok if the proxy is running.
+    let daemon = if pm.state() == ProxyState::Running {
+        "ok".to_string()
+    } else {
+        "error".to_string()
+    };
+
+    // Network: cascade from daemon. If daemon is down, network is unknown.
+    // If daemon is up, check default gateway reachability.
+    let network = if daemon != "ok" {
+        "unknown".to_string()
+    } else {
+        match pm.backend().default_gateway() {
+            Ok(_) => "ok".to_string(),
+            Err(_) => "error".to_string(),
+        }
+    };
+
+    // VPN server: cascade from network. If network is not ok, vpn_server is unknown.
+    // If network is ok and proxy is running, vpn_server is ok.
+    let vpn_server = if network != "ok" {
+        "unknown".to_string()
+    } else {
+        "ok".to_string()
+    };
+
+    // Internet: always "unknown" in this initial implementation — a real connectivity
+    // check (e.g. HTTPS probe through the tunnel) is a follow-up.
+    let internet = "unknown".to_string();
+
+    Json(DiagnosticsResponse {
+        app,
+        daemon,
+        network,
+        vpn_server,
+        internet,
+    })
+}
+
+async fn handle_public_ip<B: ProxyBackend + 'static>(
+    State(state): State<Arc<IpcState<B>>>,
+) -> Result<Json<PublicIpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check cache first.
+    {
+        let cache = state.ip_cache.lock().await;
+        if let Some((ref cached, instant)) = *cache {
+            if instant.elapsed() < IP_CACHE_TTL {
+                return Ok(Json(cached.clone()));
+            }
+        }
+    }
+
+    // Cache miss or expired — fetch from external service.
+    // ureq is blocking, so run in a blocking thread.
+    let result = tokio::task::spawn_blocking(|| -> Result<PublicIpResponse, String> {
+        let agent = ureq::Agent::new_with_defaults();
+        let body: serde_json::Value = agent
+            .get("https://ipinfo.io/json")
+            .call()
+            .map_err(|e| format!("IP lookup failed: {e}"))?
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("parse error: {e}"))?;
+
+        let ip = body["ip"]
+            .as_str()
+            .ok_or_else(|| "missing 'ip' field".to_string())?
+            .to_string();
+        let country_code = body["country"]
+            .as_str()
+            .ok_or_else(|| "missing 'country' field".to_string())?
+            .to_string();
+
+        Ok(PublicIpResponse { ip, country_code })
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("task join error: {e}"),
+            }),
+        )
+    })?
+    .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ErrorResponse { message: e })))?;
+
+    // Update cache.
+    {
+        let mut cache = state.ip_cache.lock().await;
+        *cache = Some((result.clone(), Instant::now()));
+    }
+
+    Ok(Json(result))
 }
 
 // Security ============================================================================================================
