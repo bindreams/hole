@@ -5,6 +5,7 @@
 import { initSections } from "./sections.js";
 import { initServers, renderServers } from "./servers.js";
 import { initFilters, renderFilters } from "./filters.js";
+import { initSettings, renderSettings } from "./settings.js";
 import {
   initSidebar,
   updateMetrics,
@@ -33,6 +34,7 @@ export async function loadConfig() {
     dirty = false;
     renderServers();
     renderFilters();
+    renderSettings();
   } catch (err) {
     console.error("loadConfig failed:", err);
   }
@@ -132,6 +134,7 @@ async function init() {
   initSections();
   initServers();
   initFilters();
+  initSettings();
   initSidebar();
 
   // Load config from backend.
