@@ -176,8 +176,13 @@ body {
 
 /* OverlayScrollbars custom theme — copies the layout vars from the
 upstream os-theme-dark and maps the handle colors to our --scrollbar
-token so it adapts to dark/light theme via [data-theme] automatically. */
-.os-theme-hole {
+token so it adapts to dark/light theme via [data-theme] automatically.
+Compound selector (`.os-scrollbar.os-theme-hole`) is required so this
+beats the upstream `.os-scrollbar { --os-size: 0; ... }` defaults — both
+are loaded as <style> tags and the upstream one is injected by Vite at
+runtime AFTER style.css, so equal-specificity rules would lose source
+order. (0,2,0) > (0,1,0). */
+.os-scrollbar.os-theme-hole {
   box-sizing: border-box;
   --os-size: 8px;
   --os-padding-perpendicular: 2px;
