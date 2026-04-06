@@ -572,7 +572,7 @@ fn metrics_returns_uptime_when_running() {
 }
 
 #[skuld::test]
-fn diagnostics_daemon_running() {
+fn diagnostics_bridge_running() {
     rt().block_on(async {
         let path = test_socket_path("diag-running");
         let pm = mock_proxy();
@@ -588,7 +588,7 @@ fn diagnostics_daemon_running() {
 
         let diag = get_diagnostics(&mut client).await;
         assert_eq!(diag.app, "ok");
-        assert_eq!(diag.daemon, "ok");
+        assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok"); // MockBackend.default_gateway() succeeds
         assert_eq!(diag.vpn_server, "ok");
         // internet is always "unknown" in this initial implementation
@@ -603,7 +603,7 @@ fn diagnostics_daemon_running() {
 }
 
 #[skuld::test]
-fn diagnostics_daemon_stopped() {
+fn diagnostics_bridge_stopped() {
     rt().block_on(async {
         let path = test_socket_path("diag-stopped");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
@@ -615,7 +615,7 @@ fn diagnostics_daemon_stopped() {
         let diag = get_diagnostics(&mut client).await;
 
         assert_eq!(diag.app, "ok");
-        assert_eq!(diag.daemon, "error");
+        assert_eq!(diag.bridge, "error");
         // Downstream nodes cascade to "unknown"
         assert_eq!(diag.network, "unknown");
         assert_eq!(diag.vpn_server, "unknown");

@@ -21,71 +21,71 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-// DaemonRequest/DaemonResponse JSON serialization (used by elevation flow) --------------------------------------------
+// BridgeRequest/BridgeResponse JSON serialization (used by elevation flow) --------------------------------------------
 
 #[skuld::test]
-fn daemon_request_start_json_roundtrip() {
-    let req = DaemonRequest::Start {
+fn bridge_request_start_json_roundtrip() {
+    let req = BridgeRequest::Start {
         config: sample_config(),
     };
     let json = serde_json::to_vec(&req).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn daemon_request_stop_json_roundtrip() {
-    let req = DaemonRequest::Stop;
+fn bridge_request_stop_json_roundtrip() {
+    let req = BridgeRequest::Stop;
     let json = serde_json::to_vec(&req).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn daemon_request_status_json_roundtrip() {
-    let req = DaemonRequest::Status;
+fn bridge_request_status_json_roundtrip() {
+    let req = BridgeRequest::Status;
     let json = serde_json::to_vec(&req).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn daemon_request_reload_json_roundtrip() {
-    let req = DaemonRequest::Reload {
+fn bridge_request_reload_json_roundtrip() {
+    let req = BridgeRequest::Reload {
         config: sample_config(),
     };
     let json = serde_json::to_vec(&req).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
 }
 
 #[skuld::test]
-fn daemon_response_ack_json_roundtrip() {
-    let resp = DaemonResponse::Ack;
+fn bridge_response_ack_json_roundtrip() {
+    let resp = BridgeResponse::Ack;
     let json = serde_json::to_vec(&resp).unwrap();
-    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
 #[skuld::test]
-fn daemon_response_status_json_roundtrip() {
-    let resp = DaemonResponse::Status {
+fn bridge_response_status_json_roundtrip() {
+    let resp = BridgeResponse::Status {
         running: true,
         uptime_secs: 3600,
         error: Some("minor issue".to_string()),
     };
     let json = serde_json::to_vec(&resp).unwrap();
-    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
 #[skuld::test]
-fn daemon_response_error_json_roundtrip() {
-    let resp = DaemonResponse::Error {
+fn bridge_response_error_json_roundtrip() {
+    let resp = BridgeResponse::Error {
         message: "port in use".to_string(),
     };
     let json = serde_json::to_vec(&resp).unwrap();
-    let decoded: DaemonResponse = serde_json::from_slice(&json).unwrap();
+    let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
 }
 
@@ -184,7 +184,7 @@ fn metrics_response_roundtrips() {
 fn diagnostics_response_roundtrips() {
     let resp = DiagnosticsResponse {
         app: "ok".to_string(),
-        daemon: "ok".to_string(),
+        bridge: "ok".to_string(),
         network: "ok".to_string(),
         vpn_server: "ok".to_string(),
         internet: "unknown".to_string(),
@@ -215,32 +215,32 @@ fn route_constants_for_new_endpoints_exist() {
 // Protocol variant roundtrips -----------------------------------------------------------------------------------------
 
 #[skuld::test]
-fn daemon_request_metrics_roundtrips() {
-    let req = DaemonRequest::Metrics;
+fn bridge_request_metrics_roundtrips() {
+    let req = BridgeRequest::Metrics;
     let json = serde_json::to_string(&req).unwrap();
-    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(req, parsed);
 }
 
 #[skuld::test]
-fn daemon_request_diagnostics_roundtrips() {
-    let req = DaemonRequest::Diagnostics;
+fn bridge_request_diagnostics_roundtrips() {
+    let req = BridgeRequest::Diagnostics;
     let json = serde_json::to_string(&req).unwrap();
-    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(req, parsed);
 }
 
 #[skuld::test]
-fn daemon_request_public_ip_roundtrips() {
-    let req = DaemonRequest::PublicIp;
+fn bridge_request_public_ip_roundtrips() {
+    let req = BridgeRequest::PublicIp;
     let json = serde_json::to_string(&req).unwrap();
-    let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(req, parsed);
 }
 
 #[skuld::test]
-fn daemon_response_metrics_roundtrips() {
-    let resp = DaemonResponse::Metrics {
+fn bridge_response_metrics_roundtrips() {
+    let resp = BridgeResponse::Metrics {
         bytes_in: 100,
         bytes_out: 50,
         speed_in_bps: 1024,
@@ -248,31 +248,31 @@ fn daemon_response_metrics_roundtrips() {
         uptime_secs: 60,
     };
     let json = serde_json::to_string(&resp).unwrap();
-    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp, parsed);
 }
 
 #[skuld::test]
-fn daemon_response_diagnostics_roundtrips() {
-    let resp = DaemonResponse::Diagnostics {
+fn bridge_response_diagnostics_roundtrips() {
+    let resp = BridgeResponse::Diagnostics {
         app: "ok".to_string(),
-        daemon: "ok".to_string(),
+        bridge: "ok".to_string(),
         network: "error".to_string(),
         vpn_server: "unknown".to_string(),
         internet: "unknown".to_string(),
     };
     let json = serde_json::to_string(&resp).unwrap();
-    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp, parsed);
 }
 
 #[skuld::test]
-fn daemon_response_public_ip_roundtrips() {
-    let resp = DaemonResponse::PublicIp {
+fn bridge_response_public_ip_roundtrips() {
+    let resp = BridgeResponse::PublicIp {
         ip: "1.2.3.4".to_string(),
         country_code: "US".to_string(),
     };
     let json = serde_json::to_string(&resp).unwrap();
-    let parsed: DaemonResponse = serde_json::from_str(&json).unwrap();
+    let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp, parsed);
 }

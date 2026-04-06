@@ -8,7 +8,7 @@ use super::*;
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn build_cmdline_simple_args() {
-    build_cmdline(&["daemon", "install"]);
+    build_cmdline(&["bridge", "install"]);
 }
 
 #[cfg(target_os = "windows")]
@@ -99,19 +99,19 @@ fn build_cmdline_multiple_empty_args() {
 // Status detection ====================================================================================================
 
 #[skuld::test]
-fn daemon_install_status_returns_a_value() {
-    // On a dev machine the daemon is typically not installed,
+fn bridge_install_status_returns_a_value() {
+    // On a dev machine the bridge is typically not installed,
     // but we just verify the function runs without panicking.
-    let status = daemon_install_status();
+    let status = bridge_install_status();
     // Should be one of the three variants
     assert!(matches!(
         status,
-        DaemonInstallStatus::Running | DaemonInstallStatus::Installed | DaemonInstallStatus::NotInstalled
+        BridgeInstallStatus::Running | BridgeInstallStatus::Installed | BridgeInstallStatus::NotInstalled
     ));
 }
 
 #[skuld::test]
-fn daemon_binary_path_resolves() {
-    let path = daemon_binary_path().expect("should resolve current exe");
+fn bridge_binary_path_resolves() {
+    let path = bridge_binary_path().expect("should resolve current exe");
     assert!(path.exists(), "resolved path should exist: {path:?}");
 }

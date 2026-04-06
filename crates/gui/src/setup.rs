@@ -1,4 +1,4 @@
-// Daemon installation status detection and privilege elevation.
+// Bridge installation status detection and privilege elevation.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -6,9 +6,9 @@ use thiserror::Error;
 
 // Status detection ====================================================================================================
 
-/// Installation state of the daemon service.
+/// Installation state of the bridge service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonInstallStatus {
+pub enum BridgeInstallStatus {
     /// Service is registered and currently running.
     Running,
     /// Service is registered but not currently running.
@@ -17,15 +17,15 @@ pub enum DaemonInstallStatus {
     NotInstalled,
 }
 
-/// Query the current daemon installation status.
-pub fn daemon_install_status() -> DaemonInstallStatus {
-    if !hole_daemon::platform::os::is_installed() {
-        return DaemonInstallStatus::NotInstalled;
+/// Query the current bridge installation status.
+pub fn bridge_install_status() -> BridgeInstallStatus {
+    if !hole_bridge::platform::os::is_installed() {
+        return BridgeInstallStatus::NotInstalled;
     }
-    if hole_daemon::platform::os::is_running() {
-        DaemonInstallStatus::Running
+    if hole_bridge::platform::os::is_running() {
+        BridgeInstallStatus::Running
     } else {
-        DaemonInstallStatus::Installed
+        BridgeInstallStatus::Installed
     }
 }
 
@@ -45,8 +45,8 @@ pub enum SetupError {
     Windows(#[from] windows::core::Error),
 }
 
-/// Resolve the path to the daemon binary (which is ourselves).
-pub fn daemon_binary_path() -> std::io::Result<PathBuf> {
+/// Resolve the path to the bridge binary (which is ourselves).
+pub fn bridge_binary_path() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     // Canonicalize to resolve symlinks and \\?\ prefixes
     std::fs::canonicalize(&exe)
@@ -237,30 +237,30 @@ fn shell_escape(s: &str) -> String {
 
 // Install/uninstall orchestration =====================================================================================
 
-/// Run `daemon install` — idempotent, handles upgrades.
-pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    let binary_path = daemon_binary_path()?;
+/// Run `bridge install` — idempotent, handles upgrades.
+pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    let binary_path = bridge_binary_path()?;
 
     // Create data directories
-    hole_daemon::logging::ensure_log_dir()?;
+    hole_bridge::logging::ensure_log_dir()?;
 
-    // Create access group and add installing user (before daemon starts,
-    // so the daemon can set socket/pipe permissions using the group)
-    hole_daemon::group::create_group()?;
-    match hole_daemon::group::installing_username() {
+    // Create access group and add installing user (before bridge starts,
+    // so the bridge can set socket/pipe permissions using the group)
+    hole_bridge::group::create_group()?;
+    match hole_bridge::group::installing_username() {
         Ok(user) => {
-            hole_daemon::group::add_user_to_group(&user)?;
-            eprintln!("added user '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+            hole_bridge::group::add_user_to_group(&user)?;
+            eprintln!("added user '{user}' to '{}' group", hole_bridge::group::GROUP_NAME);
 
-            // Write the installing user's SID so the daemon can add it to the
+            // Write the installing user's SID so the bridge can add it to the
             // socket DACL on first startup. This works around the Windows token
             // snapshot limitation: group membership changes are not reflected in
             // running processes until re-login, but a user's own SID is always
             // present in their token.
             #[cfg(target_os = "windows")]
-            match hole_daemon::group::lookup_sid(&user) {
+            match hole_bridge::group::lookup_sid(&user) {
                 Ok(sid) => {
-                    let sid_path = hole_daemon::ipc::installer_user_sid_path();
+                    let sid_path = hole_bridge::ipc::installer_user_sid_path();
                     if let Some(parent) = sid_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -277,91 +277,91 @@ pub fn install_daemon() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Idempotent: if already installed, stop and uninstall first
-    if hole_daemon::platform::os::is_installed() {
-        eprintln!("daemon already installed, reinstalling...");
-        let _ = hole_daemon::platform::os::stop();
-        let _ = hole_daemon::platform::os::uninstall();
+    if hole_bridge::platform::os::is_installed() {
+        eprintln!("bridge already installed, reinstalling...");
+        let _ = hole_bridge::platform::os::stop();
+        let _ = hole_bridge::platform::os::uninstall();
     }
 
     // Install and start
-    hole_daemon::platform::os::install(&binary_path)?;
-    // On macOS, install() already bootstraps with RunAtLoad=true, so the daemon starts automatically.
+    hole_bridge::platform::os::install(&binary_path)?;
+    // On macOS, install() already bootstraps with RunAtLoad=true, so the bridge starts automatically.
     // On Windows, we need to explicitly start the service.
     #[cfg(target_os = "windows")]
-    hole_daemon::platform::os::start()?;
+    hole_bridge::platform::os::start()?;
 
-    eprintln!("daemon installed and started");
+    eprintln!("bridge installed and started");
     Ok(())
 }
 
-/// Run `daemon uninstall`.
-pub fn uninstall_daemon() -> Result<(), Box<dyn std::error::Error>> {
-    if !hole_daemon::platform::os::is_installed() {
-        eprintln!("daemon is not installed");
+/// Run `bridge uninstall`.
+pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    if !hole_bridge::platform::os::is_installed() {
+        eprintln!("bridge is not installed");
         return Ok(());
     }
 
-    hole_daemon::platform::os::uninstall()?;
+    hole_bridge::platform::os::uninstall()?;
 
     // Remove socket file
-    let _ = std::fs::remove_file(hole_common::protocol::default_daemon_socket_path());
+    let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
 
     // Best-effort: remove the access group
-    let _ = hole_daemon::group::delete_group();
+    let _ = hole_bridge::group::delete_group();
 
-    eprintln!("daemon uninstalled");
+    eprintln!("bridge uninstalled");
     Ok(())
 }
 
 // GUI launch check ====================================================================================================
 
-/// Check daemon status at GUI launch and prompt for installation if needed.
+/// Check bridge status at GUI launch and prompt for installation if needed.
 ///
 /// This runs asynchronously to avoid blocking the Tauri event loop.
-pub fn check_daemon_on_launch(app: tauri::AppHandle) {
-    // In dev mode (HOLE_DAEMON_SOCKET set), the daemon runs in foreground
+pub fn check_bridge_on_launch(app: tauri::AppHandle) {
+    // In dev mode (HOLE_BRIDGE_SOCKET set), the bridge runs in foreground
     // rather than as an installed service. Skip the install check.
-    if std::env::var("HOLE_DAEMON_SOCKET").is_ok() {
-        tracing::info!("HOLE_DAEMON_SOCKET set, skipping daemon install check");
+    if std::env::var("HOLE_BRIDGE_SOCKET").is_ok() {
+        tracing::info!("HOLE_BRIDGE_SOCKET set, skipping bridge install check");
         return;
     }
 
-    let status = daemon_install_status();
+    let status = bridge_install_status();
 
     match status {
-        DaemonInstallStatus::Running => {
-            tracing::info!("daemon is running");
+        BridgeInstallStatus::Running => {
+            tracing::info!("bridge is running");
         }
-        DaemonInstallStatus::Installed => {
-            tracing::warn!("daemon is installed but not running");
+        BridgeInstallStatus::Installed => {
+            tracing::warn!("bridge is installed but not running");
             // The service has auto-start; it should start on its own.
             // Just log and continue.
         }
-        DaemonInstallStatus::NotInstalled => {
-            tracing::info!("daemon not installed, prompting user");
+        BridgeInstallStatus::NotInstalled => {
+            tracing::info!("bridge not installed, prompting user");
             tauri::async_runtime::spawn(async move {
-                prompt_daemon_install(app).await;
+                prompt_bridge_install(app).await;
             });
         }
     }
 }
 
-async fn prompt_daemon_install(app: tauri::AppHandle) {
+async fn prompt_bridge_install(app: tauri::AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let confirmed = app
         .dialog()
-        .message("The Hole daemon is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)")
+        .message("The Hole bridge is not installed. It is required for the transparent proxy to work.\n\nInstall it now? (requires administrator privileges)")
         .title("Hole — First-Time Setup")
         .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
         .blocking_show();
 
     if !confirmed {
-        tracing::info!("user declined daemon install");
+        tracing::info!("user declined bridge install");
         return;
     }
 
-    let exe = match daemon_binary_path() {
+    let exe = match bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::error!("cannot resolve binary path: {e}");
@@ -374,22 +374,22 @@ async fn prompt_daemon_install(app: tauri::AppHandle) {
     };
 
     // Run elevated install on a blocking thread
-    let result = tokio::task::spawn_blocking(move || run_elevated(&exe, &["daemon", "install"])).await;
+    let result = tokio::task::spawn_blocking(move || run_elevated(&exe, &["bridge", "install"])).await;
 
     match result {
         Ok(Ok(status)) if status.success() => {
-            tracing::info!("daemon installed successfully via elevation");
-            // Poll IPC to verify daemon is reachable
-            let reachable = poll_daemon_ipc().await;
+            tracing::info!("bridge installed successfully via elevation");
+            // Poll IPC to verify bridge is reachable
+            let reachable = poll_bridge_ipc().await;
             if !reachable {
-                tracing::warn!("daemon installed but not yet reachable via IPC");
+                tracing::warn!("bridge installed but not yet reachable via IPC");
             }
         }
         Ok(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
-            tracing::error!("daemon install exited with code {code}");
+            tracing::error!("bridge install exited with code {code}");
             app.dialog()
-                .message(format!("Daemon installation failed (exit code {code})."))
+                .message(format!("Bridge installation failed (exit code {code})."))
                 .title("Setup Error")
                 .blocking_show();
         }
@@ -409,17 +409,17 @@ async fn prompt_daemon_install(app: tauri::AppHandle) {
     }
 }
 
-/// Poll the daemon IPC socket to check if it's reachable after install.
-async fn poll_daemon_ipc() -> bool {
-    use crate::daemon_client::DaemonClient;
-    use hole_common::protocol::DaemonRequest;
+/// Poll the bridge IPC socket to check if it's reachable after install.
+async fn poll_bridge_ipc() -> bool {
+    use crate::bridge_client::BridgeClient;
+    use hole_common::protocol::BridgeRequest;
 
-    let socket_path = hole_common::protocol::default_daemon_socket_path();
+    let socket_path = hole_common::protocol::default_bridge_socket_path();
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        if let Ok(mut client) = DaemonClient::connect(&socket_path).await {
-            if client.send(DaemonRequest::Status).await.is_ok() {
+        if let Ok(mut client) = BridgeClient::connect(&socket_path).await {
+            if client.send(BridgeRequest::Status).await.is_ok() {
                 return true;
             }
         }

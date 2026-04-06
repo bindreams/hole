@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 hole-common = { path = "../common" }
-hole-daemon = { path = "../daemon" }
+hole-bridge = { path = "../bridge" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"

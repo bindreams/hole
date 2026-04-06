@@ -15,9 +15,9 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 // Constants ===========================================================================================================
 
-pub const SERVICE_NAME: &str = "HoleDaemon";
-pub const SERVICE_DISPLAY_NAME: &str = "Hole Daemon";
-pub const SERVICE_DESCRIPTION: &str = "Transparent proxy daemon for the Hole application";
+pub const SERVICE_NAME: &str = "HoleBridge";
+pub const SERVICE_DISPLAY_NAME: &str = "Hole Bridge";
+pub const SERVICE_DESCRIPTION: &str = "Transparent proxy bridge for the Hole application";
 
 // Service entry =======================================================================================================
 
@@ -26,7 +26,7 @@ static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
 pub fn run(socket_path: &Path) -> Result<(), windows_service::Error> {
-    let default = hole_common::protocol::default_daemon_socket_path();
+    let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
     }
@@ -86,7 +86,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let socket_path = SOCKET_PATH_OVERRIDE
             .get()
             .cloned()
-            .unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
+            .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
         let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
 
         tokio::select! {
@@ -110,7 +110,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Err(e) = &run_result {
-        error!(error = %e, "daemon runtime error");
+        error!(error = %e, "bridge runtime error");
     }
 
     // Always report stopped to SCM, even on error.
@@ -131,9 +131,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
 // Install/uninstall ===================================================================================================
 
-/// Install the daemon as a Windows Service.
+/// Install the bridge as a Windows Service.
 ///
-/// The service is registered to run `<binary_path> daemon run` with auto-start.
+/// The service is registered to run `<binary_path> bridge run` with auto-start.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -147,7 +147,7 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: binary_path.to_path_buf(),
-        launch_arguments: vec!["daemon".into(), "run".into()],
+        launch_arguments: vec!["bridge".into(), "run".into()],
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -160,7 +160,7 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     Ok(())
 }
 
-/// Stop and uninstall the daemon Windows Service.
+/// Stop and uninstall the bridge Windows Service.
 pub fn uninstall() -> Result<(), windows_service::Error> {
     // Stop first (ignore errors — service may not be running)
     let _ = stop();

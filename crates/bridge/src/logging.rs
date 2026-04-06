@@ -1,4 +1,4 @@
-// Daemon logging initialization.
+// Bridge logging initialization.
 
 use std::io;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-/// Returns the daemon log directory path.
+/// Returns the bridge log directory path.
 pub fn log_dir() -> PathBuf {
     if cfg!(target_os = "windows") {
         PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into()))
@@ -34,20 +34,20 @@ pub fn ensure_log_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Initialize daemon logging (rolling daily file appender).
+/// Initialize bridge logging (rolling daily file appender).
 ///
 /// Creates the log directory with restricted permissions, then sets up a
 /// rolling daily file appender.  Returns a guard that must be held for the
-/// lifetime of the daemon process; dropping it flushes and closes the log file.
+/// lifetime of the bridge process; dropping it flushes and closes the log file.
 pub fn init() -> io::Result<WorkerGuard> {
     let dir = ensure_log_dir()?;
 
-    let file_appender = tracing_appender::rolling::daily(&dir, "hole-daemon.log");
+    let file_appender = tracing_appender::rolling::daily(&dir, "hole-bridge.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("hole_daemon=info".parse().expect("valid tracing directive")),
+            EnvFilter::from_default_env().add_directive("hole_bridge=info".parse().expect("valid tracing directive")),
         )
         .with_writer(non_blocking)
         .init();
@@ -55,7 +55,7 @@ pub fn init() -> io::Result<WorkerGuard> {
     Ok(guard)
 }
 
-/// Initialize daemon logging for foreground/dev mode (log to stderr).
+/// Initialize bridge logging for foreground/dev mode (log to stderr).
 ///
 /// The returned `WorkerGuard` must be held for the lifetime of the process;
 /// dropping it flushes pending writes. Callers should bind it in the same
@@ -64,7 +64,7 @@ pub fn init_foreground() -> WorkerGuard {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("hole_daemon=debug".parse().expect("valid tracing directive")),
+            EnvFilter::from_default_env().add_directive("hole_bridge=debug".parse().expect("valid tracing directive")),
         )
         .with_writer(non_blocking)
         .init();

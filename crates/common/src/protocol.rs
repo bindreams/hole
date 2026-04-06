@@ -15,7 +15,7 @@ pub use api_generated::*;
 /// (base64 CLI serialization). Not part of the wire protocol — the client
 /// maps variants to HTTP endpoints internally.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum DaemonRequest {
+pub enum BridgeRequest {
     Start { config: ProxyConfig },
     Stop,
     Status,
@@ -29,7 +29,7 @@ pub enum DaemonRequest {
 /// Not part of the wire protocol — the client maps HTTP responses back to
 /// these variants internally.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub enum DaemonResponse {
+pub enum BridgeResponse {
     Ack,
     Status {
         running: bool,
@@ -48,7 +48,7 @@ pub enum DaemonResponse {
     },
     Diagnostics {
         app: String,
-        daemon: String,
+        bridge: String,
         network: String,
         vpn_server: String,
         internet: String,
@@ -67,24 +67,24 @@ pub struct ProxyConfig {
 
 // Constants ===========================================================================================================
 
-/// Default daemon socket path.
-pub fn default_daemon_socket_path() -> PathBuf {
+/// Default bridge socket path.
+pub fn default_bridge_socket_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        PathBuf::from("/var/run/hole-daemon.sock")
+        PathBuf::from("/var/run/hole-bridge.sock")
     }
     #[cfg(target_os = "windows")]
     {
         PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
             .join("hole")
-            .join("hole-daemon.sock")
+            .join("hole-bridge.sock")
     }
 }
 
-/// Actionable instructions shown when a client is denied access to the daemon.
+/// Actionable instructions shown when a client is denied access to the bridge.
 /// Both platform instructions are always printed regardless of the current OS.
 pub const PERMISSION_DENIED_HELP: &str = "\
-error: permission denied — you are not authorized to control the Hole daemon.
+error: permission denied — you are not authorized to control the Hole bridge.
 
 How to fix:
 

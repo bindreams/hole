@@ -1,8 +1,8 @@
-// IPC client to hole-daemon — HTTP/1.1 over local Unix domain socket.
+// IPC client to hole-bridge — HTTP/1.1 over local Unix domain socket.
 
 use bytes::Bytes;
 use hole_common::protocol::{
-    DaemonRequest, DaemonResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, PublicIpResponse,
+    BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, PublicIpResponse,
     StatusResponse, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS,
     ROUTE_STOP,
 };
@@ -19,7 +19,7 @@ const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MiB
 
 #[derive(Debug, Error)]
 pub enum ClientError {
-    #[error("permission denied: insufficient privileges to connect to the Hole daemon")]
+    #[error("permission denied: insufficient privileges to connect to the Hole bridge")]
     PermissionDenied,
     #[error("connection error: {0}")]
     Connection(#[source] std::io::Error),
@@ -31,24 +31,24 @@ pub enum ClientError {
 
 // Client ==============================================================================================================
 
-/// IPC client that connects to the daemon's local socket and speaks HTTP/1.1.
-pub struct DaemonClient {
+/// IPC client that connects to the bridge's local socket and speaks HTTP/1.1.
+pub struct BridgeClient {
     sender: http1::SendRequest<Full<Bytes>>,
     /// Background task driving the HTTP/1.1 connection. Aborted on drop.
     conn_task: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for DaemonClient {
+impl Drop for BridgeClient {
     fn drop(&mut self) {
         // abort() is safe from any context — it sets a non-blocking cancellation flag.
         self.conn_task.abort();
     }
 }
 
-impl DaemonClient {
-    /// Connect to the daemon at the given Unix domain socket path.
+impl BridgeClient {
+    /// Connect to the bridge at the given Unix domain socket path.
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
-        let stream = hole_daemon::socket::LocalStream::connect(path)
+        let stream = hole_bridge::socket::LocalStream::connect(path)
             .await
             .map_err(map_connect_error)?;
         Self::handshake(stream).await
@@ -73,58 +73,58 @@ impl DaemonClient {
 
     /// Send a request and wait for the response.
     ///
-    /// Maps `DaemonRequest` variants to HTTP endpoints, and HTTP responses
-    /// back to `DaemonResponse`.
-    pub async fn send(&mut self, req: DaemonRequest) -> Result<DaemonResponse, ClientError> {
+    /// Maps `BridgeRequest` variants to HTTP endpoints, and HTTP responses
+    /// back to `BridgeResponse`.
+    pub async fn send(&mut self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
         match req {
-            DaemonRequest::Status => {
+            BridgeRequest::Status => {
                 let resp = self.http_get(ROUTE_STATUS).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let status: StatusResponse =
                         serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    Ok(DaemonResponse::Status {
+                    Ok(BridgeResponse::Status {
                         running: status.running,
                         uptime_secs: status.uptime_secs,
                         error: status.error,
                     })
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::Start { config } => {
+            BridgeRequest::Start { config } => {
                 let body = serde_json::to_vec(&config).map_err(|e| ClientError::Protocol(e.to_string()))?;
                 let resp = self.http_post(ROUTE_START, body).await?;
                 if resp.status().is_success() {
-                    Ok(DaemonResponse::Ack)
+                    Ok(BridgeResponse::Ack)
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::Stop => {
+            BridgeRequest::Stop => {
                 let resp = self.http_post(ROUTE_STOP, Vec::new()).await?;
                 if resp.status().is_success() {
-                    Ok(DaemonResponse::Ack)
+                    Ok(BridgeResponse::Ack)
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::Reload { config } => {
+            BridgeRequest::Reload { config } => {
                 let body = serde_json::to_vec(&config).map_err(|e| ClientError::Protocol(e.to_string()))?;
                 let resp = self.http_post(ROUTE_RELOAD, body).await?;
                 if resp.status().is_success() {
-                    Ok(DaemonResponse::Ack)
+                    Ok(BridgeResponse::Ack)
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::Metrics => {
+            BridgeRequest::Metrics => {
                 let resp = self.http_get(ROUTE_METRICS).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let metrics: MetricsResponse =
                         serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    Ok(DaemonResponse::Metrics {
+                    Ok(BridgeResponse::Metrics {
                         bytes_in: metrics.bytes_in,
                         bytes_out: metrics.bytes_out,
                         speed_in_bps: metrics.speed_in_bps,
@@ -132,38 +132,38 @@ impl DaemonClient {
                         uptime_secs: metrics.uptime_secs,
                     })
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::Diagnostics => {
+            BridgeRequest::Diagnostics => {
                 let resp = self.http_get(ROUTE_DIAGNOSTICS).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let diag: DiagnosticsResponse =
                         serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    Ok(DaemonResponse::Diagnostics {
+                    Ok(BridgeResponse::Diagnostics {
                         app: diag.app,
-                        daemon: diag.daemon,
+                        bridge: diag.bridge,
                         network: diag.network,
                         vpn_server: diag.vpn_server,
                         internet: diag.internet,
                     })
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
-            DaemonRequest::PublicIp => {
+            BridgeRequest::PublicIp => {
                 let resp = self.http_get(ROUTE_PUBLIC_IP).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let pip: PublicIpResponse =
                         serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    Ok(DaemonResponse::PublicIp {
+                    Ok(BridgeResponse::PublicIp {
                         ip: pip.ip,
                         country_code: pip.country_code,
                     })
                 } else {
-                    parse_daemon_error(resp).await
+                    parse_bridge_error(resp).await
                 }
             }
         }
@@ -231,20 +231,20 @@ async fn read_body(resp: http::Response<hyper::body::Incoming>) -> Result<Bytes,
         .map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
-/// Map a non-success HTTP response to a `DaemonResponse::Error` (for 5xx)
+/// Map a non-success HTTP response to a `BridgeResponse::Error` (for 5xx)
 /// or a `ClientError::Protocol` (for unexpected status codes like 4xx).
-async fn parse_daemon_error(resp: http::Response<hyper::body::Incoming>) -> Result<DaemonResponse, ClientError> {
+async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Result<BridgeResponse, ClientError> {
     let status = resp.status();
     if status.is_server_error() {
-        // 5xx — daemon returned an operational error
+        // 5xx — bridge returned an operational error
         match read_body(resp).await {
             Ok(body) => {
                 let err: ErrorResponse = serde_json::from_slice(&body).unwrap_or(ErrorResponse {
                     message: "unknown error".to_string(),
                 });
-                Ok(DaemonResponse::Error { message: err.message })
+                Ok(BridgeResponse::Error { message: err.message })
             }
-            Err(_) => Ok(DaemonResponse::Error {
+            Err(_) => Ok(BridgeResponse::Error {
                 message: "failed to read error response".to_string(),
             }),
         }
@@ -255,5 +255,5 @@ async fn parse_daemon_error(resp: http::Response<hyper::body::Incoming>) -> Resu
 }
 
 #[cfg(test)]
-#[path = "daemon_client_tests.rs"]
-mod daemon_client_tests;
+#[path = "bridge_client_tests.rs"]
+mod bridge_client_tests;

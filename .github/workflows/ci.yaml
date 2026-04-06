@@ -138,8 +138,8 @@ jobs:
           foreach ($f in @("hole.exe", "v2ray-plugin.exe", "wintun.dll")) {
             if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
           }
-          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
-          if (!$svc) { throw "HoleDaemon service not registered" }
+          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
+          if (!$svc) { throw "HoleBridge service not registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
 
@@ -167,7 +167,7 @@ jobs:
         run: |
           $binDir = "C:\Program Files\hole\bin"
           if (Test-Path $binDir) { throw "$binDir still exists" }
-          $svc = Get-Service -Name HoleDaemon -ErrorAction SilentlyContinue
-          if ($svc) { throw "HoleDaemon service still registered" }
+          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
+          if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }

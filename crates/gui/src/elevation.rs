@@ -1,6 +1,6 @@
 // GUI elevation flow for permission-denied errors.
 //
-// When the daemon rejects a connection due to insufficient permissions,
+// When the bridge rejects a connection due to insufficient permissions,
 // this module shows a dialog and spawns a privileged helper to either
 // grant permanent access (add user to hole group) or proxy a single command.
 //
@@ -14,14 +14,14 @@
 // When the user is first added to the `hole` group (either at install time or
 // via `grant-access`), no running process will reflect that membership until
 // the user logs out and back in. To provide immediate access, the elevated
-// `grant-access` command adds the user's own SID directly to the daemon
+// `grant-access` command adds the user's own SID directly to the bridge
 // socket's DACL (a user's own SID is always present in their token). The
-// per-user SID is cleaned up on daemon restart, when the group membership
+// per-user SID is cleaned up on bridge restart, when the group membership
 // will have taken effect after re-login.
 
 use crate::setup;
 use crate::state::AppState;
-use hole_common::protocol::DaemonRequest;
+use hole_common::protocol::BridgeRequest;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tracing::{error, info, warn};
@@ -35,7 +35,7 @@ use tracing::{error, info, warn};
 /// dialog explaining the situation and offering permanent access. On subsequent
 /// encounters (`elevation_prompt_shown` is `true` in config), skips the dialog
 /// and goes directly to a UAC prompt via `ipc-send`.
-pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
+pub async fn prompt_elevation(app: &AppHandle, request: BridgeRequest) -> bool {
     let state = app.state::<AppState>();
 
     let already_shown = state.config.lock().unwrap().elevation_prompt_shown;
@@ -76,19 +76,19 @@ pub async fn prompt_elevation(app: &AppHandle, request: DaemonRequest) -> bool {
     run_ipc_send_elevated(app, &request).await
 }
 
-/// Base64-encode a DaemonRequest (test helper for the legacy `--base64` CLI flag).
+/// Base64-encode a BridgeRequest (test helper for the legacy `--base64` CLI flag).
 #[cfg(test)]
-pub fn encode_request(request: &DaemonRequest) -> String {
+pub fn encode_request(request: &BridgeRequest) -> String {
     use base64::Engine;
-    let json = serde_json::to_vec(request).expect("DaemonRequest serialization cannot fail");
+    let json = serde_json::to_vec(request).expect("BridgeRequest serialization cannot fail");
     base64::engine::general_purpose::STANDARD.encode(&json)
 }
 
-/// Write a DaemonRequest as JSON to a temp file with restrictive permissions.
+/// Write a BridgeRequest as JSON to a temp file with restrictive permissions.
 ///
 /// Returns a [`TempPath`] that auto-deletes the file on drop. The file handle is
 /// closed so the elevated subprocess can open it (required on Windows).
-fn write_request_file(request: &DaemonRequest) -> std::io::Result<tempfile::TempPath> {
+fn write_request_file(request: &BridgeRequest) -> std::io::Result<tempfile::TempPath> {
     use std::io::Write;
     let mut file = tempfile::NamedTempFile::new()?;
     serde_json::to_writer(&mut file, request).map_err(std::io::Error::other)?;
@@ -96,23 +96,23 @@ fn write_request_file(request: &DaemonRequest) -> std::io::Result<tempfile::Temp
     Ok(file.into_temp_path())
 }
 
-/// Read a DaemonRequest from a JSON file and delete it.
+/// Read a BridgeRequest from a JSON file and delete it.
 ///
 /// The file is deleted after reading as defense-in-depth (the writer's [`TempPath`]
 /// also deletes on drop, but the writer process may crash before cleanup).
-pub fn read_request_file(path: &std::path::Path) -> Result<DaemonRequest, String> {
+pub fn read_request_file(path: &std::path::Path) -> Result<BridgeRequest, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read request file {}: {e}", path.display()))?;
     let _ = std::fs::remove_file(path);
     serde_json::from_str(&content).map_err(|e| format!("invalid request JSON in {}: {e}", path.display()))
 }
 
-/// Spawn `hole daemon grant-access --then-send-file <path>` elevated.
+/// Spawn `hole bridge grant-access --then-send-file <path>` elevated.
 ///
 /// Combines group membership grant, DACL update, and IPC command proxy in a single
 /// elevated invocation (one UAC prompt).
-async fn run_grant_access_elevated(app: &AppHandle, request: &DaemonRequest) -> bool {
-    let exe = match setup::daemon_binary_path() {
+async fn run_grant_access_elevated(app: &AppHandle, request: &BridgeRequest) -> bool {
+    let exe = match setup::bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
             error!("cannot resolve binary path: {e}");
@@ -131,7 +131,7 @@ async fn run_grant_access_elevated(app: &AppHandle, request: &DaemonRequest) -> 
     let file_path = request_file.to_string_lossy().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let _keep_alive = request_file;
-        setup::run_elevated(&exe, &["daemon", "grant-access", "--then-send-file", &file_path])
+        setup::run_elevated(&exe, &["bridge", "grant-access", "--then-send-file", &file_path])
     })
     .await;
 
@@ -168,9 +168,9 @@ async fn run_grant_access_elevated(app: &AppHandle, request: &DaemonRequest) -> 
     }
 }
 
-/// Spawn `hole daemon ipc-send --request-file <path>` elevated.
-async fn run_ipc_send_elevated(_app: &AppHandle, request: &DaemonRequest) -> bool {
-    let exe = match setup::daemon_binary_path() {
+/// Spawn `hole bridge ipc-send --request-file <path>` elevated.
+async fn run_ipc_send_elevated(_app: &AppHandle, request: &BridgeRequest) -> bool {
+    let exe = match setup::bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
             error!("cannot resolve binary path: {e}");
@@ -189,7 +189,7 @@ async fn run_ipc_send_elevated(_app: &AppHandle, request: &DaemonRequest) -> boo
     let file_path = request_file.to_string_lossy().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let _keep_alive = request_file;
-        setup::run_elevated(&exe, &["daemon", "ipc-send", "--request-file", &file_path])
+        setup::run_elevated(&exe, &["bridge", "ipc-send", "--request-file", &file_path])
     })
     .await;
 

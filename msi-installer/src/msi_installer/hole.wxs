@@ -2,7 +2,7 @@
 
 <!--
   WiX installer for Hole.
-  Installs to [ProgramFiles64Folder]\hole\bin\, registers the daemon service,
+  Installs to [ProgramFiles64Folder]\hole\bin\, registers the bridge service,
   and adds hole to the system PATH.
 
   Build:   cd msi-installer && uv run build
@@ -65,13 +65,13 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Custom actions: daemon install/uninstall + PATH add/remove.
+    <!-- Custom actions: bridge install/uninstall + PATH add/remove.
          Uses FileRef (Type 18) to reference hole.exe by its File ID,
          not Directory (Type 34) which fails to launch the exe. -->
     <CustomAction
-      Id="DaemonInstall"
+      Id="BridgeInstall"
       FileRef="hole.exe"
-      ExeCommand="daemon install"
+      ExeCommand="bridge install"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
@@ -93,9 +93,9 @@
       Return="ignore" />
 
     <CustomAction
-      Id="DaemonUninstall"
+      Id="BridgeUninstall"
       FileRef="hole.exe"
-      ExeCommand="daemon uninstall"
+      ExeCommand="bridge uninstall"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
@@ -113,18 +113,18 @@
       Return="asyncNoWait" />
 
     <InstallExecuteSequence>
-      <!-- Post-install: daemon install then PATH add -->
-      <Custom Action="DaemonInstall" After="InstallFiles"
+      <!-- Post-install: bridge install then PATH add -->
+      <Custom Action="BridgeInstall" After="InstallFiles"
         Condition="NOT Installed AND NOT REMOVE" />
-      <Custom Action="PathAdd" After="DaemonInstall"
+      <Custom Action="PathAdd" After="BridgeInstall"
         Condition="NOT Installed AND NOT REMOVE" />
 
-      <!-- Pre-uninstall: PATH remove then daemon uninstall.
+      <!-- Pre-uninstall: PATH remove then bridge uninstall.
            Each uninstall CA must be transitively anchored Before RemoveFiles
            via explicit Before attributes, so ordering is fully determined. -->
-      <Custom Action="PathRemove" Before="DaemonUninstall"
+      <Custom Action="PathRemove" Before="BridgeUninstall"
         Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="DaemonUninstall" Before="RemoveFiles"
+      <Custom Action="BridgeUninstall" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
 
       <!-- Launch app after fresh install (not upgrades, not silent) -->

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Launch daemon and GUI in dev mode with multiplexed logs.
+"""Launch bridge and GUI in dev mode with multiplexed logs.
 
 Builds the workspace, then runs three processes:
   1. Vite dev server (frontend HMR on port 1420)
-  2. Daemon in foreground/no-tun mode
+  2. Bridge in foreground/no-tun mode
   3. GUI (Tauri webview loading from Vite)
 
 Frontend changes (ui/) hot-reload instantly. Rust changes need Ctrl+C and re-run.
@@ -134,20 +134,20 @@ def main() -> None:
         print(f"{YELLOW}Binary not found at {built_bin}{RESET}")
         sys.exit(1)
 
-    # Copy daemon binary to temp dir — the running daemon holds a file lock on the
+    # Copy bridge binary to temp dir — the running bridge holds a file lock on the
     # binary, which would block a subsequent cargo build. The GUI runs from the
     # original path (unlocked after it starts, since the OS loads it into memory).
-    daemon_bin = Path(
+    bridge_bin = Path(
         tempfile.gettempdir()
-    ) / f"hole-dev-daemon-{os.getpid()}{'.exe' if sys.platform == 'win32' else ''}"
-    shutil.copy2(built_bin, daemon_bin)
-    atexit.register(lambda: daemon_bin.unlink(missing_ok=True))
+    ) / f"hole-dev-bridge-{os.getpid()}{'.exe' if sys.platform == 'win32' else ''}"
+    shutil.copy2(built_bin, bridge_bin)
+    atexit.register(lambda: bridge_bin.unlink(missing_ok=True))
 
     socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
 
     print(f"\n{BOLD}Starting dev environment...{RESET}")
     print(f"  Socket: {socket_path}")
-    print(f"  {CYAN}[daemon]{RESET} {daemon_bin.name} → foreground --no-tun")
+    print(f"  {CYAN}[bridge]{RESET} {bridge_bin.name} → foreground --no-tun")
     print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI)")
     print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420")
     print(f"  Frontend changes hot-reload. Rust changes need Ctrl+C and re-run.")
@@ -178,9 +178,9 @@ def main() -> None:
             shutdown(procs)
             sys.exit(1)
 
-        # Start daemon
-        daemon_proc = subprocess.Popen(
-            [str(daemon_bin), "daemon", "run", "--foreground", "--no-tun", "--socket-path",
+        # Start bridge
+        bridge_proc = subprocess.Popen(
+            [str(bridge_bin), "bridge", "run", "--foreground", "--no-tun", "--socket-path",
              str(socket_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -188,12 +188,12 @@ def main() -> None:
             bufsize=1,
             **_POPEN_KWARGS,
         )
-        procs.append(daemon_proc)
-        threading.Thread(target=prefix_stream, args=(daemon_proc.stdout, "daemon", CYAN), daemon=True).start()
-        threading.Thread(target=wait_for_exit, args=(daemon_proc, done), daemon=True).start()
+        procs.append(bridge_proc)
+        threading.Thread(target=prefix_stream, args=(bridge_proc.stdout, "bridge", CYAN), daemon=True).start()
+        threading.Thread(target=wait_for_exit, args=(bridge_proc, done), daemon=True).start()
 
         # Start GUI
-        gui_env = {**os.environ, "HOLE_DAEMON_SOCKET": str(socket_path)}
+        gui_env = {**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}
         gui_proc = subprocess.Popen(
             [str(built_bin)],
             env=gui_env,

@@ -98,23 +98,23 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
 
 // Plugin resolution ===================================================================================================
 
-/// Resolve a plugin binary path by looking next to the daemon executable.
+/// Resolve a plugin binary path by looking next to the bridge executable.
 fn resolve_plugin_path(name: &str) -> String {
     resolve_plugin_path_inner(name, std::env::current_exe().ok())
 }
 
 /// Inner implementation that accepts an explicit exe path for testability.
 ///
-/// Looks for the plugin binary in the same directory as the daemon executable.
+/// Looks for the plugin binary in the same directory as the bridge executable.
 /// On Windows, appends `.exe` if the name doesn't already end with it.
 /// Falls back to the bare name so that shadowsocks does a PATH lookup.
 ///
 /// The PATH fallback is safe because `is_valid_plugin_name()` ensures the name
 /// contains no path separators — PATH lookup can only find binaries in directories
 /// that an administrator placed on PATH (standard system-level trust model).
-fn resolve_plugin_path_inner(name: &str, daemon_exe: Option<PathBuf>) -> String {
-    if let Some(exe) = daemon_exe {
-        // Canonicalize to resolve symlinks — the daemon may be registered via symlink,
+fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
+    if let Some(exe) = bridge_exe {
+        // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
         // but the sibling plugin binary is next to the real binary.
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(dir) = exe.parent() {

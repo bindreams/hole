@@ -1,10 +1,10 @@
-// Collect GUI and daemon logs into a zip archive.
+// Collect GUI and bridge logs into a zip archive.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Locate all log directories (GUI and daemon).
+/// Locate all log directories (GUI and bridge).
 fn log_dirs() -> Vec<(&'static str, PathBuf)> {
     let mut dirs = Vec::new();
 
@@ -12,13 +12,13 @@ fn log_dirs() -> Vec<(&'static str, PathBuf)> {
         dirs.push(("gui", local_data.join("hole").join("logs")));
     }
 
-    // Daemon logs on Windows
+    // Bridge logs on Windows
     #[cfg(target_os = "windows")]
-    dirs.push(("daemon", PathBuf::from(r"C:\ProgramData\hole\logs")));
+    dirs.push(("bridge", PathBuf::from(r"C:\ProgramData\hole\logs")));
 
-    // Daemon logs on macOS / Linux
+    // Bridge logs on macOS / Linux
     #[cfg(not(target_os = "windows"))]
-    dirs.push(("daemon", PathBuf::from("/var/log/hole")));
+    dirs.push(("bridge", PathBuf::from("/var/log/hole")));
 
     dirs
 }

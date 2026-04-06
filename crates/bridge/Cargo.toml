@@ -1,5 +1,5 @@
 [package]
-name = "hole-daemon"
+name = "hole-bridge"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 workspace = true
 
 [lib]
-name = "hole_daemon"
+name = "hole_bridge"
 harness = false
 
 [dependencies]

@@ -6,26 +6,26 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 
 Single-binary design:
 
-- **`hole`** — the only binary, serves as both the Tauri GUI and the privileged daemon depending on CLI arguments.
+- **`hole`** — the only binary, serves as both the Tauri GUI and the privileged bridge depending on CLI arguments.
 - GUI mode (no args): system tray, settings window, config management. Unprivileged.
-- Daemon mode (`hole daemon run`): privileged service running as root/SYSTEM. Manages TUN, routing, shadowsocks-service.
+- Bridge mode (`hole bridge run`): privileged service running as root/SYSTEM. Manages TUN, routing, shadowsocks-service.
 
-GUI and daemon communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
+GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
 
 ### CLI
 
 ```
 hole                              → GUI (default)
 hole version                      → print version information
-hole daemon run [--socket-path P] [--foreground] [--no-tun] → run as service/daemon (invoked by SCM/launchd)
-hole daemon install               → register + start daemon service (needs elevation)
-hole daemon uninstall             → stop + remove daemon service (needs elevation)
-hole daemon status                → print install/running status
-hole daemon log                   → print daemon log to stdout
-hole daemon log path              → print log file path
-hole daemon log watch [--tail N]  → stream log output
-hole daemon grant-access [--then-send B64 | --then-send-file PATH] → add current user to hole group (needs elevation)
-hole daemon ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
+hole bridge run [--socket-path P] [--foreground] [--no-tun] → run as service/bridge (invoked by SCM/launchd)
+hole bridge install               → register + start bridge service (needs elevation)
+hole bridge uninstall             → stop + remove bridge service (needs elevation)
+hole bridge status                → print install/running status
+hole bridge log                   → print bridge log to stdout
+hole bridge log path              → print log file path
+hole bridge log watch [--tail N]  → stream log output
+hole bridge grant-access [--then-send B64 | --then-send-file PATH] → add current user to hole group (needs elevation)
+hole bridge ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
 hole upgrade                      → check for updates and install latest version (unattended)
 hole path add                     → add hole to system PATH
 hole path remove                  → remove hole from system PATH
@@ -35,7 +35,7 @@ hole path remove                  → remove hole from system PATH
 
 ```
 crates/common/   → hole-common (shared types: protocol, config, import)
-crates/daemon/   → hole-daemon (daemon library, no binary)
+crates/bridge/   → hole-bridge (bridge library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
 external/        → Third-party source (git subrepos)
 msi-installer/   → WiX MSI installer (Python project: source, build script, tests)
@@ -45,7 +45,7 @@ ui/              → Frontend HTML/CSS/TypeScript (Vite)
 
 ## Build
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow (hot-reload, foreground daemon mode).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow (hot-reload, foreground bridge mode).
 
 Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 

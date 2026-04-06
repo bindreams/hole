@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emergency network reset script for Hole.
 
-Removes all routes and interfaces created by hole-daemon.
+Removes all routes and interfaces created by hole-bridge.
 Run with admin/root privileges:
   macOS:   sudo python3 scripts/network-reset.py
   Windows: run as Administrator
@@ -37,8 +37,8 @@ def reset_macos() -> None:
                 dest = line.split()[0]
                 run(["route", "-n", "delete", dest])
 
-    print("Killing hole-daemon...")
-    run(["pkill", "-f", "hole-daemon"])
+    print("Killing hole-bridge...")
+    run(["pkill", "-f", "hole-bridge"])
 
     print("Resetting DNS on all network services...")
     result = run(["networksetup", "-listallnetworkservices"])
@@ -76,10 +76,10 @@ def reset_windows() -> None:
     """
     ])
 
-    print("Stopping HoleDaemon service...")
-    run(["powershell", "-Command", 'Stop-Service -Name "HoleDaemon" -Force -ErrorAction SilentlyContinue'])
+    print("Stopping HoleBridge service...")
+    run(["powershell", "-Command", 'Stop-Service -Name "HoleBridge" -Force -ErrorAction SilentlyContinue'])
     run([
-        "powershell", "-Command", 'Get-Process -Name "hole-daemon" -ErrorAction SilentlyContinue | Stop-Process -Force'
+        "powershell", "-Command", 'Get-Process -Name "hole-bridge" -ErrorAction SilentlyContinue | Stop-Process -Force'
     ])
 
     print("Removing wintun adapters...")

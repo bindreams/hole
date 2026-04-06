@@ -1,10 +1,10 @@
 // Tauri IPC commands (frontend ↔ Rust).
 
-use crate::daemon_client::ClientError;
+use crate::bridge_client::ClientError;
 use crate::state::AppState;
 use hole_common::config::{AppConfig, ServerEntry};
 use hole_common::import;
-use hole_common::protocol::{DaemonRequest, DaemonResponse, ProxyConfig};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig};
 use std::io::Read;
 use std::path::Path;
 use tauri::State;
@@ -111,8 +111,8 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
 
 #[tauri::command]
 pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    match state.daemon_send(DaemonRequest::Status).await {
-        Ok(DaemonResponse::Status {
+    match state.bridge_send(BridgeRequest::Status).await {
+        Ok(BridgeResponse::Status {
             running,
             uptime_secs,
             error,
@@ -121,8 +121,8 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
             "uptime_secs": uptime_secs,
             "error": error,
         })),
-        Ok(DaemonResponse::Error { message }) => {
-            warn!(error = %message, "daemon returned error for status");
+        Ok(BridgeResponse::Error { message }) => {
+            warn!(error = %message, "bridge returned error for status");
             Ok(serde_json::json!({
                 "running": false,
                 "uptime_secs": 0,
@@ -132,14 +132,14 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
         Ok(_) => Ok(serde_json::json!({
             "running": false,
             "uptime_secs": 0,
-            "error": "unexpected response from daemon",
+            "error": "unexpected response from bridge",
         })),
         Err(e) => {
-            // Daemon not running or unreachable — not an error for the frontend
+            // Bridge not running or unreachable — not an error for the frontend
             Ok(serde_json::json!({
                 "running": false,
                 "uptime_secs": 0,
-                "error": format!("daemon unreachable: {e}"),
+                "error": format!("bridge unreachable: {e}"),
             }))
         }
     }
@@ -147,9 +147,9 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
 
 // Response mappers (extracted for testability) ========================================================================
 
-fn map_metrics_response(result: Result<DaemonResponse, ClientError>) -> serde_json::Value {
+fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_json::Value {
     match result {
-        Ok(DaemonResponse::Metrics {
+        Ok(BridgeResponse::Metrics {
             bytes_in,
             bytes_out,
             speed_in_bps,
@@ -172,24 +172,24 @@ fn map_metrics_response(result: Result<DaemonResponse, ClientError>) -> serde_js
     }
 }
 
-fn map_diagnostics_response(result: Result<DaemonResponse, ClientError>) -> serde_json::Value {
+fn map_diagnostics_response(result: Result<BridgeResponse, ClientError>) -> serde_json::Value {
     match result {
-        Ok(DaemonResponse::Diagnostics {
+        Ok(BridgeResponse::Diagnostics {
             app,
-            daemon,
+            bridge,
             network,
             vpn_server,
             internet,
         }) => serde_json::json!({
             "app": app,
-            "daemon": daemon,
+            "bridge": bridge,
             "network": network,
             "vpn_server": vpn_server,
             "internet": internet,
         }),
         _ => serde_json::json!({
             "app": "ok",
-            "daemon": "unknown",
+            "bridge": "unknown",
             "network": "unknown",
             "vpn_server": "unknown",
             "internet": "unknown",
@@ -197,11 +197,11 @@ fn map_diagnostics_response(result: Result<DaemonResponse, ClientError>) -> serd
     }
 }
 
-/// Try to extract a public IP response from the daemon result.
+/// Try to extract a public IP response from the bridge result.
 /// Returns `Some(json)` on success, `None` if fallback is needed.
-fn map_public_ip_daemon_response(result: Result<DaemonResponse, ClientError>) -> Option<serde_json::Value> {
+fn map_public_ip_bridge_response(result: Result<BridgeResponse, ClientError>) -> Option<serde_json::Value> {
     match result {
-        Ok(DaemonResponse::PublicIp { ip, country_code }) => {
+        Ok(BridgeResponse::PublicIp { ip, country_code }) => {
             Some(serde_json::json!({ "ip": ip, "country_code": country_code }))
         }
         _ => None,
@@ -212,24 +212,24 @@ fn map_public_ip_daemon_response(result: Result<DaemonResponse, ClientError>) ->
 
 #[tauri::command]
 pub async fn get_metrics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    Ok(map_metrics_response(state.daemon_send(DaemonRequest::Metrics).await))
+    Ok(map_metrics_response(state.bridge_send(BridgeRequest::Metrics).await))
 }
 
 #[tauri::command]
 pub async fn get_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     Ok(map_diagnostics_response(
-        state.daemon_send(DaemonRequest::Diagnostics).await,
+        state.bridge_send(BridgeRequest::Diagnostics).await,
     ))
 }
 
 #[tauri::command]
 pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // Try daemon first (fetches through VPN when connected)
-    if let Some(json) = map_public_ip_daemon_response(state.daemon_send(DaemonRequest::PublicIp).await) {
+    // Try bridge first (fetches through VPN when connected)
+    if let Some(json) = map_public_ip_bridge_response(state.bridge_send(BridgeRequest::PublicIp).await) {
         return Ok(json);
     }
 
-    // Daemon unreachable — fetch directly (shows ISP IP)
+    // Bridge unreachable — fetch directly (shows ISP IP)
     // Uses ureq v3 API (Agent-based, NOT free functions)
     let result = tokio::task::spawn_blocking(|| {
         let agent = ureq::Agent::new_with_defaults();

@@ -1,4 +1,4 @@
-// Re-exports for platform-specific daemon setup.
+// Re-exports for platform-specific bridge setup.
 
 #[cfg(target_os = "macos")]
 #[path = "platform/macos.rs"]

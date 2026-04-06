@@ -1,9 +1,9 @@
-// Foreground daemon runner for development.
+// Foreground bridge runner for development.
 
 use crate::proxy_manager::ProxyBackend;
 use std::path::Path;
 
-/// Run the daemon in foreground mode (for development).
+/// Run the bridge in foreground mode (for development).
 /// Bypasses the platform service manager. Shuts down on Ctrl+C.
 ///
 /// When `no_tun` is true, uses `NoTunBackend` (no elevation needed).

@@ -1,8 +1,8 @@
 // OS group management for IPC access control.
 //
-// Creates and manages a local "hole" group that gates access to the daemon's
+// Creates and manages a local "hole" group that gates access to the bridge's
 // IPC socket/pipe. Members of this group (plus root/Administrators) can
-// communicate with the daemon.
+// communicate with the bridge.
 
 use std::io;
 
@@ -153,7 +153,7 @@ mod os {
 
     pub fn create_group() -> io::Result<()> {
         let output = Command::new("net")
-            .args(["localgroup", GROUP_NAME, "/add", "/comment:Hole daemon access"])
+            .args(["localgroup", GROUP_NAME, "/add", "/comment:Hole bridge access"])
             .output()?;
 
         if output.status.success() {

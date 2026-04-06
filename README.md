@@ -14,12 +14,12 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 
 ## Architecture
 
-Single-binary design — `hole` serves as both the Tauri GUI and the privileged daemon depending on CLI arguments:
+Single-binary design — `hole` serves as both the Tauri GUI and the privileged bridge depending on CLI arguments:
 
 | Mode              | Privilege     | Role                                                        |
 | ----------------- | ------------- | ----------------------------------------------------------- |
 | `hole` (no args)  | User          | Tauri GUI — system tray, settings window, config management |
-| `hole daemon run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service       |
+| `hole bridge run` | Root / SYSTEM | Privileged helper — TUN, routing, shadowsocks-service       |
 
 Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON).
 
@@ -44,7 +44,7 @@ cargo test --workspace
 ```
 crates/
   common/    hole-common — shared types (protocol, config, import)
-  daemon/    hole-daemon — privileged daemon library
+  bridge/    hole-bridge — privileged bridge library
   gui/       hole-gui    — Tauri app + CLI (binary name: "hole")
 external/
   v2ray-plugin/  v2ray-plugin source (git subrepo)

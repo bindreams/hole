@@ -121,35 +121,35 @@ def _get_decompiled_sequence_map(tree: ET.ElementTree) -> dict[str, dict]:
 
 
 def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
-    """Install CAs must be ordered: InstallFiles < DaemonInstall < PathAdd."""
+    """Install CAs must be ordered: InstallFiles < BridgeInstall < PathAdd."""
     entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    assert "DaemonInstall" in entries, "DaemonInstall not found in InstallExecuteSequence"
+    assert "BridgeInstall" in entries, "BridgeInstall not found in InstallExecuteSequence"
     assert "PathAdd" in entries, "PathAdd not found in InstallExecuteSequence"
 
-    assert entries["DaemonInstall"]["after"] == "InstallFiles", (
-        f"DaemonInstall should be After='InstallFiles', "
-        f"got After='{entries['DaemonInstall']['after']}'"
+    assert entries["BridgeInstall"]["after"] == "InstallFiles", (
+        f"BridgeInstall should be After='InstallFiles', "
+        f"got After='{entries['BridgeInstall']['after']}'"
     )
-    assert entries["PathAdd"]["after"] == "DaemonInstall", (
-        f"PathAdd should be After='DaemonInstall', "
+    assert entries["PathAdd"]["after"] == "BridgeInstall", (
+        f"PathAdd should be After='BridgeInstall', "
         f"got After='{entries['PathAdd']['after']}'"
     )
 
 
 def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
-    """Uninstall CAs must be ordered: PathRemove < DaemonUninstall < RemoveFiles."""
+    """Uninstall CAs must be ordered: PathRemove < BridgeUninstall < RemoveFiles."""
     entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    assert "DaemonUninstall" in entries, "DaemonUninstall not found in InstallExecuteSequence"
+    assert "BridgeUninstall" in entries, "BridgeUninstall not found in InstallExecuteSequence"
     assert "PathRemove" in entries, "PathRemove not found in InstallExecuteSequence"
 
-    assert entries["DaemonUninstall"]["before"] == "RemoveFiles", (
-        f"DaemonUninstall should be Before='RemoveFiles', "
-        f"got Before='{entries['DaemonUninstall']['before']}'"
+    assert entries["BridgeUninstall"]["before"] == "RemoveFiles", (
+        f"BridgeUninstall should be Before='RemoveFiles', "
+        f"got Before='{entries['BridgeUninstall']['before']}'"
     )
-    assert entries["PathRemove"]["before"] == "DaemonUninstall", (
-        f"PathRemove should be Before='DaemonUninstall', "
+    assert entries["PathRemove"]["before"] == "BridgeUninstall", (
+        f"PathRemove should be Before='BridgeUninstall', "
         f"got Before='{entries['PathRemove']['before']}'"
     )
 
