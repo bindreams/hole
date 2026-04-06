@@ -1,27 +1,23 @@
 // Foreground bridge runner for development.
 
-use crate::proxy_manager::{ProxyBackend, ProxyManager, RealBackend};
+use crate::proxy_manager::{ProxyManager, RealBackend};
 use std::path::Path;
 
 /// Run the bridge in foreground mode (for development).
 ///
 /// Bypasses the platform service manager and shuts down on Ctrl+C. Uses
 /// the production `IpcServer::bind` + `apply_socket_permissions` path, so
-/// dev exercises the real DACL/group/SDDL code — see §3.7 of the plan
-/// and the `dev.py` / `bridge grant-access` orchestration. Requires
-/// elevation for TUN + routing.
+/// dev exercises the real DACL/group/SDDL code — see the `dev.py` /
+/// `bridge grant-access` orchestration. Requires elevation for TUN +
+/// routing.
 pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir, RealBackend))
+    rt.block_on(run_inner(socket_path, state_dir))
 }
 
-async fn run_inner<B: ProxyBackend + 'static>(
-    socket_path: &Path,
-    state_dir: &Path,
-    backend: B,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
-        backend,
+        RealBackend,
         state_dir.to_path_buf(),
     )));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
@@ -30,9 +26,13 @@ async fn run_inner<B: ProxyBackend + 'static>(
     // bind() fails and we exit without touching any routing state.
     let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
 
-    // Only after a successful bind do we run route recovery — this
-    // cleans up routes left by a previous crashed run.
-    crate::routing::recover_routes(state_dir);
+    // Offload route recovery to a blocking thread so a hung netsh/route
+    // command cannot wedge the runtime while the IPC socket is bound but
+    // not yet serving.
+    let state_dir_owned = state_dir.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_owned)).await {
+        tracing::warn!(error = %e, "recover_routes task panicked");
+    }
 
     tokio::select! {
         result = server.run() => {

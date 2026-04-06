@@ -13,6 +13,7 @@ Run with admin/root privileges:
 # /// script
 # requires-python = ">=3.9"
 # ///
+from __future__ import annotations
 
 import json
 import os

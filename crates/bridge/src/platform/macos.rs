@@ -169,9 +169,14 @@ pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         // Bind BEFORE recovery — a second instance's bind() fails before it
-        // can touch routing state.
+        // can touch routing state. Route recovery is offloaded via
+        // spawn_blocking so a hung netsh/route command cannot wedge the
+        // runtime while the IPC socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
-        crate::routing::recover_routes(state_dir);
+        let state_dir_owned = state_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_owned)).await {
+            tracing::warn!(error = %e, "recover_routes task panicked");
+        }
 
         tokio::select! {
             result = server.run() => {

@@ -79,6 +79,10 @@ Before starting the bridge, `dev.py` invokes `hole bridge grant-access` to creat
 
 If the dev process crashes or is killed and your internet breaks, run `scripts/network-reset.py` — also requires elevation — to recover. It reads the same state file the bridge writes and targets the exact leaked routes.
 
+Dev mode does **not** remove you from the `hole` group on exit (same as production: once granted access you keep it until `hole bridge uninstall`, which deletes the group). This means re-running `dev.py` after a crash is a no-op on the group-add step.
+
+On macOS, `dseditgroup` membership changes are reflected in `getgrouplist` immediately for newly-spawned processes in the normal case. If DirectoryService has cached the old membership (rare; seen on heavily-loaded systems or across user sessions), the dropped GUI may report "permission denied" when connecting to the dev socket. Re-running `dev.py` refreshes the cache; logging out and back in forces it.
+
 ### Manual workflow
 
 If you prefer separate terminals or need more control:

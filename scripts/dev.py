@@ -30,6 +30,7 @@ and re-run.
 # /// script
 # requires-python = ">=3.9"
 # ///
+from __future__ import annotations
 
 import atexit
 import os
@@ -68,18 +69,32 @@ def resolve_tool(name: str) -> str:
     return path
 
 
-def ensure_node_modules(npm: str) -> None:
+def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None) -> None:
     if Path("node_modules").exists():
         return
     print(f"{BOLD}Installing npm dependencies...{RESET}")
-    result = subprocess.run([npm, "install"], stdout=sys.stdout, stderr=sys.stderr)
+    # Run as the invoking user so `node_modules/` is not owned by root.
+    result = subprocess.run(
+        [npm, "install"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
     if result.returncode != 0:
         sys.exit(result.returncode)
 
 
-def cargo_build(cargo: str) -> None:
+def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
     print(f"{BOLD}Building workspace...{RESET}")
-    result = subprocess.run([cargo, "build"], stdout=sys.stdout, stderr=sys.stderr)
+    # Run as the invoking user so `target/` is not owned by root.
+    result = subprocess.run(
+        [cargo, "build"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
     if result.returncode != 0:
         sys.exit(result.returncode)
 
@@ -185,8 +200,8 @@ def main() -> None:
     cargo = resolve_tool("cargo")
     npm = resolve_tool("npm")
 
-    ensure_node_modules(npm)
-    cargo_build(cargo)
+    ensure_node_modules(npm, target_user)
+    cargo_build(cargo, target_user)
 
     # Locate built binary
     bin_name = "hole.exe" if sys.platform == "win32" else "hole"

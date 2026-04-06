@@ -71,7 +71,7 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 /// Build a mock proxy backed by a throw-away state dir. Uses
-/// `tempfile::tempdir().into_path()` so the directory is created but its
+/// `tempfile::tempdir().keep()` so the directory is created but its
 /// auto-cleanup Drop is suppressed — the directory lives until the
 /// process exits, which is fine for unit tests.
 fn mock_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {

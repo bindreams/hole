@@ -43,8 +43,13 @@ fn state_file(state_dir: &Path) -> PathBuf {
 
 /// Write `state` to `<state_dir>/bridge-routes.json` atomically via a
 /// same-directory temp file + rename. Contents are `sync_all`'d before
-/// persist so post-crash readers see either the old contents or the new
-/// contents, never a truncated file. Creates `state_dir` if missing.
+/// persist so a process crash (panic, SIGKILL, abort) sees either the old
+/// contents or the new contents, never a truncated file. Creates
+/// `state_dir` if missing.
+///
+/// Does NOT fsync the parent directory after the rename — power-loss
+/// durability is out of scope. The design target is process-crash
+/// recovery, not disk failure recovery.
 pub fn save(state_dir: &Path, state: &RouteState) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
 

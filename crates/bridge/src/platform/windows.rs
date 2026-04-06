@@ -96,9 +96,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
         // Bind BEFORE recovery — a second instance's bind() fails before it
-        // can touch routing state.
+        // can touch routing state. Route recovery is offloaded via
+        // spawn_blocking so a hung netsh/route command cannot wedge the
+        // runtime while the IPC socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
-        crate::routing::recover_routes(&state_dir);
+        let state_dir_for_recover = state_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_for_recover)).await {
+            tracing::warn!(error = %e, "recover_routes task panicked");
+        }
 
         tokio::select! {
             result = server.run() => {

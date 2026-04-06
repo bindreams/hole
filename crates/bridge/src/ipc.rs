@@ -500,6 +500,18 @@ pub fn installer_user_sid_path() -> std::path::PathBuf {
 /// Used by both `install_bridge` (where it's called once before service
 /// registration) and by `bridge grant-access` (where it's called by the
 /// dev workflow before starting the foreground bridge).
+///
+/// # Testing
+///
+/// This function is not covered by a unit test. Its idempotence is a
+/// property of the primitives it composes: `group::create_group` and
+/// `group::add_user_to_group` are documented as idempotent on
+/// "already exists" errors (see their implementations in `group.rs`),
+/// and `std::fs::write` on the SID file path unconditionally overwrites.
+/// An end-to-end test would require elevation (to actually call
+/// `dseditgroup` / `net localgroup`), so we don't add one — elevation is
+/// a runtime dependency, not a test-harness dependency. Integration
+/// coverage is provided by the install-service Verification step.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;

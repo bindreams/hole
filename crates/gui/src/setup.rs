@@ -244,9 +244,9 @@ pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // Create access group, add installing user, and (on Windows) write the
     // installer SID file so the bridge includes it in the socket DACL on
     // first startup. Shared with `bridge grant-access` used by dev.py.
-    if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
-        eprintln!("warning: failed to prepare IPC access: {e}");
-    }
+    // Failing here is fatal: without the hole group, the GUI cannot connect
+    // after install, so the installer must not silently continue.
+    hole_bridge::ipc::prepare_ipc_access()?;
 
     // Idempotent: if already installed, stop and uninstall first
     if hole_bridge::platform::os::is_installed() {

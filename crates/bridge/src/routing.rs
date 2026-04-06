@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // Command builders ====================================================================================================
 
@@ -113,7 +113,7 @@ where
             warn!(error = %e, "bypass-route teardown failed during recovery");
         }
     } else {
-        tracing::debug!("no route-state file found, nothing to recover");
+        debug!("no route-state file found, nothing to recover");
     }
 
     // 3. Delete the state file regardless of command outcomes. Next startup

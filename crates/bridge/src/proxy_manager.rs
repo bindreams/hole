@@ -147,10 +147,17 @@ impl<B: ProxyBackend> ProxyManager<B> {
             return Err(ProxyError::RouteSetup(msg));
         }
 
-        // Start shadowsocks-service (no route mutation yet).
-        let handle = self.backend.start_ss(ss_config).await.inspect_err(|e| {
-            self.last_error = Some(e.to_string());
-        })?;
+        // Start shadowsocks-service (no route mutation yet). On failure,
+        // clear the state file we just wrote — no routes were installed
+        // and a stale file would only mislead the next recover_routes.
+        let handle = match self.backend.start_ss(ss_config).await {
+            Ok(h) => h,
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+                let _ = crate::route_state::clear(&self.state_dir);
+                return Err(e);
+            }
+        };
 
         // Set up routes — if this fails, roll back: abort ss, defensively
         // tear down any partial route state, and clear the state file so we

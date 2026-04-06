@@ -380,8 +380,8 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
     {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
         if socket_path.exists() {
-            if let Ok(username) = hole_bridge::group::installing_username() {
-                match hole_bridge::group::lookup_sid(&username) {
+            match hole_bridge::group::installing_username() {
+                Ok(username) => match hole_bridge::group::lookup_sid(&username) {
                     Ok(user_sid) => {
                         let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
                         if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
@@ -393,6 +393,9 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
                     Err(e) => {
                         eprintln!("warning: could not look up user SID: {e}");
                     }
+                },
+                Err(e) => {
+                    eprintln!("warning: could not determine installing user for live DACL update: {e}");
                 }
             }
         }
