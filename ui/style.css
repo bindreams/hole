@@ -160,14 +160,31 @@ body {
   the native scrollbar from flashing between page load and OverlayScrollbars init. */
   overflow: hidden;
   padding: 1rem 1.2rem;
+  /* Pre-init layout: applies briefly before OverlayScrollbars wraps the
+  element and forces display:flex;flex-direction:row on the host. The
+  viewport selector below picks up the layout post-init. */
   display: flex;
   flex-direction: column;
   gap: 1.2rem;
 }
 
-/* OverlayScrollbars custom theme — uses our scrollbar color tokens so it
-adapts automatically to dark/light theme via [data-theme]. */
+.main [data-overlayscrollbars-viewport] {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+}
+
+/* OverlayScrollbars custom theme — copies the layout vars from the
+upstream os-theme-dark and maps the handle colors to our --scrollbar
+token so it adapts to dark/light theme via [data-theme] automatically. */
 .os-theme-hole {
+  box-sizing: border-box;
+  --os-size: 8px;
+  --os-padding-perpendicular: 2px;
+  --os-padding-axis: 2px;
+  --os-track-border-radius: 10px;
+  --os-handle-interactive-area-offset: 4px;
+  --os-handle-border-radius: 10px;
   --os-handle-bg: var(--scrollbar);
   --os-handle-bg-hover: var(--scrollbar);
   --os-handle-bg-active: var(--scrollbar);
@@ -292,11 +309,18 @@ adapts automatically to dark/light theme via [data-theme]. */
 .sb-content {
   flex: 1;
   padding: 0.6rem 1rem;
+  /* OverlayScrollbars creates its own scroll context — see `.main`. */
+  overflow: hidden;
+  /* Pre-init layout — see `.main`. */
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  /* OverlayScrollbars creates its own scroll context — see `.main`. */
-  overflow: hidden;
+}
+
+.sb-content [data-overlayscrollbars-viewport] {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
 /* Sidebar: throughput graph -----  */
