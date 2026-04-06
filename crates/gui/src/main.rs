@@ -52,18 +52,19 @@ fn launch_gui() {
             commands::get_public_ip,
             tray::toggle_proxy,
         ])
-        .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                window.hide().ok();
-                #[cfg(target_os = "macos")]
-                platform::hide_dock_icon(window.app_handle());
+        .on_window_event(|window, event| {
+            // Intercept the close button on the dashboard so it hides into the
+            // tray instead of destroying the window (and exiting the app, since
+            // it's currently the only window). Other windows — should any be
+            // added later — fall through to the default Tauri behavior.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "settings" {
+                    api.prevent_close();
+                    window.hide().ok();
+                    #[cfg(target_os = "macos")]
+                    platform::hide_dock_icon(window.app_handle());
+                }
             }
-            #[cfg(target_os = "macos")]
-            tauri::WindowEvent::Destroyed if window.app_handle().webview_windows().is_empty() => {
-                platform::hide_dock_icon(window.app_handle());
-            }
-            _ => {}
         })
         .setup(|app| {
             tray::create_tray(app)?;
