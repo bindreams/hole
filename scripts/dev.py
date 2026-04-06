@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch bridge + GUI in dev mode with multiplexed, colored logs.
+r"""Launch bridge + GUI in dev mode with multiplexed, colored logs.
 
 Builds the workspace, then runs three processes:
   1. Vite dev server (frontend HMR on port 1420) — unelevated on macOS
@@ -14,6 +14,13 @@ On macOS, this script detects `SUDO_USER` and drops privileges for Vite
 and the GUI so they read your real ~/Library config, while the bridge
 inherits root. On Windows, UAC is token-based so all three inherit the
 elevated token without an identity change.
+
+The bridge binary and its v2ray-plugin sidecar are staged in a per-pid
+subdirectory under the system temp dir (`$TMPDIR/hole-dev-<pid>/` or
+`%TEMP%\hole-dev-<pid>\`) so they sit side-by-side under their canonical
+names — same layout as the installed MSI in `Program Files\hole\bin\`.
+This is what `resolve_plugin_path_inner` (crates/bridge/src/proxy.rs)
+expects, and it isolates concurrent dev.py runs from each other.
 
 Dev uses the production IPC permission path: `hole bridge grant-access`
 is invoked to create the `hole` group, add you to it, and (Windows) write
@@ -251,6 +258,7 @@ def main() -> None:
     if not Path("Cargo.toml").exists() or not Path("crates/gui").exists():
         print("Error: run this script from the project root")
         sys.exit(1)
+    project_root = Path.cwd().resolve()
 
     _lib.require_elevation()
     target_user = _lib.sudo_target_user()  # (uid, gid, user, home) or None
@@ -263,19 +271,38 @@ def main() -> None:
 
     # Locate built binary
     bin_name = "hole.exe" if sys.platform == "win32" else "hole"
-    built_bin = Path("target/debug") / bin_name
+    built_bin = project_root / "target" / "debug" / bin_name
     if not built_bin.exists():
         print(f"{YELLOW}Binary not found at {built_bin}{RESET}")
         sys.exit(1)
 
-    # Copy bridge binary to temp dir — the running bridge holds a file lock on the
-    # binary, which would block a subsequent cargo build. The GUI runs from the
-    # original path (unlocked after it starts, since the OS loads it into memory).
-    bridge_bin = Path(
-        tempfile.gettempdir()
-    ) / f"hole-dev-bridge-{os.getpid()}{'.exe' if sys.platform == 'win32' else ''}"
+    # Stage the bridge binary and its v2ray-plugin sidecar in a per-pid subdir.
+    # Mirrors the installed MSI layout (Program Files\hole\bin\) so
+    # resolve_plugin_path_inner (crates/bridge/src/proxy.rs) finds the plugin
+    # as a sibling. Per-pid isolation prevents collisions between concurrent
+    # dev.py runs and avoids the running bridge holding a file lock that
+    # would block subsequent `cargo build`. Register the rmtree cleanup
+    # *before* mkdir so a partially-created dir still gets removed on exit.
+    dev_bin_dir = Path(tempfile.gettempdir()) / f"hole-dev-{os.getpid()}"
+    atexit.register(lambda: shutil.rmtree(dev_bin_dir, ignore_errors=True))
+    dev_bin_dir.mkdir(parents=True, exist_ok=True)
+
+    bridge_bin = dev_bin_dir / bin_name
     shutil.copy2(built_bin, bridge_bin)
-    atexit.register(lambda: bridge_bin.unlink(missing_ok=True))
+
+    # v2ray-plugin sidecar. Mirrors the discovery glob in stage_files() in
+    # msi-installer/src/msi_installer/__init__.py — keep these in sync.
+    plugin_cache = project_root / ".cache" / "gui" / "v2ray-plugin"
+    plugin_glob = "v2ray-plugin-*.exe" if sys.platform == "win32" else "v2ray-plugin-*"
+    plugin_candidates = list(plugin_cache.glob(plugin_glob))
+    if not plugin_candidates:
+        print(f"{YELLOW}v2ray-plugin binary not found in {plugin_cache} — did cargo build run?{RESET}")
+        sys.exit(1)
+    if len(plugin_candidates) > 1:
+        print(f"{YELLOW}multiple v2ray-plugin binaries in {plugin_cache}: {plugin_candidates}{RESET}")
+        sys.exit(1)
+    plugin_dst_name = "v2ray-plugin.exe" if sys.platform == "win32" else "v2ray-plugin"
+    shutil.copy2(plugin_candidates[0], dev_bin_dir / plugin_dst_name)
 
     socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
     bridge_state_dir = Path(tempfile.gettempdir()) / "hole-dev" / "state"
@@ -297,7 +324,7 @@ def main() -> None:
     print(f"\n{BOLD}Starting dev environment...{RESET}")
     print(f"  Socket:    {socket_path}")
     print(f"  State dir: {bridge_state_dir}")
-    print(f"  {CYAN}[bridge]{RESET} {bridge_bin.name} → real TUN + routing (elevated)")
+    print(f"  {CYAN}[bridge]{RESET} {bridge_bin} → real TUN + routing (elevated)")
     if target_user is not None:
         print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI) → dropped to user '{target_user[2]}'")
         print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420 (dropped to user '{target_user[2]}')")
