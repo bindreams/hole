@@ -413,8 +413,22 @@ def main() -> None:
         threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()
         threading.Thread(target=wait_for_exit, args=(gui_proc, done), daemon=True).start()
 
-        # Block until any process exits or Ctrl+C
-        done.wait()
+        # Block until any process exits or Ctrl+C.
+        #
+        # Poll on a short timeout instead of an unbounded wait. On Windows, an
+        # unbounded threading.Event.wait() blocks in a native condition variable
+        # that does not return for queued Python signals, swallowing Ctrl+C and
+        # preventing the `finally: shutdown(procs)` clause from running. A timed
+        # wait wakes the interpreter periodically so the pending KeyboardInterrupt
+        # can actually be raised.
+        #
+        # This is NOT a busy-wait or a latency penalty for the normal exit path:
+        # Event.wait(timeout) on both POSIX (futex) and Windows (WaitForSingleObject)
+        # wakes immediately when the daemon `wait_for_exit` thread calls done.set(),
+        # regardless of how much of the 0.5s remains. The 0.5s only bounds the
+        # Ctrl+C delivery latency.
+        while not done.wait(timeout=0.5):
+            pass
 
     except KeyboardInterrupt:
         pass
