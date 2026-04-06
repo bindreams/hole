@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import _lib
 
@@ -113,20 +114,39 @@ def prefix_stream(stream, label: str, color: str) -> None:
 
 
 def wait_for_port(port: int, timeout: float, proc: subprocess.Popen) -> bool:
-    """Poll until `proc` is accepting connections on `port`.
+    """Poll until `proc` is accepting connections on `port` via any address
+    `localhost` resolves to (IPv4 and/or IPv6).
+
+    Vite's default `localhost` host can bind to `::1` only (Windows 11,
+    macOS) or `127.0.0.1` only depending on the system's hosts-file
+    ordering. A hardcoded `127.0.0.1` probe misses the v6-only case and
+    reports a false "did not start" timeout while Vite is actually up.
 
     Returns False immediately if `proc` exits before the port opens, so we don't
     falsely succeed on a port already in use by an unrelated process.
     """
+    try:
+        addrs = socket.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # Fall back to both loopback addresses if name resolution fails.
+        addrs = [
+            (socket.AF_INET, None, None, "", ("127.0.0.1", port)),
+            (socket.AF_INET6, None, None, "", ("::1", port, 0, 0)),
+        ]
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return True
-        except OSError:
-            time.sleep(0.2)
+        for family, _sock_type, _proto, _canon, sockaddr in addrs:
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    sock.connect(sockaddr)
+                    return True
+            except OSError:
+                continue
+        time.sleep(0.2)
     return False
 
 
@@ -148,15 +168,53 @@ def wait_for_exit(proc: subprocess.Popen, done: threading.Event) -> None:
     done.set()
 
 
+def new_process_group_kwargs() -> dict[str, Any]:
+    """Return Popen kwargs that put the child in its own process group /
+    job object so `terminate_tree` can kill the whole subtree.
+
+    Necessary because `npm run dev` spawns `node vite.js` as a
+    grandchild. Without a process group, `proc.terminate()` on Windows
+    only kills `npm.cmd` and leaves the node/vite child running, which
+    holds port 1420 until the OS reaps it (minutes).
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def terminate_tree(proc: subprocess.Popen) -> None:
+    """Signal graceful shutdown of `proc` AND all its descendants.
+
+    Windows: `taskkill /T` walks the tree and terminates every process.
+    POSIX: `killpg` sends SIGTERM to the whole process group (set up by
+    `start_new_session=True` at spawn time).
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        import signal as _signal
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
+
+
 def shutdown(procs: list[subprocess.Popen]) -> None:
     print(f"\n{BOLD}Shutting down...{RESET}")
     for proc in procs:
-        if proc.poll() is None:
-            proc.terminate()
+        terminate_tree(proc)
     for proc in procs:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            # Tree-kill already used SIGKILL on Windows; on POSIX fall
+            # back to per-process SIGKILL for any stragglers.
             proc.kill()
 
 
@@ -266,6 +324,7 @@ def main() -> None:
             text=True,
             bufsize=1,
             **drop_kwargs(target_user),
+            **new_process_group_kwargs(),
         )
         procs.append(vite_proc)
         threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
@@ -294,6 +353,7 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **new_process_group_kwargs(),
         )
         procs.append(bridge_proc)
         threading.Thread(target=prefix_stream, args=(bridge_proc.stdout, "bridge", CYAN), daemon=True).start()
@@ -320,6 +380,7 @@ def main() -> None:
             text=True,
             bufsize=1,
             **drop_kwargs(target_user),
+            **new_process_group_kwargs(),
         )
         procs.append(gui_proc)
         threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()
