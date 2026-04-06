@@ -78,10 +78,16 @@ def prefix_stream(stream, label: str, color: str) -> None:
         pass  # stream closed
 
 
-def wait_for_port(port: int, timeout: float) -> bool:
-    """Poll until a TCP port is accepting connections."""
+def wait_for_port(port: int, timeout: float, proc: subprocess.Popen) -> bool:
+    """Poll until `proc` is accepting connections on `port`.
+
+    Returns False immediately if `proc` exits before the port opens, so we don't
+    falsely succeed on a port already in use by an unrelated process.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True
@@ -168,7 +174,7 @@ def main() -> None:
         threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
         threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
 
-        if not wait_for_port(VITE_PORT, timeout=VITE_READY_TIMEOUT):
+        if not wait_for_port(VITE_PORT, VITE_READY_TIMEOUT, vite_proc):
             if vite_proc.poll() is not None:
                 print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
             else:
