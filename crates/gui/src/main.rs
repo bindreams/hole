@@ -30,10 +30,7 @@ fn launch_gui() {
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
-    let log_dir = dirs::data_local_dir()
-        .expect("no local data directory found")
-        .join("hole")
-        .join("logs");
+    let log_dir = hole_common::logging::default_log_dir();
 
     let _log_guard = logging::init(&log_dir);
 

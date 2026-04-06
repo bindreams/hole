@@ -176,17 +176,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             foreground,
             no_tun,
         } => {
-            let _guard = if foreground {
-                hole_bridge::logging::init_foreground()
-            } else {
-                match hole_bridge::logging::init() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        eprintln!("failed to initialize logging: {e}");
-                        return 1;
-                    }
-                }
-            };
+            let log_dir = hole_common::logging::default_log_dir();
+            let _guard = hole_bridge::logging::init(&log_dir);
             tracing::info!("hole bridge starting");
 
             if !no_tun {
@@ -265,8 +256,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
 }
 
 fn handle_bridge_log(action: Option<LogAction>) -> i32 {
-    let log_dir = hole_bridge::logging::log_dir();
-    let log_path = log_dir.join("hole-bridge.log");
+    let log_dir = hole_common::logging::default_log_dir();
+    let log_path = log_dir.join("bridge.log");
 
     match action {
         None => {

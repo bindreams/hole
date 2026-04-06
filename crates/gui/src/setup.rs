@@ -241,9 +241,6 @@ fn shell_escape(s: &str) -> String {
 pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = bridge_binary_path()?;
 
-    // Create data directories
-    hole_bridge::logging::ensure_log_dir()?;
-
     // Create access group and add installing user (before bridge starts,
     // so the bridge can set socket/pipe permissions using the group)
     hole_bridge::group::create_group()?;

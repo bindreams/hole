@@ -1,5 +1,6 @@
 pub mod config;
 pub mod import;
+pub mod logging;
 pub mod protocol;
 pub mod version;
 
