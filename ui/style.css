@@ -156,22 +156,21 @@ body {
 /* Main area -----  */
 .main {
   flex: 1;
-  overflow-y: auto;
+  /* OverlayScrollbars creates its own scroll context — `hidden` prevents
+  the native scrollbar from flashing between page load and OverlayScrollbars init. */
+  overflow: hidden;
   padding: 1rem 1.2rem;
   display: flex;
   flex-direction: column;
   gap: 1.2rem;
 }
 
-.main::-webkit-scrollbar {
-  width: 6px;
-}
-.main::-webkit-scrollbar-track {
-  background: transparent;
-}
-.main::-webkit-scrollbar-thumb {
-  background: var(--scrollbar);
-  border-radius: 3px;
+/* OverlayScrollbars custom theme — uses our scrollbar color tokens so it
+adapts automatically to dark/light theme via [data-theme]. */
+.os-theme-hole {
+  --os-handle-bg: var(--scrollbar);
+  --os-handle-bg-hover: var(--scrollbar);
+  --os-handle-bg-active: var(--scrollbar);
 }
 
 /* Sidebar -----  */
