@@ -92,7 +92,7 @@ def reset_macos(state: dict | None) -> None:
 
     print("Killing bridge and v2ray-plugin processes...")
     # Match both the installed binary (`/usr/local/bin/hole bridge run ...`)
-    # and the dev-copied binary (`/tmp/hole-dev-bridge-<pid> bridge run ...`).
+    # and the dev-copied binary (`$TMPDIR/hole-dev-<pid>/hole bridge run ...`).
     # ERE: `hole` followed by zero-or-more non-space chars, then ` bridge run`.
     run(["pkill", "-fE", r"hole[^ ]* bridge run"])
     run(["pkill", "-f", "v2ray-plugin"])
@@ -144,9 +144,11 @@ def reset_windows(state: dict | None) -> None:
         "-Command",
         'Stop-Service -Name "HoleBridge" -Force -ErrorAction SilentlyContinue',
     ])
-    # Name LIKE 'hole%.exe' matches both the installed `hole.exe` and the dev
-    # `hole-dev-bridge-<pid>.exe`. Command-line filter ensures we only hit
-    # the bridge subcommand and not the GUI.
+    # The dev bridge is now staged at `%TEMP%\hole-dev-<pid>\hole.exe`, so
+    # `Name = 'hole.exe'` matches both installed and dev. The `LIKE 'hole%.exe'`
+    # wildcard is kept to also catch any older `hole-dev-bridge-<pid>.exe`
+    # left behind by an earlier dev.py version. Command-line filter ensures we
+    # only hit the bridge subcommand and not the GUI.
     run([
         "powershell",
         "-Command",
