@@ -17,20 +17,31 @@ GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows
 ```
 hole                              → GUI (default)
 hole version                      → print version information
-hole bridge run [--no-tun] [--socket-path P] [--log-dir DIR] → run bridge (foreground, default)
-hole bridge run --service [--log-dir DIR]                    → run as service (invoked by SCM/launchd)
+hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR] → run bridge (foreground, needs elevation)
+hole bridge run --service [--log-dir DIR] [--state-dir DIR]         → run as service (invoked by SCM/launchd)
 hole bridge install               → register + start bridge service (needs elevation)
 hole bridge uninstall             → stop + remove bridge service (needs elevation)
 hole bridge status                → print install/running status
 hole bridge log [--log-dir DIR]   → print bridge log to stdout
 hole bridge log path [--log-dir DIR] → print log file path
 hole bridge log watch [--tail N] [--log-dir DIR] → stream log output
-hole bridge grant-access [--then-send B64 | --then-send-file PATH] → add current user to hole group (needs elevation)
+hole bridge grant-access [--then-send B64 | --then-send-file PATH] → create hole group, add user, write SID file (needs elevation)
 hole bridge ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
 hole upgrade                      → check for updates and install latest version (unattended)
 hole path add                     → add hole to system PATH
 hole path remove                  → remove hole from system PATH
 ```
+
+### Crash recovery
+
+While a proxy is active, the bridge persists a small route-recovery state
+file at `<state_dir>/bridge-routes.json` that records the installed TUN
+name, server IP, and upstream interface. The file is cleared on clean
+shutdown. On next startup, the bridge calls `routing::recover_routes` —
+which runs *after* the IPC socket is bound — to tear down any routes
+leaked by a previous crashed run. If the in-bridge recovery fails or the
+process can't restart, `scripts/network-reset.py` reads the same state
+file and performs an equivalent cleanup from outside.
 
 ## Workspace layout
 
