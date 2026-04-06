@@ -52,12 +52,18 @@ fn launch_gui() {
             commands::get_public_ip,
             tray::toggle_proxy,
         ])
-        .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
-            if matches!(event, tauri::WindowEvent::Destroyed) && window.app_handle().webview_windows().is_empty() {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                window.hide().ok();
+                #[cfg(target_os = "macos")]
                 platform::hide_dock_icon(window.app_handle());
             }
-            let _ = (window, event); // suppress unused on non-macOS
+            #[cfg(target_os = "macos")]
+            tauri::WindowEvent::Destroyed if window.app_handle().webview_windows().is_empty() => {
+                platform::hide_dock_icon(window.app_handle());
+            }
+            _ => {}
         })
         .setup(|app| {
             tray::create_tray(app)?;

@@ -616,9 +616,14 @@ async fn handle_check_for_updates(app: AppHandle) {
 }
 
 fn open_settings_window(app: &AppHandle) {
-    // Reuse existing window if it's already open
+    // Reuse existing window if it's already open. The dashboard's close button
+    // is intercepted to hide the window rather than destroy it, so the window
+    // may be present but hidden — call show() before set_focus().
     if let Some(window) = app.get_webview_window("settings") {
+        window.show().ok();
         window.set_focus().ok();
+        #[cfg(target_os = "macos")]
+        crate::platform::show_dock_icon(app);
         return;
     }
 
