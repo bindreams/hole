@@ -110,7 +110,10 @@ pub(crate) enum PathAction {
 
 /// Parse CLI arguments. On Windows, attaches the parent console first so that
 /// `--help`/`--version`/error output reaches the user's terminal — but only if
-/// any args were passed, preserving silent GUI launches from Explorer.
+/// any args were passed. With zero args (the bare GUI launch from Explorer or
+/// the autostart entry) no console is attached and the app stays silent. The
+/// MSI installer launches with `--show-dashboard`, so it will attach to
+/// `msiexec`'s console if `msiexec` was started from one — that's acceptable.
 pub(crate) fn parse_args() -> Cli {
     #[cfg(target_os = "windows")]
     if std::env::args().len() > 1 {

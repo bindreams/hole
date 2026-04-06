@@ -23,7 +23,13 @@ use tauri::Manager;
 fn main() {
     let cli = cli::parse_args();
     match cli.command {
-        Some(cmd) => cli::dispatch(cmd),
+        Some(cmd) => {
+            if cli.show_dashboard {
+                eprintln!("error: --show-dashboard cannot be combined with a subcommand");
+                std::process::exit(2);
+            }
+            cli::dispatch(cmd);
+        }
         None => launch_gui(cli.show_dashboard),
     }
 }

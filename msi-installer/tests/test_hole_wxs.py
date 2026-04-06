@@ -199,6 +199,7 @@ def test_launch_ca_after_install_finalize(package: ET.Element) -> None:
 
 def test_launch_ca_passes_show_dashboard(package: ET.Element) -> None:
     """Launch CA must pass --show-dashboard so the first-run UX is the dashboard, not tray-only."""
+    assert _LAUNCH_CAS, "no launch CAs configured to test"
     cas = _ca_map(package)
     for action in _LAUNCH_CAS:
         ca = cas[action]
