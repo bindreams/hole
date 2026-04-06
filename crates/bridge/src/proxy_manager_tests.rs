@@ -87,6 +87,15 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// Build a `ProxyManager` backed by a fresh `TempDir`. Caller must hold
+/// the returned `TempDir` for the scope of the manager so its contents
+/// (any written `bridge-routes.json`) live until drop.
+fn new_manager<B: ProxyBackend>(backend: B) -> (ProxyManager<B>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let pm = ProxyManager::new(backend, dir.path().to_path_buf());
+    (pm, dir)
+}
+
 fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
@@ -108,7 +117,7 @@ fn test_config() -> ProxyConfig {
 #[skuld::test]
 fn start_transitions_to_running() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         assert_eq!(pm.state(), ProxyState::Stopped);
 
         pm.start(&test_config()).await.unwrap();
@@ -123,7 +132,7 @@ fn start_transitions_to_running() {
 #[skuld::test]
 fn stop_transitions_to_stopped() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
 
@@ -135,7 +144,7 @@ fn stop_transitions_to_stopped() {
 #[skuld::test]
 fn stop_when_stopped_is_noop() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         assert_eq!(pm.state(), ProxyState::Stopped);
 
         // Should not error
@@ -147,7 +156,7 @@ fn stop_when_stopped_is_noop() {
 #[skuld::test]
 fn start_when_running_returns_already_running() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         pm.start(&test_config()).await.unwrap();
 
         let err = pm.start(&test_config()).await.unwrap_err();
@@ -163,7 +172,7 @@ fn reload_stops_then_starts() {
         let backend = MockBackend::new();
         let start_count = Arc::clone(&backend.start_called);
 
-        let mut pm = ProxyManager::new(backend);
+        let (mut pm, _dir) = new_manager(backend);
         pm.start(&test_config()).await.unwrap();
         assert_eq!(start_count.load(Ordering::SeqCst), 1);
 
@@ -180,7 +189,7 @@ fn reload_stops_then_starts() {
 #[skuld::test]
 fn start_failure_stays_stopped() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::failing_start());
+        let (mut pm, _dir) = new_manager(MockBackend::failing_start());
         let err = pm.start(&test_config()).await.unwrap_err();
 
         assert_eq!(pm.state(), ProxyState::Stopped);
@@ -195,7 +204,7 @@ fn route_failure_cancels_ss() {
         let backend = MockBackend::failing_routes();
         let start_count = Arc::clone(&backend.start_called);
 
-        let mut pm = ProxyManager::new(backend);
+        let (mut pm, _dir) = new_manager(backend);
         let err = pm.start(&test_config()).await.unwrap_err();
 
         assert_eq!(pm.state(), ProxyState::Stopped);
@@ -210,7 +219,7 @@ fn route_failure_cancels_ss() {
 #[skuld::test]
 fn check_health_detects_crashed_task() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
 
@@ -228,9 +237,25 @@ fn check_health_detects_crashed_task() {
 }
 
 #[skuld::test]
+fn check_health_does_not_mark_healthy_task_as_crashed() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        // The mock's start_ss spawns a 3600s sleep task — still healthy
+        // after a short delay. check_health must NOT flip to Stopped.
+        pm.check_health();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
 fn uptime_increases_while_running() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(MockBackend::new());
+        let (mut pm, _dir) = new_manager(MockBackend::new());
         pm.start(&test_config()).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -242,32 +267,40 @@ fn uptime_increases_while_running() {
     });
 }
 
-// NoTunBackend tests ==================================================================================================
+// State-file side effects =============================================================================================
 
 #[skuld::test]
-fn no_tun_backend_start_stop_cycle() {
+fn start_writes_state_file_then_stop_clears_it() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(NoTunBackend);
-        assert_eq!(pm.state(), ProxyState::Stopped);
+        let (mut pm, dir) = new_manager(MockBackend::new());
+        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        assert!(!state_path.exists());
 
         pm.start(&test_config()).await.unwrap();
-        assert_eq!(pm.state(), ProxyState::Running);
+        assert!(state_path.exists(), "state file must exist while proxy is running");
+
+        // Verify the content contains the server IP
+        let loaded = crate::route_state::load(dir.path()).unwrap();
+        assert_eq!(loaded.server_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         pm.stop().await.unwrap();
-        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(!state_path.exists(), "state file must be cleared on clean stop");
     });
 }
 
 #[skuld::test]
-fn no_tun_backend_health_check() {
+fn route_failure_clears_stale_state_file() {
     rt().block_on(async {
-        let mut pm = ProxyManager::new(NoTunBackend);
-        pm.start(&test_config()).await.unwrap();
+        let (mut pm, dir) = new_manager(MockBackend::failing_routes());
+        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
 
-        // Health check should not detect a crash (task is pending forever)
-        pm.check_health();
-        assert_eq!(pm.state(), ProxyState::Running);
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(err.to_string().contains("mock route failure"));
 
-        pm.stop().await.unwrap();
+        // Even on setup_routes failure, no stale file should remain
+        assert!(
+            !state_path.exists(),
+            "state file must be cleared on setup_routes failure"
+        );
     });
 }

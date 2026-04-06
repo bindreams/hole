@@ -16,11 +16,7 @@ pub struct LogGuard {
 /// Falls back to `<data_local_dir>/hole/logs` when `state_dir` is not available
 /// (macOS and Windows don't define a distinct state dir).
 pub fn default_log_dir() -> PathBuf {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .expect("no state/data directory found")
-        .join("hole")
-        .join("logs")
+    crate::paths::default_user_subdir("logs")
 }
 
 /// Initialize logging to stderr + rolling daily file.

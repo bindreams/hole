@@ -233,21 +233,116 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 }
 
 // RouteGuard tests ====================================================================================================
+//
+// `RouteGuard::drop` shells out to `netsh`/`route` via teardown_routes AND
+// clears the route-state file. These tests are about construction only, so
+// every test uses `std::mem::forget(guard)` at the end to prevent Drop
+// from running. The tempdir holding `state_dir` still gets cleaned up via
+// its own Drop — std::mem::forget only applies to the RouteGuard itself.
 
 #[skuld::test]
 fn route_guard_stores_server_ip() {
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
     assert_eq!(guard.server_ip, ipv4_server());
+    std::mem::forget(guard);
 }
 
 #[skuld::test]
 fn route_guard_stores_tun_name() {
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
     assert_eq!(guard.tun_name, "utun7");
+    std::mem::forget(guard);
 }
 
 #[skuld::test]
 fn route_guard_stores_interface_name() {
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
     assert_eq!(guard.interface_name, "en0");
+    std::mem::forget(guard);
+}
+
+#[skuld::test]
+fn route_guard_stores_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().to_path_buf();
+    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), path.clone());
+    assert_eq!(guard.state_dir, path);
+    std::mem::forget(guard);
+}
+
+// recover_routes_with tests ===========================================================================================
+//
+// These use an injectable command runner so the test doesn't shell out. The
+// runner records (phase, commands) into a RefCell so we can assert on it.
+
+use crate::route_state::{self, RouteState, STATE_FILE_NAME};
+use std::cell::RefCell;
+
+type Captured = Vec<(String, Vec<Vec<String>>)>;
+
+fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) -> std::io::Result<()> + '_ {
+    |cmds: &[Vec<String>], phase: &str| {
+        log.borrow_mut().push((phase.into(), cmds.to_vec()));
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn recover_without_state_file_runs_only_split_teardown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(tmp.path(), capturing_runner(&log));
+
+    let log = log.into_inner();
+    assert_eq!(log.len(), 1, "expected only split-teardown phase, got {log:?}");
+    assert_eq!(log[0].0, "recover-split");
+    assert!(!tmp.path().join(STATE_FILE_NAME).exists());
+}
+
+#[skuld::test]
+fn recover_with_state_file_runs_split_then_bypass_then_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = RouteState {
+        version: route_state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+    };
+    route_state::save(tmp.path(), &state).unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(tmp.path(), capturing_runner(&log));
+
+    let log = log.into_inner();
+    assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
+    assert_eq!(log[0].0, "recover-split");
+    assert_eq!(log[1].0, "recover-bypass");
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "state file should be cleared after recovery"
+    );
+}
+
+#[skuld::test]
+fn recover_clears_state_file_even_when_runner_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = RouteState {
+        version: route_state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+    };
+    route_state::save(tmp.path(), &state).unwrap();
+
+    let failing =
+        |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
+    recover_routes_with(tmp.path(), failing);
+
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "state file should be cleared even when runner returns Err"
+    );
 }

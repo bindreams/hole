@@ -2187,6 +2187,7 @@ dependencies = [
  "shadowsocks-service",
  "skuld",
  "socket2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

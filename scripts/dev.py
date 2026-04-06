@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
-"""Launch bridge and GUI in dev mode with multiplexed logs.
+"""Launch bridge + GUI in dev mode with multiplexed, colored logs.
 
 Builds the workspace, then runs three processes:
-  1. Vite dev server (frontend HMR on port 1420)
-  2. Bridge in foreground/no-tun mode
-  3. GUI (Tauri webview loading from Vite)
+  1. Vite dev server (frontend HMR on port 1420) — unelevated on macOS
+  2. Bridge in foreground mode (REAL TUN + routing) — elevated
+  3. GUI (Tauri webview loading from Vite) — unelevated on macOS
 
-Frontend changes (ui/) hot-reload instantly. Rust changes need Ctrl+C and re-run.
+REQUIRES ELEVATION:
+  Windows: run from an elevated PowerShell (`uv run scripts/dev.py`)
+  macOS:   `sudo uv run scripts/dev.py`
 
-Usage:
-  uv run scripts/dev.py
+On macOS, this script detects `SUDO_USER` and drops privileges for Vite
+and the GUI so they read your real ~/Library config, while the bridge
+inherits root. On Windows, UAC is token-based so all three inherit the
+elevated token without an identity change.
+
+Dev uses the production IPC permission path: `hole bridge grant-access`
+is invoked to create the `hole` group, add you to it, and (Windows) write
+the installer-user-sid file. The bridge itself uses `IpcServer::bind` +
+`apply_socket_permissions`, the same code path as the installed service.
+
+If this script crashes or is killed and your internet breaks, run:
+  sudo scripts/network-reset.py    (macOS)
+  scripts/network-reset.py         (Windows, from an elevated PowerShell)
+
+Frontend changes (ui/) hot-reload instantly. Rust changes need Ctrl+C
+and re-run.
 """
 # /// script
 # requires-python = ">=3.9"
 # ///
+from __future__ import annotations
 
 import atexit
 import os
@@ -25,6 +42,9 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
+
+import _lib
 
 # ANSI colors ==========================================================================================================
 
@@ -36,6 +56,7 @@ RESET = "\033[0m"
 
 VITE_PORT = 1420
 VITE_READY_TIMEOUT = 30
+SOCKET_READY_TIMEOUT = 15
 
 # Prerequisites ========================================================================================================
 
@@ -49,18 +70,32 @@ def resolve_tool(name: str) -> str:
     return path
 
 
-def ensure_node_modules(npm: str) -> None:
+def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None) -> None:
     if Path("node_modules").exists():
         return
     print(f"{BOLD}Installing npm dependencies...{RESET}")
-    result = subprocess.run([npm, "install"], stdout=sys.stdout, stderr=sys.stderr)
+    # Run as the invoking user so `node_modules/` is not owned by root.
+    result = subprocess.run(
+        [npm, "install"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
     if result.returncode != 0:
         sys.exit(result.returncode)
 
 
-def cargo_build(cargo: str) -> None:
+def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
     print(f"{BOLD}Building workspace...{RESET}")
-    result = subprocess.run([cargo, "build"], stdout=sys.stdout, stderr=sys.stderr)
+    # Run as the invoking user so `target/` is not owned by root.
+    result = subprocess.run(
+        [cargo, "build"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
     if result.returncode != 0:
         sys.exit(result.returncode)
 
@@ -79,20 +114,51 @@ def prefix_stream(stream, label: str, color: str) -> None:
 
 
 def wait_for_port(port: int, timeout: float, proc: subprocess.Popen) -> bool:
-    """Poll until `proc` is accepting connections on `port`.
+    """Poll until `proc` is accepting connections on `port` via any address
+    `localhost` resolves to (IPv4 and/or IPv6).
+
+    Vite's default `localhost` host can bind to `::1` only (Windows 11,
+    macOS) or `127.0.0.1` only depending on the system's hosts-file
+    ordering. A hardcoded `127.0.0.1` probe misses the v6-only case and
+    reports a false "did not start" timeout while Vite is actually up.
 
     Returns False immediately if `proc` exits before the port opens, so we don't
     falsely succeed on a port already in use by an unrelated process.
     """
+    try:
+        addrs = socket.getaddrinfo("localhost", port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # Fall back to both loopback addresses if name resolution fails.
+        addrs = [
+            (socket.AF_INET, None, None, "", ("127.0.0.1", port)),
+            (socket.AF_INET6, None, None, "", ("::1", port, 0, 0)),
+        ]
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return True
-        except OSError:
-            time.sleep(0.2)
+        for family, _sock_type, _proto, _canon, sockaddr in addrs:
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    sock.connect(sockaddr)
+                    return True
+            except OSError:
+                continue
+        time.sleep(0.2)
+    return False
+
+
+def wait_for_socket(path: Path, proc: subprocess.Popen, timeout: float) -> bool:
+    """Wait until the bridge socket file appears at `path`, or `proc` dies."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        if path.exists():
+            return True
+        time.sleep(0.1)
     return False
 
 
@@ -102,16 +168,80 @@ def wait_for_exit(proc: subprocess.Popen, done: threading.Event) -> None:
     done.set()
 
 
+def new_process_group_kwargs() -> dict[str, Any]:
+    """Return Popen kwargs that put the child in its own process group /
+    job object so `terminate_tree` can kill the whole subtree.
+
+    Necessary because `npm run dev` spawns `node vite.js` as a
+    grandchild. Without a process group, `proc.terminate()` on Windows
+    only kills `npm.cmd` and leaves the node/vite child running, which
+    holds port 1420 until the OS reaps it (minutes).
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def terminate_tree(proc: subprocess.Popen) -> None:
+    """Signal graceful shutdown of `proc` AND all its descendants.
+
+    Windows: `taskkill /T` walks the tree and terminates every process.
+    POSIX: `killpg` sends SIGTERM to the whole process group (set up by
+    `start_new_session=True` at spawn time).
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        import signal as _signal
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
+
+
 def shutdown(procs: list[subprocess.Popen]) -> None:
     print(f"\n{BOLD}Shutting down...{RESET}")
     for proc in procs:
-        if proc.poll() is None:
-            proc.terminate()
+        terminate_tree(proc)
     for proc in procs:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            # Tree-kill already used SIGKILL on Windows; on POSIX fall
+            # back to per-process SIGKILL for any stragglers.
             proc.kill()
+
+
+# Privilege drop =======================================================================================================
+
+
+def drop_kwargs(target: tuple[int, int, str, str] | None) -> dict:
+    """Return Popen kwargs that drop privileges to `target` on POSIX.
+
+    `extra_groups` is set to the TARGET user's full group list (via
+    `os.getgrouplist`), NOT root's supplementary groups and NOT empty —
+    we need hole-group membership in the GUI to open the production
+    IPC socket on macOS.
+    """
+    if target is None:
+        return {}
+    uid, gid, user, _ = target
+    groups = os.getgrouplist(user, gid)
+    return {"user": uid, "group": gid, "extra_groups": groups}
+
+
+def drop_env(env: dict, target: tuple[int, int, str, str] | None) -> dict:
+    """Reset HOME/USER/LOGNAME in `env` to the target user."""
+    if target is None:
+        return env
+    _, _, user, home = target
+    return {**env, "HOME": home, "USER": user, "LOGNAME": user}
 
 
 # Main =================================================================================================================
@@ -122,11 +252,14 @@ def main() -> None:
         print("Error: run this script from the project root")
         sys.exit(1)
 
+    _lib.require_elevation()
+    target_user = _lib.sudo_target_user()  # (uid, gid, user, home) or None
+
     cargo = resolve_tool("cargo")
     npm = resolve_tool("npm")
 
-    ensure_node_modules(npm)
-    cargo_build(cargo)
+    ensure_node_modules(npm, target_user)
+    cargo_build(cargo, target_user)
 
     # Locate built binary
     bin_name = "hole.exe" if sys.platform == "win32" else "hole"
@@ -145,12 +278,32 @@ def main() -> None:
     atexit.register(lambda: bridge_bin.unlink(missing_ok=True))
 
     socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
+    bridge_state_dir = Path(tempfile.gettempdir()) / "hole-dev" / "state"
+    bridge_state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up IPC access via the production path BEFORE starting the bridge
+    # so that apply_socket_permissions picks up the hole group + user SID
+    # from the very first socket bind.
+    print(f"{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}")
+    grant_result = subprocess.run(
+        [str(bridge_bin), "bridge", "grant-access"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+    if grant_result.returncode != 0:
+        print(f"{YELLOW}bridge grant-access failed (exit {grant_result.returncode}){RESET}")
+        sys.exit(grant_result.returncode)
 
     print(f"\n{BOLD}Starting dev environment...{RESET}")
-    print(f"  Socket: {socket_path}")
-    print(f"  {CYAN}[bridge]{RESET} {bridge_bin.name} → --no-tun")
-    print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI)")
-    print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420")
+    print(f"  Socket:    {socket_path}")
+    print(f"  State dir: {bridge_state_dir}")
+    print(f"  {CYAN}[bridge]{RESET} {bridge_bin.name} → real TUN + routing (elevated)")
+    if target_user is not None:
+        print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI) → dropped to user '{target_user[2]}'")
+        print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420 (dropped to user '{target_user[2]}')")
+    else:
+        print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI)")
+        print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420")
     print(f"  Frontend changes hot-reload. Rust changes need Ctrl+C and re-run.")
     print()
 
@@ -164,11 +317,14 @@ def main() -> None:
         # and doesn't restore it when terminated, leaving arrow keys broken.
         vite_proc = subprocess.Popen(
             [npm, "run", "dev"],
+            env=drop_env({**os.environ}, target_user),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **drop_kwargs(target_user),
+            **new_process_group_kwargs(),
         )
         procs.append(vite_proc)
         threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
@@ -181,22 +337,40 @@ def main() -> None:
                 print(f"{YELLOW}Vite did not start on port {VITE_PORT} within {VITE_READY_TIMEOUT}s{RESET}")
             sys.exit(1)  # finally block handles shutdown
 
-        # Start bridge
+        # Start bridge (inherits elevated credentials).
         bridge_proc = subprocess.Popen(
-            [str(bridge_bin), "bridge", "run", "--no-tun", "--socket-path",
-             str(socket_path)],
+            [
+                str(bridge_bin),
+                "bridge",
+                "run",
+                "--socket-path",
+                str(socket_path),
+                "--state-dir",
+                str(bridge_state_dir),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **new_process_group_kwargs(),
         )
         procs.append(bridge_proc)
         threading.Thread(target=prefix_stream, args=(bridge_proc.stdout, "bridge", CYAN), daemon=True).start()
         threading.Thread(target=wait_for_exit, args=(bridge_proc, done), daemon=True).start()
 
-        # Start GUI
-        gui_env = {**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}
+        # Wait for the bridge to bind the socket before starting the GUI.
+        # Without this, the GUI races the bridge's apply_socket_permissions
+        # and can see a socket without the correct DACL/group yet.
+        if not wait_for_socket(socket_path, bridge_proc, SOCKET_READY_TIMEOUT):
+            if bridge_proc.poll() is not None:
+                print(f"{YELLOW}Bridge exited with code {bridge_proc.returncode}{RESET}")
+            else:
+                print(f"{YELLOW}Bridge did not bind socket within {SOCKET_READY_TIMEOUT}s{RESET}")
+            sys.exit(1)
+
+        # Start GUI (dropped to target user on macOS under sudo).
+        gui_env = drop_env({**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}, target_user)
         gui_proc = subprocess.Popen(
             [str(built_bin)],
             env=gui_env,
@@ -205,6 +379,8 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **drop_kwargs(target_user),
+            **new_process_group_kwargs(),
         )
         procs.append(gui_proc)
         threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()

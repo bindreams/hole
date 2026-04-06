@@ -70,12 +70,18 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// Build a mock proxy backed by a throw-away state dir. Uses
+/// `tempfile::tempdir().keep()` so the directory is created but its
+/// auto-cleanup Drop is suppressed — the directory lives until the
+/// process exits, which is fine for unit tests.
 fn mock_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::new())))
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(Mutex::new(ProxyManager::new(MockBackend::new(), state_dir)))
 }
 
 fn failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::failing())))
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(Mutex::new(ProxyManager::new(MockBackend::failing(), state_dir)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -704,13 +710,14 @@ fn is_valid_sid_string_rejects_invalid() {
     assert!(!crate::ipc::is_valid_sid_string("S-1-1-0 "));
 }
 
-// bind_dev tests ======================================================================================================
+// bind() smoke tests — the production-path bind, which in cfg(test) uses
+// the unrestricted LocalListener::bind and skips apply_socket_permissions.
 
 #[skuld::test]
-fn bind_dev_accepts_connection() {
+fn bind_accepts_connection() {
     rt().block_on(async {
-        let path = test_socket_path("bind-dev-accept");
-        let server = IpcServer::bind_dev(&path, mock_proxy()).unwrap();
+        let path = test_socket_path("bind-accept");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -721,10 +728,10 @@ fn bind_dev_accepts_connection() {
 }
 
 #[skuld::test]
-fn bind_dev_status_query() {
+fn bind_status_query() {
     rt().block_on(async {
-        let path = test_socket_path("bind-dev-status");
-        let server = IpcServer::bind_dev(&path, mock_proxy()).unwrap();
+        let path = test_socket_path("bind-status");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
