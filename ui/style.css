@@ -764,6 +764,15 @@ td.del-cell {
   color: var(--red);
 }
 
+/* Default rule lock indicator (replaces .filter-del on row 0). */
+.filter-lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-ghost);
+  line-height: 1;
+}
+
 /* Filter table: editable cells -----  */
 .editable-cell {
   cursor: pointer;

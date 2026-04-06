@@ -159,6 +159,21 @@ export function renderFilters() {
       delSpan.className = "filter-del";
       delSpan.textContent = "\u2715";
       tdDel.appendChild(delSpan);
+    } else {
+      // Default wildcard rule — show a lock icon to indicate it cannot be deleted.
+      // Inline SVG (monochrome, currentColor, evenodd) so it matches the rest of
+      // the UI's icon style instead of rendering as a colorful 🔒 emoji.
+      // innerHTML with a static SVG literal is XSS-safe (no user input) and the
+      // HTML parser correctly creates SVG-namespaced elements when parsing <svg>
+      // inside a non-SVG parent.
+      const lockSpan = document.createElement("span");
+      lockSpan.className = "filter-lock";
+      lockSpan.title = "Default rule (cannot be deleted)";
+      lockSpan.innerHTML =
+        '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" fill-rule="evenodd" aria-hidden="true">' +
+        '<path d="M8 1a3 3 0 0 0-3 3v3H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-1V4a3 3 0 0 0-3-3zM6 4a2 2 0 1 1 4 0v3H6V4z"/>' +
+        "</svg>";
+      tdDel.appendChild(lockSpan);
     }
 
     tr.appendChild(tdDel);
