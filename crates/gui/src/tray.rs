@@ -5,7 +5,7 @@ use crate::state::AppState;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use hole_gui::tray_icons;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
 
@@ -117,7 +117,9 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
         .menu(&menu)
         .tooltip("Hole")
         .icon(icon)
-        .on_menu_event(handle_tray_event);
+        .show_menu_on_left_click(false)
+        .on_menu_event(handle_tray_event)
+        .on_tray_icon_event(handle_tray_icon_event);
 
     #[cfg(target_os = "macos")]
     {
@@ -272,6 +274,22 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
 }
 
 // Tray event handler ==================================================================================================
+
+/// Handle clicks on the tray icon itself (not menu items).
+///
+/// Left-click opens the dashboard. Right-click is left to the platform default,
+/// which opens the context menu (we set `show_menu_on_left_click(false)` so
+/// left-click does not also open the menu).
+fn handle_tray_icon_event(tray: &TrayIcon, event: TrayIconEvent) {
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+    } = event
+    {
+        open_settings_window(tray.app_handle());
+    }
+}
 
 /// Handle events from the tray menu.
 ///
