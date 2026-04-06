@@ -295,18 +295,8 @@ adapts automatically to dark/light theme via [data-theme]. */
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  overflow-y: auto;
-}
-
-.sb-content::-webkit-scrollbar {
-  width: 4px;
-}
-.sb-content::-webkit-scrollbar-track {
-  background: transparent;
-}
-.sb-content::-webkit-scrollbar-thumb {
-  background: var(--scrollbar);
-  border-radius: 2px;
+  /* OverlayScrollbars creates its own scroll context — see `.main`. */
+  overflow: hidden;
 }
 
 /* Sidebar: throughput graph -----  */

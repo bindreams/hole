@@ -626,7 +626,7 @@ fn open_settings_window(app: &AppHandle) {
     let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
         .title("Hole Dashboard")
         .inner_size(800.0, 600.0)
-        .min_inner_size(800.0, 600.0)
+        .min_inner_size(800.0, 200.0)
         .max_inner_size(800.0, 4096.0)
         .resizable(true);
 

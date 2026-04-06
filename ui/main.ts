@@ -137,6 +137,12 @@ async function init() {
       scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
     });
   }
+  const sbContent = document.querySelector<HTMLElement>(".sb-content");
+  if (sbContent) {
+    OverlayScrollbars(sbContent, {
+      scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+    });
+  }
 
   // Load config from backend.
   await loadConfig();
