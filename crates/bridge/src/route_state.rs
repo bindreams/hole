@@ -53,8 +53,7 @@ fn state_file(state_dir: &Path) -> PathBuf {
 pub fn save(state_dir: &Path, state: &RouteState) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
 
-    let json = serde_json::to_vec_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Same-directory NamedTempFile -> persist is a same-filesystem atomic rename.
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;

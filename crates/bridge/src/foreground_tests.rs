@@ -70,10 +70,7 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
 
         let path_clone = path.clone();
         let server_handle = tokio::spawn(async move {
-            let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
-                StubBackend,
-                state_dir,
-            )));
+            let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(StubBackend, state_dir)));
             let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
             let server = crate::ipc::IpcServer::bind(&path_clone, proxy).unwrap();

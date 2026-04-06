@@ -267,7 +267,7 @@ fn uptime_increases_while_running() {
     });
 }
 
-// State-file side effects ============================================================================================
+// State-file side effects =============================================================================================
 
 #[skuld::test]
 fn start_writes_state_file_then_stop_clears_it() {

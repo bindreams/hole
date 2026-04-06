@@ -101,7 +101,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // runtime while the IPC socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
         let state_dir_for_recover = state_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_for_recover)).await {
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_for_recover)).await
+        {
             tracing::warn!(error = %e, "recover_routes task panicked");
         }
 

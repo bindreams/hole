@@ -337,9 +337,8 @@ fn recover_clears_state_file_even_when_runner_errors() {
     };
     route_state::save(tmp.path(), &state).unwrap();
 
-    let failing = |_: &[Vec<String>], _: &str| -> std::io::Result<()> {
-        Err(std::io::Error::other("simulated runner failure"))
-    };
+    let failing =
+        |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
     recover_routes_with(tmp.path(), failing);
 
     assert!(
