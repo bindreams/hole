@@ -500,6 +500,10 @@ body {
   overflow: hidden;
 }
 
+.section-clip.collapsed {
+  max-height: 0;
+}
+
 .section-body {
   padding-top: 0.5rem;
 }
