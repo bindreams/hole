@@ -89,24 +89,52 @@ If you prefer separate terminals or need more control:
 
 **Terminal 1 — Bridge (elevated):**
 
-```sh
-# From an elevated PowerShell (Windows) or under sudo (macOS)
+Windows (elevated PowerShell):
+
+```powershell
 cargo build
-cp target/debug/hole $TEMP/hole-dev-bridge             # copy to avoid file lock (see below)
-$TEMP/hole-dev-bridge bridge grant-access              # create hole group, add user
-$TEMP/hole-dev-bridge bridge run \
-    --socket-path $TEMP/hole-dev.sock \
-    --state-dir $TEMP/hole-dev-state
+$dev = "$env:TEMP\hole-dev-manual"
+New-Item -ItemType Directory -Force -Path $dev | Out-Null
+Copy-Item target\debug\hole.exe "$dev\hole.exe"                              # copy to avoid file lock (see below)
+Copy-Item .cache\gui\v2ray-plugin\v2ray-plugin-*.exe "$dev\v2ray-plugin.exe" # sidecar must sit next to the bridge binary
+& "$dev\hole.exe" bridge grant-access                                        # create hole group, add user
+& "$dev\hole.exe" bridge run `
+    --socket-path "$env:TEMP\hole-dev.sock" `
+    --state-dir   "$env:TEMP\hole-dev-state"
+```
+
+macOS (under sudo):
+
+```sh
+cargo build
+DEV="$TMPDIR/hole-dev-manual"
+mkdir -p "$DEV"
+cp target/debug/hole "$DEV/hole"                                  # copy to avoid file lock (see below)
+cp .cache/gui/v2ray-plugin/v2ray-plugin-* "$DEV/v2ray-plugin"     # sidecar must sit next to the bridge binary
+"$DEV/hole" bridge grant-access                                   # create hole group, add user
+"$DEV/hole" bridge run \
+    --socket-path "$TMPDIR/hole-dev.sock" \
+    --state-dir   "$TMPDIR/hole-dev-state"
 ```
 
 **Terminal 2 — Vite + GUI (unelevated):**
 
-```sh
-npm run dev &                                          # Vite on port 1420
-HOLE_BRIDGE_SOCKET=$TEMP/hole-dev.sock target/debug/hole
+Windows (PowerShell):
+
+```powershell
+npm run dev                                            # Vite on port 1420 (run in its own terminal)
+$env:HOLE_BRIDGE_SOCKET = "$env:TEMP\hole-dev.sock"
+target\debug\hole.exe
 ```
 
-The bridge binary must be copied because it holds a file lock while running. Without the copy, `cargo build` would fail with "Access is denied" when you try to rebuild.
+macOS (bash):
+
+```sh
+npm run dev &                                          # Vite on port 1420
+HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
+```
+
+The bridge binary must be copied because it holds a file lock while running. Without the copy, `cargo build` would fail with "Access is denied" when you try to rebuild. The `v2ray-plugin` sidecar must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy.rs) finds it — same layout as the installed MSI in `Program Files\hole\bin\`.
 
 ### Flags
 
