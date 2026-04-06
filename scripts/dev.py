@@ -179,8 +179,7 @@ def main() -> None:
                 print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
             else:
                 print(f"{YELLOW}Vite did not start on port {VITE_PORT} within {VITE_READY_TIMEOUT}s{RESET}")
-            shutdown(procs)
-            sys.exit(1)
+            sys.exit(1)  # finally block handles shutdown
 
         # Start bridge
         bridge_proc = subprocess.Popen(
