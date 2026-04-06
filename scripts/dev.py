@@ -425,7 +425,7 @@ def main() -> None:
             print(f"{BOLD}WKWebView remote debugging:{RESET} Safari → Develop → Hole → Hole Dashboard")
 
         gui_proc = subprocess.Popen(
-            [str(built_bin)],
+            [str(built_bin), "--show-dashboard"],
             env=gui_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

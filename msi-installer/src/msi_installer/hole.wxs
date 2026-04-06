@@ -107,7 +107,7 @@
     <CustomAction
       Id="LaunchApp"
       FileRef="hole.exe"
-      ExeCommand=""
+      ExeCommand="--show-dashboard"
       Execute="immediate"
       Impersonate="yes"
       Return="asyncNoWait" />

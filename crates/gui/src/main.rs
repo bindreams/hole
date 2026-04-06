@@ -1,5 +1,8 @@
 // Prevent console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// In test mode the bin's `main` becomes a skuld test runner, which makes all
+// the regular GUI functions appear unused to clippy.
+#![cfg_attr(test, allow(dead_code))]
 
 mod bridge_client;
 mod cli;
@@ -16,17 +19,21 @@ mod tray;
 use state::AppState;
 use tauri::Manager;
 
+#[cfg(not(test))]
 fn main() {
-    // Any argument at all routes to clap (subcommands, --version, --help).
-    // No arguments launches the GUI.
-    if std::env::args().len() > 1 {
-        cli::dispatch();
+    let cli = cli::parse_args();
+    match cli.command {
+        Some(cmd) => cli::dispatch(cmd),
+        None => launch_gui(cli.show_dashboard),
     }
-
-    launch_gui();
 }
 
-fn launch_gui() {
+#[cfg(test)]
+fn main() {
+    skuld::run_all();
+}
+
+fn launch_gui(show_dashboard: bool) {
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
@@ -66,9 +73,12 @@ fn launch_gui() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             tray::create_tray(app)?;
             platform::on_setup(app)?;
+            if show_dashboard {
+                tray::open_settings_window(app.handle());
+            }
             setup::check_bridge_on_launch(app.handle().clone());
             hole_gui::update::start_update_checker(app.handle().clone(), |app, info| {
                 // Rebuild tray menu to include the "Install Update" item.

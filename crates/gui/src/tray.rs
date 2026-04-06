@@ -615,7 +615,7 @@ async fn handle_check_for_updates(app: AppHandle) {
     }
 }
 
-fn open_settings_window(app: &AppHandle) {
+pub(crate) fn open_settings_window(app: &AppHandle) {
     // Reuse existing window if it's already open. The dashboard's close button
     // is intercepted to hide the window rather than destroy it, so the window
     // may be present but hidden — call show() before set_focus().

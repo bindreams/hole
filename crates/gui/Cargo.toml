@@ -13,6 +13,7 @@ harness = false
 [[bin]]
 name = "hole"
 path = "src/main.rs"
+harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
