@@ -39,12 +39,14 @@ enum BridgeAction {
         /// Run as a system service (invoked by SCM/launchd)
         #[arg(long)]
         service: bool,
-        /// Disable TUN/routing (IPC-only mode, no elevation needed)
-        #[arg(long, conflicts_with = "service")]
-        no_tun: bool,
         /// Override the log directory
         #[arg(long)]
         log_dir: Option<std::path::PathBuf>,
+        /// Override the directory where the bridge writes its route-recovery
+        /// state file (`bridge-routes.json`). Default: platform-specific
+        /// user state dir.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
     },
     /// Install and start the bridge service
     Install,
@@ -180,30 +182,38 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         BridgeAction::Run {
             socket_path,
             service,
-            no_tun,
             log_dir,
+            state_dir,
         } => {
             let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
             let _guard = hole_bridge::logging::init(&log_dir);
             tracing::info!("hole bridge starting");
 
-            if !no_tun {
-                hole_bridge::routing::teardown_split_routes(hole_bridge::proxy::TUN_DEVICE_NAME).ok();
-            }
+            // Canonicalize state_dir to an absolute path. If canonicalize
+            // fails (e.g. directory doesn't exist yet), fall back to
+            // joining against cwd so the service mode doesn't surprise the
+            // user with a cwd-relative path (service cwd is `C:\Windows\System32`
+            // on Windows or `/` on macOS).
+            let state_dir = state_dir.unwrap_or_else(hole_common::paths::default_state_dir);
+            let state_dir = state_dir.canonicalize().unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&state_dir))
+                    .unwrap_or(state_dir)
+            });
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
 
             let result: Result<(), Box<dyn std::error::Error>> = if service {
                 #[cfg(target_os = "macos")]
                 {
-                    hole_bridge::platform::os::run(&socket_path)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir)
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    hole_bridge::platform::os::run(&socket_path).map_err(|e| Box::new(e) as _)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir).map_err(|e| Box::new(e) as _)
                 }
             } else {
-                hole_bridge::foreground::run(&socket_path, no_tun)
+                hole_bridge::foreground::run(&socket_path, &state_dir)
             };
 
             if let Err(e) = result {
@@ -341,70 +351,52 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 
 /// Handle the `bridge grant-access` command.
 ///
-/// Adds the current user to the `hole` group and, on Windows, immediately
-/// updates the bridge socket DACL to include the user's SID. This is a
-/// workaround for the Windows token snapshot limitation:
+/// Creates the `hole` group, adds the current user to it, and on Windows
+/// writes the user's SID to the `installer-user-sid` file so the bridge
+/// includes it in the socket DACL on next startup. If the bridge is
+/// already running, also updates the live socket DACL directly so the
+/// GUI can connect without re-login. Used both by the installer (to set
+/// up IPC access at install time) and by `dev.py` (to prepare IPC access
+/// before the foreground dev bridge starts).
 ///
-/// 1. Windows process tokens are immutable snapshots of group memberships
-///    captured at logon time. There is no Win32 API to refresh a process's
-///    token to pick up new group memberships.
-/// 2. `klist purge` / `nltest` only affect Kerberos/AD tickets, not local
-///    group tokens.
-/// 3. Adding the user's own SID directly to the socket DACL provides
-///    immediate access — a user's own SID is always present in their token.
-/// 4. The per-user SID is cleaned up on bridge restart (when the group
-///    membership will have taken effect after re-login), because
-///    `apply_socket_permissions` rebuilds the DACL from scratch with only
-///    SYSTEM + Administrators + the `hole` group.
+/// The direct-DACL-update path is a workaround for the Windows
+/// token-snapshot limitation: process tokens are immutable snapshots of
+/// group memberships captured at logon time. There is no Win32 API to
+/// refresh a process's token to pick up new group memberships, and
+/// `klist purge`/`nltest` only affect Kerberos/AD tickets, not local
+/// group tokens. Adding the user's own SID directly to the DACL provides
+/// immediate access — a user's own SID is always present in their token.
 fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
-    use hole_common::protocol::PERMISSION_DENIED_HELP;
-
-    // Ensure the group exists (may not if bridge was installed by an older version)
-    if let Err(e) = hole_bridge::group::create_group() {
-        eprintln!("failed to create group: {e}");
+    // Create group + add user + (on Windows) write installer SID file.
+    if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
+        eprintln!("failed to prepare IPC access: {e}");
         return 1;
     }
 
-    // Add current user to the hole group
-    let username = match hole_bridge::group::installing_username() {
-        Ok(user) => {
-            if let Err(e) = hole_bridge::group::add_user_to_group(&user) {
-                eprintln!("failed to add '{user}' to group: {e}");
-                return 1;
-            }
-            eprintln!("added '{user}' to '{}' group", hole_bridge::group::GROUP_NAME);
-            user
-        }
-        Err(e) => {
-            eprintln!("could not determine current user: {e}");
-            eprintln!("{PERMISSION_DENIED_HELP}");
-            return 1;
-        }
-    };
-
-    // On Windows, immediately update the bridge socket DACL with the user's SID
-    // so the unprivileged GUI can connect without re-login.
+    // On Windows, if the bridge is already running, also update the live
+    // socket DACL directly so the GUI can connect immediately without
+    // waiting for a bridge restart.
     #[cfg(target_os = "windows")]
     {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
         if socket_path.exists() {
-            match hole_bridge::group::lookup_sid(&username) {
-                Ok(user_sid) => {
-                    let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
-                    if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
-                        eprintln!("warning: failed to update socket DACL: {e}");
-                    } else {
-                        eprintln!("updated socket DACL with user SID for immediate access");
+            if let Ok(username) = hole_bridge::group::installing_username() {
+                match hole_bridge::group::lookup_sid(&username) {
+                    Ok(user_sid) => {
+                        let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
+                        if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
+                            eprintln!("warning: failed to update live socket DACL: {e}");
+                        } else {
+                            eprintln!("updated live socket DACL with user SID");
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("warning: could not look up user SID: {e}");
+                    Err(e) => {
+                        eprintln!("warning: could not look up user SID: {e}");
+                    }
                 }
             }
         }
     }
-
-    drop(username); // used on Windows for DACL update, suppress unused warning on macOS
 
     // Optionally proxy a command to the bridge
     match (then_send, then_send_file) {

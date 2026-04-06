@@ -30,6 +30,7 @@ http = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 ureq = { version = "3", features = ["json"] }
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

@@ -1,32 +1,38 @@
 // Foreground bridge runner for development.
 
-use crate::proxy_manager::ProxyBackend;
+use crate::proxy_manager::{ProxyBackend, ProxyManager, RealBackend};
 use std::path::Path;
 
 /// Run the bridge in foreground mode (for development).
-/// Bypasses the platform service manager. Shuts down on Ctrl+C.
 ///
-/// When `no_tun` is true, uses `NoTunBackend` (no elevation needed).
-/// When `no_tun` is false, uses `RealBackend` (requires elevation for TUN/routing).
-pub fn run(socket_path: &Path, no_tun: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Bypasses the platform service manager and shuts down on Ctrl+C. Uses
+/// the production `IpcServer::bind` + `apply_socket_permissions` path, so
+/// dev exercises the real DACL/group/SDDL code — see §3.7 of the plan
+/// and the `dev.py` / `bridge grant-access` orchestration. Requires
+/// elevation for TUN + routing.
+pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    if no_tun {
-        rt.block_on(run_inner(socket_path, crate::proxy_manager::NoTunBackend))
-    } else {
-        rt.block_on(run_inner(socket_path, crate::proxy_manager::RealBackend))
-    }
+    rt.block_on(run_inner(socket_path, state_dir, RealBackend))
 }
 
 async fn run_inner<B: ProxyBackend + 'static>(
     socket_path: &Path,
+    state_dir: &Path,
     backend: B,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
+    let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
         backend,
+        state_dir.to_path_buf(),
     )));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-    let server = crate::ipc::IpcServer::bind_dev(socket_path, proxy)?;
+    // Bind BEFORE recovery. If a second bridge instance tries to run, the
+    // bind() fails and we exit without touching any routing state.
+    let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+
+    // Only after a successful bind do we run route recovery — this
+    // cleans up routes left by a previous crashed run.
+    crate::routing::recover_routes(state_dir);
 
     tokio::select! {
         result = server.run() => {

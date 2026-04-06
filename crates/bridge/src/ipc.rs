@@ -71,25 +71,6 @@ impl IpcServer {
         })
     }
 
-    /// Bind without restrictive permissions (for development).
-    /// Skips DACL setup and group permission checks.
-    pub fn bind_dev<B: ProxyBackend + 'static>(
-        path: &Path,
-        proxy: Arc<Mutex<ProxyManager<B>>>,
-    ) -> std::io::Result<Self> {
-        let listener = LocalListener::bind(path)?;
-        let state = Arc::new(IpcState {
-            proxy,
-            ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
-        });
-        let router = build_router(state);
-        Ok(Self {
-            listener,
-            router,
-            socket_path: path.to_owned(),
-        })
-    }
-
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
@@ -498,13 +479,44 @@ fn apply_socket_permissions(path: &Path) {
 
 /// Path to the file where the installing user's SID is stored temporarily.
 ///
-/// Written by `install_bridge()` in `setup.rs`, read and deleted by
+/// Written by [`prepare_ipc_access`], read and deleted by
 /// `apply_socket_permissions()` on bridge startup.
 #[cfg(target_os = "windows")]
 pub fn installer_user_sid_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
         .join("hole")
         .join("installer-user-sid")
+}
+
+/// Set up IPC access control so that the current interactive user can
+/// talk to the bridge once it's running. Idempotent.
+///
+/// Specifically: creates the `hole` group if missing, adds the current
+/// interactive user to it, and on Windows writes that user's SID to the
+/// `installer-user-sid` file so the next `apply_socket_permissions` call
+/// includes it in the socket DACL (working around the Windows token-snapshot
+/// limitation).
+///
+/// Used by both `install_bridge` (where it's called once before service
+/// registration) and by `bridge grant-access` (where it's called by the
+/// dev workflow before starting the foreground bridge).
+pub fn prepare_ipc_access() -> std::io::Result<()> {
+    crate::group::create_group()?;
+    let user = crate::group::installing_username()?;
+    crate::group::add_user_to_group(&user)?;
+    info!(user = %user, group = %crate::group::GROUP_NAME, "prepared IPC access");
+
+    #[cfg(target_os = "windows")]
+    {
+        let sid = crate::group::lookup_sid(&user)?;
+        let sid_path = installer_user_sid_path();
+        if let Some(parent) = sid_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&sid_path, &sid)?;
+        info!(sid = %sid, path = %sid_path.display(), "wrote installer user SID");
+    }
+    Ok(())
 }
 
 /// Check that a string looks like a valid Windows SID (e.g. `S-1-5-21-...`).

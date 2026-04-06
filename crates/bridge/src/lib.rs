@@ -6,6 +6,7 @@ pub mod logging;
 pub mod platform;
 pub mod proxy;
 pub mod proxy_manager;
+pub mod route_state;
 pub mod routing;
 pub mod socket;
 

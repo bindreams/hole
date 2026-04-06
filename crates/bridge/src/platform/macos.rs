@@ -9,6 +9,9 @@ pub const LAUNCHD_LABEL: &str = "com.hole.bridge";
 pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.bridge.plist";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.bridge";
 pub const SERVICE_LOG_DIR: &str = "/var/log/hole";
+/// System state directory for the launchd daemon (Apple convention:
+/// `/var/db/<daemon>`). Holds the route-recovery state file.
+pub const SERVICE_STATE_DIR: &str = "/var/db/hole/state";
 
 // Plist generation ====================================================================================================
 
@@ -29,6 +32,8 @@ pub fn generate_plist(binary_path: &str) -> String {
         <string>--service</string>
         <string>--log-dir</string>
         <string>{log_dir}</string>
+        <string>--state-dir</string>
+        <string>{state_dir}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -44,6 +49,7 @@ pub fn generate_plist(binary_path: &str) -> String {
         label = LAUNCHD_LABEL,
         binary_path = binary_path,
         log_dir = SERVICE_LOG_DIR,
+        state_dir = SERVICE_STATE_DIR,
     )
 }
 
@@ -57,8 +63,10 @@ pub fn install(source_binary: &Path) -> std::io::Result<()> {
     let helper_dir = Path::new("/Library/PrivilegedHelperTools");
     std::fs::create_dir_all(helper_dir)?;
 
-    // Create the service log dir (running elevated here, so LaunchDaemons can write later)
+    // Create the service log + state dirs (running elevated here, so
+    // LaunchDaemons can write to them later).
     std::fs::create_dir_all(SERVICE_LOG_DIR)?;
+    std::fs::create_dir_all(SERVICE_STATE_DIR)?;
 
     // Atomic copy: write to temp file, then rename
     let tmp_path = helper_dir.join("com.hole.bridge.tmp");
@@ -151,15 +159,19 @@ pub fn is_running() -> bool {
 }
 
 /// Run the bridge directly (called by launchd).
-pub fn run(socket_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
             crate::proxy_manager::RealBackend,
+            state_dir.to_path_buf(),
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
+        // Bind BEFORE recovery — a second instance's bind() fails before it
+        // can touch routing state.
         let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+        crate::routing::recover_routes(state_dir);
 
         tokio::select! {
             result = server.run() => {

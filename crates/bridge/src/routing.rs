@@ -1,6 +1,7 @@
 // Route table management — platform-specific split routing.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
@@ -50,14 +51,7 @@ pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) 
     run_commands(&commands, "teardown")
 }
 
-/// Clean up only the split routes (IPv4 and IPv6 halves).
-/// Used for crash recovery when the server IP is not known.
-pub fn teardown_split_routes(tun_name: &str) -> std::io::Result<()> {
-    let commands = build_split_route_teardown_commands(tun_name);
-    run_commands(&commands, "crash-recovery")
-}
-
-fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
+pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
     platform_split_route_teardown_commands(tun_name)
 }
 
@@ -74,21 +68,81 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// Crash recovery ======================================================================================================
+
+/// Clean up routes left behind by a previous bridge run.
+///
+/// Called at bridge startup **after** the IPC socket bind succeeds (so a
+/// second instance can't damage the first's routing state). Removes the
+/// fixed-CIDR split routes (idempotent — harmless if absent); if a
+/// [`crate::route_state::RouteState`] file is present in `state_dir`, also
+/// removes the server bypass route described by it; finally deletes the
+/// state file. Best-effort — all errors are logged at `warn` level and
+/// the function returns `()` (there is no meaningful caller recovery).
+pub fn recover_routes(state_dir: &Path) {
+    recover_routes_with(state_dir, run_commands);
+}
+
+/// Test seam for [`recover_routes`]: accepts an injected command runner so
+/// unit tests can assert on the emitted commands without shelling out to
+/// `netsh`/`route`.
+pub(crate) fn recover_routes_with<R>(state_dir: &Path, runner: R)
+where
+    R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
+{
+    use crate::proxy::TUN_DEVICE_NAME;
+
+    info!(state_dir = %state_dir.display(), "starting route recovery");
+
+    // 1. Split routes (IPv4 + IPv6 halves). Always attempted.
+    let split_cmds = build_split_route_teardown_commands(TUN_DEVICE_NAME);
+    if let Err(e) = runner(&split_cmds, "recover-split") {
+        warn!(error = %e, "split-route teardown failed during recovery");
+    }
+
+    // 2. If the state file is present, tear down the per-server bypass route.
+    if let Some(st) = crate::route_state::load(state_dir) {
+        info!(
+            tun = %st.tun_name,
+            server_ip = %st.server_ip,
+            iface = %st.interface_name,
+            "recovering bypass route from crashed run"
+        );
+        let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
+        if let Err(e) = runner(&bypass_cmds, "recover-bypass") {
+            warn!(error = %e, "bypass-route teardown failed during recovery");
+        }
+    } else {
+        tracing::debug!("no route-state file found, nothing to recover");
+    }
+
+    // 3. Delete the state file regardless of command outcomes. Next startup
+    //    re-runs the idempotent teardown if anything leaked past a failure.
+    if let Err(e) = crate::route_state::clear(state_dir) {
+        warn!(error = %e, "failed to clear route-state file during recovery");
+    }
+}
+
 // Route guard =========================================================================================================
 
-/// RAII guard that tears down routes on drop. Provides crash safety.
+/// RAII guard that tears down routes on drop and deletes the route-state
+/// file. Provides crash safety for the active-proxy lifetime: construction
+/// is pure (no I/O), so callers MUST write the state file before
+/// constructing the guard. See `ProxyManager::start` for the ordering.
 pub struct RouteGuard {
     pub tun_name: String,
     pub server_ip: IpAddr,
     pub interface_name: String,
+    pub state_dir: PathBuf,
 }
 
 impl RouteGuard {
-    pub fn new(tun_name: String, server_ip: IpAddr, interface_name: String) -> Self {
+    pub fn new(tun_name: String, server_ip: IpAddr, interface_name: String, state_dir: PathBuf) -> Self {
         Self {
             tun_name,
             server_ip,
             interface_name,
+            state_dir,
         }
     }
 }
@@ -97,6 +151,14 @@ impl Drop for RouteGuard {
     fn drop(&mut self) {
         if let Err(e) = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name) {
             warn!(error = %e, "failed to teardown routes in RouteGuard drop");
+        }
+        // Always clear the state file — we only need it for *crash* recovery,
+        // and reaching Drop means we took the normal shutdown path. Per-command
+        // failures above are already logged; a stale state file on the next
+        // run would just trigger an idempotent no-op teardown, so clearing is
+        // safe.
+        if let Err(e) = crate::route_state::clear(&self.state_dir) {
+            warn!(error = %e, "failed to clear route-state file in RouteGuard drop");
         }
     }
 }

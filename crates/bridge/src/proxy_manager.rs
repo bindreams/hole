@@ -6,6 +6,7 @@ use crate::routing::RouteGuard;
 use hole_common::protocol::ProxyConfig;
 use shadowsocks_service::config::Config;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -70,40 +71,14 @@ impl ProxyBackend for RealBackend {
     }
 }
 
-// No-TUN backend (development) ========================================================================================
-
-/// Development backend that skips TUN/routing/shadowsocks.
-/// All operations succeed with no side effects.
-pub struct NoTunBackend;
-
-impl ProxyBackend for NoTunBackend {
-    async fn start_ss(&self, _config: Config) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
-        Ok(tokio::spawn(async {
-            std::future::pending::<()>().await;
-            Ok(())
-        }))
-    }
-
-    fn setup_routes(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<(), ProxyError> {
-        Ok(())
-    }
-
-    fn teardown_routes(&self, _: &str, _: IpAddr, _: &str) -> Result<(), ProxyError> {
-        Ok(())
-    }
-
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
-        Ok(GatewayInfo {
-            gateway_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            interface_name: "none".into(),
-        })
-    }
-}
-
 // ProxyManager ========================================================================================================
 
 pub struct ProxyManager<B: ProxyBackend = RealBackend> {
     backend: B,
+    /// Directory where the route-recovery state file lives while a proxy is
+    /// active. Owned by the manager so the constructor does not need to do
+    /// I/O (see `start()` for the write-ordering contract).
+    state_dir: PathBuf,
     task_handle: Option<JoinHandle<std::io::Result<()>>>,
     route_guard: Option<RouteGuard>,
     server_ip: Option<IpAddr>,
@@ -113,9 +88,10 @@ pub struct ProxyManager<B: ProxyBackend = RealBackend> {
 }
 
 impl<B: ProxyBackend> ProxyManager<B> {
-    pub fn new(backend: B) -> Self {
+    pub fn new(backend: B, state_dir: PathBuf) -> Self {
         Self {
             backend,
+            state_dir,
             task_handle: None,
             route_guard: None,
             server_ip: None,
@@ -155,17 +131,39 @@ impl<B: ProxyBackend> ProxyManager<B> {
         // Detect default gateway and interface
         let gw_info = self.backend.default_gateway()?;
 
-        // Start shadowsocks-service
+        // CRITICAL ORDERING: persist the route-recovery state BEFORE any
+        // routing mutation. A panic/SIGKILL between setup_routes and
+        // construction of the RouteGuard would otherwise leak routes with
+        // no on-disk record, defeating crash recovery on next startup.
+        let persisted_state = crate::route_state::RouteState {
+            version: crate::route_state::SCHEMA_VERSION,
+            tun_name: TUN_DEVICE_NAME.to_owned(),
+            server_ip,
+            interface_name: gw_info.interface_name.clone(),
+        };
+        if let Err(e) = crate::route_state::save(&self.state_dir, &persisted_state) {
+            let msg = format!("failed to persist route-state: {e}");
+            self.last_error = Some(msg.clone());
+            return Err(ProxyError::RouteSetup(msg));
+        }
+
+        // Start shadowsocks-service (no route mutation yet).
         let handle = self.backend.start_ss(ss_config).await.inspect_err(|e| {
             self.last_error = Some(e.to_string());
         })?;
 
-        // Set up routes — if this fails, abort the ss task
+        // Set up routes — if this fails, roll back: abort ss, defensively
+        // tear down any partial route state, and clear the state file so we
+        // return to a clean Stopped with no stale on-disk artifacts.
         if let Err(e) =
             self.backend
                 .setup_routes(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)
         {
             handle.abort();
+            let _ = self
+                .backend
+                .teardown_routes(TUN_DEVICE_NAME, server_ip, &gw_info.interface_name);
+            let _ = crate::route_state::clear(&self.state_dir);
             self.last_error = Some(e.to_string());
             return Err(e);
         }
@@ -175,6 +173,7 @@ impl<B: ProxyBackend> ProxyManager<B> {
             TUN_DEVICE_NAME.to_owned(),
             server_ip,
             gw_info.interface_name,
+            self.state_dir.clone(),
         ));
         self.server_ip = Some(server_ip);
         self.started_at = Some(Instant::now());

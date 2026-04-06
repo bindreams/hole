@@ -241,36 +241,11 @@ fn shell_escape(s: &str) -> String {
 pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = bridge_binary_path()?;
 
-    // Create access group and add installing user (before bridge starts,
-    // so the bridge can set socket/pipe permissions using the group)
-    hole_bridge::group::create_group()?;
-    match hole_bridge::group::installing_username() {
-        Ok(user) => {
-            hole_bridge::group::add_user_to_group(&user)?;
-            eprintln!("added user '{user}' to '{}' group", hole_bridge::group::GROUP_NAME);
-
-            // Write the installing user's SID so the bridge can add it to the
-            // socket DACL on first startup. This works around the Windows token
-            // snapshot limitation: group membership changes are not reflected in
-            // running processes until re-login, but a user's own SID is always
-            // present in their token.
-            #[cfg(target_os = "windows")]
-            match hole_bridge::group::lookup_sid(&user) {
-                Ok(sid) => {
-                    let sid_path = hole_bridge::ipc::installer_user_sid_path();
-                    if let Some(parent) = sid_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = std::fs::write(&sid_path, &sid) {
-                        eprintln!("warning: could not write installer user SID: {e}");
-                    } else {
-                        eprintln!("wrote installer user SID ({sid}) for immediate access");
-                    }
-                }
-                Err(e) => eprintln!("warning: could not look up installer user SID: {e}"),
-            }
-        }
-        Err(e) => eprintln!("warning: could not detect installing user: {e}"),
+    // Create access group, add installing user, and (on Windows) write the
+    // installer SID file so the bridge includes it in the socket DACL on
+    // first startup. Shared with `bridge grant-access` used by dev.py.
+    if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
+        eprintln!("warning: failed to prepare IPC access: {e}");
     }
 
     // Idempotent: if already installed, stop and uninstall first

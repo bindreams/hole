@@ -23,13 +23,16 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy bridge for the Hole app
 
 /// Socket path override set by the CLI before service dispatch.
 static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+/// State directory override set by the CLI before service dispatch.
+static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), windows_service::Error> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
     }
+    STATE_DIR_OVERRIDE.set(state_dir.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -78,8 +81,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Build and run the tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
     let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async {
+        let state_dir = STATE_DIR_OVERRIDE
+            .get()
+            .cloned()
+            .unwrap_or_else(hole_common::paths::default_state_dir);
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
             crate::proxy_manager::RealBackend,
+            state_dir.clone(),
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
@@ -87,7 +95,10 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
+        // Bind BEFORE recovery — a second instance's bind() fails before it
+        // can touch routing state.
         let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
+        crate::routing::recover_routes(&state_dir);
 
         tokio::select! {
             result = server.run() => {
@@ -138,10 +149,22 @@ fn service_log_dir() -> PathBuf {
         .join("logs")
 }
 
+/// System state directory for the Windows service (`C:\ProgramData\hole\state`).
+///
+/// Used for the route-recovery state file (`bridge-routes.json`). Writable by
+/// LocalSystem; pre-created by `install()` so the service has somewhere to
+/// write on its first run.
+fn service_state_dir() -> PathBuf {
+    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+        .join("hole")
+        .join("state")
+}
+
 /// Install the bridge as a Windows Service.
 ///
 /// The service is registered to run
-/// `<binary_path> bridge run --service --log-dir <system_log_dir>` with auto-start.
+/// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`
+/// with auto-start.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -149,9 +172,11 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     )?;
 
     let log_dir = service_log_dir();
-    // Create the log dir during install (running elevated) so the service itself
-    // (running as LocalSystem) can write to it without needing to create parents.
+    let state_dir = service_state_dir();
+    // Create log + state dirs during install (running elevated) so the service
+    // itself (running as LocalSystem) can write to them on its first run.
     let _ = std::fs::create_dir_all(&log_dir);
+    let _ = std::fs::create_dir_all(&state_dir);
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -166,6 +191,8 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
             "--service".into(),
             "--log-dir".into(),
             log_dir.into_os_string(),
+            "--state-dir".into(),
+            state_dir.into_os_string(),
         ],
         dependencies: vec![],
         account_name: None, // LocalSystem
