@@ -8,6 +8,7 @@ use tracing::info;
 pub const LAUNCHD_LABEL: &str = "com.hole.bridge";
 pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.bridge.plist";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.bridge";
+pub const SERVICE_LOG_DIR: &str = "/var/log/hole";
 
 // Plist generation ====================================================================================================
 
@@ -25,20 +26,24 @@ pub fn generate_plist(binary_path: &str) -> String {
         <string>{binary_path}</string>
         <string>bridge</string>
         <string>run</string>
+        <string>--service</string>
+        <string>--log-dir</string>
+        <string>{log_dir}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/hole/bridge.log</string>
+    <string>{log_dir}/bridge.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/hole/bridge.err</string>
+    <string>{log_dir}/bridge.stderr.log</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
         binary_path = binary_path,
+        log_dir = SERVICE_LOG_DIR,
     )
 }
 
@@ -51,6 +56,9 @@ pub fn generate_plist(binary_path: &str) -> String {
 pub fn install(source_binary: &Path) -> std::io::Result<()> {
     let helper_dir = Path::new("/Library/PrivilegedHelperTools");
     std::fs::create_dir_all(helper_dir)?;
+
+    // Create the service log dir (running elevated here, so LaunchDaemons can write later)
+    std::fs::create_dir_all(SERVICE_LOG_DIR)?;
 
     // Atomic copy: write to temp file, then rename
     let tmp_path = helper_dir.join("com.hole.bridge.tmp");

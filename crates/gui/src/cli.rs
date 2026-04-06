@@ -31,17 +31,20 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BridgeAction {
-    /// Run the bridge (invoked by the service manager)
+    /// Run the bridge (foreground by default)
     Run {
-        /// Override the IPC socket path (for development/testing)
+        /// Override the IPC socket path
         #[arg(long)]
         socket_path: Option<std::path::PathBuf>,
-        /// Run in foreground (bypass service manager, log to stderr)
+        /// Run as a system service (invoked by SCM/launchd)
         #[arg(long)]
-        foreground: bool,
-        /// Disable TUN/routing (IPC-only mode, no elevation needed). Requires --foreground
-        #[arg(long, requires = "foreground")]
+        service: bool,
+        /// Disable TUN/routing (IPC-only mode, no elevation needed)
+        #[arg(long, conflicts_with = "service")]
         no_tun: bool,
+        /// Override the log directory
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
     },
     /// Install and start the bridge service
     Install,
@@ -51,6 +54,9 @@ enum BridgeAction {
     Status,
     /// View bridge logs
     Log {
+        /// Override the log directory
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<LogAction>,
     },
@@ -173,10 +179,11 @@ fn handle_bridge(action: BridgeAction) -> i32 {
     match action {
         BridgeAction::Run {
             socket_path,
-            foreground,
+            service,
             no_tun,
+            log_dir,
         } => {
-            let log_dir = hole_common::logging::default_log_dir();
+            let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
             let _guard = hole_bridge::logging::init(&log_dir);
             tracing::info!("hole bridge starting");
 
@@ -186,9 +193,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
 
             let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
 
-            let result: Result<(), Box<dyn std::error::Error>> = if foreground {
-                hole_bridge::foreground::run(&socket_path, no_tun)
-            } else {
+            let result: Result<(), Box<dyn std::error::Error>> = if service {
                 #[cfg(target_os = "macos")]
                 {
                     hole_bridge::platform::os::run(&socket_path)
@@ -197,6 +202,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 {
                     hole_bridge::platform::os::run(&socket_path).map_err(|e| Box::new(e) as _)
                 }
+            } else {
+                hole_bridge::foreground::run(&socket_path, no_tun)
             };
 
             if let Err(e) = result {
@@ -236,7 +243,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 }
             }
         }
-        BridgeAction::Log { action } => handle_bridge_log(action),
+        BridgeAction::Log { log_dir, action } => handle_bridge_log(log_dir, action),
         BridgeAction::GrantAccess {
             then_send,
             then_send_file,
@@ -255,8 +262,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
     }
 }
 
-fn handle_bridge_log(action: Option<LogAction>) -> i32 {
-    let log_dir = hole_common::logging::default_log_dir();
+fn handle_bridge_log(log_dir: Option<std::path::PathBuf>, action: Option<LogAction>) -> i32 {
+    let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
     let log_path = log_dir.join("bridge.log");
 
     match action {

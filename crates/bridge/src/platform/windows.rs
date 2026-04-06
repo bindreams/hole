@@ -131,14 +131,27 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
 // Install/uninstall ===================================================================================================
 
+/// System log directory for the Windows service (`C:\ProgramData\hole\logs`).
+fn service_log_dir() -> PathBuf {
+    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+        .join("hole")
+        .join("logs")
+}
+
 /// Install the bridge as a Windows Service.
 ///
-/// The service is registered to run `<binary_path> bridge run` with auto-start.
+/// The service is registered to run
+/// `<binary_path> bridge run --service --log-dir <system_log_dir>` with auto-start.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
+
+    let log_dir = service_log_dir();
+    // Create the log dir during install (running elevated) so the service itself
+    // (running as LocalSystem) can write to it without needing to create parents.
+    let _ = std::fs::create_dir_all(&log_dir);
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -147,7 +160,13 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: binary_path.to_path_buf(),
-        launch_arguments: vec!["bridge".into(), "run".into()],
+        launch_arguments: vec![
+            "bridge".into(),
+            "run".into(),
+            "--service".into(),
+            "--log-dir".into(),
+            log_dir.into_os_string(),
+        ],
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
