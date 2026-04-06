@@ -1,7 +1,7 @@
 use super::*;
 use axum::Json;
 use hole_common::protocol::{
-    DaemonRequest, DaemonResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, PublicIpResponse,
+    BridgeRequest, BridgeResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, PublicIpResponse,
     StatusResponse,
 };
 use hyper::body::Incoming;
@@ -17,9 +17,9 @@ fn test_socket_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hole-gui-test-{}-{suffix}.sock", std::process::id()))
 }
 
-/// Spawn a mock HTTP daemon that responds to requests with canned responses.
-async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
-    let listener = hole_daemon::socket::LocalListener::bind(path).unwrap();
+/// Spawn a mock HTTP bridge that responds to requests with canned responses.
+async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
 
     let router = axum::Router::new()
         .route(
@@ -61,7 +61,7 @@ async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()
             axum::routing::get(|| async {
                 Json(DiagnosticsResponse {
                     app: "ok".to_string(),
-                    daemon: "ok".to_string(),
+                    bridge: "ok".to_string(),
                     network: "ok".to_string(),
                     vpn_server: "ok".to_string(),
                     internet: "ok".to_string(),
@@ -101,14 +101,14 @@ async fn spawn_mock_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()
 fn send_status_request_receives_response() {
     rt().block_on(async {
         let path = test_socket_path("status");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
-        let resp = client.send(DaemonRequest::Status).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        let resp = client.send(BridgeRequest::Status).await.unwrap();
 
         assert_eq!(
             resp,
-            DaemonResponse::Status {
+            BridgeResponse::Status {
                 running: false,
                 uptime_secs: 0,
                 error: None,
@@ -121,11 +121,11 @@ fn send_status_request_receives_response() {
 fn send_start_receives_ack() {
     rt().block_on(async {
         let path = test_socket_path("start");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
         let resp = client
-            .send(DaemonRequest::Start {
+            .send(BridgeRequest::Start {
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -142,7 +142,7 @@ fn send_start_receives_ack() {
             })
             .await
             .unwrap();
-        assert_eq!(resp, DaemonResponse::Ack);
+        assert_eq!(resp, BridgeResponse::Ack);
     });
 }
 
@@ -150,15 +150,15 @@ fn send_start_receives_ack() {
 fn multiple_requests_on_same_client() {
     rt().block_on(async {
         let path = test_socket_path("multi");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
 
-        let r1 = client.send(DaemonRequest::Status).await.unwrap();
-        assert!(matches!(r1, DaemonResponse::Status { .. }));
+        let r1 = client.send(BridgeRequest::Status).await.unwrap();
+        assert!(matches!(r1, BridgeResponse::Status { .. }));
 
-        let r2 = client.send(DaemonRequest::Stop).await.unwrap();
-        assert_eq!(r2, DaemonResponse::Ack);
+        let r2 = client.send(BridgeRequest::Stop).await.unwrap();
+        assert_eq!(r2, BridgeResponse::Ack);
     });
 }
 
@@ -167,7 +167,7 @@ fn connect_to_nonexistent_returns_error() {
     rt().block_on(async {
         let path = test_socket_path("nonexistent");
         let _ = std::fs::remove_file(&path);
-        let result = DaemonClient::connect(&path).await;
+        let result = BridgeClient::connect(&path).await;
         assert!(result.is_err());
     });
 }
@@ -196,11 +196,11 @@ fn other_io_error_maps_to_connection() {
 fn send_reload_receives_ack() {
     rt().block_on(async {
         let path = test_socket_path("reload");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
         let resp = client
-            .send(DaemonRequest::Reload {
+            .send(BridgeRequest::Reload {
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -217,15 +217,15 @@ fn send_reload_receives_ack() {
             })
             .await
             .unwrap();
-        assert_eq!(resp, DaemonResponse::Ack);
+        assert_eq!(resp, BridgeResponse::Ack);
     });
 }
 
-/// Spawn a mock daemon that returns 500 with an ErrorResponse for POST /start.
-async fn spawn_error_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+/// Spawn a mock bridge that returns 500 with an ErrorResponse for POST /start.
+async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
     use hole_common::protocol::ErrorResponse;
 
-    let listener = hole_daemon::socket::LocalListener::bind(path).unwrap();
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
 
     let router = axum::Router::new()
         .route(
@@ -268,14 +268,14 @@ async fn spawn_error_daemon(path: &std::path::Path) -> tokio::task::JoinHandle<(
 }
 
 #[skuld::test]
-fn server_error_maps_to_daemon_response_error() {
+fn server_error_maps_to_bridge_response_error() {
     rt().block_on(async {
         let path = test_socket_path("err500");
-        let _mock = spawn_error_daemon(&path).await;
+        let _mock = spawn_error_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
         let resp = client
-            .send(DaemonRequest::Start {
+            .send(BridgeRequest::Start {
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -293,7 +293,7 @@ fn server_error_maps_to_daemon_response_error() {
             .await
             .unwrap();
         match resp {
-            DaemonResponse::Error { message } => {
+            BridgeResponse::Error { message } => {
                 assert!(
                     message.contains("mock start failure"),
                     "expected error message, got: {message}"
@@ -308,14 +308,14 @@ fn server_error_maps_to_daemon_response_error() {
 fn send_metrics_returns_response() {
     rt().block_on(async {
         let path = test_socket_path("metrics");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
-        let resp = client.send(DaemonRequest::Metrics).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        let resp = client.send(BridgeRequest::Metrics).await.unwrap();
 
         assert_eq!(
             resp,
-            DaemonResponse::Metrics {
+            BridgeResponse::Metrics {
                 bytes_in: 1024,
                 bytes_out: 512,
                 speed_in_bps: 2048,
@@ -330,16 +330,16 @@ fn send_metrics_returns_response() {
 fn send_diagnostics_returns_response() {
     rt().block_on(async {
         let path = test_socket_path("diagnostics");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
-        let resp = client.send(DaemonRequest::Diagnostics).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        let resp = client.send(BridgeRequest::Diagnostics).await.unwrap();
 
         assert_eq!(
             resp,
-            DaemonResponse::Diagnostics {
+            BridgeResponse::Diagnostics {
                 app: "ok".to_string(),
-                daemon: "ok".to_string(),
+                bridge: "ok".to_string(),
                 network: "ok".to_string(),
                 vpn_server: "ok".to_string(),
                 internet: "ok".to_string(),
@@ -352,14 +352,14 @@ fn send_diagnostics_returns_response() {
 fn send_public_ip_returns_response() {
     rt().block_on(async {
         let path = test_socket_path("publicip");
-        let _mock = spawn_mock_daemon(&path).await;
+        let _mock = spawn_mock_bridge(&path).await;
 
-        let mut client = DaemonClient::connect(&path).await.unwrap();
-        let resp = client.send(DaemonRequest::PublicIp).await.unwrap();
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        let resp = client.send(BridgeRequest::PublicIp).await.unwrap();
 
         assert_eq!(
             resp,
-            DaemonResponse::PublicIp {
+            BridgeResponse::PublicIp {
                 ip: "203.0.113.42".to_string(),
                 country_code: "DE".to_string(),
             }

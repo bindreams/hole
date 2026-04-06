@@ -1,7 +1,7 @@
 openapi: "3.1.0"
 info:
-  title: Hole Daemon API
-  description: REST API for controlling the Hole daemon over a local socket.
+  title: Hole Bridge API
+  description: REST API for controlling the Hole bridge over a local socket.
   version: "1.0.0"
 
 paths:
@@ -184,14 +184,14 @@ components:
       type: object
       required:
         - app
-        - daemon
+        - bridge
         - network
         - vpn_server
         - internet
       properties:
         app:
           type: string
-        daemon:
+        bridge:
           type: string
         network:
           type: string

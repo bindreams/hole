@@ -1,8 +1,8 @@
 use super::*;
 
 #[skuld::test]
-fn service_name_is_hole_daemon() {
-    assert_eq!(SERVICE_NAME, "HoleDaemon");
+fn service_name_is_hole_bridge() {
+    assert_eq!(SERVICE_NAME, "HoleBridge");
 }
 
 #[skuld::test]

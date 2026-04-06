@@ -1,17 +1,18 @@
-// macOS: launchd daemon management.
+// macOS: launchd bridge management.
 
 use std::path::Path;
 use tracing::info;
 
 // Constants ===========================================================================================================
 
-pub const LAUNCHD_LABEL: &str = "com.hole.daemon";
-pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.daemon.plist";
-pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.daemon";
+pub const LAUNCHD_LABEL: &str = "com.hole.bridge";
+pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.bridge.plist";
+pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.bridge";
+pub const SERVICE_LOG_DIR: &str = "/var/log/hole";
 
 // Plist generation ====================================================================================================
 
-/// Generate the launchd plist XML for the daemon.
+/// Generate the launchd plist XML for the bridge.
 pub fn generate_plist(binary_path: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -23,37 +24,44 @@ pub fn generate_plist(binary_path: &str) -> String {
     <key>ProgramArguments</key>
     <array>
         <string>{binary_path}</string>
-        <string>daemon</string>
+        <string>bridge</string>
         <string>run</string>
+        <string>--service</string>
+        <string>--log-dir</string>
+        <string>{log_dir}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/hole/daemon.log</string>
+    <string>{log_dir}/bridge.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/hole/daemon.err</string>
+    <string>{log_dir}/bridge.stderr.log</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
         binary_path = binary_path,
+        log_dir = SERVICE_LOG_DIR,
     )
 }
 
 // Install/uninstall ===================================================================================================
 
-/// Install the daemon: copy binary to a stable location and register with launchd.
+/// Install the bridge: copy binary to a stable location and register with launchd.
 ///
-/// The binary is copied atomically to `/Library/PrivilegedHelperTools/com.hole.daemon`
+/// The binary is copied atomically to `/Library/PrivilegedHelperTools/com.hole.bridge`
 /// and the plist references that stable path.
 pub fn install(source_binary: &Path) -> std::io::Result<()> {
     let helper_dir = Path::new("/Library/PrivilegedHelperTools");
     std::fs::create_dir_all(helper_dir)?;
 
+    // Create the service log dir (running elevated here, so LaunchDaemons can write later)
+    std::fs::create_dir_all(SERVICE_LOG_DIR)?;
+
     // Atomic copy: write to temp file, then rename
-    let tmp_path = helper_dir.join("com.hole.daemon.tmp");
+    let tmp_path = helper_dir.join("com.hole.bridge.tmp");
     std::fs::copy(source_binary, &tmp_path)?;
 
     // Preserve executable permissions
@@ -74,11 +82,11 @@ pub fn install(source_binary: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("launchctl bootstrap failed"));
     }
 
-    info!("launchd daemon installed and loaded");
+    info!("launchd bridge installed and loaded");
     Ok(())
 }
 
-/// Stop, unload, and remove the daemon.
+/// Stop, unload, and remove the bridge.
 pub fn uninstall() -> std::io::Result<()> {
     // bootout stops and unregisters
     let _ = std::process::Command::new("launchctl")
@@ -92,13 +100,13 @@ pub fn uninstall() -> std::io::Result<()> {
         std::fs::remove_file(HELPER_PATH)?;
     }
 
-    info!("launchd daemon uninstalled");
+    info!("launchd bridge uninstalled");
     Ok(())
 }
 
 // Start/stop ==========================================================================================================
 
-/// Start the daemon (bootstrap the plist if not already loaded).
+/// Start the bridge (bootstrap the plist if not already loaded).
 pub fn start() -> std::io::Result<()> {
     let status = std::process::Command::new("launchctl")
         .args(["bootstrap", "system", PLIST_PATH])
@@ -107,11 +115,11 @@ pub fn start() -> std::io::Result<()> {
     if !status.success() {
         return Err(std::io::Error::other("launchctl bootstrap failed"));
     }
-    info!("launchd daemon started");
+    info!("launchd bridge started");
     Ok(())
 }
 
-/// Stop the daemon without unregistering it.
+/// Stop the bridge without unregistering it.
 pub fn stop() -> std::io::Result<()> {
     let status = std::process::Command::new("launchctl")
         .args(["kill", "SIGTERM", &format!("system/{LAUNCHD_LABEL}")])
@@ -120,18 +128,18 @@ pub fn stop() -> std::io::Result<()> {
     if !status.success() {
         return Err(std::io::Error::other("launchctl kill failed"));
     }
-    info!("launchd daemon stopped");
+    info!("launchd bridge stopped");
     Ok(())
 }
 
 // Query ===============================================================================================================
 
-/// Check whether the daemon plist is installed.
+/// Check whether the bridge plist is installed.
 pub fn is_installed() -> bool {
     Path::new(PLIST_PATH).exists()
 }
 
-/// Check whether the daemon is currently running.
+/// Check whether the bridge is currently running.
 pub fn is_running() -> bool {
     std::process::Command::new("launchctl")
         .args(["print", &format!("system/{LAUNCHD_LABEL}")])
@@ -142,7 +150,7 @@ pub fn is_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Run the daemon directly (called by launchd).
+/// Run the bridge directly (called by launchd).
 pub fn run(socket_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {

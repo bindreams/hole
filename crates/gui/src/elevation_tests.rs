@@ -1,11 +1,11 @@
 use hole_common::config::ServerEntry;
-use hole_common::protocol::{DaemonRequest, ProxyConfig};
+use hole_common::protocol::{BridgeRequest, ProxyConfig};
 
 #[skuld::test]
 fn encode_request_roundtrips() {
     use base64::Engine;
 
-    let request = DaemonRequest::Start {
+    let request = BridgeRequest::Start {
         config: ProxyConfig {
             server: ServerEntry {
                 id: "test".into(),
@@ -23,7 +23,7 @@ fn encode_request_roundtrips() {
 
     let b64 = super::encode_request(&request);
     let decoded_bytes = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&decoded_bytes).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&decoded_bytes).unwrap();
     assert_eq!(decoded, request);
 }
 
@@ -31,25 +31,25 @@ fn encode_request_roundtrips() {
 fn encode_stop_request() {
     use base64::Engine;
 
-    let b64 = super::encode_request(&DaemonRequest::Stop);
+    let b64 = super::encode_request(&BridgeRequest::Stop);
     let decoded_bytes = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&decoded_bytes).unwrap();
-    assert_eq!(decoded, DaemonRequest::Stop);
+    let decoded: BridgeRequest = serde_json::from_slice(&decoded_bytes).unwrap();
+    assert_eq!(decoded, BridgeRequest::Stop);
 }
 
 #[skuld::test]
 fn encode_status_request() {
     use base64::Engine;
 
-    let b64 = super::encode_request(&DaemonRequest::Status);
+    let b64 = super::encode_request(&BridgeRequest::Status);
     let decoded_bytes = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
-    let decoded: DaemonRequest = serde_json::from_slice(&decoded_bytes).unwrap();
-    assert_eq!(decoded, DaemonRequest::Status);
+    let decoded: BridgeRequest = serde_json::from_slice(&decoded_bytes).unwrap();
+    assert_eq!(decoded, BridgeRequest::Status);
 }
 
 #[skuld::test]
 fn write_request_file_roundtrip() {
-    let request = DaemonRequest::Start {
+    let request = BridgeRequest::Start {
         config: ProxyConfig {
             server: ServerEntry {
                 id: "test".into(),
@@ -66,13 +66,13 @@ fn write_request_file_roundtrip() {
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
-    let parsed: DaemonRequest = serde_json::from_str(&std::fs::read_to_string(&temp_path).unwrap()).unwrap();
+    let parsed: BridgeRequest = serde_json::from_str(&std::fs::read_to_string(&temp_path).unwrap()).unwrap();
     assert_eq!(parsed, request);
 }
 
 #[skuld::test]
 fn request_file_is_deleted_on_drop() {
-    let temp_path = super::write_request_file(&DaemonRequest::Stop).unwrap();
+    let temp_path = super::write_request_file(&BridgeRequest::Stop).unwrap();
     let path_copy = temp_path.to_path_buf();
     assert!(path_copy.exists());
     drop(temp_path);
@@ -81,7 +81,7 @@ fn request_file_is_deleted_on_drop() {
 
 #[skuld::test]
 fn read_request_file_roundtrip() {
-    let request = DaemonRequest::Start {
+    let request = BridgeRequest::Start {
         config: ProxyConfig {
             server: ServerEntry {
                 id: "test".into(),
@@ -108,7 +108,7 @@ fn read_request_file_roundtrip() {
 
 #[skuld::test]
 fn read_request_file_deletes_after_reading() {
-    let temp_path = super::write_request_file(&DaemonRequest::Stop).unwrap();
+    let temp_path = super::write_request_file(&BridgeRequest::Stop).unwrap();
     let path = temp_path.to_path_buf();
     temp_path.keep().unwrap();
     assert!(path.exists());

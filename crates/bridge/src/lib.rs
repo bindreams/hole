@@ -1,3 +1,4 @@
+pub mod foreground;
 pub mod gateway;
 pub mod group;
 pub mod ipc;

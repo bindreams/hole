@@ -218,10 +218,10 @@ function updateStats(metrics: Metrics) {
 
 // Diagnostics chain ===================================================================================================
 
-const DIAG_NODES = ["app", "daemon", "network", "vpn_server", "internet"] as const;
+const DIAG_NODES = ["app", "bridge", "network", "vpn_server", "internet"] as const;
 const DIAG_ELEMENTS: Record<string, HTMLElement | null> = {
   app: document.getElementById("diag-app"),
-  daemon: document.getElementById("diag-daemon"),
+  bridge: document.getElementById("diag-bridge"),
   network: document.getElementById("diag-network"),
   vpn_server: document.getElementById("diag-vpn-server"),
   internet: document.getElementById("diag-internet"),

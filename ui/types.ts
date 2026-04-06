@@ -50,7 +50,7 @@ export interface PublicIpData {
 
 export interface DiagnosticsData {
   app: string;
-  daemon: string;
+  bridge: string;
   network: string;
   vpn_server: string;
   internet: string;

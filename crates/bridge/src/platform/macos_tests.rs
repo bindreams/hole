@@ -3,7 +3,7 @@ use super::*;
 #[skuld::test]
 fn plist_contains_label() {
     let plist = generate_plist("/usr/local/bin/hole");
-    assert!(plist.contains("com.hole.daemon"), "missing label in plist");
+    assert!(plist.contains("com.hole.bridge"), "missing label in plist");
 }
 
 #[skuld::test]
@@ -13,10 +13,10 @@ fn plist_contains_binary_path() {
 }
 
 #[skuld::test]
-fn plist_has_daemon_run_args() {
+fn plist_has_bridge_run_args() {
     let plist = generate_plist("/usr/local/bin/hole");
-    // ProgramArguments should include "daemon" and "run" as separate entries
-    assert!(plist.contains("<string>daemon</string>"), "missing 'daemon' arg");
+    // ProgramArguments should include "bridge" and "run" as separate entries
+    assert!(plist.contains("<string>bridge</string>"), "missing 'bridge' arg");
     assert!(plist.contains("<string>run</string>"), "missing 'run' arg");
 }
 
@@ -35,5 +35,5 @@ fn plist_has_keep_alive() {
 
 #[skuld::test]
 fn helper_path_is_stable() {
-    assert_eq!(HELPER_PATH, "/Library/PrivilegedHelperTools/com.hole.daemon");
+    assert_eq!(HELPER_PATH, "/Library/PrivilegedHelperTools/com.hole.bridge");
 }

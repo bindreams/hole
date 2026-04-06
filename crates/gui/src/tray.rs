@@ -2,7 +2,7 @@
 
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
+use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use hole_gui::tray_icons;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -160,10 +160,10 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
     }
 }
 
-/// Send a best-effort Stop to the daemon and exit the application.
+/// Send a best-effort Stop to the bridge and exit the application.
 async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
-    let _ = state.daemon_send(DaemonRequest::Stop).await;
+    let _ = state.bridge_send(BridgeRequest::Stop).await;
     app.exit(0);
 }
 
@@ -204,25 +204,25 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
             return Err("No server is selected. Open the Dashboard and select a server before connecting.".into());
         };
 
-        let request = DaemonRequest::Start { config: proxy_config };
-        match state.daemon_send(request.clone()).await {
-            Ok(DaemonResponse::Ack) => {
+        let request = BridgeRequest::Start { config: proxy_config };
+        match state.bridge_send(request.clone()).await {
+            Ok(BridgeResponse::Ack) => {
                 info!("proxy started");
                 Ok(true)
             }
-            Ok(DaemonResponse::Error { message }) if message.contains("already running") => {
+            Ok(BridgeResponse::Error { message }) if message.contains("already running") => {
                 info!("proxy already running");
                 Ok(true)
             }
-            Ok(DaemonResponse::Error { message }) => {
-                error!("daemon error: {message}");
-                Err(format!("Daemon error: {message}"))
+            Ok(BridgeResponse::Error { message }) => {
+                error!("bridge error: {message}");
+                Err(format!("Bridge error: {message}"))
             }
             Ok(_) => {
-                warn!("unexpected response from daemon");
-                Err("Unexpected response from daemon".into())
+                warn!("unexpected response from bridge");
+                Err("Unexpected response from bridge".into())
             }
-            Err(crate::daemon_client::ClientError::PermissionDenied) => {
+            Err(crate::bridge_client::ClientError::PermissionDenied) => {
                 if crate::elevation::prompt_elevation(app, request).await {
                     Ok(true)
                 } else {
@@ -231,25 +231,25 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
             }
             Err(e) => {
                 error!("failed to send start: {e}");
-                Err(format!("Failed to connect to daemon: {e}"))
+                Err(format!("Failed to connect to bridge: {e}"))
             }
         }
     } else {
-        let request = DaemonRequest::Stop;
-        match state.daemon_send(request.clone()).await {
-            Ok(DaemonResponse::Ack) => {
+        let request = BridgeRequest::Stop;
+        match state.bridge_send(request.clone()).await {
+            Ok(BridgeResponse::Ack) => {
                 info!("proxy stopped");
                 Ok(false)
             }
-            Ok(DaemonResponse::Error { message }) => {
-                error!("daemon error: {message}");
-                Err(format!("Daemon error: {message}"))
+            Ok(BridgeResponse::Error { message }) => {
+                error!("bridge error: {message}");
+                Err(format!("Bridge error: {message}"))
             }
             Ok(_) => {
-                warn!("unexpected response from daemon");
-                Err("Unexpected response from daemon".into())
+                warn!("unexpected response from bridge");
+                Err("Unexpected response from bridge".into())
             }
-            Err(crate::daemon_client::ClientError::PermissionDenied) => {
+            Err(crate::bridge_client::ClientError::PermissionDenied) => {
                 if crate::elevation::prompt_elevation(app, request).await {
                     Ok(false)
                 } else {
@@ -258,7 +258,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
             }
             Err(e) => {
                 error!("failed to send stop: {e}");
-                Err(format!("Failed to connect to daemon: {e}"))
+                Err(format!("Failed to connect to bridge: {e}"))
             }
         }
     };
@@ -387,7 +387,7 @@ async fn handle_uninstall_helper(app: AppHandle) {
 
     let confirmed = app
         .dialog()
-        .message("This will stop and remove the Hole daemon service.\n\nContinue?")
+        .message("This will stop and remove the Hole bridge service.\n\nContinue?")
         .title("Uninstall Helper")
         .buttons(MessageDialogButtons::OkCancelCustom(
             "Uninstall".into(),
@@ -399,7 +399,7 @@ async fn handle_uninstall_helper(app: AppHandle) {
         return;
     }
 
-    let exe = match crate::setup::daemon_binary_path() {
+    let exe = match crate::setup::bridge_binary_path() {
         Ok(p) => p,
         Err(e) => {
             error!("cannot resolve binary path: {e}");
@@ -407,12 +407,12 @@ async fn handle_uninstall_helper(app: AppHandle) {
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || crate::setup::run_elevated(&exe, &["daemon", "uninstall"])).await;
+    let result = tokio::task::spawn_blocking(move || crate::setup::run_elevated(&exe, &["bridge", "uninstall"])).await;
 
     match result {
         Ok(Ok(status)) if status.success() => {
             app.dialog()
-                .message("Daemon helper has been uninstalled.")
+                .message("Bridge helper has been uninstalled.")
                 .title("Uninstall Helper")
                 .blocking_show();
         }

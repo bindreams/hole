@@ -1,5 +1,5 @@
+pub mod bridge_client;
 pub mod commands;
-pub mod daemon_client;
 pub mod elevation;
 pub mod logging;
 pub mod path_management;

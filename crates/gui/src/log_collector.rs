@@ -1,26 +1,23 @@
-// Collect GUI and daemon logs into a zip archive.
+// Collect GUI and bridge logs into a zip archive.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Locate all log directories (GUI and daemon).
+/// Locate all log directories to include in the archive.
+///
+/// The user-local log dir holds both GUI and foreground-bridge logs.
+/// Service-mode bridge logs live in system paths and are included when present.
 fn log_dirs() -> Vec<(&'static str, PathBuf)> {
-    let mut dirs = Vec::new();
-
-    if let Some(local_data) = dirs::data_local_dir() {
-        dirs.push(("gui", local_data.join("hole").join("logs")));
-    }
-
-    // Daemon logs on Windows
     #[cfg(target_os = "windows")]
-    dirs.push(("daemon", PathBuf::from(r"C:\ProgramData\hole\logs")));
-
-    // Daemon logs on macOS / Linux
+    let service_dir = PathBuf::from(r"C:\ProgramData\hole\logs");
     #[cfg(not(target_os = "windows"))]
-    dirs.push(("daemon", PathBuf::from("/var/log/hole")));
+    let service_dir = PathBuf::from("/var/log/hole");
 
-    dirs
+    vec![
+        ("user", hole_common::logging::default_log_dir()),
+        ("service", service_dir),
+    ]
 }
 
 /// Create a zip archive containing all log files. Returns the path to the temp zip.

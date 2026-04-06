@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 hole-common = { path = "../common" }
-hole-daemon = { path = "../daemon" }
+hole-bridge = { path = "../bridge" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
@@ -25,8 +25,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 thiserror = "2"
 tempfile = "3"
 base64 = "0.22"

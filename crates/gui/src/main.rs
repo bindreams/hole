@@ -1,9 +1,9 @@
 // Prevent console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bridge_client;
 mod cli;
 mod commands;
-mod daemon_client;
 mod elevation;
 mod log_collector;
 mod logging;
@@ -30,10 +30,7 @@ fn launch_gui() {
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
-    let log_dir = dirs::data_local_dir()
-        .expect("no local data directory found")
-        .join("hole")
-        .join("logs");
+    let log_dir = hole_common::logging::default_log_dir();
 
     let _log_guard = logging::init(&log_dir);
 
@@ -65,7 +62,7 @@ fn launch_gui() {
         .setup(|app| {
             tray::create_tray(app)?;
             platform::on_setup(app)?;
-            setup::check_daemon_on_launch(app.handle().clone());
+            setup::check_bridge_on_launch(app.handle().clone());
             hole_gui::update::start_update_checker(app.handle().clone(), |app, info| {
                 // Rebuild tray menu to include the "Install Update" item.
                 if let Some(tray_icon) = app.tray_by_id("main") {

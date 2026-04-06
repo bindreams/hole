@@ -1,8 +1,8 @@
 // Application state management.
 
-use crate::daemon_client::{ClientError, DaemonClient};
+use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
-use hole_common::protocol::{DaemonRequest, DaemonResponse};
+use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::warn;
@@ -11,7 +11,7 @@ use tracing::warn;
 pub struct AppState {
     pub config_path: PathBuf,
     pub config: Mutex<AppConfig>,
-    daemon: tokio::sync::Mutex<Option<DaemonClient>>,
+    bridge: tokio::sync::Mutex<Option<BridgeClient>>,
 }
 
 impl AppState {
@@ -20,24 +20,27 @@ impl AppState {
         Self {
             config_path,
             config: Mutex::new(config),
-            daemon: tokio::sync::Mutex::new(None),
+            bridge: tokio::sync::Mutex::new(None),
         }
     }
 
-    /// Send a request to the daemon, lazily connecting on first use.
+    /// Send a request to the bridge, lazily connecting on first use.
     /// On connection failure, clears the cached client so the next call reconnects.
-    pub async fn daemon_send(&self, req: DaemonRequest) -> Result<DaemonResponse, ClientError> {
-        let mut guard = self.daemon.lock().await;
+    pub async fn bridge_send(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
+        let mut guard = self.bridge.lock().await;
 
         // Lazy connect
         if guard.is_none() {
-            let socket_path = hole_common::protocol::default_daemon_socket_path();
-            let connect_result = DaemonClient::connect(&socket_path).await;
+            let socket_path = std::env::var("HOLE_BRIDGE_SOCKET")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
+            let connect_result = BridgeClient::connect(&socket_path).await;
 
             match connect_result {
                 Ok(client) => *guard = Some(client),
                 Err(e) => {
-                    warn!(error = %e, "failed to connect to daemon");
+                    warn!(error = %e, "failed to connect to bridge");
                     return Err(e);
                 }
             }
@@ -53,7 +56,7 @@ impl AppState {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 // Connection broken — clear so next call reconnects
-                warn!(error = %e, "daemon communication error, will reconnect");
+                warn!(error = %e, "bridge communication error, will reconnect");
                 *guard = None;
                 Err(e)
             }

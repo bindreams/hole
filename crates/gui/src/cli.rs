@@ -17,10 +17,10 @@ enum Command {
     Version,
     /// Check for updates and install the latest version
     Upgrade,
-    /// Manage the privileged daemon service
-    Daemon {
+    /// Manage the privileged bridge service
+    Bridge {
         #[command(subcommand)]
-        action: DaemonAction,
+        action: BridgeAction,
     },
     /// Manage PATH integration
     Path {
@@ -30,21 +30,33 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum DaemonAction {
-    /// Run the daemon (invoked by the service manager)
+enum BridgeAction {
+    /// Run the bridge (foreground by default)
     Run {
-        /// Override the IPC socket path (for development/testing)
+        /// Override the IPC socket path
         #[arg(long)]
         socket_path: Option<std::path::PathBuf>,
+        /// Run as a system service (invoked by SCM/launchd)
+        #[arg(long)]
+        service: bool,
+        /// Disable TUN/routing (IPC-only mode, no elevation needed)
+        #[arg(long, conflicts_with = "service")]
+        no_tun: bool,
+        /// Override the log directory
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
     },
-    /// Install and start the daemon service
+    /// Install and start the bridge service
     Install,
-    /// Stop and remove the daemon service
+    /// Stop and remove the bridge service
     Uninstall,
-    /// Print daemon install/running status
+    /// Print bridge install/running status
     Status,
-    /// View daemon logs
+    /// View bridge logs
     Log {
+        /// Override the log directory
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<LogAction>,
     },
@@ -57,9 +69,9 @@ enum DaemonAction {
         #[arg(long, conflicts_with = "then_send")]
         then_send_file: Option<std::path::PathBuf>,
     },
-    /// Send a single IPC command to the daemon (requires elevation)
+    /// Send a single IPC command to the bridge (requires elevation)
     IpcSend {
-        /// Base64-encoded JSON of the DaemonRequest
+        /// Base64-encoded JSON of the BridgeRequest
         #[arg(long, required_unless_present = "request_file")]
         base64: Option<String>,
         /// Read the JSON request from this file
@@ -104,7 +116,7 @@ pub fn dispatch() -> ! {
             0
         }
         Command::Upgrade => handle_upgrade(),
-        Command::Daemon { action } => handle_daemon(action),
+        Command::Bridge { action } => handle_bridge(action),
         Command::Path { action } => handle_path(action),
     };
 
@@ -163,67 +175,83 @@ fn handle_upgrade() -> i32 {
     }
 }
 
-fn handle_daemon(action: DaemonAction) -> i32 {
+fn handle_bridge(action: BridgeAction) -> i32 {
     match action {
-        DaemonAction::Run { socket_path } => {
-            let _guard = match hole_daemon::logging::init() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    eprintln!("failed to initialize logging: {e}");
-                    return 1;
+        BridgeAction::Run {
+            socket_path,
+            service,
+            no_tun,
+            log_dir,
+        } => {
+            let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
+            let _guard = hole_bridge::logging::init(&log_dir);
+            tracing::info!("hole bridge starting");
+
+            if !no_tun {
+                hole_bridge::routing::teardown_split_routes(hole_bridge::proxy::TUN_DEVICE_NAME).ok();
+            }
+
+            let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
+
+            let result: Result<(), Box<dyn std::error::Error>> = if service {
+                #[cfg(target_os = "macos")]
+                {
+                    hole_bridge::platform::os::run(&socket_path)
                 }
+                #[cfg(target_os = "windows")]
+                {
+                    hole_bridge::platform::os::run(&socket_path).map_err(|e| Box::new(e) as _)
+                }
+            } else {
+                hole_bridge::foreground::run(&socket_path, no_tun)
             };
-            tracing::info!("hole daemon starting");
-            hole_daemon::routing::teardown_split_routes(hole_daemon::proxy::TUN_DEVICE_NAME).ok();
 
-            let socket_path = socket_path.unwrap_or_else(hole_common::protocol::default_daemon_socket_path);
-            if let Err(e) = hole_daemon::platform::os::run(&socket_path) {
-                eprintln!("daemon error: {e}");
-                return 1;
-            }
-
-            0
-        }
-        DaemonAction::Install => {
-            if let Err(e) = crate::setup::install_daemon() {
-                eprintln!("daemon install failed: {e}");
+            if let Err(e) = result {
+                eprintln!("bridge error: {e}");
                 return 1;
             }
             0
         }
-        DaemonAction::Uninstall => {
-            if let Err(e) = crate::setup::uninstall_daemon() {
-                eprintln!("daemon uninstall failed: {e}");
+        BridgeAction::Install => {
+            if let Err(e) = crate::setup::install_bridge() {
+                eprintln!("bridge install failed: {e}");
                 return 1;
             }
             0
         }
-        DaemonAction::Status => {
-            use crate::setup::DaemonInstallStatus;
-            match crate::setup::daemon_install_status() {
-                DaemonInstallStatus::Running => {
+        BridgeAction::Uninstall => {
+            if let Err(e) = crate::setup::uninstall_bridge() {
+                eprintln!("bridge uninstall failed: {e}");
+                return 1;
+            }
+            0
+        }
+        BridgeAction::Status => {
+            use crate::setup::BridgeInstallStatus;
+            match crate::setup::bridge_install_status() {
+                BridgeInstallStatus::Running => {
                     println!("installed (running)");
                     0
                 }
-                DaemonInstallStatus::Installed => {
+                BridgeInstallStatus::Installed => {
                     println!("installed (stopped)");
                     1
                 }
-                DaemonInstallStatus::NotInstalled => {
+                BridgeInstallStatus::NotInstalled => {
                     println!("not installed");
                     2
                 }
             }
         }
-        DaemonAction::Log { action } => handle_daemon_log(action),
-        DaemonAction::GrantAccess {
+        BridgeAction::Log { log_dir, action } => handle_bridge_log(log_dir, action),
+        BridgeAction::GrantAccess {
             then_send,
             then_send_file,
         } => handle_grant_access(then_send, then_send_file),
-        DaemonAction::IpcSend { base64, request_file } => match (base64, request_file) {
+        BridgeAction::IpcSend { base64, request_file } => match (base64, request_file) {
             (Some(b64), _) => handle_ipc_send_b64(&b64),
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-                Ok(request) => send_daemon_request(request),
+                Ok(request) => send_bridge_request(request),
                 Err(e) => {
                     eprintln!("{e}");
                     1
@@ -234,9 +262,9 @@ fn handle_daemon(action: DaemonAction) -> i32 {
     }
 }
 
-fn handle_daemon_log(action: Option<LogAction>) -> i32 {
-    let log_dir = hole_daemon::logging::log_dir();
-    let log_path = log_dir.join("hole-daemon.log");
+fn handle_bridge_log(log_dir: Option<std::path::PathBuf>, action: Option<LogAction>) -> i32 {
+    let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
+    let log_path = log_dir.join("bridge.log");
 
     match action {
         None => {
@@ -256,12 +284,12 @@ fn handle_daemon_log(action: Option<LogAction>) -> i32 {
             println!("{}", log_path.display());
             0
         }
-        Some(LogAction::Watch { tail }) => daemon_log_watch(&log_path, tail),
+        Some(LogAction::Watch { tail }) => bridge_log_watch(&log_path, tail),
     }
 }
 
 /// Tail and follow a log file (like `tail -f`).
-fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
+fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
     let file = match std::fs::File::open(path) {
@@ -311,10 +339,10 @@ fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
     }
 }
 
-/// Handle the `daemon grant-access` command.
+/// Handle the `bridge grant-access` command.
 ///
 /// Adds the current user to the `hole` group and, on Windows, immediately
-/// updates the daemon socket DACL to include the user's SID. This is a
+/// updates the bridge socket DACL to include the user's SID. This is a
 /// workaround for the Windows token snapshot limitation:
 ///
 /// 1. Windows process tokens are immutable snapshots of group memberships
@@ -324,27 +352,27 @@ fn daemon_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 ///    group tokens.
 /// 3. Adding the user's own SID directly to the socket DACL provides
 ///    immediate access — a user's own SID is always present in their token.
-/// 4. The per-user SID is cleaned up on daemon restart (when the group
+/// 4. The per-user SID is cleaned up on bridge restart (when the group
 ///    membership will have taken effect after re-login), because
 ///    `apply_socket_permissions` rebuilds the DACL from scratch with only
 ///    SYSTEM + Administrators + the `hole` group.
 fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
     use hole_common::protocol::PERMISSION_DENIED_HELP;
 
-    // Ensure the group exists (may not if daemon was installed by an older version)
-    if let Err(e) = hole_daemon::group::create_group() {
+    // Ensure the group exists (may not if bridge was installed by an older version)
+    if let Err(e) = hole_bridge::group::create_group() {
         eprintln!("failed to create group: {e}");
         return 1;
     }
 
     // Add current user to the hole group
-    let username = match hole_daemon::group::installing_username() {
+    let username = match hole_bridge::group::installing_username() {
         Ok(user) => {
-            if let Err(e) = hole_daemon::group::add_user_to_group(&user) {
+            if let Err(e) = hole_bridge::group::add_user_to_group(&user) {
                 eprintln!("failed to add '{user}' to group: {e}");
                 return 1;
             }
-            eprintln!("added '{user}' to '{}' group", hole_daemon::group::GROUP_NAME);
+            eprintln!("added '{user}' to '{}' group", hole_bridge::group::GROUP_NAME);
             user
         }
         Err(e) => {
@@ -354,16 +382,16 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
         }
     };
 
-    // On Windows, immediately update the daemon socket DACL with the user's SID
+    // On Windows, immediately update the bridge socket DACL with the user's SID
     // so the unprivileged GUI can connect without re-login.
     #[cfg(target_os = "windows")]
     {
-        let socket_path = hole_common::protocol::default_daemon_socket_path();
+        let socket_path = hole_common::protocol::default_bridge_socket_path();
         if socket_path.exists() {
-            match hole_daemon::group::lookup_sid(&username) {
+            match hole_bridge::group::lookup_sid(&username) {
                 Ok(user_sid) => {
-                    let sddl = hole_daemon::ipc::build_sddl(&[&user_sid]);
-                    if let Err(e) = hole_daemon::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
+                    let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
+                    if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
                         eprintln!("warning: failed to update socket DACL: {e}");
                     } else {
                         eprintln!("updated socket DACL with user SID for immediate access");
@@ -378,11 +406,11 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
 
     drop(username); // used on Windows for DACL update, suppress unused warning on macOS
 
-    // Optionally proxy a command to the daemon
+    // Optionally proxy a command to the bridge
     match (then_send, then_send_file) {
         (Some(b64), _) => handle_ipc_send_b64(&b64),
         (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-            Ok(request) => send_daemon_request(request),
+            Ok(request) => send_bridge_request(request),
             Err(e) => {
                 eprintln!("{e}");
                 1
@@ -394,7 +422,7 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
 
 fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     use base64::Engine;
-    use hole_common::protocol::DaemonRequest;
+    use hole_common::protocol::BridgeRequest;
 
     // Decode base64
     let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
@@ -406,7 +434,7 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     };
 
     // Deserialize request
-    let request: DaemonRequest = match serde_json::from_slice(&json_bytes) {
+    let request: BridgeRequest = match serde_json::from_slice(&json_bytes) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("invalid request JSON: {e}");
@@ -414,32 +442,32 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
         }
     };
 
-    send_daemon_request(request)
+    send_bridge_request(request)
 }
 
-fn send_daemon_request(request: hole_common::protocol::DaemonRequest) -> i32 {
-    use hole_common::protocol::DaemonResponse;
+fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
+    use hole_common::protocol::BridgeResponse;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let socket_path = hole_common::protocol::default_daemon_socket_path();
+        let socket_path = hole_common::protocol::default_bridge_socket_path();
 
-        let mut client = match crate::daemon_client::DaemonClient::connect(&socket_path).await {
+        let mut client = match crate::bridge_client::BridgeClient::connect(&socket_path).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("failed to connect to daemon: {e}");
+                eprintln!("failed to connect to bridge: {e}");
                 return 1;
             }
         };
 
         match client.send(request).await {
-            Ok(DaemonResponse::Ack) => 0,
-            Ok(DaemonResponse::Status { .. }) => 0,
-            Ok(DaemonResponse::Metrics { .. }) => 0,
-            Ok(DaemonResponse::Diagnostics { .. }) => 0,
-            Ok(DaemonResponse::PublicIp { .. }) => 0,
-            Ok(DaemonResponse::Error { message }) => {
-                eprintln!("daemon error: {message}");
+            Ok(BridgeResponse::Ack) => 0,
+            Ok(BridgeResponse::Status { .. }) => 0,
+            Ok(BridgeResponse::Metrics { .. }) => 0,
+            Ok(BridgeResponse::Diagnostics { .. }) => 0,
+            Ok(BridgeResponse::PublicIp { .. }) => 0,
+            Ok(BridgeResponse::Error { message }) => {
+                eprintln!("bridge error: {message}");
                 1
             }
             Err(e) => {

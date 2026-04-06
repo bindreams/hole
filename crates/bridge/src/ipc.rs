@@ -71,6 +71,25 @@ impl IpcServer {
         })
     }
 
+    /// Bind without restrictive permissions (for development).
+    /// Skips DACL setup and group permission checks.
+    pub fn bind_dev<B: ProxyBackend + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<B>>>,
+    ) -> std::io::Result<Self> {
+        let listener = LocalListener::bind(path)?;
+        let state = Arc::new(IpcState {
+            proxy,
+            ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let router = build_router(state);
+        Ok(Self {
+            listener,
+            router,
+            socket_path: path.to_owned(),
+        })
+    }
+
     /// Accept and handle one client connection, then return.
     /// Useful for testing.
     pub async fn run_once(self) -> std::io::Result<()> {
@@ -229,16 +248,16 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
     // App is always ok — we are responding to the request.
     let app = "ok".to_string();
 
-    // Daemon is ok if the proxy is running.
-    let daemon = if pm.state() == ProxyState::Running {
+    // Bridge is ok if the proxy is running.
+    let bridge = if pm.state() == ProxyState::Running {
         "ok".to_string()
     } else {
         "error".to_string()
     };
 
-    // Network: cascade from daemon. If daemon is down, network is unknown.
-    // If daemon is up, check default gateway reachability.
-    let network = if daemon != "ok" {
+    // Network: cascade from bridge. If bridge is down, network is unknown.
+    // If bridge is up, check default gateway reachability.
+    let network = if bridge != "ok" {
         "unknown".to_string()
     } else {
         match pm.backend().default_gateway() {
@@ -261,7 +280,7 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
 
     Json(DiagnosticsResponse {
         app,
-        daemon,
+        bridge,
         network,
         vpn_server,
         internet,
@@ -445,14 +464,14 @@ pub fn set_dacl_from_sddl(path: &Path, sddl: &str, protect: bool) -> std::io::Re
 /// adding the `hole` group on both platforms.
 ///
 /// On Windows: sets a DACL restricting access to SYSTEM, Administrators, and the `hole` group.
-/// If an `installer-user-sid` file exists (written by `install_daemon` in `setup.rs`),
+/// If an `installer-user-sid` file exists (written by `install_bridge` in `setup.rs`),
 /// the SID it contains is also added to the DACL, then the file is deleted. This is a
 /// workaround for the Windows token snapshot limitation: process tokens are immutable
 /// snapshots of group memberships captured at logon time, so a newly-added group
 /// membership is not reflected in any running process's token until the user logs out
 /// and back in. Adding the user's own SID directly to the DACL provides immediate
 /// access without requiring re-login. The per-user SID is cleaned up on the next
-/// daemon restart (when the group membership will have taken effect after re-login).
+/// bridge restart (when the group membership will have taken effect after re-login).
 ///
 /// On macOS: sets ownership to root:hole with mode 0660.
 #[cfg(all(target_os = "windows", not(test)))]
@@ -466,7 +485,7 @@ fn apply_socket_permissions(path: &Path) {
             extra_sids.push(sid);
         }
         // Delete the file after reading — the per-user SID is a temporary bridge
-        // that is no longer needed after the daemon restarts (group membership
+        // that is no longer needed after the bridge restarts (group membership
         // will be in the token after re-login).
         let _ = std::fs::remove_file(&sid_file);
     }
@@ -479,8 +498,8 @@ fn apply_socket_permissions(path: &Path) {
 
 /// Path to the file where the installing user's SID is stored temporarily.
 ///
-/// Written by `install_daemon()` in `setup.rs`, read and deleted by
-/// `apply_socket_permissions()` on daemon startup.
+/// Written by `install_bridge()` in `setup.rs`, read and deleted by
+/// `apply_socket_permissions()` on bridge startup.
 #[cfg(target_os = "windows")]
 pub fn installer_user_sid_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
