@@ -4,7 +4,7 @@
 
 Hole is a single Rust binary (`hole`) that serves as both the GUI app and a bridge to a remote shadowsocks server:
 
-- **GUI mode** (default, no args): Tauri desktop app with system tray and settings window. Unprivileged.
+- **GUI mode** (default): Tauri desktop app with system tray and settings window. Unprivileged.
 - **Bridge mode** (`hole bridge run`): Manages TUN device, routing, and the shadowsocks connection. Foreground by default; runs as a system service (Windows SCM or macOS launchd) when invoked with `--service`.
 
 The GUI and bridge communicate over a local Unix domain socket using HTTP/1.1 REST (JSON), defined in `crates/common/api/openapi.yaml`.

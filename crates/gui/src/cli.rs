@@ -6,13 +6,17 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "hole", about = "Shadowsocks GUI with transparent proxy", version = env!("HOLE_VERSION"))]
-struct Cli {
+pub(crate) struct Cli {
+    /// Open the dashboard window on launch instead of starting in the tray
+    #[arg(long)]
+    pub(crate) show_dashboard: bool,
+
     #[command(subcommand)]
-    command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Print version information
     Version,
     /// Check for updates and install the latest version
@@ -30,7 +34,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum BridgeAction {
+pub(crate) enum BridgeAction {
     /// Run the bridge (foreground by default)
     Run {
         /// Override the IPC socket path
@@ -83,7 +87,7 @@ enum BridgeAction {
 }
 
 #[derive(Subcommand)]
-enum LogAction {
+pub(crate) enum LogAction {
     /// Print the log file path
     Path,
     /// Stream log output (like tail -f)
@@ -95,7 +99,7 @@ enum LogAction {
 }
 
 #[derive(Subcommand)]
-enum PathAction {
+pub(crate) enum PathAction {
     /// Add hole to the system PATH
     Add,
     /// Remove hole from the system PATH
@@ -104,15 +108,24 @@ enum PathAction {
 
 // Dispatch ============================================================================================================
 
-/// Parse CLI arguments and dispatch to the appropriate handler.
-/// This function exits the process when done.
-pub fn dispatch() -> ! {
+/// Parse CLI arguments. On Windows, attaches the parent console first so that
+/// `--help`/`--version`/error output reaches the user's terminal — but only if
+/// any args were passed. With zero args (the bare GUI launch from Explorer or
+/// the autostart entry) no console is attached and the app stays silent. The
+/// MSI installer launches with `--show-dashboard`, so it will attach to
+/// `msiexec`'s console if `msiexec` was started from one — that's acceptable.
+pub(crate) fn parse_args() -> Cli {
     #[cfg(target_os = "windows")]
-    attach_console();
+    if std::env::args().len() > 1 {
+        attach_console();
+    }
 
-    let cli = Cli::parse();
+    Cli::parse()
+}
 
-    let code = match cli.command {
+/// Dispatch a parsed subcommand to its handler. Exits the process when done.
+pub(crate) fn dispatch(command: Command) -> ! {
+    let code = match command {
         Command::Version => {
             println!("hole {}", hole_gui::version::VERSION);
             0
@@ -506,3 +519,7 @@ fn attach_console() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod cli_tests;

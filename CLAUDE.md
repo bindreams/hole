@@ -15,7 +15,7 @@ GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows
 ### CLI
 
 ```
-hole                              → GUI (default)
+hole [--show-dashboard]           → GUI (default)
 hole version                      → print version information
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR] → run bridge (foreground, needs elevation)
 hole bridge run --service [--log-dir DIR] [--state-dir DIR]         → run as service (invoked by SCM/launchd)
