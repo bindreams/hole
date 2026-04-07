@@ -615,8 +615,10 @@ fn diagnostics_bridge_running() {
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok"); // MockBackend.default_gateway() succeeds
-        assert_eq!(diag.vpn_server, "ok");
-        // internet is always "unknown" in this initial implementation
+                                        // vpn_server and internet are always "unknown" on the wire — the
+                                        // GUI computes them from the selected ServerEntry's persisted
+                                        // validation state.
+        assert_eq!(diag.vpn_server, "unknown");
         assert_eq!(diag.internet, "unknown");
 
         // Cleanup

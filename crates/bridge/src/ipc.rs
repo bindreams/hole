@@ -1,13 +1,15 @@
 // IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
 use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
+use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, PublicIpResponse, StatusResponse,
-    ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    TestServerRequest, TestServerResponse, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD,
+    ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -149,6 +151,7 @@ fn build_router<B: ProxyBackend + 'static>(state: Arc<IpcState<B>>) -> axum::Rou
         .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<B>))
         .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<B>))
         .route(ROUTE_PUBLIC_IP, axum::routing::get(handle_public_ip::<B>))
+        .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<B>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
@@ -223,8 +226,7 @@ async fn handle_metrics<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSt
 async fn handle_diagnostics<B: ProxyBackend + 'static>(
     State(state): State<Arc<IpcState<B>>>,
 ) -> Json<DiagnosticsResponse> {
-    let mut pm = state.proxy.lock().await;
-    pm.check_health();
+    let pm = state.proxy.lock().await;
 
     // Bridge is always "ok" inside this handler — being able to respond to
     // this request proves the bridge IPC server is alive. App is also "ok"
@@ -243,18 +245,10 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
         Err(_) => "error".to_string(),
     };
 
-    // VPN server: when the proxy is running we know the server is reachable
-    // (we are using it). When the proxy is stopped, the bridge has no
-    // configured server to probe — return "unknown" and let the GUI override
-    // with a TCP-connect probe against the user's currently selected server.
-    let vpn_server = if pm.state() == ProxyState::Running {
-        "ok".to_string()
-    } else {
-        "unknown".to_string()
-    };
-
-    // Internet: always "unknown" in this initial implementation — a real connectivity
-    // check (e.g. HTTPS probe through the tunnel) is a follow-up.
+    // vpn_server and internet are computed by the GUI from the selected
+    // ServerEntry's persisted validation state (see ui/sidebar.ts). The
+    // wire fields are kept for backward compat but always "unknown" here.
+    let vpn_server = "unknown".to_string();
     let internet = "unknown".to_string();
 
     Json(DiagnosticsResponse {
@@ -264,6 +258,15 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
         vpn_server,
         internet,
     })
+}
+
+async fn handle_test_server<B: ProxyBackend + 'static>(
+    State(_state): State<Arc<IpcState<B>>>,
+    Json(req): Json<TestServerRequest>,
+) -> Json<TestServerResponse> {
+    let cfg = TestConfig::production();
+    let outcome = run_server_test(&req.entry, &cfg).await;
+    Json(TestServerResponse { outcome })
 }
 
 async fn handle_public_ip<B: ProxyBackend + 'static>(
