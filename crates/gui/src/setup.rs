@@ -250,7 +250,7 @@ pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
     // Idempotent: if already installed, stop and uninstall first
     if hole_bridge::platform::os::is_installed() {
-        eprintln!("bridge already installed, reinstalling...");
+        cli_log!(info, "bridge already installed, reinstalling...");
         let _ = hole_bridge::platform::os::stop();
         let _ = hole_bridge::platform::os::uninstall();
     }
@@ -262,14 +262,14 @@ pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     hole_bridge::platform::os::start()?;
 
-    eprintln!("bridge installed and started");
+    cli_log!(info, "bridge installed and started");
     Ok(())
 }
 
 /// Run `bridge uninstall`.
 pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
     if !hole_bridge::platform::os::is_installed() {
-        eprintln!("bridge is not installed");
+        cli_log!(warn, "bridge is not installed");
         return Ok(());
     }
 
@@ -281,7 +281,7 @@ pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // Best-effort: remove the access group
     let _ = hole_bridge::group::delete_group();
 
-    eprintln!("bridge uninstalled");
+    cli_log!(info, "bridge uninstalled");
     Ok(())
 }
 

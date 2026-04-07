@@ -5,6 +5,8 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod bridge_client;
+#[macro_use]
+mod cli_log;
 mod cli;
 mod commands;
 mod elevation;
