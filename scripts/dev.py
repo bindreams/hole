@@ -65,6 +65,12 @@ VITE_PORT = 1420
 VITE_READY_TIMEOUT = 30
 SOCKET_READY_TIMEOUT = 15
 
+# Chrome DevTools Protocol port for WebView2 remote debugging.
+# Enabled on Windows by injecting WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS into
+# the GUI process env. Lets external tools (Playwright, chrome-devtools-mcp,
+# manual chrome://inspect) attach to the running dashboard.
+CDP_PORT = 9222
+
 # Prerequisites ========================================================================================================
 
 
@@ -398,6 +404,26 @@ def main() -> None:
 
         # Start GUI (dropped to target user on macOS under sudo).
         gui_env = drop_env({**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}, target_user)
+
+        # Enable remote inspection of the dashboard webview. The env var only
+        # affects WebView2 (Windows) — WKWebView on macOS ignores it — but
+        # setting it unconditionally is harmless. Append to any existing value
+        # rather than overwriting.
+        existing_args = gui_env.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "").strip()
+        cdp_arg = f"--remote-debugging-port={CDP_PORT}"
+        gui_env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"{existing_args} {cdp_arg}".strip()
+
+        if sys.platform == "win32":
+            # WebView2 exposes the Chrome DevTools Protocol on this port.
+            print(f"{BOLD}WebView2 remote debugging:{RESET} http://127.0.0.1:{CDP_PORT}")
+        elif sys.platform == "darwin":
+            # WKWebView exposes itself to Safari's Web Inspector via XPC, not
+            # over a TCP port. Safari → Settings → Advanced → "Show features
+            # for web developers" must be enabled once. CDP-based tools
+            # (chrome-devtools-mcp, Playwright Chromium driver) cannot attach
+            # to a WKWebView — use Playwright's WebKit driver instead.
+            print(f"{BOLD}WKWebView remote debugging:{RESET} Safari → Develop → Hole → Hole Dashboard")
+
         gui_proc = subprocess.Popen(
             [str(built_bin)],
             env=gui_env,
