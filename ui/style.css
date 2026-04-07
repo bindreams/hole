@@ -525,6 +525,10 @@ order. (0,2,0) > (0,1,0). */
   overflow: hidden;
 }
 
+.section-clip.collapsed {
+  max-height: 0;
+}
+
 .section-body {
   padding-top: 0.5rem;
 }
