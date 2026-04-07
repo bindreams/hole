@@ -68,26 +68,6 @@ fn resolve_finds_repo_cache_via_walk_up() {
 }
 
 #[skuld::test]
-fn resolve_finds_legacy_gui_cache_path() {
-    // Transitional fallback: pre-Commit-4 path layout.
-    let dir = tempfile::tempdir().unwrap();
-    let target_debug = dir.path().join("target").join("debug");
-    let cache_wintun = dir.path().join(".cache").join("gui").join("wintun");
-    std::fs::create_dir_all(&target_debug).unwrap();
-    std::fs::create_dir_all(&cache_wintun).unwrap();
-
-    let fake_exe = target_debug.join("hole.exe");
-    let fake_wintun = cache_wintun.join("wintun.dll");
-    std::fs::write(&fake_exe, b"not a real binary").unwrap();
-    std::fs::write(&fake_wintun, b"not a real dll").unwrap();
-
-    let resolved = resolve_wintun_path_inner(Some(fake_exe)).unwrap();
-    let expected = std::fs::canonicalize(&fake_wintun).unwrap_or(fake_wintun);
-    let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-    assert_eq!(resolved, expected);
-}
-
-#[skuld::test]
 fn wintun_missing_error_message_contains_paths() {
     let dir = tempfile::tempdir().unwrap();
     let fake_exe = dir.path().join("subdir").join("hole.exe");

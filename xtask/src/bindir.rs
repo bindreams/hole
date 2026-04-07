@@ -46,28 +46,25 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     let hole_src = repo_root.join("target").join(profile.dir_name()).join(&hole_name);
     files.push(BindirFile::new(hole_src, hole_name));
 
-    // 2. v2ray-plugin sidecar. Built by crates/gui/build.rs (today) into
-    //    `.cache/gui/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}`. The
+    // 2. v2ray-plugin sidecar. Built by `cargo xtask v2ray-plugin` into
+    //    `.cache/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}`. The
     //    target-triple varies (`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
     //    etc.) so we glob and assert exactly one match.
-    //
-    //    Pre-Commit-4: glob from `.cache/gui/v2ray-plugin/`. Commit 4 moves
-    //    this to `.cache/v2ray-plugin/` (no `gui/` infix).
     let v2ray_glob_pattern = if cfg!(windows) {
-        ".cache/gui/v2ray-plugin/v2ray-plugin-*.exe"
+        ".cache/v2ray-plugin/v2ray-plugin-*.exe"
     } else {
-        ".cache/gui/v2ray-plugin/v2ray-plugin-*"
+        ".cache/v2ray-plugin/v2ray-plugin-*"
     };
     let v2ray_src = unique_glob_match(repo_root, v2ray_glob_pattern)?;
     let v2ray_dest = format!("v2ray-plugin{exe_suffix}");
     files.push(BindirFile::new(v2ray_src, v2ray_dest));
 
-    // 3. wintun.dll — Windows-only. Downloaded by crates/gui/build.rs (today)
-    //    into `.cache/gui/wintun/wintun.dll`. Not a sidecar binary; loaded as
-    //    a DLL by the bridge's TUN code path. See crates/bridge/src/wintun.rs.
+    // 3. wintun.dll — Windows-only. Downloaded by `cargo xtask wintun` into
+    //    `.cache/wintun/wintun.dll`. Not a sidecar binary; loaded as a DLL by
+    //    the bridge's TUN code path. See crates/bridge/src/wintun.rs.
     #[cfg(target_os = "windows")]
     {
-        let wintun_src = repo_root.join(".cache").join("gui").join("wintun").join("wintun.dll");
+        let wintun_src = repo_root.join(".cache").join("wintun").join("wintun.dll");
         files.push(BindirFile::new(wintun_src, "wintun.dll".to_string()));
     }
 
@@ -89,8 +86,7 @@ fn unique_glob_match(repo_root: &Path, pattern: &str) -> Result<PathBuf> {
 
     match matches.len() {
         0 => Err(anyhow!(
-            "no files matched glob {pattern_str}. Did `cargo build` run? \
-             (Commit 4 will replace this with `cargo xtask deps`.)"
+            "no files matched glob {pattern_str}. Did `cargo xtask deps` run?"
         )),
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(anyhow!(

@@ -70,8 +70,7 @@ pub fn ensure_loaded() -> Result<(), ProxyError> {
 /// Resolve a path to wintun.dll by checking, in order:
 ///
 ///   1. The directory of the current executable (production / staged BINDIR)
-///   2. The repo's `.cache/wintun/wintun.dll` (xtask deps output, post-Commit-4)
-///   3. The repo's `.cache/gui/wintun/wintun.dll` (transitional, pre-Commit-4)
+///   2. The repo's `.cache/wintun/wintun.dll` (xtask deps output)
 ///
 /// Returns the list of paths tried in the `WintunMissing` variant so the
 /// failure mode is fully diagnosable in logs.
@@ -95,15 +94,14 @@ fn resolve_wintun_path_inner(current_exe: Option<PathBuf>) -> Result<PathBuf, Pr
             }
             tried.push(candidate);
 
-            // 2/3. Repo cache fallbacks — useful when running `cargo run -p hole-gui`
-            // directly without staging the BINDIR.
-            for rel in [".cache/wintun/wintun.dll", ".cache/gui/wintun/wintun.dll"] {
-                if let Some(p) = walk_up_for(dir, Path::new(rel)) {
-                    if p.is_file() {
-                        return Ok(p);
-                    }
-                    tried.push(p);
+            // 2. Repo cache fallback — useful when running `cargo run -p hole-gui`
+            // directly without staging the BINDIR. Walks up looking for
+            // `.cache/wintun/wintun.dll` (the `cargo xtask wintun` output).
+            if let Some(p) = walk_up_for(dir, Path::new(".cache/wintun/wintun.dll")) {
+                if p.is_file() {
+                    return Ok(p);
                 }
+                tried.push(p);
             }
         }
     }

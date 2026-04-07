@@ -16,8 +16,8 @@ fn fake_repo() -> tempfile::TempDir {
         fs::write(target.join(name), b"fake hole binary").unwrap();
     }
 
-    // .cache/gui/v2ray-plugin/v2ray-plugin-<triple>{.exe} — exactly one match
-    let v2ray = root.join(".cache").join("gui").join("v2ray-plugin");
+    // .cache/v2ray-plugin/v2ray-plugin-<triple>{.exe} — exactly one match
+    let v2ray = root.join(".cache").join("v2ray-plugin");
     fs::create_dir_all(&v2ray).unwrap();
     let v2ray_name = if cfg!(windows) {
         "v2ray-plugin-x86_64-pc-windows-msvc.exe"
@@ -28,10 +28,10 @@ fn fake_repo() -> tempfile::TempDir {
     };
     fs::write(v2ray.join(v2ray_name), b"fake v2ray-plugin").unwrap();
 
-    // .cache/gui/wintun/wintun.dll — Windows only
+    // .cache/wintun/wintun.dll — Windows only
     #[cfg(target_os = "windows")]
     {
-        let wintun = root.join(".cache").join("gui").join("wintun");
+        let wintun = root.join(".cache").join("wintun");
         fs::create_dir_all(&wintun).unwrap();
         fs::write(wintun.join("wintun.dll"), b"fake wintun").unwrap();
     }
@@ -112,7 +112,7 @@ fn bindir_errors_when_v2ray_glob_has_multiple_matches() {
     let name = if cfg!(windows) { "hole.exe" } else { "hole" };
     fs::write(target.join(name), b"x").unwrap();
 
-    let v2ray = root.join(".cache").join("gui").join("v2ray-plugin");
+    let v2ray = root.join(".cache").join("v2ray-plugin");
     fs::create_dir_all(&v2ray).unwrap();
     // Two matches — should error.
     let suffix = if cfg!(windows) { ".exe" } else { "" };

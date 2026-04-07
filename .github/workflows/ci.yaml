@@ -82,6 +82,9 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -110,6 +113,9 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: astral-sh/setup-uv@v7
+
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
 
       - name: Test
         working-directory: msi-installer

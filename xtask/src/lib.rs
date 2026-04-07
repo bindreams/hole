@@ -10,6 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bindir;
 pub mod stage;
+pub mod v2ray_plugin;
+pub mod wintun;
 
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
@@ -47,6 +49,20 @@ pub enum Command {
         #[arg(long)]
         out_dir: PathBuf,
     },
+    /// Build the v2ray-plugin sidecar from `external/v2ray-plugin/`.
+    ///
+    /// Output goes into `<repo>/.cache/v2ray-plugin/`. Replaces the previous
+    /// build.rs side effect.
+    V2rayPlugin,
+    /// Download and verify wintun.dll on Windows.
+    ///
+    /// Output goes into `<repo>/.cache/wintun/`. No-op on non-Windows.
+    Wintun,
+    /// Run all `cargo xtask <step>` commands required for a runnable build.
+    ///
+    /// Currently: `v2ray-plugin` + `wintun`. The runtime asset acquisition
+    /// previously embedded in `crates/gui/build.rs`.
+    Deps,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -68,6 +84,9 @@ impl Profile {
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Stage { profile, out_dir } => run_stage(profile, &out_dir),
+        Command::V2rayPlugin => run_v2ray_plugin(),
+        Command::Wintun => run_wintun(),
+        Command::Deps => run_deps(),
     }
 }
 
@@ -76,6 +95,28 @@ pub fn run_stage(profile: Profile, out_dir: &Path) -> Result<()> {
     let files = bindir::bindir_files(profile, &repo_root)?;
     stage::stage(out_dir, &files)?;
     println!("xtask: staged {} files into {}", files.len(), out_dir.display());
+    Ok(())
+}
+
+pub fn run_v2ray_plugin() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = v2ray_plugin::build(&repo_root)?;
+    println!("xtask: v2ray-plugin built at {}", path.display());
+    Ok(())
+}
+
+pub fn run_wintun() -> Result<()> {
+    let repo_root = repo_root()?;
+    match wintun::ensure(&repo_root)? {
+        Some(path) => println!("xtask: wintun.dll at {}", path.display()),
+        None => println!("xtask: wintun.dll skipped (not Windows)"),
+    }
+    Ok(())
+}
+
+pub fn run_deps() -> Result<()> {
+    run_v2ray_plugin()?;
+    run_wintun()?;
     Ok(())
 }
 
