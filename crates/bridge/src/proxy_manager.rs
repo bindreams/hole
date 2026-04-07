@@ -231,6 +231,11 @@ impl<B: ProxyBackend> ProxyManager<B> {
 
         self.server_ip = None;
         self.started_at = None;
+        // Clear any error from a previous failed start. A clean stop is the
+        // user's signal that the bridge is in a good state again — keeping
+        // the stale error would make `handle_diagnostics` report
+        // `bridge = "error"` indefinitely. See issue #142.
+        self.last_error = None;
         self.state = ProxyState::Stopped;
 
         info!("proxy stopped");

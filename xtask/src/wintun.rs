@@ -13,7 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
+#[cfg(target_os = "windows")]
+use anyhow::{anyhow, Context};
 
 #[cfg(target_os = "windows")]
 const WINTUN_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";

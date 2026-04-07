@@ -668,12 +668,14 @@ fn diagnostics_proxy_stopped() {
         let mut client = TestClient::connect(&path).await;
         let diag = get_diagnostics(&mut client).await;
 
-        // Bridge IPC is up (we are handling this request); only the proxy
-        // is stopped. App and bridge are always "ok" inside the handler.
+        // Bridge IPC is up (we are handling this request); the proxy is stopped
+        // but no operation has failed, so `pm.last_error()` is None and the
+        // diagnostics handler reports `bridge = "ok"` (issue #142). App is
+        // always "ok" by convention (bridge can't observe the GUI directly).
         // Network is computed from the host's default gateway and the
-        // MockBackend returns Ok. vpn_server and internet are always
-        // "unknown" on the wire — the GUI computes them from the selected
-        // ServerEntry's persisted validation state.
+        // MockBackend returns Ok. vpn_server and internet are always "unknown"
+        // on the wire — the GUI computes them from the selected ServerEntry's
+        // persisted validation state (#150).
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok");

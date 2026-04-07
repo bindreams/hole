@@ -164,6 +164,66 @@ members = ["a"]
 }
 
 #[skuld::test]
+fn cargo_toml_version_skips_publish_false_members() {
+    // Mirrors the real workspace: 3 publishable crates at one version, 2
+    // internal tooling crates with publish = false. Even if the tooling
+    // crates have a different (or stale) version, the publishable version
+    // is what's returned and no inconsistency error fires.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "b", "tool", "tool-lib"]
+"#,
+    )
+    .unwrap();
+
+    for (member, version) in [("a", "1.2.3"), ("b", "1.2.3")] {
+        std::fs::create_dir_all(root.join(member)).unwrap();
+        std::fs::write(
+            root.join(member).join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+    }
+    // Tooling crates: stale version (0.0.0), publish = false. MUST be skipped.
+    for member in ["tool", "tool-lib"] {
+        std::fs::create_dir_all(root.join(member)).unwrap();
+        std::fs::write(
+            root.join(member).join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.0.0\"\npublish = false\n"),
+        )
+        .unwrap();
+    }
+
+    let v = cargo_toml_version(root).unwrap();
+    assert_eq!(v, Version::new(1, 2, 3));
+}
+
+#[skuld::test]
+fn cargo_toml_version_rejects_when_only_publish_false_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["only-tool"]
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("only-tool")).unwrap();
+    std::fs::write(
+        root.join("only-tool").join("Cargo.toml"),
+        "[package]\nname = \"only-tool\"\nversion = \"0.0.0\"\npublish = false\n",
+    )
+    .unwrap();
+    let err = cargo_toml_version(root).unwrap_err();
+    assert!(err.to_string().contains("publishable"));
+}
+
+#[skuld::test]
 fn cargo_toml_version_rejects_glob_members() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

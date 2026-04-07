@@ -46,6 +46,13 @@ jobs:
       - name: Install prek
         run: uv tool install prek
 
+      # prek runs `cargo clippy` which compiles `crates/hole/build.rs`,
+      # which calls `tauri_build::build()`, which validates that the
+      # `externalBin` declared in tauri.conf.json (`v2ray-plugin-*`) actually
+      # exists on disk. So even the lint job needs the runtime deps cached.
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
+
       - name: Run linters
         run: prek run --all-files --show-diff-on-failure
 

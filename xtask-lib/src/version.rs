@@ -27,6 +27,12 @@ use semver::Version;
 
 /// Read the workspace member Cargo.tomls and assert they all declare the
 /// same strict semver version. Returns that version.
+///
+/// Members with `publish = false` are **excluded** from the consistency
+/// check — they are internal tooling (xtask, xtask-lib) and don't share the
+/// release cadence of the user-facing crates. Without this exclusion, every
+/// release version bump would have to touch all 5 Cargo.tomls instead of 3,
+/// and a release-time mistake would silently produce mismatched binaries.
 pub fn cargo_toml_version(repo_root: &Path) -> Result<Version> {
     let root_toml = repo_root.join("Cargo.toml");
     let root_text =
@@ -47,6 +53,12 @@ pub fn cargo_toml_version(repo_root: &Path) -> Result<Version> {
         let cargo_path = repo_root.join(member).join("Cargo.toml");
         let text =
             std::fs::read_to_string(&cargo_path).with_context(|| format!("failed to read {}", cargo_path.display()))?;
+
+        // Skip publish = false members (internal tooling).
+        if parse_package_publish_false(&text) {
+            continue;
+        }
+
         let v_str =
             parse_package_version(&text).ok_or_else(|| anyhow!("no [package] version in {}", cargo_path.display()))?;
         let v = Version::parse(&v_str)
@@ -58,6 +70,12 @@ pub fn cargo_toml_version(repo_root: &Path) -> Result<Version> {
             ));
         }
         versions.push((cargo_path.display().to_string(), v));
+    }
+
+    if versions.is_empty() {
+        return Err(anyhow!(
+            "no publishable workspace members found (all have publish = false?)"
+        ));
     }
 
     let unique: std::collections::BTreeSet<_> = versions.iter().map(|(_, v)| v.clone()).collect();
@@ -243,11 +261,7 @@ fn parse_workspace_members(toml: &str) -> Option<Vec<String>> {
 
 /// Naive parser for the first `version = "..."` inside `[package]`.
 fn parse_package_version(toml: &str) -> Option<String> {
-    let pkg_start = toml.find("[package]")?;
-    let pkg_section = &toml[pkg_start..];
-    let next_section = pkg_section[1..].find("\n[").map(|i| i + 1).unwrap_or(pkg_section.len());
-    let pkg = &pkg_section[..next_section];
-
+    let pkg = extract_package_section(toml)?;
     for line in pkg.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("version") {
@@ -259,4 +273,31 @@ fn parse_package_version(toml: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Returns true if `[package]` declares `publish = false`.
+fn parse_package_publish_false(toml: &str) -> bool {
+    let Some(pkg) = extract_package_section(toml) else {
+        return false;
+    };
+    for line in pkg.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("publish") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                if rest.trim() == "false" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the `[package]` section text (everything until the next `[section]`).
+fn extract_package_section(toml: &str) -> Option<&str> {
+    let pkg_start = toml.find("[package]")?;
+    let pkg_section = &toml[pkg_start..];
+    let next_section = pkg_section[1..].find("\n[").map(|i| i + 1).unwrap_or(pkg_section.len());
+    Some(&pkg_section[..next_section])
 }
