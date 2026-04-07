@@ -28,8 +28,11 @@ Communication happens over IPC (Unix socket on macOS, named pipe on Windows) usi
 Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E tests).
 
 ```sh
-# Build all crates (build.rs automatically builds v2ray-plugin from source
-# and downloads wintun.dll on Windows)
+# One-time fetch of runtime deps (builds v2ray-plugin from Go source,
+# downloads + verifies wintun.dll on Windows). Cached after the first run.
+cargo xtask deps
+
+# Build all crates
 cargo build --workspace
 
 # Run GUI in dev mode

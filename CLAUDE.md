@@ -49,11 +49,21 @@ file and performs an equivalent cleanup from outside.
 crates/common/   → hole-common (shared types: protocol, config, import)
 crates/bridge/   → hole-bridge (bridge library, no binary)
 crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
+xtask/           → workspace task runner (`cargo xtask <stage|deps|version|...>`)
+xtask-lib/       → shared helper crate used by xtask AND crates/gui/build.rs
 external/        → Third-party source (git subrepos)
-msi-installer/   → WiX MSI installer (Python project: source, build script, tests)
-scripts/         → Utility scripts
+msi-installer/   → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
+scripts/         → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
 ui/              → Frontend HTML/CSS/TypeScript (Vite)
 ```
+
+Build orchestration is owned by `xtask/`. The canonical list of files that
+go into the runnable BINDIR (next to `hole.exe`) lives in
+[xtask/src/bindir.rs](xtask/src/bindir.rs); both `scripts/dev.py` and
+`msi-installer` call `cargo xtask stage` instead of duplicating composition.
+Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download) lives
+in `cargo xtask deps`. `crates/gui/build.rs` is restricted to compile-time
+metadata (icon generation, git version via `xtask-lib::version`).
 
 ## Build
 
@@ -63,7 +73,8 @@ Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 
 ```sh
 npm install                      # install frontend dependencies (first time only)
-cargo build --workspace          # all crates (build.rs builds v2ray-plugin + downloads wintun)
+cargo xtask deps                 # build v2ray-plugin from Go + download wintun (one-time, cached)
+cargo build --workspace          # all crates
 uv run scripts/dev.py            # dev mode (see CONTRIBUTING.md)
 cargo test --workspace           # all tests
 ```

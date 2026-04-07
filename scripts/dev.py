@@ -100,8 +100,23 @@ def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None)
 
 
 def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
+    """Build the workspace and run xtask deps (wintun + v2ray-plugin).
+
+    Both run as the invoking user so `target/` and `.cache/` are not owned
+    by root on macOS-under-sudo.
+    """
+    print(f"{BOLD}Fetching runtime deps (cargo xtask deps)...{RESET}")
+    result = subprocess.run(
+        [cargo, "xtask", "deps"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
     print(f"{BOLD}Building workspace...{RESET}")
-    # Run as the invoking user so `target/` is not owned by root.
     result = subprocess.run(
         [cargo, "build"],
         stdout=sys.stdout,
