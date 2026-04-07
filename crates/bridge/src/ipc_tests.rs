@@ -113,6 +113,7 @@ fn sample_config() -> ProxyConfig {
             password: "pw".to_string(),
             plugin: None,
             plugin_opts: None,
+            validation: None,
         },
         local_port: 4073,
     }

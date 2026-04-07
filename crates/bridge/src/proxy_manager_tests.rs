@@ -107,6 +107,7 @@ fn test_config() -> ProxyConfig {
             method: "aes-256-gcm".into(),
             plugin: None,
             plugin_opts: None,
+            validation: None,
         },
         local_port: 1080,
     }

@@ -1,6 +1,8 @@
+use crate::protocol::ServerTestOutcome;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 // Errors ==============================================================================================================
 
@@ -111,6 +113,12 @@ pub struct ServerEntry {
     pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_opts: Option<String>,
+    /// Persisted result of the most recent server test (or `None` if untested).
+    /// Set by the GUI's `test_server` and `mark_validated_by_proxy_start`
+    /// commands. Drives the per-card status indicator and the
+    /// `vpn_server`/`internet` diagnostics dots.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub validation: Option<ValidationState>,
 }
 
 impl std::fmt::Debug for ServerEntry {
@@ -124,8 +132,19 @@ impl std::fmt::Debug for ServerEntry {
             .field("password", &"<redacted>")
             .field("plugin", &self.plugin)
             .field("plugin_opts", &self.plugin_opts)
+            .field("validation", &self.validation)
             .finish()
     }
+}
+
+/// Persisted state of the most recent test for a `ServerEntry`. The
+/// `tested_at` timestamp is serialized as RFC3339 so the JS frontend can
+/// parse it directly with `new Date(...)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidationState {
+    #[serde(with = "time::serde::rfc3339")]
+    pub tested_at: OffsetDateTime,
+    pub outcome: ServerTestOutcome,
 }
 
 // Validation ==========================================================================================================

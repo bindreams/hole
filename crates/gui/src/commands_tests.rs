@@ -18,6 +18,7 @@ fn test_entry(id: &str) -> ServerEntry {
         password: "pw".to_string(),
         plugin: None,
         plugin_opts: None,
+        validation: None,
     }
 }
 
@@ -418,6 +419,7 @@ fn config_with_server(host: &str, port: u16) -> AppConfig {
             password: "pw".into(),
             plugin: None,
             plugin_opts: None,
+            validation: None,
         }],
         selected_server: Some("test".into()),
         local_port: 4073,
