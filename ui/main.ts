@@ -4,6 +4,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { OverlayScrollbars } from "overlayscrollbars";
+import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
 import { initSections } from "./sections";
 import { importFromDialog, initServers, renderServers } from "./servers";
@@ -127,6 +129,20 @@ async function init() {
   initFilters();
   initSettings();
   initSidebar();
+
+  // Replace native scrollbars with fade-in/out overlay scrollbars.
+  const main = document.querySelector<HTMLElement>(".main");
+  if (main) {
+    OverlayScrollbars(main, {
+      scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+    });
+  }
+  const sbContent = document.querySelector<HTMLElement>(".sb-content");
+  if (sbContent) {
+    OverlayScrollbars(sbContent, {
+      scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+    });
+  }
 
   // Load config from backend.
   await loadConfig();
