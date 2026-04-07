@@ -50,9 +50,9 @@ pub fn ensure_loaded() -> Result<(), ProxyError> {
     // SAFETY: `wintun_bindings::load_from_path` is `unsafe` because
     // `libloading::Library::new` calls `LoadLibraryExW`, which executes the
     // DLL's `DllMain` (arbitrary code from the DLL). wintun.dll is the
-    // WireGuard LLC userspace TUN driver, downloaded by `crates/gui/build.rs`
-    // (and a future xtask subcommand) from www.wintun.net with SHA-256
-    // verification against a hash pinned at compile time. The same DLL is
+    // WireGuard LLC userspace TUN driver, downloaded by `cargo xtask wintun`
+    // from www.wintun.net with SHA-256 verification against a hash pinned at
+    // compile time (see xtask/src/wintun.rs). The same DLL is
     // unconditionally loaded by `shadowsocks-service` later in the proxy
     // startup path; we are simply moving that load earlier and giving it an
     // explicit absolute path so we can produce a descriptive error.
@@ -94,7 +94,7 @@ fn resolve_wintun_path_inner(current_exe: Option<PathBuf>) -> Result<PathBuf, Pr
             }
             tried.push(candidate);
 
-            // 2. Repo cache fallback — useful when running `cargo run -p hole-gui`
+            // 2. Repo cache fallback — useful when running `cargo run -p hole`
             // directly without staging the BINDIR. Walks up looking for
             // `.cache/wintun/wintun.dll` (the `cargo xtask wintun` output).
             if let Some(p) = walk_up_for(dir, Path::new(".cache/wintun/wintun.dll")) {

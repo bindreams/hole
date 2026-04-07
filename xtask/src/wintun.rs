@@ -1,6 +1,6 @@
 //! Download + verify wintun.dll on Windows.
 //!
-//! This was previously [`crates/gui/build.rs::download_wintun`] — moved into
+//! This was previously [`crates/hole/build.rs::download_wintun`] — moved into
 //! xtask in Commit 4 because wintun.dll is a runtime dependency, not a
 //! compile-time input. Crucially, having the download in `build.rs` meant
 //! that any `cargo check` would attempt the download (and fail if the

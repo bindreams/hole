@@ -48,10 +48,12 @@ cargo test --workspace
 crates/
   common/    hole-common — shared types (protocol, config, import)
   bridge/    hole-bridge — privileged bridge library
-  gui/       hole-gui    — Tauri app + CLI (binary name: "hole")
+  hole/      hole        — Tauri app + CLI + bridge entry point (binary name: "hole")
+xtask/      workspace task runner (`cargo xtask <stage|deps|version|...>`)
+xtask-lib/  shared helper crate used by xtask AND crates/hole/build.rs
 external/
   v2ray-plugin/  v2ray-plugin source (git subrepo)
-msi-installer/  WiX MSI installer (Python project: source, build script, tests)
+msi-installer/  WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 ui/             Frontend HTML/CSS/JS
 scripts/        Utility scripts
 tests/       E2E test specs (WebDriverIO)

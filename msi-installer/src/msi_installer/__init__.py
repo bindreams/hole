@@ -74,7 +74,7 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
 
 
 def get_version(root: Path) -> str:
-    cargo_toml = root / "crates" / "gui" / "Cargo.toml"
+    cargo_toml = root / "crates" / "hole" / "Cargo.toml"
     with open(cargo_toml, "rb") as f:
         data = tomllib.load(f)
 

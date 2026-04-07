@@ -48,9 +48,9 @@ file and performs an equivalent cleanup from outside.
 ```
 crates/common/   → hole-common (shared types: protocol, config, import)
 crates/bridge/   → hole-bridge (bridge library, no binary)
-crates/gui/      → hole-gui (Tauri app + CLI, binary name: "hole")
+crates/hole/     → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
 xtask/           → workspace task runner (`cargo xtask <stage|deps|version|...>`)
-xtask-lib/       → shared helper crate used by xtask AND crates/gui/build.rs
+xtask-lib/       → shared helper crate used by xtask AND crates/hole/build.rs
 external/        → Third-party source (git subrepos)
 msi-installer/   → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 scripts/         → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
@@ -62,7 +62,7 @@ go into the runnable BINDIR (next to `hole.exe`) lives in
 [xtask/src/bindir.rs](xtask/src/bindir.rs); both `scripts/dev.py` and
 `msi-installer` call `cargo xtask stage` instead of duplicating composition.
 Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download) lives
-in `cargo xtask deps`. `crates/gui/build.rs` is restricted to compile-time
+in `cargo xtask deps`. `crates/hole/build.rs` is restricted to compile-time
 metadata (icon generation, git version via `xtask-lib::version`).
 
 ## Build
@@ -123,4 +123,4 @@ Each release also includes `SHA256SUMS` (hash manifest) and `SHA256SUMS.minisig`
 
 ## Icons
 
-Source icons are `crates/gui/icons/icon.svg` (app icon) and `crates/gui/icons/tray-{enabled,disabled}.svg` (tray icons). The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.
+Source icons are `crates/hole/icons/icon.svg` (app icon) and `crates/hole/icons/tray-{enabled,disabled}.svg` (tray icons). The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.

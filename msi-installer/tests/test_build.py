@@ -14,7 +14,7 @@ from msi_installer import BuildError, find_wix_exe, get_version
 
 
 def test_get_version(tmp_path: Path) -> None:
-    gui_dir = tmp_path / "crates" / "gui"
+    gui_dir = tmp_path / "crates" / "hole"
     gui_dir.mkdir(parents=True)
     (gui_dir / "Cargo.toml").write_text('[package]\nname = "test"\nversion = "1.2.3"\n')
 
@@ -22,7 +22,7 @@ def test_get_version(tmp_path: Path) -> None:
 
 
 def test_get_version_rejects_invalid(tmp_path: Path) -> None:
-    gui_dir = tmp_path / "crates" / "gui"
+    gui_dir = tmp_path / "crates" / "hole"
     gui_dir.mkdir(parents=True)
     (gui_dir / "Cargo.toml").write_text('[package]\nname = "test"\nversion = "1.2.3-beta"\n')
 

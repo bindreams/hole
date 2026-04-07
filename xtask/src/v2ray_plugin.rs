@@ -1,6 +1,6 @@
 //! Build the v2ray-plugin sidecar from `external/v2ray-plugin/` (Go source).
 //!
-//! This was previously [`crates/gui/build.rs::build_v2ray_plugin`] — moved
+//! This was previously [`crates/hole/build.rs::build_v2ray_plugin`] — moved
 //! into xtask in Commit 4 because the v2ray-plugin binary is a runtime
 //! dependency of the bridge, not a compile-time input to any Rust crate.
 //! See issue #143.

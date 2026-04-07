@@ -276,7 +276,7 @@ def drop_env(env: dict, target: tuple[int, int, str, str] | None) -> dict:
 
 
 def main() -> None:
-    if not Path("Cargo.toml").exists() or not Path("crates/gui").exists():
+    if not Path("Cargo.toml").exists() or not Path("crates/hole").exists():
         print("Error: run this script from the project root")
         sys.exit(1)
     project_root = Path.cwd().resolve()

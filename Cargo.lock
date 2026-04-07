@@ -2276,6 +2276,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "hole"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "contracts",
+ "dirs 6.0.0",
+ "hole-bridge",
+ "hole-common",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ico",
+ "minisign-verify",
+ "png 0.18.1",
+ "resvg",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "skuld",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "windows 0.62.2",
+ "winreg 0.56.0",
+ "xtask-lib",
+ "zip",
+]
+
+[[package]]
 name = "hole-bridge"
 version = "0.1.0"
 dependencies = [
@@ -2331,49 +2374,6 @@ dependencies = [
  "uuid",
  "windows 0.62.2",
  "yaml_serde",
-]
-
-[[package]]
-name = "hole-gui"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "contracts",
- "dirs 6.0.0",
- "hole-bridge",
- "hole-common",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ico",
- "minisign-verify",
- "png 0.18.1",
- "resvg",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "skuld",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tempfile",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "windows 0.62.2",
- "winreg 0.56.0",
- "xtask-lib",
- "zip",
 ]
 
 [[package]]

@@ -2,8 +2,8 @@
 
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
+use hole::tray_icons;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
-use hole_gui::tray_icons;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -33,7 +33,7 @@ const ID_COLLECT_LOGS: &str = "window_collect_logs";
 /// Build the tray menu, optionally including an "Install Update" item.
 pub fn build_tray_menu(
     app: &AppHandle,
-    update: Option<&hole_gui::update::UpdateInfo>,
+    update: Option<&hole::update::UpdateInfo>,
     enabled: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     let status_text = if enabled { "Connected" } else { "Disconnected" };
@@ -149,7 +149,7 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
 /// Preserves the "Install Update" item if an update is available.
 pub fn rebuild_tray_menu(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
-        let update_state = app.state::<hole_gui::update::UpdateState>();
+        let update_state = app.state::<hole::update::UpdateState>();
         let update_info = update_state.rx.borrow().clone();
         let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
         match build_tray_menu(app, update_info.as_ref(), enabled) {
@@ -383,7 +383,7 @@ fn handle_window_menu_event(app: &AppHandle, event: MenuEvent) {
             info!("menu: about dialog");
             use tauri_plugin_dialog::DialogExt;
             app.dialog()
-                .message(format!("Hole {}", hole_gui::version::VERSION))
+                .message(format!("Hole {}", hole::version::VERSION))
                 .title("About Hole")
                 .blocking_show();
         }
@@ -458,7 +458,7 @@ async fn handle_install_update_from_tray(app: AppHandle) {
     use tauri_plugin_dialog::DialogExt;
 
     // Get update info from update state.
-    let update_state = app.state::<hole_gui::update::UpdateState>();
+    let update_state = app.state::<hole::update::UpdateState>();
     let update_info = update_state.rx.borrow().clone();
 
     let Some(info) = update_info else {
@@ -479,7 +479,7 @@ async fn handle_install_update_from_tray(app: AppHandle) {
 
     // Download on blocking thread.
     let download_result =
-        tokio::task::spawn_blocking(move || hole_gui::update::download_asset(&asset_url, &dest_for_download)).await;
+        tokio::task::spawn_blocking(move || hole::update::download_asset(&asset_url, &dest_for_download)).await;
 
     match download_result {
         Ok(Ok(())) => {}
@@ -503,7 +503,7 @@ async fn handle_install_update_from_tray(app: AppHandle) {
     let sha256sums_url = info.sha256sums_url.clone();
     let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
     let verify_result = tokio::task::spawn_blocking(move || {
-        hole_gui::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
+        hole::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
     })
     .await;
 
@@ -525,7 +525,7 @@ async fn handle_install_update_from_tray(app: AppHandle) {
 
     // Run installer (interactive mode).
     let dest_clone = dest.clone();
-    let install_result = tokio::task::spawn_blocking(move || hole_gui::update::run_installer(&dest_clone, false)).await;
+    let install_result = tokio::task::spawn_blocking(move || hole::update::run_installer(&dest_clone, false)).await;
 
     match install_result {
         Ok(Ok(())) => {
@@ -591,7 +591,7 @@ async fn handle_collect_logs(app: AppHandle) {
 async fn handle_check_for_updates(app: AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-    let result = tokio::task::spawn_blocking(hole_gui::update::check_for_update).await;
+    let result = tokio::task::spawn_blocking(hole::update::check_for_update).await;
 
     match result {
         Ok(Ok(Some(info))) => {
@@ -607,7 +607,7 @@ async fn handle_check_for_updates(app: AppHandle) {
 
             if confirmed {
                 // Store the update info and reuse the install handler.
-                let update_state = app.state::<hole_gui::update::UpdateState>();
+                let update_state = app.state::<hole::update::UpdateState>();
                 update_state.tx.send_replace(Some(info));
                 handle_install_update_from_tray(app).await;
             }
@@ -616,7 +616,7 @@ async fn handle_check_for_updates(app: AppHandle) {
             app.dialog()
                 .message(format!(
                     "You're running the latest version ({}).",
-                    hole_gui::version::VERSION
+                    hole::version::VERSION
                 ))
                 .title("No Updates Available")
                 .blocking_show();
