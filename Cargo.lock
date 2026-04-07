@@ -2382,6 +2382,7 @@ dependencies = [
  "tauri-plugin-log",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tower",
  "tracing",
