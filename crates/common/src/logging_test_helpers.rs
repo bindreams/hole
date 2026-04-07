@@ -9,7 +9,7 @@
 // and the parent reads + asserts on it.
 
 use crate::logging::logging_tests::{CapturedEvent, ChildResult};
-use crate::logging::{redirect_stdio_to_tracing_for_tests, Stream};
+use crate::logging::redirect_stdio_to_tracing_for_tests;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -340,12 +340,18 @@ fn scenario_no_loop() {
 }
 
 fn scenario_lossy_backpressure() {
-    // SlowWriter wraps a sink and sleeps 100ms per write — used in place of
-    // the file appender to verify the relay/file pipeline doesn't block.
+    // SlowWriter sleeps 100ms per write and counts the number of successful
+    // writes — used in place of the file appender to verify the relay/file
+    // pipeline doesn't block AND that some events were actually dropped
+    // (not just queued).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+
     struct SlowWriter;
     impl Write for SlowWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            WRITES.fetch_add(1, Ordering::SeqCst);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -366,12 +372,18 @@ fn scenario_lossy_backpressure() {
 
     // Write 10000 stderr lines in a tight loop. Without lossy mode this
     // would take ~1000 seconds. With lossy mode it completes in well under
-    // a second.
+    // a second, and the SlowWriter counter lands well below 10000 (proving
+    // events were dropped, not just queued).
     for i in 0..10_000 {
         let _ = writeln!(std::io::stderr(), "lossy-line-{i}");
     }
     let _ = std::io::stderr().flush();
 
-    write_result(&ChildResult::default());
-    let _ = Stream::Stderr; // touch unused import
+    // Record the observed write count in the result so the parent test can
+    // assert on it. Reuse `tee_stderr` as a free-form channel for the value.
+    let result = ChildResult {
+        tee_stderr: WRITES.load(Ordering::SeqCst).to_string(),
+        ..ChildResult::default()
+    };
+    write_result(&result);
 }

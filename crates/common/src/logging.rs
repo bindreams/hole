@@ -68,13 +68,6 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
-    fn relay_target(self) -> &'static str {
-        match self {
-            Stream::Stderr => "hole::stderr_relay",
-            Stream::Stdout => "hole::stdout_relay",
-        }
-    }
-
     fn thread_name(self) -> &'static str {
         match self {
             Stream::Stderr => "hole-stderr-relay",
@@ -95,9 +88,23 @@ fn save_original_pair(stream: Stream) -> (Box<dyn Write + Send>, Box<dyn Write +
         Stream::Stdout => os_pipe::dup_stdout(),
     };
     let Ok(writer) = dup else {
+        tracing::debug!(target: "hole::logging", "saved-original {stream:?} dup failed, using sink fallback");
         return (Box::new(io::sink()), Box::new(io::sink()));
     };
+    // Windows: `try_clone_to_owned` on a null STD_*_HANDLE (typical for a
+    // service with no console) returns `Ok(OwnedHandle::from_raw_handle(null))`.
+    // Writing to such a handle silently fails. Detect and substitute sinks.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let raw = writer.as_raw_handle();
+        if raw.is_null() || raw as isize == -1 {
+            tracing::debug!(target: "hole::logging", "saved-original {stream:?} handle is null/invalid, using sink fallback");
+            return (Box::new(io::sink()), Box::new(io::sink()));
+        }
+    }
     let Ok(clone) = writer.try_clone() else {
+        tracing::debug!(target: "hole::logging", "saved-original {stream:?} try_clone failed, using sink fallback for layer writer");
         return (Box::new(writer), Box::new(io::sink()));
     };
     (Box::new(writer), Box::new(clone))
@@ -128,12 +135,11 @@ fn redirect_one(stream: Stream) -> io::Result<(JoinHandle<()>, WorkerGuard, Box<
     // `mem::forget` where needed.
     drop(write_end);
 
-    let target = stream.relay_target();
     let thread = std::thread::Builder::new()
         .name(stream.thread_name().into())
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                relay_loop(read_end, tee_nb, target);
+                relay_loop(read_end, tee_nb, stream);
             }));
         })?;
 
@@ -157,8 +163,9 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
 #[cfg(windows)]
 fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
     use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
 
     let std_handle = match stream {
         Stream::Stderr => STD_ERROR_HANDLE,
@@ -170,9 +177,7 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
     // outlives the PipeWriter wrapper's Drop. Without this, after we drop
     // `write_end`, the kernel handle that STD_*_HANDLE references would be
     // closed, and any subprocess inheriting it would see EBADF.
-    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE as WHANDLE};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    let mut dup: WHANDLE = WHANDLE::default();
+    let mut dup = HANDLE::default();
     let proc = unsafe { GetCurrentProcess() };
     unsafe {
         DuplicateHandle(proc, h, proc, &mut dup, 0, true, DUPLICATE_SAME_ACCESS)?;
@@ -188,16 +193,11 @@ fn redirect_fd(stream: Stream, write_end: &os_pipe::PipeWriter) -> io::Result<()
 /// saved-original handle, and emit a tracing event for each non-empty line.
 ///
 /// Tracing's `event!` macro takes a literal target string, so we dispatch on
-/// the runtime target value to one of the two known emit_* helpers.
-fn relay_loop(reader: os_pipe::PipeReader, mut tee: tracing_appender::non_blocking::NonBlocking, target: &'static str) {
+/// the `Stream` enum to one of the two known emit_* helpers.
+fn relay_loop(reader: os_pipe::PipeReader, mut tee: tracing_appender::non_blocking::NonBlocking, stream: Stream) {
     use std::io::{BufRead, BufReader};
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::with_capacity(4096);
-    let emit: fn(&str) = if target == "hole::stderr_relay" {
-        emit_stderr_relay
-    } else {
-        emit_stdout_relay
-    };
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
@@ -211,7 +211,10 @@ fn relay_loop(reader: os_pipe::PipeReader, mut tee: tracing_appender::non_blocki
                 let line = String::from_utf8_lossy(&buf);
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if !trimmed.is_empty() {
-                    emit(trimmed);
+                    match stream {
+                        Stream::Stderr => emit_stderr_relay(trimmed),
+                        Stream::Stdout => emit_stdout_relay(trimmed),
+                    }
                 }
             }
             Err(_) => break,
@@ -279,27 +282,77 @@ fn redirect_one_with_writer(
     redirect_fd(stream, &write_end)?;
     drop(write_end);
 
-    let target = stream.relay_target();
     let thread = std::thread::Builder::new()
         .name(stream.thread_name().into())
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                relay_loop(read_end, tee_nb, target);
+                relay_loop(read_end, tee_nb, stream);
             }));
         })?;
     Ok((thread, tee_guard))
 }
 
+// Test-only escape hatch ==============================================================================================
+
+/// Only in `debug_assertions` builds, honor `HOLE_LOGGING_DISABLE_REDIRECT`.
+/// Release builds always perform the FD redirect — the env var is a no-op.
+#[cfg(debug_assertions)]
+fn disable_redirect_for_tests() -> bool {
+    std::env::var_os("HOLE_LOGGING_DISABLE_REDIRECT").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn disable_redirect_for_tests() -> bool {
+    false
+}
+
 // Panic hook ==========================================================================================================
 
+/// Has `install_panic_hook` already run in this process? Panic hook
+/// installation is one-shot: the hook captures `prev = take_hook()` at
+/// install time. If `init()` is called twice (as can happen in tests that
+/// share a process), the second install would chain our OWN hook, creating
+/// an N-level chain whose depth grows with every `init()` call and that
+/// leaks across tests. Use this flag to skip subsequent installs.
+static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Per-thread re-entry guard for the panic hook. If `tracing::error!` inside
+// the hook itself panics (e.g. a writer panics or a format impl misbehaves),
+// the global panic dispatcher calls our hook again. Without this guard we'd
+// recurse until the thread's stack overflows. When re-entry is detected we
+// fall through to the previous hook only, skipping the tracing emit.
+std::thread_local! {
+    static PANIC_HOOK_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only variant that ignores the idempotency guard. Tests that
+/// exercise the panic hook want to install it fresh each run so their
+/// save/restore pattern works — the production idempotency rule that "only
+/// the first init() in a process installs the hook" would cause the second
+/// test to see the first test's hook instead of its own chain.
 #[cfg(test)]
 pub(crate) fn install_panic_hook_for_tests() {
-    install_panic_hook();
+    install_panic_hook_inner();
 }
 
 fn install_panic_hook() {
+    // Idempotent: only install once per process. See PANIC_HOOK_INSTALLED.
+    if PANIC_HOOK_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    install_panic_hook_inner();
+}
+
+fn install_panic_hook_inner() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Re-entry guard. If the tracing emit itself panics, skip the emit
+        // and fall through to the previous hook directly.
+        let reentered = PANIC_HOOK_ENTERED.with(|c| c.replace(true));
+        if reentered {
+            prev(info);
+            return;
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let location = info
             .location()
@@ -318,6 +371,7 @@ fn install_panic_hook() {
             "panic: {}",
             payload,
         );
+        PANIC_HOOK_ENTERED.with(|c| c.set(false));
         prev(info);
     }));
 }
@@ -335,13 +389,12 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
     // Order matters: redirect BEFORE constructing the non-blocking stderr
     // writer so the writer targets the saved-original handle, not the pipe.
     //
-    // The `HOLE_LOGGING_DISABLE_REDIRECT` env var is honored for tests that
-    // call init() but should not get a global FD redirect — libtest-mimic
-    // prints its per-test result lines to FD 1, and those lines would be
-    // eaten by the redirect. Tests that specifically exercise the redirect
-    // call `redirect_stdio_to_tracing_for_tests` from a child process where
-    // the result-line concern doesn't apply.
-    let (relays, original_stderr) = if std::env::var_os("HOLE_LOGGING_DISABLE_REDIRECT").is_some() {
+    // `HOLE_LOGGING_DISABLE_REDIRECT` is honored only in dev/test builds
+    // (`debug_assertions`). Tests that call `init()` but don't want a global
+    // FD redirect set it because libtest-mimic prints per-test result lines
+    // to FD 1, and the redirect would eat them. In release builds the env
+    // var is ignored — the FD safety net is non-negotiable in production.
+    let (relays, original_stderr) = if disable_redirect_for_tests() {
         (
             StdioRelayHandles {
                 _stderr_thread: None,
@@ -363,8 +416,16 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
     let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(true).finish(file_appender);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
-    let env_filter =
-        EnvFilter::from_default_env().add_directive(default_directive.parse().expect("valid tracing directive"));
+    // The EnvFilter default for non-matching targets is ERROR, so we must
+    // add explicit directives for the relay and panic targets — otherwise
+    // their INFO-level events would be filtered out and the entire FD-level
+    // safety net would be a no-op in production.
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive(default_directive.parse().expect("valid tracing directive"))
+        .add_directive("hole::stderr_relay=info".parse().expect("valid directive"))
+        .add_directive("hole::stdout_relay=info".parse().expect("valid directive"))
+        .add_directive("hole::panic=error".parse().expect("valid directive"))
+        .add_directive("hole::logging=debug".parse().expect("valid directive"));
 
     // Filter that excludes the relay's own events from the stderr layer to
     // prevent any feedback loop in either direction. The file layer has no

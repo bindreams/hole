@@ -2,29 +2,43 @@ use super::*;
 use skuld::temp_dir;
 use std::path::Path;
 
-/// Set the env var that disables the FD-level stdio redirect inside
-/// `hole_common::logging::init`. Required because libtest-mimic prints its
-/// per-test result lines to FD 1; with the redirect installed those lines
-/// would be eaten and `cargo test` couldn't display per-test status.
-fn disable_redirect() {
-    // SAFETY: tests in this file run sequentially via skuld's test harness
-    // and the env var is only ever set, never read concurrently with set.
-    unsafe {
-        std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1");
+/// RAII guard: sets `HOLE_LOGGING_DISABLE_REDIRECT` on construction and
+/// clears it on drop. Required because libtest-mimic prints its per-test
+/// result lines to FD 1; with the redirect installed those lines would be
+/// eaten. The cleanup-on-drop ensures the env var does not leak into any
+/// subsequent test in the same process that happens to call `init()`.
+struct DisableRedirectGuard;
+
+impl DisableRedirectGuard {
+    fn new() -> Self {
+        // SAFETY: these tests are marked `serial`, so no other test reads or
+        // writes the process environment concurrently.
+        unsafe {
+            std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1");
+        }
+        Self
     }
 }
 
-#[skuld::test]
+impl Drop for DisableRedirectGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("HOLE_LOGGING_DISABLE_REDIRECT");
+        }
+    }
+}
+
+#[skuld::test(serial)]
 fn init_creates_log_directory(#[fixture(temp_dir)] dir: &Path) {
-    disable_redirect();
+    let _g = DisableRedirectGuard::new();
     let log_dir = dir.join("logs");
     let _guard = init(&log_dir);
     assert!(log_dir.exists());
 }
 
-#[skuld::test]
+#[skuld::test(serial)]
 fn init_returns_guard(#[fixture(temp_dir)] dir: &Path) {
-    disable_redirect();
+    let _g = DisableRedirectGuard::new();
     let log_dir = dir.join("logs");
     let guard = init(&log_dir);
     // Guard should be valid (not panic on drop)

@@ -126,33 +126,42 @@ pub(crate) fn parse_args() -> Cli {
     Cli::parse()
 }
 
+/// Return `true` if dispatching `command` should install a `gui-cli.log`
+/// subscriber. Exempt commands:
+///
+/// - `Version` — pure stdout, no audit trail needed.
+/// - `Bridge::Run` — installs its own `bridge.log` guard via
+///   `hole_bridge::logging::init`. Calling init() again here would clash
+///   (second `try_init` returns Err) and leave bridge events pointing at
+///   the wrong subscriber.
+/// - `Bridge::Log` — read-only inspection. No need to write a log entry to
+///   read one.
+pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Version
+            | Command::Bridge {
+                action: BridgeAction::Run { .. }
+            }
+            | Command::Bridge {
+                action: BridgeAction::Log { .. }
+            }
+    )
+}
+
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
 ///
 /// For write-action subcommands (Upgrade, Bridge::{Install, Uninstall, Status,
 /// GrantAccess, IpcSend}, and Path), install a CLI log guard so that
 /// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
-/// user-facing terminal output. Exempt:
-///
-/// - `Version` — pure stdout, no audit trail needed.
-/// - `Bridge::Run` — installs its own bridge.log guard via
-///   `hole_bridge::logging::init`. Calling init() again here would be a
-///   no-op subscriber install (try_init returns Err) and the second
-///   redirect would corrupt the first.
-/// - `Bridge::Log` — read-only inspection. No need to write a log entry to
-///   read one.
+/// user-facing terminal output. See [`should_install_cli_log_guard`] for
+/// the exemption list.
 pub(crate) fn dispatch(command: Command) -> ! {
-    let _cli_log_guard = match &command {
-        Command::Version => None,
-        Command::Bridge {
-            action: BridgeAction::Run { .. },
-        } => None,
-        Command::Bridge {
-            action: BridgeAction::Log { .. },
-        } => None,
-        _ => {
-            let log_dir = hole_common::logging::default_log_dir();
-            Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole_gui=info"))
-        }
+    let _cli_log_guard = if should_install_cli_log_guard(&command) {
+        let log_dir = hole_common::logging::default_log_dir();
+        Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole_gui=info"))
+    } else {
+        None
     };
     let code = match command {
         Command::Version => {

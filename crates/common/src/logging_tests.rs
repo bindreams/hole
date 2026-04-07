@@ -220,12 +220,14 @@ fn redirect_does_not_loop(#[fixture(temp_dir)] dir: &Path) {
 
 #[skuld::test]
 fn lossy_mode_drops_under_backpressure(#[fixture(temp_dir)] dir: &Path) {
-    // The child writes ~10000 lines to stderr while the file appender is
+    // The child writes 10000 lines to stderr while the file appender is
     // throttled to 100ms per write. Under non-lossy mode, this would block for
     // hundreds of seconds. Under lossy mode, the child completes promptly and
-    // some events are dropped.
+    // MANY events are dropped — the SlowWriter should see far fewer than
+    // 10000 writes (proving the lossy channel is actually dropping, not just
+    // queuing).
     let start = std::time::Instant::now();
-    let _result = run_child("lossy_backpressure", dir);
+    let result = run_child("lossy_backpressure", dir);
     let elapsed = start.elapsed();
     // Generous deadline: child loop is 10k * a few microseconds per iteration
     // plus a few seconds for process spawn/cleanup. The 100ms-per-write file
@@ -233,6 +235,13 @@ fn lossy_mode_drops_under_backpressure(#[fixture(temp_dir)] dir: &Path) {
     assert!(
         elapsed < std::time::Duration::from_secs(20),
         "lossy backpressure test took {elapsed:?} — likely blocking on file writer"
+    );
+    // `tee_stderr` holds the observed SlowWriter write count (child reused
+    // this field — see scenario_lossy_backpressure).
+    let writes: usize = result.tee_stderr.parse().expect("observed write count from child");
+    assert!(
+        writes < 10_000,
+        "lossy mode should have dropped events under backpressure, but SlowWriter saw {writes} writes",
     );
 }
 
@@ -346,10 +355,20 @@ fn panic_hook_chains_previous() {
 #[skuld::test(serial)]
 fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
     // Disable the FD redirect inside init() so libtest-mimic's per-test
-    // result lines (printed to FD 1) aren't eaten.
+    // result lines (printed to FD 1) aren't eaten. Clean up the env var on
+    // every exit path to avoid leaking the override into other tests.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("HOLE_LOGGING_DISABLE_REDIRECT");
+            }
+        }
+    }
     unsafe {
         std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1");
     }
+    let _env_guard = EnvGuard;
     let log_dir = dir.join("log-bridge-test");
     let _guard = init(&log_dir, "test.log", "info");
 
