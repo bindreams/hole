@@ -112,7 +112,7 @@ fn resolve_plugin_path(name: &str) -> String {
 /// The PATH fallback is safe because `is_valid_plugin_name()` ensures the name
 /// contains no path separators — PATH lookup can only find binaries in directories
 /// that an administrator placed on PATH (standard system-level trust model).
-fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
+pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
     if let Some(exe) = bridge_exe {
         // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
         // but the sibling plugin binary is next to the real binary.

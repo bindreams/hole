@@ -2301,6 +2301,7 @@ dependencies = [
  "axum",
  "bytes",
  "default-net",
+ "hex",
  "hole-common",
  "http",
  "http-body-util",

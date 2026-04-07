@@ -102,15 +102,19 @@ pub enum ServerTestOutcome {
     /// OR the plugin process exited within the wait window. The string
     /// carries the underlying error message.
     PluginStartFailed { detail: String },
-    /// Pre-flight passed; `ProxyClientStream::connect` succeeded; the first
-    /// read after `HEAD /` returned 0 bytes (EOF) — the upstream server
-    /// closed the stream after seeing our AEAD header. Catches wrong
-    /// password, wrong cipher, and v2ray-plugin handshake rejected at the
-    /// server side, indistinguishably.
+    /// Pre-flight passed and `ProxyClientStream::connect` succeeded, but the
+    /// shadowsocks server stopped responding without ever closing the stream.
+    /// On the rust shadowsocks server with v1 AEAD ciphers, this is the
+    /// canonical anti-probing behavior on AEAD decryption failure: the
+    /// server enters `ignore_until_end` and silently drains forever. Catches
+    /// wrong password, wrong cipher, and v2ray-plugin handshake rejected at
+    /// the server side, indistinguishably.
     TunnelHandshakeFailed,
-    /// Tunnel established; sentinel reads timed out from both fallback
-    /// addresses. The shadowsocks server is alive and accepted our request,
-    /// but cannot itself reach the public internet.
+    /// Tunnel established (server decrypted credentials successfully) but
+    /// the upstream sentinel was unreachable through the tunnel. The
+    /// shadowsocks server tried to forward our request and either could not
+    /// connect to the sentinel or saw the upstream close immediately,
+    /// causing it to close our tunnel side cleanly (EOF on the client).
     ServerCannotReachInternet,
     /// Bytes flowed back from the sentinel but did not start with the
     /// ASCII bytes "HTTP". `detail` carries the hex of the first ~32 bytes
