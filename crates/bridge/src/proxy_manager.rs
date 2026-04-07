@@ -127,6 +127,21 @@ impl<B: ProxyBackend> ProxyManager<B> {
             self.last_error = Some(e.to_string());
         })?;
 
+        // Pre-load wintun.dll explicitly so we can give a descriptive error
+        // if it's missing. shadowsocks-service uses the bare "wintun.dll" name
+        // via tun-0.8.6, which becomes LoadLibraryExW with default search
+        // order. By loading the DLL here first (with an absolute path), the
+        // OS loader-table services the later bare-name lookup from the same
+        // process via base-name dedup. See crates/bridge/src/wintun.rs.
+        //
+        // No routes have been touched yet at this point, so we don't need
+        // to roll anything back — just record last_error and return like
+        // the build_ss_config path above.
+        #[cfg(target_os = "windows")]
+        crate::wintun::ensure_loaded().inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
+
         // Resolve server hostname to IP
         let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
             .await
