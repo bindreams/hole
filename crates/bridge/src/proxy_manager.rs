@@ -123,13 +123,21 @@ impl<B: ProxyBackend> ProxyManager<B> {
         }
 
         // Build shadowsocks config
-        let ss_config = build_ss_config(config)?;
+        let ss_config = build_ss_config(config).inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
 
         // Resolve server hostname to IP
-        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
+        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
+            .await
+            .inspect_err(|e| {
+                self.last_error = Some(e.to_string());
+            })?;
 
         // Detect default gateway and interface
-        let gw_info = self.backend.default_gateway()?;
+        let gw_info = self.backend.default_gateway().inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
 
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
         // routing mutation. A panic/SIGKILL between setup_routes and

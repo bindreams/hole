@@ -175,10 +175,13 @@ async fn handle_start<B: ProxyBackend + 'static>(
     let mut pm = state.proxy.lock().await;
     match pm.start(&config).await {
         Ok(()) => Ok(Json(EmptyResponse {})),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { message: e.to_string() }),
-        )),
+        Err(e) => {
+            error!(error = %e, "proxy start failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { message: e.to_string() }),
+            ))
+        }
     }
 }
 
@@ -188,10 +191,13 @@ async fn handle_stop<B: ProxyBackend + 'static>(
     let mut pm = state.proxy.lock().await;
     match pm.stop().await {
         Ok(()) => Ok(Json(EmptyResponse {})),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { message: e.to_string() }),
-        )),
+        Err(e) => {
+            error!(error = %e, "proxy stop failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { message: e.to_string() }),
+            ))
+        }
     }
 }
 
@@ -202,10 +208,13 @@ async fn handle_reload<B: ProxyBackend + 'static>(
     let mut pm = state.proxy.lock().await;
     match pm.reload(&config).await {
         Ok(()) => Ok(Json(EmptyResponse {})),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { message: e.to_string() }),
-        )),
+        Err(e) => {
+            error!(error = %e, "proxy reload failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { message: e.to_string() }),
+            ))
+        }
     }
 }
 
@@ -228,15 +237,23 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
 ) -> Json<DiagnosticsResponse> {
     let pm = state.proxy.lock().await;
 
-    // Bridge is always "ok" inside this handler — being able to respond to
-    // this request proves the bridge IPC server is alive. App is also "ok"
-    // by convention; the bridge cannot directly observe the GUI process,
-    // but if it weren't running we wouldn't have received this request
-    // either. The GUI's fallback path (map_diagnostics_response) is the
-    // only place either can be non-ok, and it sets them when the IPC call
+    // App is "ok" by convention: the bridge cannot directly observe the GUI
+    // process, but if it weren't running we wouldn't have received this
+    // request either. The GUI's fallback path (map_diagnostics_response) is
+    // the only place this can be non-ok, and it sets it when the IPC call
     // itself fails.
     let app = "ok".to_string();
-    let bridge = "ok".to_string();
+
+    // Bridge is "error" when ProxyManager has a recorded last_error from a
+    // failed start/reload/stop, and "ok" otherwise. The IPC server itself is
+    // alive (we got here), but the *bridge work* may have failed silently
+    // before; reporting "ok" unconditionally would mask exactly the kind of
+    // bug class that motivated this change. See issue #142.
+    let bridge = if pm.last_error().is_some() {
+        "error".to_string()
+    } else {
+        "ok".to_string()
+    };
 
     // Network: does the host have a default gateway? Best-effort local
     // check; does not actually probe the gateway.

@@ -685,6 +685,120 @@ fn diagnostics_proxy_stopped() {
     });
 }
 
+#[skuld::test]
+fn diagnostics_bridge_error_after_failed_start() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-bridge-err");
+        let server = IpcServer::bind(&path, gateway_failing_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Trigger a failed start so ProxyManager.last_error is populated.
+        // The gateway-failing mock makes default_gateway return Err, which
+        // ProxyManager::start now records via inspect_err.
+        let resp = post_start(&mut client, &sample_config()).await;
+        assert_eq!(resp.status(), 500);
+        let _ = resp.into_body().collect().await;
+
+        let diag = get_diagnostics(&mut client).await;
+        // Bridge IPC is up but the most recent operation failed — this is
+        // exactly the situation the old hardcoded "ok" was masking.
+        assert_eq!(diag.app, "ok");
+        assert_eq!(diag.bridge, "error");
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+// Log capture: a global tracing subscriber that writes ERROR-level events into a
+// shared buffer. Initialized lazily on first use; subsequent installations are no-ops.
+// Tests that depend on the buffer must serialize via `LOG_CAPTURE_GUARD` to avoid
+// interleaving with each other (other tests are unaffected — they don't read the buffer).
+mod log_capture {
+    use std::io;
+    use std::sync::{Mutex, OnceLock};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    static BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static INIT: OnceLock<()> = OnceLock::new();
+    pub static GUARD: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone)]
+    struct VecWriter;
+
+    impl io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            BUFFER.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for VecWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            VecWriter
+        }
+    }
+
+    pub fn install() {
+        INIT.get_or_init(|| {
+            tracing_subscriber::fmt()
+                .with_writer(VecWriter)
+                .with_max_level(tracing::Level::ERROR)
+                .with_ansi(false)
+                .init();
+        });
+    }
+
+    pub fn take() -> String {
+        let mut buf = BUFFER.lock().unwrap();
+        let s = String::from_utf8(buf.clone()).unwrap_or_default();
+        buf.clear();
+        s
+    }
+}
+
+#[skuld::test]
+fn start_failure_emits_error_log() {
+    let _serial = log_capture::GUARD.lock().unwrap();
+    log_capture::install();
+    let _ = log_capture::take(); // clear any prior pollution
+
+    rt().block_on(async {
+        let path = test_socket_path("start-fail-log");
+        let pm = failing_proxy();
+        let server = IpcServer::bind(&path, pm).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_start(&mut client, &sample_config()).await;
+        assert_eq!(resp.status(), 500);
+        let _ = resp.into_body().collect().await;
+
+        drop(client);
+        let _ = handle.await;
+    });
+
+    let logs = log_capture::take();
+    assert!(
+        logs.contains("proxy start failed"),
+        "expected 'proxy start failed' in captured logs, got: {logs}"
+    );
+    assert!(
+        logs.contains("mock failure"),
+        "expected mock error message in captured logs, got: {logs}"
+    );
+}
+
 // public_ip handler test is intentionally omitted — it makes an external HTTP call
 // to ipinfo.io which is not available in CI and cannot be easily mocked without
 // adding an HTTP client abstraction layer (a follow-up concern).
