@@ -597,6 +597,7 @@ body {
   font-size: 0.75rem;
   cursor: pointer;
   padding: 0.5rem 0.8rem;
+  margin-top: 0.6rem;
   border: 1px dashed var(--border-strong);
   border-radius: 4px;
   transition:
