@@ -191,14 +191,42 @@ components:
       properties:
         app:
           type: string
+          description: |
+            Always "ok" inside this handler — being able to respond proves the
+            GUI process is alive. The GUI overrides to "unknown" only when the
+            IPC call to the bridge fails entirely.
         bridge:
           type: string
+          description: |
+            Always "ok" inside this handler — being able to respond proves the
+            bridge IPC server is alive. Set to "unknown" by the GUI fallback
+            path when the bridge is unreachable.
         network:
           type: string
+          description: |
+            "ok" if the host has a default gateway configured (a weak proxy
+            for local network availability). "error" if no default gateway
+            can be detected. Best-effort local check; does not actually
+            probe the gateway.
         vpn_server:
           type: string
+          description: |
+            From the bridge: "ok" when the proxy tunnel is Running
+            (reachability is implied), or "unknown" when the proxy is
+            Stopped (the bridge has no server config to probe). The GUI
+            overrides any "unknown" value (whether from this handler or
+            from the bridge-unreachable fallback path) with the result of
+            a TCP connect probe against the user's currently selected
+            server: "ok" if a TCP connection to host:port can be
+            established (implies network reachability and an open
+            listener; does not validate the shadowsocks handshake or that
+            a working server is actually behind the port), "error" if
+            unreachable.
         internet:
           type: string
+          description: |
+            Always "unknown" today. A real connectivity check (HTTPS probe
+            through the tunnel) is a follow-up.
 
     PublicIpResponse:
       type: object
