@@ -8,6 +8,7 @@
     "autostart:allow-is-enabled",
     "dialog:allow-open",
     "dialog:allow-message",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "log:allow-log"
   ]
 }
