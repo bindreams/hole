@@ -137,11 +137,17 @@ body {
   overflow: hidden;
 }
 
+html {
+  /* Defines the rem base. The whole UI is sized in rem-based design tokens
+  that assume a 14px base; explicitly setting it here keeps rem and px
+  measurements consistent (the browser default would be 16px). */
+  font-size: 14px;
+}
+
 body {
   font-family: "Inter", system-ui, -apple-system, sans-serif;
   background: var(--bg-base);
   color: var(--text-primary);
-  font-size: 14px;
   line-height: 1.5;
 }
 
@@ -256,6 +262,7 @@ order. (0,2,0) > (0,1,0). */
 .sb-status {
   font-size: 0.85rem;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .sb-status strong {
