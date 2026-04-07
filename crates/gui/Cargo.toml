@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [build-dependencies]
 tauri-build = "2"
-semver = "1"
+xtask-lib = { path = "../../xtask-lib" }
 resvg = "0.45"
 png = "0.18"
 ico = "0.5"

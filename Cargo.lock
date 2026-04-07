@@ -2353,7 +2353,6 @@ dependencies = [
  "minisign-verify",
  "png 0.18.1",
  "resvg",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2373,6 +2372,7 @@ dependencies = [
  "ureq",
  "windows 0.62.2",
  "winreg 0.56.0",
+ "xtask-lib",
  "zip",
 ]
 
@@ -7886,7 +7886,18 @@ dependencies = [
  "skuld",
  "tempfile",
  "ureq",
+ "xtask-lib",
  "zip",
+]
+
+[[package]]
+name = "xtask-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "semver",
+ "skuld",
+ "tempfile",
 ]
 
 [[package]]

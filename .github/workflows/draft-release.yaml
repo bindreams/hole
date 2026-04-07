@@ -29,9 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Normalize and validate version
         id: version
@@ -45,7 +43,7 @@ jobs:
         run: git tag "v${{ steps.version.outputs.version }}"
 
       - name: Validate Cargo.toml matches version
-        run: python scripts/check-version.py --exact
+        run: cargo xtask version --check --exact
 
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})

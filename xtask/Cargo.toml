@@ -20,6 +20,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
+xtask-lib = { path = "../xtask-lib" }
 
 # `cargo xtask wintun` (Windows-only at runtime, but the deps are unconditional
 # so the workspace `cargo check` is identical across platforms — easier to keep

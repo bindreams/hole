@@ -63,6 +63,17 @@ pub enum Command {
     /// Currently: `v2ray-plugin` + `wintun`. The runtime asset acquisition
     /// previously embedded in `crates/gui/build.rs`.
     Deps,
+    /// Print or validate the workspace version. Replaces scripts/check-version.py.
+    Version {
+        /// Validate Cargo.toml version against the nearest git tag instead of
+        /// printing the display version.
+        #[arg(long)]
+        check: bool,
+        /// With `--check`, require an exact tag/Cargo.toml match (instead of
+        /// allowing one bump ahead). Used by the release CI workflow.
+        #[arg(long, requires = "check")]
+        exact: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -87,6 +98,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::V2rayPlugin => run_v2ray_plugin(),
         Command::Wintun => run_wintun(),
         Command::Deps => run_deps(),
+        Command::Version { check, exact } => run_version(check, exact),
     }
 }
 
@@ -117,6 +129,17 @@ pub fn run_wintun() -> Result<()> {
 pub fn run_deps() -> Result<()> {
     run_v2ray_plugin()?;
     run_wintun()?;
+    Ok(())
+}
+
+pub fn run_version(check: bool, exact: bool) -> Result<()> {
+    let repo_root = repo_root()?;
+    if check {
+        let v = xtask_lib::version::validate_against_tag(&repo_root, exact)?;
+        println!("{v}");
+    } else {
+        println!("{}", xtask_lib::version::display_version(&repo_root));
+    }
     Ok(())
 }
 
