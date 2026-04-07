@@ -273,6 +273,26 @@ fn route_guard_stores_state_dir() {
     std::mem::forget(guard);
 }
 
+// Phase classifier ====================================================================================================
+//
+// `is_recovery_phase` decides whether `run_commands` logs failures at debug
+// (idempotent best-effort cleanup) or warn (a real error). These tests are
+// regressions against accidental modification of the matcher itself —
+// they reference the same `PHASE_*` constants used by `recover_routes_with`,
+// so the literal phase strings live in exactly one place.
+
+#[skuld::test]
+fn recover_phases_are_classified_as_expected_failures() {
+    assert!(is_recovery_phase(PHASE_RECOVER_SPLIT));
+    assert!(is_recovery_phase(PHASE_RECOVER_BYPASS));
+}
+
+#[skuld::test]
+fn setup_and_teardown_phases_are_not_recovery() {
+    assert!(!is_recovery_phase(PHASE_SETUP));
+    assert!(!is_recovery_phase(PHASE_TEARDOWN));
+}
+
 // recover_routes_with tests ===========================================================================================
 //
 // These use an injectable command runner so the test doesn't shell out. The
@@ -298,7 +318,7 @@ fn recover_without_state_file_runs_only_split_teardown() {
 
     let log = log.into_inner();
     assert_eq!(log.len(), 1, "expected only split-teardown phase, got {log:?}");
-    assert_eq!(log[0].0, "recover-split");
+    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());
 }
 
@@ -318,8 +338,8 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
-    assert_eq!(log[0].0, "recover-split");
-    assert_eq!(log[1].0, "recover-bypass");
+    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
+    assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
         "state file should be cleared after recovery"

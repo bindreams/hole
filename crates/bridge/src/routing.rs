@@ -34,6 +34,15 @@ pub fn build_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name
 
 // Execution ===========================================================================================================
 
+// Phase tags used for structured logging and to classify expected failures.
+// `is_recovery_phase` is the single source of truth for which phases are
+// best-effort cleanup; adding a new `PHASE_RECOVER_*` here MUST be paired
+// with a matching arm in `is_recovery_phase`.
+pub(crate) const PHASE_SETUP: &str = "setup";
+pub(crate) const PHASE_TEARDOWN: &str = "teardown";
+pub(crate) const PHASE_RECOVER_SPLIT: &str = "recover-split";
+pub(crate) const PHASE_RECOVER_BYPASS: &str = "recover-bypass";
+
 /// Execute route setup commands. Logs each command and its result.
 pub fn setup_routes(
     tun_name: &str,
@@ -42,27 +51,46 @@ pub fn setup_routes(
     interface_name: &str,
 ) -> std::io::Result<()> {
     let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
-    run_commands(&commands, "setup")
+    run_commands(&commands, PHASE_SETUP)
 }
 
 /// Execute route teardown commands. Idempotent — safe to call even if routes don't exist.
 pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> std::io::Result<()> {
     let commands = build_teardown_commands(tun_name, server_ip, interface_name);
-    run_commands(&commands, "teardown")
+    run_commands(&commands, PHASE_TEARDOWN)
 }
 
 pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
     platform_split_route_teardown_commands(tun_name)
 }
 
+/// Returns true if route command failures during this phase are *expected*
+/// idempotent-cleanup behavior and should be logged at debug, not warn.
+///
+/// Recovery is best-effort: every clean startup tries to delete the four
+/// fixed split routes, and on a healthy system all four of those calls fail
+/// because nothing leaked. Treating those failures as warnings would drown
+/// every dev/prod startup in red. Adding a new `PHASE_RECOVER_*` constant
+/// requires updating this matcher.
+fn is_recovery_phase(phase: &str) -> bool {
+    phase == PHASE_RECOVER_SPLIT || phase == PHASE_RECOVER_BYPASS
+}
+
 fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
+    let recovery = is_recovery_phase(phase);
     for cmd in commands {
         debug_assert!(!cmd.is_empty(), "route command must not be empty");
         info!(phase, cmd = cmd.join(" "), "running route command");
         let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(phase, cmd = cmd.join(" "), stderr = %stderr, "route command failed (may be expected during teardown)");
+            if recovery {
+                debug!(phase, cmd = cmd.join(" "), stderr = %stderr,
+                       "recovery command failed (expected if no leaked routes)");
+            } else {
+                warn!(phase, cmd = cmd.join(" "), stderr = %stderr,
+                      "route command failed (may be expected during teardown)");
+            }
         }
     }
     Ok(())
@@ -96,7 +124,7 @@ where
 
     // 1. Split routes (IPv4 + IPv6 halves). Always attempted.
     let split_cmds = build_split_route_teardown_commands(TUN_DEVICE_NAME);
-    if let Err(e) = runner(&split_cmds, "recover-split") {
+    if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
         warn!(error = %e, "split-route teardown failed during recovery");
     }
 
@@ -109,7 +137,7 @@ where
             "recovering bypass route from crashed run"
         );
         let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
-        if let Err(e) = runner(&bypass_cmds, "recover-bypass") {
+        if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
             warn!(error = %e, "bypass-route teardown failed during recovery");
         }
     } else {
