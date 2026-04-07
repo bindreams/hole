@@ -275,40 +275,30 @@ def main() -> None:
     ensure_node_modules(npm, target_user)
     cargo_build(cargo, target_user)
 
-    # Locate built binary
-    bin_name = "hole.exe" if sys.platform == "win32" else "hole"
-    built_bin = project_root / "target" / "debug" / bin_name
-    if not built_bin.exists():
-        print(f"{YELLOW}Binary not found at {built_bin}{RESET}")
-        sys.exit(1)
-
-    # Stage the bridge binary and its v2ray-plugin sidecar in a per-pid subdir.
-    # Mirrors the installed MSI layout (Program Files\hole\bin\) so
-    # resolve_plugin_path_inner (crates/bridge/src/proxy.rs) finds the plugin
-    # as a sibling. Per-pid isolation prevents collisions between concurrent
+    # Stage the runnable BINDIR (hole.exe + v2ray-plugin.exe + wintun.dll on
+    # Windows) in a per-pid subdir under TEMP. The contents and naming are
+    # owned by `cargo xtask stage` — see xtask/src/bindir.rs for the canonical
+    # file list. Per-pid isolation prevents collisions between concurrent
     # dev.py runs and avoids the running bridge holding a file lock that
     # would block subsequent `cargo build`. Register the rmtree cleanup
     # *before* mkdir so a partially-created dir still gets removed on exit.
     dev_bin_dir = Path(tempfile.gettempdir()) / f"hole-dev-{os.getpid()}"
     atexit.register(lambda: shutil.rmtree(dev_bin_dir, ignore_errors=True))
-    dev_bin_dir.mkdir(parents=True, exist_ok=True)
 
+    stage_result = subprocess.run(
+        [cargo, "xtask", "stage", "--profile", "debug", "--out-dir",
+         str(dev_bin_dir)],
+        cwd=project_root,
+        env=drop_env({**os.environ}, target_user),
+        **drop_kwargs(target_user),
+    )
+    if stage_result.returncode != 0:
+        print(f"{YELLOW}cargo xtask stage failed (exit {stage_result.returncode}){RESET}")
+        sys.exit(stage_result.returncode)
+
+    bin_name = "hole.exe" if sys.platform == "win32" else "hole"
     bridge_bin = dev_bin_dir / bin_name
-    shutil.copy2(built_bin, bridge_bin)
-
-    # v2ray-plugin sidecar. Mirrors the discovery glob in stage_files() in
-    # msi-installer/src/msi_installer/__init__.py — keep these in sync.
-    plugin_cache = project_root / ".cache" / "gui" / "v2ray-plugin"
-    plugin_glob = "v2ray-plugin-*.exe" if sys.platform == "win32" else "v2ray-plugin-*"
-    plugin_candidates = list(plugin_cache.glob(plugin_glob))
-    if not plugin_candidates:
-        print(f"{YELLOW}v2ray-plugin binary not found in {plugin_cache} — did cargo build run?{RESET}")
-        sys.exit(1)
-    if len(plugin_candidates) > 1:
-        print(f"{YELLOW}multiple v2ray-plugin binaries in {plugin_cache}: {plugin_candidates}{RESET}")
-        sys.exit(1)
-    plugin_dst_name = "v2ray-plugin.exe" if sys.platform == "win32" else "v2ray-plugin"
-    shutil.copy2(plugin_candidates[0], dev_bin_dir / plugin_dst_name)
+    built_bin = project_root / "target" / "debug" / bin_name
 
     socket_path = Path(tempfile.gettempdir()) / "hole-dev.sock"
     bridge_state_dir = Path(tempfile.gettempdir()) / "hole-dev" / "state"

@@ -1,0 +1,26 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "xtask"
+path = "src/lib.rs"
+harness = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+
+[dev-dependencies]
+skuld = { git = "https://github.com/bindreams/skuld" }
+tempfile = "3"

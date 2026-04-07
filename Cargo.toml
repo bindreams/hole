@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/gui"]
+members = ["crates/common", "crates/bridge", "crates/gui", "xtask"]
 resolver = "2"
 
 [workspace.lints.clippy]
