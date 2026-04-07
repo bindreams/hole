@@ -18,18 +18,28 @@ use tokio::task::JoinHandle;
 
 struct MockBackend {
     fail_start: AtomicBool,
+    fail_gateway: AtomicBool,
 }
 
 impl MockBackend {
     fn new() -> Self {
         Self {
             fail_start: AtomicBool::new(false),
+            fail_gateway: AtomicBool::new(false),
         }
     }
 
     fn failing() -> Self {
         Self {
             fail_start: AtomicBool::new(true),
+            fail_gateway: AtomicBool::new(false),
+        }
+    }
+
+    fn gateway_failing() -> Self {
+        Self {
+            fail_start: AtomicBool::new(false),
+            fail_gateway: AtomicBool::new(true),
         }
     }
 }
@@ -57,6 +67,9 @@ impl ProxyBackend for MockBackend {
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        if self.fail_gateway.load(Ordering::SeqCst) {
+            return Err(ProxyError::Gateway("mock gateway failure".into()));
+        }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             interface_name: "MockEthernet".into(),
@@ -82,6 +95,11 @@ fn mock_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
 fn failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     Arc::new(Mutex::new(ProxyManager::new(MockBackend::failing(), state_dir)))
+}
+
+fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(Mutex::new(ProxyManager::new(MockBackend::gateway_failing(), state_dir)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -609,7 +627,33 @@ fn diagnostics_bridge_running() {
 }
 
 #[skuld::test]
-fn diagnostics_bridge_stopped() {
+fn diagnostics_network_error_when_gateway_unavailable() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-net-err");
+        let server = IpcServer::bind(&path, gateway_failing_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let diag = get_diagnostics(&mut client).await;
+
+        // Bridge IPC is up; the host has no detectable default gateway.
+        assert_eq!(diag.app, "ok");
+        assert_eq!(diag.bridge, "ok");
+        assert_eq!(diag.network, "error");
+        // vpn_server is "unknown" because the proxy is stopped (this mock
+        // never started one); the GUI would override it with a probe.
+        assert_eq!(diag.vpn_server, "unknown");
+        assert_eq!(diag.internet, "unknown");
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn diagnostics_proxy_stopped() {
     rt().block_on(async {
         let path = test_socket_path("diag-stopped");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
@@ -620,10 +664,14 @@ fn diagnostics_bridge_stopped() {
         let mut client = TestClient::connect(&path).await;
         let diag = get_diagnostics(&mut client).await;
 
+        // Bridge IPC is up (we are handling this request); only the proxy is
+        // stopped. App and bridge are always "ok" inside the handler. Network
+        // is computed from the host's default gateway and the MockBackend
+        // returns Ok. vpn_server is "unknown" because the bridge has no
+        // server config to probe — the GUI overrides it with a TCP probe.
         assert_eq!(diag.app, "ok");
-        assert_eq!(diag.bridge, "error");
-        // Downstream nodes cascade to "unknown"
-        assert_eq!(diag.network, "unknown");
+        assert_eq!(diag.bridge, "ok");
+        assert_eq!(diag.network, "ok");
         assert_eq!(diag.vpn_server, "unknown");
         assert_eq!(diag.internet, "unknown");
 

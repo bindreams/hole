@@ -226,33 +226,31 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
     let mut pm = state.proxy.lock().await;
     pm.check_health();
 
-    // App is always ok — we are responding to the request.
+    // Bridge is always "ok" inside this handler — being able to respond to
+    // this request proves the bridge IPC server is alive. App is also "ok"
+    // by convention; the bridge cannot directly observe the GUI process,
+    // but if it weren't running we wouldn't have received this request
+    // either. The GUI's fallback path (map_diagnostics_response) is the
+    // only place either can be non-ok, and it sets them when the IPC call
+    // itself fails.
     let app = "ok".to_string();
+    let bridge = "ok".to_string();
 
-    // Bridge is ok if the proxy is running.
-    let bridge = if pm.state() == ProxyState::Running {
-        "ok".to_string()
-    } else {
-        "error".to_string()
+    // Network: does the host have a default gateway? Best-effort local
+    // check; does not actually probe the gateway.
+    let network = match pm.backend().default_gateway() {
+        Ok(_) => "ok".to_string(),
+        Err(_) => "error".to_string(),
     };
 
-    // Network: cascade from bridge. If bridge is down, network is unknown.
-    // If bridge is up, check default gateway reachability.
-    let network = if bridge != "ok" {
-        "unknown".to_string()
-    } else {
-        match pm.backend().default_gateway() {
-            Ok(_) => "ok".to_string(),
-            Err(_) => "error".to_string(),
-        }
-    };
-
-    // VPN server: cascade from network. If network is not ok, vpn_server is unknown.
-    // If network is ok and proxy is running, vpn_server is ok.
-    let vpn_server = if network != "ok" {
-        "unknown".to_string()
-    } else {
+    // VPN server: when the proxy is running we know the server is reachable
+    // (we are using it). When the proxy is stopped, the bridge has no
+    // configured server to probe — return "unknown" and let the GUI override
+    // with a TCP-connect probe against the user's currently selected server.
+    let vpn_server = if pm.state() == ProxyState::Running {
         "ok".to_string()
+    } else {
+        "unknown".to_string()
     };
 
     // Internet: always "unknown" in this initial implementation — a real connectivity
