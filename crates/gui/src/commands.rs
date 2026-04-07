@@ -197,6 +197,81 @@ fn map_diagnostics_response(result: Result<BridgeResponse, ClientError>) -> serd
     }
 }
 
+// VPN server reachability probe =======================================================================================
+
+/// Probe a configured server by attempting a TCP connect with a short
+/// timeout. Returns `true` if the connection succeeds, `false` on any
+/// failure (refused, timeout, DNS resolution failure, empty hostname).
+///
+/// We use a plain TCP connect rather than an HTTP HEAD because shadowsocks
+/// servers do not necessarily speak HTTP — only v2ray-plugin in
+/// WebSocket-over-HTTP mode would respond. TCP connect is the most general
+/// reachability test and works for both plain shadowsocks and HTTP-fronted
+/// configurations. tokio's `TcpStream::connect((&str, u16))` handles both
+/// IPv4 and IPv6 (including bare IPv6 literals) via `ToSocketAddrs`.
+async fn probe_vpn_server_reachable(host: String, port: u16) -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    if host.is_empty() {
+        debug!("vpn server probe skipped: empty hostname");
+        return false;
+    }
+    debug!(host = %host, port, "probing vpn server reachability");
+
+    let result = timeout(Duration::from_secs(2), TcpStream::connect((host.as_str(), port))).await;
+    let reachable = matches!(result, Ok(Ok(_)));
+    debug!(host = %host, port, reachable, "vpn server probe complete");
+    reachable
+}
+
+/// Override `vpn_server` in `diag` based on a probe outcome.
+///
+/// Contract: this function only modifies `vpn_server` when the bridge said
+/// "unknown". The bridge returns "unknown" precisely when the proxy is
+/// Stopped — the bridge has no server config to probe and defers to the
+/// GUI. When the bridge has authoritative knowledge ("ok" or "error"), the
+/// caller's probe result is ignored.
+fn merge_vpn_probe(mut diag: serde_json::Value, probe: bool) -> serde_json::Value {
+    if diag.get("vpn_server").and_then(|v| v.as_str()) == Some("unknown") {
+        diag["vpn_server"] = serde_json::json!(if probe { "ok" } else { "error" });
+    }
+    diag
+}
+
+/// Combine a bridge diagnostics result with a local VPN-server probe.
+/// Thin wrapper around [`diagnose_with`] that injects the real probe.
+async fn diagnose(bridge_result: Result<BridgeResponse, ClientError>, config: &AppConfig) -> serde_json::Value {
+    diagnose_with(bridge_result, config, |host, port| {
+        Box::pin(probe_vpn_server_reachable(host, port))
+    })
+    .await
+}
+
+/// Test seam for [`diagnose`]: accepts an injected async probe function so
+/// unit tests can exercise the orchestration without depending on the
+/// runner's network stack. The GHA windows-latest image drops inbound SYNs
+/// to ephemeral loopback ports, which makes any real-socket "reachable"
+/// fixture unusable there — injection is the only platform-agnostic way to
+/// test the "probe says reachable → vpn_server=ok" path.
+async fn diagnose_with<F>(
+    bridge_result: Result<BridgeResponse, ClientError>,
+    config: &AppConfig,
+    probe: F,
+) -> serde_json::Value
+where
+    F: FnOnce(String, u16) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+{
+    let mut diag = map_diagnostics_response(bridge_result);
+    if diag.get("vpn_server").and_then(|v| v.as_str()) == Some("unknown") {
+        if let Some(pc) = build_proxy_config(config) {
+            let reachable = probe(pc.server.server, pc.server.server_port).await;
+            diag = merge_vpn_probe(diag, reachable);
+        }
+    }
+    diag
+}
+
 /// Try to extract a public IP response from the bridge result.
 /// Returns `Some(json)` on success, `None` if fallback is needed.
 fn map_public_ip_bridge_response(result: Result<BridgeResponse, ClientError>) -> Option<serde_json::Value> {
@@ -217,9 +292,11 @@ pub async fn get_metrics(state: State<'_, AppState>) -> Result<serde_json::Value
 
 #[tauri::command]
 pub async fn get_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    Ok(map_diagnostics_response(
-        state.bridge_send(BridgeRequest::Diagnostics).await,
-    ))
+    let bridge_result = state.bridge_send(BridgeRequest::Diagnostics).await;
+    // Clone the config out from under the std::sync::Mutex BEFORE the await
+    // so the guard does not cross an `.await` point.
+    let config = state.config.lock().unwrap().clone();
+    Ok(diagnose(bridge_result, &config).await)
 }
 
 #[tauri::command]
