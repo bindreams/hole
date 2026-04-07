@@ -12,7 +12,12 @@ import { initSections } from "./sections";
 import { importFromDialog, initServers, renderServers } from "./servers";
 import { initSettings, renderSettings } from "./settings";
 import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
-import type { Config, DiagnosticsData, Metrics, ProxyStatus } from "./types";
+import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./types";
+
+/// Maximum number of concurrent server tests during bulk auto-test (e.g.
+/// after a JSON import). 50 concurrent v2ray-plugin processes is non-trivial
+/// RAM and looks like a port scan from one IP to commercial SS providers.
+const TEST_CONCURRENCY = 5;
 
 // State ===============================================================================================================
 
@@ -32,6 +37,10 @@ export async function loadConfig() {
     renderServers();
     renderFilters();
     renderSettings();
+    // Diagnostics dots depend on the selected server's persisted
+    // validation state, which lives on `config`. Recompute on every
+    // config reload.
+    updateDiagnostics();
   } catch (err) {
     console.error("loadConfig failed:", err);
   }
@@ -65,9 +74,24 @@ async function pollProxyStatus() {
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
-    if (result.changed) {
-      // Connection state changed — refresh IP.
-      updatePublicIp();
+    if (!result.changed) return;
+
+    // Connection state changed — refresh IP.
+    updatePublicIp();
+
+    // Stopped → Running transition: mark the selected server as
+    // "validated by a successful proxy start" so the user gets a green
+    // dot without needing to run an explicit test. Sequence the persist
+    // BEFORE the reload so loadConfig() sees the new validation state
+    // and a subsequent disconnect cannot sneak in between persist and
+    // reload.
+    if (result.connected && config?.selected_server) {
+      try {
+        await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
+        await loadConfig();
+      } catch (err) {
+        console.error("mark_validated_by_proxy_start failed:", err);
+      }
     }
   } catch (err) {
     console.error("get_proxy_status failed:", err);
@@ -94,14 +118,42 @@ async function pollDiagnostics() {
   }
 }
 
+// Bounded-concurrency auto-test =======================================================================================
+
+/// Run `test_server` for each ID, capping in-flight calls at `maxInFlight`.
+/// Each completion is fire-and-forget from the caller's perspective; the
+/// `validation-changed` listener picks up the result and triggers a
+/// rerender. Used by both single-server-add and bulk-import flows.
+export async function runTestsBounded(ids: string[], maxInFlight: number) {
+  let i = 0;
+  const workers = Array.from({ length: Math.min(maxInFlight, ids.length) }, async () => {
+    while (i < ids.length) {
+      const myIdx = i++;
+      const id = ids[myIdx];
+      try {
+        await invoke("test_server", { entryId: id });
+      } catch (err) {
+        console.error(`auto-test failed for ${id}:`, err);
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+
 // Event listeners =====================================================================================================
 
 /** Handle file import (from menu or drag-and-drop). */
 async function importFile(path: string) {
   try {
-    await invoke("import_servers_from_file", { path });
+    const newServers = await invoke<Server[]>("import_servers_from_file", { path });
     // Reload config so the UI picks up the new servers.
     await loadConfig();
+    // Auto-test the newly imported servers in parallel (bounded). Fire
+    // and forget — the validation-changed listener handles repaint.
+    runTestsBounded(
+      newServers.map((s) => s.id),
+      TEST_CONCURRENCY,
+    );
   } catch (err) {
     console.error("import failed:", err);
   }
@@ -118,6 +170,12 @@ function setupEventListeners() {
       // Import the first dropped file.
       await importFile(paths[0]);
     }
+  });
+
+  // Persisted validation changed (from `test_server` or
+  // `mark_validated_by_proxy_start`). Pull fresh config and rerender.
+  listen<string>("validation-changed", async () => {
+    await loadConfig();
   });
 }
 

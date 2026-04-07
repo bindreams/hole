@@ -1,5 +1,31 @@
 // Shared type definitions for the Hole Dashboard UI.
 
+/// Sentinel value of `latency_ms` meaning "validated by a successful proxy
+/// start, not by an explicit test run". Mirrors the Rust constant
+/// `LATENCY_VALIDATED_ON_CONNECT` in `crates/common/src/protocol.rs`.
+export const LATENCY_VALIDATED_ON_CONNECT = 0;
+
+/// Result of a one-shot test run against a `Server`. Mirrors the Rust
+/// `ServerTestOutcome` enum in `crates/common/src/protocol.rs`.
+export type ServerTestOutcome =
+  | { kind: "reachable"; latency_ms: number }
+  | { kind: "dns_failed" }
+  | { kind: "tcp_refused" }
+  | { kind: "tcp_timeout" }
+  | { kind: "plugin_start_failed"; detail: string }
+  | { kind: "tunnel_handshake_failed" }
+  | { kind: "server_cannot_reach_internet" }
+  | { kind: "sentinel_mismatch"; detail: string }
+  | { kind: "internal_error"; detail: string };
+
+/// Persisted result of the most recent server test. `tested_at` is an
+/// RFC3339 string serialized from `time::OffsetDateTime` on the Rust side
+/// and parses cleanly into JS `Date`.
+export interface ValidationState {
+  tested_at: string;
+  outcome: ServerTestOutcome;
+}
+
 export interface Server {
   id: string;
   name: string;
@@ -9,6 +35,7 @@ export interface Server {
   plugin_opts?: string;
   method: string;
   password: string;
+  validation?: ValidationState | null;
 }
 
 export interface FilterRule {
