@@ -74,24 +74,14 @@ async function pollProxyStatus() {
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
-    if (!result.changed) return;
-
-    // Connection state changed — refresh IP.
-    updatePublicIp();
-
-    // Stopped → Running transition: mark the selected server as
-    // "validated by a successful proxy start" so the user gets a green
-    // dot without needing to run an explicit test. Sequence the persist
-    // BEFORE the reload so loadConfig() sees the new validation state
-    // and a subsequent disconnect cannot sneak in between persist and
-    // reload.
-    if (result.connected && config?.selected_server) {
-      try {
-        await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
-        await loadConfig();
-      } catch (err) {
-        console.error("mark_validated_by_proxy_start failed:", err);
-      }
+    // The poll only reconciles state when the bridge disagrees with the
+    // UI (e.g. an external disconnect). Click-driven transitions fire
+    // `mark_validated_by_proxy_start` themselves from the click handler
+    // — the poll never observes the `connecting` intermediate state, so
+    // it cannot distinguish "user just connected" from "bridge was
+    // already connected when the GUI started".
+    if (result.changed) {
+      updatePublicIp();
     }
   } catch (err) {
     console.error("get_proxy_status failed:", err);

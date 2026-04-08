@@ -27,6 +27,13 @@ pub enum ProxyError {
     RouteSetup(String),
     #[error("proxy already running")]
     AlreadyRunning,
+    /// The start was cancelled via `CancellationToken` before it could
+    /// complete. The error message is the stable `CANCELLED_MESSAGE`
+    /// constant from `hole_common::protocol` so bridge and client can
+    /// round-trip it exactly. Not set as `last_error` — the user asked
+    /// for the cancel, so it is not a diagnostic failure.
+    #[error("cancelled")]
+    Cancelled,
     #[error("wintun.dll not found (tried: {})", .tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
