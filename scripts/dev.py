@@ -128,6 +128,77 @@ def node_modules_is_stale(project_root: Path) -> bool:
         return True
 
 
+def _write_install_stamp(
+    project_root: Path,
+    target_user: tuple[int, int, str, str] | None,
+) -> None:
+    """Write `node_modules/.hole-install-stamp` with the current SHA-256 of
+    `package-lock.json` so subsequent runs can detect drift.
+
+    Must be called AFTER a successful `npm install` so the hash matches the
+    lockfile npm has actually written (npm may rewrite the lock to resolve
+    drift between `package.json` and the existing lock).
+
+    On macOS-under-sudo this chowns the stamp — and `node_modules/` itself
+    if we had to create it — to `target_user`, so the tree is uniformly
+    owned by the invoking user (matching the install output). Without
+    this, a future user-mode `npm install` may fail to overwrite
+    root-owned entries.
+
+    Fails loudly: if the stamp write itself fails (permissions, read-only
+    filesystem, etc.), `sys.exit(1)`. The invariant of this module is
+    'stamp present and current after successful install'; a silent
+    swallow would mean every future run reinstalls needlessly and hides
+    the underlying problem. A chown failure is non-fatal — the stamp is
+    still correct, just not uniformly owned."""
+    stamp_hash = _hash_lockfile(project_root)
+    if stamp_hash is None:
+        print(
+            f"{YELLOW}Warning: could not hash package-lock.json; "
+            f"install stamp not written{RESET}",
+            file=sys.stderr,
+        )
+        return
+
+    stamp_path = project_root / "node_modules" / INSTALL_STAMP_NAME
+    # npm omits `node_modules/` on zero-dep projects ("up to date, audited
+    # 1 package"), so we can't assume the directory exists even after a
+    # successful install. Track whether we're creating it so the chown
+    # below can fix up ownership on the parent too.
+    created_dir = not stamp_path.parent.exists()
+    try:
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(stamp_hash)
+    except OSError as e:
+        print(
+            f"{YELLOW}Failed to write install stamp at {stamp_path}: {e}{RESET}",
+            file=sys.stderr,
+        )
+        print(
+            f"{YELLOW}Without the stamp, dev.py cannot track package-lock "
+            f"drift and will reinstall on every run. Investigate permissions "
+            f"on `node_modules/`.{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if target_user is not None:
+        # `target_user is not None` implies POSIX-under-sudo (see
+        # `_lib.sudo_target_user` — it returns None on Windows
+        # unconditionally), so `os.chown` is guaranteed available here.
+        uid, gid = target_user[0], target_user[1]
+        try:
+            if created_dir:
+                os.chown(stamp_path.parent, uid, gid)
+            os.chown(stamp_path, uid, gid)
+        except OSError as e:
+            print(
+                f"{YELLOW}Warning: failed to chown install stamp to "
+                f"target user: {e}{RESET}",
+                file=sys.stderr,
+            )
+
+
 def ensure_node_modules(
     npm: str,
     target_user: tuple[int, int, str, str] | None,
@@ -139,9 +210,10 @@ def ensure_node_modules(
     Drift detection lives in `node_modules_is_stale`. Without it, any PR
     that adds a JS dependency leaves `dev.py` running against a stale
     tree and Vite fails to resolve the new import."""
+    assert project_root.is_absolute(), project_root
     if not node_modules_is_stale(project_root):
         return
-    print(f"{BOLD}Installing npm dependencies (lockfile changed)...{RESET}")
+    print(f"{BOLD}Installing npm dependencies (node_modules out of sync)...{RESET}")
     # Run as the invoking user so `node_modules/` is not owned by root.
     result = subprocess.run(
         [npm, "install"],
@@ -153,31 +225,7 @@ def ensure_node_modules(
     )
     if result.returncode != 0:
         sys.exit(result.returncode)
-    # Write the freshness stamp AFTER a successful install so it matches
-    # the lockfile npm has actually written (npm may rewrite the lockfile
-    # to resolve drift between package.json and the existing lock). On
-    # macOS-under-sudo, chown the stamp to the target user so it lives in
-    # a uniformly owned `node_modules/` — without this, the directory and
-    # its packages are user-owned (because `drop_kwargs` ran the install)
-    # but the stamp would be root-owned, and a future user-mode
-    # `npm install` may fail to overwrite it. Any write/chown OSError is
-    # logged and swallowed: the next dev.py run will simply reinstall,
-    # never silently skip.
-    stamp_hash = _hash_lockfile(project_root)
-    if stamp_hash is None:
-        return
-    stamp_path = project_root / "node_modules" / INSTALL_STAMP_NAME
-    try:
-        # npm omits `node_modules/` on projects with zero dependencies
-        # ("up to date, audited 1 package"). Create the directory so the
-        # stamp has somewhere to live — self-consistent with `node_modules/`
-        # existing after a successful install.
-        stamp_path.parent.mkdir(parents=True, exist_ok=True)
-        stamp_path.write_text(stamp_hash)
-        if target_user is not None and hasattr(os, "chown"):
-            os.chown(stamp_path, target_user[0], target_user[1])
-    except OSError as e:
-        print(f"{YELLOW}Warning: failed to write install stamp: {e}{RESET}")
+    _write_install_stamp(project_root, target_user)
 
 
 def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:

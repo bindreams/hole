@@ -77,6 +77,8 @@ sudo uv run scripts/dev.py
 
 This builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
 
+`dev.py` re-runs `npm install` automatically whenever `package-lock.json` has changed since the last successful install (tracked via a SHA-256 stamp at `node_modules/.hole-install-stamp`), so you do not need to manually `npm install` after pulling a branch that adds a JS dependency.
+
 On macOS, `dev.py` detects `SUDO_USER` and drops privileges for the GUI and Vite subprocesses (via POSIX `setuid`/`setgid` + `extra_groups`) so they read your real `~/Library` config while the bridge inherits root. On Windows, UAC elevation is token-based, so all subprocesses naturally share the same user identity — no drop is needed.
 
 Before starting the bridge, `dev.py` invokes `hole bridge grant-access` to create the `hole` group, add your user to it, and (on Windows) write the installer-user-SID file. The bridge then uses the production `IpcServer::bind` + `apply_socket_permissions` path — the same DACL/group/SDDL code that runs in the installed service. Dev exercises this path on every run.
