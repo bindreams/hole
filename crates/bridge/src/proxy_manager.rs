@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 // StartedState ========================================================================================================
@@ -131,21 +132,59 @@ impl<B: ProxyBackend> ProxyManager<B> {
         self.last_error.as_deref()
     }
 
+    /// Non-cancellable convenience wrapper around `start_cancellable`.
+    /// Equivalent to passing a fresh, never-signaled `CancellationToken`.
+    /// Used by existing callers (tests, `reload`) that don't need cancel
+    /// semantics.
     pub async fn start(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
+        self.start_cancellable(config, CancellationToken::new()).await
+    }
+
+    /// Start the proxy with a caller-supplied `CancellationToken`. Signaling
+    /// the token at any point during `start_inner` returns
+    /// `Err(ProxyError::Cancelled)` and rolls back partial state (via the
+    /// RAII guards inside `start_inner`) without mutating `self`.
+    ///
+    /// Three race scenarios are handled correctly:
+    ///
+    /// 1. **Cancel before any `start_inner` await.** `tokio::select!` with
+    ///    `biased;` polls the cancel branch first, so an already-cancelled
+    ///    token returns `Cancelled` without invoking `start_inner` at all.
+    /// 2. **Cancel mid-flight.** `select!` drops the `start_inner` future,
+    ///    which runs every live RAII guard's `Drop` in reverse-declaration
+    ///    order — the ss task is aborted, the route-state file is cleared,
+    ///    and (if `setup_routes` had already committed) routes are torn
+    ///    down by `RouteGuard::drop`.
+    /// 3. **Cancel right after `start_inner` returns `Ok(started)`.** Commit
+    ///    to `self` happens in this outer function AFTER `select!` has
+    ///    already yielded `Ok(started)`, so the late cancel cannot race the
+    ///    commit. The started proxy is left running; the client sees
+    ///    `Ok(())`. A caller that wanted to cancel that late can follow up
+    ///    with an explicit stop.
+    pub async fn start_cancellable(
+        &mut self,
+        config: &ProxyConfig,
+        cancel: CancellationToken,
+    ) -> Result<(), ProxyError> {
         if self.state == ProxyState::Running {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // `start_inner` is an associated function — it does NOT touch
-        // `self`. All partial state lives in local variables wrapped in
-        // RAII guards, and only on `Ok` is the resulting `StartedState`
-        // committed into `self` here in the outer function. This makes
-        // the whole call drop-safe: if the future returned by
-        // `start_inner` is dropped at any `.await` point, every live
-        // guard runs its `Drop` and `self` is left in its pre-start
-        // state. See Phase 4 for where this property is exploited by
-        // `tokio::select!`-based cancellation.
-        match Self::start_inner(&self.backend, config, &self.state_dir).await {
+        // Run start_inner in a select! against the cancel token. Note that
+        // start_inner is a free associated function — it does NOT touch
+        // `self`, so dropping the future leaves `self` untouched. All
+        // partial state is owned by RAII guards inside start_inner and
+        // cleans up on drop.
+        let result: Result<StartedState, ProxyError> = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ProxyError::Cancelled),
+            r = Self::start_inner(&self.backend, config, &self.state_dir) => r,
+        };
+
+        // Commit (or record the error) in the outer function, so the only
+        // path that mutates `self.state = Running` is strictly after the
+        // select! has completed successfully.
+        match result {
             Ok(started) => {
                 let server_ip = started.server_ip;
                 self.task_handle = Some(started.task_handle);
@@ -156,6 +195,11 @@ impl<B: ProxyBackend> ProxyManager<B> {
                 self.state = ProxyState::Running;
                 info!(server_ip = %server_ip, "proxy started");
                 Ok(())
+            }
+            Err(ProxyError::Cancelled) => {
+                // Do NOT set last_error on cancel — the user asked for it.
+                info!("proxy start cancelled");
+                Err(ProxyError::Cancelled)
             }
             Err(e) => {
                 self.last_error = Some(e.to_string());

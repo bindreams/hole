@@ -7,14 +7,18 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 // Mock backend ========================================================================================================
 
 struct MockBackend {
     start_called: Arc<AtomicU32>,
+    teardown_called: Arc<AtomicU32>,
     fail_start: AtomicBool,
     fail_routes: AtomicBool,
     fail_gateway: AtomicBool,
+    /// If Some, start_ss awaits this gate before returning.
+    start_ss_gate: Option<Arc<tokio::sync::Notify>>,
     gateway: IpAddr,
 }
 
@@ -22,9 +26,11 @@ impl MockBackend {
     fn new() -> Self {
         Self {
             start_called: Arc::new(AtomicU32::new(0)),
+            teardown_called: Arc::new(AtomicU32::new(0)),
             fail_start: AtomicBool::new(false),
             fail_routes: AtomicBool::new(false),
             fail_gateway: AtomicBool::new(false),
+            start_ss_gate: None,
             gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
         }
     }
@@ -46,6 +52,12 @@ impl MockBackend {
         m.fail_gateway = AtomicBool::new(true);
         m
     }
+
+    fn with_start_ss_gate(gate: Arc<tokio::sync::Notify>) -> Self {
+        let mut m = Self::new();
+        m.start_ss_gate = Some(gate);
+        m
+    }
 }
 
 impl ProxyBackend for MockBackend {
@@ -54,6 +66,9 @@ impl ProxyBackend for MockBackend {
         _config: shadowsocks_service::config::Config,
     ) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
         self.start_called.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.start_ss_gate.as_ref() {
+            gate.notified().await;
+        }
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(ProxyError::Runtime(std::io::Error::other("mock start failure")));
         }
@@ -78,6 +93,7 @@ impl ProxyBackend for MockBackend {
     }
 
     fn teardown_routes(&self, _tun_name: &str, _server_ip: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
+        self.teardown_called.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -389,5 +405,164 @@ fn route_failure_clears_stale_state_file() {
             !state_path.exists(),
             "state file must be cleared on setup_routes failure"
         );
+    });
+}
+
+// Cancellation ========================================================================================================
+
+#[skuld::test]
+fn start_cancellable_succeeds_when_not_cancelled() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        let token = CancellationToken::new();
+        pm.start_cancellable(&test_config(), token).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn start_cancellable_cancelled_during_ss_start_rolls_back() {
+    rt().block_on(async {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend = MockBackend::with_start_ss_gate(gate.clone());
+        let teardown_count = Arc::clone(&backend.teardown_called);
+
+        let (mut pm, dir) = new_manager(backend);
+        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let token = CancellationToken::new();
+
+        // Fire off the cancel after a short delay so the start is already
+        // parked in `start_ss`.
+        let cancel_clone = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(
+            pm.last_error().is_none(),
+            "ProxyError::Cancelled must NOT be recorded as last_error"
+        );
+        assert!(
+            !state_path.exists(),
+            "state file must be cleared on cancel during start_ss"
+        );
+        // setup_routes was never called, so no teardown should have run.
+        assert_eq!(teardown_count.load(Ordering::SeqCst), 0);
+
+        // The gate is still held — release it so the spawned ss task can drop cleanly.
+        gate.notify_one();
+    });
+}
+
+#[skuld::test]
+fn start_cancellable_cancel_before_start_returns_immediately() {
+    rt().block_on(async {
+        let (mut pm, dir) = new_manager(MockBackend::new());
+        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let token = CancellationToken::new();
+        token.cancel(); // already cancelled before start is even called
+
+        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        assert!(matches!(err, ProxyError::Cancelled));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(pm.last_error().is_none());
+        assert!(!state_path.exists());
+    });
+}
+
+#[skuld::test]
+fn start_cancellable_cancel_after_success_does_not_corrupt_state() {
+    // Race scenario: start_inner has committed successfully and returned
+    // Ok(StartedState) before the cancel token is signaled. The commit
+    // happens in the outer `start_cancellable` AFTER `select!` resolves,
+    // so a late cancel that lost the race must not leave the manager in
+    // an inconsistent (Running + last_error=cancelled) state.
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        let token = CancellationToken::new();
+        let result = pm.start_cancellable(&test_config(), token.clone()).await;
+        // Fire the cancel after start has returned. This is a no-op for
+        // the just-started proxy but must not panic or corrupt state.
+        token.cancel();
+
+        // Outcome must be Ok + Running (start completed before cancel landed)
+        // OR Err(Cancelled) + Stopped (cancel raced and won). Never a mix.
+        match result {
+            Ok(()) => {
+                assert_eq!(pm.state(), ProxyState::Running);
+                assert!(pm.last_error().is_none());
+                pm.stop().await.unwrap();
+            }
+            Err(ProxyError::Cancelled) => {
+                assert_eq!(pm.state(), ProxyState::Stopped);
+                assert!(pm.last_error().is_none());
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn start_cancellable_dropped_future_runs_guards() {
+    // Drop-safety: even without CancellationToken, dropping the start
+    // future at an await point must clean up. Uses `tokio::time::timeout`
+    // with a very short deadline to force the drop while `start_ss` is
+    // parked on the gate.
+    rt().block_on(async {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend = MockBackend::with_start_ss_gate(gate.clone());
+        let teardown_count = Arc::clone(&backend.teardown_called);
+
+        let (mut pm, dir) = new_manager(backend);
+        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let token = CancellationToken::new();
+
+        // Short deadline — the future will be dropped before start_ss
+        // ever returns (the gate is never released).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            pm.start_cancellable(&test_config(), token),
+        )
+        .await;
+        assert!(result.is_err(), "expected elapsed timeout");
+
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(
+            !state_path.exists(),
+            "StateFileGuard::drop must clear the file on dropped future"
+        );
+        assert_eq!(
+            teardown_count.load(Ordering::SeqCst),
+            0,
+            "setup_routes never ran, so teardown should not have either"
+        );
+
+        gate.notify_one();
+    });
+}
+
+#[skuld::test]
+fn reload_creates_fresh_uncancellable_token() {
+    // reload() internally calls start_cancellable with a fresh token that
+    // is never signaled. Verifies the reload path still works after the
+    // cancellation refactor.
+    rt().block_on(async {
+        let backend = MockBackend::new();
+        let start_count = Arc::clone(&backend.start_called);
+
+        let (mut pm, _dir) = new_manager(backend);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+        pm.reload(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert_eq!(start_count.load(Ordering::SeqCst), 2);
+
+        pm.stop().await.unwrap();
     });
 }
