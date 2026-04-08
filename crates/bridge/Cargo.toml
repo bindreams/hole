@@ -54,4 +54,3 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
 shadowsocks-service = { version = "1", features = ["server"] }
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
