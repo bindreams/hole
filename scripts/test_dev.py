@@ -132,9 +132,11 @@ class WriteInstallStampTests(unittest.TestCase):
 
     def test_write_failure_exits_loudly(self) -> None:
         # Block the stamp write by making `node_modules` a plain file.
-        # `stamp_path.parent.mkdir(exist_ok=True)` sees an existing path,
-        # skips the mkdir, and the subsequent `write_text` raises
-        # NotADirectoryError (OSError) — which must trigger sys.exit(1).
+        # `Path.mkdir(exist_ok=True)` only suppresses FileExistsError if
+        # the existing path is a directory — when it's a regular file the
+        # error is re-raised (see pathlib source). The test asserts that
+        # any OSError in the try-block triggers sys.exit(1), regardless
+        # of whether it comes from mkdir or write_text.
         (self.tmp / "node_modules").write_bytes(b"not a directory")
         with self.assertRaises(SystemExit) as ctx:
             dev._write_install_stamp(self.tmp, None)
