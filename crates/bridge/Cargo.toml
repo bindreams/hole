@@ -12,7 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
-shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http"] }
+shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
@@ -54,3 +54,6 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
 shadowsocks-service = { version = "1", features = ["server"] }
+rcgen = "0.13"
+rand = "0.9"
+base64 = "0.22"

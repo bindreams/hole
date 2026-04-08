@@ -5,6 +5,8 @@
 //! returned [`JoinHandle`]s own the server loop and must be kept alive for
 //! the duration of the test that uses them.
 
+use crate::test_support::certs::TestCerts;
+use base64::Engine as _;
 use shadowsocks::config::{Mode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::plugin::PluginConfig;
@@ -16,6 +18,26 @@ use tokio::task::JoinHandle;
 pub(crate) const TEST_METHOD_STR: &str = "aes-256-gcm";
 pub(crate) const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;
 pub(crate) const TEST_PASSWORD: &str = "test-password-1234";
+
+/// Generate a fresh random "password" for the given cipher in the format the
+/// cipher expects.
+///
+/// - For AEAD-2022 ciphers (`2022-blake3-*`), the "password" is a base64-
+///   encoded random key of `cipher.key_len()` bytes. Passing an arbitrary
+///   string fails inside `ServerConfig::new`.
+/// - For all other ciphers (stream, AEAD v1), the password is just an
+///   arbitrary string and we hex-encode the random bytes for legibility.
+pub(crate) fn random_password_for(method: CipherKind) -> String {
+    use rand::RngCore;
+    let key_len = method.key_len();
+    let mut bytes = vec![0u8; key_len];
+    rand::rng().fill_bytes(&mut bytes);
+    if matches!(method, CipherKind::AEAD2022_BLAKE3_AES_256_GCM) {
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    } else {
+        hex::encode(&bytes)
+    }
+}
 
 /// Spin up a real shadowsocks server bound to `127.0.0.1:0` with the given
 /// cipher/password. Returns the bound TCP address and a handle to the
@@ -57,14 +79,54 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws(
     public_port: u16,
     plugin_path: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
+    spawn_ss_with_plugin(method, password, public_port, plugin_path, "server").await
+}
+
+/// Spin up a real shadowsocks server with v2ray-plugin (websocket + TLS) in
+/// front. Same shape as [`start_real_ss_server_with_plugin_ws`] but with TLS
+/// enabled and the cert+key from `certs` mounted on the server side.
+pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
+    method: CipherKind,
+    password: &str,
+    public_port: u16,
+    plugin_path: &str,
+    certs: &TestCerts,
+) -> (SocketAddr, JoinHandle<()>) {
+    let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
+    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
+}
+
+/// Spin up a real shadowsocks server with v2ray-plugin (QUIC transport) in
+/// front. QUIC auto-enables TLS inside v2ray-plugin
+/// ([main.go:142](../../../external/v2ray-plugin/main.go)), so the cert+key
+/// pair must still be supplied.
+pub(crate) async fn start_real_ss_server_with_plugin_quic(
+    method: CipherKind,
+    password: &str,
+    public_port: u16,
+    plugin_path: &str,
+    certs: &TestCerts,
+) -> (SocketAddr, JoinHandle<()>) {
+    let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
+    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
+}
+
+/// Inner helper used by every `_with_plugin_*` variant. Builds a server-side
+/// `ServerConfig`, attaches a `PluginConfig` with the given `plugin_opts`,
+/// and spawns the server loop.
+async fn spawn_ss_with_plugin(
+    method: CipherKind,
+    password: &str,
+    public_port: u16,
+    plugin_path: &str,
+    plugin_opts: &str,
+) -> (SocketAddr, JoinHandle<()>) {
     let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
     svr_cfg.set_mode(Mode::TcpOnly);
 
-    // SS_PLUGIN_OPTIONS="server" puts v2ray-plugin in server mode (defaults
-    // are websocket transport, no TLS, host=cloudfront.com, path=/).
     svr_cfg.set_plugin(PluginConfig {
         plugin: plugin_path.to_string(),
-        plugin_opts: Some("server".to_string()),
+        plugin_opts: Some(plugin_opts.to_string()),
         plugin_args: vec![],
         plugin_mode: Mode::TcpOnly,
     });
