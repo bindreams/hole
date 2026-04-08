@@ -634,18 +634,18 @@ async fn handle_check_for_updates(app: AppHandle) {
 }
 
 pub(crate) fn open_settings_window(app: &AppHandle) {
-    // Reuse existing window if it's already open. The dashboard's close button
-    // is intercepted to hide the window rather than destroy it, so the window
-    // may be present but hidden — call show() before set_focus().
-    if let Some(window) = app.get_webview_window("settings") {
-        window.show().ok();
-        window.set_focus().ok();
-        #[cfg(target_os = "macos")]
-        crate::platform::show_dock_icon(app);
-        return;
-    }
-
-    #[allow(unused_mut)]
+    // Always build the dashboard fresh. Under the destroy-on-close lifecycle
+    // (issue #144), the previous "reuse if already open" short-circuit had a
+    // microsecond race where the wry runtime had cleared the window inner
+    // but Tauri's manager hadn't yet removed the entry — `get_webview_window`
+    // would return `Some` but `show()` would silently no-op, and the user
+    // would see nothing happen. The webview cold-start cost (~200–500 ms) is
+    // acceptable for an infrequently-opened settings panel.
+    //
+    // The per-window menu listener registered below is stored in a
+    // `HashMap<String, ...>` keyed by window label inside Tauri's
+    // `MenuManager`, so rebuilding with the same label "settings" replaces
+    // the prior entry — no menu handler leaks across rebuilds.
     let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
         .title("Hole Dashboard")
         .inner_size(800.0, 600.0)

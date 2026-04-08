@@ -37,6 +37,8 @@ Log files are `gui.log` and `bridge.log` respectively. When running the bridge a
 - Windows: `C:\ProgramData\hole\logs\`
 - macOS: `/var/log/hole/`
 
+**WebView2 / Chromium logs (Windows, dev mode only).** Tauri's embedded WebView2 runtime carries its own Chromium logging facility that writes directly to the inherited stderr handle, bypassing our `tracing` subscriber. Such lines appear in Chromium's native `[MMDD/HHMMSS.mmm:LEVEL:file:line]` format and are not written to `gui.log`. In release builds the GUI binary has no console (`windows_subsystem = "windows"`), so they are invisible to end users; in dev mode `scripts/dev.py` reprints them with a `[client]` prefix. If you see one of these lines, it is a real Chromium log record — investigate the underlying cause rather than reaching for a filter. See [#144](https://github.com/bindreams/hole/issues/144) for a worked example (the dashboard close lifecycle that triggered `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`).
+
 ### State files (crash recovery)
 
 While a proxy is active, the bridge writes `bridge-routes.json` to its state directory recording the installed TUN name, server IP, and upstream interface. On next startup the bridge reads this file (after a successful IPC bind) to clean up any routes leaked by a previous crashed run. The file is removed on clean shutdown.
