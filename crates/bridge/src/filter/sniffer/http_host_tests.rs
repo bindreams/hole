@@ -44,13 +44,15 @@ fn extracts_host_strips_port() {
 #[skuld::test]
 fn extracts_host_with_ipv6_literal() {
     let req = b"GET / HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n";
-    assert_eq!(extract_host(req).as_deref(), Some("[2001:db8::1]"));
+    // RFC 7230 brackets are framing only; the returned host should
+    // be parseable as an IpAddr.
+    assert_eq!(extract_host(req).as_deref(), Some("2001:db8::1"));
 }
 
 #[skuld::test]
 fn extracts_host_with_ipv6_literal_no_port() {
     let req = b"GET / HTTP/1.1\r\nHost: [2001:db8::1]\r\n\r\n";
-    assert_eq!(extract_host(req).as_deref(), Some("[2001:db8::1]"));
+    assert_eq!(extract_host(req).as_deref(), Some("2001:db8::1"));
 }
 
 #[skuld::test]

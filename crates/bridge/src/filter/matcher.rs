@@ -69,16 +69,35 @@ impl Matcher {
         }
     }
 
-    /// Test whether this matcher matches the given connection. Pure
-    /// function; never allocates.
+    /// Test whether this matcher matches the given connection.
+    ///
+    /// Domain matchers canonicalize the connection's domain on the
+    /// fly (via [`canonicalize_for_match`]) so the contract holds
+    /// even if the dispatcher passes an un-normalized string. IP
+    /// matchers canonicalize IPv4-mapped IPv6 addresses.
     pub fn matches(&self, conn: &ConnInfo) -> bool {
         match self {
-            Matcher::ExactDomain(want) => conn.domain.as_deref().is_some_and(|got| got.eq_ignore_ascii_case(want)),
-            Matcher::SubdomainDomain(want) => match conn.domain.as_deref() {
-                None => false,
-                Some(got) => domain_matches_with_subdomains(got, want),
-            },
-            Matcher::WildcardDomain(re) => conn.domain.as_deref().is_some_and(|got| re.is_match(got)),
+            Matcher::ExactDomain(want) => {
+                let Some(got) = conn.domain.as_deref() else {
+                    return false;
+                };
+                let got_canon = canonicalize_for_match(got);
+                got_canon == *want
+            }
+            Matcher::SubdomainDomain(want) => {
+                let Some(got) = conn.domain.as_deref() else {
+                    return false;
+                };
+                let got_canon = canonicalize_for_match(got);
+                domain_matches_with_subdomains(&got_canon, want)
+            }
+            Matcher::WildcardDomain(re) => {
+                let Some(got) = conn.domain.as_deref() else {
+                    return false;
+                };
+                let got_canon = canonicalize_for_match(got);
+                re.is_match(&got_canon)
+            }
             Matcher::ExactIp(want) => canonicalize_ip(conn.dst_ip) == *want,
             Matcher::Subnet(net) => net.contains(&canonicalize_ip(conn.dst_ip)),
         }
@@ -157,8 +176,9 @@ fn glob_to_regex(glob: &str) -> String {
     out
 }
 
-/// Canonicalize a domain string: IDNA-normalize, lowercase, strip a
-/// trailing dot. Returns the normalized form on success.
+/// Canonicalize a domain string at compile time: IDNA-normalize,
+/// lowercase, strip a trailing dot. Returns the normalized form on
+/// success or a `CompileError` if the input is malformed.
 fn canonicalize_domain(input: &str) -> Result<String, CompileError> {
     let trimmed = input.trim_end_matches('.');
     if trimmed.is_empty() {
@@ -174,6 +194,29 @@ fn canonicalize_domain(input: &str) -> Result<String, CompileError> {
     Ok(ascii)
 }
 
+/// Canonicalize a connection-side domain at match time. Best-effort:
+/// runs IDNA normalization + lowercase + trailing-dot strip. On any
+/// failure (malformed Unicode, idna error, empty string), returns the
+/// trimmed input lowercased verbatim — we never reject a connection
+/// just because the sniffer/fake-DNS handed us something we couldn't
+/// canonicalize, since rule compilation has already rejected its own
+/// malformed inputs.
+///
+/// This is exposed publicly so the dispatcher (Plans 2/3) can call it
+/// once per connection at `ConnInfo` construction time. The matcher
+/// also calls it internally so contracts hold even if the dispatcher
+/// forgets.
+pub fn canonicalize_for_match(domain: &str) -> String {
+    let trimmed = domain.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match idna::domain_to_ascii(trimmed) {
+        Ok(ascii) if !ascii.is_empty() => ascii,
+        _ => trimmed.to_ascii_lowercase(),
+    }
+}
+
 /// Canonicalize an IPv4-mapped IPv6 address to its underlying IPv4 form
 /// (e.g. `::ffff:1.2.3.4` → `1.2.3.4`). Other addresses pass through
 /// unchanged.
@@ -186,12 +229,13 @@ pub(crate) fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     ip
 }
 
-/// Domain string match for `WithSubdomains`. The connection domain is
-/// already lowercased by the caller (via `canonicalize_for_match`); the
-/// stored matcher value is also already lowercased. Returns true if the
-/// connection domain equals the rule domain or is a true subdomain
-/// (`a.example.com` matches rule `example.com`, but `notexample.com`
-/// does not).
+/// Domain string match for `WithSubdomains`. Both `got` and `want`
+/// are assumed lowercased and IDNA-canonical (the matcher's call
+/// site runs the connection-side string through
+/// `canonicalize_for_match`; the stored matcher value was lowercased
+/// at compile time). Returns true if the connection domain equals
+/// the rule domain or is a true subdomain (`a.example.com` matches
+/// rule `example.com`, but `notexample.com` does not).
 fn domain_matches_with_subdomains(got: &str, want: &str) -> bool {
     if got.eq_ignore_ascii_case(want) {
         return true;

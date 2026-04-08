@@ -26,6 +26,13 @@ pub struct ConnInfo {
     pub dst_port: u16,
     /// Set when the dispatcher recovered a domain via fake DNS reverse
     /// lookup or the TLS/HTTP sniffer. `None` for raw IP destinations.
+    ///
+    /// The matcher canonicalizes this value internally on every match
+    /// (case-fold + trailing dot strip + IDNA), so callers may pass
+    /// the raw string from the sniffer or fake DNS without
+    /// pre-normalizing. The dispatcher in Plans 2/3 may still want to
+    /// canonicalize once via [`super::matcher::canonicalize_for_match`]
+    /// to amortize the cost across rules.
     pub domain: Option<String>,
     pub proto: L4Proto,
 }
