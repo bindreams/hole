@@ -144,12 +144,18 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
                 "running": false,
                 "uptime_secs": 0,
                 "error": message,
+                "invalid_filters": Vec::<()>::new(),
+                "udp_proxy_available": true,
+                "ipv6_bypass_available": true,
             }))
         }
         Ok(_) => Ok(serde_json::json!({
             "running": false,
             "uptime_secs": 0,
             "error": "unexpected response from bridge",
+            "invalid_filters": Vec::<()>::new(),
+            "udp_proxy_available": true,
+            "ipv6_bypass_available": true,
         })),
         Err(e) => {
             // Bridge not running or unreachable — not an error for the frontend
@@ -157,6 +163,9 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
                 "running": false,
                 "uptime_secs": 0,
                 "error": format!("bridge unreachable: {e}"),
+                "invalid_filters": Vec::<()>::new(),
+                "udp_proxy_available": true,
+                "ipv6_bypass_available": true,
             }))
         }
     }
@@ -187,6 +196,7 @@ fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_js
             "speed_in_bps": 0,
             "speed_out_bps": 0,
             "uptime_secs": 0,
+            "filter": serde_json::Value::Null,
         }),
     }
 }

@@ -92,12 +92,14 @@ fn parse_host_line(line: &[u8]) -> Option<String> {
     }
 
     // Strip optional `:port` suffix. The host part can also be a
-    // bracketed IPv6 literal like `[2001:db8::1]:443`; in that case
-    // the port colon is the one *after* the closing bracket.
+    // bracketed IPv6 literal like `[2001:db8::1]:443`; the brackets
+    // themselves are RFC 7230 framing and not part of the host
+    // identifier — they must be stripped from the returned value so
+    // it parses as an `IpAddr` downstream.
     let host_bytes = if value.first() == Some(&b'[') {
         match value.iter().position(|&b| b == b']') {
-            Some(close) => &value[..=close],
-            None => return None,
+            Some(close) if close >= 2 => &value[1..close],
+            _ => return None,
         }
     } else {
         match value.iter().position(|&b| b == b':') {

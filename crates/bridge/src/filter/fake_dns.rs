@@ -41,6 +41,12 @@ pub const DEFAULT_POOL_V6: &str = "fd00:0:0:ff00::/64";
 /// frequently and the bimap stays warm.
 pub const FAKE_DNS_TTL: u32 = 60;
 
+/// Maximum number of allocation probes before giving up (per query)
+/// regardless of the actual pool size. Bounds the worst-case latency
+/// of a single allocation under a pathological pool configuration
+/// (e.g. a `/0` pool with `2^32` candidates).
+const MAX_ALLOCATION_PROBES: u64 = 1024;
+
 // Errors ==============================================================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,9 +329,11 @@ impl FakeDns {
             return Ok(existing);
         }
 
-        // Sequential allocation with collision skip. Bound the loop
-        // by the pool size so we never spin forever.
-        for _ in 0..self.pool_v4_size {
+        // Sequential allocation with collision skip. Bounded by the
+        // smaller of the pool size and MAX_ALLOCATION_PROBES so we
+        // never spin millions of iterations on a `/0` user pool.
+        let probe_limit = std::cmp::min(self.pool_v4_size, MAX_ALLOCATION_PROBES);
+        for _ in 0..probe_limit {
             let offset = state.next_v4_offset;
             state.next_v4_offset = (state.next_v4_offset + 1) % self.pool_v4_size;
             let candidate = ipv4_at_offset(&self.pool_v4, offset);
@@ -411,12 +419,16 @@ fn network_size_v4(net: &Ipv4Net) -> u64 {
 }
 
 /// Compute the IPv4 address at the given offset within a network.
-/// Wraps via modulo on the caller's side.
+/// The offset is taken modulo the network size, so the returned
+/// address is always inside `net`. Pool sizes near `2^32` (e.g.
+/// `/0`) wrap correctly without overflow because the addition is
+/// done in `u64`.
 fn ipv4_at_offset(net: &Ipv4Net, offset: u64) -> Ipv4Addr {
-    let base = u32::from(net.network());
+    let base = u64::from(u32::from(net.network()));
     let max_offset = network_size_v4(net);
-    let normalized = (offset % max_offset) as u32;
-    Ipv4Addr::from(base.wrapping_add(normalized))
+    let normalized = offset % max_offset;
+    let result = (base + normalized) as u32;
+    Ipv4Addr::from(result)
 }
 
 /// Compute the IPv6 address at the given offset within a network.

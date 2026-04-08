@@ -172,6 +172,51 @@ fn get_metrics_returns_json() {
     assert_eq!(json["speed_in_bps"], 2048);
     assert_eq!(json["speed_out_bps"], 1024);
     assert_eq!(json["uptime_secs"], 120);
+    // The `filter` field is always present in the JSON shape so the
+    // frontend doesn't see two distinct shapes for running vs stopped.
+    assert_eq!(json["filter"], serde_json::Value::Null);
+}
+
+/// Verify that a Metrics BridgeResponse with filter metrics emits
+/// them in the JSON shape.
+#[skuld::test]
+fn get_metrics_with_filter_metrics_returns_json() {
+    use hole_common::protocol::FilterMetrics;
+    let resp = BridgeResponse::Metrics {
+        bytes_in: 1024,
+        bytes_out: 512,
+        speed_in_bps: 2048,
+        speed_out_bps: 1024,
+        uptime_secs: 120,
+        filter: Some(FilterMetrics {
+            total_connections: 42,
+            proxied: 30,
+            bypassed: 8,
+            blocked: 4,
+            sniffer_hits: 12,
+            sniffer_misses: 5,
+            fake_dns_queries: 100,
+            fake_dns_reverse_hits: 95,
+            active_udp_flows: 7,
+            udp_drops_backpressure: 0,
+        }),
+    };
+    let json = map_metrics_response(Ok(resp));
+    assert_eq!(json["filter"]["total_connections"], 42);
+    assert_eq!(json["filter"]["proxied"], 30);
+    assert_eq!(json["filter"]["bypassed"], 8);
+    assert_eq!(json["filter"]["blocked"], 4);
+    assert_eq!(json["filter"]["active_udp_flows"], 7);
+}
+
+/// Verify that the metrics fallback path emits the same JSON shape as
+/// the success path (always includes `filter`).
+#[skuld::test]
+fn get_metrics_fallback_includes_filter_field() {
+    let err = ClientError::Connection(std::io::Error::other("nope"));
+    let json = map_metrics_response(Err(err));
+    assert_eq!(json["bytes_in"], 0);
+    assert_eq!(json["filter"], serde_json::Value::Null);
 }
 
 /// Verify that a failed metrics request returns zero defaults.

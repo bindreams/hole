@@ -41,13 +41,17 @@ impl RuleSet {
         let mut dropped = Vec::new();
 
         for (i, rule) in rules.iter().enumerate() {
+            // The wire schema uses u32 for the index. A user with
+            // > 4 billion rules is implausible, but if they ever
+            // existed we'd silently truncate — clamp explicitly.
+            let index = u32::try_from(i).unwrap_or(u32::MAX);
             match Matcher::compile(&rule.address, rule.matching) {
                 Ok(matcher) => compiled.push(CompiledRule {
                     matcher,
                     action: rule.action,
                 }),
                 Err(err) => dropped.push(InvalidFilter {
-                    index: i as u32,
+                    index,
                     error: err.to_string(),
                 }),
             }

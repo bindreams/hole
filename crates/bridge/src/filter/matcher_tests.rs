@@ -311,3 +311,52 @@ fn ipv6_unspecified_match() {
         proto: L4Proto::Tcp,
     }));
 }
+
+// Connection-side canonicalization at match time ======================================================================
+
+#[skuld::test]
+fn matches_uncanonicalized_uppercase_connection_domain() {
+    // Compile-side rule is normalized; the dispatcher hands the
+    // matcher a raw uppercase string from the sniffer/fake DNS.
+    let m = compile("example.com", MatchType::Exactly);
+    assert!(m.matches(&dom_conn("1.2.3.4", "Example.COM")));
+}
+
+#[skuld::test]
+fn matches_uncanonicalized_trailing_dot() {
+    let m = compile("example.com", MatchType::Exactly);
+    assert!(m.matches(&dom_conn("1.2.3.4", "example.com.")));
+}
+
+#[skuld::test]
+fn matches_uncanonicalized_unicode_domain() {
+    // Connection side carries the U-label form; rule is the A-label.
+    let m = compile("xn--r8jz45g.com", MatchType::Exactly);
+    assert!(m.matches(&dom_conn("1.2.3.4", "例え.com")));
+}
+
+#[skuld::test]
+fn subdomain_match_canonicalizes_connection_domain() {
+    let m = compile("example.com", MatchType::WithSubdomains);
+    assert!(m.matches(&dom_conn("1.2.3.4", "API.Example.COM")));
+    assert!(m.matches(&dom_conn("1.2.3.4", "api.example.com.")));
+}
+
+#[skuld::test]
+fn canonicalize_for_match_handles_garbage_gracefully() {
+    // Pure garbage that idna refuses should fall through to a
+    // best-effort lowercase, never panic.
+    let s = canonicalize_for_match("not a domain at all");
+    assert!(!s.is_empty());
+}
+
+#[skuld::test]
+fn canonicalize_for_match_strips_trailing_dot_and_lowercases() {
+    assert_eq!(canonicalize_for_match("Example.COM."), "example.com");
+}
+
+#[skuld::test]
+fn canonicalize_for_match_empty_returns_empty() {
+    assert_eq!(canonicalize_for_match(""), "");
+    assert_eq!(canonicalize_for_match("."), "");
+}
