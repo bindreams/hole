@@ -165,6 +165,11 @@ async fn handle_status<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSta
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
         error: pm.last_error().map(|s| s.to_string()),
+        // Filter-engine fields are stubbed in Plan 1 — Plans 2-4 wire them
+        // from the dispatcher's RuleSet, plugin detection, and gateway probe.
+        invalid_filters: Vec::new(),
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
     })
 }
 
@@ -229,6 +234,9 @@ async fn handle_metrics<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSt
         speed_in_bps: 0,
         speed_out_bps: 0,
         uptime_secs: pm.uptime_secs(),
+        // Filter-engine metrics are stubbed in Plan 1 — Plan 4 wires them
+        // from the dispatcher's atomic counters.
+        filter: None,
     })
 }
 

@@ -1,10 +1,13 @@
 //! Generates Rust types and route constants from the OpenAPI spec at `api/openapi.yaml`.
 //!
-//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `PublicIpResponse`.
+//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`,
+//! `MetricsResponse`, `DiagnosticsResponse`, `PublicIpResponse`,
+//! `InvalidFilter`, `FilterMetrics`.
 //! Generated constants: `ROUTE_STATUS`, `ROUTE_START`, `ROUTE_STOP`, `ROUTE_RELOAD`, `ROUTE_METRICS`, `ROUTE_DIAGNOSTICS`, `ROUTE_PUBLIC_IP`, `ROUTE_TEST_SERVER`.
 //!
-//! `ProxyConfig`, `ServerEntry`, `ValidationState`, `ServerTestOutcome`, `TestServerRequest`,
-//! and `TestServerResponse` are defined in the spec for documentation purposes
+//! `ProxyConfig`, `FilterRule`, `MatchType`, `FilterAction`, `ServerEntry`,
+//! `ValidationState`, `ServerTestOutcome`, `TestServerRequest`, and
+//! `TestServerResponse` are defined in the spec for documentation purposes
 //! but are not generated — they are hand-written in `protocol.rs` and `config.rs`.
 
 use schemars::schema::Schema;
@@ -16,7 +19,7 @@ fn main() {
     let yaml_str = std::fs::read_to_string("api/openapi.yaml").unwrap();
     let spec: serde_json::Value = yaml_serde::from_str(&yaml_str).unwrap();
 
-    // Only generate these types (ProxyConfig/ServerEntry are hand-written)
+    // Only generate these types (ProxyConfig/ServerEntry/FilterRule are hand-written)
     let schemas = spec["components"]["schemas"].as_object().unwrap();
     let types_to_generate = [
         "StatusResponse",
@@ -25,6 +28,8 @@ fn main() {
         "MetricsResponse",
         "DiagnosticsResponse",
         "PublicIpResponse",
+        "InvalidFilter",
+        "FilterMetrics",
     ];
 
     let ref_types: Vec<(String, Schema)> = types_to_generate

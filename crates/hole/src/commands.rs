@@ -127,10 +127,16 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
             running,
             uptime_secs,
             error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
         }) => Ok(serde_json::json!({
             "running": running,
             "uptime_secs": uptime_secs,
             "error": error,
+            "invalid_filters": invalid_filters,
+            "udp_proxy_available": udp_proxy_available,
+            "ipv6_bypass_available": ipv6_bypass_available,
         })),
         Ok(BridgeResponse::Error { message }) => {
             warn!(error = %message, "bridge returned error for status");
@@ -166,12 +172,14 @@ fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_js
             speed_in_bps,
             speed_out_bps,
             uptime_secs,
+            filter,
         }) => serde_json::json!({
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
             "speed_in_bps": speed_in_bps,
             "speed_out_bps": speed_out_bps,
             "uptime_secs": uptime_secs,
+            "filter": filter,
         }),
         _ => serde_json::json!({
             "bytes_in": 0,
@@ -364,6 +372,7 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     Some(ProxyConfig {
         server: entry.clone(),
         local_port: config.local_port,
+        filters: config.filters.clone(),
     })
 }
 

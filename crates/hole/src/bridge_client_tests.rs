@@ -29,6 +29,9 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     running: false,
                     uptime_secs: 0,
                     error: None,
+                    invalid_filters: Vec::new(),
+                    udp_proxy_available: true,
+                    ipv6_bypass_available: true,
                 })
             }),
         )
@@ -53,6 +56,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     speed_in_bps: 2048,
                     speed_out_bps: 1024,
                     uptime_secs: 120,
+                    filter: None,
                 })
             }),
         )
@@ -112,6 +116,9 @@ fn send_status_request_receives_response() {
                 running: false,
                 uptime_secs: 0,
                 error: None,
+                invalid_filters: Vec::new(),
+                udp_proxy_available: true,
+                ipv6_bypass_available: true,
             }
         );
     });
@@ -139,6 +146,7 @@ fn send_start_receives_ack() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -215,6 +223,7 @@ fn send_reload_receives_ack() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -237,6 +246,9 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     running: false,
                     uptime_secs: 0,
                     error: None,
+                    invalid_filters: Vec::new(),
+                    udp_proxy_available: true,
+                    ipv6_bypass_available: true,
                 })
             }),
         )
@@ -291,6 +303,7 @@ fn server_error_maps_to_bridge_response_error() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -324,6 +337,7 @@ fn send_metrics_returns_response() {
                 speed_in_bps: 2048,
                 speed_out_bps: 1024,
                 uptime_secs: 120,
+                filter: None,
             }
         );
     });

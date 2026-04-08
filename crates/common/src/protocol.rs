@@ -1,4 +1,4 @@
-use crate::config::ServerEntry;
+use crate::config::{FilterRule, ServerEntry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -36,6 +36,9 @@ pub enum BridgeResponse {
         running: bool,
         uptime_secs: u64,
         error: Option<String>,
+        invalid_filters: Vec<InvalidFilter>,
+        udp_proxy_available: bool,
+        ipv6_bypass_available: bool,
     },
     Error {
         message: String,
@@ -46,6 +49,7 @@ pub enum BridgeResponse {
         speed_in_bps: u64,
         speed_out_bps: u64,
         uptime_secs: u64,
+        filter: Option<FilterMetrics>,
     },
     Diagnostics {
         app: String,
@@ -67,6 +71,11 @@ pub enum BridgeResponse {
 pub struct ProxyConfig {
     pub server: ServerEntry,
     pub local_port: u16,
+    /// Filter rules applied by the bridge dispatcher. Defaults to empty
+    /// (no filtering — all captured traffic proxied). The full filter engine
+    /// is documented in the design spec.
+    #[serde(default)]
+    pub filters: Vec<FilterRule>,
 }
 
 // Server test outcome =================================================================================================

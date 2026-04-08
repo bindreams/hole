@@ -19,6 +19,7 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
+        filters: Vec::new(),
     }
 }
 
@@ -74,6 +75,9 @@ fn bridge_response_status_json_roundtrip() {
         running: true,
         uptime_secs: 3600,
         error: Some("minor issue".to_string()),
+        invalid_filters: Vec::new(),
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
     let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
@@ -114,6 +118,9 @@ fn status_response_json_roundtrip() {
         running: true,
         uptime_secs: 3600,
         error: Some("minor issue".to_string()),
+        invalid_filters: Vec::new(),
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -126,6 +133,9 @@ fn status_response_without_error() {
         running: false,
         uptime_secs: 0,
         error: None,
+        invalid_filters: Vec::new(),
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
     };
     let json = serde_json::to_string(&resp).unwrap();
     assert!(!json.contains("error"), "None error should be skipped in serialization");
@@ -152,7 +162,14 @@ fn empty_response_serializes_to_empty_object() {
 
 #[skuld::test]
 fn status_response_explicit_null_error() {
-    let json = r#"{"running": false, "uptime_secs": 0, "error": null}"#;
+    let json = r#"{
+        "running": false,
+        "uptime_secs": 0,
+        "error": null,
+        "invalid_filters": [],
+        "udp_proxy_available": true,
+        "ipv6_bypass_available": true
+    }"#;
     let decoded: StatusResponse = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.error, None);
 }
@@ -175,6 +192,33 @@ fn metrics_response_roundtrips() {
         speed_in_bps: 1_048_576,
         speed_out_bps: 524_288,
         uptime_secs: 3600,
+        filter: None,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let parsed: MetricsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(resp, parsed);
+}
+
+#[skuld::test]
+fn metrics_response_with_filter_roundtrips() {
+    let resp = MetricsResponse {
+        bytes_in: 1_000_000,
+        bytes_out: 500_000,
+        speed_in_bps: 1_048_576,
+        speed_out_bps: 524_288,
+        uptime_secs: 3600,
+        filter: Some(FilterMetrics {
+            total_connections: 42,
+            proxied: 30,
+            bypassed: 8,
+            blocked: 4,
+            sniffer_hits: 12,
+            sniffer_misses: 5,
+            fake_dns_queries: 100,
+            fake_dns_reverse_hits: 95,
+            active_udp_flows: 7,
+            udp_drops_backpressure: 0,
+        }),
     };
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: MetricsResponse = serde_json::from_str(&json).unwrap();
@@ -247,6 +291,7 @@ fn bridge_response_metrics_roundtrips() {
         speed_in_bps: 1024,
         speed_out_bps: 512,
         uptime_secs: 60,
+        filter: None,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
