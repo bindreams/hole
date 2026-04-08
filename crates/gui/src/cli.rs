@@ -352,21 +352,48 @@ fn handle_bridge_log(log_dir: Option<std::path::PathBuf>, action: Option<LogActi
     }
 }
 
-/// Tail and follow a log file (like `tail -f`).
-fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+/// Open `path` for tailing and capture a `same_file::Handle` tied to the
+/// same underlying FD. The handle is built from `file.try_clone()` so there
+/// is no TOCTOU race between opening the file and identifying it.
+fn open_watch_reader(
+    path: &std::path::Path,
+) -> std::io::Result<(std::io::BufReader<std::fs::File>, same_file::Handle)> {
+    let file = std::fs::File::open(path)?;
+    let handle = same_file::Handle::from_file(file.try_clone()?)?;
+    Ok((std::io::BufReader::new(file), handle))
+}
 
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
+/// Returns `Ok(true)` if the file currently at `path` is a different file
+/// than the one identified by `current` (rename-rotation); `Ok(false)` if
+/// it's the same file or if the path is transiently missing (rotation in
+/// progress); `Err` for any other stat failure.
+fn file_was_rotated(path: &std::path::Path, current: &same_file::Handle) -> std::io::Result<bool> {
+    match same_file::Handle::from_path(path) {
+        Ok(latest) => Ok(&latest != current),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Tail and follow a log file (like `tail -f`). Detects rename-rotation by
+/// `file-rotate` and reopens `path` so the stream keeps flowing after
+/// rollover.
+fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let (mut reader, mut handle) = match open_watch_reader(path) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("cannot open log file {}: {e}", path.display());
             return 1;
         }
     };
 
-    let mut reader = BufReader::new(file);
-
-    // If tail > 0, read and show the last N lines using the same reader
+    // If tail > 0, read and show the last N lines using the same reader.
+    //
+    // If rotation happens *during* the tail read, the tail lines come from
+    // the old (pre-rotation) inode — that's the expected behavior. The
+    // first Ok(0) after the tail completes will detect the swap and reopen.
     if tail_lines > 0 {
         let mut all_lines = Vec::new();
         let mut buf = String::new();
@@ -390,6 +417,40 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
+                match file_was_rotated(path, &handle) {
+                    Ok(true) => {
+                        // Drain any final bytes from the old (renamed) file
+                        // before swapping. file-rotate may have flushed a
+                        // line between our last Ok(0) and the rename.
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) => break,
+                                Ok(_) => print!("{line}"),
+                                Err(_) => break,
+                            }
+                        }
+                        match open_watch_reader(path) {
+                            Ok((r, h)) => {
+                                reader = r;
+                                handle = h;
+                                continue; // read the rotated file without sleeping
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // New file not yet created; retry next tick.
+                            }
+                            Err(e) => {
+                                eprintln!("reopen error: {e}");
+                                return 1;
+                            }
+                        }
+                    }
+                    Ok(false) => { /* not rotated */ }
+                    Err(e) => {
+                        eprintln!("stat error: {e}");
+                        return 1;
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Ok(_) => {

@@ -3,7 +3,7 @@
 use hole_common::logging::LogGuard;
 use std::path::Path;
 
-/// Initialize GUI logging (stderr + rolling daily file).
+/// Initialize GUI logging (stderr + size-rotated file).
 pub fn init(log_dir: &Path) -> LogGuard {
     hole_common::logging::init(log_dir, "gui.log", "hole_gui=info")
 }

@@ -1,5 +1,7 @@
 use super::*;
 use clap::Parser;
+use skuld::temp_dir;
+use std::path::Path;
 
 #[skuld::test]
 fn no_args_means_gui_mode() {
@@ -103,4 +105,70 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
     assert!(should_install_cli_log_guard(&Command::Path {
         action: PathAction::Add,
     }));
+}
+
+// Tests: bridge_log_watch rotation detection ==========================================================================
+//
+// These exercise the `open_watch_reader` + `file_was_rotated` helpers in
+// isolation. They simulate the rename+recreate sequence that `file-rotate`
+// performs on size-based rollover.
+
+#[skuld::test]
+fn file_was_rotated_detects_rename_and_recreate(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("watched.log");
+    std::fs::write(&path, b"original content\n").expect("seed watched.log");
+
+    let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
+
+    // Simulate file-rotate: rename current → .1, create a fresh active file.
+    std::fs::rename(&path, dir.join("watched.log.1")).expect("rename watched.log");
+    std::fs::write(&path, b"").expect("recreate watched.log");
+
+    assert!(
+        super::file_was_rotated(&path, &handle).expect("stat new file"),
+        "file_was_rotated should detect the rename+recreate"
+    );
+}
+
+#[skuld::test]
+fn file_was_rotated_reports_false_for_unchanged_file_even_after_appends(#[fixture(temp_dir)] dir: &Path) {
+    use std::io::Write;
+
+    let path = dir.join("watched.log");
+    std::fs::write(&path, b"initial\n").expect("seed watched.log");
+
+    let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
+
+    // Append to the same file — the inode/file-id is unchanged, so
+    // file_was_rotated must return false.
+    let mut appender = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open for append");
+    appender.write_all(b"more\n").expect("append bytes");
+    drop(appender);
+
+    assert!(
+        !super::file_was_rotated(&path, &handle).expect("stat unchanged file"),
+        "appending to the same file must not look like rotation"
+    );
+}
+
+#[skuld::test]
+fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("watched.log");
+    std::fs::write(&path, b"initial").expect("seed watched.log");
+
+    let (_reader, handle) = super::open_watch_reader(&path).expect("open_watch_reader");
+
+    // Simulate the sub-millisecond window in file-rotate between rename and
+    // recreate: the path is transiently missing. `file_was_rotated` must
+    // return Ok(false), not Err, so the watch loop will just retry on the
+    // next poll tick.
+    std::fs::remove_file(&path).expect("remove watched.log");
+
+    assert!(
+        !super::file_was_rotated(&path, &handle).expect("stat missing path"),
+        "missing path must map to Ok(false), not an error"
+    );
 }
