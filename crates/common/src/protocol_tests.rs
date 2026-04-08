@@ -61,6 +61,22 @@ fn bridge_request_reload_json_roundtrip() {
 }
 
 #[skuld::test]
+fn bridge_request_cancel_json_roundtrip() {
+    let req = BridgeRequest::Cancel;
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
+    assert_eq!(decoded, req);
+}
+
+#[skuld::test]
+fn cancelled_message_constant_is_stable() {
+    // The bridge writes this exact string into ErrorResponse when a Start is
+    // cancelled; the client matches against it. Changing it is a breaking
+    // change to the client/bridge contract.
+    assert_eq!(CANCELLED_MESSAGE, "cancelled");
+}
+
+#[skuld::test]
 fn bridge_response_ack_json_roundtrip() {
     let resp = BridgeResponse::Ack;
     let json = serde_json::to_vec(&resp).unwrap();
@@ -162,6 +178,7 @@ fn route_constants_are_correct() {
     assert_eq!(ROUTE_STATUS, "/v1/status");
     assert_eq!(ROUTE_START, "/v1/start");
     assert_eq!(ROUTE_STOP, "/v1/stop");
+    assert_eq!(ROUTE_CANCEL, "/v1/cancel");
     assert_eq!(ROUTE_RELOAD, "/v1/reload");
 }
 

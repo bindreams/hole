@@ -41,6 +41,10 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
             axum::routing::post(|| async { Json(EmptyResponse {}) }),
         )
         .route(
+            hole_common::protocol::ROUTE_CANCEL,
+            axum::routing::post(|| async { Json(EmptyResponse {}) }),
+        )
+        .route(
             hole_common::protocol::ROUTE_RELOAD,
             axum::routing::post(|| async { Json(EmptyResponse {}) }),
         )
@@ -191,6 +195,18 @@ fn other_io_error_maps_to_connection() {
         matches!(client_err, ClientError::Connection(_)),
         "expected Connection, got: {client_err:?}"
     );
+}
+
+#[skuld::test]
+fn send_cancel_receives_ack() {
+    rt().block_on(async {
+        let path = test_socket_path("cancel");
+        let _mock = spawn_mock_bridge(&path).await;
+
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        let resp = client.send(BridgeRequest::Cancel).await.unwrap();
+        assert_eq!(resp, BridgeResponse::Ack);
+    });
 }
 
 #[skuld::test]

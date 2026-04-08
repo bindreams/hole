@@ -16,15 +16,30 @@ pub use api_generated::*;
 /// maps variants to HTTP endpoints internally.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BridgeRequest {
-    Start { config: ProxyConfig },
+    Start {
+        config: ProxyConfig,
+    },
     Stop,
+    /// Cancel an in-flight `Start`. Idempotent — if no start is in flight, the
+    /// cancel is pre-armed and consumed by the next start. See the
+    /// `/v1/cancel` route in `openapi.yaml`.
+    Cancel,
     Status,
-    Reload { config: ProxyConfig },
+    Reload {
+        config: ProxyConfig,
+    },
     Metrics,
     Diagnostics,
     PublicIp,
-    TestServer { entry: ServerEntry },
+    TestServer {
+        entry: ServerEntry,
+    },
 }
+
+/// Error-payload message string that identifies a cancelled start. Both bridge
+/// and client compare against this constant rather than re-parsing the error
+/// text.
+pub const CANCELLED_MESSAGE: &str = "cancelled";
 
 /// Client-side response enum. Used by the GUI client API and elevation flow.
 /// Not part of the wire protocol — the client maps HTTP responses back to

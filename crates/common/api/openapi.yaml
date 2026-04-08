@@ -59,6 +59,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/cancel:
+    post:
+      summary: Cancel an in-flight proxy start
+      description: |
+        Idempotent signal that interrupts an in-flight `POST /v1/start`. If no
+        start is currently in flight, the cancel is "pre-armed" and consumed by
+        the very next start. Always returns 200 — the bridge records the intent
+        regardless of whether there is anything to cancel right now. The
+        cancelled start itself returns 500 with `ErrorResponse { message: "cancelled" }`.
+      operationId: cancelProxy
+      responses:
+        "200":
+          description: Cancel recorded (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+
   /v1/reload:
     post:
       summary: Reload the proxy with new configuration
