@@ -84,12 +84,20 @@ def resolve_tool(name: str) -> str:
 
 
 def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None) -> None:
-    if Path("node_modules").exists():
-        return
-    print(f"{BOLD}Installing npm dependencies...{RESET}")
+    """Run `npm install` unconditionally to keep `node_modules/` in sync with
+    `package-lock.json`.
+
+    Unconditional install is deliberate: a prior version of this function
+    skipped on `node_modules/` existing, which silently hid dependency
+    additions pulled from a new commit (e.g. #148 adding
+    `@tauri-apps/plugin-log`) and left Vite failing to resolve the import.
+    `npm install` on a healthy tree costs ~1s, dominated by cargo below;
+    `--no-audit --no-fund` trims the output to a single line so dev.py's
+    startup stays quiet on the happy path."""
+    print(f"{BOLD}Syncing npm dependencies...{RESET}")
     # Run as the invoking user so `node_modules/` is not owned by root.
     result = subprocess.run(
-        [npm, "install"],
+        [npm, "install", "--no-audit", "--no-fund"],
         stdout=sys.stdout,
         stderr=sys.stderr,
         env=drop_env({**os.environ}, target_user),
