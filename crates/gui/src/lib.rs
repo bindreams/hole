@@ -1,4 +1,6 @@
 pub mod bridge_client;
+#[macro_use]
+pub mod cli_log;
 pub mod commands;
 pub mod elevation;
 pub mod logging;

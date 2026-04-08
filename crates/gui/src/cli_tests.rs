@@ -38,3 +38,69 @@ fn show_dashboard_before_subcommand_parses() {
     assert!(cli.show_dashboard);
     assert!(matches!(cli.command, Some(Command::Version)));
 }
+
+// Dispatch guard exemption: must NOT install a gui-cli.log subscriber for
+// commands that either have their own subscriber (`bridge run`) or don't
+// need an audit trail (`version`, `bridge log [...]`). Installing one would
+// either clobber the bridge's own subscriber via a failed try_init or
+// create spurious `gui-cli.log` files for read-only inspection commands.
+
+#[skuld::test]
+fn dispatch_exempts_version_from_cli_log_guard() {
+    assert!(!should_install_cli_log_guard(&Command::Version));
+}
+
+#[skuld::test]
+fn dispatch_exempts_bridge_run_from_cli_log_guard() {
+    let cmd = Command::Bridge {
+        action: BridgeAction::Run {
+            socket_path: None,
+            service: false,
+            log_dir: None,
+            state_dir: None,
+        },
+    };
+    assert!(!should_install_cli_log_guard(&cmd));
+}
+
+#[skuld::test]
+fn dispatch_exempts_bridge_log_from_cli_log_guard() {
+    let cmd = Command::Bridge {
+        action: BridgeAction::Log {
+            log_dir: None,
+            action: None,
+        },
+    };
+    assert!(!should_install_cli_log_guard(&cmd));
+    let cmd = Command::Bridge {
+        action: BridgeAction::Log {
+            log_dir: None,
+            action: Some(LogAction::Path),
+        },
+    };
+    assert!(!should_install_cli_log_guard(&cmd));
+    let cmd = Command::Bridge {
+        action: BridgeAction::Log {
+            log_dir: None,
+            action: Some(LogAction::Watch { tail: 0 }),
+        },
+    };
+    assert!(!should_install_cli_log_guard(&cmd));
+}
+
+#[skuld::test]
+fn dispatch_installs_cli_log_guard_for_write_actions() {
+    assert!(should_install_cli_log_guard(&Command::Upgrade));
+    assert!(should_install_cli_log_guard(&Command::Bridge {
+        action: BridgeAction::Install,
+    }));
+    assert!(should_install_cli_log_guard(&Command::Bridge {
+        action: BridgeAction::Uninstall,
+    }));
+    assert!(should_install_cli_log_guard(&Command::Bridge {
+        action: BridgeAction::Status,
+    }));
+    assert!(should_install_cli_log_guard(&Command::Path {
+        action: PathAction::Add,
+    }));
+}

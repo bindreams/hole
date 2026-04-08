@@ -34,7 +34,7 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
     // Check if already present
     let entries: Vec<&str> = current_path.split(';').collect();
     if entries.iter().any(|e| e.eq_ignore_ascii_case(&dir_str)) {
-        eprintln!("PATH already contains {dir_str}");
+        cli_log!(warn, "PATH already contains {dir_str}");
         return Ok(());
     }
 
@@ -56,7 +56,7 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
     };
     env.set_raw_value("Path", &reg_value)?;
     broadcast_env_change();
-    eprintln!("added {dir_str} to system PATH");
+    cli_log!(info, "added {dir_str} to system PATH");
     Ok(())
 }
 
@@ -83,7 +83,7 @@ pub fn remove() -> Result<(), Box<dyn std::error::Error>> {
     let new_path = new_entries.join(";");
 
     if new_path.len() == current_path.len() {
-        eprintln!("PATH does not contain {dir_str}");
+        cli_log!(warn, "PATH does not contain {dir_str}");
         return Ok(());
     }
 
@@ -98,7 +98,7 @@ pub fn remove() -> Result<(), Box<dyn std::error::Error>> {
     };
     env.set_raw_value("Path", &reg_value)?;
     broadcast_env_change();
-    eprintln!("removed {dir_str} from system PATH");
+    cli_log!(info, "removed {dir_str} from system PATH");
     Ok(())
 }
 
@@ -141,8 +141,8 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
     // Warn about App Translocation
     let exe_str = exe.to_string_lossy();
     if exe_str.contains("/private/var/folders/") {
-        eprintln!("warning: binary appears to be in an App Translocation path");
-        eprintln!("  move Hole.app to /Applications first, then retry");
+        cli_log!(warn, "warning: binary appears to be in an App Translocation path");
+        cli_log!(warn, "  move Hole.app to /Applications first, then retry");
         return Err("App Translocation detected".into());
     }
 
@@ -150,7 +150,7 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
         // Check if it already points to us
         if let Ok(target) = std::fs::read_link(link_path) {
             if target == exe {
-                eprintln!("symlink already exists and points to {exe_str}");
+                cli_log!(info, "symlink already exists and points to {exe_str}");
                 return Ok(());
             }
         }
@@ -159,7 +159,7 @@ pub fn add() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     symlink(&exe, link_path)?;
-    eprintln!("created symlink /usr/local/bin/hole -> {exe_str}");
+    cli_log!(info, "created symlink /usr/local/bin/hole -> {exe_str}");
     Ok(())
 }
 
@@ -168,7 +168,7 @@ pub fn remove() -> Result<(), Box<dyn std::error::Error>> {
     let link_path = std::path::Path::new("/usr/local/bin/hole");
 
     if !link_path.is_symlink() {
-        eprintln!("/usr/local/bin/hole does not exist or is not a symlink");
+        cli_log!(warn, "/usr/local/bin/hole does not exist or is not a symlink");
         return Ok(());
     }
 
@@ -188,7 +188,7 @@ pub fn remove() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::fs::remove_file(link_path)?;
-    eprintln!("removed /usr/local/bin/hole");
+    cli_log!(info, "removed /usr/local/bin/hole");
     Ok(())
 }
 

@@ -37,3 +37,20 @@ fn plist_has_keep_alive() {
 fn helper_path_is_stable() {
     assert_eq!(HELPER_PATH, "/Library/PrivilegedHelperTools/com.hole.bridge");
 }
+
+#[skuld::test]
+fn plist_does_not_set_standard_paths() {
+    // The FD-level stdio redirect in hole_common::logging::init captures
+    // stdout/stderr into bridge.log; a launchd-side capture would only
+    // produce duplicate files. If StandardOutPath or StandardErrorPath is
+    // reintroduced, this test fails and catches the regression.
+    let plist = generate_plist("/usr/local/bin/hole");
+    assert!(
+        !plist.contains("StandardErrorPath"),
+        "plist must not set StandardErrorPath — the FD redirect already captures stderr",
+    );
+    assert!(
+        !plist.contains("StandardOutPath"),
+        "plist must not set StandardOutPath — the FD redirect already captures stdout",
+    );
+}

@@ -51,21 +51,43 @@ pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
 pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
     let mount_dir = tempfile::TempDir::with_prefix("hole-dmg-mount-")?;
 
-    // Mount the DMG
+    // Mount the DMG. Use `.output()` (not `.status()`) so a mount failure's
+    // stderr reaches the tracing file log — historically these errors went
+    // to inherited stdio and were lost in GUI-background install contexts.
     let attach_args = hdiutil_attach_args(path, mount_dir.path());
     let attach_args_ref: Vec<&str> = attach_args.iter().map(|s| s.as_str()).collect();
-    let status = std::process::Command::new("hdiutil").args(&attach_args_ref).status()?;
-    if !status.success() {
-        return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
+    let output = std::process::Command::new("hdiutil").args(&attach_args_ref).output()?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            %stdout,
+            %stderr,
+            status = ?output.status,
+            "hdiutil attach failed",
+        );
+        return Err(UpdateError::InstallerFailed(output.status.code().unwrap_or(-1)));
     }
 
     // Everything after a successful attach must go through detach.
     let result = install_from_mount(mount_dir.path());
 
-    // Always unmount
-    let _ = std::process::Command::new("hdiutil")
+    // Always unmount. Failure here is logged but not propagated (we already
+    // have the install result).
+    let detach_output = std::process::Command::new("hdiutil")
         .args(["detach", &mount_dir.path().to_string_lossy()])
-        .status();
+        .output();
+    match detach_output {
+        Ok(o) if !o.status.success() => {
+            tracing::warn!(
+                stdout = %String::from_utf8_lossy(&o.stdout),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "hdiutil detach failed",
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "hdiutil detach spawn failed"),
+        _ => {}
+    }
 
     result
 }

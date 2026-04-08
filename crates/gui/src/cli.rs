@@ -1,4 +1,7 @@
 // CLI subcommand dispatch.
+//
+// The `cli_log!` macro is exported from `crate::cli_log` at the crate root
+// (visible here via `#[macro_use]` in `main.rs` and `lib.rs`).
 
 use clap::{Parser, Subcommand};
 
@@ -123,8 +126,43 @@ pub(crate) fn parse_args() -> Cli {
     Cli::parse()
 }
 
+/// Return `true` if dispatching `command` should install a `gui-cli.log`
+/// subscriber. Exempt commands:
+///
+/// - `Version` — pure stdout, no audit trail needed.
+/// - `Bridge::Run` — installs its own `bridge.log` guard via
+///   `hole_bridge::logging::init`. Calling init() again here would clash
+///   (second `try_init` returns Err) and leave bridge events pointing at
+///   the wrong subscriber.
+/// - `Bridge::Log` — read-only inspection. No need to write a log entry to
+///   read one.
+pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Version
+            | Command::Bridge {
+                action: BridgeAction::Run { .. }
+            }
+            | Command::Bridge {
+                action: BridgeAction::Log { .. }
+            }
+    )
+}
+
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
+///
+/// For write-action subcommands (Upgrade, Bridge::{Install, Uninstall, Status,
+/// GrantAccess, IpcSend}, and Path), install a CLI log guard so that
+/// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
+/// user-facing terminal output. See [`should_install_cli_log_guard`] for
+/// the exemption list.
 pub(crate) fn dispatch(command: Command) -> ! {
+    let _cli_log_guard = if should_install_cli_log_guard(&command) {
+        let log_dir = hole_common::logging::default_log_dir();
+        Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole_gui=info"))
+    } else {
+        None
+    };
     let code = match command {
         Command::Version => {
             println!("hole {}", hole_gui::version::VERSION);
@@ -139,52 +177,52 @@ pub(crate) fn dispatch(command: Command) -> ! {
 }
 
 fn handle_upgrade() -> i32 {
-    eprintln!("checking for updates...");
+    cli_log!(info, "checking for updates...");
     match hole_gui::update::check_for_update() {
         Ok(Some(info)) => {
-            eprintln!("update available: v{}", info.version);
+            cli_log!(info, "update available: v{}", info.version);
 
             let download_dir = match tempfile::TempDir::with_prefix("hole-update-") {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("failed to create temp dir: {e}");
+                    cli_log!(error, "failed to create temp dir: {e}");
                     return 1;
                 }
             };
             let dest = download_dir.path().join(&info.asset_name);
 
-            eprintln!("downloading {}...", info.asset_name);
+            cli_log!(info, "downloading {}...", info.asset_name);
             if let Err(e) = hole_gui::update::download_asset(&info.asset_url, &dest) {
-                eprintln!("download failed: {e}");
+                cli_log!(error, "download failed: {e}");
                 return 1;
             }
 
-            eprintln!("verifying...");
+            cli_log!(info, "verifying...");
             if let Err(e) = hole_gui::update::verify_asset(
                 &dest,
                 &info.asset_name,
                 &info.sha256sums_url,
                 &info.sha256sums_minisig_url,
             ) {
-                eprintln!("verification failed: {e}");
+                cli_log!(error, "verification failed: {e}");
                 return 1;
             }
 
-            eprintln!("installing...");
+            cli_log!(info, "installing...");
             if let Err(e) = hole_gui::update::run_installer(&dest, true) {
-                eprintln!("installation failed: {e}");
+                cli_log!(error, "installation failed: {e}");
                 return 1;
             }
 
-            eprintln!("updated to v{}", info.version);
+            cli_log!(info, "updated to v{}", info.version);
             0
         }
         Ok(None) => {
-            eprintln!("already up to date ({})", hole_gui::version::VERSION);
+            cli_log!(info, "already up to date ({})", hole_gui::version::VERSION);
             0
         }
         Err(e) => {
-            eprintln!("update check failed: {e}");
+            cli_log!(error, "update check failed: {e}");
             1
         }
     }
@@ -230,21 +268,24 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             };
 
             if let Err(e) = result {
-                eprintln!("bridge error: {e}");
+                // BridgeAction::Run installs its own bridge.log subscriber via
+                // hole_bridge::logging::init, so we use the macro freely here
+                // — the tracing call routes through that subscriber.
+                cli_log!(error, "bridge error: {e}");
                 return 1;
             }
             0
         }
         BridgeAction::Install => {
             if let Err(e) = crate::setup::install_bridge() {
-                eprintln!("bridge install failed: {e}");
+                cli_log!(error, "bridge install failed: {e}");
                 return 1;
             }
             0
         }
         BridgeAction::Uninstall => {
             if let Err(e) = crate::setup::uninstall_bridge() {
-                eprintln!("bridge uninstall failed: {e}");
+                cli_log!(error, "bridge uninstall failed: {e}");
                 return 1;
             }
             0
@@ -276,7 +317,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
                 Ok(request) => send_bridge_request(request),
                 Err(e) => {
-                    eprintln!("{e}");
+                    cli_log!(error, "{e}");
                     1
                 }
             },
@@ -382,7 +423,7 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
     // Create group + add user + (on Windows) write installer SID file.
     if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
-        eprintln!("failed to prepare IPC access: {e}");
+        cli_log!(error, "failed to prepare IPC access: {e}");
         return 1;
     }
 
@@ -398,17 +439,20 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
                     Ok(user_sid) => {
                         let sddl = hole_bridge::ipc::build_sddl(&[&user_sid]);
                         if let Err(e) = hole_bridge::ipc::set_dacl_from_sddl(&socket_path, &sddl, false) {
-                            eprintln!("warning: failed to update live socket DACL: {e}");
+                            cli_log!(warn, "warning: failed to update live socket DACL: {e}");
                         } else {
-                            eprintln!("updated live socket DACL with user SID");
+                            cli_log!(info, "updated live socket DACL with user SID");
                         }
                     }
                     Err(e) => {
-                        eprintln!("warning: could not look up user SID: {e}");
+                        cli_log!(warn, "warning: could not look up user SID: {e}");
                     }
                 },
                 Err(e) => {
-                    eprintln!("warning: could not determine installing user for live DACL update: {e}");
+                    cli_log!(
+                        warn,
+                        "warning: could not determine installing user for live DACL update: {e}"
+                    );
                 }
             }
         }
@@ -420,7 +464,7 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
         (_, Some(path)) => match crate::elevation::read_request_file(&path) {
             Ok(request) => send_bridge_request(request),
             Err(e) => {
-                eprintln!("{e}");
+                cli_log!(error, "{e}");
                 1
             }
         },
@@ -436,7 +480,7 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("invalid base64: {e}");
+            cli_log!(error, "invalid base64: {e}");
             return 1;
         }
     };
@@ -445,7 +489,7 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     let request: BridgeRequest = match serde_json::from_slice(&json_bytes) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("invalid request JSON: {e}");
+            cli_log!(error, "invalid request JSON: {e}");
             return 1;
         }
     };
@@ -463,7 +507,7 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
         let mut client = match crate::bridge_client::BridgeClient::connect(&socket_path).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("failed to connect to bridge: {e}");
+                cli_log!(error, "failed to connect to bridge: {e}");
                 return 1;
             }
         };
@@ -475,11 +519,11 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
             Ok(BridgeResponse::Diagnostics { .. }) => 0,
             Ok(BridgeResponse::PublicIp { .. }) => 0,
             Ok(BridgeResponse::Error { message }) => {
-                eprintln!("bridge error: {message}");
+                cli_log!(error, "bridge error: {message}");
                 1
             }
             Err(e) => {
-                eprintln!("communication error: {e}");
+                cli_log!(error, "communication error: {e}");
                 1
             }
         }
@@ -490,14 +534,14 @@ fn handle_path(action: PathAction) -> i32 {
     match action {
         PathAction::Add => {
             if let Err(e) = crate::path_management::add() {
-                eprintln!("path add failed: {e}");
+                cli_log!(error, "path add failed: {e}");
                 return 1;
             }
             0
         }
         PathAction::Remove => {
             if let Err(e) = crate::path_management::remove() {
-                eprintln!("path remove failed: {e}");
+                cli_log!(error, "path remove failed: {e}");
                 return 1;
             }
             0

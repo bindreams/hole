@@ -4,6 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
@@ -123,6 +124,21 @@ function setupEventListeners() {
 // Initialization ======================================================================================================
 
 async function init() {
+  // Wire the webview into the Rust log pipeline BEFORE anything else so the
+  // subsequent console.error/warn calls are captured, and `window.onerror` /
+  // `window.onunhandledrejection` route through tracing too. The plugin is
+  // registered on the Rust side in main.rs with `.skip_logger()` so JS log
+  // events flow through `log` → `tracing-log::LogTracer` → `gui.log`.
+  await attachConsole();
+
+  window.addEventListener("error", (e) => {
+    logError(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const reason = e.reason instanceof Error ? `${e.reason.message}\n${e.reason.stack ?? ""}` : String(e.reason);
+    logError(`unhandledrejection: ${reason}`);
+  });
+
   // Initialize UI modules.
   initSections();
   initServers();

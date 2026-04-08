@@ -5,6 +5,8 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod bridge_client;
+#[macro_use]
+mod cli_log;
 mod cli;
 mod commands;
 mod elevation;
@@ -53,6 +55,15 @@ fn launch_gui(show_dashboard: bool) {
             None,
         ))
         .plugin(tauri_plugin_dialog::init())
+        // `.skip_logger()` is critical: `tracing-subscriber 0.3`'s default
+        // features include `tracing-log`, which installs `LogTracer` as the
+        // global `log` dispatcher during `try_init` above. `tauri-plugin-log`
+        // by default *also* calls `log::set_boxed_logger`, which would
+        // collide — a second install fails. `skip_logger` makes the plugin
+        // only handle JS→Rust IPC: incoming JS `info!`/`error!` calls become
+        // Rust `log::*` events that flow through `LogTracer` into our
+        // existing `tracing` subscriber → `gui.log`.
+        .plugin(tauri_plugin_log::Builder::new().skip_logger().build())
         .manage(AppState::new(config_path))
         .manage(hole_gui::update::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
