@@ -84,6 +84,7 @@ fn launch_gui(show_dashboard: bool) {
             commands::test_server,
             commands::mark_validated_by_proxy_start,
             tray::toggle_proxy,
+            tray::cancel_proxy,
         ])
         .setup(move |app| {
             // Manage shared state here (instead of pre-`.setup()`) so that

@@ -53,11 +53,7 @@ impl AppState {
 
         // Lazy connect
         if guard.is_none() {
-            let socket_path = std::env::var("HOLE_BRIDGE_SOCKET")
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
-            let connect_result = BridgeClient::connect(&socket_path).await;
+            let connect_result = BridgeClient::connect(&resolve_bridge_socket_path()).await;
 
             match connect_result {
                 Ok(client) => *guard = Some(client),
@@ -84,4 +80,29 @@ impl AppState {
             }
         }
     }
+
+    /// Send a request over a fresh, single-use bridge connection that
+    /// bypasses the pooled `BridgeClient`. This exists specifically so
+    /// `BridgeRequest::Cancel` can race an in-flight request on the main
+    /// connection: `bridge_send` holds `self.bridge.lock().await` for the
+    /// entire duration of each request, which would otherwise block a
+    /// concurrent cancel until the request it is trying to cancel finishes.
+    ///
+    /// Unix-domain-socket connect latency is sub-millisecond, so the
+    /// per-call overhead is negligible. Use sparingly — the pooled client
+    /// is still the right choice for normal request traffic.
+    pub async fn bridge_send_oneshot(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
+        let mut client = BridgeClient::connect(&resolve_bridge_socket_path()).await?;
+        client.send(req).await
+    }
+}
+
+/// Resolve the bridge socket path from `HOLE_BRIDGE_SOCKET` or the
+/// platform default. Extracted so `bridge_send` and `bridge_send_oneshot`
+/// stay in sync.
+fn resolve_bridge_socket_path() -> PathBuf {
+    std::env::var("HOLE_BRIDGE_SOCKET")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(hole_common::protocol::default_bridge_socket_path)
 }

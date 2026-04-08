@@ -3,11 +3,31 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
-use hole_common::protocol::{BridgeRequest, BridgeResponse};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
+use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tracing::{error, info, warn};
+
+// ToggleOutcome =======================================================================================================
+
+/// Result of a `set_proxy_enabled` call, distinguishing an ordinary
+/// state transition from a user-initiated cancellation of a Start.
+/// The frontend maps these variants to its own state machine (see
+/// `ui/connection-state.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToggleOutcome {
+    /// Proxy is now running.
+    Running,
+    /// Proxy is now stopped.
+    Stopped,
+    /// The Start was cancelled via `cancel_proxy` before it could finish;
+    /// proxy is back in the Stopped state. Never returned by
+    /// `set_proxy_enabled(false)` — stop is not cancellable.
+    Cancelled,
+}
 
 // Menu IDs ============================================================================================================
 
@@ -181,17 +201,27 @@ fn revert_proxy_state(app: &AppHandle, enabled: bool) {
     rebuild_tray_menu(app);
 }
 
-/// Set the proxy to the given enabled state. Returns the new state on success.
+/// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
+/// describing whether the proxy ended up Running, Stopped, or the Start
+/// was Cancelled before it could complete (only when `enabled == true`).
 ///
-/// On failure, reverts config + tray state and returns an error message.
+/// On bridge errors that are NOT a cancellation, reverts config + tray
+/// state and returns an error message. On `Cancelled`, reverts config
+/// back to `false` — the optimistic `config.enabled = true` flip is
+/// rolled back so the persisted state matches reality.
 /// Used by both the tray Enable checkbox and the frontend toggle button.
-pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
     let proxy_config = {
         let mut config = state.config.lock().unwrap();
         if config.enabled == enabled {
-            return Ok(enabled); // Already in the desired state (concurrent toggle)
+            // Already in the desired state (concurrent toggle).
+            return Ok(if enabled {
+                ToggleOutcome::Running
+            } else {
+                ToggleOutcome::Stopped
+            });
         }
         config.enabled = enabled;
         config.save(&state.config_path).ok();
@@ -200,7 +230,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
 
     set_tray_icon(app, enabled);
 
-    let result = if enabled {
+    let result: Result<ToggleOutcome, String> = if enabled {
         let Some(proxy_config) = proxy_config else {
             revert_proxy_state(app, false);
             return Err("No server is selected. Open the Dashboard and select a server before connecting.".into());
@@ -210,11 +240,15 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
         match state.bridge_send(request.clone()).await {
             Ok(BridgeResponse::Ack) => {
                 info!("proxy started");
-                Ok(true)
+                Ok(ToggleOutcome::Running)
+            }
+            Ok(BridgeResponse::Error { message }) if message == CANCELLED_MESSAGE => {
+                info!("proxy start cancelled");
+                Ok(ToggleOutcome::Cancelled)
             }
             Ok(BridgeResponse::Error { message }) if message.contains("already running") => {
                 info!("proxy already running");
-                Ok(true)
+                Ok(ToggleOutcome::Running)
             }
             Ok(BridgeResponse::Error { message }) => {
                 error!("bridge error: {message}");
@@ -226,7 +260,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
             }
             Err(crate::bridge_client::ClientError::PermissionDenied) => {
                 if crate::elevation::prompt_elevation(app, request).await {
-                    Ok(true)
+                    Ok(ToggleOutcome::Running)
                 } else {
                     Err("Elevation was denied or failed".into())
                 }
@@ -241,7 +275,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
         match state.bridge_send(request.clone()).await {
             Ok(BridgeResponse::Ack) => {
                 info!("proxy stopped");
-                Ok(false)
+                Ok(ToggleOutcome::Stopped)
             }
             Ok(BridgeResponse::Error { message }) => {
                 error!("bridge error: {message}");
@@ -253,7 +287,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
             }
             Err(crate::bridge_client::ClientError::PermissionDenied) => {
                 if crate::elevation::prompt_elevation(app, request).await {
-                    Ok(false)
+                    Ok(ToggleOutcome::Stopped)
                 } else {
                     Err("Elevation was denied or failed".into())
                 }
@@ -266,7 +300,14 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<bool, S
     };
 
     match &result {
-        Ok(_) => rebuild_tray_menu(app),
+        Ok(ToggleOutcome::Running | ToggleOutcome::Stopped) => rebuild_tray_menu(app),
+        Ok(ToggleOutcome::Cancelled) => {
+            // The user cancelled the Start. Roll back the optimistic
+            // `config.enabled = true` flip so persisted state matches
+            // reality, and rebuild the menu with enabled=false.
+            debug_assert!(enabled, "Cancelled outcome only possible on Start");
+            revert_proxy_state(app, false);
+        }
         Err(_) => revert_proxy_state(app, !enabled),
     }
 
@@ -304,9 +345,20 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
                 let enabled = !state.config.lock().unwrap().enabled;
-                if let Err(msg) = set_proxy_enabled(&app_handle, enabled).await {
-                    use tauri_plugin_dialog::DialogExt;
-                    app_handle.dialog().message(msg).title("Error").blocking_show();
+                match set_proxy_enabled(&app_handle, enabled).await {
+                    Ok(ToggleOutcome::Running) | Ok(ToggleOutcome::Stopped) => { /* menu already rebuilt */ }
+                    Ok(ToggleOutcome::Cancelled) => {
+                        // Tray never initiates Cancel itself, so this is an
+                        // observer effect: the frontend cancelled while the
+                        // tray-triggered Start was still in flight. The
+                        // config has already been reverted by
+                        // set_proxy_enabled. Nothing to do here.
+                        info!("tray: start was cancelled externally");
+                    }
+                    Err(msg) => {
+                        use tauri_plugin_dialog::DialogExt;
+                        app_handle.dialog().message(msg).title("Error").blocking_show();
+                    }
                 }
             });
         }
@@ -712,11 +764,32 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
 
 // Tauri commands ======================================================================================================
 
-/// Toggle the proxy on/off. Returns `true` if proxy is now enabled, `false` if disabled.
+/// Toggle the proxy on/off. Returns a `ToggleOutcome` describing the
+/// resulting state (Running / Stopped / Cancelled). The frontend
+/// distinguishes the three cases in its connection state machine.
 #[tauri::command]
-pub async fn toggle_proxy(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+pub async fn toggle_proxy(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ToggleOutcome, String> {
     let enabled = !state.config.lock().unwrap().enabled;
     set_proxy_enabled(&app, enabled).await
+}
+
+/// Cancel an in-flight proxy start. Uses `bridge_send_oneshot` so the
+/// cancel can race an in-flight `toggle_proxy` on the main pooled
+/// bridge connection. Always returns `Ok(())` on a successful bridge
+/// round-trip — the bridge's `/v1/cancel` route is idempotent.
+#[tauri::command]
+pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    match state.bridge_send_oneshot(BridgeRequest::Cancel).await {
+        Ok(BridgeResponse::Ack) => Ok(()),
+        Ok(other) => {
+            warn!("unexpected response to Cancel: {other:?}");
+            Err("Unexpected response from bridge".into())
+        }
+        Err(e) => {
+            error!("failed to send cancel: {e}");
+            Err(format!("Failed to cancel: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]

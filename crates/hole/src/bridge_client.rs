@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, PublicIpResponse,
-    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP,
-    ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
+    ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -103,6 +103,14 @@ impl BridgeClient {
             }
             BridgeRequest::Stop => {
                 let resp = self.http_post(ROUTE_STOP, Vec::new()).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
+            BridgeRequest::Cancel => {
+                let resp = self.http_post(ROUTE_CANCEL, Vec::new()).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {

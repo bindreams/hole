@@ -1,5 +1,6 @@
 // IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
+use crate::proxy::ProxyError;
 use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
@@ -8,8 +9,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, PublicIpResponse, StatusResponse,
-    TestServerRequest, TestServerResponse, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_PUBLIC_IP, ROUTE_RELOAD,
-    ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    TestServerRequest, TestServerResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
+    ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 #[allow(unused_imports)]
 use tracing::warn;
@@ -25,10 +27,30 @@ use tracing::{debug, error, info};
 
 // IPC state ===========================================================================================================
 
-/// Shared state for IPC handlers, holding the proxy manager and an IP cache.
+/// State for tracking the in-flight start's cancellation token, plus a
+/// "pre-armed" flag that consumes a Cancel arriving before any Start has
+/// registered its token. Held in a `std::sync::Mutex` because all access is
+/// a trivial read/write of a small struct, never held across `.await`, and
+/// the sync lock avoids any coupling with the async proxy mutex.
+#[derive(Default)]
+pub struct StartCancelState {
+    /// Token of the currently-in-flight start, if any. Set by `handle_start`
+    /// before calling `pm.start_cancellable`; cleared on exit.
+    pub token: Option<CancellationToken>,
+    /// Cancel request arrived while no start was in flight. Consumed by the
+    /// very next `handle_start` invocation, which returns `Cancelled`
+    /// without even attempting to start. Handles the race where a cancel
+    /// reaches the bridge before `handle_start` has stored its token.
+    pub pending: bool,
+}
+
+/// Shared state for IPC handlers, holding the proxy manager, IP cache, and
+/// the start-cancellation handoff struct.
 pub struct IpcState<B: ProxyBackend> {
     pub proxy: Arc<Mutex<ProxyManager<B>>>,
     pub ip_cache: Arc<tokio::sync::Mutex<Option<(PublicIpResponse, Instant)>>>,
+    // std::sync::Mutex — never held across .await. See StartCancelState docs.
+    pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
 }
 
 /// IP cache time-to-live.
@@ -64,6 +86,7 @@ impl IpcServer {
         let state = Arc::new(IpcState {
             proxy,
             ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         });
         let router = build_router(state);
         Ok(Self {
@@ -79,6 +102,27 @@ impl IpcServer {
         let stream = self.listener.accept().await?;
         // Connection errors (client disconnect, shutdown) are non-fatal.
         let _ = serve_connection(TokioIo::new(stream), self.router.clone()).await;
+        Ok(())
+    }
+
+    /// Accept exactly `n` client connections (in parallel), then return when
+    /// all have finished. Test-only helper used by the cancellation tests
+    /// that need multiple concurrent connections — using `run()` indefinitely
+    /// adds noticeable accept-poll churn on Windows (50 ms `spawn_blocking`
+    /// loop) which can starve other parallel tests on slow CI runners.
+    /// Bounding the accept loop to exactly `n` iterations keeps the test
+    /// runtime cheap and predictable.
+    #[cfg(test)]
+    pub async fn run_n(self, n: usize) -> std::io::Result<()> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let stream = self.listener.accept().await?;
+            let router = self.router.clone();
+            tasks.spawn(async move {
+                let _ = serve_connection(TokioIo::new(stream), router).await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -147,6 +191,7 @@ fn build_router<B: ProxyBackend + 'static>(state: Arc<IpcState<B>>) -> axum::Rou
         .route(ROUTE_STATUS, axum::routing::get(handle_status::<B>))
         .route(ROUTE_START, axum::routing::post(handle_start::<B>))
         .route(ROUTE_STOP, axum::routing::post(handle_stop::<B>))
+        .route(ROUTE_CANCEL, axum::routing::post(handle_cancel::<B>))
         .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<B>))
         .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<B>))
         .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<B>))
@@ -172,9 +217,65 @@ async fn handle_start<B: ProxyBackend + 'static>(
     State(state): State<Arc<IpcState<B>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = state.proxy.lock().await;
-    match pm.start(&config).await {
+    // Register the cancellation token BEFORE taking the proxy mutex. If a
+    // pre-armed cancel is already queued, consume it and return immediately
+    // without even attempting the start. If a concurrent start is already
+    // in flight, reject this one — the slot is single-occupancy because a
+    // Cancel targets exactly one in-flight start.
+    let token = CancellationToken::new();
+    {
+        let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
+        if cs.pending {
+            cs.pending = false;
+            info!("start request consumed pre-armed cancel");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: CANCELLED_MESSAGE.to_string(),
+                }),
+            ));
+        }
+        if cs.token.is_some() {
+            // A previous handle_start has already registered its token but
+            // not yet cleared it (still running or blocked on proxy.lock()).
+            // Overwriting the slot would orphan the earlier start from any
+            // future Cancel — the Cancel would signal this new token
+            // instead — so we reject the duplicate with 409 Conflict rather
+            // than silently corrupting the slot.
+            warn!("concurrent start request rejected — another start is already in flight");
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "start already in progress".to_string(),
+                }),
+            ));
+        }
+        debug_assert!(cs.token.is_none(), "start_cancel token slot invariant");
+        cs.token = Some(token.clone());
+    }
+
+    let result = {
+        let mut pm = state.proxy.lock().await;
+        pm.start_cancellable(&config, token).await
+    };
+
+    // Clear the token slot regardless of outcome so the next start starts
+    // with a clean slate. A Cancel arriving during this tiny window between
+    // start_cancellable returning and us clearing the slot would cancel a
+    // token that is already done — harmless.
+    {
+        let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
+        cs.token = None;
+    }
+
+    match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
+        Err(ProxyError::Cancelled) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: CANCELLED_MESSAGE.to_string(),
+            }),
+        )),
         Err(e) => {
             error!(error = %e, "proxy start failed");
             Err((
@@ -183,6 +284,21 @@ async fn handle_start<B: ProxyBackend + 'static>(
             ))
         }
     }
+}
+
+/// Signal the in-flight start's `CancellationToken` if one is registered,
+/// or pre-arm a cancel for the next start otherwise. Always 200 Ack — the
+/// client's intent is recorded regardless.
+async fn handle_cancel<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<EmptyResponse> {
+    let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
+    if let Some(t) = &cs.token {
+        info!("cancelling in-flight proxy start");
+        t.cancel();
+    } else {
+        info!("no start in flight — pre-arming cancel for next start");
+        cs.pending = true;
+    }
+    Json(EmptyResponse {})
 }
 
 async fn handle_stop<B: ProxyBackend + 'static>(

@@ -1,15 +1,35 @@
 // Proxy lifecycle manager — start/stop/reload orchestration.
 
 use crate::gateway::GatewayInfo;
+use crate::guards::{StateFileGuard, TaskHandleGuard};
 use crate::proxy::{build_ss_config, ProxyError, TUN_DEVICE_NAME};
 use crate::routing::RouteGuard;
 use hole_common::protocol::ProxyConfig;
 use shadowsocks_service::config::Config;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+// StartedState ========================================================================================================
+
+/// Everything `start_inner` produces on success. Held by value until the
+/// outer `start` commits it into `self`, so that cancelling `start_inner`
+/// mid-flight (dropping the future) runs every guard's `Drop` without ever
+/// touching the `ProxyManager` fields.
+///
+/// `route_guard` and `server_ip` are `Option`s because backends that return
+/// `false` from `installs_routes()` (e.g. `SocksOnlyBackend` in tests) skip
+/// the entire DNS-resolution / gateway-detection / route-installation
+/// pipeline.
+struct StartedState {
+    task_handle: JoinHandle<std::io::Result<()>>,
+    route_guard: Option<RouteGuard>,
+    server_ip: Option<IpAddr>,
+    started_at: Instant,
+}
 
 // State ===============================================================================================================
 
@@ -137,122 +157,195 @@ impl<B: ProxyBackend> ProxyManager<B> {
         self.last_error.as_deref()
     }
 
+    /// Non-cancellable convenience wrapper around `start_cancellable`.
+    /// Equivalent to passing a fresh, never-signaled `CancellationToken`.
+    /// Used by existing callers (tests, `reload`) that don't need cancel
+    /// semantics.
     pub async fn start(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
+        self.start_cancellable(config, CancellationToken::new()).await
+    }
+
+    /// Start the proxy with a caller-supplied `CancellationToken`. Signaling
+    /// the token at any point during `start_inner` returns
+    /// `Err(ProxyError::Cancelled)` and rolls back partial state (via the
+    /// RAII guards inside `start_inner`) without mutating `self`.
+    ///
+    /// Three race scenarios are handled correctly:
+    ///
+    /// 1. **Cancel before any `start_inner` await.** `tokio::select!` with
+    ///    `biased;` polls the cancel branch first, so an already-cancelled
+    ///    token returns `Cancelled` without invoking `start_inner` at all.
+    /// 2. **Cancel mid-flight.** `select!` drops the `start_inner` future,
+    ///    which runs every live RAII guard's `Drop` in reverse-declaration
+    ///    order — the ss task is aborted, the route-state file is cleared,
+    ///    and (if `setup_routes` had already committed) routes are torn
+    ///    down by `RouteGuard::drop`.
+    /// 3. **Cancel right after `start_inner` returns `Ok(started)`.** Commit
+    ///    to `self` happens in this outer function AFTER `select!` has
+    ///    already yielded `Ok(started)`, so the late cancel cannot race the
+    ///    commit. The started proxy is left running; the client sees
+    ///    `Ok(())`. A caller that wanted to cancel that late can follow up
+    ///    with an explicit stop.
+    pub async fn start_cancellable(
+        &mut self,
+        config: &ProxyConfig,
+        cancel: CancellationToken,
+    ) -> Result<(), ProxyError> {
         if self.state == ProxyState::Running {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // Build shadowsocks config
-        let ss_config = build_ss_config(config).inspect_err(|e| {
-            self.last_error = Some(e.to_string());
-        })?;
-
-        // Routing prerequisites: only resolve / detect / persist when the
-        // backend actually installs routes. Test backends that want to skip
-        // host-state mutation (see SocksOnlyBackend) override
-        // `installs_routes` to `false` and the entire block below is
-        // bypassed — including wintun preload, DNS resolution, gateway
-        // detection, state-file persistence, and `setup_routes`. The
-        // matching cleanup in `stop()` is handled by the absence of a
-        // `RouteGuard`.
-        let route_setup = if self.backend.installs_routes() {
-            // Pre-load wintun.dll explicitly so we can give a descriptive
-            // error if it's missing. shadowsocks-service uses the bare
-            // "wintun.dll" name via tun-0.8.6, which becomes LoadLibraryExW
-            // with default search order. By loading the DLL here first
-            // (with an absolute path), the OS loader-table services the
-            // later bare-name lookup from the same process via base-name
-            // dedup. See crates/bridge/src/wintun.rs.
-            //
-            // No routes have been touched yet at this point, so we don't
-            // need to roll anything back — just record last_error and
-            // return like the build_ss_config path above.
-            #[cfg(target_os = "windows")]
-            crate::wintun::ensure_loaded().inspect_err(|e| {
-                self.last_error = Some(e.to_string());
-            })?;
-
-            // Resolve server hostname to IP
-            let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
-                .await
-                .inspect_err(|e| {
-                    self.last_error = Some(e.to_string());
-                })?;
-
-            // Detect default gateway and interface
-            let gw_info = self.backend.default_gateway().inspect_err(|e| {
-                self.last_error = Some(e.to_string());
-            })?;
-
-            // CRITICAL ORDERING: persist the route-recovery state BEFORE any
-            // routing mutation. A panic/SIGKILL between setup_routes and
-            // construction of the RouteGuard would otherwise leak routes with
-            // no on-disk record, defeating crash recovery on next startup.
-            let persisted_state = crate::route_state::RouteState {
-                version: crate::route_state::SCHEMA_VERSION,
-                tun_name: TUN_DEVICE_NAME.to_owned(),
-                server_ip,
-                interface_name: gw_info.interface_name.clone(),
-            };
-            if let Err(e) = crate::route_state::save(&self.state_dir, &persisted_state) {
-                let msg = format!("failed to persist route-state: {e}");
-                self.last_error = Some(msg.clone());
-                return Err(ProxyError::RouteSetup(msg));
-            }
-
-            Some((server_ip, gw_info))
-        } else {
-            None
+        // Run start_inner in a select! against the cancel token. Note that
+        // start_inner is a free associated function — it does NOT touch
+        // `self`, so dropping the future leaves `self` untouched. All
+        // partial state is owned by RAII guards inside start_inner and
+        // cleans up on drop.
+        let result: Result<StartedState, ProxyError> = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ProxyError::Cancelled),
+            r = Self::start_inner(&self.backend, config, &self.state_dir) => r,
         };
 
-        // Start shadowsocks-service (no route mutation yet). On failure,
-        // clear the state file we just wrote — no routes were installed
-        // and a stale file would only mislead the next recover_routes.
-        let handle = match self.backend.start_ss(ss_config).await {
-            Ok(h) => h,
+        // Commit (or record the error) in the outer function, so the only
+        // path that mutates `self.state = Running` is strictly after the
+        // select! has completed successfully.
+        match result {
+            Ok(started) => {
+                self.task_handle = Some(started.task_handle);
+                // route_guard / server_ip are Option<_> because
+                // installs_routes()=false backends skip them.
+                self.route_guard = started.route_guard;
+                self.server_ip = started.server_ip;
+                self.started_at = Some(started.started_at);
+                self.last_error = None;
+                self.state = ProxyState::Running;
+                info!(server_ip = ?self.server_ip, "proxy started");
+                Ok(())
+            }
+            Err(ProxyError::Cancelled) => {
+                // Do NOT set last_error on cancel — the user asked for it.
+                info!("proxy start cancelled");
+                Err(ProxyError::Cancelled)
+            }
             Err(e) => {
                 self.last_error = Some(e.to_string());
-                if route_setup.is_some() {
-                    let _ = crate::route_state::clear(&self.state_dir);
-                }
-                return Err(e);
+                Err(e)
             }
-        };
+        }
+    }
 
-        if let Some((server_ip, gw_info)) = &route_setup {
-            // Set up routes — if this fails, roll back: abort ss,
-            // defensively tear down any partial route state, and clear the
-            // state file so we return to a clean Stopped with no stale
-            // on-disk artifacts.
-            if let Err(e) =
-                self.backend
-                    .setup_routes(TUN_DEVICE_NAME, *server_ip, gw_info.gateway_ip, &gw_info.interface_name)
-            {
-                handle.abort();
-                let _ = self
-                    .backend
-                    .teardown_routes(TUN_DEVICE_NAME, *server_ip, &gw_info.interface_name);
-                let _ = crate::route_state::clear(&self.state_dir);
-                self.last_error = Some(e.to_string());
-                return Err(e);
-            }
+    /// Produce a `StartedState` without touching `self`. All partial
+    /// state is owned by local RAII guards so that dropping this future
+    /// at any `.await` point unwinds cleanly:
+    ///
+    /// 1. `StateFileGuard` — clears `bridge-routes.json` if dropped
+    ///    before `RouteGuard` takes over state-file cleanup.
+    /// 2. `TaskHandleGuard` — aborts the shadowsocks-service task if
+    ///    dropped before commit.
+    /// 3. `RouteGuard` — on drop tears down routes AND clears the state
+    ///    file (`RouteGuard::drop` handles both), so once it is
+    ///    constructed, `StateFileGuard` is committed to avoid a
+    ///    double-clear race.
+    ///
+    /// CRITICAL ORDERING: the route-state file is persisted BEFORE any
+    /// routing mutation. A panic or SIGKILL between `setup_routes` and
+    /// `RouteGuard` construction would otherwise leak routes with no
+    /// on-disk record, defeating crash recovery on next startup. The
+    /// guard discipline above maintains this invariant under drop as
+    /// well as under explicit error returns.
+    ///
+    /// When `backend.installs_routes()` returns `false` (test backends
+    /// like `SocksOnlyBackend`), the entire wintun-preload / DNS /
+    /// gateway / state-file / `setup_routes` / `RouteGuard` pipeline is
+    /// skipped — `start_ss` is the only side effect. The returned
+    /// `StartedState` carries `route_guard: None` and `server_ip: None`.
+    async fn start_inner(backend: &B, config: &ProxyConfig, state_dir: &Path) -> Result<StartedState, ProxyError> {
+        // Build shadowsocks config (sync, no partial state).
+        let ss_config: Config = build_ss_config(config)?;
 
-            self.route_guard = Some(RouteGuard::new(
-                TUN_DEVICE_NAME.to_owned(),
-                *server_ip,
-                gw_info.interface_name.clone(),
-                self.state_dir.clone(),
-            ));
-            self.server_ip = Some(*server_ip);
+        if !backend.installs_routes() {
+            // No-routing path. Just start the shadowsocks task; nothing
+            // to roll back on failure beyond the task itself, which
+            // tokio will tear down via the runtime drop if the future
+            // is cancelled.
+            let task_handle = backend.start_ss(ss_config).await?;
+            return Ok(StartedState {
+                task_handle,
+                route_guard: None,
+                server_ip: None,
+                started_at: Instant::now(),
+            });
         }
 
-        self.task_handle = Some(handle);
-        self.started_at = Some(Instant::now());
-        self.last_error = None;
-        self.state = ProxyState::Running;
+        // Pre-load wintun.dll explicitly so we can give a descriptive
+        // error if it's missing. shadowsocks-service uses the bare
+        // "wintun.dll" name via tun-0.8.6, which becomes LoadLibraryExW
+        // with default search order. By loading the DLL here first
+        // (with an absolute path), the OS loader-table services the
+        // later bare-name lookup from the same process via base-name
+        // dedup. See crates/bridge/src/wintun.rs.
+        //
+        // No routes have been touched yet at this point, so we don't
+        // need to roll anything back on failure.
+        #[cfg(target_os = "windows")]
+        crate::wintun::ensure_loaded()?;
 
-        info!(server_ip = ?self.server_ip, "proxy started");
-        Ok(())
+        // Resolve server hostname to IP.
+        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
+
+        // Detect default gateway and interface.
+        let gw_info = backend.default_gateway()?;
+
+        // Persist the route-recovery state. From here on, if the future
+        // is dropped or an error is returned, `StateFileGuard::drop`
+        // clears the file.
+        let persisted_state = crate::route_state::RouteState {
+            version: crate::route_state::SCHEMA_VERSION,
+            tun_name: TUN_DEVICE_NAME.to_owned(),
+            server_ip,
+            interface_name: gw_info.interface_name.clone(),
+        };
+        crate::route_state::save(state_dir, &persisted_state)
+            .map_err(|e| ProxyError::RouteSetup(format!("failed to persist route-state: {e}")))?;
+        let state_file_guard = StateFileGuard::new(state_dir.to_owned());
+
+        // Start shadowsocks-service (no route mutation yet). Wrap in a
+        // TaskHandleGuard so the spawned task is aborted if we drop or
+        // return an error before commit.
+        let task_guard = TaskHandleGuard::new(backend.start_ss(ss_config).await?);
+
+        // Set up routes. On failure both `task_guard` and
+        // `state_file_guard` are dropped in reverse-declaration order,
+        // cleaning up the ss task and the state file. `teardown_routes`
+        // is NOT called explicitly: if `setup_routes` itself fails,
+        // nothing has been installed; if it partially installed and
+        // then errored, the backend is expected to clean up its own
+        // partial state (the existing contract — see `RealBackend`).
+        backend.setup_routes(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+
+        // Routes are installed. RouteGuard takes over both route
+        // teardown and state-file clearing (see RouteGuard::drop), so
+        // disarm StateFileGuard to avoid double-clearing the file on
+        // success paths.
+        let route_guard = RouteGuard::new(
+            TUN_DEVICE_NAME.to_owned(),
+            server_ip,
+            gw_info.interface_name,
+            state_dir.to_owned(),
+        );
+        state_file_guard.commit();
+
+        // Extract the task handle from the guard now that routes are
+        // committed. The handle moves into StartedState and will be
+        // owned by the ProxyManager after the outer `start` commits.
+        let task_handle = task_guard.commit();
+
+        Ok(StartedState {
+            task_handle,
+            route_guard: Some(route_guard),
+            server_ip: Some(server_ip),
+            started_at: Instant::now(),
+        })
     }
 
     pub async fn stop(&mut self) -> Result<(), ProxyError> {
