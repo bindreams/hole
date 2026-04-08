@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// Initialize GUI logging (stderr + size-rotated file).
 pub fn init(log_dir: &Path) -> LogGuard {
-    hole_common::logging::init(log_dir, "gui.log", "hole_gui=info")
+    hole_common::logging::init(log_dir, "gui.log", "hole=info")
 }
 
 #[cfg(test)]

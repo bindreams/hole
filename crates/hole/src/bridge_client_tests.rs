@@ -14,7 +14,7 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 fn test_socket_path(suffix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("hole-gui-test-{}-{suffix}.sock", std::process::id()))
+    std::env::temp_dir().join(format!("hole-test-{}-{suffix}.sock", std::process::id()))
 }
 
 /// Spawn a mock HTTP bridge that responds to requests with canned responses.

@@ -27,6 +27,10 @@ pub enum ProxyError {
     RouteSetup(String),
     #[error("proxy already running")]
     AlreadyRunning,
+    #[error("wintun.dll not found (tried: {})", .tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
+    WintunMissing { tried: Vec<PathBuf> },
+    #[error("wintun.dll load failed at {}: {message}", .path.display())]
+    WintunLoad { path: PathBuf, message: String },
 }
 
 // Config builder ======================================================================================================

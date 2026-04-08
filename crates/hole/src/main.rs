@@ -90,14 +90,14 @@ fn launch_gui(show_dashboard: bool) {
             // `AppState` has access to a real `tauri::AppHandle` for emitting
             // events from commands like `test_server`.
             app.manage(AppState::new(config_path.clone(), app.handle().clone()));
-            app.manage(hole_gui::update::UpdateState::default());
+            app.manage(hole::update::UpdateState::default());
             tray::create_tray(app)?;
             platform::on_setup(app)?;
             if show_dashboard {
                 tray::open_settings_window(app.handle());
             }
             setup::check_bridge_on_launch(app.handle().clone());
-            hole_gui::update::start_update_checker(app.handle().clone(), |app, info| {
+            hole::update::start_update_checker(app.handle().clone(), |app, info| {
                 // Rebuild tray menu to include the "Install Update" item.
                 if let Some(tray_icon) = app.tray_by_id("main") {
                     let enabled = app.state::<AppState>().config.lock().unwrap().enabled;

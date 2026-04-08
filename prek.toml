@@ -32,8 +32,8 @@ pass_filenames = false
 [[repos.hooks]]
 id = "check-version"
 name = "check Cargo.toml version vs git tag"
-entry = "python scripts/check-version.py"
-language = "python"
+entry = "cargo xtask version --check"
+language = "system"
 pass_filenames = false
 always_run = true
 
