@@ -105,6 +105,27 @@ impl IpcServer {
         Ok(())
     }
 
+    /// Accept exactly `n` client connections (in parallel), then return when
+    /// all have finished. Test-only helper used by the cancellation tests
+    /// that need multiple concurrent connections — using `run()` indefinitely
+    /// adds noticeable accept-poll churn on Windows (50 ms `spawn_blocking`
+    /// loop) which can starve other parallel tests on slow CI runners.
+    /// Bounding the accept loop to exactly `n` iterations keeps the test
+    /// runtime cheap and predictable.
+    #[cfg(test)]
+    pub async fn run_n(self, n: usize) -> std::io::Result<()> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let stream = self.listener.accept().await?;
+            let router = self.router.clone();
+            tasks.spawn(async move {
+                let _ = serve_connection(TokioIo::new(stream), router).await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        Ok(())
+    }
+
     /// Run the server loop, accepting connections indefinitely.
     /// Each connection is handled in a separate task.
     pub async fn run(self) -> std::io::Result<()> {

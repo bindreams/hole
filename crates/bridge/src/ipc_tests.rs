@@ -792,7 +792,9 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         let path = test_socket_path("cancel-in-flight");
         let gate = Arc::new(tokio::sync::Notify::new());
         let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
-        let handle = tokio::spawn(async move { server.run().await });
+        // Bound the accept loop to exactly the two connections this test
+        // uses, instead of running indefinitely. See `run_n` docstring.
+        let handle = tokio::spawn(async move { server.run_n(2).await });
 
         // Connection A: owns its client end. Spawn a task that drives the
         // start request so this test task can issue a cancel concurrently.
@@ -826,13 +828,12 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             .expect("start task panicked");
         assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
 
-        // The gate is still held — release it before the server task is
-        // aborted so the waker inside the mock's `start_ss` is properly
-        // drained (the future was dropped by select!; notify_one on a
-        // dropped waker is a no-op, but this is harmless and leaves the
-        // mock in a well-defined state for any subsequent polling).
+        // Release the gate so the mock's start_ss future can settle if it
+        // is still parked anywhere; harmless no-op if already dropped.
         gate.notify_one();
-        handle.abort();
+        // run_n(2) returns naturally once both connections are handled, so
+        // no abort is needed — but use a bounded await to surface any leak.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
@@ -845,9 +846,9 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
     rt().block_on(async {
         let path = test_socket_path("cancel-prearm");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
-        let handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        // Single client connection — use run_once to avoid long-lived
+        // accept polling on Windows.
+        let handle = tokio::spawn(async move { server.run_once().await });
 
         let mut client = TestClient::connect(&path).await;
 
@@ -866,7 +867,7 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
@@ -877,9 +878,7 @@ fn cancel_with_no_start_is_ack_idempotent() {
     rt().block_on(async {
         let path = test_socket_path("cancel-noop");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
-        let handle = tokio::spawn(async move {
-            server.run().await.unwrap();
-        });
+        let handle = tokio::spawn(async move { server.run_once().await });
 
         let mut client = TestClient::connect(&path).await;
 
@@ -887,7 +886,7 @@ fn cancel_with_no_start_is_ack_idempotent() {
         assert_eq!(consume(post_cancel(&mut client).await).await, 200);
 
         drop(client);
-        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
@@ -902,7 +901,8 @@ fn concurrent_start_is_rejected_with_conflict() {
         let path = test_socket_path("concurrent-start");
         let gate = Arc::new(tokio::sync::Notify::new());
         let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
-        let handle = tokio::spawn(async move { server.run().await });
+        // 3 connections: A start, B start, C cancel.
+        let handle = tokio::spawn(async move { server.run_n(3).await });
 
         // Client A parks in start_ss.
         let path_a = path.clone();
@@ -944,7 +944,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
@@ -957,7 +957,8 @@ fn sequential_start_cancel_start_consumes_pre_arm_once() {
     rt().block_on(async {
         let path = test_socket_path("seq-start-cancel-start");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
-        let handle = tokio::spawn(async move { server.run().await.unwrap() });
+        // Single client connection — use run_once.
+        let handle = tokio::spawn(async move { server.run_once().await });
 
         let mut client = TestClient::connect(&path).await;
 
@@ -980,7 +981,7 @@ fn sequential_start_cancel_start_consumes_pre_arm_once() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
@@ -995,7 +996,8 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         let path = test_socket_path("double-cancel");
         let gate = Arc::new(tokio::sync::Notify::new());
         let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
-        let handle = tokio::spawn(async move { server.run().await });
+        // 3 connections: A start, B cancel, C cancel.
+        let handle = tokio::spawn(async move { server.run_n(3).await });
 
         // Client A parks in start_ss.
         let path_a = path.clone();
@@ -1031,7 +1033,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     });
 }
 
