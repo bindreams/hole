@@ -172,3 +172,97 @@ fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &P
         "missing path must map to Ok(false), not an error"
     );
 }
+
+// Proxy subcommand parsing ============================================================================================
+
+#[skuld::test]
+fn proxy_start_parses_with_required_args() {
+    let cli =
+        Cli::try_parse_from(["hole", "proxy", "start", "--config-file", "/tmp/cfg.json"]).expect("parse proxy start");
+    let Some(Command::Proxy {
+        action: ProxyAction::Start {
+            config_file,
+            local_port,
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Proxy::Start");
+    };
+    assert_eq!(config_file, std::path::PathBuf::from("/tmp/cfg.json"));
+    assert_eq!(local_port, 4073, "default local_port should be 4073");
+}
+
+#[skuld::test]
+fn proxy_start_accepts_custom_local_port() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "proxy",
+        "start",
+        "--config-file",
+        "/tmp/cfg.json",
+        "--local-port",
+        "40730",
+    ])
+    .expect("parse proxy start with custom port");
+    let Some(Command::Proxy {
+        action: ProxyAction::Start { local_port, .. },
+    }) = cli.command
+    else {
+        panic!("expected Command::Proxy::Start");
+    };
+    assert_eq!(local_port, 40730);
+}
+
+#[skuld::test]
+fn proxy_stop_takes_no_args() {
+    let cli = Cli::try_parse_from(["hole", "proxy", "stop"]).expect("parse proxy stop");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Proxy {
+            action: ProxyAction::Stop
+        })
+    ));
+}
+
+#[skuld::test]
+fn proxy_test_server_parses() {
+    let cli = Cli::try_parse_from(["hole", "proxy", "test-server", "--config-file", "/tmp/cfg.json"])
+        .expect("parse proxy test-server");
+    let Some(Command::Proxy {
+        action: ProxyAction::TestServer { config_file },
+    }) = cli.command
+    else {
+        panic!("expected Command::Proxy::TestServer");
+    };
+    assert_eq!(config_file, std::path::PathBuf::from("/tmp/cfg.json"));
+}
+
+#[skuld::test]
+fn proxy_start_requires_config_file_arg() {
+    // Missing --config-file is a clap-level parse error.
+    assert!(Cli::try_parse_from(["hole", "proxy", "start"]).is_err());
+}
+
+#[skuld::test]
+fn read_server_entry_file_parses_valid_json(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("entry.json");
+    std::fs::write(
+        &path,
+        r#"{"id":"x","name":"x","server":"127.0.0.1","server_port":8388,"method":"aes-256-gcm","password":"secret"}"#,
+    )
+    .unwrap();
+    let entry = super::read_server_entry_file(&path).expect("parse entry");
+    assert_eq!(entry.server, "127.0.0.1");
+    assert_eq!(entry.server_port, 8388);
+}
+
+#[skuld::test]
+fn read_server_entry_file_rejects_malformed_json(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("malformed.json");
+    std::fs::write(&path, b"{not valid json}").unwrap();
+    let err = super::read_server_entry_file(&path).expect_err("malformed json should error");
+    assert!(
+        err.contains("failed to parse"),
+        "error should mention parse failure: {err}"
+    );
+}
