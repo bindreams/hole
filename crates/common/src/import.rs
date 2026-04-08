@@ -72,6 +72,7 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
         password: password.to_string(),
         plugin,
         plugin_opts,
+        validation: None,
     })
 }
 

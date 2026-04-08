@@ -119,6 +119,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/PublicIpResponse"
 
+  /v1/test-server:
+    post:
+      summary: Run a one-shot shadowsocks client test against a server entry
+      operationId: testServer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestServerRequest"
+      responses:
+        "200":
+          description: Test result (the test ran to completion; the outcome may itself be a failure variant)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestServerResponse"
+        "500":
+          description: The test runner itself failed (not the test outcome)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     StatusResponse:
@@ -211,22 +235,15 @@ components:
         vpn_server:
           type: string
           description: |
-            From the bridge: "ok" when the proxy tunnel is Running
-            (reachability is implied), or "unknown" when the proxy is
-            Stopped (the bridge has no server config to probe). The GUI
-            overrides any "unknown" value (whether from this handler or
-            from the bridge-unreachable fallback path) with the result of
-            a TCP connect probe against the user's currently selected
-            server: "ok" if a TCP connection to host:port can be
-            established (implies network reachability and an open
-            listener; does not validate the shadowsocks handshake or that
-            a working server is actually behind the port), "error" if
-            unreachable.
+            Bridge always returns "unknown". The GUI computes this dot from
+            the selected ServerEntry's persisted validation state and
+            ignores this field. Kept on the wire for backward compatibility.
         internet:
           type: string
           description: |
-            Always "unknown" today. A real connectivity check (HTTPS probe
-            through the tunnel) is a follow-up.
+            Bridge always returns "unknown". The GUI computes this dot from
+            the selected ServerEntry's persisted validation state and
+            ignores this field.
 
     PublicIpResponse:
       type: object
@@ -287,3 +304,35 @@ components:
           type:
             - string
             - "null"
+        validation:
+          description: |
+            Hand-written in config.rs as ValidationState. Tagged enum with
+            kind discriminator; see protocol.rs::ServerTestOutcome.
+          type:
+            - object
+            - "null"
+
+    TestServerRequest:
+      type: object
+      description: "Hand-written in protocol.rs; ServerTestOutcome is a tagged enum, not modeled here."
+      required:
+        - entry
+      properties:
+        entry:
+          $ref: "#/components/schemas/ServerEntry"
+
+    TestServerResponse:
+      type: object
+      description: "Hand-written in protocol.rs."
+      required:
+        - outcome
+      properties:
+        outcome:
+          type: object
+          description: |
+            Tagged union with `kind` discriminator. Variants:
+            reachable {kind, latency_ms}, dns_failed {kind}, tcp_refused {kind},
+            tcp_timeout {kind}, plugin_start_failed {kind, detail},
+            tunnel_handshake_failed {kind}, server_cannot_reach_internet {kind},
+            sentinel_mismatch {kind, detail}, internal_error {kind, detail}.
+            See protocol.rs::ServerTestOutcome.

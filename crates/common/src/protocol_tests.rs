@@ -11,6 +11,7 @@ fn sample_server() -> ServerEntry {
         password: "pw".to_string(),
         plugin: None,
         plugin_opts: None,
+        validation: None,
     }
 }
 

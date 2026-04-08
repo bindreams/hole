@@ -24,6 +24,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
             password: "secret".to_string(),
             plugin: None,
             plugin_opts: None,
+            validation: None,
         }],
         selected_server: Some("abc-123".to_string()),
         local_port: 5555,
@@ -77,6 +78,7 @@ fn selected_entry_with_unknown_uuid_returns_none() {
             password: "pw".to_string(),
             plugin: None,
             plugin_opts: None,
+            validation: None,
         }],
         ..Default::default()
     };
@@ -97,6 +99,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 password: "pw1".to_string(),
                 plugin: None,
                 plugin_opts: None,
+                validation: None,
             },
             ServerEntry {
                 id: "target-id".to_string(),
@@ -107,6 +110,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 password: "pw2".to_string(),
                 plugin: None,
                 plugin_opts: None,
+                validation: None,
             },
         ],
         ..Default::default()
@@ -246,6 +250,7 @@ fn server_entry_debug_redacts_password() {
         password: "super-secret-do-not-leak".to_string(),
         plugin: None,
         plugin_opts: None,
+        validation: None,
     };
     let debug_output = format!("{:?}", entry);
     assert!(
@@ -269,6 +274,7 @@ fn server_entry_debug_shows_non_sensitive_fields() {
         password: "do-not-show-this".to_string(),
         plugin: Some("v2ray-plugin".to_string()),
         plugin_opts: Some("server;tls".to_string()),
+        validation: None,
     };
     let debug_output = format!("{:?}", entry);
     assert!(debug_output.contains("unique-id-123"), "should contain id");

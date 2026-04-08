@@ -64,8 +64,6 @@ fn launch_gui(show_dashboard: bool) {
         // Rust `log::*` events that flow through `LogTracer` into our
         // existing `tracing` subscriber → `gui.log`.
         .plugin(tauri_plugin_log::Builder::new().skip_logger().build())
-        .manage(AppState::new(config_path))
-        .manage(hole_gui::update::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
@@ -74,6 +72,8 @@ fn launch_gui(show_dashboard: bool) {
             commands::get_metrics,
             commands::get_diagnostics,
             commands::get_public_ip,
+            commands::test_server,
+            commands::mark_validated_by_proxy_start,
             tray::toggle_proxy,
         ])
         .on_window_event(|window, event| {
@@ -91,6 +91,11 @@ fn launch_gui(show_dashboard: bool) {
             }
         })
         .setup(move |app| {
+            // Manage shared state here (instead of pre-`.setup()`) so that
+            // `AppState` has access to a real `tauri::AppHandle` for emitting
+            // events from commands like `test_server`.
+            app.manage(AppState::new(config_path.clone(), app.handle().clone()));
+            app.manage(hole_gui::update::UpdateState::default());
             tray::create_tray(app)?;
             platform::on_setup(app)?;
             if show_dashboard {

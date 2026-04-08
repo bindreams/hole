@@ -3,7 +3,16 @@
 
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import type { DiagnosticsData, Metrics, ProxyStatus, PublicIpData } from "./types";
+import { config } from "./main";
+import { statusTooltipFor } from "./servers";
+import {
+  type DiagnosticsData,
+  LATENCY_VALIDATED_ON_CONNECT,
+  type Metrics,
+  type ProxyStatus,
+  type PublicIpData,
+  type ValidationState,
+} from "./types";
 
 // Formatting helpers ==================================================================================================
 
@@ -218,7 +227,6 @@ function updateStats(metrics: Metrics) {
 
 // Diagnostics chain ===================================================================================================
 
-const DIAG_NODES = ["app", "bridge", "network", "vpn_server", "internet"] as const;
 const DIAG_ELEMENTS: Record<string, HTMLElement | null> = {
   app: document.getElementById("diag-app"),
   bridge: document.getElementById("diag-bridge"),
@@ -234,14 +242,74 @@ function diagStatusClass(status: string): string {
   return "unknown";
 }
 
-export function updateDiagnostics(data: DiagnosticsData) {
-  for (const key of DIAG_NODES) {
-    // The API uses snake_case; the element IDs use kebab-case.
+/// Cache the most recent bridge poll so non-poll-driven rerenders (e.g.
+/// selection change) can recompute the dots without a fresh bridge call.
+/// Initialized to "all unknown" so the first render before the first poll
+/// has a value to use.
+let lastDiagnosticsData: DiagnosticsData = {
+  app: "unknown",
+  bridge: "unknown",
+  network: "unknown",
+  vpn_server: "unknown",
+  internet: "unknown",
+};
+
+function setVpnDot(v: ValidationState | null | undefined) {
+  const el = DIAG_ELEMENTS.vpn_server;
+  if (!el) return;
+  if (!v) {
+    el.className = "nd unknown";
+    el.title = "Untested. Click Test on the selected server to validate.";
+    return;
+  }
+  if (v.outcome.kind === "reachable") {
+    el.className = "nd ok";
+  } else {
+    el.className = "nd error";
+  }
+  el.title = statusTooltipFor(v);
+}
+
+function setInternetDot(v: ValidationState | null | undefined) {
+  const el = DIAG_ELEMENTS.internet;
+  if (!el) return;
+  // Internet is "ok" only when the most recent test reached the sentinel
+  // HTTP roundtrip — i.e. a real test result with non-sentinel latency.
+  // The "validated on connect" path (latency_ms == LATENCY_VALIDATED_ON_CONNECT)
+  // does NOT prove sentinel reachability, so the dot stays gray. The dot
+  // is "unknown" (gray), NEVER red, when the test failed earlier — we have
+  // no positive evidence of "internet broken", only "test didn't get that
+  // far".
+  if (v?.outcome.kind === "reachable" && v.outcome.latency_ms !== LATENCY_VALIDATED_ON_CONNECT) {
+    el.className = "nd ok";
+    el.title = "Reachable through the VPN.";
+  } else {
+    el.className = "nd unknown";
+    el.title = "Untested through this server.";
+  }
+}
+
+/// Repaint all five diagnostics dots.
+///
+/// `app`/`bridge`/`network` come from the bridge poll (cached in
+/// `lastDiagnosticsData`). `vpn_server`/`internet` are computed from the
+/// currently selected server's persisted validation state. Call with
+/// `data` from `pollDiagnostics`, or with no argument from non-poll
+/// rerenders (selection change, validation-changed event) — the cached
+/// poll data is reused.
+export function updateDiagnostics(data?: DiagnosticsData) {
+  if (data) lastDiagnosticsData = data;
+
+  for (const key of ["app", "bridge", "network"] as const) {
     const el = DIAG_ELEMENTS[key];
     if (!el) continue;
-    const status = data[key] || "unknown";
-    el.className = `nd ${diagStatusClass(status)}`;
+    el.className = `nd ${diagStatusClass(lastDiagnosticsData[key] || "unknown")}`;
   }
+
+  const selected = config?.servers.find((s) => s.id === config?.selected_server) ?? null;
+  const validation = selected?.validation ?? null;
+  setVpnDot(validation);
+  setInternetDot(validation);
 }
 
 // Version footer ======================================================================================================

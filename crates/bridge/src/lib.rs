@@ -8,6 +8,7 @@ pub mod proxy;
 pub mod proxy_manager;
 pub mod route_state;
 pub mod routing;
+pub mod server_test;
 pub mod socket;
 
 #[cfg(test)]

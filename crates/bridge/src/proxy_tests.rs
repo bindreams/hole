@@ -14,6 +14,7 @@ fn sample_server() -> ServerEntry {
         password: "secret".to_string(),
         plugin: None,
         plugin_opts: None,
+        validation: None,
     }
 }
 

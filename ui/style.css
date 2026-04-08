@@ -583,8 +583,72 @@ order. (0,2,0) > (0,1,0). */
   font-size: 0.7rem;
 }
 
-.srv .srv-del {
+.srv .srv-status {
   margin-left: auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.srv .srv-status.untested {
+  background: var(--text-ghost);
+}
+
+.srv .srv-status.ok {
+  background: var(--green);
+}
+
+.srv .srv-status.fail {
+  background: var(--red);
+}
+
+.srv .srv-status.testing {
+  background: var(--text-ghost);
+  animation: srv-status-pulse 1s ease-in-out infinite;
+}
+
+@keyframes srv-status-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.srv .srv-test {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-size: 0.65rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    opacity 0.15s;
+}
+
+.srv .srv-test:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--accent-border);
+}
+
+.srv .srv-test:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.srv .srv-test.loading {
+  color: var(--text-ghost);
+}
+
+.srv .srv-del {
   color: var(--text-ghost);
   font-size: 0.7rem;
   cursor: pointer;
