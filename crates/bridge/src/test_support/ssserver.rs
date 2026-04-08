@@ -22,9 +22,9 @@ pub(crate) const TEST_PASSWORD: &str = "test-password-1234";
 /// Generate a fresh random "password" for the given cipher in the format the
 /// cipher expects.
 ///
-/// - For AEAD-2022 ciphers (`2022-blake3-*`), the "password" is a base64-
-///   encoded random key of `cipher.key_len()` bytes. Passing an arbitrary
-///   string fails inside `ServerConfig::new`.
+/// - For ALL AEAD-2022 ciphers (`2022-blake3-*`, all four variants), the
+///   "password" is a base64-encoded random key of `cipher.key_len()` bytes.
+///   Passing an arbitrary string fails inside `ServerConfig::new`.
 /// - For all other ciphers (stream, AEAD v1), the password is just an
 ///   arbitrary string and we hex-encode the random bytes for legibility.
 pub(crate) fn random_password_for(method: CipherKind) -> String {
@@ -32,7 +32,7 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
     let key_len = method.key_len();
     let mut bytes = vec![0u8; key_len];
     rand::rng().fill_bytes(&mut bytes);
-    if matches!(method, CipherKind::AEAD2022_BLAKE3_AES_256_GCM) {
+    if method.is_aead_2022() {
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     } else {
         hex::encode(&bytes)
@@ -69,17 +69,20 @@ pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> 
 /// in front. The plugin listens on `public_port` (which the caller
 /// pre-allocates and passes here) and forwards to the SS server. Returns the
 /// public-facing socket address and the spawned server task handle.
-///
-/// Historical name: this was `start_real_ss_server_with_plugin` before the
-/// test_support extraction. Renamed with a `_ws` suffix so sibling variants
-/// (`_ws_tls`, `_quic`) can coexist in the plugin matrix.
 pub(crate) async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
     public_port: u16,
     plugin_path: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
-    spawn_ss_with_plugin(method, password, public_port, plugin_path, "server").await
+    spawn_ss_with_plugin(
+        method,
+        password,
+        public_port,
+        plugin_path,
+        "server;host=cloudfront.com;path=/",
+    )
+    .await
 }
 
 /// Spin up a real shadowsocks server with v2ray-plugin (websocket + TLS) in

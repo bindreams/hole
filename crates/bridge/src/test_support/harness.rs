@@ -27,9 +27,20 @@ use tempfile::TempDir;
 pub(crate) struct BridgeHarness<B: ProxyBackend> {
     pub manager: ProxyManager<B>,
     pub proxy_config: ProxyConfig,
-    /// Held alive for the duration of the test so the route-recovery state
-    /// file persists where the manager expects it.
-    pub _state_dir: TempDir,
+    /// State-dir tempdir. Held alive for the test's duration so the
+    /// route-recovery state file persists where the manager expects it,
+    /// AND so test bodies can read paths inside it (e.g.
+    /// `bridge-routes.json` in `lifecycle_state_file_cleared_on_clean_stop`).
+    pub state_dir: TempDir,
+}
+
+impl<B: ProxyBackend> BridgeHarness<B> {
+    /// Convenience: path to the `bridge-routes.json` state file inside
+    /// `state_dir`. May or may not exist depending on backend +
+    /// proxy lifecycle phase.
+    pub fn state_file_path(&self) -> std::path::PathBuf {
+        self.state_dir.path().join("bridge-routes.json")
+    }
 }
 
 /// Build a `ServerEntry` from the loose pieces a test fixture provides.
@@ -73,7 +84,7 @@ pub(crate) fn build_socks_harness(
     BridgeHarness {
         manager,
         proxy_config,
-        _state_dir: state_dir,
+        state_dir,
     }
 }
 
@@ -98,6 +109,6 @@ pub(crate) fn build_tun_harness(
     BridgeHarness {
         manager,
         proxy_config,
-        _state_dir: state_dir,
+        state_dir,
     }
 }

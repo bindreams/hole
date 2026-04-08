@@ -49,9 +49,11 @@ pub(crate) enum TargetBind {
 
 /// Long-lived HTTP/1.0 sentinel that owns its own tokio runtime. Drop sends
 /// a graceful shutdown signal and tears down the runtime.
+///
+/// The body the server returns is [`SENTINEL_BODY`]. Tests assert against
+/// the canonical const directly rather than reading a struct field.
 pub(crate) struct HttpTarget {
     pub addr: SocketAddr,
-    pub sentinel: &'static [u8],
     shutdown: Option<oneshot::Sender<()>>,
     _runtime: tokio::runtime::Runtime,
 }
@@ -65,7 +67,8 @@ impl Drop for HttpTarget {
     }
 }
 
-const SENTINEL_BODY: &[u8] = b"HOLE-OK\n";
+/// The body the HTTP target sends back. Tests assert against this.
+pub(crate) const SENTINEL_BODY: &[u8] = b"HOLE-OK\n";
 const SENTINEL_RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nHOLE-OK\n";
 
 /// Spawn an HTTP/1.0 sentinel server.
@@ -117,7 +120,6 @@ pub(crate) fn start_http_target(bind: TargetBind) -> HttpTarget {
 
     HttpTarget {
         addr,
-        sentinel: SENTINEL_BODY,
         shutdown: Some(tx),
         _runtime: runtime,
     }

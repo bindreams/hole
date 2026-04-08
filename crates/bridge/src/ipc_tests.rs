@@ -79,9 +79,7 @@ impl ProxyBackend for MockBackend {
 
 // Helpers =============================================================================================================
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
-}
+use crate::test_support::rt;
 
 /// Build a mock proxy backed by a throw-away state dir. Uses
 /// `tempfile::tempdir().keep()` so the directory is created but its

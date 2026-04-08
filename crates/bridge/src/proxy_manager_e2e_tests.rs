@@ -39,8 +39,6 @@ use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-const SENTINEL_BODY: &[u8] = b"HOLE-OK\n";
-
 /// Run a SOCKS5 GET against the harness's proxy and assert the response
 /// body matches the sentinel. Used by every core-flow test.
 async fn assert_socks5_roundtrip(local_port: u16, target_addr: SocketAddr) {
@@ -56,7 +54,11 @@ async fn assert_socks5_roundtrip(local_port: u16, target_addr: SocketAddr) {
         .expect("SOCKS5 request through bridge");
 
     let body = http_response_body(&response).expect("HTTP response has header terminator");
-    assert_eq!(body, SENTINEL_BODY, "expected sentinel body, got {response:?}");
+    assert_eq!(
+        body,
+        crate::test_support::http_target::SENTINEL_BODY,
+        "expected sentinel body, got {response:?}"
+    );
 }
 
 /// Build a harness, start it, run a SOCKS5 round-trip, stop it. Shared by
@@ -180,7 +182,7 @@ mod tun {
             let request = http_get_request(&http.addr, "/");
             let response = direct_tcp_get(http.addr, &request).await;
             let body = http_response_body(&response).expect("HTTP response");
-            assert_eq!(body, SENTINEL_BODY);
+            assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
             harness.manager.stop().await.unwrap();
         });
     }
@@ -205,7 +207,7 @@ mod tun {
             let request = http_get_request(&http.addr, "/");
             let response = direct_tcp_get(http.addr, &request).await;
             let body = http_response_body(&response).expect("HTTP response");
-            assert_eq!(body, SENTINEL_BODY);
+            assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
             harness.manager.stop().await.unwrap();
         });
     }
@@ -297,7 +299,7 @@ fn lifecycle_state_file_cleared_on_clean_stop(
     #[fixture(http_target_ipv4)] _http: &HttpTarget,
 ) {
     let mut harness = build_socks_harness(ss.addr, ss.method, &ss.password, None, None);
-    let state_file = harness._state_dir.path().join("bridge-routes.json");
+    let state_file = harness.state_file_path();
     rt().block_on(async {
         harness.manager.start(&harness.proxy_config).await.unwrap();
         harness.manager.stop().await.unwrap();

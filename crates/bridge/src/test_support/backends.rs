@@ -60,13 +60,23 @@ impl ProxyBackend for SocksOnlyBackend {
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
-        // Synthetic TEST-NET-1 gateway. The value is never actually used
-        // because `setup_routes` is a no-op, but `ProxyManager::start`
-        // queries the gateway before calling `setup_routes`, so we have to
-        // return *something* that parses as an `IpAddr`.
+        // Synthetic TEST-NET-1 gateway. With `installs_routes()` returning
+        // false (below) `ProxyManager::start` never actually calls this,
+        // but the trait still requires the method to be implemented.
         Ok(GatewayInfo {
             gateway_ip: "192.0.2.1".parse().unwrap(),
             interface_name: "test-net".to_string(),
         })
+    }
+
+    /// `false` so `ProxyManager::start` skips wintun preload, server-IP
+    /// resolution, gateway detection, state-file writes, `setup_routes`, and
+    /// `RouteGuard` construction. Critical: without this override, the
+    /// hardcoded `RouteGuard::drop` calls the **free function**
+    /// `routing::teardown_routes` (not `self.backend.teardown_routes`),
+    /// which shells out to `netsh` / `route` and mutates host state even
+    /// when our `teardown_routes` impl is a no-op.
+    fn installs_routes(&self) -> bool {
+        false
     }
 }

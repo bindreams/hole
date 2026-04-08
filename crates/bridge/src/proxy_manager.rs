@@ -36,6 +36,26 @@ pub trait ProxyBackend: Send + Sync {
     ) -> Result<(), ProxyError>;
     fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError>;
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
+
+    /// Whether this backend installs and removes host routes when start/stop
+    /// is called. Default `true`. Test backends like
+    /// [`crate::test_support::backends::SocksOnlyBackend`] override to
+    /// `false` so `ProxyManager::start` skips:
+    ///
+    /// - the wintun preload (Windows)
+    /// - DNS resolution of the server hostname
+    /// - default-gateway detection
+    /// - the route-recovery state file write
+    /// - the call to `setup_routes`
+    /// - construction of the `RouteGuard` (whose `Drop` impl shells out to
+    ///   `netsh` / `route` regardless of which backend you wrapped, because
+    ///   it calls the free function `routing::teardown_routes`).
+    ///
+    /// Without this hook, a backend that no-ops `setup_routes` /
+    /// `teardown_routes` still triggers real `netsh` invocations on stop.
+    fn installs_routes(&self) -> bool {
+        true
+    }
 }
 
 // Real backend ========================================================================================================
@@ -127,48 +147,63 @@ impl<B: ProxyBackend> ProxyManager<B> {
             self.last_error = Some(e.to_string());
         })?;
 
-        // Pre-load wintun.dll explicitly so we can give a descriptive error
-        // if it's missing. shadowsocks-service uses the bare "wintun.dll" name
-        // via tun-0.8.6, which becomes LoadLibraryExW with default search
-        // order. By loading the DLL here first (with an absolute path), the
-        // OS loader-table services the later bare-name lookup from the same
-        // process via base-name dedup. See crates/bridge/src/wintun.rs.
-        //
-        // No routes have been touched yet at this point, so we don't need
-        // to roll anything back — just record last_error and return like
-        // the build_ss_config path above.
-        #[cfg(target_os = "windows")]
-        crate::wintun::ensure_loaded().inspect_err(|e| {
-            self.last_error = Some(e.to_string());
-        })?;
-
-        // Resolve server hostname to IP
-        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
-            .await
-            .inspect_err(|e| {
+        // Routing prerequisites: only resolve / detect / persist when the
+        // backend actually installs routes. Test backends that want to skip
+        // host-state mutation (see SocksOnlyBackend) override
+        // `installs_routes` to `false` and the entire block below is
+        // bypassed — including wintun preload, DNS resolution, gateway
+        // detection, state-file persistence, and `setup_routes`. The
+        // matching cleanup in `stop()` is handled by the absence of a
+        // `RouteGuard`.
+        let route_setup = if self.backend.installs_routes() {
+            // Pre-load wintun.dll explicitly so we can give a descriptive
+            // error if it's missing. shadowsocks-service uses the bare
+            // "wintun.dll" name via tun-0.8.6, which becomes LoadLibraryExW
+            // with default search order. By loading the DLL here first
+            // (with an absolute path), the OS loader-table services the
+            // later bare-name lookup from the same process via base-name
+            // dedup. See crates/bridge/src/wintun.rs.
+            //
+            // No routes have been touched yet at this point, so we don't
+            // need to roll anything back — just record last_error and
+            // return like the build_ss_config path above.
+            #[cfg(target_os = "windows")]
+            crate::wintun::ensure_loaded().inspect_err(|e| {
                 self.last_error = Some(e.to_string());
             })?;
 
-        // Detect default gateway and interface
-        let gw_info = self.backend.default_gateway().inspect_err(|e| {
-            self.last_error = Some(e.to_string());
-        })?;
+            // Resolve server hostname to IP
+            let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
+                .await
+                .inspect_err(|e| {
+                    self.last_error = Some(e.to_string());
+                })?;
 
-        // CRITICAL ORDERING: persist the route-recovery state BEFORE any
-        // routing mutation. A panic/SIGKILL between setup_routes and
-        // construction of the RouteGuard would otherwise leak routes with
-        // no on-disk record, defeating crash recovery on next startup.
-        let persisted_state = crate::route_state::RouteState {
-            version: crate::route_state::SCHEMA_VERSION,
-            tun_name: TUN_DEVICE_NAME.to_owned(),
-            server_ip,
-            interface_name: gw_info.interface_name.clone(),
+            // Detect default gateway and interface
+            let gw_info = self.backend.default_gateway().inspect_err(|e| {
+                self.last_error = Some(e.to_string());
+            })?;
+
+            // CRITICAL ORDERING: persist the route-recovery state BEFORE any
+            // routing mutation. A panic/SIGKILL between setup_routes and
+            // construction of the RouteGuard would otherwise leak routes with
+            // no on-disk record, defeating crash recovery on next startup.
+            let persisted_state = crate::route_state::RouteState {
+                version: crate::route_state::SCHEMA_VERSION,
+                tun_name: TUN_DEVICE_NAME.to_owned(),
+                server_ip,
+                interface_name: gw_info.interface_name.clone(),
+            };
+            if let Err(e) = crate::route_state::save(&self.state_dir, &persisted_state) {
+                let msg = format!("failed to persist route-state: {e}");
+                self.last_error = Some(msg.clone());
+                return Err(ProxyError::RouteSetup(msg));
+            }
+
+            Some((server_ip, gw_info))
+        } else {
+            None
         };
-        if let Err(e) = crate::route_state::save(&self.state_dir, &persisted_state) {
-            let msg = format!("failed to persist route-state: {e}");
-            self.last_error = Some(msg.clone());
-            return Err(ProxyError::RouteSetup(msg));
-        }
 
         // Start shadowsocks-service (no route mutation yet). On failure,
         // clear the state file we just wrote — no routes were installed
@@ -177,40 +212,46 @@ impl<B: ProxyBackend> ProxyManager<B> {
             Ok(h) => h,
             Err(e) => {
                 self.last_error = Some(e.to_string());
-                let _ = crate::route_state::clear(&self.state_dir);
+                if route_setup.is_some() {
+                    let _ = crate::route_state::clear(&self.state_dir);
+                }
                 return Err(e);
             }
         };
 
-        // Set up routes — if this fails, roll back: abort ss, defensively
-        // tear down any partial route state, and clear the state file so we
-        // return to a clean Stopped with no stale on-disk artifacts.
-        if let Err(e) =
-            self.backend
-                .setup_routes(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)
-        {
-            handle.abort();
-            let _ = self
-                .backend
-                .teardown_routes(TUN_DEVICE_NAME, server_ip, &gw_info.interface_name);
-            let _ = crate::route_state::clear(&self.state_dir);
-            self.last_error = Some(e.to_string());
-            return Err(e);
+        if let Some((server_ip, gw_info)) = &route_setup {
+            // Set up routes — if this fails, roll back: abort ss,
+            // defensively tear down any partial route state, and clear the
+            // state file so we return to a clean Stopped with no stale
+            // on-disk artifacts.
+            if let Err(e) =
+                self.backend
+                    .setup_routes(TUN_DEVICE_NAME, *server_ip, gw_info.gateway_ip, &gw_info.interface_name)
+            {
+                handle.abort();
+                let _ = self
+                    .backend
+                    .teardown_routes(TUN_DEVICE_NAME, *server_ip, &gw_info.interface_name);
+                let _ = crate::route_state::clear(&self.state_dir);
+                self.last_error = Some(e.to_string());
+                return Err(e);
+            }
+
+            self.route_guard = Some(RouteGuard::new(
+                TUN_DEVICE_NAME.to_owned(),
+                *server_ip,
+                gw_info.interface_name.clone(),
+                self.state_dir.clone(),
+            ));
+            self.server_ip = Some(*server_ip);
         }
 
         self.task_handle = Some(handle);
-        self.route_guard = Some(RouteGuard::new(
-            TUN_DEVICE_NAME.to_owned(),
-            server_ip,
-            gw_info.interface_name,
-            self.state_dir.clone(),
-        ));
-        self.server_ip = Some(server_ip);
         self.started_at = Some(Instant::now());
         self.last_error = None;
         self.state = ProxyState::Running;
 
-        info!(server_ip = %server_ip, "proxy started");
+        info!(server_ip = ?self.server_ip, "proxy started");
         Ok(())
     }
 

@@ -168,6 +168,11 @@ pub(crate) fn parse_args() -> Cli {
 ///   the wrong subscriber.
 /// - `Bridge::Log` — read-only inspection. No need to write a log entry to
 ///   read one.
+///
+/// Non-exempt (install the guard): `Upgrade`, `Bridge::{Install,
+/// Uninstall, Status, GrantAccess, IpcSend}`, `Proxy::{Start, Stop,
+/// TestServer}`, `Path::{Add, Remove}`. These all use `cli_log!` on
+/// failure paths and benefit from a persistent audit trail.
 pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
     !matches!(
         command,
@@ -177,8 +182,7 @@ pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
             }
             | Command::Bridge {
                 action: BridgeAction::Log { .. }
-            } // `Command::Proxy` writes to gui-cli.log via cli_log! on failure paths,
-              // and prints results to stdout on success — install the guard.
+            }
     )
 }
 
