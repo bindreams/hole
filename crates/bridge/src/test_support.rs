@@ -14,8 +14,11 @@
 //! `mod test_support;` declaration in `lib.rs`.
 #![allow(dead_code)]
 
+pub(crate) mod backends;
 pub(crate) mod certs;
+pub(crate) mod harness;
 pub(crate) mod http_target;
+pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod ssserver;
 
