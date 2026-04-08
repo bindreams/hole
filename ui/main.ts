@@ -17,7 +17,7 @@ import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./ty
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
 /// after a JSON import). 50 concurrent v2ray-plugin processes is non-trivial
 /// RAM and looks like a port scan from one IP to commercial SS providers.
-const TEST_CONCURRENCY = 5;
+export const TEST_CONCURRENCY = 5;
 
 // State ===============================================================================================================
 

@@ -645,8 +645,9 @@ fn diagnostics_network_error_when_gateway_unavailable() {
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "error");
-        // vpn_server is "unknown" because the proxy is stopped (this mock
-        // never started one); the GUI would override it with a probe.
+        // vpn_server and internet are always "unknown" on the wire — the
+        // GUI computes them from the selected ServerEntry's persisted
+        // validation state.
         assert_eq!(diag.vpn_server, "unknown");
         assert_eq!(diag.internet, "unknown");
 
@@ -667,11 +668,12 @@ fn diagnostics_proxy_stopped() {
         let mut client = TestClient::connect(&path).await;
         let diag = get_diagnostics(&mut client).await;
 
-        // Bridge IPC is up (we are handling this request); only the proxy is
-        // stopped. App and bridge are always "ok" inside the handler. Network
-        // is computed from the host's default gateway and the MockBackend
-        // returns Ok. vpn_server is "unknown" because the bridge has no
-        // server config to probe — the GUI overrides it with a TCP probe.
+        // Bridge IPC is up (we are handling this request); only the proxy
+        // is stopped. App and bridge are always "ok" inside the handler.
+        // Network is computed from the host's default gateway and the
+        // MockBackend returns Ok. vpn_server and internet are always
+        // "unknown" on the wire — the GUI computes them from the selected
+        // ServerEntry's persisted validation state.
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok");

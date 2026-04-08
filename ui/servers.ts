@@ -2,7 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { config, loadConfig, runTestsBounded, saveConfig } from "./main";
+import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
 import { LATENCY_VALIDATED_ON_CONNECT, type ServerTestOutcome, type ValidationState } from "./types";
 
@@ -203,7 +203,7 @@ export async function importFromDialog() {
     // Auto-test imported servers in parallel (bounded). Fire and forget.
     runTestsBounded(
       newServers.map((s) => s.id),
-      5,
+      TEST_CONCURRENCY,
     );
   } catch (err) {
     console.error("import from dialog failed:", err);

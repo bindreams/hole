@@ -90,12 +90,19 @@ fn auto_select_first_server(config: &mut AppConfig) {
 }
 
 /// Import servers from a config file path. Reads the file and parses it.
+///
+/// Returns only the entries that were actually appended to the config —
+/// duplicates of existing servers are silently dropped. The frontend uses
+/// the returned IDs to auto-test *new* entries; returning phantom IDs for
+/// deduped entries would produce silent "no server with id …" errors in
+/// the auto-test loop.
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
-    let new_servers = validate_and_read_import(Path::new(&path))?;
+    let parsed = validate_and_read_import(Path::new(&path))?;
 
     let mut config = state.config.lock().unwrap();
-    for server in &new_servers {
+    let mut appended = Vec::new();
+    for server in parsed {
         let already_exists = config.servers.iter().any(|s| {
             s.server == server.server
                 && s.server_port == server.server_port
@@ -104,12 +111,13 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
         });
         if !already_exists {
             config.servers.push(server.clone());
+            appended.push(server);
         }
     }
     auto_select_first_server(&mut config);
     config.save(&state.config_path).map_err(|e| e.to_string())?;
 
-    Ok(new_servers)
+    Ok(appended)
 }
 
 #[tauri::command]
