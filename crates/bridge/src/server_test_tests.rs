@@ -163,13 +163,16 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
     }
 }
 
-/// Fast defaults for tests that don't need plugin startup.
+/// Fast defaults for tests that don't need plugin startup. Timeouts
+/// were doubled relative to the original "fast" values to absorb
+/// Windows CI runners that intermittently take ~10s to deliver a TCP
+/// SYN-ACK on loopback when the runner is under load.
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
-        preflight_timeout: Duration::from_secs(5),
-        plugin_wait_timeout: Duration::from_secs(2),
-        ss_connect_timeout: Duration::from_secs(5),
-        sentinel_read_timeout: Duration::from_secs(5),
+        preflight_timeout: Duration::from_secs(10),
+        plugin_wait_timeout: Duration::from_secs(4),
+        ss_connect_timeout: Duration::from_secs(10),
+        sentinel_read_timeout: Duration::from_secs(10),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
         plugin_path_override: None,
     }
@@ -198,13 +201,14 @@ fn fixture_starts_real_ss_server() {
 
 /// Build a [`TestConfig`] pointing at a single bogus IP for both sentinels.
 /// Used by the pre-flight tests, where the test never reaches Phase 3.
+/// Timeouts doubled to match `fast_test_config`.
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
-        preflight_timeout: Duration::from_secs(5),
-        plugin_wait_timeout: Duration::from_secs(5),
-        ss_connect_timeout: Duration::from_secs(5),
-        sentinel_read_timeout: Duration::from_secs(5),
+        preflight_timeout: Duration::from_secs(10),
+        plugin_wait_timeout: Duration::from_secs(10),
+        ss_connect_timeout: Duration::from_secs(10),
+        sentinel_read_timeout: Duration::from_secs(10),
         sentinels: [bogus.to_string(), bogus.to_string()],
         plugin_path_override: None,
     }
@@ -514,8 +518,9 @@ fn run_test_with_v2ray_plugin_happy_path() {
             start_real_ss_server_with_plugin(TEST_METHOD, TEST_PASSWORD, public_port, plugin_path.to_str().unwrap())
                 .await;
         // The SS server's plugin is spawned async; wait for it to bind the
-        // public port before letting the runner attempt preflight.
-        wait_for_port(svr_addr, Duration::from_secs(30)).await;
+        // public port before letting the runner attempt preflight. Doubled
+        // to 60 s to absorb slow Windows CI runners.
+        wait_for_port(svr_addr, Duration::from_secs(60)).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -527,15 +532,15 @@ fn run_test_with_v2ray_plugin_happy_path() {
         );
         entry.plugin = Some("v2ray-plugin".into());
 
-        // Generous plugin window for cold start. The CI default of 2 s in
-        // fast_test_config is too short for v2ray-plugin's WS handshake.
+        // Generous plugin window for cold start. Doubled from the prior
+        // 30 s value because the WS handshake stalls on slow Windows CI.
         let cfg = TestConfig {
-            plugin_wait_timeout: Duration::from_secs(30),
+            plugin_wait_timeout: Duration::from_secs(60),
             plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
             // Generous SS connect/sentinel timeouts because the WS handshake
-            // adds latency on top of the raw TCP connect.
-            ss_connect_timeout: Duration::from_secs(5),
-            sentinel_read_timeout: Duration::from_secs(5),
+            // adds latency on top of the raw TCP connect. Doubled.
+            ss_connect_timeout: Duration::from_secs(10),
+            sentinel_read_timeout: Duration::from_secs(10),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
 
