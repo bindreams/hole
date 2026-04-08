@@ -378,6 +378,12 @@ fn install_panic_hook_inner() {
 
 // init ================================================================================================================
 
+/// Size threshold at which the active log file is rotated.
+const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
+/// Number of rotated log files to keep alongside the active one.
+/// With a value of 1, the on-disk layout is `<name>` (current) + `<name>.1` (previous).
+const MAX_ROTATED_LOGS: usize = 1;
+
 /// Initialize logging.
 ///
 /// Creates `log_dir` if it doesn't exist. Returns a guard that must be held
@@ -385,6 +391,7 @@ fn install_panic_hook_inner() {
 /// threads stay alive.
 pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogGuard {
     let _ = std::fs::create_dir_all(log_dir);
+    cleanup_legacy_daily_logs(log_dir, log_filename);
 
     // Order matters: redirect BEFORE constructing the non-blocking stderr
     // writer so the writer targets the saved-original handle, not the pipe.
@@ -408,7 +415,13 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
         redirect_stdio_to_tracing().expect("stdio redirect failed")
     };
 
-    let file_appender = tracing_appender::rolling::daily(log_dir, log_filename);
+    let file_appender = file_rotate::FileRotate::new(
+        log_dir.join(log_filename),
+        file_rotate::suffix::AppendCount::new(MAX_ROTATED_LOGS),
+        file_rotate::ContentLimit::Bytes(MAX_LOG_BYTES),
+        file_rotate::compression::Compression::None,
+        None,
+    );
     // Lossy mode on every non-blocking writer: when the channel is full
     // (backpressure from a slow disk), drop events instead of blocking the
     // producer. Discarding logs is strictly better than wedging the bridge or
@@ -462,6 +475,72 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
         _stderr: stderr_guard,
         _relays: relays,
     }
+}
+
+// Legacy cleanup ======================================================================================================
+
+/// Remove legacy `<log_filename>.YYYY-MM-DD` files left behind by the prior
+/// `tracing_appender::rolling::daily` scheme.
+///
+/// Silent best-effort: never panics, never returns an error, ignores anything
+/// it can't delete (missing dir, permission denied, file vanished between
+/// `read_dir` and `remove_file`, entry is a directory, etc.). Idempotent —
+/// safe to call on every `init()`.
+///
+/// Runs before the tracing subscriber is installed, so it MUST NOT use any
+/// `tracing::*` macros.
+///
+/// Non-recursive: scans only `log_dir` itself. The old daily scheme wrote
+/// dated files flat next to `<log_filename>`, so recursion is unnecessary.
+///
+/// Scope: one call cleans dated files for a single stem. Callers with
+/// multiple streams in the same directory must call this once per stem.
+/// In practice each `init()` caller owns exactly one stem.
+///
+/// Non-UTF-8 filenames are skipped (the old scheme produced pure-ASCII names).
+fn cleanup_legacy_daily_logs(log_dir: &Path, log_filename: &str) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if is_legacy_daily_suffix(name_str, log_filename) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// True if `candidate` is exactly `<stem>.YYYY-MM-DD` (ten trailing chars:
+/// four digits, dash, two digits, dash, two digits). Deliberately avoids a
+/// regex dependency; the shape is fixed so a manual check is clearer.
+///
+/// Accepted tradeoff: does not validate the calendar (e.g. `9999-99-99`
+/// passes). A legitimate file with that exact shape and a matching stem
+/// does not exist in practice.
+fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(stem) else {
+        return false;
+    };
+    let Some(suffix) = rest.strip_prefix('.') else {
+        return false;
+    };
+    if suffix.len() != 10 {
+        return false;
+    }
+    let b = suffix.as_bytes();
+    b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
 }
 
 #[cfg(test)]

@@ -350,6 +350,131 @@ fn panic_hook_chains_previous() {
     std::panic::set_hook(prev_hook);
 }
 
+// Tests: size-based rotation ==========================================================================================
+
+#[skuld::test]
+fn file_rotate_appender_rotates_and_prunes(#[fixture(temp_dir)] dir: &Path) {
+    use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
+    use std::io::Write;
+
+    let log_path = dir.join("test.log");
+    let mut appender = FileRotate::new(
+        &log_path,
+        AppendCount::new(1),
+        ContentLimit::Bytes(1024),
+        Compression::None,
+        None,
+    );
+
+    // 30 chunks × 100 bytes = 3000 bytes total. With a 1024-byte rotation
+    // threshold and max_files=1, this must produce exactly `test.log` and
+    // `test.log.1` at the end; older rotations are pruned.
+    let payload = vec![b'x'; 100];
+    for i in 0..30 {
+        appender.write_all(&payload).expect("write payload");
+        if i % 10 == 9 {
+            appender.flush().expect("flush appender");
+        }
+    }
+    drop(appender); // release the Windows file handle before re-reading the directory
+
+    assert!(log_path.exists(), "active log file is missing");
+    assert!(dir.join("test.log.1").exists(), "rotated log file .1 is missing");
+    assert!(
+        !dir.join("test.log.2").exists(),
+        "rotated log file .2 exists — max_files=1 pruning did not run"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("test.log"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected exactly 2 test.log* files, found {}: {:?}",
+        entries.len(),
+        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+}
+
+// Tests: legacy daily-log cleanup =====================================================================================
+
+#[skuld::test]
+fn cleanup_legacy_daily_logs_removes_only_dated_siblings_of_stem(#[fixture(temp_dir)] dir: &Path) {
+    std::fs::write(dir.join("bridge.log"), b"").expect("seed bridge.log");
+    std::fs::write(dir.join("bridge.log.1"), b"").expect("seed bridge.log.1");
+    std::fs::write(dir.join("bridge.other.txt"), b"").expect("seed bridge.other.txt");
+    std::fs::write(dir.join("gui.log.2024-01-01"), b"").expect("seed gui.log.2024-01-01");
+    std::fs::write(dir.join("bridge.log.2024-01-01"), b"").expect("seed bridge.log.2024-01-01");
+    std::fs::write(dir.join("bridge.log.2024-02-15"), b"").expect("seed bridge.log.2024-02-15");
+
+    super::cleanup_legacy_daily_logs(dir, "bridge.log");
+
+    assert!(dir.join("bridge.log").exists(), "bridge.log must survive");
+    assert!(dir.join("bridge.log.1").exists(), "bridge.log.1 must survive");
+    assert!(dir.join("bridge.other.txt").exists(), "bridge.other.txt must survive");
+    assert!(
+        dir.join("gui.log.2024-01-01").exists(),
+        "gui.log.2024-01-01 must survive (different stem)"
+    );
+    assert!(
+        !dir.join("bridge.log.2024-01-01").exists(),
+        "bridge.log.2024-01-01 must be deleted"
+    );
+    assert!(
+        !dir.join("bridge.log.2024-02-15").exists(),
+        "bridge.log.2024-02-15 must be deleted"
+    );
+
+    // Exercise the co-located streams case: a second call with a different
+    // stem must clean up that stem's dated files without disturbing the
+    // already-cleaned set.
+    super::cleanup_legacy_daily_logs(dir, "gui.log");
+
+    assert!(
+        !dir.join("gui.log.2024-01-01").exists(),
+        "gui.log.2024-01-01 must now be gone"
+    );
+    assert!(dir.join("bridge.log").exists(), "bridge.log still present");
+    assert!(dir.join("bridge.log.1").exists(), "bridge.log.1 still present");
+    assert!(dir.join("bridge.other.txt").exists(), "bridge.other.txt still present");
+}
+
+#[skuld::test]
+fn is_legacy_daily_suffix_matches_exactly_one_shape() {
+    let cases: &[(&str, &str, bool)] = &[
+        // Positive
+        ("bridge.log.2024-01-01", "bridge.log", true),
+        // Negatives
+        ("bridge.log", "bridge.log", false),
+        ("bridge.log.1", "bridge.log", false),
+        ("bridge.log.2024-1-01", "bridge.log", false),
+        ("bridge.log.20240101", "bridge.log", false),
+        ("bridgeXlog.2024-01-01", "bridge.log", false),
+        ("bridge.log.2024-01-01x", "bridge.log", false),
+        ("other.log.2024-01-01", "bridge.log", false),
+        ("bridge.log.old", "bridge.log", false),
+        ("bridge.log.backup", "bridge.log", false),
+    ];
+
+    for (candidate, stem, expected) in cases {
+        assert_eq!(
+            super::is_legacy_daily_suffix(candidate, stem),
+            *expected,
+            "is_legacy_daily_suffix({candidate:?}, {stem:?}) should be {expected}"
+        );
+    }
+}
+
+#[skuld::test]
+fn cleanup_legacy_daily_logs_tolerates_missing_directory(#[fixture(temp_dir)] dir: &Path) {
+    let nonexistent = dir.join("does-not-exist");
+    // Must not panic.
+    super::cleanup_legacy_daily_logs(&nonexistent, "bridge.log");
+}
+
 // Tests: log crate bridge =============================================================================================
 
 #[skuld::test(serial)]
@@ -382,7 +507,7 @@ fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
     let log_file = entries
         .iter()
         .find(|e| e.file_name().to_string_lossy().starts_with("test.log"))
-        .expect("daily log file");
+        .expect("log file");
     let contents = std::fs::read_to_string(log_file.path()).expect("read log file");
     assert!(
         contents.contains("from-log-crate-bridge-test"),

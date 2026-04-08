@@ -29,7 +29,7 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ### Logging
 
-Both the GUI and the bridge always write logs to stderr **and** a rolling daily file. The default log directory is `dirs::state_dir()/hole/logs` (user-local, no elevation needed):
+Both the GUI and the bridge always write logs to stderr **and** a 10 MiB rotating file (one rotated backup kept). The default log directory is `dirs::state_dir()/hole/logs` (user-local, no elevation needed):
 
 - Windows: `%LOCALAPPDATA%\hole\logs\`
 - macOS: `~/Library/Application Support/hole/logs/`
