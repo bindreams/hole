@@ -198,7 +198,9 @@ async fn handle_start<B: ProxyBackend + 'static>(
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Register the cancellation token BEFORE taking the proxy mutex. If a
     // pre-armed cancel is already queued, consume it and return immediately
-    // without even attempting the start.
+    // without even attempting the start. If a concurrent start is already
+    // in flight, reject this one — the slot is single-occupancy because a
+    // Cancel targets exactly one in-flight start.
     let token = CancellationToken::new();
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
@@ -212,6 +214,22 @@ async fn handle_start<B: ProxyBackend + 'static>(
                 }),
             ));
         }
+        if cs.token.is_some() {
+            // A previous handle_start has already registered its token but
+            // not yet cleared it (still running or blocked on proxy.lock()).
+            // Overwriting the slot would orphan the earlier start from any
+            // future Cancel — the Cancel would signal this new token
+            // instead — so we reject the duplicate with 409 Conflict rather
+            // than silently corrupting the slot.
+            warn!("concurrent start request rejected — another start is already in flight");
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "start already in progress".to_string(),
+                }),
+            ));
+        }
+        debug_assert!(cs.token.is_none(), "start_cancel token slot invariant");
         cs.token = Some(token.clone());
     }
 

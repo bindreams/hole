@@ -74,26 +74,14 @@ async function pollProxyStatus() {
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
-    if (result.state === result.previousState) return;
-
-    // Connection state changed — refresh IP.
-    updatePublicIp();
-
-    // Fire `mark_validated_by_proxy_start` only on the specific
-    // transition into `connected`. This avoids re-firing on every poll
-    // that happens to observe `running: true`, and sidesteps the
-    // polling-vs-click race: the user-initiated connect goes through
-    // `handlePowerClick` which uses the same transition so the event
-    // is emitted consistently regardless of which path landed the
-    // state change. Sequence the persist BEFORE the reload so
-    // loadConfig() sees the new validation state.
-    if (result.state === "connected" && config?.selected_server) {
-      try {
-        await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
-        await loadConfig();
-      } catch (err) {
-        console.error("mark_validated_by_proxy_start failed:", err);
-      }
+    // The poll only reconciles state when the bridge disagrees with the
+    // UI (e.g. an external disconnect). Click-driven transitions fire
+    // `mark_validated_by_proxy_start` themselves from the click handler
+    // — the poll never observes the `connecting` intermediate state, so
+    // it cannot distinguish "user just connected" from "bridge was
+    // already connected when the GUI started".
+    if (result.changed) {
+      updatePublicIp();
     }
   } catch (err) {
     console.error("get_proxy_status failed:", err);

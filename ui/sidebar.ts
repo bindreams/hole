@@ -13,7 +13,7 @@ import {
   statusTextFor,
   statusWordClassFor,
 } from "./connection-state";
-import { config } from "./main";
+import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
 import {
   type DiagnosticsData,
@@ -86,7 +86,6 @@ const versionFooter = document.getElementById("version-footer")!;
 // State ===============================================================================================================
 
 let currentState: ConnectionState = "disconnected";
-let previousState: ConnectionState = "disconnected";
 let currentIp = "";
 
 // Throughput graph data — circular buffer of 60 data points.
@@ -130,12 +129,8 @@ graphSvg.appendChild(txLine);
 
 // Power button ========================================================================================================
 
-/// Transition the UI to a new state and repaint the DOM. Tracks the
-/// previous state for polling-side event emission
-/// (`mark_validated_by_proxy_start` fires on connecting → connected
-/// specifically, not on any "became connected").
+/// Transition the UI to a new state and repaint the DOM.
 function setState(next: ConnectionState) {
-  previousState = currentState;
   currentState = next;
   updateConnectionUI();
 }
@@ -202,16 +197,52 @@ async function toggleFromIdle(goingToConnect: boolean) {
     return;
   }
 
-  if (raced.kind === "ok") {
-    setState(stateForToggleOutcome(raced.outcome));
-    // Refresh IP on any successful transition.
+  if (raced.kind === "err") {
+    console.error("toggle_proxy failed:", raced.error);
+    setState(goingToConnect ? "connection-failed" : "disconnection-failed");
+    return;
+  }
+
+  // raced.kind === "ok"
+  const outcome = raced.outcome;
+
+  // Race: the user clicked Cancel during connecting, but the Start had
+  // already succeeded at the bridge before the cancel reached it. The
+  // outcome is Running despite the user's intent to cancel. Honor the
+  // user's intent by firing a follow-up Stop. This preserves the plan's
+  // "cancelling --raced-- disconnecting" transition.
+  if (currentState === "cancelling" && outcome === "running") {
+    console.info("cancel raced with successful start — firing follow-up stop");
+    setState("disconnecting");
+    try {
+      const stopOutcome = await invoke<ToggleOutcome>("toggle_proxy");
+      setState(stateForToggleOutcome(stopOutcome));
+    } catch (err) {
+      console.error("follow-up stop failed:", err);
+      setState("disconnection-failed");
+    }
     updatePublicIp();
     return;
   }
 
-  // raced.kind === "err"
-  console.error("toggle_proxy failed:", raced.error);
-  setState(goingToConnect ? "connection-failed" : "disconnection-failed");
+  setState(stateForToggleOutcome(outcome));
+  // Refresh IP on any successful transition.
+  updatePublicIp();
+
+  // User-initiated connect succeeded — mark the selected server as
+  // validated so the UI gets a green dot without a separate test run.
+  // Fired from the click handler (not polling) because `connecting →
+  // connected` is a click-local transition that polling never observes.
+  // Sequence the persist BEFORE the reload so loadConfig() sees the
+  // new validation state.
+  if (goingToConnect && outcome === "running" && config?.selected_server) {
+    try {
+      await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
+      await loadConfig();
+    } catch (err) {
+      console.error("mark_validated_by_proxy_start failed:", err);
+    }
+  }
 }
 
 // IP display ==========================================================================================================
@@ -424,19 +455,23 @@ export function updateMetrics(metrics: Metrics) {
  * and must not be clobbered by a poll landing mid-transition. A poll
  * that arrives during a transition is a no-op for state purposes.
  *
- * Returns `{ state, previousState }` so `main.ts` can emit
- * `mark_validated_by_proxy_start` on the specific `connecting → connected`
- * transition (not on every poll that observes `running: true`).
+ * Returns `{ state, changed }` where `changed` is true iff this poll
+ * itself caused a state change (not including click-driven transitions
+ * that were applied between polls). `main.ts` uses this to know when to
+ * refresh the public IP. The click handler owns the `connecting →
+ * connected` emission of `mark_validated_by_proxy_start`, so the poll
+ * does not need to track previous state.
  */
 export function updateProxyStatus(status: ProxyStatus) {
   if (!IDLE_STATES.has(currentState)) {
-    return { state: currentState, previousState };
+    return { state: currentState, changed: false };
   }
   const polled = stateForPolledRunning(!!status.running);
-  if (polled !== currentState) {
-    setState(polled);
+  if (polled === currentState) {
+    return { state: currentState, changed: false };
   }
-  return { state: currentState, previousState };
+  setState(polled);
+  return { state: currentState, changed: true };
 }
 
 /** Returns the current connection state. */

@@ -476,34 +476,29 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
 }
 
 #[skuld::test]
-fn start_cancellable_cancel_after_success_does_not_corrupt_state() {
-    // Race scenario: start_inner has committed successfully and returned
-    // Ok(StartedState) before the cancel token is signaled. The commit
-    // happens in the outer `start_cancellable` AFTER `select!` resolves,
-    // so a late cancel that lost the race must not leave the manager in
-    // an inconsistent (Running + last_error=cancelled) state.
+fn start_cancellable_late_cancel_on_finished_token_is_noop() {
+    // Sanity check that cancelling a CancellationToken AFTER its owning
+    // start has already completed is a harmless no-op. The "post-commit
+    // race" (cancel fires between select!'s ok branch resolving and the
+    // outer match arm committing to self) is not reachable here — the
+    // match arms are synchronous, so once select! has chosen the Ok
+    // branch there is no await between that and the commit. This test
+    // verifies only that a late cancel does not panic or mutate state
+    // after the start has returned. The real post-commit race is
+    // prevented by the synchronous-commit design in start_cancellable,
+    // not by this test.
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockBackend::new());
         let token = CancellationToken::new();
-        let result = pm.start_cancellable(&test_config(), token.clone()).await;
-        // Fire the cancel after start has returned. This is a no-op for
-        // the just-started proxy but must not panic or corrupt state.
-        token.cancel();
+        pm.start_cancellable(&test_config(), token.clone()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
 
-        // Outcome must be Ok + Running (start completed before cancel landed)
-        // OR Err(Cancelled) + Stopped (cancel raced and won). Never a mix.
-        match result {
-            Ok(()) => {
-                assert_eq!(pm.state(), ProxyState::Running);
-                assert!(pm.last_error().is_none());
-                pm.stop().await.unwrap();
-            }
-            Err(ProxyError::Cancelled) => {
-                assert_eq!(pm.state(), ProxyState::Stopped);
-                assert!(pm.last_error().is_none());
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
+        // Late cancel — must not panic, must not mutate proxy state.
+        token.cancel();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert!(pm.last_error().is_none());
+
+        pm.stop().await.unwrap();
     });
 }
 

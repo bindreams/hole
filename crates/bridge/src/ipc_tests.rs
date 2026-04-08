@@ -826,8 +826,11 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             .expect("start task panicked");
         assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
 
-        // Release the gate so the spawned ss future (from MockBackend) can
-        // settle cleanly as part of the TaskHandleGuard drop path.
+        // The gate is still held — release it before the server task is
+        // aborted so the waker inside the mock's `start_ss` is properly
+        // drained (the future was dropped by select!; notify_one on a
+        // dropped waker is a no-op, but this is harmless and leaves the
+        // mock in a well-defined state for any subsequent polling).
         gate.notify_one();
         handle.abort();
     });
@@ -884,6 +887,150 @@ fn cancel_with_no_start_is_ack_idempotent() {
         assert_eq!(consume(post_cancel(&mut client).await).await, 200);
 
         drop(client);
+        handle.abort();
+    });
+}
+
+#[skuld::test]
+fn concurrent_start_is_rejected_with_conflict() {
+    // Client A holds a start parked in start_ss on the gate. Client B
+    // sends a second Start concurrently. B must be rejected with 409
+    // Conflict rather than silently overwriting A's token slot — the
+    // slot is single-occupancy because a Cancel targets exactly one
+    // in-flight start. This covers the pre-fix bug in review #4.
+    rt().block_on(async {
+        let path = test_socket_path("concurrent-start");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let handle = tokio::spawn(async move { server.run().await });
+
+        // Client A parks in start_ss.
+        let path_a = path.clone();
+        let a_future = tokio::spawn(async move {
+            let mut client_a = TestClient::connect(&path_a).await;
+            let resp = post_start(&mut client_a, &sample_config()).await;
+            (client_a, resp)
+        });
+
+        // Give A a moment to register its token.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Client B sends a concurrent Start and must be rejected.
+        let mut client_b = TestClient::connect(&path).await;
+        let b_resp = post_start(&mut client_b, &sample_config()).await;
+        assert_eq!(
+            b_resp.status(),
+            409,
+            "concurrent start must be rejected with 409 Conflict"
+        );
+        let b_body = b_resp.into_body().collect().await.unwrap().to_bytes();
+        let b_err: ErrorResponse = serde_json::from_slice(&b_body).unwrap();
+        assert!(
+            b_err.message.contains("already in progress"),
+            "unexpected message: {}",
+            b_err.message
+        );
+
+        // B's rejection must not have perturbed A's token slot — a
+        // subsequent cancel must still reach A. Send it.
+        let mut client_c = TestClient::connect(&path).await;
+        assert_eq!(consume(post_cancel(&mut client_c).await).await, 200);
+
+        // A's start must eventually return Cancelled.
+        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
+            .await
+            .expect("A's start did not return")
+            .expect("A task panicked");
+        assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
+
+        gate.notify_one();
+        handle.abort();
+    });
+}
+
+#[skuld::test]
+fn sequential_start_cancel_start_consumes_pre_arm_once() {
+    // Plan scenario: Start completes, then Cancel arrives (sets pending),
+    // then another Start arrives (consumes pending → Cancelled). A third
+    // Start after that must succeed normally — the pre-arm must be
+    // consumed exactly once, not forever.
+    rt().block_on(async {
+        let path = test_socket_path("seq-start-cancel-start");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move { server.run().await.unwrap() });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Start #1 succeeds.
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        // Stop so the next start has somewhere to go.
+        assert_eq!(consume(post_stop(&mut client).await).await, 200);
+
+        // Cancel with nothing in flight — pre-arms the flag.
+        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
+
+        // Start #2 consumes the pre-arm and must fail with Cancelled.
+        let resp2 = post_start(&mut client, &sample_config()).await;
+        assert_eq!(error_message(resp2).await, CANCELLED_MESSAGE);
+
+        // Start #3 must succeed (pre-arm was a one-shot).
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        // Cleanup.
+        consume(post_stop(&mut client).await).await;
+
+        drop(client);
+        handle.abort();
+    });
+}
+
+#[skuld::test]
+fn concurrent_double_cancel_during_start_both_succeed() {
+    // Two Cancel requests arrive on separate connections while a single
+    // Start is in flight. Both must succeed with 200 — the cancel path
+    // is idempotent, and the second cancel sees the token already
+    // signaled and is a no-op that still returns 200. The in-flight
+    // Start must return Cancelled promptly.
+    rt().block_on(async {
+        let path = test_socket_path("double-cancel");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let handle = tokio::spawn(async move { server.run().await });
+
+        // Client A parks in start_ss.
+        let path_a = path.clone();
+        let a_future = tokio::spawn(async move {
+            let mut client_a = TestClient::connect(&path_a).await;
+            let resp = post_start(&mut client_a, &sample_config()).await;
+            (client_a, resp)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Two concurrent cancels on separate connections.
+        let path_b = path.clone();
+        let b_task = tokio::spawn(async move {
+            let mut client = TestClient::connect(&path_b).await;
+            post_cancel(&mut client).await
+        });
+        let path_c = path.clone();
+        let c_task = tokio::spawn(async move {
+            let mut client = TestClient::connect(&path_c).await;
+            post_cancel(&mut client).await
+        });
+
+        let b_resp = b_task.await.unwrap();
+        let c_resp = c_task.await.unwrap();
+        assert_eq!(b_resp.status(), 200);
+        assert_eq!(c_resp.status(), 200);
+
+        // A's start returns Cancelled.
+        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
+            .await
+            .expect("A's start did not return")
+            .expect("A task panicked");
+        assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
+
+        gate.notify_one();
         handle.abort();
     });
 }
