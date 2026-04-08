@@ -24,7 +24,7 @@
 //! can use them interchangeably with `build_socks_harness` /
 //! `build_tun_harness`.
 
-use crate::test_support::certs::TestCerts;
+use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
 use crate::test_support::port_alloc::allocate_ephemeral_port;
 use crate::test_support::ssserver::{
@@ -57,13 +57,13 @@ fn require_v2ray_plugin() -> String {
 }
 
 #[skuld::fixture(scope = process)]
-fn test_certs() -> Result<TestCerts, String> {
+pub(crate) fn test_certs() -> Result<TestCerts, String> {
     Ok(crate::test_support::certs::generate_test_certs())
 }
 
 /// Plain shadowsocks server, no plugin.
 #[skuld::fixture(scope = process)]
-fn ssserver_none() -> Result<SsServerHandle, String> {
+pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let (addr, _handle) = runtime.block_on(start_real_ss_server(TEST_METHOD, TEST_PASSWORD));
     Ok(SsServerHandle {
@@ -78,7 +78,7 @@ fn ssserver_none() -> Result<SsServerHandle, String> {
 
 /// Shadowsocks server fronted by v2ray-plugin (websocket, no TLS).
 #[skuld::fixture(scope = process)]
-fn ssserver_ws() -> Result<SsServerHandle, String> {
+pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
     let plugin_path = require_v2ray_plugin();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let addr = runtime.block_on(async {
@@ -99,13 +99,13 @@ fn ssserver_ws() -> Result<SsServerHandle, String> {
 
 /// Shadowsocks server fronted by v2ray-plugin (websocket + TLS).
 #[skuld::fixture(scope = process)]
-fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
+pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
     let plugin_path = require_v2ray_plugin();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
         "host=cloudfront.com;path=/;tls;cert={};key={}",
-        certs.cert_path.display(),
-        certs.key_path.display()
+        path_for_plugin_opts(&certs.cert_path),
+        path_for_plugin_opts(&certs.key_path)
     );
     let addr = runtime.block_on(async {
         let public_port = allocate_ephemeral_port().await;
@@ -126,13 +126,13 @@ fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerH
 /// Shadowsocks server fronted by v2ray-plugin (QUIC transport). QUIC
 /// auto-enables TLS inside v2ray-plugin so the cert+key pair is required.
 #[skuld::fixture(scope = process)]
-fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
+pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
     let plugin_path = require_v2ray_plugin();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
         "host=cloudfront.com;mode=quic;cert={};key={}",
-        certs.cert_path.display(),
-        certs.key_path.display()
+        path_for_plugin_opts(&certs.cert_path),
+        path_for_plugin_opts(&certs.key_path)
     );
     let addr = runtime.block_on(async {
         let public_port = allocate_ephemeral_port().await;
@@ -153,12 +153,12 @@ fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHan
 /// HTTP target bound to the host's primary non-loopback IPv4 (so TUN tests
 /// see the traffic).
 #[skuld::fixture(scope = process)]
-fn http_target_ipv4() -> Result<HttpTarget, String> {
+pub(crate) fn http_target_ipv4() -> Result<HttpTarget, String> {
     Ok(start_http_target(TargetBind::Ipv4Primary))
 }
 
 /// HTTP target bound to `[::1]` for the IPv6 axis test.
 #[skuld::fixture(scope = process)]
-fn http_target_ipv6() -> Result<HttpTarget, String> {
+pub(crate) fn http_target_ipv6() -> Result<HttpTarget, String> {
     Ok(start_http_target(TargetBind::Ipv6Loopback))
 }

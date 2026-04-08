@@ -21,6 +21,7 @@ pub(crate) mod http_target;
 pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod skuld_fixtures;
+pub(crate) mod socks5_client;
 pub(crate) mod ssserver;
 
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.

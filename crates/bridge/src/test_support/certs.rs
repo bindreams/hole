@@ -35,25 +35,51 @@ pub(crate) struct TestCerts {
 
 impl TestCerts {
     /// Plugin_opts fragment for the cert/key paths, in the form
-    /// `cert=<path>;key=<path>`. Use as a building block when constructing
-    /// `SS_PLUGIN_OPTIONS` strings.
+    /// `cert=<path>;key=<path>`.
     pub fn plugin_opts_fragment(&self) -> String {
-        // Tempdir paths on Windows contain backslashes but no semicolons or
-        // equals signs, so SIP003's k=v;k=v separator format is safe to use
-        // raw — no escaping required as long as paths don't contain ; or =.
-        format!("cert={};key={}", self.cert_path.display(), self.key_path.display())
+        format!(
+            "cert={};key={}",
+            path_for_plugin_opts(&self.cert_path),
+            path_for_plugin_opts(&self.key_path)
+        )
     }
+}
+
+/// Render a path for embedding in a SIP003 `plugin_opts` string.
+///
+/// v2ray-plugin's args parser treats backslashes as escape characters
+/// (`\X` is unescaped to `X`), which mangles Windows paths like
+/// `C:\Users\foo\AppData\...` into `C:UsersfooAppData...`. Workarounds:
+///
+/// 1. Replace backslashes with forward slashes — Windows accepts forward
+///    slashes in file paths and v2ray-plugin's underlying `os.Open` does
+///    too.
+/// 2. Or double the backslashes (`\\`) in the plugin_opts string.
+///
+/// Option 1 is simpler and is what we use here.
+pub(crate) fn path_for_plugin_opts(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// Generate a self-signed CA cert with SAN `DNS:cloudfront.com` and write it
 /// to a fresh tempdir. Panics if rcgen or std::fs fails — tests want loud
 /// errors here.
 pub(crate) fn generate_test_certs() -> TestCerts {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
     let mut params = CertificateParams::new(vec!["cloudfront.com".to_string()])
         .expect("rcgen accepts cloudfront.com as a subject name");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // Explicit key usages: CA needs KeyCertSign + DigitalSignature; the
+    // same cert is also presented as the server's leaf, so it needs
+    // ServerAuth EKU. Without these, Go's crypto/x509 (v2ray-plugin's
+    // verifier) rejects the cert during chain validation.
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
     let key_pair = KeyPair::generate().expect("rcgen ECDSA key generation");
     let cert = params
