@@ -40,6 +40,7 @@ and re-run.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import shutil
 import socket
@@ -71,6 +72,11 @@ SOCKET_READY_TIMEOUT = 15
 # manual chrome://inspect) attach to the running dashboard.
 CDP_PORT = 9222
 
+# Name of the sentinel file `ensure_node_modules` writes under `node_modules/`
+# after every successful `npm install`. Holds the SHA-256 of `package-lock.json`
+# at install time; compared on subsequent runs to detect lockfile drift.
+INSTALL_STAMP_NAME = ".hole-install-stamp"
+
 # Prerequisites ========================================================================================================
 
 
@@ -83,20 +89,95 @@ def resolve_tool(name: str) -> str:
     return path
 
 
-def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None) -> None:
-    if Path("node_modules").exists():
+def _hash_lockfile(project_root: Path) -> str | None:
+    """SHA-256 hex digest of `package-lock.json`, or `None` if the file is
+    missing or unreadable. Callers treat `None` as 'needs install'."""
+    lockfile = project_root / "package-lock.json"
+    try:
+        return hashlib.sha256(lockfile.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def node_modules_is_stale(project_root: Path) -> bool:
+    """Return True if `node_modules/` is missing OR out of sync with
+    `package-lock.json`.
+
+    Sync is tracked by writing the SHA-256 of `package-lock.json` into
+    `node_modules/.hole-install-stamp` after every successful `npm install`.
+    Any failure path (missing dir, missing stamp, unreadable stamp,
+    unreadable lockfile, hash mismatch) returns True so we always reinstall
+    rather than silently leaving stale state. This survives `git checkout`,
+    partial installs, and editor permission glitches on Windows.
+
+    A byte-comparison of the root `package-lock.json` against
+    `node_modules/.package-lock.json` (npm's install-time snapshot) is NOT
+    a viable alternative: the snapshot omits `packages[""]` and filters
+    platform-optional deps, so the two files are byte-unequal even
+    immediately after a clean install.
+    """
+    if not (project_root / "node_modules").exists():
+        return True
+    expected = _hash_lockfile(project_root)
+    if expected is None:
+        return True
+    stamp = project_root / "node_modules" / INSTALL_STAMP_NAME
+    try:
+        return stamp.read_text().strip() != expected
+    except OSError:
+        return True
+
+
+def ensure_node_modules(
+    npm: str,
+    target_user: tuple[int, int, str, str] | None,
+    project_root: Path,
+) -> None:
+    """Run `npm install` if `node_modules/` is missing or out of sync with
+    `package-lock.json`, then refresh the freshness stamp.
+
+    Drift detection lives in `node_modules_is_stale`. Without it, any PR
+    that adds a JS dependency leaves `dev.py` running against a stale
+    tree and Vite fails to resolve the new import."""
+    if not node_modules_is_stale(project_root):
         return
-    print(f"{BOLD}Installing npm dependencies...{RESET}")
+    print(f"{BOLD}Installing npm dependencies (lockfile changed)...{RESET}")
     # Run as the invoking user so `node_modules/` is not owned by root.
     result = subprocess.run(
         [npm, "install"],
         stdout=sys.stdout,
         stderr=sys.stderr,
         env=drop_env({**os.environ}, target_user),
+        cwd=project_root,
         **drop_kwargs(target_user),
     )
     if result.returncode != 0:
         sys.exit(result.returncode)
+    # Write the freshness stamp AFTER a successful install so it matches
+    # the lockfile npm has actually written (npm may rewrite the lockfile
+    # to resolve drift between package.json and the existing lock). On
+    # macOS-under-sudo, chown the stamp to the target user so it lives in
+    # a uniformly owned `node_modules/` — without this, the directory and
+    # its packages are user-owned (because `drop_kwargs` ran the install)
+    # but the stamp would be root-owned, and a future user-mode
+    # `npm install` may fail to overwrite it. Any write/chown OSError is
+    # logged and swallowed: the next dev.py run will simply reinstall,
+    # never silently skip.
+    stamp_hash = _hash_lockfile(project_root)
+    if stamp_hash is None:
+        return
+    stamp_path = project_root / "node_modules" / INSTALL_STAMP_NAME
+    try:
+        # npm omits `node_modules/` on projects with zero dependencies
+        # ("up to date, audited 1 package"). Create the directory so the
+        # stamp has somewhere to live — self-consistent with `node_modules/`
+        # existing after a successful install.
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(stamp_hash)
+        if target_user is not None and hasattr(os, "chown"):
+            os.chown(stamp_path, target_user[0], target_user[1])
+    except OSError as e:
+        print(f"{YELLOW}Warning: failed to write install stamp: {e}{RESET}")
 
 
 def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
@@ -287,7 +368,7 @@ def main() -> None:
     cargo = resolve_tool("cargo")
     npm = resolve_tool("npm")
 
-    ensure_node_modules(npm, target_user)
+    ensure_node_modules(npm, target_user, project_root)
     cargo_build(cargo, target_user)
 
     # Stage the runnable BINDIR (hole.exe + v2ray-plugin.exe + wintun.dll on
