@@ -56,9 +56,6 @@ jobs:
       - name: Run linters
         run: prek run --all-files --show-diff-on-failure
 
-      - name: Test scripts
-        run: python scripts/test_dev.py
-
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
