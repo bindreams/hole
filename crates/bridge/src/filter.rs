@@ -6,10 +6,12 @@
 //! that drives them at runtime is added in Plan 2 (TCP) and Plan 3 (UDP).
 
 pub mod engine;
+pub mod fake_dns;
 pub mod matcher;
 pub mod rules;
 
 pub use engine::{decide, ConnInfo, L4Proto};
+pub use fake_dns::{AllocateError, FakeDns, DEFAULT_POOL_V4, DEFAULT_POOL_V6, FAKE_DNS_TTL};
 pub use matcher::Matcher;
 pub use rules::{CompiledRule, RuleSet};
 
