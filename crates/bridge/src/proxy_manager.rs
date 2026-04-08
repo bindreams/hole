@@ -123,13 +123,36 @@ impl<B: ProxyBackend> ProxyManager<B> {
         }
 
         // Build shadowsocks config
-        let ss_config = build_ss_config(config)?;
+        let ss_config = build_ss_config(config).inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
+
+        // Pre-load wintun.dll explicitly so we can give a descriptive error
+        // if it's missing. shadowsocks-service uses the bare "wintun.dll" name
+        // via tun-0.8.6, which becomes LoadLibraryExW with default search
+        // order. By loading the DLL here first (with an absolute path), the
+        // OS loader-table services the later bare-name lookup from the same
+        // process via base-name dedup. See crates/bridge/src/wintun.rs.
+        //
+        // No routes have been touched yet at this point, so we don't need
+        // to roll anything back — just record last_error and return like
+        // the build_ss_config path above.
+        #[cfg(target_os = "windows")]
+        crate::wintun::ensure_loaded().inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
 
         // Resolve server hostname to IP
-        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
+        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port)
+            .await
+            .inspect_err(|e| {
+                self.last_error = Some(e.to_string());
+            })?;
 
         // Detect default gateway and interface
-        let gw_info = self.backend.default_gateway()?;
+        let gw_info = self.backend.default_gateway().inspect_err(|e| {
+            self.last_error = Some(e.to_string());
+        })?;
 
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
         // routing mutation. A panic/SIGKILL between setup_routes and
@@ -208,6 +231,11 @@ impl<B: ProxyBackend> ProxyManager<B> {
 
         self.server_ip = None;
         self.started_at = None;
+        // Clear any error from a previous failed start. A clean stop is the
+        // user's signal that the bridge is in a good state again — keeping
+        // the stale error would make `handle_diagnostics` report
+        // `bridge = "error"` indefinitely. See issue #142.
+        self.last_error = None;
         self.state = ProxyState::Stopped;
 
         info!("proxy stopped");

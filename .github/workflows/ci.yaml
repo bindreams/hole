@@ -46,6 +46,13 @@ jobs:
       - name: Install prek
         run: uv tool install prek
 
+      # prek runs `cargo clippy` which compiles `crates/hole/build.rs`,
+      # which calls `tauri_build::build()`, which validates that the
+      # `externalBin` declared in tauri.conf.json (`v2ray-plugin-*`) actually
+      # exists on disk. So even the lint job needs the runtime deps cached.
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
+
       - name: Run linters
         run: prek run --all-files --show-diff-on-failure
 
@@ -82,6 +89,9 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -110,6 +120,9 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
       - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: astral-sh/setup-uv@v7
+
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
 
       - name: Test
         working-directory: msi-installer

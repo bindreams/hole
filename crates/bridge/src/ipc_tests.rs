@@ -668,12 +668,14 @@ fn diagnostics_proxy_stopped() {
         let mut client = TestClient::connect(&path).await;
         let diag = get_diagnostics(&mut client).await;
 
-        // Bridge IPC is up (we are handling this request); only the proxy
-        // is stopped. App and bridge are always "ok" inside the handler.
+        // Bridge IPC is up (we are handling this request); the proxy is stopped
+        // but no operation has failed, so `pm.last_error()` is None and the
+        // diagnostics handler reports `bridge = "ok"` (issue #142). App is
+        // always "ok" by convention (bridge can't observe the GUI directly).
         // Network is computed from the host's default gateway and the
-        // MockBackend returns Ok. vpn_server and internet are always
-        // "unknown" on the wire — the GUI computes them from the selected
-        // ServerEntry's persisted validation state.
+        // MockBackend returns Ok. vpn_server and internet are always "unknown"
+        // on the wire — the GUI computes them from the selected ServerEntry's
+        // persisted validation state (#150).
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok");
@@ -684,6 +686,54 @@ fn diagnostics_proxy_stopped() {
         let _ = handle.await;
     });
 }
+
+#[skuld::test]
+fn diagnostics_bridge_error_after_failed_start() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-bridge-err");
+        let server = IpcServer::bind(&path, gateway_failing_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Trigger a failed start so ProxyManager.last_error is populated.
+        // The gateway-failing mock makes default_gateway return Err, which
+        // ProxyManager::start now records via inspect_err.
+        let resp = post_start(&mut client, &sample_config()).await;
+        assert_eq!(resp.status(), 500);
+        let _ = resp.into_body().collect().await;
+
+        let diag = get_diagnostics(&mut client).await;
+        // Bridge IPC is up but the most recent operation failed — this is
+        // exactly the situation the old hardcoded "ok" was masking.
+        assert_eq!(diag.app, "ok");
+        assert_eq!(diag.bridge, "error");
+
+        drop(client);
+        let _ = handle.await;
+    });
+}
+
+// The bridge's error-log emission on IPC handler failure is a single
+// `error!(error = %e, "proxy start failed")` call in `handle_start` (and
+// the analogous calls in `handle_stop`/`handle_reload`). We deliberately
+// do NOT write a log-capture test for these, because installing a custom
+// tracing subscriber in a workspace test binary has process-wide side
+// effects — `tracing_subscriber::fmt().init()` calls `LogTracer::init()`
+// which mutates the global `log::max_level` state and makes every
+// `log::debug!`/`trace!` call in every dependency (shadowsocks-service,
+// tokio, mio, etc.) start flowing through the tracing → log bridge.
+// That added per-event overhead causes the parallel `server_test_tests`
+// (which do real localhost TCP handshakes with 5 s timeouts) to tip over
+// into timing out on GH Actions Windows runners — see the #147 CI
+// investigation.
+//
+// Keeping the coverage elsewhere: `start_failure_returns_error` (line
+// ~363) exercises the exact same error path and verifies the HTTP 500
+// response and error message. The `error!` call is trivially verifiable
+// by reading the three-line match arm in `ipc.rs`.
 
 // public_ip handler test is intentionally omitted — it makes an external HTTP call
 // to ipinfo.io which is not available in CI and cannot be easily mocked without

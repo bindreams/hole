@@ -14,6 +14,7 @@ struct MockBackend {
     start_called: Arc<AtomicU32>,
     fail_start: AtomicBool,
     fail_routes: AtomicBool,
+    fail_gateway: AtomicBool,
     gateway: IpAddr,
 }
 
@@ -23,6 +24,7 @@ impl MockBackend {
             start_called: Arc::new(AtomicU32::new(0)),
             fail_start: AtomicBool::new(false),
             fail_routes: AtomicBool::new(false),
+            fail_gateway: AtomicBool::new(false),
             gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
         }
     }
@@ -36,6 +38,12 @@ impl MockBackend {
     fn failing_routes() -> Self {
         let mut m = Self::new();
         m.fail_routes = AtomicBool::new(true);
+        m
+    }
+
+    fn failing_gateway() -> Self {
+        let mut m = Self::new();
+        m.fail_gateway = AtomicBool::new(true);
         m
     }
 }
@@ -74,6 +82,9 @@ impl ProxyBackend for MockBackend {
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        if self.fail_gateway.load(Ordering::SeqCst) {
+            return Err(ProxyError::Gateway("mock gateway failure".into()));
+        }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
             interface_name: "MockEthernet".into(),
@@ -265,6 +276,81 @@ fn uptime_increases_while_running() {
         pm.stop().await.unwrap();
         // After stop, uptime should be 0
         assert_eq!(pm.uptime_secs(), 0);
+    });
+}
+
+// last_error coverage for early-failure paths =========================================================================
+
+#[skuld::test]
+fn build_config_failure_sets_last_error() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        let mut config = test_config();
+        config.server.method = "not-a-real-cipher".into();
+
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidMethod(_)));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(pm.last_error().is_some(), "build_ss_config failure must set last_error");
+        assert!(pm.last_error().unwrap().contains("not-a-real-cipher"));
+    });
+}
+
+#[skuld::test]
+fn dns_resolution_failure_sets_last_error() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        let mut config = test_config();
+        // RFC 2606 reserves .invalid for guaranteed-non-resolution. lookup_host
+        // returns an error quickly (no real DNS query is sent for reserved TLDs
+        // by most resolvers, but even if one is, the upstream NXDOMAIN is fast).
+        config.server.server = "test.invalid".into();
+
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(matches!(err, ProxyError::DnsResolution { .. }));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(
+            pm.last_error().is_some(),
+            "resolve_server_ip failure must set last_error"
+        );
+        assert!(pm.last_error().unwrap().contains("test.invalid"));
+    });
+}
+
+#[skuld::test]
+fn gateway_failure_sets_last_error() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockBackend::failing_gateway());
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(matches!(err, ProxyError::Gateway(_)));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(pm.last_error().is_some(), "default_gateway failure must set last_error");
+        assert!(pm.last_error().unwrap().contains("mock gateway failure"));
+    });
+}
+
+#[skuld::test]
+fn stop_clears_last_error() {
+    rt().block_on(async {
+        // Successful start clears last_error itself (line 210). The point of
+        // this test is to verify the stop() side: any error left over from a
+        // hypothetical earlier failed start must be cleared on a clean stop,
+        // so handle_diagnostics doesn't keep reporting bridge=error after the
+        // user has rolled out of the failed state. See issue #142.
+        let (mut pm, _dir) = new_manager(MockBackend::new());
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        // Inject a stale error to simulate "previous failed start" residue.
+        pm.last_error = Some("stale error from a previous run".into());
+
+        pm.stop().await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert!(
+            pm.last_error().is_none(),
+            "stop() must clear last_error so diagnostics report bridge=ok again"
+        );
     });
 }
 

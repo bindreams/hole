@@ -28,8 +28,11 @@ Communication happens over IPC (Unix socket on macOS, named pipe on Windows) usi
 Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E tests).
 
 ```sh
-# Build all crates (build.rs automatically builds v2ray-plugin from source
-# and downloads wintun.dll on Windows)
+# One-time fetch of runtime deps (builds v2ray-plugin from Go source,
+# downloads + verifies wintun.dll on Windows). Cached after the first run.
+cargo xtask deps
+
+# Build all crates
 cargo build --workspace
 
 # Run GUI in dev mode
@@ -45,10 +48,12 @@ cargo test --workspace
 crates/
   common/    hole-common — shared types (protocol, config, import)
   bridge/    hole-bridge — privileged bridge library
-  gui/       hole-gui    — Tauri app + CLI (binary name: "hole")
+  hole/      hole        — Tauri app + CLI + bridge entry point (binary name: "hole")
+xtask/      workspace task runner (`cargo xtask <stage|deps|version|...>`)
+xtask-lib/  shared helper crate used by xtask AND crates/hole/build.rs
 external/
   v2ray-plugin/  v2ray-plugin source (git subrepo)
-msi-installer/  WiX MSI installer (Python project: source, build script, tests)
+msi-installer/  WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 ui/             Frontend HTML/CSS/JS
 scripts/        Utility scripts
 tests/       E2E test specs (WebDriverIO)

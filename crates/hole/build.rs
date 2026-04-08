@@ -7,17 +7,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", svg_path.display());
 
     let repo_root = git_repo_root();
-    let cache_dir = repo_root.join(".cache").join("gui");
-    let cache_icons_dir = cache_dir.join("icons");
-    std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/gui/icons/");
+    let cache_icons_dir = repo_root.join(".cache").join("icons");
+    std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
     emit_version_env(&repo_root);
     generate_icons(&svg_path, &cache_icons_dir);
     generate_tray_icons(icons_dir);
-    build_v2ray_plugin(&repo_root, &cache_dir);
 
-    #[cfg(target_os = "windows")]
-    download_wintun(&cache_dir);
+    // Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download)
+    // moved to `cargo xtask deps` in Commit 4 of this PR. See issue #143.
 
     tauri_build::build();
 }
@@ -40,7 +38,10 @@ fn git_repo_root() -> PathBuf {
 fn emit_version_env(repo_root: &Path) {
     let git_dir = repo_root.join(".git");
 
-    // Rerun triggers: branch ref changes, tag changes, packed-refs.
+    // Rerun triggers: branch ref changes, tag changes, packed-refs. The
+    // version computation itself lives in xtask-lib so it's testable and
+    // shared with `cargo xtask version` (which the prek hook + release CI
+    // workflow use). See xtask-lib/src/version.rs and issue #143.
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
         if let Some(refpath) = head.trim().strip_prefix("ref: ") {
@@ -50,208 +51,8 @@ fn emit_version_env(repo_root: &Path) {
     println!("cargo:rerun-if-changed={}", git_dir.join("refs").join("tags").display());
     println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
 
-    let version = match compute_git_version(repo_root) {
-        Ok(v) => v,
-        Err(msg) => {
-            println!("cargo:warning=failed to compute git version: {msg}");
-            "0.0.0-unknown".to_string()
-        }
-    };
-
+    let version = xtask_lib::version::display_version(repo_root);
     println!("cargo:rustc-env=HOLE_VERSION={version}");
-}
-
-fn compute_git_version(repo_root: &Path) -> Result<String, String> {
-    // git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --long
-    // Output format: <tag>-<distance>-g<short-hash>
-    let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--match", "v[0-9]*.[0-9]*.[0-9]*", "--long"])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| format!("git describe: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git describe exited {}: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let desc = String::from_utf8(output.stdout).map_err(|e| format!("git describe output not utf-8: {e}"))?;
-    let desc = desc.trim();
-
-    // Parse --long format by splitting from the right on '-'.
-    // Safe because we validate the tag contains no hyphens below.
-    let parts: Vec<&str> = desc.rsplitn(3, '-').collect();
-    if parts.len() != 3 {
-        return Err(format!("unexpected git describe output: {desc}"));
-    }
-    let tag = parts[2];
-    let distance: u64 = parts[1].parse().map_err(|e| format!("bad distance in '{desc}': {e}"))?;
-
-    // Validate strict vMAJOR.MINOR.PATCH (no pre-release/build suffixes).
-    let semver = tag
-        .strip_prefix('v')
-        .ok_or_else(|| format!("tag '{tag}' missing 'v' prefix"))?;
-    let parsed = semver::Version::parse(semver).map_err(|e| format!("tag '{tag}' is not valid semver: {e}"))?;
-    if !parsed.pre.is_empty() || !parsed.build.is_empty() {
-        return Err(format!(
-            "tag '{tag}' must be strict vMAJOR.MINOR.PATCH (no pre-release/build)"
-        ));
-    }
-
-    let mut version = semver.to_string();
-
-    if distance > 0 {
-        // Get full commit hash for the snapshot suffix.
-        let hash_output = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo_root)
-            .output()
-            .map_err(|e| format!("git rev-parse HEAD: {e}"))?;
-        let full_hash =
-            String::from_utf8(hash_output.stdout).map_err(|e| format!("git rev-parse output not utf-8: {e}"))?;
-        version = format!("{version}-snapshot+git.{}", full_hash.trim());
-    }
-
-    // Check if worktree is dirty (tracked files only; untracked files are ignored,
-    // matching `git describe --dirty` behavior).
-    let dirty = std::process::Command::new("git")
-        .args(["diff-index", "--quiet", "HEAD", "--"])
-        .current_dir(repo_root)
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(false);
-
-    if dirty {
-        version.push_str(".dirty");
-    }
-
-    Ok(version)
-}
-
-// v2ray-plugin build ==================================================================================================
-
-fn v2ray_plugin_output_name() -> &'static str {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        "v2ray-plugin-x86_64-pc-windows-msvc.exe"
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "v2ray-plugin-aarch64-apple-darwin"
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "v2ray-plugin-x86_64-apple-darwin"
-    }
-
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-    )))]
-    compile_error!("unsupported platform for v2ray-plugin sidecar")
-}
-
-fn build_v2ray_plugin(repo_root: &Path, cache_dir: &Path) {
-    let source_dir = repo_root.join("external").join("v2ray-plugin");
-    let output_dir = cache_dir.join("v2ray-plugin");
-    let output_name = v2ray_plugin_output_name();
-    let output_path = output_dir.join(output_name);
-
-    // No rerun-if-changed for the source dir: cargo's directory tracking only
-    // detects top-level file additions/removals, not modifications inside.
-    // Go's own build cache makes repeated builds fast (~instant if unchanged).
-
-    std::fs::create_dir_all(&output_dir).expect("failed to create cache/v2ray-plugin/");
-
-    let status = std::process::Command::new("go")
-        .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
-        .arg(&output_path)
-        .arg(".")
-        .current_dir(&source_dir)
-        .env("CGO_ENABLED", "0")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => panic!("go build failed with exit code {}", s.code().unwrap_or(-1)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            panic!("Go toolchain not found. Install from https://go.dev/dl/");
-        }
-        Err(e) => panic!("failed to run go build: {e}"),
-    }
-}
-
-// wintun download =====================================================================================================
-
-#[cfg(target_os = "windows")]
-const WINTUN_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";
-#[cfg(target_os = "windows")]
-const WINTUN_ZIP_SHA256: &str = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51";
-
-#[cfg(target_os = "windows")]
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(data);
-    hex_encode(&hash)
-}
-
-#[cfg(target_os = "windows")]
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(target_os = "windows")]
-fn download_wintun(cache_dir: &Path) {
-    let wintun_dir = cache_dir.join("wintun");
-    let dll_path = wintun_dir.join("wintun.dll");
-
-    std::fs::create_dir_all(&wintun_dir).expect("failed to create cache/wintun/");
-
-    // Check cache: verify the hash sentinel written after a successful download
-    let hash_sentinel = wintun_dir.join("wintun.dll.verified");
-    if dll_path.exists() && hash_sentinel.exists() {
-        let stored_hash = std::fs::read_to_string(&hash_sentinel).unwrap_or_default();
-        if stored_hash.trim() == WINTUN_ZIP_SHA256 {
-            return;
-        }
-        // Hash mismatch — stale cache from a different version, re-download
-    }
-
-    // Download and verify
-    eprintln!("Downloading wintun.dll from {WINTUN_URL}...");
-    let response = ureq::get(WINTUN_URL).call().expect("failed to download wintun zip");
-
-    let zip_data = response
-        .into_body()
-        .read_to_vec()
-        .expect("failed to read wintun zip response");
-
-    let actual_hash = sha256_hex(&zip_data);
-    assert_eq!(
-        actual_hash, WINTUN_ZIP_SHA256,
-        "wintun.zip hash mismatch: expected {WINTUN_ZIP_SHA256}, got {actual_hash}"
-    );
-
-    // Extract wintun.dll from zip
-    let cursor = std::io::Cursor::new(&zip_data);
-    let mut archive = zip::ZipArchive::new(cursor).expect("failed to open wintun zip");
-
-    let mut dll_file = archive
-        .by_name("wintun/bin/amd64/wintun.dll")
-        .expect("wintun.dll not found in zip archive");
-
-    let mut dll_data = Vec::new();
-    std::io::Read::read_to_end(&mut dll_file, &mut dll_data).expect("failed to read wintun.dll from zip");
-
-    std::fs::write(&dll_path, &dll_data).expect("failed to write wintun.dll to cache");
-    std::fs::write(&hash_sentinel, WINTUN_ZIP_SHA256).expect("failed to write hash sentinel");
-    eprintln!("wintun.dll downloaded and verified ({} bytes)", dll_data.len());
 }
 
 // Icons ===============================================================================================================

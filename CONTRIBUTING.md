@@ -17,13 +17,15 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ### Workspace layout
 
-| Directory        | Crate/Purpose                                                |
-| ---------------- | ------------------------------------------------------------ |
-| `crates/common/` | `hole-common` — shared types: protocol, config, logging      |
-| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC) |
-| `crates/gui/`    | `hole-gui` — Tauri app + CLI (binary name: `hole`)           |
-| `external/`      | Third-party source (git subrepos)                            |
-| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                          |
+| Directory        | Crate/Purpose                                                       |
+| ---------------- | ------------------------------------------------------------------- |
+| `crates/common/` | `hole-common` — shared types: protocol, config, logging             |
+| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)        |
+| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`) |
+| `xtask/`         | workspace task runner (`cargo xtask <stage\|deps\|version\|...>`)   |
+| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`        |
+| `external/`      | Third-party source (git subrepos)                                   |
+| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                 |
 
 ### Logging
 
@@ -56,7 +58,7 @@ If the dev bridge is killed before clean shutdown and your internet breaks, run 
 ## Prerequisites
 
 - Rust toolchain
-- Go toolchain (for v2ray-plugin, built automatically by `build.rs`)
+- Go toolchain (for v2ray-plugin, built by `cargo xtask deps`)
 - Node.js (for frontend tooling)
 
 ## Development
@@ -94,13 +96,11 @@ If you prefer separate terminals or need more control:
 Windows (elevated PowerShell):
 
 ```powershell
+cargo xtask deps                                                          # build v2ray-plugin + download wintun
 cargo build
-$dev = "$env:TEMP\hole-dev-manual"
-New-Item -ItemType Directory -Force -Path $dev | Out-Null
-Copy-Item target\debug\hole.exe "$dev\hole.exe"                              # copy to avoid file lock (see below)
-Copy-Item .cache\gui\v2ray-plugin\v2ray-plugin-*.exe "$dev\v2ray-plugin.exe" # sidecar must sit next to the bridge binary
-& "$dev\hole.exe" bridge grant-access                                        # create hole group, add user
-& "$dev\hole.exe" bridge run `
+cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"   # populates BINDIR (hole.exe + sidecars + wintun.dll)
+& "$env:TEMP\hole-dev-manual\hole.exe" bridge grant-access                # create hole group, add user
+& "$env:TEMP\hole-dev-manual\hole.exe" bridge run `
     --socket-path "$env:TEMP\hole-dev.sock" `
     --state-dir   "$env:TEMP\hole-dev-state"
 ```
@@ -108,13 +108,11 @@ Copy-Item .cache\gui\v2ray-plugin\v2ray-plugin-*.exe "$dev\v2ray-plugin.exe" # s
 macOS (under sudo):
 
 ```sh
+cargo xtask deps                                                          # build v2ray-plugin
 cargo build
-DEV="$TMPDIR/hole-dev-manual"
-mkdir -p "$DEV"
-cp target/debug/hole "$DEV/hole"                                  # copy to avoid file lock (see below)
-cp .cache/gui/v2ray-plugin/v2ray-plugin-* "$DEV/v2ray-plugin"     # sidecar must sit next to the bridge binary
-"$DEV/hole" bridge grant-access                                   # create hole group, add user
-"$DEV/hole" bridge run \
+cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # populates BINDIR (hole + sidecars)
+"$TMPDIR/hole-dev-manual/hole" bridge grant-access                        # create hole group, add user
+"$TMPDIR/hole-dev-manual/hole" bridge run \
     --socket-path "$TMPDIR/hole-dev.sock" \
     --state-dir   "$TMPDIR/hole-dev-state"
 ```
@@ -136,7 +134,7 @@ npm run dev &                                          # Vite on port 1420
 HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```
 
-The bridge binary must be copied because it holds a file lock while running. Without the copy, `cargo build` would fail with "Access is denied" when you try to rebuild. The `v2ray-plugin` sidecar must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy.rs) finds it — same layout as the installed MSI in `Program Files\hole\bin\`.
+`cargo xtask stage` populates a directory with `hole.exe`, `v2ray-plugin.exe`, and (on Windows) `wintun.dll` — the same layout as the installed MSI in `Program Files\hole\bin\`. The canonical file list lives in [xtask/src/bindir.rs](xtask/src/bindir.rs); adding a new BINDIR file is a one-line change there and both `dev.py` and `msi-installer` pick it up automatically. The bridge binary must be staged out of the cargo target dir because the running bridge holds a file lock on its own exe — without staging, the next `cargo build` would fail with "Access is denied". The `v2ray-plugin` sidecar must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy.rs) finds it.
 
 ### Flags
 
@@ -151,7 +149,7 @@ The bridge binary must be copied because it holds a file lock while running. Wit
 
 - Running `hole bridge run` requires elevation (for TUN/routing). `scripts/dev.py` enforces this at startup.
 - Use absolute paths (like `$TEMP`) for `--socket-path` to avoid Windows AF_UNIX path length limits.
-- The first build is slow (compiles v2ray-plugin from Go, downloads wintun on Windows, generates icons). Subsequent rebuilds are incremental.
+- The first run of `cargo xtask deps` is slow (compiles v2ray-plugin from Go, downloads wintun on Windows). Subsequent runs are near-instant: Go's build cache short-circuits, and the wintun download is sha256-sentineled. Icons are generated by `crates/hole/build.rs` on every cargo build but cached in `.cache/icons/`.
 
 ## Testing
 

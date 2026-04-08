@@ -159,13 +159,13 @@ pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
 pub(crate) fn dispatch(command: Command) -> ! {
     let _cli_log_guard = if should_install_cli_log_guard(&command) {
         let log_dir = hole_common::logging::default_log_dir();
-        Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole_gui=info"))
+        Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole=info"))
     } else {
         None
     };
     let code = match command {
         Command::Version => {
-            println!("hole {}", hole_gui::version::VERSION);
+            println!("hole {}", hole::version::VERSION);
             0
         }
         Command::Upgrade => handle_upgrade(),
@@ -178,7 +178,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
 
 fn handle_upgrade() -> i32 {
     cli_log!(info, "checking for updates...");
-    match hole_gui::update::check_for_update() {
+    match hole::update::check_for_update() {
         Ok(Some(info)) => {
             cli_log!(info, "update available: v{}", info.version);
 
@@ -192,13 +192,13 @@ fn handle_upgrade() -> i32 {
             let dest = download_dir.path().join(&info.asset_name);
 
             cli_log!(info, "downloading {}...", info.asset_name);
-            if let Err(e) = hole_gui::update::download_asset(&info.asset_url, &dest) {
+            if let Err(e) = hole::update::download_asset(&info.asset_url, &dest) {
                 cli_log!(error, "download failed: {e}");
                 return 1;
             }
 
             cli_log!(info, "verifying...");
-            if let Err(e) = hole_gui::update::verify_asset(
+            if let Err(e) = hole::update::verify_asset(
                 &dest,
                 &info.asset_name,
                 &info.sha256sums_url,
@@ -209,7 +209,7 @@ fn handle_upgrade() -> i32 {
             }
 
             cli_log!(info, "installing...");
-            if let Err(e) = hole_gui::update::run_installer(&dest, true) {
+            if let Err(e) = hole::update::run_installer(&dest, true) {
                 cli_log!(error, "installation failed: {e}");
                 return 1;
             }
@@ -218,7 +218,7 @@ fn handle_upgrade() -> i32 {
             0
         }
         Ok(None) => {
-            cli_log!(info, "already up to date ({})", hole_gui::version::VERSION);
+            cli_log!(info, "already up to date ({})", hole::version::VERSION);
             0
         }
         Err(e) => {

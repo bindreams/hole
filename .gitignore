@@ -5,9 +5,9 @@
 node_modules/
 
 # Tauri generated
-crates/gui/gen/
+crates/hole/gen/
 
-# Build cache (v2ray-plugin Go build, wintun download)
+# Build cache (xtask deps: v2ray-plugin Go build, wintun download, generated icons)
 /.cache/
 
 # Claude Code

@@ -7,7 +7,6 @@ Usage: uv run --directory msi-installer build
 """
 
 import hashlib
-import os
 import platform
 import re
 import shutil
@@ -39,17 +38,6 @@ def _find_repo_root() -> Path:
     raise BuildError("could not find repo root (no .git/ directory found)")
 
 
-def link_or_copy(src: Path, dst: Path) -> str:
-    """Hardlink src to dst, falling back to copy. Returns method used."""
-    dst.unlink(missing_ok=True)
-    try:
-        os.link(src, dst)
-        return "hardlinked"
-    except OSError:
-        shutil.copy2(src, dst)
-        return "copied"
-
-
 # Build ================================================================================================================
 
 
@@ -64,37 +52,29 @@ def cargo_build(console: Console) -> None:
 
 
 def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    console.print(f"[bold]Staging installer files[/] to {stage_dir}")
+    """Stage the runnable BINDIR via `cargo xtask stage`.
 
-    # hole.exe
-    src = root / "target" / "release" / "hole.exe"
-    method = link_or_copy(src, stage_dir / "hole.exe")
-    console.print(f"  hole.exe ({method})")
-
-    # v2ray-plugin.exe
-    v2ray_dir = root / ".cache" / "gui" / "v2ray-plugin"
-    candidates = list(v2ray_dir.glob("v2ray-plugin-*.exe"))
-    if len(candidates) == 0:
-        raise BuildError(f"no v2ray-plugin binary found in {v2ray_dir}")
-    if len(candidates) > 1:
-        raise BuildError(f"multiple v2ray-plugin binaries in {v2ray_dir}: {candidates}")
-    method = link_or_copy(candidates[0], stage_dir / "v2ray-plugin.exe")
-    console.print(f"  v2ray-plugin.exe ({method})")
-
-    # wintun.dll
-    wintun = root / ".cache" / "gui" / "wintun" / "wintun.dll"
-    if not wintun.exists():
-        raise BuildError(f"wintun.dll not found at {wintun}")
-    method = link_or_copy(wintun, stage_dir / "wintun.dll")
-    console.print(f"  wintun.dll ({method})")
+    The canonical list of files (hole.exe + v2ray-plugin.exe + wintun.dll on
+    Windows) lives in `xtask/src/bindir.rs::bindir_files()`. dev.py and this
+    function both call into the same xtask subcommand, so adding a new BINDIR
+    file is a one-line change in xtask and both consumers pick it up
+    automatically. See issue #143.
+    """
+    console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
+    result = subprocess.run(
+        ["cargo", "xtask", "stage", "--profile", "release", "--out-dir",
+         str(stage_dir)],
+        cwd=root,
+    )
+    if result.returncode != 0:
+        raise BuildError(f"cargo xtask stage failed with exit code {result.returncode}")
 
 
 # Version ==============================================================================================================
 
 
 def get_version(root: Path) -> str:
-    cargo_toml = root / "crates" / "gui" / "Cargo.toml"
+    cargo_toml = root / "crates" / "hole" / "Cargo.toml"
     with open(cargo_toml, "rb") as f:
         data = tomllib.load(f)
 

@@ -10,6 +10,8 @@ pub mod route_state;
 pub mod routing;
 pub mod server_test;
 pub mod socket;
+#[cfg(target_os = "windows")]
+pub mod wintun;
 
 #[cfg(test)]
 fn main() {

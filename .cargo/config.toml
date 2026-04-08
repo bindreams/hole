@@ -1,0 +1,4 @@
+# `cargo xtask <subcommand>` invokes the workspace's xtask binary.
+# Standard matklad/cargo-xtask convention. See xtask/src/main.rs.
+[alias]
+xtask = "run --package xtask --quiet --"

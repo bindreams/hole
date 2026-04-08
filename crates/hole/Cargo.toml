@@ -1,5 +1,5 @@
 [package]
-name = "hole-gui"
+name = "hole"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 workspace = true
 
 [lib]
-name = "hole_gui"
+name = "hole"
 harness = false
 
 [[bin]]
@@ -62,10 +62,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [build-dependencies]
 tauri-build = "2"
-semver = "1"
+xtask-lib = { path = "../../xtask-lib" }
 resvg = "0.45"
 png = "0.18"
 ico = "0.5"
-ureq = "3"
-zip = "8"
-sha2 = "0.11"
