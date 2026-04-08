@@ -74,18 +74,20 @@ async function pollProxyStatus() {
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
-    if (!result.changed) return;
+    if (result.state === result.previousState) return;
 
     // Connection state changed — refresh IP.
     updatePublicIp();
 
-    // Stopped → Running transition: mark the selected server as
-    // "validated by a successful proxy start" so the user gets a green
-    // dot without needing to run an explicit test. Sequence the persist
-    // BEFORE the reload so loadConfig() sees the new validation state
-    // and a subsequent disconnect cannot sneak in between persist and
-    // reload.
-    if (result.connected && config?.selected_server) {
+    // Fire `mark_validated_by_proxy_start` only on the specific
+    // transition into `connected`. This avoids re-firing on every poll
+    // that happens to observe `running: true`, and sidesteps the
+    // polling-vs-click race: the user-initiated connect goes through
+    // `handlePowerClick` which uses the same transition so the event
+    // is emitted consistently regardless of which path landed the
+    // state change. Sequence the persist BEFORE the reload so
+    // loadConfig() sees the new validation state.
+    if (result.state === "connected" && config?.selected_server) {
       try {
         await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
         await loadConfig();

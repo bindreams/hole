@@ -3,6 +3,16 @@
 
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  type ConnectionState,
+  IDLE_STATES,
+  isEffectivelyOn,
+  powerBtnClassFor,
+  stateForPolledRunning,
+  stateForToggleOutcome,
+  statusTextFor,
+  statusWordClassFor,
+} from "./connection-state";
 import { config } from "./main";
 import { statusTooltipFor } from "./servers";
 import {
@@ -13,6 +23,17 @@ import {
   type PublicIpData,
   type ValidationState,
 } from "./types";
+
+/// Backend returns `ToggleOutcome` serialized as lowercase strings. Must
+/// match `crates/hole/src/tray.rs::ToggleOutcome`.
+type ToggleOutcome = "running" | "stopped" | "cancelled";
+
+/// Client-side timeout for `toggle_proxy`. If the IPC call doesn't
+/// resolve within this window we fire `cancel_proxy` and move the UI to
+/// a "failed" state. Chosen to comfortably exceed a real connect (DNS +
+/// handshake + route setup usually <5 s) while still surfacing a hung
+/// bridge promptly.
+const TOGGLE_TIMEOUT_MS = 15_000;
 
 // Formatting helpers ==================================================================================================
 
@@ -64,8 +85,8 @@ const versionFooter = document.getElementById("version-footer")!;
 
 // State ===============================================================================================================
 
-let connected = false;
-let toggling = false;
+let currentState: ConnectionState = "disconnected";
+let previousState: ConnectionState = "disconnected";
 let currentIp = "";
 
 // Throughput graph data — circular buffer of 60 data points.
@@ -109,29 +130,88 @@ graphSvg.appendChild(txLine);
 
 // Power button ========================================================================================================
 
-async function handlePowerClick() {
-  if (toggling) return;
-  toggling = true;
-  powerBtn.style.opacity = "0.6";
-
-  try {
-    const newState = await invoke<boolean>("toggle_proxy");
-    connected = newState;
-    updateConnectionUI();
-    // Refresh IP on connection state change.
-    updatePublicIp();
-  } catch (err) {
-    console.error("toggle_proxy failed:", err);
-  } finally {
-    toggling = false;
-    powerBtn.style.opacity = "";
-  }
+/// Transition the UI to a new state and repaint the DOM. Tracks the
+/// previous state for polling-side event emission
+/// (`mark_validated_by_proxy_start` fires on connecting → connected
+/// specifically, not on any "became connected").
+function setState(next: ConnectionState) {
+  previousState = currentState;
+  currentState = next;
+  updateConnectionUI();
 }
 
 function updateConnectionUI() {
-  powerBtn.className = connected ? "power-btn on" : "power-btn off";
-  statusWord.className = connected ? "on" : "off";
-  statusWord.textContent = connected ? "Connected" : "Disconnected";
+  powerBtn.className = powerBtnClassFor(currentState);
+  statusWord.className = statusWordClassFor(currentState);
+  statusWord.textContent = statusTextFor(currentState);
+}
+
+async function handlePowerClick() {
+  // Non-interactive transition states — click is ignored.
+  if (currentState === "cancelling" || currentState === "disconnecting") {
+    return;
+  }
+
+  // Click during connecting → fire cancel. The original toggle_proxy
+  // promise is still pending in toggleFromIdle(); `cancel_proxy`
+  // races it on a fresh bridge connection so it does not block behind
+  // the in-flight start.
+  if (currentState === "connecting") {
+    setState("cancelling");
+    invoke("cancel_proxy").catch((err) => {
+      console.error("cancel_proxy failed:", err);
+    });
+    return;
+  }
+
+  // Idle state — start or stop based on whether the proxy is
+  // effectively on. Retry paths (connection-failed, disconnection-failed)
+  // are treated as their base idle states for the purpose of this dispatch.
+  const goingToConnect = !isEffectivelyOn(currentState);
+  await toggleFromIdle(goingToConnect);
+}
+
+/// Issue `toggle_proxy` with a 15 s client-side timeout. On success,
+/// the state transitions per `ToggleOutcome`; on explicit failure, to
+/// the matching `-failed` idle state; on timeout, to the matching
+/// `-failed` state AND a best-effort `cancel_proxy` is fired to stop
+/// the bridge from completing the operation in the background.
+async function toggleFromIdle(goingToConnect: boolean) {
+  setState(goingToConnect ? "connecting" : "disconnecting");
+
+  const togglePromise = invoke<ToggleOutcome>("toggle_proxy");
+  // Prevent unhandled-rejection warnings if the promise settles after
+  // we've already moved on due to timeout.
+  togglePromise.catch(() => {});
+
+  const raced = await Promise.race<
+    { kind: "ok"; outcome: ToggleOutcome } | { kind: "err"; error: unknown } | { kind: "timeout" }
+  >([
+    togglePromise
+      .then((outcome) => ({ kind: "ok" as const, outcome }))
+      .catch((error) => ({ kind: "err" as const, error })),
+    new Promise((resolve) => setTimeout(() => resolve({ kind: "timeout" as const }), TOGGLE_TIMEOUT_MS)),
+  ]);
+
+  if (raced.kind === "timeout") {
+    console.error(`toggle_proxy timed out after ${TOGGLE_TIMEOUT_MS}ms — firing cancel`);
+    // Best-effort cancel so the bridge doesn't finish the connect in
+    // the background behind our back. Ignore the result.
+    invoke("cancel_proxy").catch(() => {});
+    setState(goingToConnect ? "connection-failed" : "disconnection-failed");
+    return;
+  }
+
+  if (raced.kind === "ok") {
+    setState(stateForToggleOutcome(raced.outcome));
+    // Refresh IP on any successful transition.
+    updatePublicIp();
+    return;
+  }
+
+  // raced.kind === "err"
+  console.error("toggle_proxy failed:", raced.error);
+  setState(goingToConnect ? "connection-failed" : "disconnection-failed");
 }
 
 // IP display ==========================================================================================================
@@ -336,19 +416,32 @@ export function updateMetrics(metrics: Metrics) {
 }
 
 /**
- * Update the connection state from a proxy status poll.
- * Returns the `running` boolean so main.ts can track state changes.
+ * Update the connection state from a periodic proxy status poll.
+ *
+ * Only overwrites `currentState` when the current state is IDLE.
+ * Transition states (`connecting`/`cancelling`/`disconnecting`) are
+ * short-lived, carry their own owning IPC promise in `handlePowerClick`,
+ * and must not be clobbered by a poll landing mid-transition. A poll
+ * that arrives during a transition is a no-op for state purposes.
+ *
+ * Returns `{ state, previousState }` so `main.ts` can emit
+ * `mark_validated_by_proxy_start` on the specific `connecting → connected`
+ * transition (not on every poll that observes `running: true`).
  */
 export function updateProxyStatus(status: ProxyStatus) {
-  const wasConnected = connected;
-  connected = !!status.running;
-  updateConnectionUI();
-  return { connected, changed: wasConnected !== connected };
+  if (!IDLE_STATES.has(currentState)) {
+    return { state: currentState, previousState };
+  }
+  const polled = stateForPolledRunning(!!status.running);
+  if (polled !== currentState) {
+    setState(polled);
+  }
+  return { state: currentState, previousState };
 }
 
 /** Returns the current connection state. */
-export function isConnected() {
-  return connected;
+export function getConnectionState(): ConnectionState {
+  return currentState;
 }
 
 // Initialization ======================================================================================================

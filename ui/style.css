@@ -231,6 +231,7 @@ order. (0,2,0) > (0,1,0). */
   justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
+  position: relative;
   transition:
     background 0.2s,
     box-shadow 0.2s;
@@ -247,9 +248,60 @@ order. (0,2,0) > (0,1,0). */
   box-shadow: 0 0 12px var(--red-glow);
 }
 
+/* Transition state: neutral background, spinning arc instead of the
+  power icon. Click is still enabled (so "cancel connect" works) but
+  the button visually reads as busy/indeterminate. */
+.power-btn.transitioning {
+  background: var(--text-ghost);
+  box-shadow: 0 0 12px rgba(128, 128, 128, 0.25);
+}
+
+/* Failure flash — briefly draws attention to a just-failed button so
+  the state change is visually distinct from the idle red/green. The
+  persistent "Connection failed" / "Disconnect failed" text next to
+  the button is the actual persistent error signal. */
+.power-btn.failed-off {
+  animation: power-btn-failed-flash 0.8s ease-out;
+}
+
+.power-btn.failed-on {
+  animation: power-btn-failed-flash 0.8s ease-out;
+}
+
+@keyframes power-btn-failed-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.8);
+  }
+  100% {
+    box-shadow: 0 0 12px rgba(239, 68, 68, 0.35);
+  }
+}
+
 .power-btn svg {
   width: 18px;
   height: 18px;
+}
+
+/* Hide the power icon while transitioning; the rotating arc
+  (rendered via ::before) stands in for it. */
+.power-btn.transitioning svg {
+  display: none;
+}
+
+.power-btn.transitioning::before {
+  content: "";
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2.5px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #ffffff;
+  animation: power-btn-spin 1s linear infinite;
+}
+
+@keyframes power-btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .sb-status-block {
@@ -275,6 +327,10 @@ order. (0,2,0) > (0,1,0). */
 
 .sb-status strong.off {
   color: var(--red);
+}
+
+.sb-status strong.transitioning {
+  color: var(--text-secondary);
 }
 
 .sb-ip {
