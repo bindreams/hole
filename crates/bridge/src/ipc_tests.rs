@@ -19,6 +19,10 @@ use tokio::task::JoinHandle;
 struct MockBackend {
     fail_start: AtomicBool,
     fail_gateway: AtomicBool,
+    /// If Some, `start_ss` awaits this gate before returning. Used to
+    /// simulate a slow start so tests can race `POST /v1/cancel` against
+    /// an in-flight `POST /v1/start`.
+    start_ss_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MockBackend {
@@ -26,6 +30,7 @@ impl MockBackend {
         Self {
             fail_start: AtomicBool::new(false),
             fail_gateway: AtomicBool::new(false),
+            start_ss_gate: None,
         }
     }
 
@@ -33,6 +38,7 @@ impl MockBackend {
         Self {
             fail_start: AtomicBool::new(true),
             fail_gateway: AtomicBool::new(false),
+            start_ss_gate: None,
         }
     }
 
@@ -40,6 +46,15 @@ impl MockBackend {
         Self {
             fail_start: AtomicBool::new(false),
             fail_gateway: AtomicBool::new(true),
+            start_ss_gate: None,
+        }
+    }
+
+    fn gated(gate: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            fail_start: AtomicBool::new(false),
+            fail_gateway: AtomicBool::new(false),
+            start_ss_gate: Some(gate),
         }
     }
 }
@@ -49,6 +64,9 @@ impl ProxyBackend for MockBackend {
         &self,
         _config: shadowsocks_service::config::Config,
     ) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
+        if let Some(gate) = self.start_ss_gate.as_ref() {
+            gate.notified().await;
+        }
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(ProxyError::Runtime(std::io::Error::other("mock failure")));
         }
@@ -100,6 +118,11 @@ fn failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
 fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     Arc::new(Mutex::new(ProxyManager::new(MockBackend::gateway_failing(), state_dir)))
+}
+
+fn gated_proxy(gate: Arc<tokio::sync::Notify>) -> Arc<Mutex<ProxyManager<MockBackend>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(Mutex::new(ProxyManager::new(MockBackend::gated(gate), state_dir)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -184,6 +207,16 @@ async fn post_stop(client: &mut TestClient) -> http::Response<hyper::body::Incom
     let req = http::Request::builder()
         .method("POST")
         .uri(ROUTE_STOP)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    client.send(req).await
+}
+
+async fn post_cancel(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(ROUTE_CANCEL)
         .header("host", "localhost")
         .body(Full::new(Bytes::new()))
         .unwrap();
@@ -738,6 +771,122 @@ fn diagnostics_bridge_error_after_failed_start() {
 // public_ip handler test is intentionally omitted — it makes an external HTTP call
 // to ipinfo.io which is not available in CI and cannot be easily mocked without
 // adding an HTTP client abstraction layer (a follow-up concern).
+
+// Cancel tests ========================================================================================================
+
+/// Extract the `message` field from a 500 `ErrorResponse`.
+async fn error_message(resp: http::Response<hyper::body::Incoming>) -> String {
+    assert_eq!(resp.status(), 500, "expected 500 for cancelled start");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+    err.message
+}
+
+#[skuld::test]
+fn cancel_while_start_in_flight_returns_cancelled() {
+    // Two concurrent connections. A posts Start against a gated mock so
+    // start_ss hangs. B posts Cancel. A's Start response must come back
+    // with 500 + "cancelled" promptly (not after the full gate duration,
+    // which never elapses in this test).
+    rt().block_on(async {
+        let path = test_socket_path("cancel-in-flight");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let handle = tokio::spawn(async move { server.run().await });
+
+        // Connection A: owns its client end. Spawn a task that drives the
+        // start request so this test task can issue a cancel concurrently.
+        let path_a = path.clone();
+        let start_future = tokio::spawn(async move {
+            let mut client_a = TestClient::connect(&path_a).await;
+            let resp = post_start(&mut client_a, &sample_config()).await;
+            (client_a, resp)
+        });
+
+        // Give A a moment to acquire the proxy mutex and park in start_ss.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Connection B: cancel the in-flight start. Must succeed without
+        // waiting for the in-flight Start (which never completes since the
+        // gate is not released).
+        let mut client_b = TestClient::connect(&path).await;
+        let cancel_resp = post_cancel(&mut client_b).await;
+        assert_eq!(
+            cancel_resp.status(),
+            200,
+            "cancel must succeed even while start is in flight"
+        );
+
+        // Wait for A's Start to return, bounded. With cancellation working
+        // correctly the select! branch fires, drop-safety unwinds the
+        // partial state, and Cancelled is returned promptly.
+        let (_client_a, resp_a) = tokio::time::timeout(std::time::Duration::from_secs(5), start_future)
+            .await
+            .expect("start did not return within 5s of cancel")
+            .expect("start task panicked");
+        assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
+
+        // Release the gate so the spawned ss future (from MockBackend) can
+        // settle cleanly as part of the TaskHandleGuard drop path.
+        gate.notify_one();
+        handle.abort();
+    });
+}
+
+#[skuld::test]
+fn cancel_before_start_is_pre_armed_and_consumed() {
+    // A cancel arriving before any start is in flight pre-arms a flag
+    // that the next start consumes. The next Start returns 500 +
+    // "cancelled" immediately without even attempting to acquire the
+    // proxy mutex or call backend.start_ss.
+    rt().block_on(async {
+        let path = test_socket_path("cancel-prearm");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Pre-arm: cancel with no start in flight — still 200 Ack.
+        let resp = post_cancel(&mut client).await;
+        assert_eq!(consume(resp).await, 200);
+
+        // Now start — should be rejected as cancelled, consuming the pre-arm.
+        let start_resp = post_start(&mut client, &sample_config()).await;
+        assert_eq!(error_message(start_resp).await, CANCELLED_MESSAGE);
+
+        // A second start with no pre-arm should succeed normally.
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        // Cleanup
+        consume(post_stop(&mut client).await).await;
+
+        drop(client);
+        handle.abort();
+    });
+}
+
+#[skuld::test]
+fn cancel_with_no_start_is_ack_idempotent() {
+    // Double-cancel with no start in flight — both 200. The pre-arm flag
+    // is idempotent: arming it twice is equivalent to arming it once.
+    rt().block_on(async {
+        let path = test_socket_path("cancel-noop");
+        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
+        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
+
+        drop(client);
+        handle.abort();
+    });
+}
 
 // SDDL tests (Windows only) ===========================================================================================
 
