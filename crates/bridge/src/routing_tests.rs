@@ -311,14 +311,24 @@ fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) ->
 }
 
 #[skuld::test]
-fn recover_without_state_file_runs_only_split_teardown() {
+fn recover_without_state_file_is_a_noop() {
+    // With state-file-driven recovery, the absence of a state file
+    // means the previous run never installed any routes (the
+    // write-ordering contract in `ProxyManager::start_inner` persists
+    // the state file BEFORE any routing mutation). So recovery issues
+    // zero commands.
+    //
+    // This is load-bearing for the e2e test harness, which runs
+    // multiple bridge subprocesses in parallel: a SOCKS5-only bridge
+    // with an empty state dir must not issue `netsh delete route`
+    // calls that would rip routes out from under a concurrent TUN
+    // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(tmp.path(), capturing_runner(&log));
 
     let log = log.into_inner();
-    assert_eq!(log.len(), 1, "expected only split-teardown phase, got {log:?}");
-    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
+    assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());
 }
 

@@ -100,7 +100,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
 
 /// Test 1: SocksOnly mode, no plugin. Baseline — proves the dist harness +
 /// SocksOnly config path work end-to-end.
-#[skuld::test]
+#[skuld::test(serial)]
 fn e2e_none_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -110,7 +110,7 @@ fn e2e_none_socks_only_roundtrip(
 }
 
 /// Test 2: SocksOnly mode with v2ray-plugin (websocket, no TLS).
-#[skuld::test]
+#[skuld::test(serial)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -126,7 +126,7 @@ fn e2e_ws_socks_only_roundtrip(
 /// `DisableSystemRoot=true`, and v2ray-plugin never sets that flag in
 /// client mode. Tracked as a separate follow-up.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test]
+#[skuld::test(serial)]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
@@ -138,7 +138,7 @@ fn e2e_ws_tls_socks_only_roundtrip(
 /// Test 4: SocksOnly mode with v2ray-plugin (QUIC). Same Windows
 /// limitation as test 3 — QUIC auto-enables TLS inside v2ray-plugin.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test]
+#[skuld::test(serial)]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
@@ -204,7 +204,7 @@ mod tun {
 /// Test 7: starting twice without stopping returns an error from the
 /// second start. The dist harness exposes the error payload via
 /// `BridgeResponse::Error`.
-#[skuld::test]
+#[skuld::test(serial)]
 fn lifecycle_start_twice_returns_error(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -239,7 +239,7 @@ fn lifecycle_start_twice_returns_error(
 /// Test 8: stopping a bridge that never started is a clean noop. The
 /// handle subprocess goes straight from its initial Stopped state through
 /// another Stopped, returning Ack.
-#[skuld::test]
+#[skuld::test(serial)]
 fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
     rt().block_on(async {
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -253,7 +253,7 @@ fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
 
 /// Test 9: reload swaps the proxy config. The new local_port must bind
 /// after reload; the subprocess keeps running throughout.
-#[skuld::test]
+#[skuld::test(serial)]
 fn lifecycle_reload_changes_local_port(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -293,7 +293,7 @@ fn lifecycle_reload_changes_local_port(
 /// Test 10: SocksOnly mode does not write `bridge-routes.json`. The file
 /// should not exist after Start because the state-file write path is
 /// explicitly skipped for SocksOnly.
-#[skuld::test]
+#[skuld::test(serial)]
 fn lifecycle_state_file_absent_in_socks_only_mode(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -324,7 +324,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// Test 11: chacha20-ietf-poly1305 cipher round-trips through a dist-backed
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
-#[skuld::test]
+#[skuld::test(serial)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -360,7 +360,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
-#[skuld::test]
+#[skuld::test(serial)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -397,7 +397,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 // IPv6 axis ===========================================================================================================
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
-#[skuld::test(labels = [ipv6])]
+#[skuld::test(labels = [ipv6], serial)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,

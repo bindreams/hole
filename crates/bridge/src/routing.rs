@@ -122,30 +122,50 @@ where
 
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
-    // 1. Split routes (IPv4 + IPv6 halves). Always attempted.
+    // Read the state file first. If absent, there's nothing to recover —
+    // return early without poking any global routing state.
+    //
+    // Previously this function unconditionally issued split-route
+    // teardown commands on every startup, on the rationale that the
+    // commands are idempotent. That was a problem under the test
+    // harness: running multiple bridge subprocesses in parallel (one
+    // TUN + one SOCKS5, say) caused each subprocess's startup recovery
+    // to concurrently `netsh delete route ... hole-tun`, and a
+    // SOCKS5-only bridge's recovery would rip routes out from under a
+    // concurrent TUN bridge mid-flight. State-file-driven recovery is
+    // strictly sufficient: the write-ordering contract in
+    // `ProxyManager::start_inner` guarantees the state file is
+    // persisted BEFORE any route mutation, so a crashed run that
+    // installed routes MUST have left a state file behind.
+    let Some(st) = crate::route_state::load(state_dir) else {
+        debug!("no route-state file found, nothing to recover");
+        return;
+    };
+
+    info!(
+        tun = %st.tun_name,
+        server_ip = %st.server_ip,
+        iface = %st.interface_name,
+        "recovering routes from crashed run"
+    );
+
+    // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
+    //    absent. Runs under state-file guard so this only fires when we
+    //    have positive evidence of a prior route install.
     let split_cmds = build_split_route_teardown_commands(TUN_DEVICE_NAME);
     if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
         warn!(error = %e, "split-route teardown failed during recovery");
     }
 
-    // 2. If the state file is present, tear down the per-server bypass route.
-    if let Some(st) = crate::route_state::load(state_dir) {
-        info!(
-            tun = %st.tun_name,
-            server_ip = %st.server_ip,
-            iface = %st.interface_name,
-            "recovering bypass route from crashed run"
-        );
-        let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
-        if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
-            warn!(error = %e, "bypass-route teardown failed during recovery");
-        }
-    } else {
-        debug!("no route-state file found, nothing to recover");
+    // 2. Per-server bypass route recorded in the state file.
+    let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
+    if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
+        warn!(error = %e, "bypass-route teardown failed during recovery");
     }
 
-    // 3. Delete the state file regardless of command outcomes. Next startup
-    //    re-runs the idempotent teardown if anything leaked past a failure.
+    // 3. Delete the state file regardless of command outcomes. Next
+    //    startup re-runs the idempotent teardown if anything leaked
+    //    past a failure.
     if let Err(e) = crate::route_state::clear(state_dir) {
         warn!(error = %e, "failed to clear route-state file during recovery");
     }
