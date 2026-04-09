@@ -156,3 +156,13 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```sh
 cargo test --workspace
 ```
+
+### CI labels
+
+- `ci-diag` — **throwaway label for bindreams/hole#165.** When present on
+  a PR, CI additionally runs two diagnostic jobs
+  (`windows-diag-preflight`, `windows-diag`) that wrap the Windows test
+  binary with ETW TCP/IP tracing, WFP netevents capture, `pktmon`
+  loopback packet capture, and Defender/process snapshots. Artifacts are
+  uploaded for offline inspection. Delete the label and both jobs after
+  the investigation is closed.

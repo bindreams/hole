@@ -184,3 +184,226 @@ jobs:
           if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+  # =====================================================================
+  # Throwaway diagnostic jobs for issue #165 (Windows CI `start_real_ss_server`
+  # loopback timeout regression). Gated behind the `ci-diag` PR label so they
+  # never run on ordinary PRs. Both jobs, including all diagnostic code,
+  # are scheduled for deletion in the same PR that ships the root-cause fix.
+  # =====================================================================
+
+  windows-diag-preflight:
+    name: windows-diag-preflight
+    if: contains(github.event.pull_request.labels.*.name, 'ci-diag')
+    runs-on: windows-latest
+    steps:
+      - name: Probe logman tcpip provider access
+        shell: pwsh
+        run: |
+          Write-Host "=== logman query providers (Microsoft-Windows-TCPIP) ==="
+          logman query providers "Microsoft-Windows-TCPIP"
+
+      - name: Probe netsh wfp access
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "=== netsh wfp show state (head) ==="
+          netsh wfp show state file=- | Select-Object -First 20
+
+      - name: Probe pktmon availability
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "=== pktmon filter add --help ==="
+          pktmon filter add --help
+
+      - name: Probe admin context
+        shell: pwsh
+        run: |
+          $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $p = New-Object System.Security.Principal.WindowsPrincipal($id)
+          Write-Host "running as: $($id.Name)"
+          Write-Host "IsAdmin: $($p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator))"
+
+  windows-diag:
+    name: windows-diag
+    if: contains(github.event.pull_request.labels.*.name, 'ci-diag')
+    needs: [windows-diag-preflight]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Fetch runtime deps (v2ray-plugin, wintun)
+        run: cargo xtask deps
+
+      - name: Capture toolchain fingerprint
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\diag" | Out-Null
+          rustc --version --verbose | Out-File "$env:RUNNER_TEMP\diag\rustc.txt"
+          cargo --version --verbose | Out-File "$env:RUNNER_TEMP\diag\cargo.txt"
+          [System.Environment]::OSVersion.VersionString | Out-File "$env:RUNNER_TEMP\diag\os.txt"
+          Get-ComputerInfo -Property OsBuildNumber, OsHardwareAbstractionLayer, WindowsProductName, WindowsVersion | Out-File "$env:RUNNER_TEMP\diag\computerinfo.txt"
+
+      - name: Pre-build test binary
+        run: cargo test -p hole-bridge --lib --no-run
+
+      - name: Start ETW TCP/IP trace
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          logman start tcpip-trace -p "Microsoft-Windows-TCPIP" 0xffffffff 4 -o "$env:RUNNER_TEMP\diag\tcpip.etl" -ets
+
+      - name: Start WFP netevents capture
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          netsh wfp capture start file="$env:RUNNER_TEMP\diag\wfp.etl"
+
+      - name: Start pktmon loopback capture
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          pktmon reset
+          pktmon filter add -t TCP
+          pktmon start --etw -m real-time -f "$env:RUNNER_TEMP\diag\pktmon.etl"
+
+      - name: Run diag_bind_and_hold (primary experiment)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib diag_bind_and_hold -- --nocapture 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\diag_bind_and_hold.txt"
+
+      - name: Run diag_external_probe
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib diag_external_probe -- --nocapture 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\diag_external_probe.txt"
+
+      - name: Run diag_dual_socket_parity
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib diag_dual_socket_parity -- --nocapture 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\diag_dual_socket_parity.txt"
+
+      # S6 isolation matrix — sequential cargo test invocations with
+      # different name filters. Each uses its own log file so the
+      # artifact is comparable across runs.
+
+      - name: S6 diag-isolated (fixture_starts_real_ss_server alone, serial)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib fixture_starts_real_ss_server -- --nocapture --test-threads=1 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\s6-isolated.txt"
+
+      - name: S6 diag-serial (all bridge lib tests, serial)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib -- --nocapture --test-threads=1 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\s6-serial.txt"
+
+      - name: S6 diag-no-filter (bridge lib tests, filter tests skipped, default threading)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib -- --nocapture --skip filter 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\s6-no-filter.txt"
+
+      - name: S6 diag-only-server (server_test_tests only, default threading)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib server_test_tests -- --nocapture 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\s6-only-server.txt"
+
+      # Control run (observer-effect check): same failing tests but with
+      # ZERO diagnostic captures in flight. If this passes while the
+      # instrumented run fails, the capture overhead is masking the bug
+      # and the instrumentation must be redesigned before interpreting
+      # any results above.
+      - name: Stop all captures before control run
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          logman stop tcpip-trace -ets 2>&1 | Out-Null
+          netsh wfp capture stop 2>&1 | Out-Null
+          pktmon stop 2>&1 | Out-Null
+
+      - name: Control run (uninstrumented server_test_tests)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cargo test -p hole-bridge --lib server_test_tests -- --nocapture 2>&1 `
+            | Tee-Object -FilePath "$env:RUNNER_TEMP\diag\control.txt"
+
+      - name: Post-run captures (Defender events, process snapshot)
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" `
+                -MaxEvents 200 -ErrorAction Stop |
+                Select-Object TimeCreated, Id, LevelDisplayName, Message |
+                Export-Csv "$env:RUNNER_TEMP\diag\defender-events.csv" -NoTypeInformation
+          } catch {
+            "defender-log-unavailable: $_" | Out-File "$env:RUNNER_TEMP\diag\defender-events.err"
+          }
+
+          Get-Process -Name 'hole_bridge*' -ErrorAction SilentlyContinue |
+              Format-List * | Out-File "$env:RUNNER_TEMP\diag\processes.txt"
+
+          Get-NetTCPConnection -ErrorAction SilentlyContinue |
+              Export-Csv "$env:RUNNER_TEMP\diag\tcp-connections.csv" -NoTypeInformation
+
+      - name: Convert pktmon etl to text
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP\diag\pktmon.etl") {
+            pktmon format "$env:RUNNER_TEMP\diag\pktmon.etl" -o "$env:RUNNER_TEMP\diag\pktmon.txt"
+          }
+
+      - name: Convert tcpip etl to xml
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP\diag\tcpip.etl") {
+            tracerpt "$env:RUNNER_TEMP\diag\tcpip.etl" -o "$env:RUNNER_TEMP\diag\tcpip.xml" -of XML -y
+          }
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diag-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\diag
+          if-no-files-found: warn
+          retention-days: 14

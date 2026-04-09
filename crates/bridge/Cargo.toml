@@ -65,3 +65,9 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld" }
 shadowsocks-service = { version = "1", features = ["server"] }
+# Test harness honors RUST_LOG for `cargo test` output. Originally added
+# during the investigation of issue #165 to surface `shadowsocks_service::*`
+# listener logs; kept as permanent fixture hardening so future "why is
+# this test hanging" investigations can enable tracing output without a
+# code edit.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
