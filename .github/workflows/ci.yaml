@@ -269,26 +269,36 @@ jobs:
 
       - name: Start ETW TCP/IP trace
         shell: pwsh
+        timeout-minutes: 2
         continue-on-error: true
         run: |
           logman start tcpip-trace -p "Microsoft-Windows-TCPIP" 0xffffffff 4 -o "$env:RUNNER_TEMP\diag\tcpip.etl" -ets
 
       - name: Start WFP netevents capture
         shell: pwsh
+        timeout-minutes: 2
         continue-on-error: true
         run: |
           netsh wfp capture start file="$env:RUNNER_TEMP\diag\wfp.etl"
 
       - name: Start pktmon loopback capture
         shell: pwsh
+        timeout-minutes: 2
         continue-on-error: true
         run: |
+          # Use `pktmon start --etw` WITHOUT `-m real-time`: the
+          # real-time flag blocks the parent shell. Default mode writes
+          # packets to an ETW session file that we convert with
+          # `pktmon format` post-run. Also use Start-Process as extra
+          # insurance so a hang doesn't block the job.
           pktmon reset
           pktmon filter add -t TCP
-          pktmon start --etw -m real-time -f "$env:RUNNER_TEMP\diag\pktmon.etl"
+          $p = Start-Process pktmon -ArgumentList 'start','--etw','-f',"$env:RUNNER_TEMP\diag\pktmon.etl" -Wait -NoNewWindow -PassThru
+          Write-Host "pktmon start exit: $($p.ExitCode)"
 
       - name: Run diag_bind_and_hold (primary experiment)
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib diag_bind_and_hold -- --nocapture 2>&1 `
@@ -296,6 +306,7 @@ jobs:
 
       - name: Run diag_external_probe
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib diag_external_probe -- --nocapture 2>&1 `
@@ -303,6 +314,7 @@ jobs:
 
       - name: Run diag_dual_socket_parity
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib diag_dual_socket_parity -- --nocapture 2>&1 `
@@ -314,6 +326,7 @@ jobs:
 
       - name: S6 diag-isolated (fixture_starts_real_ss_server alone, serial)
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib fixture_starts_real_ss_server -- --nocapture --test-threads=1 2>&1 `
@@ -321,6 +334,7 @@ jobs:
 
       - name: S6 diag-serial (all bridge lib tests, serial)
         shell: pwsh
+        timeout-minutes: 8
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib -- --nocapture --test-threads=1 2>&1 `
@@ -328,6 +342,7 @@ jobs:
 
       - name: S6 diag-no-filter (bridge lib tests, filter tests skipped, default threading)
         shell: pwsh
+        timeout-minutes: 5
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib -- --nocapture --skip filter 2>&1 `
@@ -335,6 +350,7 @@ jobs:
 
       - name: S6 diag-only-server (server_test_tests only, default threading)
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib server_test_tests -- --nocapture 2>&1 `
@@ -356,6 +372,7 @@ jobs:
 
       - name: Control run (uninstrumented server_test_tests)
         shell: pwsh
+        timeout-minutes: 3
         continue-on-error: true
         run: |
           cargo test -p hole-bridge --lib server_test_tests -- --nocapture 2>&1 `
