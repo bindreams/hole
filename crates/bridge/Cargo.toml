@@ -52,5 +52,5 @@ windows = { version = "0.62", features = [
 wintun-bindings = "0.7"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld" }
+skuld = { git = "https://github.com/bindreams/skuld", rev = "ce215370354a2624b5f1662c96190424df8329aa" }
 shadowsocks-service = { version = "1", features = ["server"] }
