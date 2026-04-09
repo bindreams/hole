@@ -57,3 +57,9 @@ shadowsocks-service = { version = "1", features = ["server"] }
 rcgen = "0.13"
 rand = "0.9"
 base64 = "0.22"
+# Library dep on the workspace task runner so the dist-directory e2e test
+# fixture can call `xtask::run_stage` directly instead of shelling out to
+# `cargo xtask stage`. The path-dep form is deliberate: if `xtask` ever
+# moves, compilation breaks immediately with a clear error rather than
+# silently drifting.
+xtask = { path = "../../xtask" }

@@ -1,51 +1,66 @@
-//! End-to-end tests for [`ProxyManager`] against a real backend.
+//! End-to-end tests for the bridge, driven as a real subprocess spawned
+//! from a staged dist directory.
 //!
-//! Unlike `proxy_manager_tests.rs`, which mocks `ProxyBackend`, every test
-//! here drives a full `ProxyManager<SocksOnlyBackend>` (or
-//! `ProxyManager<RealBackend>` for TUN tests) against the in-process
-//! shadowsocks-server fixtures from [`crate::test_support::skuld_fixtures`].
-//! HTTP traffic flows through the bridge's local SOCKS5 listener (or the
-//! real TUN device) and reaches a controlled HTTP target binding the host's
-//! primary non-loopback IPv4.
+//! Each test:
 //!
-//! Tests are organized as:
+//! 1. Takes a reference to the process-scoped `dist_dir` fixture (staged
+//!    once per test binary).
+//! 2. Spawns a fresh `hole bridge run` subprocess via [`DistHarness::spawn`],
+//!    which binds its own ephemeral IPC socket and writes route-recovery
+//!    state into a per-test tempdir.
+//! 3. Takes references to the process-scoped ssserver / http_target
+//!    fixtures (shared across tests for speed).
+//! 4. Sends `BridgeRequest::Start { config: ProxyConfig { tunnel_mode: SocksOnly, ... } }`
+//!    over IPC. `SocksOnly` tells the bridge to bind its SOCKS5 listener
+//!    without touching TUN, routes, or the wintun/DNS/gateway pipeline,
+//!    so the subprocess does not need elevation.
+//! 5. Runs a SOCKS5 HTTP round-trip through the bridge's local port to
+//!    the `HttpTarget` fixture.
+//! 6. Sends `BridgeRequest::Stop` and asserts the result.
 //!
-//! - **Core flow** (1-8): plugin × mode matrix. Asserts an HTTP GET through
-//!   the proxy returns the target's sentinel body.
-//! - **Lifecycle** (9-12): start/stop/reload edge cases against the real
-//!   backend, complementing the mock-backend coverage in
-//!   `proxy_manager_tests.rs`.
-//! - **Cipher** (13-14): chacha20 and 2022-blake3 ciphers via the ws plugin.
-//! - **IPv6** (15): one test against an `[::1]` HTTP target.
-//! - **IPC smoke** (16): full bridge IPC server + raw hyper HTTP/1.1
-//!   client, exercising the IPC marshalling on top of the real backend.
-//!
-//! TUN tests (5-8) are gated `#[cfg(target_os = "windows")]` because GitHub-
-//! hosted Windows runners are admin by default but macOS runners do not run
-//! `cargo test` under sudo. Adding macOS TUN coverage is a follow-up.
+//! TUN tests go through the same pipeline with `tunnel_mode: Full` and are
+//! `cfg(target_os = "windows")` + `labels = [tun]` because macOS CI does
+//! not run elevated and spawning an elevated child from an unelevated
+//! test binary would fail on both OSes.
 
-use crate::proxy_manager::ProxyState;
-use crate::test_support::harness::{build_socks_harness, BridgeHarness};
+use crate::test_support::dist_fixture::*;
+use crate::test_support::dist_harness::DistHarness;
 use crate::test_support::http_target::HttpTarget;
-use crate::test_support::port_alloc::wait_for_port;
+use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
-// Fixture identifiers (e.g. `ssserver_ws`) must be in scope at the use site
-// because skuld's `#[fixture(name)]` macro generates a `let _ = &name;` line
-// to anchor the linkage. Glob-import everything from skuld_fixtures.
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use crate::test_support::ssserver::random_password_for;
+use hole_common::config::ServerEntry;
+use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
-/// Run a SOCKS5 GET against the harness's proxy and assert the response
-/// body matches the sentinel. Used by every core-flow test.
-async fn assert_socks5_roundtrip(local_port: u16, target_addr: SocketAddr) {
-    let proxy_addr: SocketAddr = format!("127.0.0.1:{local_port}").parse().unwrap();
-    // Wait for the bridge's SOCKS5 listener to bind. ProxyManager::start
-    // returns once the spawn is dispatched, but the underlying tokio task
-    // may not have hit accept() yet.
+// Helpers =============================================================================================================
+
+/// Build a `ServerEntry` from a shared `SsServerHandle` fixture.
+fn entry_from(ss: &SsServerHandle) -> ServerEntry {
+    ServerEntry {
+        id: "e2e-test".into(),
+        name: "e2e-test".into(),
+        server: ss.addr.ip().to_string(),
+        server_port: ss.addr.port(),
+        method: ss.method.into(),
+        password: ss.password.clone(),
+        plugin: ss.plugin.clone(),
+        plugin_opts: ss.plugin_opts.clone(),
+        validation: None,
+    }
+}
+
+/// Assert that a SOCKS5 GET to `target` through `proxy_port` returns the
+/// `HttpTarget` sentinel body.
+async fn assert_socks5_roundtrip(proxy_port: u16, target_addr: SocketAddr) {
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+    // The bridge has already returned Ack from Start, but the SOCKS5
+    // listener may not have reached `accept()` yet. Poll until it does.
     wait_for_port(proxy_addr, Duration::from_secs(10)).await;
 
     let request = http_get_request(&target_addr, "/");
@@ -61,323 +76,332 @@ async fn assert_socks5_roundtrip(local_port: u16, target_addr: SocketAddr) {
     );
 }
 
-/// Build a harness, start it, run a SOCKS5 round-trip, stop it. Shared by
-/// every test in the core-flow matrix and the cipher matrix.
-fn run_socks5_e2e<B: crate::proxy_manager::ProxyBackend>(mut harness: BridgeHarness<B>, target: SocketAddr) {
-    rt().block_on(async {
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        assert_eq!(harness.manager.state(), ProxyState::Running);
-        assert_socks5_roundtrip(harness.proxy_config.local_port, target).await;
-        harness.manager.stop().await.unwrap();
-        assert_eq!(harness.manager.state(), ProxyState::Stopped);
-    });
+/// Full template: start a bridge subprocess, send Start with the given
+/// `ProxyConfig`, do a SOCKS5 round-trip, send Stop, assert Ack.
+async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
+    let local_port = allocate_ephemeral_port().await;
+    let config = ProxyConfig {
+        server: entry_from(ss),
+        local_port,
+        tunnel_mode: TunnelMode::SocksOnly,
+    };
+
+    let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+    assert_socks5_roundtrip(local_port, http.addr).await;
+
+    let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
+    assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 }
 
 // Core flow matrix ====================================================================================================
 
-/// Test 1: SOCKS5 mode, no plugin. Baseline — proves
-/// `ProxyManager<SocksOnlyBackend>` round-trips traffic through real
-/// shadowsocks-service.
+/// Test 1: SocksOnly mode, no plugin. Baseline — proves the dist harness +
+/// SocksOnly config path work end-to-end.
 #[skuld::test]
-fn e2e_none_socks5_http_roundtrip(
+fn e2e_none_socks_only_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
-    let harness = build_socks_harness(
-        ss.addr,
-        ss.method,
-        &ss.password,
-        ss.plugin.clone(),
-        ss.plugin_opts.clone(),
-    );
-    run_socks5_e2e(harness, http.addr);
+    rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 2: SOCKS5 mode, v2ray-plugin (websocket, no TLS).
+/// Test 2: SocksOnly mode with v2ray-plugin (websocket, no TLS).
 #[skuld::test]
-fn e2e_ws_socks5_http_roundtrip(
+fn e2e_ws_socks_only_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
-    let harness = build_socks_harness(
-        ss.addr,
-        ss.method,
-        &ss.password,
-        ss.plugin.clone(),
-        ss.plugin_opts.clone(),
-    );
-    run_socks5_e2e(harness, http.addr);
+    rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 3: SOCKS5 mode, v2ray-plugin (websocket + TLS).
+/// Test 3: SocksOnly mode with v2ray-plugin (websocket + TLS).
 ///
-/// **Non-Windows only.** v2ray-plugin's `--cert` option doesn't work on
-/// Windows due to a v2ray-core limitation: on Windows
-/// (`transport/internet/tls/config_windows.go`), `getCertPool()` returns
-/// `nil` (system roots) unless `DisableSystemRoot=true`, and v2ray-plugin
-/// never sets that flag — so the user-supplied cert is silently dropped
-/// from the trust pool. On non-Windows it's appended to the system pool
-/// and works correctly. Tracked as a follow-up issue.
+/// `cfg(not(target_os = "windows"))` because of an upstream v2ray-core
+/// Windows TLS limitation: the user-supplied cert pool is ignored unless
+/// `DisableSystemRoot=true`, and v2ray-plugin never sets that flag in
+/// client mode. Tracked as a separate follow-up.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test]
-fn e2e_ws_tls_socks5_http_roundtrip(
+fn e2e_ws_tls_socks_only_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
-    let harness = build_socks_harness(
-        ss.addr,
-        ss.method,
-        &ss.password,
-        ss.plugin.clone(),
-        ss.plugin_opts.clone(),
-    );
-    run_socks5_e2e(harness, http.addr);
+    rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 4: SOCKS5 mode, v2ray-plugin (QUIC). Same Windows limitation as
-/// test 3 (QUIC auto-enables TLS).
+/// Test 4: SocksOnly mode with v2ray-plugin (QUIC). Same Windows
+/// limitation as test 3 — QUIC auto-enables TLS inside v2ray-plugin.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test]
-fn e2e_quic_socks5_http_roundtrip(
+fn e2e_quic_socks_only_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
-    let harness = build_socks_harness(
-        ss.addr,
-        ss.method,
-        &ss.password,
-        ss.plugin.clone(),
-        ss.plugin_opts.clone(),
-    );
-    run_socks5_e2e(harness, http.addr);
+    rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-// TUN matrix (Windows-only because macOS CI doesn't run elevated) =====================================================
+// TUN matrix (Windows admin only) =====================================================================================
 
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
-    use crate::test_support::harness::build_tun_harness;
 
-    /// Test 5: TUN mode, no plugin.
-    // TUN tests bind the hardcoded `hole-tun` device name, so they MUST be
-    // serial — concurrent runs collide on the device installation mutex.
+    async fn run_full_tunnel_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
+        let local_port = allocate_ephemeral_port().await;
+        let config = ProxyConfig {
+            server: entry_from(ss),
+            local_port,
+            tunnel_mode: TunnelMode::Full,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+        // With TUN installed we could hit http.addr directly — traffic
+        // to the non-loopback primary IPv4 goes through the TUN routes.
+        // For consistency with the SocksOnly tests we still use the
+        // SOCKS5 listener, which also works in Full mode.
+        assert_socks5_roundtrip(local_port, http.addr).await;
+
+        let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+    }
+
+    /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows
+    /// admin. TUN tests are serial because they all bind the hardcoded
+    /// `hole-tun` device name.
     #[skuld::test(labels = [tun], serial)]
-    fn e2e_none_tun_http_roundtrip(
+    fn e2e_none_full_tunnel_roundtrip(
+        #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
         #[fixture(http_target_ipv4)] http: &HttpTarget,
     ) {
-        let mut harness = build_tun_harness(
-            ss.addr,
-            ss.method,
-            &ss.password,
-            ss.plugin.clone(),
-            ss.plugin_opts.clone(),
-        );
-        rt().block_on(async {
-            harness.manager.start(&harness.proxy_config).await.unwrap();
-            // TUN tests can also reach the http target directly (without
-            // SOCKS5) because the TUN routes catch traffic to the primary
-            // IPv4. Use a direct TCP connection.
-            let request = http_get_request(&http.addr, "/");
-            let response = direct_tcp_get(http.addr, &request).await;
-            let body = http_response_body(&response).expect("HTTP response");
-            assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
-            harness.manager.stop().await.unwrap();
-        });
+        rt().block_on(run_full_tunnel_e2e(dist, ss, http));
     }
 
-    /// Test 6: TUN mode, v2ray-plugin (websocket).
-    // TUN tests bind the hardcoded `hole-tun` device name, so they MUST be
-    // serial — concurrent runs collide on the device installation mutex.
+    /// Test 6: Full mode with v2ray-plugin (websocket). Requires Windows
+    /// admin.
     #[skuld::test(labels = [tun], serial)]
-    fn e2e_ws_tun_http_roundtrip(
+    fn e2e_ws_full_tunnel_roundtrip(
+        #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
         #[fixture(http_target_ipv4)] http: &HttpTarget,
     ) {
-        let mut harness = build_tun_harness(
-            ss.addr,
-            ss.method,
-            &ss.password,
-            ss.plugin.clone(),
-            ss.plugin_opts.clone(),
-        );
-        rt().block_on(async {
-            harness.manager.start(&harness.proxy_config).await.unwrap();
-            let request = http_get_request(&http.addr, "/");
-            let response = direct_tcp_get(http.addr, &request).await;
-            let body = http_response_body(&response).expect("HTTP response");
-            assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
-            harness.manager.stop().await.unwrap();
-        });
-    }
-
-    // Tests 7 (TUN ws+tls) and 8 (TUN quic) are intentionally absent.
-    // They would require both Windows admin (TUN) and working TLS on
-    // Windows (broken — see test 3 doc comment). Tracked as a follow-up
-    // issue alongside the v2ray-plugin Windows TLS fix.
-
-    async fn direct_tcp_get(target: SocketAddr, request: &[u8]) -> Vec<u8> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut sock = tokio::net::TcpStream::connect(target).await.expect("connect target");
-        sock.write_all(request).await.expect("write request");
-        let mut response = Vec::new();
-        sock.read_to_end(&mut response).await.expect("read response");
-        response
+        rt().block_on(run_full_tunnel_e2e(dist, ss, http));
     }
 }
 
 // Lifecycle matrix ====================================================================================================
 
-/// Test 9: starting twice without stopping returns `AlreadyRunning`.
+/// Test 7: starting twice without stopping returns an error from the
+/// second start. The dist harness exposes the error payload via
+/// `BridgeResponse::Error`.
 #[skuld::test]
-fn lifecycle_start_twice_returns_already_running(
+fn lifecycle_start_twice_returns_error(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] _http: &HttpTarget,
 ) {
-    let mut harness = build_socks_harness(ss.addr, ss.method, &ss.password, None, None);
     rt().block_on(async {
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        let second = harness.manager.start(&harness.proxy_config).await;
-        match second {
-            Err(crate::proxy::ProxyError::AlreadyRunning) => {}
-            other => panic!("expected AlreadyRunning, got {other:?}"),
-        }
-        harness.manager.stop().await.unwrap();
+        let local_port = allocate_ephemeral_port().await;
+        let config = ProxyConfig {
+            server: entry_from(ss),
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        let resp1 = harness
+            .send(BridgeRequest::Start { config: config.clone() })
+            .await
+            .unwrap();
+        assert!(matches!(resp1, BridgeResponse::Ack));
+
+        let resp2 = harness.send(BridgeRequest::Start { config }).await.unwrap();
+        // The second start should return an Error response (the bridge
+        // maps the ProxyError::AlreadyRunning into a 5xx).
+        assert!(
+            matches!(resp2, BridgeResponse::Error { .. }),
+            "expected Error on second start, got {resp2:?}"
+        );
+
+        harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
 
-/// Test 10: stopping a manager that was never started is a clean noop.
-/// Verified against the real backend; previously only covered with mocks.
+/// Test 8: stopping a bridge that never started is a clean noop. The
+/// handle subprocess goes straight from its initial Stopped state through
+/// another Stopped, returning Ack.
 #[skuld::test]
-fn lifecycle_stop_when_idle_is_noop(#[fixture(ssserver_none)] ss: &SsServerHandle) {
-    let mut harness = build_socks_harness(ss.addr, ss.method, &ss.password, None, None);
+fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
     rt().block_on(async {
-        // No prior start() — stop() should still succeed.
-        harness.manager.stop().await.unwrap();
-        assert_eq!(harness.manager.state(), ProxyState::Stopped);
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        let resp = harness.send(BridgeRequest::Stop).await.unwrap();
+        assert!(
+            matches!(resp, BridgeResponse::Ack),
+            "Stop on idle bridge should Ack, got {resp:?}"
+        );
     });
 }
 
-/// Test 11: reload swaps the proxy config. Both old and new local_port
-/// transitions are observable: the new port becomes connectable; the old
-/// port stops accepting (after a short grace period for the kernel to
-/// reclaim the bind).
+/// Test 9: reload swaps the proxy config. The new local_port must bind
+/// after reload; the subprocess keeps running throughout.
 #[skuld::test]
 fn lifecycle_reload_changes_local_port(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
-    let mut harness = build_socks_harness(ss.addr, ss.method, &ss.password, None, None);
-    let original_port = harness.proxy_config.local_port;
     rt().block_on(async {
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        assert_socks5_roundtrip(original_port, http.addr).await;
+        let port1 = allocate_ephemeral_port().await;
+        let config1 = ProxyConfig {
+            server: entry_from(ss),
+            local_port: port1,
+            tunnel_mode: TunnelMode::SocksOnly,
+        };
 
-        // Build a new ProxyConfig with a freshly-allocated port.
-        let mut new_config = harness.proxy_config.clone();
-        new_config.local_port = crate::test_support::port_alloc::allocate_ephemeral_port_sync();
-        assert_ne!(
-            new_config.local_port, original_port,
-            "ephemeral allocator should give a fresh port"
-        );
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config: config1.clone(),
+            })
+            .await
+            .unwrap();
+        assert_socks5_roundtrip(port1, http.addr).await;
 
-        harness.manager.reload(&new_config).await.unwrap();
-        assert_eq!(harness.manager.state(), ProxyState::Running);
+        let port2 = allocate_ephemeral_port().await;
+        assert_ne!(port1, port2, "ephemeral allocator should give a fresh port");
+        let config2 = ProxyConfig {
+            local_port: port2,
+            ..config1
+        };
+        let resp = harness.send(BridgeRequest::Reload { config: config2 }).await.unwrap();
+        assert!(matches!(resp, BridgeResponse::Ack), "reload should Ack, got {resp:?}");
+        assert_socks5_roundtrip(port2, http.addr).await;
 
-        // New port works.
-        assert_socks5_roundtrip(new_config.local_port, http.addr).await;
-
-        harness.manager.stop().await.unwrap();
+        harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
 
-/// Test 12: state file is absent after a clean stop.
+/// Test 10: SocksOnly mode does not write `bridge-routes.json`. The file
+/// should not exist after Start because the state-file write path is
+/// explicitly skipped for SocksOnly.
 #[skuld::test]
-fn lifecycle_state_file_cleared_on_clean_stop(
+fn lifecycle_state_file_absent_in_socks_only_mode(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
-    #[fixture(http_target_ipv4)] _http: &HttpTarget,
 ) {
-    let mut harness = build_socks_harness(ss.addr, ss.method, &ss.password, None, None);
-    let state_file = harness.state_file_path();
     rt().block_on(async {
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        harness.manager.stop().await.unwrap();
+        let local_port = allocate_ephemeral_port().await;
+        let config = ProxyConfig {
+            server: entry_from(ss),
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        let state_file = harness.state_dir.path().join("bridge-routes.json");
+        harness.send(BridgeRequest::Start { config }).await.unwrap();
+
+        assert!(
+            !state_file.exists(),
+            "bridge-routes.json should be absent in SocksOnly mode, found at {state_file:?}"
+        );
+
+        harness.send(BridgeRequest::Stop).await.unwrap();
     });
-    assert!(
-        !state_file.exists(),
-        "bridge-routes.json should be absent after clean stop, but found at {state_file:?}"
-    );
 }
 
 // Cipher matrix =======================================================================================================
 
-/// Test 13: chacha20-ietf-poly1305 cipher round-trips through the bridge.
+/// Test 11: chacha20-ietf-poly1305 cipher round-trips through a dist-backed
+/// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
+/// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
 #[skuld::test]
-fn cipher_chacha20_ietf_poly1305_roundtrip(#[fixture(http_target_ipv4)] http: &HttpTarget) {
+fn cipher_chacha20_ietf_poly1305_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
+    #[fixture(http_target_ipv4)] http: &HttpTarget,
+) {
     rt().block_on(async {
         let method = CipherKind::CHACHA20_POLY1305;
-        let method_str = "chacha20-ietf-poly1305";
         let password = random_password_for(method);
         let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
 
-        let mut harness = build_socks_harness(ss_addr, method_str, &password, None, None);
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        assert_socks5_roundtrip(harness.proxy_config.local_port, http.addr).await;
-        harness.manager.stop().await.unwrap();
+        let local_port = allocate_ephemeral_port().await;
+        let config = ProxyConfig {
+            server: ServerEntry {
+                id: "cipher-test".into(),
+                name: "cipher-test".into(),
+                server: ss_addr.ip().to_string(),
+                server_port: ss_addr.port(),
+                method: "chacha20-ietf-poly1305".into(),
+                password,
+                plugin: None,
+                plugin_opts: None,
+                validation: None,
+            },
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        assert_socks5_roundtrip(local_port, http.addr).await;
+        harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
 
-/// Test 14: 2022-blake3-aes-256-gcm cipher round-trips through the bridge.
-/// Requires the `aead-cipher-2022` feature on `shadowsocks-service` (enabled
-/// in `crates/bridge/Cargo.toml` line 15).
+/// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
+/// `aead-cipher-2022` feature on `shadowsocks-service`.
 #[skuld::test]
-fn cipher_2022_blake3_aes_256_gcm_roundtrip(#[fixture(http_target_ipv4)] http: &HttpTarget) {
+fn cipher_2022_blake3_aes_256_gcm_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
+    #[fixture(http_target_ipv4)] http: &HttpTarget,
+) {
     rt().block_on(async {
         let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
-        let method_str = "2022-blake3-aes-256-gcm";
         let password = random_password_for(method);
         let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
 
-        let mut harness = build_socks_harness(ss_addr, method_str, &password, None, None);
-        harness.manager.start(&harness.proxy_config).await.unwrap();
-        assert_socks5_roundtrip(harness.proxy_config.local_port, http.addr).await;
-        harness.manager.stop().await.unwrap();
+        let local_port = allocate_ephemeral_port().await;
+        let config = ProxyConfig {
+            server: ServerEntry {
+                id: "cipher-test".into(),
+                name: "cipher-test".into(),
+                server: ss_addr.ip().to_string(),
+                server_port: ss_addr.port(),
+                method: "2022-blake3-aes-256-gcm".into(),
+                password,
+                plugin: None,
+                plugin_opts: None,
+                validation: None,
+            },
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.unwrap();
+        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        assert_socks5_roundtrip(local_port, http.addr).await;
+        harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
 
 // IPv6 axis ===========================================================================================================
 
-/// Test 15: ws plugin, SOCKS5 mode, IPv6 HTTP target on `[::1]`.
+/// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 #[skuld::test(labels = [ipv6])]
-fn ipv6_ws_socks5_http_roundtrip(
+fn ipv6_ws_socks_only_roundtrip(
+    #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
     #[fixture(http_target_ipv6)] http: &HttpTarget,
 ) {
-    let harness = build_socks_harness(
-        ss.addr,
-        ss.method,
-        &ss.password,
-        ss.plugin.clone(),
-        ss.plugin_opts.clone(),
-    );
-    run_socks5_e2e(harness, http.addr);
+    rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
-
-// IPC smoke ===========================================================================================================
-//
-// The plan v3 listed an "ipc_start_then_http_then_stop" test that would
-// drive a real IpcServer + raw hyper HTTP/1.1 client. Implementation was
-// deferred because the IPC layer's router is private (`fn build_router`)
-// and the only public surface — `IpcServer::bind` + `run` — wants to own
-// the listener loop. Wiring a hyper http1 client through `LocalStream` to
-// it inside a synchronous test body adds enough machinery that it deserves
-// its own follow-up issue.
-//
-// Coverage today comes from two complementary sources:
-// - `ipc_tests.rs` exercises the IPC marshalling against a `MockBackend`.
-// - `proxy_manager_e2e_tests.rs` (this file) exercises the real backend
-//   end-to-end via direct `ProxyManager` calls.
-//
-// The combination covers everything except "real backend behind real IPC,"
-// which is a thin combinatorial seam. Tracked separately.

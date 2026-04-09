@@ -4,7 +4,7 @@ use crate::gateway::GatewayInfo;
 use crate::guards::{StateFileGuard, TaskHandleGuard};
 use crate::proxy::{build_ss_config, ProxyError, TUN_DEVICE_NAME};
 use crate::routing::RouteGuard;
-use hole_common::protocol::ProxyConfig;
+use hole_common::protocol::{ProxyConfig, TunnelMode};
 use shadowsocks_service::config::Config;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -56,26 +56,6 @@ pub trait ProxyBackend: Send + Sync {
     ) -> Result<(), ProxyError>;
     fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError>;
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
-
-    /// Whether this backend installs and removes host routes when start/stop
-    /// is called. Default `true`. Test backends like
-    /// [`crate::test_support::backends::SocksOnlyBackend`] override to
-    /// `false` so `ProxyManager::start` skips:
-    ///
-    /// - the wintun preload (Windows)
-    /// - DNS resolution of the server hostname
-    /// - default-gateway detection
-    /// - the route-recovery state file write
-    /// - the call to `setup_routes`
-    /// - construction of the `RouteGuard` (whose `Drop` impl shells out to
-    ///   `netsh` / `route` regardless of which backend you wrapped, because
-    ///   it calls the free function `routing::teardown_routes`).
-    ///
-    /// Without this hook, a backend that no-ops `setup_routes` /
-    /// `teardown_routes` still triggers real `netsh` invocations on stop.
-    fn installs_routes(&self) -> bool {
-        true
-    }
 }
 
 // Real backend ========================================================================================================
@@ -254,17 +234,18 @@ impl<B: ProxyBackend> ProxyManager<B> {
     /// guard discipline above maintains this invariant under drop as
     /// well as under explicit error returns.
     ///
-    /// When `backend.installs_routes()` returns `false` (test backends
-    /// like `SocksOnlyBackend`), the entire wintun-preload / DNS /
-    /// gateway / state-file / `setup_routes` / `RouteGuard` pipeline is
-    /// skipped — `start_ss` is the only side effect. The returned
-    /// `StartedState` carries `route_guard: None` and `server_ip: None`.
+    /// When `config.tunnel_mode` is [`TunnelMode::SocksOnly`], the entire
+    /// wintun-preload / DNS / gateway / state-file / `setup_routes` /
+    /// `RouteGuard` pipeline is skipped — `start_ss` is the only side
+    /// effect. The returned `StartedState` carries `route_guard: None`
+    /// and `server_ip: None`. This lets the bridge serve a pure SOCKS5
+    /// listener without requiring elevation.
     async fn start_inner(backend: &B, config: &ProxyConfig, state_dir: &Path) -> Result<StartedState, ProxyError> {
         // Build shadowsocks config (sync, no partial state).
         let ss_config: Config = build_ss_config(config)?;
 
-        if !backend.installs_routes() {
-            // No-routing path. Just start the shadowsocks task; nothing
+        if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
+            // SocksOnly path. Just start the shadowsocks task; nothing
             // to roll back on failure beyond the task itself, which
             // tokio will tear down via the runtime drop if the future
             // is cancelled.

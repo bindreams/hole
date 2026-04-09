@@ -57,6 +57,12 @@ pub(crate) enum ProxyAction {
         /// production default of 4073.
         #[arg(long, default_value_t = 4073)]
         local_port: u16,
+        /// Tunnel mode. `full` installs the TUN adapter + split routes
+        /// (the production default, requires elevation). `socks-only`
+        /// binds only the SOCKS5 listener and skips all routing work
+        /// (no elevation required; client-side SOCKS5 config needed).
+        #[arg(long, value_enum, default_value_t = CliTunnelMode::Full)]
+        tunnel_mode: CliTunnelMode,
     },
     /// Stop the proxy
     Stop,
@@ -66,6 +72,24 @@ pub(crate) enum ProxyAction {
         #[arg(long)]
         config_file: std::path::PathBuf,
     },
+}
+
+/// CLI-facing mirror of [`hole_common::protocol::TunnelMode`]. Separate
+/// type because `clap::ValueEnum` wants kebab-case by default and the
+/// wire protocol uses snake_case — converting here keeps both happy.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum CliTunnelMode {
+    Full,
+    SocksOnly,
+}
+
+impl From<CliTunnelMode> for hole_common::protocol::TunnelMode {
+    fn from(mode: CliTunnelMode) -> Self {
+        match mode {
+            CliTunnelMode::Full => hole_common::protocol::TunnelMode::Full,
+            CliTunnelMode::SocksOnly => hole_common::protocol::TunnelMode::SocksOnly,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -655,6 +679,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
         ProxyAction::Start {
             config_file,
             local_port,
+            tunnel_mode,
         } => {
             let entry = match read_server_entry_file(&config_file) {
                 Ok(e) => e,
@@ -667,6 +692,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                 config: ProxyConfig {
                     server: entry,
                     local_port,
+                    tunnel_mode: tunnel_mode.into(),
                 },
             };
             match send_bridge_request_inner(request) {

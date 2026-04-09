@@ -114,6 +114,7 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
         action: ProxyAction::Start {
             config_file: std::path::PathBuf::from("/tmp/x.json"),
             local_port: 4073,
+            tunnel_mode: CliTunnelMode::Full,
         },
     }));
     assert!(should_install_cli_log_guard(&Command::Proxy {
@@ -199,6 +200,7 @@ fn proxy_start_parses_with_required_args() {
         action: ProxyAction::Start {
             config_file,
             local_port,
+            tunnel_mode,
         },
     }) = cli.command
     else {
@@ -206,6 +208,34 @@ fn proxy_start_parses_with_required_args() {
     };
     assert_eq!(config_file, std::path::PathBuf::from("/tmp/cfg.json"));
     assert_eq!(local_port, 4073, "default local_port should be 4073");
+    assert!(
+        matches!(tunnel_mode, CliTunnelMode::Full),
+        "default tunnel mode should be Full"
+    );
+}
+
+#[skuld::test]
+fn proxy_start_accepts_socks_only_tunnel_mode() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "proxy",
+        "start",
+        "--config-file",
+        "/tmp/cfg.json",
+        "--tunnel-mode",
+        "socks-only",
+    ])
+    .expect("parse proxy start with --tunnel-mode socks-only");
+    let Some(Command::Proxy {
+        action: ProxyAction::Start { tunnel_mode, .. },
+    }) = cli.command
+    else {
+        panic!("expected Command::Proxy::Start");
+    };
+    assert!(
+        matches!(tunnel_mode, CliTunnelMode::SocksOnly),
+        "tunnel_mode should be SocksOnly"
+    );
 }
 
 #[skuld::test]

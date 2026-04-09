@@ -358,12 +358,18 @@ pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Val
 }
 
 /// Build a `ProxyConfig` from the currently selected server in app config.
+///
+/// Always requests [`TunnelMode::Full`] — the GUI does not currently expose
+/// a tunnel-mode toggle, so every GUI-initiated `Start` installs the full
+/// TUN + routing pipeline. `TunnelMode::SocksOnly` is reachable through
+/// `hole proxy start --tunnel-mode socks-only` and through direct IPC.
 pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     let selected_id = config.selected_server.as_ref()?;
     let entry = config.servers.iter().find(|s| &s.id == selected_id)?;
     Some(ProxyConfig {
         server: entry.clone(),
         local_port: config.local_port,
+        tunnel_mode: hole_common::protocol::TunnelMode::Full,
     })
 }
 

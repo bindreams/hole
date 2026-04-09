@@ -288,6 +288,26 @@ components:
           type: integer
           format: uint16
           minimum: 0
+        tunnel_mode:
+          $ref: "#/components/schemas/TunnelMode"
+          description: |
+            Which parts of the network stack to install. Defaults to
+            `full` when absent (backwards-compatible with older clients).
+
+    TunnelMode:
+      type: string
+      description: |
+        Tunnel installation mode. `full` installs the TUN adapter,
+        binds the SOCKS5 listener, and adds split host routes — the
+        production default and the only mode the GUI currently sends.
+        `socks_only` binds only the SOCKS5 listener and performs no
+        routing, wintun, DNS, or gateway work. It works without
+        elevation and is intended for advanced SOCKS5-only users,
+        containerized deployments, and tests.
+      enum:
+        - full
+        - socks_only
+      default: full
 
     ServerEntry:
       type: object

@@ -78,10 +78,37 @@ pub enum BridgeResponse {
     },
 }
 
+/// Which parts of the network stack the bridge should install when starting
+/// a proxy.
+///
+/// Per-request on `ProxyConfig` so the client can choose at start time. The
+/// GUI currently always uses [`TunnelMode::Full`]; [`TunnelMode::SocksOnly`]
+/// is exposed for advanced users (browser-only SOCKS5 usage), future
+/// containerized deployments where routing is managed externally, and tests
+/// that need to exercise the real bridge binary without elevation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelMode {
+    /// TUN adapter + SOCKS5 listener + split host routes. Requires
+    /// elevation (admin on Windows, root on macOS). Production default.
+    #[default]
+    Full,
+    /// SOCKS5 listener only. No TUN adapter is created; no host routes
+    /// are installed; no DNS resolution or gateway detection is performed.
+    /// Works without elevation. Clients must configure their own
+    /// SOCKS5-aware traffic routing (browser proxy setting, curl --socks5,
+    /// container netns, etc.).
+    SocksOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProxyConfig {
     pub server: ServerEntry,
     pub local_port: u16,
+    /// Defaults to [`TunnelMode::Full`] when absent — older clients (the
+    /// current GUI) that don't send this field keep their existing behavior.
+    #[serde(default)]
+    pub tunnel_mode: TunnelMode,
 }
 
 // Server test outcome =================================================================================================

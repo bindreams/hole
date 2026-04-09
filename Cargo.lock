@@ -2362,6 +2362,7 @@ dependencies = [
  "windows 0.62.2",
  "windows-service",
  "wintun-bindings",
+ "xtask",
 ]
 
 [[package]]

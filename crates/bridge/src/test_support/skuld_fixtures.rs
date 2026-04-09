@@ -45,15 +45,23 @@ pub(crate) struct SsServerHandle {
     _runtime: tokio::runtime::Runtime,
 }
 
-/// Verify the cargo-built v2ray-plugin binary exists and return its path.
-/// Panics with a clear remediation message — per CLAUDE.md, tests must fail
-/// loudly on missing dependencies.
+/// Verify the cargo-built v2ray-plugin binary exists and return its
+/// absolute path. Panics with a clear remediation message if the binary
+/// is missing — per CLAUDE.md, tests must fail loudly on missing
+/// dependencies.
+///
+/// Used to point the **server-side** `start_real_ss_server_with_plugin_*`
+/// helpers at the plugin. The **client-side** plugin is resolved by the
+/// bridge subprocess at runtime (it finds `v2ray-plugin` next to its own
+/// `hole` binary in the dist dir staged by the `dist_dir` fixture). So
+/// this helper does NOT touch any ambient process state — no env vars,
+/// no file copies.
 fn require_v2ray_plugin() -> String {
-    let path = locate_built_v2ray_plugin();
-    if !path.is_file() {
-        panic!("v2ray-plugin not built at {path:?} — run 'cargo build --workspace' before 'cargo test'",);
+    let source = locate_built_v2ray_plugin();
+    if !source.is_file() {
+        panic!("v2ray-plugin not built at {source:?} — run 'cargo build --workspace' before 'cargo test'",);
     }
-    path.to_str().expect("plugin path is valid utf-8").to_string()
+    source.to_str().expect("plugin path is valid utf-8").to_string()
 }
 
 #[skuld::fixture(scope = process)]
