@@ -152,6 +152,32 @@ fn e2e_quic_socks_only_roundtrip(
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// TUN tests exercise the bridge's transparent-proxy path: the test
+    /// connects directly to the HTTP target's primary non-loopback IPv4
+    /// address, and the TUN routes catch that traffic and tunnel it
+    /// through the shadowsocks server.
+    ///
+    /// **Critically**: TUN tests must NOT try to connect to anything on
+    /// `127.0.0.1` while the bridge is running, because the bridge
+    /// installs a `route add 127.0.0.1 mask 255.255.255.255 <tun-gw>`
+    /// bypass route (so its own shadowsocks connection to a
+    /// loopback-bound test server can escape the TUN). That bypass
+    /// globally redirects all loopback traffic through the TUN
+    /// adapter, which has no SOCKS5 server on the other side — so any
+    /// attempt to connect to `127.0.0.1:<port>` from the test body
+    /// times out.
+    async fn direct_http_get(target_addr: SocketAddr) -> Vec<u8> {
+        let mut sock = tokio::net::TcpStream::connect(target_addr)
+            .await
+            .expect("direct TCP connect to http_target");
+        let request = http_get_request(&target_addr, "/");
+        sock.write_all(&request).await.expect("write HTTP request");
+        let mut response = Vec::new();
+        sock.read_to_end(&mut response).await.expect("read HTTP response");
+        response
+    }
 
     async fn run_full_tunnel_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
         let local_port = allocate_ephemeral_port().await;
@@ -165,11 +191,17 @@ mod tun {
         let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-        // With TUN installed we could hit http.addr directly — traffic
-        // to the non-loopback primary IPv4 goes through the TUN routes.
-        // For consistency with the SocksOnly tests we still use the
-        // SOCKS5 listener, which also works in Full mode.
-        assert_socks5_roundtrip(local_port, http.addr).await;
+        // Direct TCP to `http.addr` (the primary non-loopback IPv4) —
+        // traffic caught by the TUN split routes, tunneled through
+        // shadowsocks, and delivered to the HTTP target. This
+        // exercises the transparent-proxy path.
+        let response = direct_http_get(http.addr).await;
+        let body = http_response_body(&response).expect("HTTP response has header terminator");
+        assert_eq!(
+            body,
+            crate::test_support::http_target::SENTINEL_BODY,
+            "expected sentinel body, got {response:?}"
+        );
 
         let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");

@@ -95,8 +95,12 @@ pub(crate) struct DistHarness {
     /// Log directory override for the subprocess. Held to keep it alive
     /// and out of the default log path.
     _log_dir: TempDir,
-    child: Child,
-    client: BridgeIpcClient,
+    child: Option<Child>,
+    /// Client is wrapped in `Option` so `Drop` can `take()` it and
+    /// dispatch a final `BridgeRequest::Stop` via a short-lived tokio
+    /// runtime. After `shutdown()` (or the initial construction
+    /// failure path), this is `None`.
+    client: Option<BridgeIpcClient>,
 }
 
 impl DistHarness {
@@ -157,34 +161,17 @@ impl DistHarness {
             socket_path,
             state_dir,
             _log_dir: log_dir,
-            child,
-            client,
+            child: Some(child),
+            client: Some(client),
         })
     }
 
     /// Send a `BridgeRequest` over IPC and await the response.
     pub(crate) async fn send(&mut self, req: BridgeRequest) -> Result<BridgeResponse, HarnessError> {
-        self.client.send(req).await
-    }
-
-    /// Send `BridgeRequest::Stop`, wait for the child to exit, then return.
-    /// Tests that want to assert on post-stop state (e.g. state-file
-    /// cleanup) should call this instead of relying on Drop.
-    pub(crate) async fn shutdown(mut self) -> Result<(), HarnessError> {
-        let _ = self.client.send(BridgeRequest::Stop).await;
-        // Give the bridge a short grace period to flush & exit.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
-                Err(e) => return Err(HarnessError(format!("try_wait: {e}"))),
-            }
+        match self.client.as_mut() {
+            Some(c) => c.send(req).await,
+            None => Err(HarnessError("DistHarness client already consumed by shutdown()".into())),
         }
-        // Grace expired — kill.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        Ok(())
     }
 
     /// Mint an ephemeral socket path that fits within OS-specific limits.
@@ -215,12 +202,76 @@ impl DistHarness {
 
 impl Drop for DistHarness {
     fn drop(&mut self) {
-        // Best-effort cleanup: kill the child unconditionally. Any test
-        // that wants a clean stop calls `shutdown()` first.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Remove the socket file (Unix only — Windows named pipes are
-        // freed when the child exits).
+        // Drop order matters for test isolation. In particular, if a
+        // TUN-mode test panics mid-assertion, the subprocess still has
+        // routes installed — killing it with SIGTERM/TerminateProcess
+        // does NOT run `ProxyManager::stop()`, which means the
+        // `RouteGuard::drop` path (which tears down the
+        // `route add 127.0.0.1 via <tun-gw>` bypass) never runs, and
+        // localhost stays globally redirected through TUN for the rest
+        // of the test binary's lifetime.
+        //
+        // So we must send `BridgeRequest::Stop` and wait for the
+        // bridge to actually exit before falling back to kill. Because
+        // `Drop` is synchronous and the test's tokio runtime may
+        // already be torn down at this point, we spin up a tiny
+        // one-shot runtime in a dedicated thread to drive the async
+        // Stop + reconnect.
+        let client = self.client.take();
+        let Some(mut child) = self.child.take() else {
+            // `shutdown()` already consumed or construction failed.
+            return;
+        };
+
+        if let Some(client) = client {
+            // Move client into a worker thread that drives a short
+            // current-thread runtime. Return the `bool` "did we exit
+            // cleanly?" back so the outer scope knows whether to fall
+            // back to kill.
+            let clean = std::thread::scope(|scope| {
+                let child_ref = &mut child;
+                scope
+                    .spawn(move || -> bool {
+                        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                            return false;
+                        };
+                        rt.block_on(async move {
+                            let mut client = client;
+                            if client.send(BridgeRequest::Stop).await.is_err() {
+                                return false;
+                            }
+                            drop(client);
+
+                            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                            loop {
+                                match child_ref.try_wait() {
+                                    Ok(Some(_)) => return true,
+                                    Ok(None) if std::time::Instant::now() >= deadline => return false,
+                                    Ok(None) => tokio::time::sleep(Duration::from_millis(25)).await,
+                                    Err(_) => return false,
+                                }
+                            }
+                        })
+                    })
+                    .join()
+                    .unwrap_or(false)
+            });
+
+            if !clean {
+                // Clean shutdown failed or timed out — force-kill the
+                // subprocess so we don't leave zombies for the next
+                // test run.
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        } else {
+            // No client (construction failure path). Just kill.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        // Remove the socket file (Unix only — Windows AF_UNIX sockets
+        // are freed on close).
         #[cfg(not(windows))]
         {
             let _ = std::fs::remove_file(&self.socket_path);
