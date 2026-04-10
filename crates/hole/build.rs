@@ -33,7 +33,7 @@ fn ensure_external_bin_stub(repo_root: &Path) {
     if !path.exists() {
         std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create .cache/v2ray-plugin/");
         std::fs::File::create(&path).expect("failed to create v2ray-plugin stub");
-        eprintln!("cargo:warning=created empty v2ray-plugin stub — run `cargo xtask deps` for a real build");
+        println!("cargo:warning=created empty v2ray-plugin stub — run `cargo xtask deps` for a real build");
     }
 }
 
@@ -156,7 +156,7 @@ fn generate_tray_icons(icons_dir: &Path) {
         match target_os.as_str() {
             "macos" => generate_tray_icons_macos(&tree, &out_dir, name),
             "windows" => generate_tray_icons_windows(&tree, &out_dir, name),
-            other => eprintln!("cargo:warning=tray icon generation not implemented for {other}"),
+            other => println!("cargo:warning=tray icon generation not implemented for {other}"),
         }
     }
 }
