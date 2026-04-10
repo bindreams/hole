@@ -57,6 +57,9 @@ struct TcpConn {
     to_handler: mpsc::Sender<Vec<u8>>,
     /// Receive data FROM the handler task (handler writes to SmoltcpStream).
     from_handler: mpsc::Receiver<Vec<u8>>,
+    /// Buffered remainder from a partial `smoltcp::send_slice` call.
+    /// Drained on the next relay pass before reading new data from the channel.
+    pending_send: Vec<u8>,
 }
 
 /// Tracks a TCP listener socket in smoltcp waiting for incoming SYN packets.
@@ -154,43 +157,51 @@ impl TunDriver {
     /// or the TUN device is closed.
     pub async fn run(mut self) {
         let mut tun_buf = vec![0u8; TUN_BUF_SIZE];
+        // Poll interval ensures handler→smoltcp data is relayed even
+        // when no TUN packets are arriving (e.g. response data for
+        // established connections).
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(1));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Phase 1: Read from TUN (non-blocking) or wait for events.
+            // Phase 1: Read from TUN OR poll interval tick OR cancel.
             let read_result = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
                     debug!("TUN driver cancelled");
                     break;
                 }
-                result = self.tun.read(&mut tun_buf) => result,
+                result = self.tun.read(&mut tun_buf) => Some(result),
+                _ = poll_interval.tick() => None,
             };
 
-            match read_result {
-                Ok(0) => {
-                    debug!("TUN device closed (read 0 bytes)");
-                    break;
-                }
-                Ok(n) => {
-                    let packet = &tun_buf[..n];
-
-                    // Before feeding to smoltcp, parse the packet to set up
-                    // TCP listeners dynamically. This ensures smoltcp has a
-                    // socket ready to accept the SYN.
-                    if let Some((dst_port, proto)) = parse_ip_dst(packet) {
-                        if proto == IpProto::Tcp {
-                            self.ensure_listener(dst_port);
-                        }
-                        // Port 53 UDP is handled by the smoltcp UDP socket.
+            if let Some(read_result) = read_result {
+                match read_result {
+                    Ok(0) => {
+                        debug!("TUN device closed (read 0 bytes)");
+                        break;
                     }
+                    Ok(n) => {
+                        let packet = &tun_buf[..n];
 
-                    self.device.enqueue_rx(packet.to_vec());
-                }
-                Err(e) => {
-                    warn!("TUN read error: {e}");
-                    break;
+                        // Before feeding to smoltcp, parse the packet to set
+                        // up TCP listeners dynamically.
+                        if let Some((dst_port, proto)) = parse_ip_dst(packet) {
+                            if proto == IpProto::Tcp {
+                                self.ensure_listener(dst_port);
+                            }
+                        }
+
+                        self.device.enqueue_rx(packet.to_vec());
+                    }
+                    Err(e) => {
+                        warn!("TUN read error: {e}");
+                        break;
+                    }
                 }
             }
+            // If read_result is None, it was a poll-interval tick — we
+            // still need to run phases 2-8 to relay handler data.
 
             // Phase 2: Poll smoltcp.
             self.poll_smoltcp();
@@ -324,6 +335,7 @@ impl TunDriver {
                 TcpConn {
                     to_handler,
                     from_handler,
+                    pending_send: Vec::new(),
                 },
             );
 
@@ -383,14 +395,27 @@ impl TunDriver {
 
             // Direction: handler → smoltcp (recv from handler, send to socket).
             if socket.may_send() {
-                while socket.can_send() {
+                // First, drain any pending partial send from the previous pass.
+                if !conn.pending_send.is_empty() && socket.can_send() {
+                    if let Ok(sent) = socket.send_slice(&conn.pending_send) {
+                        if sent >= conn.pending_send.len() {
+                            conn.pending_send.clear();
+                        } else {
+                            conn.pending_send.drain(..sent);
+                        }
+                    }
+                }
+
+                // Then read new data from the handler channel.
+                while conn.pending_send.is_empty() && socket.can_send() {
                     match conn.from_handler.try_recv() {
                         Ok(data) => match socket.send_slice(&data) {
-                            Ok(sent) => {
-                                if sent < data.len() {
-                                    trace!("partial smoltcp send: {sent}/{} bytes", data.len());
-                                }
+                            Ok(sent) if sent < data.len() => {
+                                // Partial send: buffer the remainder for next pass.
+                                conn.pending_send = data[sent..].to_vec();
+                                break;
                             }
+                            Ok(_) => {} // fully sent
                             Err(_) => break,
                         },
                         Err(mpsc::error::TryRecvError::Empty) => break,

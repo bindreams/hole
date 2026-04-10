@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -32,7 +32,10 @@ use crate::filter::FakeDns;
 pub struct Dispatcher {
     rules: Arc<ArcSwap<RuleSet>>,
     cancel: CancellationToken,
-    driver_handle: JoinHandle<()>,
+    /// `Option` so `shutdown()` can take it for graceful await.
+    /// `Drop` aborts via `driver_abort` as a safety net.
+    driver_handle: Option<JoinHandle<()>>,
+    driver_abort: AbortHandle,
 }
 
 impl Dispatcher {
@@ -98,13 +101,15 @@ impl Dispatcher {
         );
 
         let driver_handle = tokio::spawn(driver.run());
+        let driver_abort = driver_handle.abort_handle();
 
         debug!("Dispatcher started (local_port={local_port}, iface_index={iface_index})");
 
         Ok(Self {
             rules: rules_arc,
             cancel,
-            driver_handle,
+            driver_handle: Some(driver_handle),
+            driver_abort,
         })
     }
 
@@ -113,33 +118,36 @@ impl Dispatcher {
         self.rules.store(Arc::new(new_rules));
     }
 
-    /// Graceful shutdown.
-    ///
-    /// 1. Cancel token (signals driver + handlers to stop; driver's
-    ///    TUN read is racing against cancelled(), so cancel unblocks it)
-    /// 2. Wait up to 2 s for the driver to finish
-    /// 3. Abort the driver handle if it doesn't finish in time
-    pub async fn shutdown(self) {
+    /// Graceful shutdown. Cancels the driver, waits up to 2s, then
+    /// aborts if needed. Idempotent — safe to call multiple times or
+    /// after Drop has already aborted.
+    pub async fn shutdown(&mut self) {
         debug!("Dispatcher shutting down");
-
-        // Signal cancellation. The driver's main loop uses `tokio::select!`
-        // between TUN read and cancel, so this unblocks the driver promptly.
         self.cancel.cancel();
 
-        // Abort handle before awaiting so we can force-stop on timeout.
-        let abort_handle = self.driver_handle.abort_handle();
-
-        // Wait for the driver with a timeout.
-        match tokio::time::timeout(std::time::Duration::from_secs(2), self.driver_handle).await {
-            Ok(Ok(())) => debug!("Dispatcher driver exited cleanly"),
-            Ok(Err(e)) if e.is_cancelled() => debug!("Dispatcher driver was aborted"),
-            Ok(Err(e)) => warn!("Dispatcher driver panicked: {e}"),
-            Err(_) => {
-                warn!("Dispatcher driver did not exit in 2s, aborting");
-                abort_handle.abort();
+        if let Some(handle) = self.driver_handle.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(())) => debug!("Dispatcher driver exited cleanly"),
+                Ok(Err(e)) if e.is_cancelled() => debug!("Dispatcher driver was aborted"),
+                Ok(Err(e)) => warn!("Dispatcher driver panicked: {e}"),
+                Err(_) => {
+                    warn!("Dispatcher driver did not exit in 2s, aborting");
+                    self.driver_abort.abort();
+                }
             }
         }
 
         debug!("Dispatcher shutdown complete");
+    }
+}
+
+/// Cancel the driver and abort it on drop. This ensures that implicit
+/// drops (e.g., from `check_health` or a cancelled `start_cancellable`)
+/// do not leak the driver task. `shutdown()` is preferred for graceful
+/// teardown, but the `Drop` provides a safety net.
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.driver_abort.abort();
     }
 }
