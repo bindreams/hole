@@ -118,7 +118,9 @@ fn install_child_subscriber() -> ChildHarness {
     let stderr_writer = VecWriter::new();
 
     let no_relay = tracing_subscriber::filter::filter_fn(|m| {
-        !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
+        !m.target().starts_with("hole::stderr_relay")
+            && !m.target().starts_with("hole::stdout_relay")
+            && !m.target().starts_with("hole::plugin")
     });
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -174,6 +176,7 @@ pub(crate) fn run_child(kind: &str) {
         "redirect_multiline" => scenario_multiline(),
         "redirect_no_loop" => scenario_no_loop(),
         "lossy_backpressure" => scenario_lossy_backpressure(),
+        "plugin_log_reformat" => scenario_plugin_log_reformat(),
         "echo_stderr" => scenario_echo_stderr(),
         "echo_stdout" => scenario_echo_stdout(),
         other => panic!("unknown HOLE_LOGGING_TEST_KIND: {other}"),
@@ -385,5 +388,24 @@ fn scenario_lossy_backpressure() {
         tee_stderr: WRITES.load(Ordering::SeqCst).to_string(),
         ..ChildResult::default()
     };
+    write_result(&result);
+}
+
+fn scenario_plugin_log_reformat() {
+    let harness = install_child_subscriber();
+    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    // Go-format line with v2ray-core severity tag on stderr — should be
+    // parsed and re-emitted under hole::plugin with WARN level.
+    let _ = writeln!(std::io::stderr(), "2026/04/08 17:48:30 [Warning] test-plugin-msg");
+    let _ = std::io::stderr().flush();
+    // Go-format line on stdout — same parsing should apply.
+    let _ = writeln!(std::io::stdout(), "2026/04/08 17:48:30 [Error] test-stdout-plugin-msg");
+    let _ = std::io::stdout().flush();
+    // Plain line that does NOT match Go log format — should pass through as
+    // a generic hole::stderr_relay event.
+    let _ = writeln!(std::io::stderr(), "plain-non-go-line");
+    let _ = std::io::stderr().flush();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let result = finish(&harness);
     write_result(&result);
 }
