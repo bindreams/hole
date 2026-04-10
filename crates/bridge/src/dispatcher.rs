@@ -11,6 +11,7 @@ pub mod socks5_client;
 pub mod socks5_udp;
 pub mod tcp_handler;
 pub mod udp_flow;
+pub mod udp_handler;
 pub mod upstream_dns;
 
 use std::net::IpAddr;
