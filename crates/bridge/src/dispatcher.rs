@@ -3,4 +3,7 @@
 //! paths. Constructed by `ProxyManager::start`, destroyed on `stop`.
 
 pub mod block_log;
+pub mod bypass;
+pub mod device;
 pub mod socks5_client;
+pub mod upstream_dns;

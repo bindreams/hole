@@ -147,6 +147,8 @@ impl Routing for MockRouting {
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             interface_name: "MockEthernet".into(),
+            interface_index: 1,
+            ipv6_available: false,
         })
     }
 }

@@ -75,6 +75,8 @@ impl Routing for StubRouting {
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             interface_name: "StubIf".into(),
+            interface_index: 1,
+            ipv6_available: false,
         })
     }
 }
