@@ -96,7 +96,19 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee target/test-output.log
+
+      - name: Upload test output on failure
+        if: failure() && steps.test.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hole-test-output-${{ runner.os }}-${{ github.run_attempt }}
+          path: target/test-output.log
+          retention-days: 14
 
   test-installer:
     name: Test installer (windows/amd64)

@@ -469,6 +469,30 @@ fn stop_runs_mock_teardown_not_real_netsh() {
     });
 }
 
+/// Runtime belt-and-suspenders for the compile-time `disallowed_methods`
+/// clippy lint. Runs serial so the global counter is exclusively owned
+/// during this test. Asserts absolute zero because any nonzero value
+/// proves a proxy_manager test path spawned a real routing subprocess.
+#[skuld::test(serial)]
+fn proxy_manager_tests_never_spawn_routing_subprocess() {
+    crate::routing::ROUTING_SUBPROCESS_SPAWN_COUNT.store(0, Ordering::SeqCst);
+
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        for _ in 0..10 {
+            pm.start(&test_config()).await.unwrap();
+            pm.stop().await.unwrap();
+        }
+    });
+
+    let count = crate::routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst);
+    eprintln!("proxy_manager start/stop cycles spawned {count} routing subprocesses");
+    assert_eq!(
+        count, 0,
+        "proxy_manager tests must not spawn routing subprocesses (regression of #165)"
+    );
+}
+
 // last_error coverage for early-failure paths =========================================================================
 
 #[skuld::test]

@@ -12,6 +12,10 @@ Single-binary design:
 
 GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
 
+### Bridge test-isolation contract
+
+All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` and `Routing` traits in `crates/bridge/src/`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in `clippy.toml` via the `disallowed_methods` list. See `crates/bridge/src/proxy.rs` and `crates/bridge/src/routing.rs` for trait contracts, and bindreams/hole#165 for the incident that motivated the rule.
+
 ### CLI
 
 ```
