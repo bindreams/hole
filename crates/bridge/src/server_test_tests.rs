@@ -164,12 +164,20 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
 }
 
 /// Fast defaults for tests that don't need plugin startup.
+///
+/// Reverted to pre-#165 values in PR-A (#169). The #165 bug was that
+/// every test that went through `ProxyManager::start/stop` shelled out
+/// to real `netsh`/`route` via a RouteGuard that bypassed the backend
+/// trait, corrupting loopback state over time. Now that the refactor
+/// eliminates the bypass, tests no longer touch the routing table, so
+/// the original tight timeouts hold. If CI fails after this revert,
+/// investigate root cause — do NOT bump the values back.
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
-        preflight_timeout: Duration::from_secs(5),
+        preflight_timeout: Duration::from_millis(500),
         plugin_wait_timeout: Duration::from_secs(2),
-        ss_connect_timeout: Duration::from_secs(5),
-        sentinel_read_timeout: Duration::from_secs(5),
+        ss_connect_timeout: Duration::from_millis(800),
+        sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
         plugin_path_override: None,
     }
@@ -201,10 +209,10 @@ fn fixture_starts_real_ss_server() {
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
-        preflight_timeout: Duration::from_secs(5),
-        plugin_wait_timeout: Duration::from_secs(5),
-        ss_connect_timeout: Duration::from_secs(5),
-        sentinel_read_timeout: Duration::from_secs(5),
+        preflight_timeout: Duration::from_millis(500),
+        plugin_wait_timeout: Duration::from_secs(1),
+        ss_connect_timeout: Duration::from_millis(500),
+        sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
         plugin_path_override: None,
     }
@@ -515,7 +523,7 @@ fn run_test_with_v2ray_plugin_happy_path() {
                 .await;
         // The SS server's plugin is spawned async; wait for it to bind the
         // public port before letting the runner attempt preflight.
-        wait_for_port(svr_addr, Duration::from_secs(30)).await;
+        wait_for_port(svr_addr, Duration::from_secs(7)).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -530,7 +538,7 @@ fn run_test_with_v2ray_plugin_happy_path() {
         // Generous plugin window for cold start. The CI default of 2 s in
         // fast_test_config is too short for v2ray-plugin's WS handshake.
         let cfg = TestConfig {
-            plugin_wait_timeout: Duration::from_secs(30),
+            plugin_wait_timeout: Duration::from_secs(7),
             plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.

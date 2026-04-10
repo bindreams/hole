@@ -1,7 +1,8 @@
 // IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
-use crate::proxy::ProxyError;
-use crate::proxy_manager::{ProxyBackend, ProxyManager, ProxyState};
+use crate::proxy::{Proxy, ProxyError};
+use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::routing::Routing;
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use axum::extract::State;
@@ -46,8 +47,8 @@ pub struct StartCancelState {
 
 /// Shared state for IPC handlers, holding the proxy manager, IP cache, and
 /// the start-cancellation handoff struct.
-pub struct IpcState<B: ProxyBackend> {
-    pub proxy: Arc<Mutex<ProxyManager<B>>>,
+pub struct IpcState<P: Proxy, R: Routing> {
+    pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
     pub ip_cache: Arc<tokio::sync::Mutex<Option<(PublicIpResponse, Instant)>>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
@@ -74,7 +75,10 @@ impl IpcServer {
     /// Removes any stale socket file, creates parent directories, binds with
     /// restrictive initial permissions (umask on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
-    pub fn bind<B: ProxyBackend + 'static>(path: &Path, proxy: Arc<Mutex<ProxyManager<B>>>) -> std::io::Result<Self> {
+    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<P, R>>>,
+    ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
         #[cfg(test)]
@@ -186,24 +190,26 @@ where
 
 // Router ==============================================================================================================
 
-fn build_router<B: ProxyBackend + 'static>(state: Arc<IpcState<B>>) -> axum::Router {
+fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P, R>>) -> axum::Router {
     axum::Router::new()
-        .route(ROUTE_STATUS, axum::routing::get(handle_status::<B>))
-        .route(ROUTE_START, axum::routing::post(handle_start::<B>))
-        .route(ROUTE_STOP, axum::routing::post(handle_stop::<B>))
-        .route(ROUTE_CANCEL, axum::routing::post(handle_cancel::<B>))
-        .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<B>))
-        .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<B>))
-        .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<B>))
-        .route(ROUTE_PUBLIC_IP, axum::routing::get(handle_public_ip::<B>))
-        .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<B>))
+        .route(ROUTE_STATUS, axum::routing::get(handle_status::<P, R>))
+        .route(ROUTE_START, axum::routing::post(handle_start::<P, R>))
+        .route(ROUTE_STOP, axum::routing::post(handle_stop::<P, R>))
+        .route(ROUTE_CANCEL, axum::routing::post(handle_cancel::<P, R>))
+        .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<P, R>))
+        .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<P, R>))
+        .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<P, R>))
+        .route(ROUTE_PUBLIC_IP, axum::routing::get(handle_public_ip::<P, R>))
+        .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
 
 // Handlers ============================================================================================================
 
-async fn handle_status<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<StatusResponse> {
+async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Json<StatusResponse> {
     let mut pm = state.proxy.lock().await;
     pm.check_health();
     Json(StatusResponse {
@@ -213,8 +219,8 @@ async fn handle_status<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSta
     })
 }
 
-async fn handle_start<B: ProxyBackend + 'static>(
-    State(state): State<Arc<IpcState<B>>>,
+async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Register the cancellation token BEFORE taking the proxy mutex. If a
@@ -289,7 +295,9 @@ async fn handle_start<B: ProxyBackend + 'static>(
 /// Signal the in-flight start's `CancellationToken` if one is registered,
 /// or pre-arm a cancel for the next start otherwise. Always 200 Ack — the
 /// client's intent is recorded regardless.
-async fn handle_cancel<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<EmptyResponse> {
+async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Json<EmptyResponse> {
     let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
     if let Some(t) = &cs.token {
         info!("cancelling in-flight proxy start");
@@ -301,8 +309,8 @@ async fn handle_cancel<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSta
     Json(EmptyResponse {})
 }
 
-async fn handle_stop<B: ProxyBackend + 'static>(
-    State(state): State<Arc<IpcState<B>>>,
+async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut pm = state.proxy.lock().await;
     match pm.stop().await {
@@ -317,8 +325,8 @@ async fn handle_stop<B: ProxyBackend + 'static>(
     }
 }
 
-async fn handle_reload<B: ProxyBackend + 'static>(
-    State(state): State<Arc<IpcState<B>>>,
+async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut pm = state.proxy.lock().await;
@@ -336,7 +344,9 @@ async fn handle_reload<B: ProxyBackend + 'static>(
 
 // New handlers ========================================================================================================
 
-async fn handle_metrics<B: ProxyBackend + 'static>(State(state): State<Arc<IpcState<B>>>) -> Json<MetricsResponse> {
+async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Json<MetricsResponse> {
     let mut pm = state.proxy.lock().await;
     pm.check_health();
     Json(MetricsResponse {
@@ -348,8 +358,8 @@ async fn handle_metrics<B: ProxyBackend + 'static>(State(state): State<Arc<IpcSt
     })
 }
 
-async fn handle_diagnostics<B: ProxyBackend + 'static>(
-    State(state): State<Arc<IpcState<B>>>,
+async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<DiagnosticsResponse> {
     let pm = state.proxy.lock().await;
 
@@ -372,8 +382,10 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
     };
 
     // Network: does the host have a default gateway? Best-effort local
-    // check; does not actually probe the gateway.
-    let network = match pm.backend().default_gateway() {
+    // check; does not actually probe the gateway. Routes through
+    // `ProxyManager::default_gateway` (delegating to `Routing`) so tests
+    // hit `MockRouting`'s stub rather than the host OS.
+    let network = match pm.default_gateway() {
         Ok(_) => "ok".to_string(),
         Err(_) => "error".to_string(),
     };
@@ -393,8 +405,8 @@ async fn handle_diagnostics<B: ProxyBackend + 'static>(
     })
 }
 
-async fn handle_test_server<B: ProxyBackend + 'static>(
-    State(_state): State<Arc<IpcState<B>>>,
+async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
+    State(_state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<TestServerRequest>,
 ) -> Json<TestServerResponse> {
     let cfg = TestConfig::production();
@@ -402,8 +414,8 @@ async fn handle_test_server<B: ProxyBackend + 'static>(
     Json(TestServerResponse { outcome })
 }
 
-async fn handle_public_ip<B: ProxyBackend + 'static>(
-    State(state): State<Arc<IpcState<B>>>,
+async fn handle_public_ip<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<PublicIpResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check cache first.
     {

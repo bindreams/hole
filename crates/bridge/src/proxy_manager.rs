@@ -1,30 +1,38 @@
 // Proxy lifecycle manager — start/stop/reload orchestration.
+//
+// # Design notes (post-#165)
+//
+// `ProxyManager` is parameterized over two traits:
+// - `P: Proxy`     — the proxy backend (production: `ShadowsocksProxy`).
+// - `R: Routing`   — the OS routing provider (production: `SystemRouting`).
+//
+// Both traits return RAII associated types on success (`P::Running` /
+// `R::Installed`) whose Drop impls clean up their respective side effects.
+// This is what makes `start_inner` cancel-safe: if the start future is
+// dropped mid-flight (for example because a `tokio::select!` cancel branch
+// fired), the locally-owned `Running` / `Installed` values are dropped in
+// reverse-declaration order — aborting the shadowsocks task and tearing
+// down routes without the ProxyManager fields ever being mutated.
+//
+// A cycle's transient state lives in `Option<RunningState<P, R>>`. When
+// `stop()` takes the state, the proxy handle is explicitly
+// `stop().await`ed (so errors are reported), then the routes guard drops
+// (tearing down). On a successful `start`, the full `RunningState` is
+// committed to `self.running` from the synchronous match arm, after the
+// `tokio::select!` that races the cancel token has already resolved.
+//
+// There are deliberately no getters for `proxy` or `routing` — test access
+// to mock state happens via `Arc` clones captured before the mock is
+// handed to `new`. Re-adding a getter would recreate the encapsulation
+// smell the pre-#165 `pub fn backend(&self)` carried.
 
-use crate::gateway::GatewayInfo;
-use crate::guards::{StateFileGuard, TaskHandleGuard};
-use crate::proxy::{build_ss_config, ProxyError, TUN_DEVICE_NAME};
-use crate::routing::RouteGuard;
+use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
+use crate::routing::{Routing, SystemRouting};
 use hole_common::protocol::ProxyConfig;
-use shadowsocks_service::config::Config;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-
-// StartedState ========================================================================================================
-
-/// Everything `start_inner` produces on success. Held by value until the
-/// outer `start` commits it into `self`, so that cancelling `start_inner`
-/// mid-flight (dropping the future) runs every guard's `Drop` without ever
-/// touching the `ProxyManager` fields.
-struct StartedState {
-    task_handle: JoinHandle<std::io::Result<()>>,
-    route_guard: RouteGuard,
-    server_ip: IpAddr,
-    started_at: Instant,
-}
 
 // State ===============================================================================================================
 
@@ -34,165 +42,138 @@ pub enum ProxyState {
     Running,
 }
 
-// Backend trait =======================================================================================================
+// Running state =======================================================================================================
 
-pub trait ProxyBackend: Send + Sync {
-    fn start_ss(
-        &self,
-        config: Config,
-    ) -> impl std::future::Future<Output = Result<JoinHandle<std::io::Result<()>>, ProxyError>> + Send;
-
-    fn setup_routes(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        gateway: IpAddr,
-        interface_name: &str,
-    ) -> Result<(), ProxyError>;
-    fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError>;
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
-}
-
-// Real backend ========================================================================================================
-
-pub struct RealBackend;
-
-impl ProxyBackend for RealBackend {
-    async fn start_ss(&self, config: Config) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
-        let server = shadowsocks_service::local::Server::new(config)
-            .await
-            .map_err(ProxyError::Runtime)?;
-        Ok(tokio::spawn(async move { server.run().await }))
-    }
-
-    fn setup_routes(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        gateway: IpAddr,
-        interface_name: &str,
-    ) -> Result<(), ProxyError> {
-        crate::routing::setup_routes(tun_name, server_ip, gateway, interface_name)
-            .map_err(|e| ProxyError::RouteSetup(e.to_string()))
-    }
-
-    fn teardown_routes(&self, tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Result<(), ProxyError> {
-        crate::routing::teardown_routes(tun_name, server_ip, interface_name)
-            .map_err(|e| ProxyError::RouteSetup(e.to_string()))
-    }
-
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
-        crate::gateway::get_default_gateway_info().map_err(|e| ProxyError::Gateway(e.to_string()))
-    }
+/// Per-cycle state owned only while a proxy is running. Dropping this
+/// struct aborts the proxy task (via `P::Running::drop`) and tears down
+/// routes (via `R::Installed::drop`). Field declaration order matters:
+/// `proxy` drops before `_routes` so the ss task is aborted before the
+/// routes it was using are removed.
+struct RunningState<P: Proxy, R: Routing> {
+    /// Handle on the running proxy. Drop aborts the task (best-effort);
+    /// supported graceful shutdown is via `stop().await` from
+    /// [`ProxyManager::stop`].
+    proxy: P::Running,
+    /// Installed routes. Held only for the Drop side effect — dropping
+    /// this field tears down the routes and clears the state file.
+    /// `#[allow(dead_code)]` because the field is "unused" syntactically
+    /// but load-bearing semantically.
+    #[allow(dead_code)]
+    routes: R::Installed,
+    server_ip: IpAddr,
+    started_at: Instant,
 }
 
 // ProxyManager ========================================================================================================
 
-pub struct ProxyManager<B: ProxyBackend = RealBackend> {
-    backend: B,
-    /// Directory where the route-recovery state file lives while a proxy is
-    /// active. Owned by the manager so the constructor does not need to do
-    /// I/O (see `start()` for the write-ordering contract).
-    state_dir: PathBuf,
-    task_handle: Option<JoinHandle<std::io::Result<()>>>,
-    route_guard: Option<RouteGuard>,
-    server_ip: Option<IpAddr>,
-    started_at: Option<Instant>,
+pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting> {
+    proxy: P,
+    routing: R,
+    running: Option<RunningState<P, R>>,
     last_error: Option<String>,
-    state: ProxyState,
 }
 
-impl<B: ProxyBackend> ProxyManager<B> {
-    pub fn new(backend: B, state_dir: PathBuf) -> Self {
+impl<P: Proxy, R: Routing> ProxyManager<P, R> {
+    pub fn new(proxy: P, routing: R) -> Self {
         Self {
-            backend,
-            state_dir,
-            task_handle: None,
-            route_guard: None,
-            server_ip: None,
-            started_at: None,
+            proxy,
+            routing,
+            running: None,
             last_error: None,
-            state: ProxyState::Stopped,
         }
     }
 
     pub fn state(&self) -> ProxyState {
-        self.state
-    }
-
-    pub fn backend(&self) -> &B {
-        &self.backend
+        // ProxyState is retained (Stopped/Running) to preserve the IPC
+        // `StatusResponse.running` field semantics unchanged for the GUI.
+        if self.running.is_some() {
+            ProxyState::Running
+        } else {
+            ProxyState::Stopped
+        }
     }
 
     pub fn uptime_secs(&self) -> u64 {
-        self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+        self.running
+            .as_ref()
+            .map(|r| r.started_at.elapsed().as_secs())
+            .unwrap_or(0)
     }
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
 
-    /// Non-cancellable convenience wrapper around `start_cancellable`.
-    /// Equivalent to passing a fresh, never-signaled `CancellationToken`.
-    /// Used by existing callers (tests, `reload`) that don't need cancel
+    /// Delegation for `handle_diagnostics`: expose the routing provider's
+    /// default-gateway query without leaking the provider itself. This is
+    /// NOT an encapsulation-breaking getter — it's a single capability
+    /// intentionally surfaced for the diagnostics handler so tests can
+    /// exercise the mock routing's gateway stub instead of hitting the
+    /// host OS.
+    pub fn default_gateway(&self) -> Result<crate::gateway::GatewayInfo, ProxyError> {
+        self.routing.default_gateway()
+    }
+
+    /// Non-cancellable convenience wrapper around
+    /// [`start_cancellable`](Self::start_cancellable). Equivalent to
+    /// passing a fresh, never-signaled `CancellationToken`. Used by
+    /// existing callers (tests, `reload`) that don't need cancel
     /// semantics.
     pub async fn start(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
         self.start_cancellable(config, CancellationToken::new()).await
     }
 
-    /// Start the proxy with a caller-supplied `CancellationToken`. Signaling
-    /// the token at any point during `start_inner` returns
-    /// `Err(ProxyError::Cancelled)` and rolls back partial state (via the
-    /// RAII guards inside `start_inner`) without mutating `self`.
+    /// Start the proxy with a caller-supplied `CancellationToken`.
+    /// Signaling the token at any point during `start_inner` returns
+    /// `Err(ProxyError::Cancelled)` and rolls back partial state (via
+    /// the RAII guards inside `start_inner`) without mutating `self`.
     ///
     /// Three race scenarios are handled correctly:
     ///
-    /// 1. **Cancel before any `start_inner` await.** `tokio::select!` with
-    ///    `biased;` polls the cancel branch first, so an already-cancelled
-    ///    token returns `Cancelled` without invoking `start_inner` at all.
-    /// 2. **Cancel mid-flight.** `select!` drops the `start_inner` future,
-    ///    which runs every live RAII guard's `Drop` in reverse-declaration
-    ///    order — the ss task is aborted, the route-state file is cleared,
-    ///    and (if `setup_routes` had already committed) routes are torn
-    ///    down by `RouteGuard::drop`.
-    /// 3. **Cancel right after `start_inner` returns `Ok(started)`.** Commit
-    ///    to `self` happens in this outer function AFTER `select!` has
-    ///    already yielded `Ok(started)`, so the late cancel cannot race the
-    ///    commit. The started proxy is left running; the client sees
-    ///    `Ok(())`. A caller that wanted to cancel that late can follow up
-    ///    with an explicit stop.
+    /// 1. **Cancel before any `start_inner` await.** `tokio::select!`
+    ///    with `biased;` polls the cancel branch first, so an
+    ///    already-cancelled token returns `Cancelled` without invoking
+    ///    `start_inner` at all.
+    /// 2. **Cancel mid-flight.** `select!` drops the `start_inner`
+    ///    future, which runs every live RAII guard's `Drop` in
+    ///    reverse-declaration order — the proxy task is aborted (by
+    ///    `P::Running::drop`), routes are torn down (by
+    ///    `R::Installed::drop`), and the state file is cleared (by the
+    ///    same `R::Installed::drop`).
+    /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
+    ///    Commit to `self` happens in this outer function AFTER
+    ///    `select!` has already yielded `Ok(started)`, so the late
+    ///    cancel cannot race the commit. The started proxy is left
+    ///    running; the client sees `Ok(())`. A caller that wanted to
+    ///    cancel that late can follow up with an explicit stop.
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
         cancel: CancellationToken,
     ) -> Result<(), ProxyError> {
-        if self.state == ProxyState::Running {
+        if self.running.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // Run start_inner in a select! against the cancel token. Note that
-        // start_inner is a free associated function — it does NOT touch
-        // `self`, so dropping the future leaves `self` untouched. All
-        // partial state is owned by RAII guards inside start_inner and
-        // cleans up on drop.
-        let result: Result<StartedState, ProxyError> = tokio::select! {
+        // Run start_inner in a select! against the cancel token.
+        // `start_inner` is a free associated function — it does NOT
+        // touch `self`, so dropping the future leaves `self` untouched.
+        // All partial state is owned by the locally-constructed RAII
+        // types inside start_inner and cleans up on drop.
+        let result: Result<RunningState<P, R>, ProxyError> = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ProxyError::Cancelled),
-            r = Self::start_inner(&self.backend, config, &self.state_dir) => r,
+            r = Self::start_inner(&self.proxy, &self.routing, config) => r,
         };
 
-        // Commit (or record the error) in the outer function, so the only
-        // path that mutates `self.state = Running` is strictly after the
-        // select! has completed successfully.
+        // Commit (or record the error) in the outer function, so the
+        // only path that mutates `self.running = Some(..)` is strictly
+        // after the select! has completed successfully.
         match result {
-            Ok(started) => {
-                let server_ip = started.server_ip;
-                self.task_handle = Some(started.task_handle);
-                self.route_guard = Some(started.route_guard);
-                self.server_ip = Some(started.server_ip);
-                self.started_at = Some(started.started_at);
+            Ok(state) => {
+                let server_ip = state.server_ip;
+                self.running = Some(state);
                 self.last_error = None;
-                self.state = ProxyState::Running;
                 info!(server_ip = %server_ip, "proxy started");
                 Ok(())
             }
@@ -208,126 +189,84 @@ impl<B: ProxyBackend> ProxyManager<B> {
         }
     }
 
-    /// Produce a `StartedState` without touching `self`. All partial
-    /// state is owned by local RAII guards so that dropping this future
+    /// Produce a [`RunningState`] without touching `self`. All partial
+    /// state is owned by local RAII values so that dropping this future
     /// at any `.await` point unwinds cleanly:
     ///
-    /// 1. `StateFileGuard` — clears `bridge-routes.json` if dropped
-    ///    before `RouteGuard` takes over state-file cleanup.
-    /// 2. `TaskHandleGuard` — aborts the shadowsocks-service task if
-    ///    dropped before commit.
-    /// 3. `RouteGuard` — on drop tears down routes AND clears the state
-    ///    file (`RouteGuard::drop` handles both), so once it is
-    ///    constructed, `StateFileGuard` is committed to avoid a
-    ///    double-clear race.
+    /// 1. `P::Running` — on drop, aborts the spawned proxy task.
+    /// 2. `R::Installed` — on drop, tears down routes and clears the
+    ///    crash-recovery state file.
     ///
-    /// CRITICAL ORDERING: the route-state file is persisted BEFORE any
-    /// routing mutation. A panic or SIGKILL between `setup_routes` and
-    /// `RouteGuard` construction would otherwise leak routes with no
-    /// on-disk record, defeating crash recovery on next startup. The
-    /// guard discipline above maintains this invariant under drop as
-    /// well as under explicit error returns.
-    async fn start_inner(backend: &B, config: &ProxyConfig, state_dir: &Path) -> Result<StartedState, ProxyError> {
+    /// CRITICAL ORDERING: the routing provider is responsible for
+    /// persisting the recovery state BEFORE mutating routes. A panic
+    /// or SIGKILL between `setup_routes` and `SystemRoutes`
+    /// construction would otherwise leak routes with no on-disk record,
+    /// defeating crash recovery on next startup. See
+    /// [`crate::routing::SystemRouting::install`] for the invariant.
+    async fn start_inner(proxy: &P, routing: &R, config: &ProxyConfig) -> Result<RunningState<P, R>, ProxyError> {
         // Build shadowsocks config (sync, no partial state).
-        let ss_config: Config = build_ss_config(config)?;
+        let ss_config = build_ss_config(config)?;
 
         // Pre-load wintun.dll explicitly so we can give a descriptive
-        // error if it's missing. shadowsocks-service uses the bare
-        // "wintun.dll" name via tun-0.8.6, which becomes LoadLibraryExW
-        // with default search order. By loading the DLL here first
-        // (with an absolute path), the OS loader-table services the
-        // later bare-name lookup from the same process via base-name
-        // dedup. See crates/bridge/src/wintun.rs.
-        //
-        // No routes have been touched yet at this point, so we don't
-        // need to roll anything back on failure.
+        // error if it's missing. See crates/bridge/src/wintun.rs.
         #[cfg(target_os = "windows")]
         crate::wintun::ensure_loaded()?;
 
         // Resolve server hostname to IP.
         let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
 
-        // Detect default gateway and interface.
-        let gw_info = backend.default_gateway()?;
+        // Query the OS default gateway via the routing provider.
+        let gw_info = routing.default_gateway()?;
 
-        // Persist the route-recovery state. From here on, if the future
-        // is dropped or an error is returned, `StateFileGuard::drop`
-        // clears the file.
-        let persisted_state = crate::route_state::RouteState {
-            version: crate::route_state::SCHEMA_VERSION,
-            tun_name: TUN_DEVICE_NAME.to_owned(),
-            server_ip,
-            interface_name: gw_info.interface_name.clone(),
-        };
-        crate::route_state::save(state_dir, &persisted_state)
-            .map_err(|e| ProxyError::RouteSetup(format!("failed to persist route-state: {e}")))?;
-        let state_file_guard = StateFileGuard::new(state_dir.to_owned());
+        // Start the proxy tunnel. From here on, if the future is
+        // dropped or an error is returned, `P::Running::drop` aborts
+        // the spawned task (best-effort, no await).
+        let running_proxy = proxy.start(ss_config).await?;
 
-        // Start shadowsocks-service (no route mutation yet). Wrap in a
-        // TaskHandleGuard so the spawned task is aborted if we drop or
-        // return an error before commit.
-        let task_guard = TaskHandleGuard::new(backend.start_ss(ss_config).await?);
+        // Install the routes. On failure, `running_proxy` drops
+        // (aborting the proxy task) as the `?` propagates.
+        // `SystemRouting::install` writes the state file atomically
+        // BEFORE mutating routes and clears it on its own internal
+        // rollback path, so no `StateFileGuard` is needed here.
+        let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
-        // Set up routes. On failure both `task_guard` and
-        // `state_file_guard` are dropped in reverse-declaration order,
-        // cleaning up the ss task and the state file. `teardown_routes`
-        // is NOT called explicitly: if `setup_routes` itself fails,
-        // nothing has been installed; if it partially installed and
-        // then errored, the backend is expected to clean up its own
-        // partial state (the existing contract — see `RealBackend`).
-        backend.setup_routes(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
-
-        // Routes are installed. RouteGuard takes over both route
-        // teardown and state-file clearing (see RouteGuard::drop), so
-        // disarm StateFileGuard to avoid double-clearing the file on
-        // success paths.
-        let route_guard = RouteGuard::new(
-            TUN_DEVICE_NAME.to_owned(),
-            server_ip,
-            gw_info.interface_name,
-            state_dir.to_owned(),
-        );
-        state_file_guard.commit();
-
-        // Extract the task handle from the guard now that routes are
-        // committed. The handle moves into StartedState and will be
-        // owned by the ProxyManager after the outer `start` commits.
-        let task_handle = task_guard.commit();
-
-        Ok(StartedState {
-            task_handle,
-            route_guard,
+        Ok(RunningState {
+            proxy: running_proxy,
+            routes,
             server_ip,
             started_at: Instant::now(),
         })
     }
 
     pub async fn stop(&mut self) -> Result<(), ProxyError> {
-        if self.state == ProxyState::Stopped {
+        let Some(state) = self.running.take() else {
             return Ok(());
-        }
+        };
+        // Destructure so the proxy handle can be moved out for
+        // `stop(self).await` while the routes guard drops at the end
+        // of the scope.
+        let RunningState {
+            proxy,
+            routes,
+            server_ip: _,
+            started_at: _,
+        } = state;
 
-        // Abort the ss task
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-            // Wait for it to finish (will return Err(JoinError::Cancelled))
-            let _ = handle.await;
-        }
+        // Graceful proxy shutdown first — stop the tunnel before
+        // tearing down the routes it was using. `stop(self)` consumes
+        // the handle and awaits the task, so panics in the spawned
+        // task are surfaced as `ProxyError::Runtime`.
+        let res = proxy.stop().await;
+        drop(routes); // tears down routes + clears state file via RAII
 
-        // Drop route guard (tears down routes via RAII)
-        self.route_guard.take();
-
-        self.server_ip = None;
-        self.started_at = None;
-        // Clear any error from a previous failed start. A clean stop is the
-        // user's signal that the bridge is in a good state again — keeping
-        // the stale error would make `handle_diagnostics` report
-        // `bridge = "error"` indefinitely. See issue #142.
+        // Clear any error from a previous failed start. A clean stop
+        // is the user's signal that the bridge is in a good state
+        // again — keeping the stale error would make
+        // `handle_diagnostics` report `bridge = "error"` indefinitely.
+        // See issue #142.
         self.last_error = None;
-        self.state = ProxyState::Stopped;
-
         info!("proxy stopped");
-        Ok(())
+        res
     }
 
     pub async fn reload(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
@@ -335,19 +274,22 @@ impl<B: ProxyBackend> ProxyManager<B> {
         self.start(config).await
     }
 
-    /// Check if the ss task has exited unexpectedly and update state.
+    /// Sync health check: detects a proxy task that exited on its own
+    /// (e.g. shadowsocks panic or upstream connection failure).
+    ///
+    /// **Error-discard note**: this function cannot await the dead
+    /// handle, so the underlying task's `io::Result` is discarded.
+    /// Callers that need the task's error must use `stop().await`
+    /// instead. The graceful duplication-fix from pre-#165 is complete
+    /// (this is now one line) but the sync-vs-async limitation is
+    /// fundamental to Rust — we do not make `check_health` async
+    /// because every caller would have to be made async too.
     pub fn check_health(&mut self) {
-        if self.state == ProxyState::Running {
-            if let Some(ref handle) = self.task_handle {
-                if handle.is_finished() {
-                    error!("proxy task exited unexpectedly");
-                    self.last_error = Some("proxy task exited unexpectedly".into());
-                    self.task_handle.take();
-                    self.route_guard.take();
-                    self.server_ip = None;
-                    self.started_at = None;
-                    self.state = ProxyState::Stopped;
-                }
+        if let Some(state) = &self.running {
+            if !state.proxy.is_alive() {
+                error!("proxy task exited unexpectedly");
+                self.last_error = Some("proxy task exited unexpectedly".into());
+                self.running = None; // Drop tears down routes + clears state file
             }
         }
     }

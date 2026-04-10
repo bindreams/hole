@@ -1,40 +1,76 @@
 use crate::gateway::GatewayInfo;
-use crate::proxy::ProxyError;
-use crate::proxy_manager::{ProxyBackend, ProxyManager};
+use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy_manager::ProxyManager;
+use crate::routing::Routing;
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
 
-// Minimal stub backend used only for the foreground-run IPC smoke test.
-// None of its methods are exercised by this test — we only construct the
-// ProxyManager so `IpcServer::bind` can be bound and the status endpoint
-// queried. A shared test-support module would be overkill for one use.
-struct StubBackend;
+// Minimal stub types used only for the foreground-run IPC smoke test.
+// None of their methods are exercised by this test — we only construct
+// the ProxyManager so `IpcServer::bind` can be bound and the status
+// endpoint queried. A shared test-support module would be overkill for
+// one use.
 
-impl ProxyBackend for StubBackend {
-    async fn start_ss(
-        &self,
-        _config: shadowsocks_service::config::Config,
-    ) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
-        Ok(tokio::spawn(async {
-            std::future::pending::<std::io::Result<()>>().await
-        }))
+struct StubProxy;
+
+impl Proxy for StubProxy {
+    type Running = StubRunning;
+    async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<StubRunning, ProxyError> {
+        Ok(StubRunning {
+            handle: Some(tokio::spawn(async { std::future::pending::<io::Result<()>>().await })),
+        })
     }
+}
 
-    fn setup_routes(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<(), ProxyError> {
+struct StubRunning {
+    handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl RunningProxy for StubRunning {
+    fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+    async fn stop(mut self) -> Result<(), ProxyError> {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
         Ok(())
     }
+}
 
-    fn teardown_routes(&self, _: &str, _: IpAddr, _: &str) -> Result<(), ProxyError> {
-        Ok(())
+impl Drop for StubRunning {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
     }
+}
 
+struct StubRouting {
+    state_dir: PathBuf,
+}
+
+impl StubRouting {
+    fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
+
+impl Routing for StubRouting {
+    type Installed = StubRoutes;
+    fn install(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<StubRoutes, ProxyError> {
+        Ok(StubRoutes {
+            _state_dir: self.state_dir.clone(),
+        })
+    }
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -43,12 +79,19 @@ impl ProxyBackend for StubBackend {
     }
 }
 
+struct StubRoutes {
+    // Held only so tests can replicate production-like state-dir behavior
+    // if they ever need it. Currently unused — the foreground test never
+    // calls start, just binds the IPC server and queries status.
+    _state_dir: PathBuf,
+}
+
 fn test_socket_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hole-fg-test-{}-{suffix}.sock", std::process::id()))
 }
 
 /// Connect to the server with retry (avoids flaky sleep-based waits).
-async fn connect_with_retry(path: &std::path::Path) -> LocalStream {
+async fn connect_with_retry(path: &Path) -> LocalStream {
     for _ in 0..50 {
         match LocalStream::connect(path).await {
             Ok(stream) => return stream,
@@ -70,7 +113,10 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
 
         let path_clone = path.clone();
         let server_handle = tokio::spawn(async move {
-            let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(StubBackend, state_dir)));
+            let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
+                StubProxy,
+                StubRouting::new(state_dir),
+            )));
             let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
             let server = crate::ipc::IpcServer::bind(&path_clone, proxy).unwrap();
