@@ -17,7 +17,24 @@ fn main() {
     // Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download)
     // moved to `cargo xtask deps` in Commit 4 of this PR. See issue #143.
 
+    ensure_external_bin_stub(&repo_root);
     tauri_build::build();
+}
+
+/// Ensure the `externalBin` stub exists so `tauri_build::build()` passes
+/// validation even when `cargo xtask deps` has not been run yet.
+/// The real binary is built by `cargo xtask deps`.
+fn ensure_external_bin_stub(repo_root: &Path) {
+    let target = std::env::var("TARGET").unwrap();
+    let suffix = if target.contains("windows") { ".exe" } else { "" };
+    let path = repo_root
+        .join(".cache/v2ray-plugin")
+        .join(format!("v2ray-plugin-{target}{suffix}"));
+    if !path.exists() {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create .cache/v2ray-plugin/");
+        std::fs::File::create(&path).expect("failed to create v2ray-plugin stub");
+        println!("cargo:warning=created empty v2ray-plugin stub — run `cargo xtask deps` for a real build");
+    }
 }
 
 // Repo root ===========================================================================================================
@@ -139,7 +156,7 @@ fn generate_tray_icons(icons_dir: &Path) {
         match target_os.as_str() {
             "macos" => generate_tray_icons_macos(&tree, &out_dir, name),
             "windows" => generate_tray_icons_windows(&tree, &out_dir, name),
-            other => eprintln!("cargo:warning=tray icon generation not implemented for {other}"),
+            other => println!("cargo:warning=tray icon generation not implemented for {other}"),
         }
     }
 }
