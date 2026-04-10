@@ -4,14 +4,12 @@
 //
 // 1. **FD-level stdio safety net.** At startup, FD 1 (stdout) and FD 2 (stderr)
 //    are redirected to OS pipes. A reader thread per pipe tees each captured
-//    line to (a) a `tracing` event and (b) the *saved-original* handle (which
-//    preserves dev-terminal / CLI-script visibility). Lines matching Go's
-//    standard log format (`YYYY/MM/DD HH:MM:SS [Severity] msg`) are parsed
-//    and re-emitted under target `hole::plugin` with the appropriate tracing
-//    level; all other lines fall through to `hole::stdout_relay` /
-//    `hole::stderr_relay` at INFO. Catches any third-party output that
-//    bypasses tracing — Go runtime stderr from v2ray-plugin, native
-//    libraries, the default panic printer, etc.
+//    line to (a) a `tracing` event with target `hole::stdout_relay` /
+//    `hole::stderr_relay` (which the file layer captures) and (b) the
+//    *saved-original* handle (which preserves dev-terminal / CLI-script
+//    visibility). Catches any third-party output that bypasses tracing —
+//    Go runtime stderr from v2ray-plugin, native libraries, the default panic
+//    printer, etc.
 //
 // 2. **Multi-layer tracing subscriber.** A `Registry` with two `fmt::layer()`s:
 //    a file layer that records everything (including the relay-target events,
@@ -225,98 +223,11 @@ fn relay_loop(reader: os_pipe::PipeReader, mut tee: tracing_appender::non_blocki
 }
 
 fn emit_stderr_relay(msg: &str) {
-    if let Some((level, parsed)) = try_parse_plugin_log_line(msg) {
-        emit_plugin_line(level, parsed);
-    } else {
-        tracing::event!(target: "hole::stderr_relay", tracing::Level::INFO, "{}", msg);
-    }
+    tracing::event!(target: "hole::stderr_relay", tracing::Level::INFO, "{}", msg);
 }
 
 fn emit_stdout_relay(msg: &str) {
-    if let Some((level, parsed)) = try_parse_plugin_log_line(msg) {
-        emit_plugin_line(level, parsed);
-    } else {
-        tracing::event!(target: "hole::stdout_relay", tracing::Level::INFO, "{}", msg);
-    }
-}
-
-// Plugin log parsing ==================================================================================================
-
-/// Try to parse a Go-standard-log-format line produced by v2ray-plugin or
-/// v2ray-core and return the extracted tracing level + message body.
-///
-/// Go's `log` package produces `YYYY/MM/DD HH:MM:SS <message>` (always
-/// zero-padded, fixed-width). v2ray-core's `GeneralMessage.String()` prepends
-/// a bracketed severity tag from its protobuf `Severity` enum — one of
-/// `[Error]`, `[Warning]`, `[Info]`, `[Debug]`, or `[Unknown]`. Lines from
-/// v2ray-plugin's own `log.Println` calls have no tag.
-///
-/// Returns `None` for lines that don't match the Go timestamp prefix, or
-/// whose message body after timestamp/tag stripping is empty.
-pub(crate) fn try_parse_plugin_log_line(line: &str) -> Option<(tracing::Level, &str)> {
-    // Go's log format: `YYYY/MM/DD HH:MM:SS ` — exactly 20 bytes.
-    let b = line.as_bytes();
-    if b.len() < 21 {
-        return None;
-    }
-    if !(b[0].is_ascii_digit()
-        && b[1].is_ascii_digit()
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit()
-        && b[4] == b'/'
-        && b[5].is_ascii_digit()
-        && b[6].is_ascii_digit()
-        && b[7] == b'/'
-        && b[8].is_ascii_digit()
-        && b[9].is_ascii_digit()
-        && b[10] == b' '
-        && b[11].is_ascii_digit()
-        && b[12].is_ascii_digit()
-        && b[13] == b':'
-        && b[14].is_ascii_digit()
-        && b[15].is_ascii_digit()
-        && b[16] == b':'
-        && b[17].is_ascii_digit()
-        && b[18].is_ascii_digit()
-        && b[19] == b' ')
-    {
-        return None;
-    }
-
-    let rest = &line[20..];
-
-    // Try stripping a v2ray-core severity tag.
-    let (level, msg) = if let Some(msg) = rest.strip_prefix("[Error] ") {
-        (tracing::Level::ERROR, msg)
-    } else if let Some(msg) = rest.strip_prefix("[Warning] ") {
-        (tracing::Level::WARN, msg)
-    } else if let Some(msg) = rest.strip_prefix("[Info] ") {
-        (tracing::Level::INFO, msg)
-    } else if let Some(msg) = rest.strip_prefix("[Debug] ") {
-        (tracing::Level::DEBUG, msg)
-    } else if let Some(msg) = rest.strip_prefix("[Unknown] ") {
-        (tracing::Level::WARN, msg)
-    } else {
-        (tracing::Level::INFO, rest)
-    };
-
-    let msg = msg.trim();
-    if msg.is_empty() {
-        return None;
-    }
-    Some((level, msg))
-}
-
-/// Emit a parsed plugin log line under `hole::plugin` with the appropriate
-/// tracing level. Matching is required because `tracing::event!` needs a
-/// const-level for its compile-time metadata.
-fn emit_plugin_line(level: tracing::Level, msg: &str) {
-    match level {
-        l if l == tracing::Level::ERROR => tracing::error!(target: "hole::plugin", "{}", msg),
-        l if l == tracing::Level::WARN => tracing::warn!(target: "hole::plugin", "{}", msg),
-        l if l == tracing::Level::DEBUG => tracing::debug!(target: "hole::plugin", "{}", msg),
-        _ => tracing::info!(target: "hole::plugin", "{}", msg),
-    }
+    tracing::event!(target: "hole::stdout_relay", tracing::Level::INFO, "{}", msg);
 }
 
 /// Set up the FD-level redirect for both stderr and stdout. Returns the relay
@@ -531,15 +442,11 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
         .add_directive(default_directive.parse().expect("valid tracing directive"))
         .add_directive("hole::logging=debug".parse().expect("valid directive"));
 
-    // Exclude relay-originated events from the stderr layer to prevent
-    // double output: the relay tee already writes raw bytes to the
-    // saved-original handle (terminal / dev.py pipe). Letting the same
-    // events through the stderr layer would duplicate them. The file
-    // layer has no such filter — capturing relay events is its purpose.
+    // Filter that excludes the relay's own events from the stderr layer to
+    // prevent any feedback loop in either direction. The file layer has no
+    // such filter — the whole point is to capture relay events to the file.
     let no_relay = tracing_subscriber::filter::filter_fn(|m| {
-        !m.target().starts_with("hole::stderr_relay")
-            && !m.target().starts_with("hole::stdout_relay")
-            && !m.target().starts_with("hole::plugin")
+        !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
     });
 
     let file_layer = tracing_subscriber::fmt::layer().with_writer(file_nb).with_ansi(false);
