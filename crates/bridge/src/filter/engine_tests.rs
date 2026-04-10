@@ -29,7 +29,7 @@ fn conn(dst: &str, port: u16, domain: Option<&str>) -> ConnInfo {
 #[skuld::test]
 fn empty_ruleset_falls_back_to_proxy() {
     let rs = RuleSet::from_user_rules(&[]);
-    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)), FilterAction::Proxy);
+    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)).action, FilterAction::Proxy);
 }
 
 #[skuld::test]
@@ -37,7 +37,7 @@ fn ruleset_with_only_invalid_rules_falls_back_to_proxy() {
     let rs = RuleSet::from_user_rules(&[rule("nonsense", MatchType::Subnet, FilterAction::Block)]);
     assert!(rs.rules.is_empty());
     assert_eq!(rs.dropped.len(), 1);
-    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)), FilterAction::Proxy);
+    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)).action, FilterAction::Proxy);
 }
 
 // Single-rule basics ==================================================================================================
@@ -46,7 +46,7 @@ fn ruleset_with_only_invalid_rules_falls_back_to_proxy() {
 fn single_proxy_rule() {
     let rs = RuleSet::from_user_rules(&[rule("example.com", MatchType::Exactly, FilterAction::Proxy)]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Proxy
     );
 }
@@ -55,7 +55,7 @@ fn single_proxy_rule() {
 fn single_block_rule() {
     let rs = RuleSet::from_user_rules(&[rule("example.com", MatchType::Exactly, FilterAction::Block)]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Block
     );
 }
@@ -63,14 +63,14 @@ fn single_block_rule() {
 #[skuld::test]
 fn single_bypass_rule() {
     let rs = RuleSet::from_user_rules(&[rule("10.0.0.0/8", MatchType::Subnet, FilterAction::Bypass)]);
-    assert_eq!(decide(&rs, &conn("10.1.2.3", 443, None)), FilterAction::Bypass);
+    assert_eq!(decide(&rs, &conn("10.1.2.3", 443, None)).action, FilterAction::Bypass);
 }
 
 #[skuld::test]
 fn no_matching_rule_falls_back_to_proxy() {
     let rs = RuleSet::from_user_rules(&[rule("example.com", MatchType::Exactly, FilterAction::Block)]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("other.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("other.com"))).action,
         FilterAction::Proxy
     );
 }
@@ -87,7 +87,7 @@ fn worked_example_a_example_com_proxied() {
         rule("a.example.com", MatchType::Exactly, FilterAction::Proxy),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("a.example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("a.example.com"))).action,
         FilterAction::Proxy
     );
 }
@@ -99,7 +99,7 @@ fn worked_example_b_example_com_blocked() {
         rule("a.example.com", MatchType::Exactly, FilterAction::Proxy),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("b.example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("b.example.com"))).action,
         FilterAction::Block
     );
 }
@@ -111,7 +111,7 @@ fn worked_example_apex_blocked() {
         rule("a.example.com", MatchType::Exactly, FilterAction::Proxy),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Block
     );
 }
@@ -125,7 +125,7 @@ fn later_rule_overrides_earlier_for_same_address() {
         rule("example.com", MatchType::Exactly, FilterAction::Block),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Block
     );
 }
@@ -137,7 +137,7 @@ fn earlier_rule_wins_when_no_later_rule_matches() {
         rule("other.com", MatchType::Exactly, FilterAction::Bypass),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Block
     );
 }
@@ -153,7 +153,7 @@ fn mixed_rules_ip_subnet_later_wins() {
         rule("1.2.3.0/24", MatchType::Subnet, FilterAction::Bypass),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Bypass
     );
 }
@@ -165,7 +165,7 @@ fn mixed_rules_domain_later_wins() {
         rule("example.com", MatchType::Exactly, FilterAction::Block),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Block
     );
 }
@@ -177,13 +177,13 @@ fn ip_only_connection_with_domain_rule_in_set_falls_through() {
         rule("example.com", MatchType::Exactly, FilterAction::Block),
         rule("1.2.3.0/24", MatchType::Subnet, FilterAction::Bypass),
     ]);
-    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)), FilterAction::Bypass);
+    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)).action, FilterAction::Bypass);
 }
 
 #[skuld::test]
 fn ip_only_connection_no_ip_rule_falls_back_to_proxy() {
     let rs = RuleSet::from_user_rules(&[rule("example.com", MatchType::Exactly, FilterAction::Block)]);
-    assert_eq!(decide(&rs, &conn("9.9.9.9", 443, None)), FilterAction::Proxy);
+    assert_eq!(decide(&rs, &conn("9.9.9.9", 443, None)).action, FilterAction::Proxy);
 }
 
 // Three locked default rules (matches the UI's planned behavior) ======================================================
@@ -196,11 +196,11 @@ fn three_locked_default_rules_pass_everything_through() {
         rule("::/0", MatchType::Subnet, FilterAction::Proxy),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("example.com"))).action,
         FilterAction::Proxy
     );
-    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)), FilterAction::Proxy);
-    assert_eq!(decide(&rs, &conn("::1", 443, None)), FilterAction::Proxy);
+    assert_eq!(decide(&rs, &conn("1.2.3.4", 443, None)).action, FilterAction::Proxy);
+    assert_eq!(decide(&rs, &conn("::1", 443, None)).action, FilterAction::Proxy);
 }
 
 #[skuld::test]
@@ -212,11 +212,11 @@ fn block_rule_overrides_locked_defaults() {
         rule("evil.com", MatchType::WithSubdomains, FilterAction::Block),
     ]);
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("api.evil.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("api.evil.com"))).action,
         FilterAction::Block
     );
     assert_eq!(
-        decide(&rs, &conn("1.2.3.4", 443, Some("good.com"))),
+        decide(&rs, &conn("1.2.3.4", 443, Some("good.com"))).action,
         FilterAction::Proxy
     );
 }
