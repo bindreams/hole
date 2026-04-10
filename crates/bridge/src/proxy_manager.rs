@@ -66,6 +66,10 @@ struct RunningState<P: Proxy, R: Routing> {
     proxy: P::Running,
     server_ip: Option<IpAddr>,
     started_at: Instant,
+    /// Whether UDP proxy relay is available (from plugin config).
+    udp_proxy_available: bool,
+    /// Whether IPv6 bypass is available (from gateway info).
+    ipv6_bypass_available: bool,
 }
 
 // ProxyManager ========================================================================================================
@@ -75,6 +79,13 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting>
     routing: R,
     running: Option<RunningState<P, R>>,
     last_error: Option<String>,
+    /// Last successfully-started config. Used by `reload` to detect
+    /// filter-only changes (hot-swap path vs full restart).
+    active_config: Option<ProxyConfig>,
+    /// Whether the server's plugin configuration supports UDP relay.
+    udp_proxy_available: bool,
+    /// Whether the upstream network has IPv6 connectivity.
+    ipv6_bypass_available: bool,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R> {
@@ -84,6 +95,9 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             routing,
             running: None,
             last_error: None,
+            active_config: None,
+            udp_proxy_available: true,
+            ipv6_bypass_available: true,
         }
     }
 
@@ -116,6 +130,25 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// host OS.
     pub fn default_gateway(&self) -> Result<crate::gateway::GatewayInfo, ProxyError> {
         self.routing.default_gateway()
+    }
+
+    /// Get the list of invalid (dropped) filter rules from the current ruleset.
+    pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
+        self.running
+            .as_ref()
+            .and_then(|r| r.dispatcher.as_ref())
+            .map(|d| d.invalid_filters())
+            .unwrap_or_default()
+    }
+
+    /// Whether UDP proxy relay is available with the current config.
+    pub fn udp_proxy_available(&self) -> bool {
+        self.udp_proxy_available
+    }
+
+    /// Whether IPv6 bypass is available on the upstream network.
+    pub fn ipv6_bypass_available(&self) -> bool {
+        self.ipv6_bypass_available
     }
 
     /// Non-cancellable convenience wrapper around
@@ -176,7 +209,10 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         match result {
             Ok(state) => {
                 let server_ip = state.server_ip;
+                self.udp_proxy_available = state.udp_proxy_available;
+                self.ipv6_bypass_available = state.ipv6_bypass_available;
                 self.running = Some(state);
+                self.active_config = Some(config.clone());
                 self.last_error = None;
                 info!(server_ip = ?server_ip, "proxy started");
                 Ok(())
@@ -224,6 +260,8 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 proxy: running_proxy,
                 server_ip: None,
                 started_at: Instant::now(),
+                udp_proxy_available: crate::proxy::udp_proxy_available(config),
+                ipv6_bypass_available: false,
             });
         }
 
@@ -278,6 +316,8 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             proxy: running_proxy,
             server_ip: Some(server_ip),
             started_at: Instant::now(),
+            udp_proxy_available: crate::proxy::udp_proxy_available(config),
+            ipv6_bypass_available: gw_info.ipv6_available,
         })
     }
 
@@ -291,6 +331,8 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             routes,
             server_ip: _,
             started_at: _,
+            udp_proxy_available: _,
+            ipv6_bypass_available: _,
         } = state;
 
         // 1. Shut down dispatcher (closes TUN, cancels all handlers).
@@ -306,13 +348,40 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
 
         // Clear any error from a previous failed start. See issue #142.
         self.last_error = None;
+        self.active_config = None;
+        self.udp_proxy_available = true;
+        self.ipv6_bypass_available = true;
         info!("proxy stopped");
         res
     }
 
     pub async fn reload(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
-        self.stop().await?;
-        self.start(config).await
+        let Some(ref active) = self.active_config else {
+            // Not running: just start.
+            return self.start(config).await;
+        };
+
+        // Structural equality check (ignoring filters).
+        let structural_same = active.server == config.server
+            && active.local_port == config.local_port
+            && active.tunnel_mode == config.tunnel_mode;
+
+        if structural_same {
+            // Fast path: hot-swap filter rules without restart.
+            let new_ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
+            if let Some(ref state) = self.running {
+                if let Some(ref dispatcher) = state.dispatcher {
+                    dispatcher.swap_rules(new_ruleset);
+                }
+            }
+            self.active_config = Some(config.clone());
+            info!("filter rules hot-swapped");
+            Ok(())
+        } else {
+            // Slow path: full stop + start.
+            self.stop().await?;
+            self.start(config).await
+        }
     }
 
     /// Sync health check: detects a proxy task that exited on its own
@@ -331,6 +400,9 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 error!("proxy task exited unexpectedly");
                 self.last_error = Some("proxy task exited unexpectedly".into());
                 self.running = None; // Drop tears down routes + clears state file
+                self.active_config = None;
+                self.udp_proxy_available = true;
+                self.ipv6_bypass_available = true;
             }
         }
     }

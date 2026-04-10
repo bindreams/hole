@@ -127,10 +127,16 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
             running,
             uptime_secs,
             error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
         }) => Ok(serde_json::json!({
             "running": running,
             "uptime_secs": uptime_secs,
             "error": error,
+            "invalid_filters": invalid_filters,
+            "udp_proxy_available": udp_proxy_available,
+            "ipv6_bypass_available": ipv6_bypass_available,
         })),
         Ok(BridgeResponse::Error { message }) => {
             warn!(error = %message, "bridge returned error for status");
@@ -138,12 +144,18 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
                 "running": false,
                 "uptime_secs": 0,
                 "error": message,
+                "invalid_filters": [],
+                "udp_proxy_available": true,
+                "ipv6_bypass_available": true,
             }))
         }
         Ok(_) => Ok(serde_json::json!({
             "running": false,
             "uptime_secs": 0,
             "error": "unexpected response from bridge",
+            "invalid_filters": [],
+            "udp_proxy_available": true,
+            "ipv6_bypass_available": true,
         })),
         Err(e) => {
             // Bridge not running or unreachable — not an error for the frontend
@@ -151,6 +163,9 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
                 "running": false,
                 "uptime_secs": 0,
                 "error": format!("bridge unreachable: {e}"),
+                "invalid_filters": [],
+                "udp_proxy_available": true,
+                "ipv6_bypass_available": true,
             }))
         }
     }
@@ -166,12 +181,14 @@ fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_js
             speed_in_bps,
             speed_out_bps,
             uptime_secs,
+            filter,
         }) => serde_json::json!({
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
             "speed_in_bps": speed_in_bps,
             "speed_out_bps": speed_out_bps,
             "uptime_secs": uptime_secs,
+            "filter": filter,
         }),
         _ => serde_json::json!({
             "bytes_in": 0,
@@ -179,6 +196,7 @@ fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_js
             "speed_in_bps": 0,
             "speed_out_bps": 0,
             "uptime_secs": 0,
+            "filter": null,
         }),
     }
 }
@@ -372,6 +390,29 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: config.filters.clone(),
     })
+}
+
+/// Reload the proxy's filter rules from the current config. If the proxy
+/// is not running, this is a no-op (changes apply on next start).
+#[tauri::command]
+pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), String> {
+    let config = {
+        let app_config = state.config.lock().unwrap();
+        if !app_config.enabled {
+            return Ok(()); // Not running, changes apply on next start.
+        }
+        build_proxy_config(&app_config)
+    };
+
+    let Some(proxy_config) = config else {
+        return Ok(()); // No server selected.
+    };
+
+    state
+        .bridge_send(BridgeRequest::Reload { config: proxy_config })
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

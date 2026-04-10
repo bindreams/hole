@@ -341,6 +341,9 @@ fn status_when_not_running_returns_false() {
                 running: false,
                 uptime_secs: 0,
                 error: None,
+                invalid_filters: Vec::new(),
+                udp_proxy_available: true,
+                ipv6_bypass_available: true,
             }
         );
         drop(client);

@@ -1,6 +1,6 @@
 //! Generates Rust types and route constants from the OpenAPI spec at `api/openapi.yaml`.
 //!
-//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `PublicIpResponse`.
+//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `PublicIpResponse`, `InvalidFilter`, `FilterMetrics`.
 //! Generated constants: `ROUTE_STATUS`, `ROUTE_START`, `ROUTE_STOP`, `ROUTE_RELOAD`, `ROUTE_METRICS`, `ROUTE_DIAGNOSTICS`, `ROUTE_PUBLIC_IP`, `ROUTE_TEST_SERVER`.
 //!
 //! `ProxyConfig`, `ServerEntry`, `ValidationState`, `ServerTestOutcome`, `TestServerRequest`,
@@ -25,6 +25,8 @@ fn main() {
         "MetricsResponse",
         "DiagnosticsResponse",
         "PublicIpResponse",
+        "InvalidFilter",
+        "FilterMetrics",
     ];
 
     let ref_types: Vec<(String, Schema)> = types_to_generate

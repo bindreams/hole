@@ -9,6 +9,24 @@ mod api_generated {
 }
 pub use api_generated::*;
 
+#[allow(clippy::derivable_impls)] // FilterMetrics is code-generated without Default
+impl Default for FilterMetrics {
+    fn default() -> Self {
+        Self {
+            total_connections: 0,
+            proxied: 0,
+            bypassed: 0,
+            blocked: 0,
+            sniffer_hits: 0,
+            sniffer_misses: 0,
+            fake_dns_queries: 0,
+            fake_dns_reverse_hits: 0,
+            active_udp_flows: 0,
+            udp_drops_backpressure: 0,
+        }
+    }
+}
+
 // Types ===============================================================================================================
 
 /// Client-side request enum. Used by the GUI client API and elevation flow
@@ -51,6 +69,9 @@ pub enum BridgeResponse {
         running: bool,
         uptime_secs: u64,
         error: Option<String>,
+        invalid_filters: Vec<InvalidFilter>,
+        udp_proxy_available: bool,
+        ipv6_bypass_available: bool,
     },
     Error {
         message: String,
@@ -61,6 +82,7 @@ pub enum BridgeResponse {
         speed_in_bps: u64,
         speed_out_bps: u64,
         uptime_secs: u64,
+        filter: Option<FilterMetrics>,
     },
     Diagnostics {
         app: String,

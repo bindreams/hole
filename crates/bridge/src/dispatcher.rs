@@ -118,6 +118,11 @@ impl Dispatcher {
         })
     }
 
+    /// Get the list of invalid (dropped) filter rules from the current ruleset.
+    pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
+        self.rules.load().dropped.clone()
+    }
+
     /// Hot-swap the filter rules without restarting the dispatcher.
     pub fn swap_rules(&self, new_rules: RuleSet) {
         self.rules.store(Arc::new(new_rules));
