@@ -398,7 +398,7 @@ impl TunDriver {
             tokio::spawn(async move {
                 let result = tcp_handler::handle_tcp_connection(stream, dst_ip, dst_port, env).await;
                 if let Err(e) = result {
-                    trace!("TCP handler error for {dst_ip}:{dst_port}: {e}");
+                    debug!("TCP handler error for {dst_ip}:{dst_port}: {e}");
                 }
                 drop(permit);
             });

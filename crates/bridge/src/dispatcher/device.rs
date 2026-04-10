@@ -1,6 +1,6 @@
 //! smoltcp `Device` implementation backed by in-memory queues.
 
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use std::collections::VecDeque;
 
@@ -59,6 +59,16 @@ impl Device for VirtualTunDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
+        // Don't verify checksums on received packets. TUN adapters (wintun
+        // on Windows, utun on macOS) deliver packets without computing
+        // transport-layer checksums — the OS relies on NIC hardware
+        // offloading, which a virtual adapter lacks. Still compute checksums
+        // on transmitted packets so the OS accepts them.
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.icmpv6 = Checksum::Tx;
         caps
     }
 }
