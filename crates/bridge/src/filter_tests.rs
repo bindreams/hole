@@ -21,5 +21,5 @@ fn re_exports_decide_constructable_from_user_rules() {
         proto: L4Proto::Tcp,
     };
 
-    assert_eq!(decide(&rs, &conn), FilterAction::Block);
+    assert_eq!(decide(&rs, &conn).action, FilterAction::Block);
 }

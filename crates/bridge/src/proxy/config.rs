@@ -6,7 +6,7 @@
 // `crates/bridge/src/proxy/shadowsocks.rs`.
 
 use hole_common::config::is_valid_plugin_name;
-use hole_common::protocol::{ProxyConfig, TunnelMode};
+use hole_common::protocol::ProxyConfig;
 use shadowsocks::config::ServerAddr;
 use shadowsocks::ServerConfig;
 use shadowsocks_service::config::{
@@ -57,13 +57,11 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 
 /// Build a shadowsocks-service Config from our ProxyConfig.
 ///
-/// The number of local instances depends on `config.tunnel_mode`:
-/// - [`TunnelMode::Full`] (production default): TUN + SOCKS5. The TUN
-///   adapter provides transparent proxying for all traffic; the SOCKS5
-///   listener is there for advanced users.
-/// - [`TunnelMode::SocksOnly`]: SOCKS5 only. No TUN adapter is created
-///   by `shadowsocks-service::local::Server::new`, so the resulting
-///   server works without elevation.
+/// Always creates exactly one local instance: SOCKS5 on
+/// `127.0.0.1:{local_port}` with `Mode::TcpAndUdp`. The TUN device is
+/// now owned by the dispatcher (`crates/bridge/src/dispatcher/`), not
+/// by shadowsocks-service. `TunnelMode` is respected by the
+/// `ProxyManager` which skips the dispatcher in `SocksOnly` mode.
 pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
     let entry = &config.server;
 
@@ -100,21 +98,13 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
         .server
         .push(ServerInstanceConfig::with_server_config(server_config));
 
-    // Local 1: TUN (only in Full mode). SocksOnly deliberately skips
-    // this — `shadowsocks-service::local::Server::new` would otherwise
-    // try to open the TUN adapter, which requires elevation.
-    if matches!(config.tunnel_mode, TunnelMode::Full) {
-        let mut tun_local = LocalConfig::new(ProtocolType::Tun);
-        tun_local.tun_interface_address = Some(TUN_SUBNET.parse().expect("TUN_SUBNET is a valid CIDR literal"));
-        tun_local.tun_interface_name = Some(TUN_DEVICE_NAME.to_owned());
-        ss_config.local.push(LocalInstanceConfig::with_local_config(tun_local));
-    }
-
-    // Local 2: SOCKS5 (always present)
+    // SOCKS5 local — the only local instance. TcpAndUdp enables UDP
+    // associate for the dispatcher's proxy path (Plan 3).
     let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port)
         .parse()
         .expect("127.0.0.1:{u16} is always a valid SocketAddr");
-    let socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
+    let mut socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
+    socks_local.mode = shadowsocks::config::Mode::TcpAndUdp;
     ss_config
         .local
         .push(LocalInstanceConfig::with_local_config(socks_local));

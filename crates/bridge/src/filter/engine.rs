@@ -37,18 +37,34 @@ pub struct ConnInfo {
     pub proto: L4Proto,
 }
 
+/// Result of a filter engine decision: the action to take and the index
+/// of the rule that matched (if any). The rule index is the position in
+/// the original user-supplied rule list. `None` means the terminal
+/// fallback fired (no rule matched).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decision {
+    pub action: FilterAction,
+    pub rule_index: Option<usize>,
+}
+
 /// Run the filter engine for one connection. O(n) in the rule count;
 /// pure function.
-pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> FilterAction {
-    for rule in rules.rules.iter().rev() {
+pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
+    for (i, rule) in rules.rules.iter().enumerate().rev() {
         if rule.matcher.matches(conn) {
-            return rule.action;
+            return Decision {
+                action: rule.action,
+                rule_index: Some(i),
+            };
         }
     }
     // Terminal fallback: never reached when the UI's locked default
     // rules are present, but preserves "proxy everything" if a
     // hand-edited config strips them out.
-    FilterAction::Proxy
+    Decision {
+        action: FilterAction::Proxy,
+        rule_index: None,
+    }
 }
 
 #[cfg(test)]

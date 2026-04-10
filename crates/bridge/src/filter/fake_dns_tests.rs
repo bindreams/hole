@@ -5,6 +5,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, RecordType};
 use ipnet::{Ipv4Net, Ipv6Net};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
@@ -388,4 +389,93 @@ fn pin_canonicalizes_v4_mapped_v6() {
     ));
     dns.pin(mapped);
     assert_eq!(dns.reverse_lookup(IpAddr::V4(ip)).as_deref(), Some("mapped.test"));
+}
+
+// TCP framing (RFC 1035 §4.2.2) =======================================================================================
+
+/// Write a DNS message with TCP framing (2-byte big-endian length prefix).
+async fn tcp_write_query<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) {
+    w.write_u16(payload.len() as u16).await.unwrap();
+    w.write_all(payload).await.unwrap();
+    w.flush().await.unwrap();
+}
+
+/// Read a TCP-framed DNS response: 2-byte length prefix, then that many bytes.
+async fn tcp_read_response<R: AsyncReadExt + Unpin>(r: &mut R) -> Vec<u8> {
+    let len = r.read_u16().await.unwrap() as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await.unwrap();
+    buf
+}
+
+#[skuld::test]
+fn handle_tcp_resolves_a_record() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let dns = FakeDns::with_defaults();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let handle = tokio::spawn(async move { dns.handle_tcp(server).await });
+
+        // Send an A query for example.com.
+        let query = build_query("example.com.", RecordType::A);
+        tcp_write_query(&mut client, &query).await;
+
+        // Read and verify the response.
+        let resp_bytes = tcp_read_response(&mut client).await;
+        let resp = parse_response(&resp_bytes);
+        assert_eq!(resp.message_type(), MessageType::Response);
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.id(), 0x1234);
+
+        let pool: Ipv4Net = DEFAULT_POOL_V4.parse().unwrap();
+        let ip = answer_ipv4(&resp).expect("expected an A record");
+        assert!(pool.contains(&ip), "{ip} not in pool {pool}");
+
+        // Close the client side so handle_tcp sees EOF and returns Ok(()).
+        drop(client);
+        handle.await.unwrap().unwrap();
+    });
+}
+
+#[skuld::test]
+fn handle_tcp_multiple_queries() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let dns = FakeDns::with_defaults();
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let handle = tokio::spawn(async move { dns.handle_tcp(server).await });
+
+        // First query: A record for alpha.test.
+        let q1 = build_query("alpha.test.", RecordType::A);
+        tcp_write_query(&mut client, &q1).await;
+        let r1_bytes = tcp_read_response(&mut client).await;
+        let r1 = parse_response(&r1_bytes);
+        assert_eq!(r1.response_code(), ResponseCode::NoError);
+        let ip1 = answer_ipv4(&r1).expect("expected an A record for alpha.test");
+
+        // Second query: A record for beta.test.
+        let q2 = build_query("beta.test.", RecordType::A);
+        tcp_write_query(&mut client, &q2).await;
+        let r2_bytes = tcp_read_response(&mut client).await;
+        let r2 = parse_response(&r2_bytes);
+        assert_eq!(r2.response_code(), ResponseCode::NoError);
+        let ip2 = answer_ipv4(&r2).expect("expected an A record for beta.test");
+
+        // The two domains should get different fake IPs.
+        assert_ne!(ip1, ip2, "different domains should get different fake IPs");
+
+        // Close the client side so handle_tcp returns.
+        drop(client);
+        handle.await.unwrap().unwrap();
+    });
 }

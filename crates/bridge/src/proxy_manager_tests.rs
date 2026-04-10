@@ -217,6 +217,8 @@ impl Routing for MockRouting {
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
             interface_name: "MockEthernet".into(),
+            interface_index: 1,
+            ipv6_available: false,
         })
     }
 }
