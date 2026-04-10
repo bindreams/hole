@@ -48,6 +48,7 @@ tls-parser = "0.12"
 # uses transitively so cargo deduplicates them.
 tun = { version = "0.8", features = ["async"] }
 smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
 ] }

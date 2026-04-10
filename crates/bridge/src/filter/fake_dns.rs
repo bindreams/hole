@@ -205,6 +205,18 @@ impl FakeDns {
         }
     }
 
+    /// Check whether an IP address falls within one of the fake DNS pools
+    /// (without requiring it to be currently allocated). Used by the
+    /// dispatcher's bypass path to decide whether upstream DNS resolution
+    /// is needed.
+    pub fn is_fake_ip(&self, ip: IpAddr) -> bool {
+        let ip = canonicalize_ip(ip);
+        match ip {
+            IpAddr::V4(v4) => self.pool_v4.contains(&v4),
+            IpAddr::V6(v6) => self.pool_v6.contains(&v6),
+        }
+    }
+
     /// Decrement the refcount for an entry; if it reaches zero, move
     /// it back into the LRU set so it becomes evictable. Unpinning a
     /// non-pinned IP is a no-op.
