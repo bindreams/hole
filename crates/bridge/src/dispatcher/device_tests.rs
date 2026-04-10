@@ -1,5 +1,5 @@
 use super::VirtualTunDevice;
-use smoltcp::phy::{Device, RxToken, TxToken};
+use smoltcp::phy::{Checksum, Device, RxToken, TxToken};
 use smoltcp::time::Instant;
 
 #[skuld::test]
@@ -51,4 +51,15 @@ fn dequeue_tx_drains_all() {
     let sent = dev.dequeue_tx();
     assert_eq!(sent.len(), 2);
     assert!(!dev.has_tx());
+}
+
+#[skuld::test]
+fn capabilities_skip_rx_checksum_verification() {
+    let dev = VirtualTunDevice::new(1400);
+    let caps = dev.capabilities();
+    assert!(matches!(caps.checksum.ipv4, Checksum::Tx));
+    assert!(matches!(caps.checksum.tcp, Checksum::Tx));
+    assert!(matches!(caps.checksum.udp, Checksum::Tx));
+    assert!(matches!(caps.checksum.icmpv4, Checksum::Tx));
+    assert!(matches!(caps.checksum.icmpv6, Checksum::Tx));
 }
