@@ -57,7 +57,24 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
 
 /// Assert that a SOCKS5 GET to `target` through `proxy_port` returns the
 /// `HttpTarget` sentinel body.
-async fn assert_socks5_roundtrip(proxy_port: u16, target_addr: SocketAddr) {
+///
+/// Sends a `Status` health check before polling the port so that a dead
+/// proxy task produces a clear assertion ("proxy reports not running")
+/// instead of a blind 10-second timeout on `wait_for_port`.
+async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, target_addr: SocketAddr) {
+    // Health check: if the proxy task exited between Start and now,
+    // the bridge's check_health() will notice and report running=false.
+    let status = harness.send(BridgeRequest::Status).await.expect("send Status");
+    match &status {
+        BridgeResponse::Status { running, error, .. } => {
+            assert!(
+                *running,
+                "proxy reports not running before SOCKS5 roundtrip (error: {error:?})"
+            );
+        }
+        other => panic!("expected Status response, got {other:?}"),
+    }
+
     let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
     // The bridge has already returned Ack from Start, but the SOCKS5
     // listener may not have reached `accept()` yet. Poll until it does.
@@ -91,7 +108,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
     let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-    assert_socks5_roundtrip(local_port, http.addr).await;
+    assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
 
     let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -310,7 +327,7 @@ fn lifecycle_reload_changes_local_port(
             })
             .await
             .unwrap();
-        assert_socks5_roundtrip(port1, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port1, http.addr).await;
 
         let port2 = allocate_ephemeral_port().await;
         assert_ne!(port1, port2, "ephemeral allocator should give a fresh port");
@@ -320,7 +337,7 @@ fn lifecycle_reload_changes_local_port(
         };
         let resp = harness.send(BridgeRequest::Reload { config: config2 }).await.unwrap();
         assert!(matches!(resp, BridgeResponse::Ack), "reload should Ack, got {resp:?}");
-        assert_socks5_roundtrip(port2, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port2, http.addr).await;
 
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
@@ -391,7 +408,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         harness.send(BridgeRequest::Start { config }).await.unwrap();
-        assert_socks5_roundtrip(local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
@@ -428,7 +445,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         harness.send(BridgeRequest::Start { config }).await.unwrap();
-        assert_socks5_roundtrip(local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
