@@ -44,28 +44,23 @@ pub enum ProxyState {
 
 // Running state =======================================================================================================
 
-/// Per-cycle state owned only while a proxy is running. Dropping this
-/// struct tears down routes and then aborts the proxy task.
+/// Per-cycle state owned only while a proxy is running.
 ///
-/// **Field declaration order is load-bearing.** Rust drops fields in
-/// declaration order. `routes` is declared BEFORE `proxy` so that on
-/// Drop (panic path, cancel path, or scope exit without explicit
-/// `stop()`), route teardown runs while the TUN adapter — owned by the
-/// proxy task — is still alive. If the proxy drops first, the TUN
-/// adapter disappears and Windows starts asynchronously flushing routes
-/// bound to it; the subsequent `netsh delete route ... hole-tun`
-/// commands then race against the OS flush and often fail silently,
-/// leaving localhost traffic broken for seconds. See bindreams/hole#160
-/// CI investigation.
+/// **Field declaration order is load-bearing.** Dispatcher drops first
+/// (closes TUN, cancels handlers), then routes (teardown commands
+/// target a live TUN since the dispatcher already closed it), then
+/// proxy (releases SS). `None` fields for SocksOnly mode where
+/// routing/dispatcher are skipped.
 struct RunningState<P: Proxy, R: Routing> {
-    /// Installed routes. Dropped FIRST so teardown commands target a
-    /// live TUN interface. `None` in `SocksOnly` mode where routing is
-    /// skipped entirely. Held only for the Drop side effect —
-    /// `#[allow(dead_code)]` because the field is "unused" syntactically
-    /// but load-bearing semantically.
+    /// TCP dispatcher — owns TUN device, smoltcp, fake DNS, handler
+    /// tasks. Drops FIRST. `None` in SocksOnly mode and under
+    /// `#[cfg(test)]`.
+    #[allow(dead_code)]
+    dispatcher: Option<crate::dispatcher::Dispatcher>,
+    /// Installed routes. Dropped SECOND. `None` in SocksOnly mode.
     #[allow(dead_code)]
     routes: Option<R::Installed>,
-    /// Handle on the running proxy. Dropped AFTER routes. Drop aborts
+    /// Handle on the running proxy. Dropped LAST. Drop aborts
     /// the task (best-effort); supported graceful shutdown is via
     /// `stop().await` from [`ProxyManager::stop`].
     proxy: P::Running,
@@ -213,7 +208,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// defeating crash recovery on next startup. See
     /// [`crate::routing::SystemRouting::install`] for the invariant.
     async fn start_inner(proxy: &P, routing: &R, config: &ProxyConfig) -> Result<RunningState<P, R>, ProxyError> {
-        // Build shadowsocks config (sync, no partial state).
+        // Build shadowsocks config (SOCKS5 only, no TUN).
         let ss_config = build_ss_config(config)?;
 
         // SocksOnly mode: skip everything routing-related (wintun preload,
@@ -224,6 +219,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
             let running_proxy = proxy.start(ss_config).await?;
             return Ok(RunningState {
+                dispatcher: None,
                 routes: None,
                 proxy: running_proxy,
                 server_ip: None,
@@ -242,19 +238,41 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Query the OS default gateway via the routing provider.
         let gw_info = routing.default_gateway()?;
 
-        // Start the proxy tunnel. From here on, if the future is
-        // dropped or an error is returned, `P::Running::drop` aborts
-        // the spawned task (best-effort, no await).
+        // Discover upstream DNS servers BEFORE routes are installed, so
+        // queries use the real upstream path (not the TUN).
+        let dns_servers = crate::dispatcher::upstream_dns::discover_dns_servers()
+            .map_err(|e| ProxyError::Gateway(format!("DNS discovery failed: {e}")))?;
+
+        // Compile filter rules.
+        let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
+
+        // Start the SS SOCKS5 proxy.
         let running_proxy = proxy.start(ss_config).await?;
 
-        // Install the routes. On failure, `running_proxy` drops
-        // (aborting the proxy task) as the `?` propagates.
-        // `SystemRouting::install` writes the state file atomically
-        // BEFORE mutating routes and clears it on its own internal
-        // rollback path, so no `StateFileGuard` is needed here.
+        // Start the dispatcher (owns TUN device + smoltcp). Skipped
+        // under #[cfg(test)] because creating a TUN requires elevation.
+        #[cfg(not(test))]
+        let dispatcher = {
+            let d = crate::dispatcher::Dispatcher::new(
+                config.local_port,
+                gw_info.interface_index,
+                gw_info.ipv6_available,
+                ruleset,
+                &dns_servers,
+            )?;
+            Some(d)
+        };
+        #[cfg(test)]
+        let dispatcher: Option<crate::dispatcher::Dispatcher> = {
+            let _ = (ruleset, dns_servers); // suppress unused warnings
+            None
+        };
+
+        // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
         Ok(RunningState {
+            dispatcher,
             routes: Some(routes),
             proxy: running_proxy,
             server_ip: Some(server_ip),
@@ -266,43 +284,26 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         let Some(state) = self.running.take() else {
             return Ok(());
         };
-        // Destructure so the proxy handle can be moved out for
-        // `stop(self).await` while the routes guard drops at the end
-        // of the scope.
         let RunningState {
+            dispatcher,
             proxy,
             routes,
             server_ip: _,
             started_at: _,
         } = state;
 
-        // ORDERING: tear down routes FIRST while the TUN adapter is
-        // still alive, THEN stop the proxy (which releases the adapter).
-        //
-        // The proxy task owns the TUN adapter via shadowsocks-service's
-        // Server → TunLocal → wintun handle. If we stop the proxy first,
-        // wintun releases the adapter, and Windows starts asynchronously
-        // flushing routes bound to `hole-tun`. The subsequent
-        // `netsh delete route ... hole-tun` commands in the routes
-        // teardown then race against the OS flush and often fail silently,
-        // leaving localhost traffic broken for several seconds.
-        //
-        // By tearing down routes first (while `hole-tun` still exists),
-        // the `netsh` commands target a live interface and succeed
-        // deterministically. The subsequent proxy stop releases the
-        // adapter cleanly — there are no routes left to flush.
-        //
-        // This matches the field declaration order in `RunningState`
-        // (routes before proxy) so the Drop path (panic/cancel) gets
-        // the same correct ordering.
-        drop(routes); // tears down routes + clears state file via RAII
+        // 1. Shut down dispatcher (closes TUN, cancels all handlers).
+        if let Some(mut d) = dispatcher {
+            d.shutdown().await;
+        }
+
+        // 2. Graceful proxy shutdown (stops SS SOCKS5).
         let res = proxy.stop().await;
 
-        // Clear any error from a previous failed start. A clean stop
-        // is the user's signal that the bridge is in a good state
-        // again — keeping the stale error would make
-        // `handle_diagnostics` report `bridge = "error"` indefinitely.
-        // See issue #142.
+        // 3. Routes tear down via RAII Drop.
+        drop(routes);
+
+        // Clear any error from a previous failed start. See issue #142.
         self.last_error = None;
         info!("proxy stopped");
         res
