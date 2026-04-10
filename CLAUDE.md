@@ -31,6 +31,9 @@ hole bridge log path [--log-dir DIR] → print log file path
 hole bridge log watch [--tail N] [--log-dir DIR] → stream log output
 hole bridge grant-access [--then-send B64 | --then-send-file PATH] → create hole group, add user, write SID file (needs elevation)
 hole bridge ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
+hole proxy start --config-file PATH [--local-port PORT]            → start the proxy from a ServerEntry JSON file
+hole proxy stop                                                    → stop the proxy
+hole proxy test-server --config-file PATH                          → run a one-shot connectivity test against a server config
 hole upgrade                      → check for updates and install latest version (unattended)
 hole path add                     → add hole to system PATH
 hole path remove                  → remove hole from system PATH

@@ -12,7 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
-shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http"] }
+shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
@@ -65,3 +65,12 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { git = "https://github.com/bindreams/skuld", rev = "ce215370354a2624b5f1662c96190424df8329aa" }
 shadowsocks-service = { version = "1", features = ["server"] }
+rcgen = "0.13"
+rand = "0.9"
+base64 = "0.22"
+# Library dep on the workspace task runner so the dist-directory e2e test
+# fixture can call `xtask::run_stage` directly instead of shelling out to
+# `cargo xtask stage`. The path-dep form is deliberate: if `xtask` ever
+# moves, compilation breaks immediately with a clear error rather than
+# silently drifting.
+xtask = { path = "../../xtask" }

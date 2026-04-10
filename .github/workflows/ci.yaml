@@ -95,6 +95,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # cargo clippy uses `cargo check`, which leaves binary outputs under
+      # `target/debug/deps/hole-<hash>.exe` but does NOT create the
+      # top-level `target/debug/hole[.exe]` copy. The bridge crate's e2e
+      # test fixture (`dist_dir`) calls `xtask::run_stage` to hardlink
+      # `target/debug/hole[.exe]` into `target/debug/dist/bin/`, so we
+      # need a real `cargo build` to produce it.
+      - name: Build workspace (for dist-dir test fixture)
+        run: cargo build --workspace
+
       - name: Test
         id: test
         shell: bash

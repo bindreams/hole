@@ -22,6 +22,7 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
+        tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
     }
 }
@@ -105,6 +106,50 @@ fn socks5_uses_custom_port() {
     let ss = build_ss_config(&cfg).unwrap();
     let addr = ss.local[1].config.addr.as_ref().unwrap();
     assert_eq!(addr.port(), 9999);
+}
+
+// TunnelMode::SocksOnly ===============================================================================================
+
+#[skuld::test]
+fn socks_only_mode_creates_exactly_one_local() {
+    let mut cfg = sample_config();
+    cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+    let ss = build_ss_config(&cfg).unwrap();
+    assert_eq!(ss.local.len(), 1, "SocksOnly must skip the TUN local entirely");
+}
+
+#[skuld::test]
+fn socks_only_mode_only_local_is_socks5() {
+    let mut cfg = sample_config();
+    cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+    let ss = build_ss_config(&cfg).unwrap();
+    assert_eq!(ss.local[0].config.protocol.as_str(), "socks");
+}
+
+#[skuld::test]
+fn socks_only_mode_binds_socks5_to_configured_port() {
+    let mut cfg = sample_config();
+    cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+    cfg.local_port = 12345;
+    let ss = build_ss_config(&cfg).unwrap();
+    let addr = ss.local[0].config.addr.as_ref().unwrap();
+    assert_eq!(addr.host(), "127.0.0.1");
+    assert_eq!(addr.port(), 12345);
+}
+
+#[skuld::test]
+fn socks_only_mode_has_no_tun_local() {
+    let mut cfg = sample_config();
+    cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+    let ss = build_ss_config(&cfg).unwrap();
+    for local in &ss.local {
+        assert_ne!(
+            local.config.protocol.as_str(),
+            "tun",
+            "SocksOnly config must not contain any TUN local: {:?}",
+            ss.local
+        );
+    }
 }
 
 // Plugin tests ========================================================================================================

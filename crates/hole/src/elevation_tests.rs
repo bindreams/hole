@@ -1,5 +1,5 @@
 use hole_common::config::ServerEntry;
-use hole_common::protocol::{BridgeRequest, ProxyConfig};
+use hole_common::protocol::{BridgeRequest, ProxyConfig, TunnelMode};
 
 #[skuld::test]
 fn encode_request_roundtrips() {
@@ -19,6 +19,7 @@ fn encode_request_roundtrips() {
                 validation: None,
             },
             local_port: 4073,
+            tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
         },
     };
@@ -65,6 +66,7 @@ fn write_request_file_roundtrip() {
                 validation: None,
             },
             local_port: 4073,
+            tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
         },
     };
@@ -99,6 +101,7 @@ fn read_request_file_roundtrip() {
                 validation: None,
             },
             local_port: 4073,
+            tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
         },
     };

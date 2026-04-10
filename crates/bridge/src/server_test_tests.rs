@@ -4,149 +4,23 @@
 //! with the `server` feature, dev-dep) bound to `127.0.0.1:0`, plus a tiny tokio
 //! TCP "fake sentinel" listener. The test runner is then pointed at the fixture
 //! and asserted against.
+//!
+//! The server/sentinel/port helpers live in the crate-wide `test_support`
+//! module so `proxy_manager_e2e_tests.rs` can reuse them.
 
 use super::{run_server_test, TestConfig};
+use crate::test_support::http_target::start_fake_sentinel;
+use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
+use crate::test_support::rt;
+use crate::test_support::ssserver::{
+    locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
+    TEST_PASSWORD,
+};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ServerTestOutcome;
-use shadowsocks::config::{Mode, ServerConfig};
-use shadowsocks::crypto::CipherKind;
-use shadowsocks::plugin::PluginConfig;
-use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
-
-/// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
-}
-
-const TEST_METHOD_STR: &str = "aes-256-gcm";
-const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;
-const TEST_PASSWORD: &str = "test-password-1234";
-
-// Fixtures ============================================================================================================
-
-/// Bind a TCP listener on `127.0.0.1:0` that, on the first accept, drains the
-/// request (so the client's `write_all` completes cleanly without an RST race),
-/// then sends `response` and closes. Returns the bound address and the
-/// spawned task handle.
-async fn start_fake_sentinel(response: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        if let Ok((mut sock, _)) = listener.accept().await {
-            let mut sink = [0u8; 256];
-            let _ = sock.read(&mut sink).await;
-            let _ = sock.write_all(&response).await;
-            let _ = sock.shutdown().await;
-        }
-    });
-    (addr, handle)
-}
-
-/// Spin up a real shadowsocks server bound to `127.0.0.1:0` with the given
-/// cipher/password. Returns the bound TCP address and a handle to the
-/// running server task. The server relays anything the client asks for.
-async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
-    let mut svr_cfg = ServerConfig::new(("127.0.0.1", 0u16), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly); // skip UDP — the runner is TCP-only
-
-    let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
-
-    // Read the bound address BEFORE moving `server` into the spawn closure.
-    // The `&TcpServer` borrow ends at the semicolon.
-    let addr = server
-        .tcp_server()
-        .expect("TCP mode is enabled, tcp_server should exist")
-        .local_addr()
-        .unwrap();
-
-    let handle = tokio::spawn(async move {
-        // Server::run consumes self and only ever returns Err on teardown
-        // ("server exited unexpectedly"). The test ignores the error.
-        let _ = server.run().await;
-    });
-
-    (addr, handle)
-}
-
-/// Spin up a real shadowsocks server with v2ray-plugin in front. The plugin
-/// listens on `public_port` (which the caller pre-allocates and passes here),
-/// and forwards to the SS server. Returns the public-facing socket address
-/// and the spawned server task handle.
-async fn start_real_ss_server_with_plugin(
-    method: CipherKind,
-    password: &str,
-    public_port: u16,
-    plugin_path: &str,
-) -> (SocketAddr, JoinHandle<()>) {
-    let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly);
-
-    // SS_PLUGIN_OPTIONS="server" puts v2ray-plugin in server mode (defaults
-    // are websocket transport, no TLS, host=cloudfront.com, path=/).
-    svr_cfg.set_plugin(PluginConfig {
-        plugin: plugin_path.to_string(),
-        plugin_opts: Some("server".to_string()),
-        plugin_args: vec![],
-        plugin_mode: Mode::TcpOnly,
-    });
-
-    let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
-
-    let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    (public_addr, handle)
-}
-
-/// Locate the cargo-built `v2ray-plugin` binary in the target directory.
-/// Respects `CARGO_TARGET_DIR`. Used by test 10.
-fn locate_built_v2ray_plugin() -> PathBuf {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    let bin = if cfg!(windows) {
-        "v2ray-plugin.exe"
-    } else {
-        "v2ray-plugin"
-    };
-    target_dir.join(profile).join(bin)
-}
-
-/// Pre-allocate a TCP port number and immediately drop the listener. The
-/// port is used to construct the public-facing address for the v2ray-plugin
-/// server before the plugin spawns. There is a tiny TOCTOU window between
-/// drop and the plugin's bind; in practice the kernel does not reissue
-/// freshly-released ports immediately.
-async fn allocate_ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Poll-connect to `addr` until either a TCP connection succeeds or
-/// `timeout` elapses. Used by tests that spawn a child process which binds
-/// asynchronously after the parent function returns. Panics on timeout.
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("port {addr} did not become connectable within {timeout:?}");
-}
 
 /// Build a [`ServerEntry`] for the runner under test.
 fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
@@ -519,7 +393,7 @@ fn run_test_with_v2ray_plugin_happy_path() {
     rt().block_on(async {
         let public_port = allocate_ephemeral_port().await;
         let (svr_addr, _svr) =
-            start_real_ss_server_with_plugin(TEST_METHOD, TEST_PASSWORD, public_port, plugin_path.to_str().unwrap())
+            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, public_port, plugin_path.to_str().unwrap())
                 .await;
         // The SS server's plugin is spawned async; wait for it to bind the
         // public port before letting the runner attempt preflight.

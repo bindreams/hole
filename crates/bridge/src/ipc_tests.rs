@@ -163,9 +163,7 @@ impl Drop for MockRoutes {
 
 // Helpers =============================================================================================================
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
-}
+use crate::test_support::rt;
 
 /// Build a mock proxy manager backed by a throw-away state dir. Uses
 /// `tempfile::tempdir().keep()` so the directory is created but its
@@ -209,6 +207,7 @@ fn sample_config() -> ProxyConfig {
             validation: None,
         },
         local_port: 4073,
+        tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
     }
 }

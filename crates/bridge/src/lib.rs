@@ -14,6 +14,13 @@ pub mod socket;
 #[cfg(target_os = "windows")]
 pub mod wintun;
 
+// Cross-cutting test helpers. Deviates from the sibling `foo_tests.rs`
+// convention used everywhere else in this crate because there is no
+// business-logic counterpart: `test_support` is pure test infrastructure
+// consumed by multiple `*_tests.rs` files.
+#[cfg(test)]
+mod test_support;
+
 #[cfg(test)]
 fn main() {
     skuld::run_all();

@@ -29,11 +29,67 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: BridgeAction,
     },
+    /// Drive an installed bridge: start/stop the proxy and test servers
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
     /// Manage PATH integration
     Path {
         #[command(subcommand)]
         action: PathAction,
     },
+}
+
+/// Proxy lifecycle subcommands. Thin wrappers over `BridgeRequest::Start` /
+/// `Stop` / `TestServer` that read a `ServerEntry` from a JSON file. Designed
+/// for the bug-repro workflow: hand-crafting a JSON config and driving the
+/// running bridge from a shell without round-tripping through the GUI.
+#[derive(Subcommand)]
+pub(crate) enum ProxyAction {
+    /// Start the proxy with a server config from a JSON file
+    Start {
+        /// Path to a JSON file containing a `ServerEntry` (server, server_port,
+        /// method, password, optional plugin/plugin_opts).
+        #[arg(long)]
+        config_file: std::path::PathBuf,
+        /// Local SOCKS5 port the bridge should bind. Defaults to the
+        /// production default of 4073.
+        #[arg(long, default_value_t = 4073)]
+        local_port: u16,
+        /// Tunnel mode. `full` installs the TUN adapter + split routes
+        /// (the production default, requires elevation). `socks-only`
+        /// binds only the SOCKS5 listener and skips all routing work
+        /// (no elevation required; client-side SOCKS5 config needed).
+        #[arg(long, value_enum, default_value_t = CliTunnelMode::Full)]
+        tunnel_mode: CliTunnelMode,
+    },
+    /// Stop the proxy
+    Stop,
+    /// Run a one-shot connectivity test against a server config
+    TestServer {
+        /// Path to a JSON file containing a `ServerEntry`
+        #[arg(long)]
+        config_file: std::path::PathBuf,
+    },
+}
+
+/// CLI-facing mirror of [`hole_common::protocol::TunnelMode`]. Separate
+/// type because `clap::ValueEnum` wants kebab-case by default and the
+/// wire protocol uses snake_case — converting here keeps both happy.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum CliTunnelMode {
+    Full,
+    SocksOnly,
+}
+
+impl From<CliTunnelMode> for hole_common::protocol::TunnelMode {
+    fn from(mode: CliTunnelMode) -> Self {
+        match mode {
+            CliTunnelMode::Full => hole_common::protocol::TunnelMode::Full,
+            CliTunnelMode::SocksOnly => hole_common::protocol::TunnelMode::SocksOnly,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -136,6 +192,11 @@ pub(crate) fn parse_args() -> Cli {
 ///   the wrong subscriber.
 /// - `Bridge::Log` — read-only inspection. No need to write a log entry to
 ///   read one.
+///
+/// Non-exempt (install the guard): `Upgrade`, `Bridge::{Install,
+/// Uninstall, Status, GrantAccess, IpcSend}`, `Proxy::{Start, Stop,
+/// TestServer}`, `Path::{Add, Remove}`. These all use `cli_log!` on
+/// failure paths and benefit from a persistent audit trail.
 pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
     !matches!(
         command,
@@ -170,6 +231,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
         }
         Command::Upgrade => handle_upgrade(),
         Command::Bridge { action } => handle_bridge(action),
+        Command::Proxy { action } => handle_proxy(action),
         Command::Path { action } => handle_path(action),
     };
 
@@ -558,38 +620,153 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     send_bridge_request(request)
 }
 
+/// Send a `BridgeRequest`, mapping the response to an exit code (0 on
+/// success, 1 on error). Used by `bridge ipc-send` which doesn't print the
+/// response body.
 fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
     use hole_common::protocol::BridgeResponse;
 
+    match send_bridge_request_inner(request) {
+        Ok(BridgeResponse::Ack) => 0,
+        Ok(BridgeResponse::Status { .. }) => 0,
+        Ok(BridgeResponse::Metrics { .. }) => 0,
+        Ok(BridgeResponse::Diagnostics { .. }) => 0,
+        Ok(BridgeResponse::PublicIp { .. }) => 0,
+        Ok(BridgeResponse::TestServerResult { .. }) => 0,
+        Ok(BridgeResponse::Error { message }) => {
+            cli_log!(error, "bridge error: {message}");
+            1
+        }
+        Err(msg) => {
+            cli_log!(error, "{msg}");
+            1
+        }
+    }
+}
+
+/// Underlying request driver. Returns the parsed `BridgeResponse` or a
+/// human-readable error message.
+fn send_bridge_request_inner(
+    request: hole_common::protocol::BridgeRequest,
+) -> Result<hole_common::protocol::BridgeResponse, String> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
+        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path)
+            .await
+            .map_err(|e| format!("failed to connect to bridge: {e}"))?;
+        client
+            .send(request)
+            .await
+            .map_err(|e| format!("communication error: {e}"))
+    })
+}
 
-        let mut client = match crate::bridge_client::BridgeClient::connect(&socket_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                cli_log!(error, "failed to connect to bridge: {e}");
-                return 1;
-            }
-        };
+// Proxy subcommand ====================================================================================================
 
-        match client.send(request).await {
-            Ok(BridgeResponse::Ack) => 0,
-            Ok(BridgeResponse::Status { .. }) => 0,
-            Ok(BridgeResponse::Metrics { .. }) => 0,
-            Ok(BridgeResponse::Diagnostics { .. }) => 0,
-            Ok(BridgeResponse::PublicIp { .. }) => 0,
-            Ok(BridgeResponse::TestServerResult { .. }) => 0,
-            Ok(BridgeResponse::Error { message }) => {
-                cli_log!(error, "bridge error: {message}");
-                1
-            }
-            Err(e) => {
-                cli_log!(error, "communication error: {e}");
-                1
+/// Read a `ServerEntry` from a JSON file. Returns Err with a user-facing
+/// message on file IO or parse failure.
+fn read_server_entry_file(path: &std::path::Path) -> Result<hole_common::config::ServerEntry, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    serde_json::from_slice::<hole_common::config::ServerEntry>(&bytes)
+        .map_err(|e| format!("failed to parse {} as ServerEntry JSON: {e}", path.display()))
+}
+
+fn handle_proxy(action: ProxyAction) -> i32 {
+    use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig};
+
+    match action {
+        ProxyAction::Start {
+            config_file,
+            local_port,
+            tunnel_mode,
+        } => {
+            let entry = match read_server_entry_file(&config_file) {
+                Ok(e) => e,
+                Err(msg) => {
+                    cli_log!(error, "{msg}");
+                    return 1;
+                }
+            };
+            let request = BridgeRequest::Start {
+                config: ProxyConfig {
+                    server: entry,
+                    local_port,
+                    tunnel_mode: tunnel_mode.into(),
+                    filters: Vec::new(),
+                },
+            };
+            match send_bridge_request_inner(request) {
+                Ok(BridgeResponse::Ack) => {
+                    println!("proxy started on local_port {local_port}");
+                    0
+                }
+                Ok(BridgeResponse::Error { message }) => {
+                    cli_log!(error, "bridge rejected start: {message}");
+                    1
+                }
+                Ok(other) => {
+                    cli_log!(error, "unexpected response: {other:?}");
+                    1
+                }
+                Err(msg) => {
+                    cli_log!(error, "{msg}");
+                    1
+                }
             }
         }
-    })
+        ProxyAction::Stop => match send_bridge_request_inner(BridgeRequest::Stop) {
+            Ok(BridgeResponse::Ack) => {
+                println!("proxy stopped");
+                0
+            }
+            Ok(BridgeResponse::Error { message }) => {
+                cli_log!(error, "bridge rejected stop: {message}");
+                1
+            }
+            Ok(other) => {
+                cli_log!(error, "unexpected response: {other:?}");
+                1
+            }
+            Err(msg) => {
+                cli_log!(error, "{msg}");
+                1
+            }
+        },
+        ProxyAction::TestServer { config_file } => {
+            let entry = match read_server_entry_file(&config_file) {
+                Ok(e) => e,
+                Err(msg) => {
+                    cli_log!(error, "{msg}");
+                    return 1;
+                }
+            };
+            match send_bridge_request_inner(BridgeRequest::TestServer { entry }) {
+                Ok(BridgeResponse::TestServerResult { outcome }) => {
+                    println!("{outcome:#?}");
+                    // Reachable is the only "success" outcome; everything else
+                    // is some flavor of failure that the operator wants to see.
+                    if matches!(outcome, hole_common::protocol::ServerTestOutcome::Reachable { .. }) {
+                        0
+                    } else {
+                        2
+                    }
+                }
+                Ok(BridgeResponse::Error { message }) => {
+                    cli_log!(error, "bridge rejected test-server: {message}");
+                    1
+                }
+                Ok(other) => {
+                    cli_log!(error, "unexpected response: {other:?}");
+                    1
+                }
+                Err(msg) => {
+                    cli_log!(error, "{msg}");
+                    1
+                }
+            }
+        }
+    }
 }
 
 fn handle_path(action: PathAction) -> i32 {

@@ -28,7 +28,7 @@
 
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
 use crate::routing::{Routing, SystemRouting};
-use hole_common::protocol::ProxyConfig;
+use hole_common::protocol::{ProxyConfig, TunnelMode};
 use std::net::IpAddr;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -45,22 +45,31 @@ pub enum ProxyState {
 // Running state =======================================================================================================
 
 /// Per-cycle state owned only while a proxy is running. Dropping this
-/// struct aborts the proxy task (via `P::Running::drop`) and tears down
-/// routes (via `R::Installed::drop`). Field declaration order matters:
-/// `proxy` drops before `_routes` so the ss task is aborted before the
-/// routes it was using are removed.
+/// struct tears down routes and then aborts the proxy task.
+///
+/// **Field declaration order is load-bearing.** Rust drops fields in
+/// declaration order. `routes` is declared BEFORE `proxy` so that on
+/// Drop (panic path, cancel path, or scope exit without explicit
+/// `stop()`), route teardown runs while the TUN adapter — owned by the
+/// proxy task — is still alive. If the proxy drops first, the TUN
+/// adapter disappears and Windows starts asynchronously flushing routes
+/// bound to it; the subsequent `netsh delete route ... hole-tun`
+/// commands then race against the OS flush and often fail silently,
+/// leaving localhost traffic broken for seconds. See bindreams/hole#160
+/// CI investigation.
 struct RunningState<P: Proxy, R: Routing> {
-    /// Handle on the running proxy. Drop aborts the task (best-effort);
-    /// supported graceful shutdown is via `stop().await` from
-    /// [`ProxyManager::stop`].
-    proxy: P::Running,
-    /// Installed routes. Held only for the Drop side effect — dropping
-    /// this field tears down the routes and clears the state file.
+    /// Installed routes. Dropped FIRST so teardown commands target a
+    /// live TUN interface. `None` in `SocksOnly` mode where routing is
+    /// skipped entirely. Held only for the Drop side effect —
     /// `#[allow(dead_code)]` because the field is "unused" syntactically
     /// but load-bearing semantically.
     #[allow(dead_code)]
-    routes: R::Installed,
-    server_ip: IpAddr,
+    routes: Option<R::Installed>,
+    /// Handle on the running proxy. Dropped AFTER routes. Drop aborts
+    /// the task (best-effort); supported graceful shutdown is via
+    /// `stop().await` from [`ProxyManager::stop`].
+    proxy: P::Running,
+    server_ip: Option<IpAddr>,
     started_at: Instant,
 }
 
@@ -174,7 +183,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 let server_ip = state.server_ip;
                 self.running = Some(state);
                 self.last_error = None;
-                info!(server_ip = %server_ip, "proxy started");
+                info!(server_ip = ?server_ip, "proxy started");
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
@@ -207,8 +216,23 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Build shadowsocks config (sync, no partial state).
         let ss_config = build_ss_config(config)?;
 
-        // Pre-load wintun.dll explicitly so we can give a descriptive
-        // error if it's missing. See crates/bridge/src/wintun.rs.
+        // SocksOnly mode: skip everything routing-related (wintun preload,
+        // DNS resolution, gateway detection, route installation). Just start
+        // the proxy tunnel — `build_ss_config` has already omitted the TUN
+        // local instance, so `shadowsocks-service::local::Server::new` will
+        // only bind the SOCKS5 listener.
+        if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
+            let running_proxy = proxy.start(ss_config).await?;
+            return Ok(RunningState {
+                routes: None,
+                proxy: running_proxy,
+                server_ip: None,
+                started_at: Instant::now(),
+            });
+        }
+
+        // Full mode: pre-load wintun.dll explicitly so we can give a
+        // descriptive error if it's missing. See crates/bridge/src/wintun.rs.
         #[cfg(target_os = "windows")]
         crate::wintun::ensure_loaded()?;
 
@@ -231,9 +255,9 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
         Ok(RunningState {
+            routes: Some(routes),
             proxy: running_proxy,
-            routes,
-            server_ip,
+            server_ip: Some(server_ip),
             started_at: Instant::now(),
         })
     }
@@ -252,12 +276,27 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             started_at: _,
         } = state;
 
-        // Graceful proxy shutdown first — stop the tunnel before
-        // tearing down the routes it was using. `stop(self)` consumes
-        // the handle and awaits the task, so panics in the spawned
-        // task are surfaced as `ProxyError::Runtime`.
-        let res = proxy.stop().await;
+        // ORDERING: tear down routes FIRST while the TUN adapter is
+        // still alive, THEN stop the proxy (which releases the adapter).
+        //
+        // The proxy task owns the TUN adapter via shadowsocks-service's
+        // Server → TunLocal → wintun handle. If we stop the proxy first,
+        // wintun releases the adapter, and Windows starts asynchronously
+        // flushing routes bound to `hole-tun`. The subsequent
+        // `netsh delete route ... hole-tun` commands in the routes
+        // teardown then race against the OS flush and often fail silently,
+        // leaving localhost traffic broken for several seconds.
+        //
+        // By tearing down routes first (while `hole-tun` still exists),
+        // the `netsh` commands target a live interface and succeed
+        // deterministically. The subsequent proxy stop releases the
+        // adapter cleanly — there are no routes left to flush.
+        //
+        // This matches the field declaration order in `RunningState`
+        // (routes before proxy) so the Drop path (panic/cancel) gets
+        // the same correct ordering.
         drop(routes); // tears down routes + clears state file via RAII
+        let res = proxy.stop().await;
 
         // Clear any error from a previous failed start. A clean stop
         // is the user's signal that the bridge is in a good state

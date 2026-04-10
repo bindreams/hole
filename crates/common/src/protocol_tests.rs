@@ -19,6 +19,7 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
+        tunnel_mode: TunnelMode::Full,
         filters: Vec::new(),
     }
 }
@@ -294,4 +295,91 @@ fn bridge_response_public_ip_roundtrips() {
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(resp, parsed);
+}
+
+// TunnelMode wire compatibility =======================================================================================
+
+#[skuld::test]
+fn tunnel_mode_default_is_full() {
+    // Explicit assertion — TunnelMode::default() MUST be Full because
+    // older clients that omit the field rely on this to preserve
+    // pre-existing behavior (TUN + routing).
+    assert_eq!(TunnelMode::default(), TunnelMode::Full);
+}
+
+#[skuld::test]
+fn tunnel_mode_serializes_as_snake_case() {
+    // snake_case is the project-wide serialization convention and is
+    // load-bearing for the OpenAPI spec's enum values.
+    assert_eq!(serde_json::to_string(&TunnelMode::Full).unwrap(), r#""full""#);
+    assert_eq!(
+        serde_json::to_string(&TunnelMode::SocksOnly).unwrap(),
+        r#""socks_only""#,
+    );
+}
+
+#[skuld::test]
+fn proxy_config_parses_without_tunnel_mode_field() {
+    // Wire compat: the existing GUI does not send `tunnel_mode`. Parsing
+    // must succeed and yield the default (Full). This is the test that
+    // prevents an accidental #[serde(default)] removal from silently
+    // breaking every deployed GUI the next time the bridge is updated.
+    let json = r#"{
+        "server": {
+            "id": "x",
+            "name": "x",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "pw"
+        },
+        "local_port": 4073
+    }"#;
+    let cfg: ProxyConfig = serde_json::from_str(json).expect("legacy payload must parse");
+    assert_eq!(cfg.tunnel_mode, TunnelMode::Full);
+    assert_eq!(cfg.local_port, 4073);
+}
+
+#[skuld::test]
+fn proxy_config_parses_with_socks_only_tunnel_mode() {
+    let json = r#"{
+        "server": {
+            "id": "x",
+            "name": "x",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "pw"
+        },
+        "local_port": 4073,
+        "tunnel_mode": "socks_only"
+    }"#;
+    let cfg: ProxyConfig = serde_json::from_str(json).expect("socks_only payload must parse");
+    assert_eq!(cfg.tunnel_mode, TunnelMode::SocksOnly);
+}
+
+#[skuld::test]
+fn proxy_config_tunnel_mode_full_roundtrips() {
+    let cfg = ProxyConfig {
+        server: sample_server(),
+        local_port: 4073,
+        tunnel_mode: TunnelMode::Full,
+        filters: Vec::new(),
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, cfg);
+}
+
+#[skuld::test]
+fn proxy_config_tunnel_mode_socks_only_roundtrips() {
+    let cfg = ProxyConfig {
+        server: sample_server(),
+        local_port: 4073,
+        tunnel_mode: TunnelMode::SocksOnly,
+        filters: Vec::new(),
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, cfg);
 }
