@@ -8,6 +8,7 @@ pub mod device;
 pub mod driver;
 pub mod smoltcp_stream;
 pub mod socks5_client;
+pub mod socks5_udp;
 pub mod tcp_handler;
 pub mod udp_flow;
 pub mod upstream_dns;
