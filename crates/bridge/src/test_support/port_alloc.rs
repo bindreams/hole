@@ -30,14 +30,17 @@ pub(crate) fn allocate_ephemeral_port_sync() -> u16 {
 
 /// Poll-connect to `addr` until either a TCP connection succeeds or
 /// `timeout` elapses. Used by tests that spawn a child process which binds
-/// asynchronously after the parent function returns. Panics on timeout.
+/// asynchronously after the parent function returns. Panics on timeout,
+/// including the last OS-level connect error for diagnostics.
 pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
     let start = std::time::Instant::now();
+    let mut last_err: Option<std::io::Error> = None;
     while start.elapsed() < timeout {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(_) => return,
+            Err(e) => last_err = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("port {addr} did not become connectable within {timeout:?}");
+    panic!("port {addr} did not become connectable within {timeout:?} (last error: {last_err:?})");
 }

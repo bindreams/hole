@@ -79,11 +79,20 @@ fn local_is_socks5() {
 }
 
 #[skuld::test]
-fn socks5_mode_is_tcp_and_udp() {
+fn full_mode_socks5_is_tcp_and_udp() {
     let ss = build_ss_config(&sample_config()).unwrap();
     let mode = ss.local[0].config.mode;
     // Mode doesn't impl PartialEq; use Debug string comparison.
     assert_eq!(format!("{mode:?}"), "TcpAndUdp");
+}
+
+#[skuld::test]
+fn socks_only_mode_socks5_is_tcp_only() {
+    let mut cfg = sample_config();
+    cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+    let ss = build_ss_config(&cfg).unwrap();
+    let mode = ss.local[0].config.mode;
+    assert_eq!(format!("{mode:?}"), "TcpOnly");
 }
 
 #[skuld::test]

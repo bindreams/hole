@@ -57,11 +57,13 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 
 /// Build a shadowsocks-service Config from our ProxyConfig.
 ///
-/// Always creates exactly one local instance: SOCKS5 on
-/// `127.0.0.1:{local_port}` with `Mode::TcpAndUdp`. The TUN device is
-/// now owned by the dispatcher (`crates/bridge/src/dispatcher/`), not
-/// by shadowsocks-service. `TunnelMode` is respected by the
-/// `ProxyManager` which skips the dispatcher in `SocksOnly` mode.
+/// Creates exactly one local instance: SOCKS5 on `127.0.0.1:{local_port}`.
+/// The mode depends on `tunnel_mode`:
+///
+/// * **Full** — `TcpAndUdp`, so the dispatcher's UDP handler can use
+///   SOCKS5 UDP ASSOCIATE to relay datagrams through the tunnel.
+/// * **SocksOnly** — `TcpOnly`, because there is no dispatcher and nobody
+///   uses UDP ASSOCIATE. See #189 for why this matters on Windows.
 pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
     let entry = &config.server;
 
@@ -98,13 +100,23 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
         .server
         .push(ServerInstanceConfig::with_server_config(server_config));
 
-    // SOCKS5 local — the only local instance. TcpAndUdp enables UDP
-    // associate for the dispatcher's proxy path (Plan 3).
+    // SOCKS5 local — the only local instance.
+    //
+    // Full mode: TcpAndUdp — the dispatcher's UDP handler needs SOCKS5
+    // UDP ASSOCIATE to relay datagrams through the SS tunnel.
+    //
+    // SocksOnly mode: TcpOnly — there is no dispatcher, so nobody uses
+    // UDP ASSOCIATE. Creating the UDP server on Windows can cause
+    // select_all inside shadowsocks-service to drop the TCP listener
+    // when the UDP future completes early. See #189.
     let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port)
         .parse()
         .expect("127.0.0.1:{u16} is always a valid SocketAddr");
     let mut socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
-    socks_local.mode = shadowsocks::config::Mode::TcpAndUdp;
+    socks_local.mode = match config.tunnel_mode {
+        hole_common::protocol::TunnelMode::Full => shadowsocks::config::Mode::TcpAndUdp,
+        hole_common::protocol::TunnelMode::SocksOnly => shadowsocks::config::Mode::TcpOnly,
+    };
     ss_config
         .local
         .push(LocalInstanceConfig::with_local_config(socks_local));
