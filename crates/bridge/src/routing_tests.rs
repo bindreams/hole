@@ -232,46 +232,13 @@ fn setup_with_spaced_interface_name_includes_full_name() {
     );
 }
 
-// RouteGuard tests ====================================================================================================
-//
-// `RouteGuard::drop` shells out to `netsh`/`route` via teardown_routes AND
-// clears the route-state file. These tests are about construction only, so
-// every test uses `std::mem::forget(guard)` at the end to prevent Drop
-// from running. The tempdir holding `state_dir` still gets cleaned up via
-// its own Drop — std::mem::forget only applies to the RouteGuard itself.
-
-#[skuld::test]
-fn route_guard_stores_server_ip() {
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
-    assert_eq!(guard.server_ip, ipv4_server());
-    std::mem::forget(guard);
-}
-
-#[skuld::test]
-fn route_guard_stores_tun_name() {
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
-    assert_eq!(guard.tun_name, "utun7");
-    std::mem::forget(guard);
-}
-
-#[skuld::test]
-fn route_guard_stores_interface_name() {
-    let tmp = tempfile::tempdir().unwrap();
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), tmp.path().to_path_buf());
-    assert_eq!(guard.interface_name, "en0");
-    std::mem::forget(guard);
-}
-
-#[skuld::test]
-fn route_guard_stores_state_dir() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().to_path_buf();
-    let guard = RouteGuard::new("utun7".into(), ipv4_server(), "en0".into(), path.clone());
-    assert_eq!(guard.state_dir, path);
-    std::mem::forget(guard);
-}
+// `SystemRoutes` construction tests removed post-#165: the type now has
+// private fields (no pub constructor) and is always produced via
+// `SystemRouting::install`. Field-storage assertions would require
+// either making fields public or exercising `install` with real netsh —
+// the latter is exactly what the refactor disallows. The critical
+// invariant ("Drop tears down via the trait, not the free function") is
+// covered by `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
 
 // Phase classifier ====================================================================================================
 //

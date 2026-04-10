@@ -1,6 +1,8 @@
 // Foreground bridge runner for development.
 
-use crate::proxy_manager::{ProxyManager, RealBackend};
+use crate::proxy::ShadowsocksProxy;
+use crate::proxy_manager::ProxyManager;
+use crate::routing::SystemRouting;
 use std::path::Path;
 
 /// Run the bridge in foreground mode (for development).
@@ -17,8 +19,8 @@ pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::erro
 
 async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(ProxyManager::new(
-        RealBackend,
-        state_dir.to_path_buf(),
+        ShadowsocksProxy::new(),
+        SystemRouting::new(state_dir.to_path_buf()),
     )));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
