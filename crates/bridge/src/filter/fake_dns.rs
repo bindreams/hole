@@ -24,6 +24,7 @@ use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use ipnet::{Ipv4Net, Ipv6Net};
 use lru::LruCache;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::matcher::canonicalize_ip;
 
@@ -261,6 +262,39 @@ impl FakeDns {
         };
 
         self.build_response(&request).to_vec().unwrap_or_default()
+    }
+
+    /// Handle DNS queries over TCP (RFC 1035 section 4.2.2 framing).
+    ///
+    /// Each message on the stream is prefixed with a 2-byte big-endian
+    /// length. The method loops until the client closes the connection
+    /// (EOF on the length read).
+    pub async fn handle_tcp<S>(&self, mut stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            // Read the 2-byte length prefix. EOF here means the client
+            // closed the connection gracefully.
+            let len = match stream.read_u16().await {
+                Ok(n) => n as usize,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            };
+
+            // Read the DNS message.
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+
+            // Process via the same logic as UDP.
+            let response = self.handle_udp(&buf);
+
+            // Write 2-byte length prefix + response.
+            let resp_len = response.len() as u16;
+            stream.write_u16(resp_len).await?;
+            stream.write_all(&response).await?;
+            stream.flush().await?;
+        }
     }
 
     /// Build a response `Message` for a parsed query. Pure-ish — only
