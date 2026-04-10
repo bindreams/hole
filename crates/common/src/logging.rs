@@ -518,16 +518,17 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
     let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(true).finish(file_appender);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
-    // The EnvFilter default for non-matching targets is ERROR, so we must
-    // add explicit directives for the relay and panic targets — otherwise
-    // their INFO-level events would be filtered out and the entire FD-level
-    // safety net would be a no-op in production.
-    let env_filter = EnvFilter::from_default_env()
+    // Global default is INFO so third-party crates (shadowsocks-service,
+    // hickory, hyper, etc.) emit useful startup/warning diagnostics without
+    // needing per-crate directives. The caller's `default_directive` can
+    // still override specific crates (e.g. "hole_bridge=debug").
+    //
+    // `hole::logging=debug` is the only pin below INFO — it lets the
+    // logging subsystem itself emit debug-level lifecycle events.
+    let env_filter = EnvFilter::builder()
+        .with_default_directive("info".parse().expect("valid directive"))
+        .from_env_lossy()
         .add_directive(default_directive.parse().expect("valid tracing directive"))
-        .add_directive("hole::stderr_relay=info".parse().expect("valid directive"))
-        .add_directive("hole::stdout_relay=info".parse().expect("valid directive"))
-        .add_directive("hole::plugin=info".parse().expect("valid directive"))
-        .add_directive("hole::panic=error".parse().expect("valid directive"))
         .add_directive("hole::logging=debug".parse().expect("valid directive"));
 
     // Exclude relay-originated events from the stderr layer to prevent
