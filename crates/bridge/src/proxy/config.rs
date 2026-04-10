@@ -119,6 +119,15 @@ fn resolve_plugin_path(name: &str) -> String {
     resolve_plugin_path_inner(name, std::env::current_exe().ok())
 }
 
+/// Whether UDP can be proxied through the shadowsocks server.
+///
+/// Returns `false` when a v2ray-plugin is configured — plugins are
+/// TCP-only by protocol definition, so UDP traffic cannot be carried.
+/// The dispatcher uses this to downgrade UDP Proxy actions to Bypass.
+pub fn udp_proxy_available(config: &ProxyConfig) -> bool {
+    config.server.plugin.is_none()
+}
+
 /// Inner implementation that accepts an explicit exe path for testability.
 ///
 /// Looks for the plugin binary in the same directory as the bridge executable.
@@ -146,3 +155,7 @@ pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>)
     }
     name.to_string()
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod config_tests;

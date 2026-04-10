@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 
 use super::device::VirtualTunDevice;
 use super::smoltcp_stream::SmoltcpStream;
-use super::tcp_handler::{self, TcpHandlerContext};
+use super::tcp_handler::{self, HandlerContext};
 use crate::filter::rules::RuleSet;
 use crate::filter::FakeDns;
 
@@ -84,7 +84,7 @@ pub struct TunDriver {
     conn_semaphore: Arc<Semaphore>,
     sniffer_semaphore: Arc<Semaphore>,
     rules: Arc<ArcSwap<RuleSet>>,
-    handler_ctx: Arc<TcpHandlerContext>,
+    handler_ctx: Arc<HandlerContext>,
     /// Reference time for converting std::time::Instant to smoltcp::time::Instant.
     epoch: StdInstant,
 }
@@ -97,7 +97,7 @@ impl TunDriver {
         tun: tun::AsyncDevice,
         fake_dns: Option<Arc<FakeDns>>,
         rules: Arc<ArcSwap<RuleSet>>,
-        handler_ctx: Arc<TcpHandlerContext>,
+        handler_ctx: Arc<HandlerContext>,
         cancel: CancellationToken,
     ) -> Self {
         let mut device = VirtualTunDevice::new(MTU);

@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 
 use self::block_log::BlockLog;
 use self::driver::{TunDriver, MTU};
-use self::tcp_handler::TcpHandlerContext;
+use self::tcp_handler::HandlerContext;
 use self::upstream_dns::UpstreamResolver;
 use crate::filter::rules::RuleSet;
 use crate::filter::FakeDns;
@@ -50,6 +50,7 @@ impl Dispatcher {
         local_port: u16,
         iface_index: u32,
         ipv6_available: bool,
+        udp_proxy_available: bool,
         rules: RuleSet,
         dns_servers: &[IpAddr],
     ) -> std::io::Result<Self> {
@@ -79,13 +80,14 @@ impl Dispatcher {
         let upstream_resolver = UpstreamResolver::new(dns_servers);
 
         // Handler context (shared by all TCP handlers).
-        let handler_ctx = Arc::new(TcpHandlerContext {
+        let handler_ctx = Arc::new(HandlerContext {
             local_port,
             iface_index,
             ipv6_available,
             upstream_resolver,
             block_log: std::sync::Mutex::new(BlockLog::new()),
             ipv6_bypass_warned: AtomicBool::new(false),
+            udp_proxy_available,
         });
 
         // Cancellation token.
