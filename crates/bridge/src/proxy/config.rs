@@ -123,7 +123,7 @@ fn resolve_plugin_path(name: &str) -> String {
 ///
 /// Returns `false` when a v2ray-plugin is configured — plugins are
 /// TCP-only by protocol definition, so UDP traffic cannot be carried.
-/// The dispatcher uses this to downgrade UDP Proxy actions to Bypass.
+/// The dispatcher uses this to block UDP traffic that cannot be proxied.
 pub fn udp_proxy_available(config: &ProxyConfig) -> bool {
     config.server.plugin.is_none()
 }
