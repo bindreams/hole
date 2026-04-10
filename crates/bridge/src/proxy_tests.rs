@@ -67,34 +67,29 @@ fn invalid_method_returns_error() {
 // Local instances tests ===============================================================================================
 
 #[skuld::test]
-fn creates_two_local_instances() {
+fn creates_one_local_instance() {
     let ss = build_ss_config(&sample_config()).unwrap();
-    assert_eq!(ss.local.len(), 2);
+    assert_eq!(ss.local.len(), 1, "only SOCKS5 local, no TUN");
 }
 
 #[skuld::test]
-fn first_local_is_tun() {
+fn local_is_socks5() {
     let ss = build_ss_config(&sample_config()).unwrap();
-    assert_eq!(ss.local[0].config.protocol.as_str(), "tun");
+    assert_eq!(ss.local[0].config.protocol.as_str(), "socks");
 }
 
 #[skuld::test]
-fn tun_has_correct_subnet() {
+fn socks5_mode_is_tcp_and_udp() {
     let ss = build_ss_config(&sample_config()).unwrap();
-    let addr = ss.local[0].config.tun_interface_address.unwrap();
-    assert_eq!(addr.to_string(), "10.255.0.1/24");
-}
-
-#[skuld::test]
-fn second_local_is_socks5() {
-    let ss = build_ss_config(&sample_config()).unwrap();
-    assert_eq!(ss.local[1].config.protocol.as_str(), "socks");
+    let mode = ss.local[0].config.mode;
+    // Mode doesn't impl PartialEq; use Debug string comparison.
+    assert_eq!(format!("{mode:?}"), "TcpAndUdp");
 }
 
 #[skuld::test]
 fn socks5_binds_to_localhost_on_configured_port() {
     let ss = build_ss_config(&sample_config()).unwrap();
-    let addr = ss.local[1].config.addr.as_ref().unwrap();
+    let addr = ss.local[0].config.addr.as_ref().unwrap();
     assert_eq!(addr.host(), "127.0.0.1");
     assert_eq!(addr.port(), 4073);
 }
@@ -104,7 +99,7 @@ fn socks5_uses_custom_port() {
     let mut cfg = sample_config();
     cfg.local_port = 9999;
     let ss = build_ss_config(&cfg).unwrap();
-    let addr = ss.local[1].config.addr.as_ref().unwrap();
+    let addr = ss.local[0].config.addr.as_ref().unwrap();
     assert_eq!(addr.port(), 9999);
 }
 

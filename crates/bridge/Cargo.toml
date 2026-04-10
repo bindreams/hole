@@ -12,7 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
-shadowsocks-service = { version = "1", features = ["local", "local-tun", "local-http", "aead-cipher-2022"] }
+shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "net"] }
@@ -43,6 +43,17 @@ regex = "1"
 # New crates not previously in the tree.
 lru = "0.16"
 tls-parser = "0.12"
+# Filter engine Plan 2 — dispatcher dependencies.
+# tun and smoltcp are pinned to the same versions shadowsocks-service 1.24
+# uses transitively so cargo deduplicates them.
+tun = { version = "0.8", features = ["async"] }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "medium-ip", "proto-ipv4", "proto-ipv6",
+    "socket-tcp", "socket-udp",
+] }
+arc-swap = "1"
+tokio-socks = "0.5"
+hickory-resolver = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -54,6 +65,9 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_RemoteDesktop",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 # Pinned to the same minor version that shadowsocks-service 1.24 uses
 # transitively (via tun-0.8.6) so cargo deduplicates the crate. We load
