@@ -257,6 +257,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 config.local_port,
                 gw_info.interface_index,
                 gw_info.ipv6_available,
+                crate::proxy::udp_proxy_available(config),
                 ruleset,
                 &dns_servers,
             )?;

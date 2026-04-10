@@ -38,7 +38,7 @@ const PEEK_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Shared state for all TCP handler tasks. Created once by the Dispatcher
 /// and passed (via Arc) to each spawned handler.
-pub struct TcpHandlerContext {
+pub struct HandlerContext {
     /// SS SOCKS5 local port on 127.0.0.1.
     pub local_port: u16,
     /// Upstream interface index for bypass sockets.
@@ -52,13 +52,15 @@ pub struct TcpHandlerContext {
     pub block_log: std::sync::Mutex<BlockLog>,
     /// One-time flag: emitted when IPv6 bypass falls back to block.
     pub ipv6_bypass_warned: AtomicBool,
+    /// Whether the current proxy config supports UDP relay (no v2ray-plugin).
+    pub udp_proxy_available: bool,
 }
 
 // Handler entry point =================================================================================================
 
 /// Per-connection environment, bundled to avoid clippy::too_many_arguments.
 pub struct ConnEnv {
-    pub ctx: Arc<TcpHandlerContext>,
+    pub ctx: Arc<HandlerContext>,
     pub rules: Arc<ArcSwap<RuleSet>>,
     pub fake_dns: Option<Arc<FakeDns>>,
     pub sniffer_semaphore: Arc<Semaphore>,
@@ -87,7 +89,7 @@ async fn handle_inner(
     stream: &mut SmoltcpStream,
     dst_ip: IpAddr,
     dst_port: u16,
-    ctx: &TcpHandlerContext,
+    ctx: &HandlerContext,
     rules: &ArcSwap<RuleSet>,
     fake_dns: Option<&FakeDns>,
     sniffer_semaphore: &Semaphore,
@@ -131,7 +133,7 @@ async fn handle_inner(
 
 /// Bundled dispatch environment (avoids too_many_arguments).
 struct DispatchEnv<'a> {
-    ctx: &'a TcpHandlerContext,
+    ctx: &'a HandlerContext,
     rules: &'a ArcSwap<RuleSet>,
     fake_dns: Option<&'a FakeDns>,
     sniffer_semaphore: &'a Semaphore,
@@ -196,7 +198,7 @@ async fn dispatch_proxy(
     dst_ip: IpAddr,
     dst_port: u16,
     domain: &Option<String>,
-    ctx: &TcpHandlerContext,
+    ctx: &HandlerContext,
     peek_buf: &[u8],
 ) -> std::io::Result<()> {
     let mut upstream = socks5_connect(ctx.local_port, dst_ip, dst_port, domain.as_deref()).await?;
@@ -215,7 +217,7 @@ async fn dispatch_bypass(
     dst_ip: IpAddr,
     dst_port: u16,
     domain: &Option<String>,
-    ctx: &TcpHandlerContext,
+    ctx: &HandlerContext,
     fake_dns: Option<&FakeDns>,
     peek_buf: &[u8],
 ) -> std::io::Result<()> {
@@ -245,7 +247,7 @@ fn dispatch_block(
     dst_ip: IpAddr,
     dst_port: u16,
     domain: Option<&str>,
-    ctx: &TcpHandlerContext,
+    ctx: &HandlerContext,
     decision: &filter::Decision,
 ) {
     let rule_index = decision.rule_index.unwrap_or(0) as u32;
@@ -270,7 +272,7 @@ fn dispatch_block(
 async fn resolve_bypass_ip(
     dst_ip: IpAddr,
     domain: Option<&str>,
-    ctx: &TcpHandlerContext,
+    ctx: &HandlerContext,
     fake_dns: Option<&FakeDns>,
 ) -> std::io::Result<IpAddr> {
     // Only resolve if the IP is a fake DNS synthetic IP.

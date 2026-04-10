@@ -29,7 +29,7 @@ use shadowsocks_service::config::Config;
 pub mod config;
 pub mod shadowsocks;
 
-pub use config::{build_ss_config, ProxyError, TUN_DEVICE_NAME, TUN_SUBNET};
+pub use config::{build_ss_config, udp_proxy_available, ProxyError, TUN_DEVICE_NAME, TUN_SUBNET};
 pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
 
 // Used by `server_test.rs` + `proxy_tests.rs`. Kept crate-private so
