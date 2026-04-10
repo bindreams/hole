@@ -14,13 +14,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: ./.github/actions/setup-build
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
-
       - uses: astral-sh/setup-uv@v7
+
+      - uses: ./.github/actions/setup-build
 
       - name: Install prek
         run: uv tool install prek
@@ -80,8 +79,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: ./.github/actions/setup-build
       - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/setup-build
 
       - name: Test
         working-directory: msi-installer
