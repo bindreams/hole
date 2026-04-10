@@ -334,15 +334,30 @@ impl<B: ProxyBackend> ProxyManager<B> {
             return Ok(());
         }
 
-        // Abort the ss task
+        // ORDERING: tear down routes BEFORE aborting the ss task.
+        //
+        // The ss task owns the TUN adapter (via shadowsocks-service's
+        // `Server` → `TunLocal` → wintun handle). When the task is
+        // aborted, wintun releases the adapter, and Windows starts
+        // asynchronously flushing routes bound to `hole-tun`. If we
+        // run `netsh delete route ... hole-tun` AFTER the adapter is
+        // gone, the commands race against the OS flush and often fail
+        // with empty stderr ("route not found"), leaving the host
+        // routing table in a transitional state where localhost TCP
+        // connections time out for several seconds.
+        //
+        // By tearing down routes first (while `hole-tun` still exists),
+        // the `netsh` commands target a live interface and succeed
+        // deterministically. The subsequent task abort releases the
+        // adapter cleanly — there are no routes left to flush.
+        self.route_guard.take();
+
+        // Now abort the ss task (releases TUN adapter).
         if let Some(handle) = self.task_handle.take() {
             handle.abort();
             // Wait for it to finish (will return Err(JoinError::Cancelled))
             let _ = handle.await;
         }
-
-        // Drop route guard (tears down routes via RAII)
-        self.route_guard.take();
 
         self.server_ip = None;
         self.started_at = None;
