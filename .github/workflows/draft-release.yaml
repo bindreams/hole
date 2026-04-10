@@ -59,11 +59,12 @@ jobs:
       - name: Create local tag for build
         run: git tag "v${{ needs.validate.outputs.version }}"
 
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.os == 'windows'
+
       - uses: ./.github/actions/setup-build
 
       # Windows build
-      - uses: astral-sh/setup-uv@v7
-        if: matrix.os == 'windows'
       - name: Build MSI
         if: matrix.os == 'windows'
         run: uv run --directory msi-installer build
