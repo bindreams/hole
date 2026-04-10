@@ -1,4 +1,4 @@
-use crate::config::ServerEntry;
+use crate::config::{FilterRule, ServerEntry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -109,6 +109,10 @@ pub struct ProxyConfig {
     /// current GUI) that don't send this field keep their existing behavior.
     #[serde(default)]
     pub tunnel_mode: TunnelMode,
+    /// Filter rules applied by the bridge dispatcher. Defaults to empty
+    /// (no filtering — all captured traffic proxied).
+    #[serde(default)]
+    pub filters: Vec<FilterRule>,
 }
 
 // Server test outcome =================================================================================================

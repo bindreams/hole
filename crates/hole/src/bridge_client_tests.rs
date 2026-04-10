@@ -144,6 +144,7 @@ fn send_start_receives_ack() {
                     },
                     local_port: 4073,
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -233,6 +234,7 @@ fn send_reload_receives_ack() {
                     },
                     local_port: 4073,
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -310,6 +312,7 @@ fn server_error_maps_to_bridge_response_error() {
                     },
                     local_port: 4073,
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
+                    filters: Vec::new(),
                 },
             })
             .await

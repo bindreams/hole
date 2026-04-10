@@ -208,6 +208,7 @@ fn sample_config() -> ProxyConfig {
         },
         local_port: 4073,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
+        filters: Vec::new(),
     }
 }
 

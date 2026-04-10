@@ -276,6 +276,7 @@ fn test_config() -> ProxyConfig {
         },
         local_port: 1080,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
+        filters: Vec::new(),
     }
 }
 

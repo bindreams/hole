@@ -20,6 +20,7 @@ fn sample_config() -> ProxyConfig {
         server: sample_server(),
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
+        filters: Vec::new(),
     }
 }
 
@@ -363,6 +364,7 @@ fn proxy_config_tunnel_mode_full_roundtrips() {
         server: sample_server(),
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
+        filters: Vec::new(),
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
@@ -375,6 +377,7 @@ fn proxy_config_tunnel_mode_socks_only_roundtrips() {
         server: sample_server(),
         local_port: 4073,
         tunnel_mode: TunnelMode::SocksOnly,
+        filters: Vec::new(),
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();

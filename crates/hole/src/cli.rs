@@ -693,6 +693,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     server: entry,
                     local_port,
                     tunnel_mode: tunnel_mode.into(),
+                    filters: Vec::new(),
                 },
             };
             match send_bridge_request_inner(request) {
