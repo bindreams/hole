@@ -113,6 +113,32 @@ pub async fn create_bypass_tcp(dst_ip: IpAddr, dst_port: u16, iface_index: u32) 
     tcp_socket.connect(dst).await
 }
 
+// Bypass UDP socket ===================================================================================================
+
+/// Create an unconnected UDP socket bound to the upstream interface.
+pub async fn create_bypass_udp(iface_index: u32, v6: bool) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = if v6 {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        bind_to_interface_v6(&s, iface_index)?;
+        s
+    } else {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        bind_to_interface_v4(&s, iface_index)?;
+        s
+    };
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
+
 #[cfg(test)]
 #[path = "bypass_tests.rs"]
 mod bypass_tests;
