@@ -4,9 +4,18 @@
 //! status response so the GUI can highlight problem rows.
 
 use hole_common::config::{FilterAction, FilterRule};
-use hole_common::protocol::InvalidFilter;
+use serde::{Deserialize, Serialize};
 
 use super::matcher::Matcher;
+
+/// A filter rule that failed to compile, recording its original index
+/// and a human-readable reason. Moved to `hole_common::protocol` and
+/// wired into the IPC status response in Plan 4 when the GUI needs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvalidFilter {
+    pub index: u32,
+    pub error: String,
+}
 
 /// One compiled rule: matcher + action. Rules are stored in the same
 /// order as the user's input so the reverse-scan in `engine::decide`

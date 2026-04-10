@@ -209,6 +209,7 @@ fn sample_config() -> ProxyConfig {
             validation: None,
         },
         local_port: 4073,
+        filters: Vec::new(),
     }
 }
 

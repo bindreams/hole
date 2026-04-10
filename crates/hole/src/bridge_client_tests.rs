@@ -143,6 +143,7 @@ fn send_start_receives_ack() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -231,6 +232,7 @@ fn send_reload_receives_ack() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
@@ -307,6 +309,7 @@ fn server_error_maps_to_bridge_response_error() {
                         validation: None,
                     },
                     local_port: 4073,
+                    filters: Vec::new(),
                 },
             })
             .await
