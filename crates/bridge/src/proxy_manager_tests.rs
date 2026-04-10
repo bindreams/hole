@@ -443,6 +443,36 @@ fn check_health_detects_crashed_task() {
 }
 
 #[skuld::test]
+fn check_health_clears_active_config_so_reload_restarts() {
+    // Regression guard: check_health must clear active_config, otherwise
+    // a subsequent reload would take the hot-swap path (no-op) instead
+    // of starting a new proxy.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.start_calls_handle();
+
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
+
+        // Simulate crash.
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+        assert_eq!(pm.state(), ProxyState::Stopped);
+
+        // Un-crash so the next start succeeds.
+        state.crashed.store(false, Ordering::SeqCst);
+
+        // Reload must detect that we're not running and do a full start.
+        pm.reload(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 2);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
 fn check_health_does_not_mark_healthy_task_as_crashed() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());

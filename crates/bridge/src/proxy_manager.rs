@@ -400,6 +400,9 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 error!("proxy task exited unexpectedly");
                 self.last_error = Some("proxy task exited unexpectedly".into());
                 self.running = None; // Drop tears down routes + clears state file
+                self.active_config = None;
+                self.udp_proxy_available = true;
+                self.ipv6_bypass_available = true;
             }
         }
     }
