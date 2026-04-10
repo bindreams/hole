@@ -1,3 +1,23 @@
 [[disallowed-methods]]
 path = "hyper::client::conn::http1::SendRequest::send_request"
 reason = "Must call sender.ready().await before send_request() (tower::Service contract). Use a wrapper type that enforces this."
+
+# Bridge trait-contract enforcement (bindreams/hole#165 mitigation) ----
+#
+# The `Proxy` and `Routing` traits are the only sanctioned entry points
+# for spawning tunnels and mutating host routing tables. Direct calls to
+# the underlying free functions / constructors bypass mock-based test
+# isolation and caused the #165 incident (unit tests shelling out to
+# real `netsh`, corrupting loopback state on Windows CI runners).
+#
+# Legitimate callers (the trait implementations themselves and the
+# crash-recovery path) suppress the lint with a per-site
+# `#[allow(clippy::disallowed_methods)]` plus a comment.
+
+[[disallowed-methods]]
+path = "crate::routing::setup_routes"
+reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in routing.rs may call this. See #165."
+
+[[disallowed-methods]]
+path = "crate::routing::teardown_routes"
+reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in routing.rs and `recover_routes` may call this. See #165."

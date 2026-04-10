@@ -5,7 +5,16 @@ use crate::proxy::ProxyError;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
+
+/// Total number of routing subprocess spawns this process has performed.
+/// Incremented once per command in [`run_commands`]. Exposed so
+/// `diagnostics` handlers and tests can observe invariant violations
+/// (see the `proxy_manager_tests_never_spawn_routing_subprocess`
+/// regression test). The one-instruction `fetch_add` has negligible
+/// production cost — far below the millisecond-scale subprocess itself.
+pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // Command builders ====================================================================================================
 
@@ -82,6 +91,7 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
     let recovery = is_recovery_phase(phase);
     for cmd in commands {
         debug_assert!(!cmd.is_empty(), "route command must not be empty");
+        ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
         info!(phase, cmd = cmd.join(" "), "running route command");
         let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
         if !output.status.success() {
@@ -259,7 +269,9 @@ impl Routing for SystemRouting {
         // `run_commands` currently returns `Err` only on process-spawn
         // failure, but a future change that makes it early-exit on first
         // non-zero status would otherwise leak partial routes.
+        #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
         if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name) {
+            #[allow(clippy::disallowed_methods)] // defensive rollback inside install
             let _ = teardown_routes(tun_name, server_ip, interface_name);
             let _ = crate::route_state::clear(&self.state_dir);
             return Err(ProxyError::RouteSetup(e.to_string()));
@@ -292,6 +304,7 @@ pub struct SystemRoutes {
 
 impl Drop for SystemRoutes {
     fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods)] // SystemRoutes IS Routing::Installed
         if let Err(e) = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name) {
             warn!(error = %e, "route teardown failed in SystemRoutes::drop");
         }
