@@ -19,6 +19,7 @@ fn sample_config() -> ProxyConfig {
     ProxyConfig {
         server: sample_server(),
         local_port: 4073,
+        filters: Vec::new(),
     }
 }
 

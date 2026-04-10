@@ -1,3 +1,4 @@
+pub mod filter;
 pub mod foreground;
 pub mod gateway;
 pub mod group;

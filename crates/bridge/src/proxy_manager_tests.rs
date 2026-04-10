@@ -275,6 +275,7 @@ fn test_config() -> ProxyConfig {
             validation: None,
         },
         local_port: 1080,
+        filters: Vec::new(),
     }
 }
 

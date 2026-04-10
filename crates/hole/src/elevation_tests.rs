@@ -19,6 +19,7 @@ fn encode_request_roundtrips() {
                 validation: None,
             },
             local_port: 4073,
+            filters: Vec::new(),
         },
     };
 
@@ -64,6 +65,7 @@ fn write_request_file_roundtrip() {
                 validation: None,
             },
             local_port: 4073,
+            filters: Vec::new(),
         },
     };
 
@@ -97,6 +99,7 @@ fn read_request_file_roundtrip() {
                 validation: None,
             },
             local_port: 4073,
+            filters: Vec::new(),
         },
     };
 
