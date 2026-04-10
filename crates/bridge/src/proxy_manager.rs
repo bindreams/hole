@@ -440,3 +440,7 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 #[cfg(test)]
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
+
+#[cfg(test)]
+#[path = "proxy_manager_e2e_tests.rs"]
+mod proxy_manager_e2e_tests;
