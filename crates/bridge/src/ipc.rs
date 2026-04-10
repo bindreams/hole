@@ -216,6 +216,9 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
         error: pm.last_error().map(|s| s.to_string()),
+        invalid_filters: pm.invalid_filters(),
+        udp_proxy_available: pm.udp_proxy_available(),
+        ipv6_bypass_available: pm.ipv6_bypass_available(),
     })
 }
 
@@ -349,12 +352,18 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
 ) -> Json<MetricsResponse> {
     let mut pm = state.proxy.lock().await;
     pm.check_health();
+    let filter = if pm.state() == ProxyState::Running {
+        Some(hole_common::protocol::FilterMetrics::default())
+    } else {
+        None
+    };
     Json(MetricsResponse {
         bytes_in: 0,
         bytes_out: 0,
         speed_in_bps: 0,
         speed_out_bps: 0,
         uptime_secs: pm.uptime_secs(),
+        filter,
     })
 }
 

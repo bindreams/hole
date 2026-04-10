@@ -87,6 +87,9 @@ impl BridgeClient {
                         running: status.running,
                         uptime_secs: status.uptime_secs,
                         error: status.error,
+                        invalid_filters: status.invalid_filters,
+                        udp_proxy_available: status.udp_proxy_available,
+                        ipv6_bypass_available: status.ipv6_bypass_available,
                     })
                 } else {
                     parse_bridge_error(resp).await
@@ -138,6 +141,7 @@ impl BridgeClient {
                         speed_in_bps: metrics.speed_in_bps,
                         speed_out_bps: metrics.speed_out_bps,
                         uptime_secs: metrics.uptime_secs,
+                        filter: metrics.filter,
                     })
                 } else {
                     parse_bridge_error(resp).await

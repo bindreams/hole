@@ -179,6 +179,17 @@ components:
           type:
             - string
             - "null"
+        invalid_filters:
+          type: array
+          items:
+            $ref: "#/components/schemas/InvalidFilter"
+          default: []
+        udp_proxy_available:
+          type: boolean
+          default: true
+        ipv6_bypass_available:
+          type: boolean
+          default: true
 
     ErrorResponse:
       type: object
@@ -191,6 +202,74 @@ components:
     EmptyResponse:
       type: object
       additionalProperties: false
+
+    InvalidFilter:
+      type: object
+      required:
+        - index
+        - error
+      properties:
+        index:
+          type: integer
+          format: uint32
+          minimum: 0
+        error:
+          type: string
+
+    FilterMetrics:
+      type: object
+      required:
+        - total_connections
+        - proxied
+        - bypassed
+        - blocked
+        - sniffer_hits
+        - sniffer_misses
+        - fake_dns_queries
+        - fake_dns_reverse_hits
+        - active_udp_flows
+        - udp_drops_backpressure
+      properties:
+        total_connections:
+          type: integer
+          format: uint64
+          minimum: 0
+        proxied:
+          type: integer
+          format: uint64
+          minimum: 0
+        bypassed:
+          type: integer
+          format: uint64
+          minimum: 0
+        blocked:
+          type: integer
+          format: uint64
+          minimum: 0
+        sniffer_hits:
+          type: integer
+          format: uint64
+          minimum: 0
+        sniffer_misses:
+          type: integer
+          format: uint64
+          minimum: 0
+        fake_dns_queries:
+          type: integer
+          format: uint64
+          minimum: 0
+        fake_dns_reverse_hits:
+          type: integer
+          format: uint64
+          minimum: 0
+        active_udp_flows:
+          type: integer
+          format: uint32
+          minimum: 0
+        udp_drops_backpressure:
+          type: integer
+          format: uint64
+          minimum: 0
 
     MetricsResponse:
       type: object
@@ -221,6 +300,10 @@ components:
           type: integer
           format: uint64
           minimum: 0
+        filter:
+          oneOf:
+            - $ref: "#/components/schemas/FilterMetrics"
+            - type: "null"
 
     DiagnosticsResponse:
       type: object

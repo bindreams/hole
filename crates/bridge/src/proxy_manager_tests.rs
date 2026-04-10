@@ -336,7 +336,7 @@ fn start_when_running_returns_already_running() {
 }
 
 #[skuld::test]
-fn reload_stops_then_starts() {
+fn reload_with_same_server_hot_swaps_rules() {
     rt().block_on(async {
         let backend = MockProxy::new();
         let state = backend.start_calls_handle();
@@ -345,7 +345,37 @@ fn reload_stops_then_starts() {
         pm.start(&test_config()).await.unwrap();
         assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
 
-        pm.reload(&test_config()).await.unwrap();
+        // Reload with same server config but different filters — hot-swap path.
+        let mut config = test_config();
+        config.filters.push(hole_common::config::FilterRule {
+            address: "example.com".into(),
+            matching: hole_common::config::MatchType::Exactly,
+            action: hole_common::config::FilterAction::Block,
+        });
+        pm.reload(&config).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        // start was NOT called a second time (hot swap, no restart)
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
+
+        pm.stop().await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Stopped);
+    });
+}
+
+#[skuld::test]
+fn reload_with_different_server_restarts() {
+    rt().block_on(async {
+        let backend = MockProxy::new();
+        let state = backend.start_calls_handle();
+
+        let (mut pm, _dir) = new_manager(backend);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
+
+        // Reload with different server → full stop + start.
+        let mut config = test_config();
+        config.server.server = "10.0.0.1".into();
+        pm.reload(&config).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         // start was called a second time (stop + start)
         assert_eq!(state.start_calls.load(Ordering::SeqCst), 2);
@@ -745,9 +775,9 @@ fn start_cancellable_dropped_future_runs_guards() {
 
 #[skuld::test]
 fn reload_creates_fresh_uncancellable_token() {
-    // reload() internally calls start_cancellable with a fresh token
-    // that is never signaled. Verifies the reload path still works
-    // after the cancellation refactor.
+    // reload() with a different server internally calls start_cancellable
+    // with a fresh token that is never signaled. Verifies the full-restart
+    // reload path still works after the cancellation refactor.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let state = proxy.start_calls_handle();
@@ -756,9 +786,29 @@ fn reload_creates_fresh_uncancellable_token() {
         pm.start(&test_config()).await.unwrap();
         assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
 
-        pm.reload(&test_config()).await.unwrap();
+        // Different server triggers full stop + start path.
+        let mut config = test_config();
+        config.server.server = "10.0.0.1".into();
+        pm.reload(&config).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         assert_eq!(state.start_calls.load(Ordering::SeqCst), 2);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn reload_when_not_running_starts() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.start_calls_handle();
+
+        let (mut pm, _dir) = new_manager(proxy);
+        assert_eq!(pm.state(), ProxyState::Stopped);
+
+        pm.reload(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 1);
 
         pm.stop().await.unwrap();
     });

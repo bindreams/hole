@@ -83,6 +83,7 @@ fn launch_gui(show_dashboard: bool) {
             commands::get_public_ip,
             commands::test_server,
             commands::mark_validated_by_proxy_start,
+            commands::reload_proxy_filters,
             tray::toggle_proxy,
             tray::cancel_proxy,
         ])

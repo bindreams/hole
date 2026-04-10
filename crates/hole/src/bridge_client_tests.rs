@@ -29,6 +29,9 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     running: false,
                     uptime_secs: 0,
                     error: None,
+                    invalid_filters: Vec::new(),
+                    udp_proxy_available: true,
+                    ipv6_bypass_available: true,
                 })
             }),
         )
@@ -57,6 +60,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     speed_in_bps: 2048,
                     speed_out_bps: 1024,
                     uptime_secs: 120,
+                    filter: None,
                 })
             }),
         )
@@ -116,6 +120,9 @@ fn send_status_request_receives_response() {
                 running: false,
                 uptime_secs: 0,
                 error: None,
+                invalid_filters: Vec::new(),
+                udp_proxy_available: true,
+                ipv6_bypass_available: true,
             }
         );
     });
@@ -257,6 +264,9 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     running: false,
                     uptime_secs: 0,
                     error: None,
+                    invalid_filters: Vec::new(),
+                    udp_proxy_available: true,
+                    ipv6_bypass_available: true,
                 })
             }),
         )
@@ -346,6 +356,7 @@ fn send_metrics_returns_response() {
                 speed_in_bps: 2048,
                 speed_out_bps: 1024,
                 uptime_secs: 120,
+                filter: None,
             }
         );
     });

@@ -164,6 +164,7 @@ fn get_metrics_returns_json() {
         speed_in_bps: 2048,
         speed_out_bps: 1024,
         uptime_secs: 120,
+        filter: None,
     };
     let json = map_metrics_response(Ok(resp));
     assert_eq!(json["bytes_in"], 1024);
@@ -171,6 +172,7 @@ fn get_metrics_returns_json() {
     assert_eq!(json["speed_in_bps"], 2048);
     assert_eq!(json["speed_out_bps"], 1024);
     assert_eq!(json["uptime_secs"], 120);
+    assert!(json["filter"].is_null());
 }
 
 /// Verify that a failed metrics request returns zero defaults.
