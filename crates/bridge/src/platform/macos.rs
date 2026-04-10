@@ -208,8 +208,8 @@ pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy_manager::RealBackend,
-            state_dir.to_path_buf(),
+            crate::proxy::ShadowsocksProxy::new(),
+            crate::routing::SystemRouting::new(state_dir.to_path_buf()),
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 

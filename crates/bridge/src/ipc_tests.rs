@@ -1,7 +1,8 @@
 use super::*;
 use crate::gateway::GatewayInfo;
-use crate::proxy::ProxyError;
-use crate::proxy_manager::{ProxyBackend, ProxyManager};
+use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy_manager::ProxyManager;
+use crate::routing::Routing;
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::config::ServerEntry;
@@ -9,79 +10,134 @@ use hole_common::protocol::{DiagnosticsResponse, MetricsResponse, ProxyConfig};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
-// Mock backend ========================================================================================================
+// MockProxy ===========================================================================================================
 
-struct MockBackend {
+struct MockProxy {
     fail_start: AtomicBool,
-    fail_gateway: AtomicBool,
-    /// If Some, `start_ss` awaits this gate before returning. Used to
+    /// If Some, `start` awaits this gate before returning. Used to
     /// simulate a slow start so tests can race `POST /v1/cancel` against
     /// an in-flight `POST /v1/start`.
-    start_ss_gate: Option<Arc<tokio::sync::Notify>>,
+    start_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
-impl MockBackend {
+impl MockProxy {
     fn new() -> Self {
         Self {
             fail_start: AtomicBool::new(false),
-            fail_gateway: AtomicBool::new(false),
-            start_ss_gate: None,
+            start_gate: None,
         }
     }
 
     fn failing() -> Self {
         Self {
             fail_start: AtomicBool::new(true),
-            fail_gateway: AtomicBool::new(false),
-            start_ss_gate: None,
-        }
-    }
-
-    fn gateway_failing() -> Self {
-        Self {
-            fail_start: AtomicBool::new(false),
-            fail_gateway: AtomicBool::new(true),
-            start_ss_gate: None,
+            start_gate: None,
         }
     }
 
     fn gated(gate: Arc<tokio::sync::Notify>) -> Self {
         Self {
             fail_start: AtomicBool::new(false),
-            fail_gateway: AtomicBool::new(false),
-            start_ss_gate: Some(gate),
+            start_gate: Some(gate),
         }
     }
 }
 
-impl ProxyBackend for MockBackend {
-    async fn start_ss(
-        &self,
-        _config: shadowsocks_service::config::Config,
-    ) -> Result<JoinHandle<std::io::Result<()>>, ProxyError> {
-        if let Some(gate) = self.start_ss_gate.as_ref() {
+impl Proxy for MockProxy {
+    type Running = MockRunning;
+
+    async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+        if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
         }
         if self.fail_start.load(Ordering::SeqCst) {
-            return Err(ProxyError::Runtime(std::io::Error::other("mock failure")));
+            return Err(ProxyError::Runtime(io::Error::other("mock failure")));
         }
-        Ok(tokio::spawn(async {
+        let handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             Ok(())
-        }))
+        });
+        Ok(MockRunning { handle: Some(handle) })
     }
+}
 
-    fn setup_routes(&self, _tun: &str, _server: IpAddr, _gw: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
+struct MockRunning {
+    handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl RunningProxy for MockRunning {
+    fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+    async fn stop(mut self) -> Result<(), ProxyError> {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
         Ok(())
     }
+}
 
-    fn teardown_routes(&self, _tun: &str, _server: IpAddr, _interface_name: &str) -> Result<(), ProxyError> {
-        Ok(())
+impl Drop for MockRunning {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+// MockRouting =========================================================================================================
+
+struct MockRouting {
+    state_dir: PathBuf,
+    fail_gateway: AtomicBool,
+}
+
+impl MockRouting {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            fail_gateway: AtomicBool::new(false),
+        }
+    }
+
+    fn failing_gateway(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            fail_gateway: AtomicBool::new(true),
+        }
+    }
+}
+
+impl Routing for MockRouting {
+    type Installed = MockRoutes;
+
+    fn install(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        _gateway: IpAddr,
+        interface_name: &str,
+    ) -> Result<MockRoutes, ProxyError> {
+        // Match SystemRouting ordering: write the state file BEFORE
+        // any mutation, so tests that assert on `bridge-routes.json`
+        // see the same write-then-clear lifecycle as production.
+        let persisted = crate::route_state::RouteState {
+            version: crate::route_state::SCHEMA_VERSION,
+            tun_name: tun_name.to_owned(),
+            server_ip,
+            interface_name: interface_name.to_owned(),
+        };
+        crate::route_state::save(&self.state_dir, &persisted)
+            .map_err(|e| ProxyError::RouteSetup(format!("mock persist failed: {e}")))?;
+        Ok(MockRoutes {
+            state_dir: self.state_dir.clone(),
+        })
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
@@ -95,32 +151,46 @@ impl ProxyBackend for MockBackend {
     }
 }
 
+struct MockRoutes {
+    state_dir: PathBuf,
+}
+
+impl Drop for MockRoutes {
+    fn drop(&mut self) {
+        let _ = crate::route_state::clear(&self.state_dir);
+    }
+}
+
 // Helpers =============================================================================================================
 
 use crate::test_support::rt;
 
-/// Build a mock proxy backed by a throw-away state dir. Uses
+/// Build a mock proxy manager backed by a throw-away state dir. Uses
 /// `tempfile::tempdir().keep()` so the directory is created but its
 /// auto-cleanup Drop is suppressed — the directory lives until the
 /// process exits, which is fine for unit tests.
-fn mock_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
+fn mock_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::new(), state_dir)))
+    let routing = MockRouting::new(state_dir);
+    Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
-fn failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
+fn failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::failing(), state_dir)))
+    let routing = MockRouting::new(state_dir);
+    Arc::new(Mutex::new(ProxyManager::new(MockProxy::failing(), routing)))
 }
 
-fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockBackend>>> {
+fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::gateway_failing(), state_dir)))
+    let routing = MockRouting::failing_gateway(state_dir);
+    Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
-fn gated_proxy(gate: Arc<tokio::sync::Notify>) -> Arc<Mutex<ProxyManager<MockBackend>>> {
+fn gated_proxy(gate: Arc<tokio::sync::Notify>) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    Arc::new(Mutex::new(ProxyManager::new(MockBackend::gated(gate), state_dir)))
+    let routing = MockRouting::new(state_dir);
+    Arc::new(Mutex::new(ProxyManager::new(MockProxy::gated(gate), routing)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -646,7 +716,7 @@ fn diagnostics_bridge_running() {
         let diag = get_diagnostics(&mut client).await;
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
-        assert_eq!(diag.network, "ok"); // MockBackend.default_gateway() succeeds
+        assert_eq!(diag.network, "ok"); // MockRouting.default_gateway() succeeds
                                         // vpn_server and internet are always "unknown" on the wire — the
                                         // GUI computes them from the selected ServerEntry's persisted
                                         // validation state.
@@ -705,7 +775,7 @@ fn diagnostics_proxy_stopped() {
         // diagnostics handler reports `bridge = "ok"` (issue #142). App is
         // always "ok" by convention (bridge can't observe the GUI directly).
         // Network is computed from the host's default gateway and the
-        // MockBackend returns Ok. vpn_server and internet are always "unknown"
+        // MockRouting returns Ok. vpn_server and internet are always "unknown"
         // on the wire — the GUI computes them from the selected ServerEntry's
         // persisted validation state (#150).
         assert_eq!(diag.app, "ok");

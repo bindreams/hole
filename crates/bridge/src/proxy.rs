@@ -1,157 +1,80 @@
-use hole_common::config::is_valid_plugin_name;
-use hole_common::protocol::{ProxyConfig, TunnelMode};
-use shadowsocks::config::ServerAddr;
-use shadowsocks::ServerConfig;
-use shadowsocks_service::config::{
-    Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
-};
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use thiserror::Error;
+// Proxy trait surface + shadowsocks implementation.
+//
+// # Bridge test-isolation contract
+//
+// All production I/O that spawns a tunnel or touches shadowsocks runtime
+// state in bridge code MUST route through the [`Proxy`] / [`RunningProxy`]
+// traits defined here. Helper types whose `Drop` impls shut down a running
+// proxy must do so through a `RunningProxy::stop` / `Drop` path on the
+// associated running type, not by calling `shadowsocks_service` directly.
+//
+// The reason is test isolation. [`crate::proxy_manager::ProxyManager`] is
+// generic over the `Proxy` trait so unit tests can substitute a mock that
+// returns inert running handles. A helper that bypasses the trait cannot
+// be intercepted by the mock and will exercise real production code from
+// unit tests, with catastrophic consequences for test reliability and CI
+// health. See the bindreams/hole#165 incident.
+//
+// Module layout:
+//
+// - [`config`] — `ProxyError`, `TUN_DEVICE_NAME`, `TUN_SUBNET`, and the
+//   shadowsocks-service config builder. Not conceptually part of the
+//   `Proxy` trait but lives in the same module tree because everything
+//   proxy-related is funneled through this module.
+// - [`shadowsocks`] — `ShadowsocksProxy` / `ShadowsocksRunning`, the
+//   production implementation.
 
-// Errors ==============================================================================================================
+use shadowsocks_service::config::Config;
 
-#[derive(Debug, Error)]
-pub enum ProxyError {
-    #[error("invalid cipher method: {0}")]
-    InvalidMethod(String),
-    #[error("invalid plugin name: {0}")]
-    InvalidPluginName(String),
-    #[error("proxy runtime error: {0}")]
-    Runtime(#[from] std::io::Error),
-    #[error("gateway detection failed: {0}")]
-    Gateway(String),
-    #[error("DNS resolution failed for {host}: {source}")]
-    DnsResolution { host: String, source: std::io::Error },
-    #[error("route setup failed: {0}")]
-    RouteSetup(String),
-    #[error("proxy already running")]
-    AlreadyRunning,
-    /// The start was cancelled via `CancellationToken` before it could
-    /// complete. The error message is the stable `CANCELLED_MESSAGE`
-    /// constant from `hole_common::protocol` so bridge and client can
-    /// round-trip it exactly. Not set as `last_error` — the user asked
-    /// for the cancel, so it is not a diagnostic failure.
-    #[error("cancelled")]
-    Cancelled,
-    #[error("wintun.dll not found (tried: {})", .tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
-    WintunMissing { tried: Vec<PathBuf> },
-    #[error("wintun.dll load failed at {}: {message}", .path.display())]
-    WintunLoad { path: PathBuf, message: String },
+pub mod config;
+pub mod shadowsocks;
+
+pub use config::{build_ss_config, ProxyError, TUN_DEVICE_NAME, TUN_SUBNET};
+pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
+
+// Used by `server_test.rs` + `proxy_tests.rs`. Kept crate-private so
+// external consumers can't rely on it.
+pub(crate) use config::resolve_plugin_path_inner;
+
+// Trait surface =======================================================================================================
+
+/// A proxy tunnel implementation.
+///
+/// Calling [`start`](Self::start) spawns a fresh running-proxy handle
+/// ([`Self::Running`]) per invocation. The factory (`Self`) is persistent
+/// across multiple start/stop cycles and holds whatever configuration or
+/// test instrumentation is needed; the running handle is single-use and
+/// owns the spawned task.
+///
+/// The trait takes `&self` (not `&mut self`) on `start` so that
+/// [`crate::proxy_manager::ProxyManager::start_inner`] can be a cancel-safe
+/// future that operates on locally-owned RAII state without ever mutating
+/// `ProxyManager`. See [`crate::proxy_manager`] for the cancellation
+/// contract.
+pub trait Proxy: Send + Sync {
+    type Running: RunningProxy + Send;
+
+    /// Spawn a new proxy tunnel from `config`. On success returns an
+    /// owned [`Self::Running`] handle whose `Drop` aborts the spawned
+    /// task if it is dropped without an explicit `stop().await`.
+    fn start(&self, config: Config) -> impl std::future::Future<Output = Result<Self::Running, ProxyError>> + Send;
 }
 
-// Config builder ======================================================================================================
-
-/// TUN interface subnet (hardcoded, not configurable via IPC).
-pub const TUN_SUBNET: &str = "10.255.0.1/24";
-
-/// TUN interface device name.
-pub const TUN_DEVICE_NAME: &str = "hole-tun";
-
-/// Build a shadowsocks-service Config from our ProxyConfig.
+/// Handle on a running proxy tunnel returned from [`Proxy::start`].
 ///
-/// The number of local instances depends on `config.tunnel_mode`:
-/// - [`TunnelMode::Full`] (production default): TUN + SOCKS5. The TUN
-///   adapter provides transparent proxying for all traffic; the SOCKS5
-///   listener is there for advanced users.
-/// - [`TunnelMode::SocksOnly`]: SOCKS5 only. No TUN adapter is created
-///   by `shadowsocks-service::local::Server::new`, so the resulting
-///   server works without elevation. Used by advanced users who want a
-///   pure SOCKS5 provider (browser proxy settings, curl --socks5), and
-///   by the e2e test harness to exercise the bridge without admin.
-pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
-    let entry = &config.server;
+/// Single-use: [`stop`](Self::stop) consumes `self`. Drop aborts the
+/// underlying task best-effort. A type implementing `RunningProxy` MUST
+/// also implement `Drop` such that the spawned task is aborted on drop —
+/// this is the cancellation-safety primitive that
+/// [`crate::proxy_manager::ProxyManager::start_inner`] relies on.
+pub trait RunningProxy: Send + Sync {
+    /// Cheap, synchronous check: is the underlying task still running?
+    fn is_alive(&self) -> bool;
 
-    // Parse cipher method
-    let method = entry
-        .method
-        .parse()
-        .map_err(|_| ProxyError::InvalidMethod(entry.method.clone()))?;
-
-    // Build server config
-    let server_addr = ServerAddr::DomainName(entry.server.clone(), entry.server_port);
-    let mut server_config = ServerConfig::new(server_addr, entry.password.clone(), method)
-        .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;
-
-    // Configure v2ray-plugin if present
-    if let Some(ref plugin) = entry.plugin {
-        if !is_valid_plugin_name(plugin) {
-            return Err(ProxyError::InvalidPluginName(plugin.clone()));
-        }
-        let plugin_path = resolve_plugin_path(plugin);
-
-        server_config.set_plugin(shadowsocks::plugin::PluginConfig {
-            plugin: plugin_path,
-            plugin_opts: entry.plugin_opts.clone(),
-            plugin_args: Vec::new(),
-            plugin_mode: shadowsocks::config::Mode::TcpOnly,
-        });
-    }
-
-    let mut ss_config = Config::new(ConfigType::Local);
-
-    // Server
-    ss_config
-        .server
-        .push(ServerInstanceConfig::with_server_config(server_config));
-
-    // Local 1: TUN (only in Full mode). SocksOnly deliberately skips
-    // this — `shadowsocks-service::local::Server::new` would otherwise
-    // try to open the TUN adapter, which requires elevation.
-    if matches!(config.tunnel_mode, TunnelMode::Full) {
-        let mut tun_local = LocalConfig::new(ProtocolType::Tun);
-        tun_local.tun_interface_address = Some(TUN_SUBNET.parse().expect("TUN_SUBNET is a valid CIDR literal"));
-        tun_local.tun_interface_name = Some(TUN_DEVICE_NAME.to_owned());
-        ss_config.local.push(LocalInstanceConfig::with_local_config(tun_local));
-    }
-
-    // Local 2: SOCKS5 (always present — the production bridge has always
-    // exposed this alongside TUN, and it's the only thing present in
-    // SocksOnly mode).
-    let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port)
-        .parse()
-        .expect("127.0.0.1:{u16} is always a valid SocketAddr");
-    let socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
-    ss_config
-        .local
-        .push(LocalInstanceConfig::with_local_config(socks_local));
-
-    Ok(ss_config)
-}
-
-// Plugin resolution ===================================================================================================
-
-/// Resolve a plugin binary path by looking next to the bridge executable.
-fn resolve_plugin_path(name: &str) -> String {
-    resolve_plugin_path_inner(name, std::env::current_exe().ok())
-}
-
-/// Inner implementation that accepts an explicit exe path for testability.
-///
-/// Looks for the plugin binary in the same directory as the bridge executable.
-/// On Windows, appends `.exe` if the name doesn't already end with it.
-/// Falls back to the bare name so that shadowsocks does a PATH lookup.
-///
-/// The PATH fallback is safe because `is_valid_plugin_name()` ensures the name
-/// contains no path separators — PATH lookup can only find binaries in directories
-/// that an administrator placed on PATH (standard system-level trust model).
-pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
-    if let Some(exe) = bridge_exe {
-        // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
-        // but the sibling plugin binary is next to the real binary.
-        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-        if let Some(dir) = exe.parent() {
-            let candidate = if cfg!(windows) && !name.ends_with(".exe") {
-                dir.join(format!("{name}.exe"))
-            } else {
-                dir.join(name)
-            };
-            if candidate.is_file() {
-                return candidate.to_string_lossy().to_string();
-            }
-        }
-    }
-    name.to_string()
+    /// Graceful shutdown: abort the task and await its result so errors
+    /// can be reported to the caller. Idempotent with respect to
+    /// subsequent `Drop` because `stop` consumes `self`.
+    fn stop(self) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
 }
 
 #[cfg(test)]

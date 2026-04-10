@@ -2309,7 +2309,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "skuld",
+ "skuld 0.1.0 (git+https://github.com/bindreams/skuld)",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2350,7 +2350,7 @@ dependencies = [
  "serde_json",
  "shadowsocks",
  "shadowsocks-service",
- "skuld",
+ "skuld 0.1.0 (git+https://github.com/bindreams/skuld?rev=ce215370354a2624b5f1662c96190424df8329aa)",
  "socket2",
  "tempfile",
  "thiserror 2.0.18",
@@ -2378,7 +2378,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "skuld",
+ "skuld 0.1.0 (git+https://github.com/bindreams/skuld)",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -5277,6 +5277,22 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 [[package]]
 name = "skuld"
 version = "0.1.0"
+source = "git+https://github.com/bindreams/skuld?rev=ce215370354a2624b5f1662c96190424df8329aa#ce215370354a2624b5f1662c96190424df8329aa"
+dependencies = [
+ "clap",
+ "inventory",
+ "libtest-mimic",
+ "serde",
+ "serde_yml",
+ "skuld-macros 0.1.0 (git+https://github.com/bindreams/skuld?rev=ce215370354a2624b5f1662c96190424df8329aa)",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "skuld"
+version = "0.1.0"
 source = "git+https://github.com/bindreams/skuld#e63157105a0a38eb5b6f22972e8ac892fcf47519"
 dependencies = [
  "clap",
@@ -5284,8 +5300,18 @@ dependencies = [
  "libtest-mimic",
  "serde",
  "serde_yml",
- "skuld-macros",
+ "skuld-macros 0.1.0 (git+https://github.com/bindreams/skuld)",
  "tempfile",
+]
+
+[[package]]
+name = "skuld-macros"
+version = "0.1.0"
+source = "git+https://github.com/bindreams/skuld?rev=ce215370354a2624b5f1662c96190424df8329aa#ce215370354a2624b5f1662c96190424df8329aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7927,7 +7953,7 @@ dependencies = [
  "clap",
  "glob",
  "sha2 0.11.0",
- "skuld",
+ "skuld 0.1.0 (git+https://github.com/bindreams/skuld)",
  "tempfile",
  "ureq",
  "xtask-lib",
@@ -7940,7 +7966,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "semver",
- "skuld",
+ "skuld 0.1.0 (git+https://github.com/bindreams/skuld)",
  "tempfile",
 ]
 

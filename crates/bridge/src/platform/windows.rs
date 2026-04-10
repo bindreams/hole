@@ -86,8 +86,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .unwrap_or_else(hole_common::paths::default_state_dir);
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy_manager::RealBackend,
-            state_dir.clone(),
+            crate::proxy::ShadowsocksProxy::new(),
+            crate::routing::SystemRouting::new(state_dir.clone()),
         )));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 

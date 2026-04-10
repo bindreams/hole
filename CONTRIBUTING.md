@@ -156,3 +156,26 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```sh
 cargo test --workspace
 ```
+
+### Investigating Windows CI flakes
+
+When Windows CI fails with a timeout in `server_test_tests` or loopback connects time out unexpectedly, work through these steps IN ORDER before proposing any timeout bump. bindreams/hole#165 was debugged for multiple hours because these steps were not documented — the bug was a unit test that shelled out to `netsh` via an RAII guard that bypassed the backend trait.
+
+1. **Grep the failing test output for `routing subprocesses` or `netsh|route add|route delete`.** The #165 fix added a regression test (`proxy_manager_tests_never_spawn_routing_subprocess`) that prints `"proxy_manager start/stop cycles spawned N routing subprocesses"` and asserts `N == 0`. If that assertion fires, a new code path has bypassed the `Routing` trait — find the new `Drop` impl or helper that calls the free `routing::setup_routes`/`teardown_routes` functions and route it through the trait. Clippy's `disallowed_methods` lint should have caught this at build time; if it didn't, the lint needs tightening.
+
+1. **Run `cargo clippy --workspace` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
+
+1. **Check for new `std::process::Command::new` calls in recent diffs to `crates/bridge/src/`.** Not covered by the clippy lint (too broad a ban would break platform/group.rs). Each new usage is a potential test-time subprocess leak.
+
+1. **Check the runner-level duration lines in skuld's stderr** — skuld prints `[skuld] <test>: pass (NN ms)` for every test. Any test whose duration is a significant outlier compared to main is the load driver.
+
+1. **Compare with a recent main branch CI run on the same runner image.** If main passes and your branch doesn't, the delta is in your branch (necessary but not sufficient — #165 was a latent bug that a new branch tripped via timing).
+
+1. **Only if all of the above rule out code-level issues**, consider that the CI runner image itself has changed. Open a tracking issue and reconstruct a packet-capture CI job from git history at branch `azhukova/165` — do not bump timeouts without completing the investigation.
+
+**Do NOT, under any circumstances:**
+
+- Bump timeouts in `server_test_tests.rs` without completing steps 1-5
+- Mark failing tests with `#[cfg_attr(windows, ignore)]`
+- Add `--test-threads=1` to the Windows CI invocation
+- Serialize tests via `#[skuld::test(serial)]` except for structural invariant checks
