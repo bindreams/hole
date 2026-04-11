@@ -30,7 +30,6 @@ const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: cl
 #[derive(Debug, Clone)]
 pub struct TestConfig {
     pub preflight_timeout: Duration,
-    pub plugin_wait_timeout: Duration,
     pub ss_connect_timeout: Duration,
     pub sentinel_read_timeout: Duration,
     /// Two sentinel `host:port` strings (the second is the fallback).
@@ -45,7 +44,6 @@ impl TestConfig {
     pub fn production() -> Self {
         Self {
             preflight_timeout: Duration::from_secs(2),
-            plugin_wait_timeout: Duration::from_secs(5),
             ss_connect_timeout: Duration::from_secs(5),
             sentinel_read_timeout: Duration::from_secs(5),
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],

@@ -23,7 +23,6 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// CTRL_BREAK on Windows, 5s drain timeout) and aborts the task as a
 /// safety net.
 pub struct PluginChain {
-    #[allow(dead_code)]
     handle: tokio::task::JoinHandle<garter::Result<()>>,
     cancel: CancellationToken,
     local_addr: SocketAddr,
@@ -85,6 +84,9 @@ pub async fn start_plugin_chain(
         local_port: local_addr.port(),
         remote_host: server_host.to_string(),
         remote_port: server_port,
+        // Not consumed by ChainRunner (it reads local/remote from the env).
+        // BinaryPlugin gets the options via its own `options` field. Set here
+        // only because PluginEnv requires it for completeness.
         plugin_options: plugin_opts.map(String::from),
     };
 
@@ -95,11 +97,21 @@ pub async fn start_plugin_chain(
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    // Wait for the plugin to bind its local port.
-    let local_addr = tokio::time::timeout(READINESS_TIMEOUT, ready_rx)
-        .await
-        .map_err(|_| ProxyError::Plugin("plugin did not become ready within 30s".into()))?
-        .map_err(|_| ProxyError::Plugin("plugin exited before becoming ready".into()))?;
+    // Wait for the plugin to bind its local port. On failure, clean up the
+    // spawned task and cancel the plugin — otherwise they're orphaned.
+    let local_addr = match tokio::time::timeout(READINESS_TIMEOUT, ready_rx).await {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(_)) => {
+            cancel.cancel();
+            handle.abort();
+            return Err(ProxyError::Plugin("plugin exited before becoming ready".into()));
+        }
+        Err(_) => {
+            cancel.cancel();
+            handle.abort();
+            return Err(ProxyError::Plugin("plugin did not become ready within 30s".into()));
+        }
+    };
 
     Ok(PluginChain {
         handle,

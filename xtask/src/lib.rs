@@ -66,8 +66,7 @@ pub enum Command {
     Wintun,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
-    /// Currently: `v2ray-plugin` + `wintun`. The runtime asset acquisition
-    /// previously embedded in `crates/hole/build.rs`.
+    /// Currently: `v2ray-plugin` + `galoshes` + `wintun`.
     Deps,
     /// Print or validate the workspace version. Replaces scripts/check-version.py.
     Version {
