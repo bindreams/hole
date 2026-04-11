@@ -170,41 +170,6 @@ async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -
     Ok(())
 }
 
-/// Relay UDP datagrams over a yamux stream using length-prefixed framing.
-///
-/// Client side: reads from a local UDP socket, frames datagrams and sends over
-/// the yamux stream; reads framed datagrams from the yamux stream and sends
-/// back to the last known peer address.
-async fn relay_udp_client(mut yamux_stream: yamux::Stream, udp: &UdpSocket, peer: SocketAddr) -> Result<()> {
-    let mut recv_buf = [0u8; 65536 + 2];
-    let mut udp_buf = [0u8; 65536];
-
-    loop {
-        tokio::select! {
-            // UDP -> yamux
-            result = udp.recv_from(&mut udp_buf) => {
-                let (n, _from) = result.context("udp recv")?;
-                let framed = frame_udp_datagram(&udp_buf[..n]);
-                yamux_stream.write_all(&framed).await.context("yamux write")?;
-                yamux_stream.flush().await.context("yamux flush")?;
-            }
-            // yamux -> UDP
-            result = yamux_stream.read(&mut recv_buf) => {
-                let n = result.context("yamux read")?;
-                if n == 0 {
-                    break;
-                }
-                // Simple: assume one complete frame per read for now.
-                if let Some((payload, _)) = deframe_udp_datagram(&recv_buf[..n]) {
-                    udp.send_to(payload, peer).await.context("udp send")?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Relay UDP datagrams on the server side: yamux stream <-> remote UDP socket.
 async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -> Result<()> {
     let udp = UdpSocket::bind("127.0.0.1:0").await.context("bind udp")?;

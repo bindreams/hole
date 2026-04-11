@@ -7,6 +7,6 @@
 	remote = https://github.com/shadowsocks/v2ray-plugin.git
 	branch = master
 	commit = e9af1cdd2549d528deb20a4ab8d61c5fbe51f306
-	parent = 1cc7f4b9cb2b5d4a26f25256762a9115b09ca5f9
+	parent = 86783bc4f4a5eeabed88bd1ded7bff936862b2be
 	method = merge
 	cmdver = 0.4.9
