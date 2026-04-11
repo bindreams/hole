@@ -45,6 +45,8 @@ pub enum ProxyError {
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
     WintunLoad { path: PathBuf, message: String },
+    #[error("plugin error: {0}")]
+    Plugin(String),
 }
 
 // Config builder ======================================================================================================
