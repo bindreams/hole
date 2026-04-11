@@ -16,6 +16,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use thiserror::Error;
 
+use hole_common::plugin;
+
 // Errors ==============================================================================================================
 
 #[derive(Debug, Error)]
@@ -59,13 +61,23 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 
 /// Build a shadowsocks-service Config from our ProxyConfig.
 ///
-/// Always creates exactly one local instance: SOCKS5 on
-/// `127.0.0.1:{local_port}` with `Mode::TcpAndUdp`. The TUN device is
-/// now owned by the dispatcher (`crates/bridge/src/dispatcher/`), not
-/// by shadowsocks-service. `TunnelMode` is respected by the
-/// `ProxyManager` which skips the dispatcher in `SocksOnly` mode.
-pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
+/// When `plugin_local` is `Some`, the server address is overridden to point
+/// at the Garter-managed plugin chain's local port. The cipher and password
+/// remain the original server's — the server address is just the transport
+/// endpoint, not part of the shadowsocks protocol. No `PluginConfig` is set
+/// on the `ServerConfig` because Garter owns the plugin lifecycle.
+///
+/// When `plugin_local` is `None`, the original server address is used as-is
+/// (no plugin, or plugin management is handled elsewhere).
+pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -> Result<Config, ProxyError> {
     let entry = &config.server;
+
+    // Validate plugin name (format check, not known-plugin check).
+    if let Some(ref p) = entry.plugin {
+        if !is_valid_plugin_name(p) {
+            return Err(ProxyError::InvalidPluginName(p.clone()));
+        }
+    }
 
     // Parse cipher method
     let method = entry
@@ -73,25 +85,16 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
         .parse()
         .map_err(|_| ProxyError::InvalidMethod(entry.method.clone()))?;
 
-    // Build server config
-    let server_addr = ServerAddr::DomainName(entry.server.clone(), entry.server_port);
-    let mut server_config = ServerConfig::new(server_addr, entry.password.clone(), method)
+    // Build server config. When a plugin chain is running, point ss-service
+    // at the chain's local port instead of the real server.
+    let server_addr = match plugin_local {
+        Some(addr) => ServerAddr::SocketAddr(addr),
+        None => ServerAddr::DomainName(entry.server.clone(), entry.server_port),
+    };
+    let server_config = ServerConfig::new(server_addr, entry.password.clone(), method)
         .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;
 
-    // Configure v2ray-plugin if present
-    if let Some(ref plugin) = entry.plugin {
-        if !is_valid_plugin_name(plugin) {
-            return Err(ProxyError::InvalidPluginName(plugin.clone()));
-        }
-        let plugin_path = resolve_plugin_path(plugin);
-
-        server_config.set_plugin(shadowsocks::plugin::PluginConfig {
-            plugin: plugin_path,
-            plugin_opts: entry.plugin_opts.clone(),
-            plugin_args: Vec::new(),
-            plugin_mode: shadowsocks::config::Mode::TcpOnly,
-        });
-    }
+    // No PluginConfig is set — Garter manages the plugin lifecycle externally.
 
     let mut ss_config = Config::new(ConfigType::Local);
 
@@ -117,17 +120,21 @@ pub fn build_ss_config(config: &ProxyConfig) -> Result<Config, ProxyError> {
 // Plugin resolution ===================================================================================================
 
 /// Resolve a plugin binary path by looking next to the bridge executable.
-fn resolve_plugin_path(name: &str) -> String {
+pub fn resolve_plugin_path(name: &str) -> String {
     resolve_plugin_path_inner(name, std::env::current_exe().ok())
 }
 
 /// Whether UDP can be proxied through the shadowsocks server.
 ///
-/// Returns `false` when a v2ray-plugin is configured — plugins are
-/// TCP-only by protocol definition, so UDP traffic cannot be carried.
-/// The dispatcher uses this to downgrade UDP Proxy actions to Bypass.
+/// Returns `false` when a TCP-only plugin is configured (e.g. plain
+/// v2ray-plugin). Returns `true` for plugins with UDP support (e.g.
+/// galoshes, which uses YAMUX multiplexing). The dispatcher uses this
+/// to downgrade UDP Proxy actions to Bypass when UDP isn't available.
 pub fn udp_proxy_available(config: &ProxyConfig) -> bool {
-    config.server.plugin.is_none()
+    match &config.server.plugin {
+        None => true,
+        Some(name) => plugin::lookup(name).is_some_and(|p| p.udp_supported),
+    }
 }
 
 /// Inner implementation that accepts an explicit exe path for testability.
