@@ -159,3 +159,19 @@ pub(crate) fn locate_built_v2ray_plugin() -> PathBuf {
     };
     target_dir.join(profile).join(bin)
 }
+
+/// Locate the galoshes binary built by `cargo xtask galoshes`.
+///
+/// Galoshes is built inside the galoshes subrepo's own target directory,
+/// always in release mode (it embeds v2ray-plugin at compile time).
+pub(crate) fn locate_built_galoshes() -> PathBuf {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let bin = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
+    workspace_root
+        .join("external")
+        .join("galoshes")
+        .join("target")
+        .join("release")
+        .join(bin)
+}
