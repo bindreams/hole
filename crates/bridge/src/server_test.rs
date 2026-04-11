@@ -9,10 +9,9 @@
 use crate::proxy::resolve_plugin_path_inner;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT};
-use shadowsocks::config::{Mode, ServerAddr, ServerConfig, ServerType};
+use shadowsocks::config::{ServerAddr, ServerConfig, ServerType};
 use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
-use shadowsocks::plugin::{Plugin, PluginConfig, PluginMode};
 use shadowsocks::relay::socks5::Address;
 use shadowsocks::ProxyClientStream;
 use std::io::ErrorKind;
@@ -191,18 +190,17 @@ fn build_server_config(entry: &ServerEntry) -> Result<ServerConfig, String> {
     .map_err(|e| format!("invalid server config: {e}"))
 }
 
-/// If `entry.plugin` is set, spawn it in client mode and store its bound
-/// `local_addr` on `svr_cfg` so [`ProxyClientStream::connect`] dials the
-/// plugin instead of the upstream port.
+/// If `entry.plugin` is set, spawn it via Garter and override `svr_cfg`'s
+/// server address to point at the plugin chain's local port.
 ///
 /// Returns `Ok(None)` if no plugin is configured (plain shadowsocks). Returns
-/// the [`Plugin`] guard otherwise — its [`Drop`] impl SIGTERMs and then
-/// SIGKILLs the child on every exit path.
+/// the [`PluginChain`] guard otherwise — its [`Drop`] cancels the chain
+/// (SIP003u graceful shutdown).
 async fn maybe_start_plugin(
     entry: &ServerEntry,
     svr_cfg: &mut ServerConfig,
     cfg: &TestConfig,
-) -> Result<Option<Plugin>, ServerTestOutcome> {
+) -> Result<Option<crate::proxy::plugin::PluginChain>, ServerTestOutcome> {
     let Some(plugin_name) = entry.plugin.as_ref() else {
         return Ok(None);
     };
@@ -212,42 +210,29 @@ async fn maybe_start_plugin(
         .clone()
         .unwrap_or_else(|| resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()));
 
-    let plugin_cfg = PluginConfig {
-        plugin: plugin_path,
-        plugin_opts: entry.plugin_opts.clone(),
-        plugin_args: vec![],
-        plugin_mode: Mode::TcpOnly,
+    let (server_host, server_port) = match svr_cfg.addr() {
+        ServerAddr::SocketAddr(sa) => (sa.ip().to_string(), sa.port()),
+        ServerAddr::DomainName(host, port) => (host.clone(), *port),
     };
 
-    // Spawn the plugin BEFORE installing it on the svr_cfg, so we can use
-    // svr_cfg.addr() (the upstream public addr) as the plugin's
-    // remote_addr. After the plugin binds locally, we register it on
-    // svr_cfg via set_plugin + set_plugin_addr so that
-    // `tcp_external_addr()` returns the plugin's bound local address —
-    // this is what makes `ProxyClientStream::connect` dial the local
-    // plugin instead of bypassing it and going straight to upstream.
-    let remote_addr = svr_cfg.addr().clone();
-    let plugin = match Plugin::start(&plugin_cfg, &remote_addr, PluginMode::Client) {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(ServerTestOutcome::PluginStartFailed { detail: e.to_string() });
-        }
-    };
+    let chain =
+        crate::proxy::plugin::start_plugin_chain(&plugin_path, entry.plugin_opts.as_deref(), &server_host, server_port)
+            .await
+            .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
 
-    if !plugin.wait_started(cfg.plugin_wait_timeout).await {
-        return Err(ServerTestOutcome::PluginStartFailed {
-            detail: format!(
-                "plugin process started but never bound its local port within {:?}",
-                cfg.plugin_wait_timeout
-            ),
-        });
-    }
+    // Override the server address to point at the plugin's local port.
+    let local = chain.local_addr();
+    *svr_cfg = ServerConfig::new(
+        ServerAddr::SocketAddr(local),
+        svr_cfg.password().to_owned(),
+        svr_cfg.method(),
+    )
+    .map_err(|e| ServerTestOutcome::PluginStartFailed {
+        detail: format!("failed to rebuild server config: {e}"),
+    })?;
 
-    let local = plugin.local_addr();
-    svr_cfg.set_plugin(plugin_cfg);
-    svr_cfg.set_plugin_addr(ServerAddr::SocketAddr(local));
     debug!("server_test plugin bound at {local}");
-    Ok(Some(plugin))
+    Ok(Some(chain))
 }
 
 /// Open a single shadowsocks tunnel through `svr_cfg` to `sentinel_str`,
