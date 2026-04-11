@@ -9,6 +9,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bindir;
+pub mod galoshes;
 pub mod stage;
 pub mod v2ray_plugin;
 pub mod wintun;
@@ -54,6 +55,11 @@ pub enum Command {
     /// Output goes into `<repo>/.cache/v2ray-plugin/`. Replaces the previous
     /// build.rs side effect.
     V2rayPlugin,
+    /// Build the galoshes sidecar from `external/galoshes/`.
+    ///
+    /// Builds galoshes' embedded v2ray-plugin first (independent version),
+    /// then the galoshes binary itself in release mode.
+    Galoshes,
     /// Download and verify wintun.dll on Windows.
     ///
     /// Output goes into `<repo>/.cache/wintun/`. No-op on non-Windows.
@@ -96,6 +102,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Stage { profile, out_dir } => run_stage(profile, &out_dir),
         Command::V2rayPlugin => run_v2ray_plugin(),
+        Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::Deps => run_deps(),
         Command::Version { check, exact } => run_version(check, exact),
@@ -126,8 +133,16 @@ pub fn run_wintun() -> Result<()> {
     Ok(())
 }
 
+pub fn run_galoshes() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = galoshes::build(&repo_root)?;
+    println!("xtask: galoshes built at {}", path.display());
+    Ok(())
+}
+
 pub fn run_deps() -> Result<()> {
     run_v2ray_plugin()?;
+    run_galoshes()?;
     run_wintun()?;
     Ok(())
 }
