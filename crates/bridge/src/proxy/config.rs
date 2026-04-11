@@ -129,7 +129,7 @@ pub fn resolve_plugin_path(name: &str) -> String {
 /// Returns `false` when a TCP-only plugin is configured (e.g. plain
 /// v2ray-plugin). Returns `true` for plugins with UDP support (e.g.
 /// galoshes, which uses YAMUX multiplexing). The dispatcher uses this
-/// to downgrade UDP Proxy actions to Bypass when UDP isn't available.
+/// to block UDP traffic that cannot be proxied.
 pub fn udp_proxy_available(config: &ProxyConfig) -> bool {
     match &config.server.plugin {
         None => true,

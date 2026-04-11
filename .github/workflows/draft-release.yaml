@@ -13,11 +13,6 @@ on:
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
-
 jobs:
   validate:
     name: Validate version
@@ -64,28 +59,12 @@ jobs:
       - name: Create local tag for build
         run: git tag "v${{ needs.validate.outputs.version }}"
 
-      - uses: dtolnay/rust-toolchain@stable
-        id: rust-toolchain
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: stable
-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Fetch runtime deps (v2ray-plugin, wintun)
-        run: cargo xtask deps
-
-      # Windows build
       - uses: astral-sh/setup-uv@v7
         if: matrix.os == 'windows'
+
+      - uses: ./.github/actions/setup-build
+
+      # Windows build
       - name: Build MSI
         if: matrix.os == 'windows'
         run: uv run --directory msi-installer build

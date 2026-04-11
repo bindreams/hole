@@ -1,0 +1,35 @@
+name: Setup Build
+description: Set up a compilable Rust workspace (toolchains, cache, runtime deps)
+
+runs:
+  using: composite
+  steps:
+    - name: Set cargo env vars
+      shell: bash
+      run: |
+        echo "CARGO_TERM_COLOR=always" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+    - uses: dtolnay/rust-toolchain@stable
+      id: rust-toolchain
+      with:
+        components: clippy, rustfmt
+
+    - uses: actions/setup-go@v6
+      with:
+        go-version: stable
+
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+
+    - uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Fetch runtime deps (v2ray-plugin, wintun)
+      shell: bash
+      run: cargo xtask deps

@@ -95,14 +95,14 @@ async fn create_udp_flow_inner(
     let decision = decide(rules, &conn_info);
     let mut action = decision.action;
 
-    // 3. Plugin incompatibility: downgrade Proxy -> Bypass when UDP relay
-    //    is unavailable (v2ray-plugin does not support UDP).
+    // 3. Plugin incompatibility: block when UDP relay is unavailable
+    //    (v2ray-plugin does not support UDP).
     if action == FilterAction::Proxy && !ctx.udp_proxy_available {
         let mut block_log = ctx.block_log.lock().unwrap();
         if block_log.should_log(decision.rule_index.unwrap_or(0) as u32, dst_ip, dst_port) {
-            warn!(dst_ip = %dst_ip, dst_port, "UDP proxy unavailable (v2ray-plugin), bypassing");
+            warn!(dst_ip = %dst_ip, dst_port, "UDP proxy unavailable (v2ray-plugin), blocking");
         }
-        action = FilterAction::Bypass;
+        action = FilterAction::Block;
     }
 
     // 4. Resolve bypass IP if needed.
