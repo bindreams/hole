@@ -59,7 +59,18 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     let v2ray_dest = format!("v2ray-plugin{exe_suffix}");
     files.push(BindirFile::new(v2ray_src, v2ray_dest));
 
-    // 3. wintun.dll — Windows-only. Downloaded by `cargo xtask wintun` into
+    // 3. galoshes sidecar. Built by `cargo xtask galoshes` into
+    //    `external/galoshes/target/release/galoshes{.exe}`.
+    let galoshes_name = format!("galoshes{exe_suffix}");
+    let galoshes_src = repo_root
+        .join("external")
+        .join("galoshes")
+        .join("target")
+        .join("release")
+        .join(&galoshes_name);
+    files.push(BindirFile::new(galoshes_src, galoshes_name));
+
+    // 4. wintun.dll — Windows-only. Downloaded by `cargo xtask wintun` into
     //    `.cache/wintun/wintun.dll`. Not a sidecar binary; loaded as a DLL by
     //    the bridge's TUN code path. See crates/bridge/src/wintun.rs.
     #[cfg(target_os = "windows")]

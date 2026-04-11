@@ -28,7 +28,7 @@ use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
 use crate::test_support::port_alloc::allocate_ephemeral_port;
 use crate::test_support::ssserver::{
-    locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_quic,
+    locate_built_galoshes, start_real_ss_server, start_real_ss_server_with_plugin_quic,
     start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR,
     TEST_PASSWORD,
 };
@@ -45,21 +45,18 @@ pub(crate) struct SsServerHandle {
     _runtime: tokio::runtime::Runtime,
 }
 
-/// Verify the cargo-built v2ray-plugin binary exists and return its
-/// absolute path. Panics with a clear remediation message if the binary
-/// is missing — per CLAUDE.md, tests must fail loudly on missing
-/// dependencies.
+/// Verify the galoshes binary exists and return its absolute path.
+/// Panics with a clear remediation message if the binary is missing —
+/// per CLAUDE.md, tests must fail loudly on missing dependencies.
 ///
 /// Used to point the **server-side** `start_real_ss_server_with_plugin_*`
-/// helpers at the plugin. The **client-side** plugin is resolved by the
-/// bridge subprocess at runtime (it finds `v2ray-plugin` next to its own
-/// `hole` binary in the dist dir staged by the `dist_dir` fixture). So
-/// this helper does NOT touch any ambient process state — no env vars,
-/// no file copies.
-fn require_v2ray_plugin() -> String {
-    let source = locate_built_v2ray_plugin();
+/// helpers at galoshes. The **client-side** plugin is resolved by the
+/// bridge subprocess at runtime (it finds `galoshes` next to its own
+/// `hole` binary in the dist dir staged by the `dist_dir` fixture).
+fn require_galoshes() -> String {
+    let source = locate_built_galoshes();
     if !source.is_file() {
-        panic!("v2ray-plugin not built at {source:?} — run 'cargo build --workspace' before 'cargo test'",);
+        panic!("galoshes not built at {source:?} — run 'cargo xtask galoshes' before 'cargo test'",);
     }
     source.to_str().expect("plugin path is valid utf-8").to_string()
 }
@@ -84,10 +81,10 @@ pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
     })
 }
 
-/// Shadowsocks server fronted by v2ray-plugin (websocket, no TLS).
+/// Shadowsocks server fronted by galoshes (websocket, no TLS).
 #[skuld::fixture(scope = process)]
 pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
-    let plugin_path = require_v2ray_plugin();
+    let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let addr = runtime.block_on(async {
         let public_port = allocate_ephemeral_port().await;
@@ -99,16 +96,16 @@ pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
         addr,
         method: TEST_METHOD_STR,
         password: TEST_PASSWORD.to_string(),
-        plugin: Some("v2ray-plugin".to_string()),
+        plugin: Some("galoshes".to_string()),
         plugin_opts: Some("host=cloudfront.com;path=/".to_string()),
         _runtime: runtime,
     })
 }
 
-/// Shadowsocks server fronted by v2ray-plugin (websocket + TLS).
+/// Shadowsocks server fronted by galoshes (websocket + TLS).
 #[skuld::fixture(scope = process)]
 pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
-    let plugin_path = require_v2ray_plugin();
+    let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
         "host=cloudfront.com;path=/;tls;cert={};key={}",
@@ -125,17 +122,17 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
         addr,
         method: TEST_METHOD_STR,
         password: TEST_PASSWORD.to_string(),
-        plugin: Some("v2ray-plugin".to_string()),
+        plugin: Some("galoshes".to_string()),
         plugin_opts: Some(plugin_opts),
         _runtime: runtime,
     })
 }
 
-/// Shadowsocks server fronted by v2ray-plugin (QUIC transport). QUIC
-/// auto-enables TLS inside v2ray-plugin so the cert+key pair is required.
+/// Shadowsocks server fronted by galoshes (QUIC transport). QUIC
+/// auto-enables TLS inside the wrapped v2ray-plugin so the cert+key pair is required.
 #[skuld::fixture(scope = process)]
 pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
-    let plugin_path = require_v2ray_plugin();
+    let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let plugin_opts = format!(
         "host=cloudfront.com;mode=quic;cert={};key={}",
@@ -152,7 +149,7 @@ pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<
         addr,
         method: TEST_METHOD_STR,
         password: TEST_PASSWORD.to_string(),
-        plugin: Some("v2ray-plugin".to_string()),
+        plugin: Some("galoshes".to_string()),
         plugin_opts: Some(plugin_opts),
         _runtime: runtime,
     })

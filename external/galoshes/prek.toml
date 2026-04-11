@@ -1,0 +1,55 @@
+exclude = "^external/"
+default_install_hook_types = ["pre-commit", "commit-msg"]
+
+# Local hooks ==========================================================================================================
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "no-std-test"
+name = "no stray #[test] attribute"
+entry = '^\s*#\[test\]'
+language = "pygrep"
+types = ["rust"]
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+entry = "cargo clippy --all-targets -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+# External hooks =======================================================================================================
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v5.0.0"
+hooks = [
+  { id = "check-executables-have-shebangs" },
+  { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
+  { id = "mixed-line-ending", args = ["--fix=lf"] },
+]
+
+[[repos]]
+repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
+rev = "3.2.1"
+hooks = [
+  { id = "editorconfig-checker", exclude_types = ["rust", "markdown"] },
+]
+
+[[repos]]
+repo = "https://github.com/hukkin/mdformat"
+rev = "1.0.0"
+hooks = [
+  { id = "mdformat", additional_dependencies = ["mdformat-gfm"] },
+]
