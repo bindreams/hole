@@ -1,0 +1,5 @@
+/target
+/.cache
+/.tmp
+CLAUDE.local.md
+.claude/*.local.*
