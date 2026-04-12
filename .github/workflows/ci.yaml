@@ -67,7 +67,8 @@ jobs:
         shell: bash
         env:
           SKULD_DEBUG: "1"
-        run: cargo nextest run --workspace
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --workspace --no-fail-fast
 
 
   test-installer:
