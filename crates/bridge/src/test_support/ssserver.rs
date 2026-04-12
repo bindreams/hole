@@ -129,7 +129,7 @@ async fn spawn_ss_with_galoshes(
 
     // 2. Start galoshes via garter, pointing at the SS server.
     //    Same code path the bridge uses on the client side.
-    let chain = crate::proxy::plugin::start_plugin_chain(
+    match crate::proxy::plugin::start_plugin_chain(
         plugin_path,
         Some(plugin_opts),
         &ss_addr.ip().to_string(),
@@ -137,9 +137,30 @@ async fn spawn_ss_with_galoshes(
         None,
     )
     .await
-    .expect("start server-side galoshes");
-
-    (chain.local_addr(), ss_handle, chain)
+    {
+        Ok(chain) => (chain.local_addr(), ss_handle, chain),
+        Err(e) => {
+            // Diagnostic: try running galoshes directly to capture its stderr.
+            let output = std::process::Command::new(plugin_path)
+                .env("SS_LOCAL_HOST", "127.0.0.1")
+                .env("SS_LOCAL_PORT", "0")
+                .env("SS_REMOTE_HOST", ss_addr.ip().to_string())
+                .env("SS_REMOTE_PORT", ss_addr.port().to_string())
+                .env("SS_PLUGIN_OPTIONS", plugin_opts)
+                .output()
+                .expect("spawn galoshes for diagnostics");
+            panic!(
+                "start server-side galoshes: {e}\n\
+                 --- diagnostic run ---\n\
+                 exit: {:?}\n\
+                 stdout: {}\n\
+                 stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 }
 
 /// Locate the cargo-built `v2ray-plugin` binary in the target directory.
