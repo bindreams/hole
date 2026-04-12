@@ -67,17 +67,8 @@ jobs:
         shell: bash
         env:
           SKULD_DEBUG: "1"
-        run: |
-          set -o pipefail
-          cargo nextest run --workspace 2>&1 | tee target/test-output.log
+        run: cargo nextest run --workspace
 
-      - name: Upload test output on failure
-        if: failure() && steps.test.conclusion == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hole-test-output-${{ runner.os }}-${{ github.run_attempt }}
-          path: target/test-output.log
-          retention-days: 14
 
   test-installer:
     name: Test installer (windows/amd64)
