@@ -5,7 +5,6 @@
 //! returned [`JoinHandle`]s own the server loop and must be kept alive for
 //! the duration of the test that uses them.
 
-use crate::proxy::plugin::PluginChain;
 use crate::test_support::certs::TestCerts;
 use base64::Engine as _;
 use shadowsocks::config::{Mode, ServerConfig};
@@ -72,7 +71,7 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>, GaloshesHandle) {
     spawn_ss_with_galoshes(method, password, plugin_path, "server;host=cloudfront.com;path=/").await
 }
 
@@ -84,7 +83,7 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
     password: &str,
     plugin_path: &str,
     certs: &TestCerts,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>, GaloshesHandle) {
     let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
     spawn_ss_with_galoshes(method, password, plugin_path, &opts).await
 }
@@ -97,43 +96,105 @@ pub(crate) async fn start_real_ss_server_with_plugin_quic(
     password: &str,
     plugin_path: &str,
     certs: &TestCerts,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>, GaloshesHandle) {
     let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
     spawn_ss_with_galoshes(method, password, plugin_path, &opts).await
 }
 
 /// Start an SS server (no plugin) + galoshes independently via garter.
 ///
-/// This mirrors the production client-side flow (`start_plugin_chain`):
-/// garter allocates a local port, spawns galoshes, and waits for readiness
-/// via TCP connect probe. No TOCTOU race — the port is confirmed bound
-/// before this function returns.
+/// Uses garter to spawn galoshes and waits for readiness via TCP connect
+/// probe. No TOCTOU: garter allocates ports and the readiness probe
+/// confirms galoshes has bound before this function returns.
 ///
-/// The caller must keep the [`PluginChain`] alive; dropping it shuts down
-/// galoshes.
+/// ## SIP003 env var mapping for server mode
+///
+/// v2ray-plugin in server mode **swaps** the roles of SS_LOCAL/SS_REMOTE:
+/// it LISTENS on SS_REMOTE (public-facing) and CONNECTS to SS_LOCAL (the
+/// SS server). The chain inside galoshes is wired as:
+///
+/// ```text
+/// clients → v2ray (LISTENS on SS_REMOTE) → intermediate → yamux-server → SS_LOCAL → SS server
+/// ```
+///
+/// So we set:
+/// - `SS_LOCAL`  = the SS server's internal address
+/// - `SS_REMOTE` = the galoshes public port (where clients connect)
+///
+/// The caller must keep the returned [`GaloshesHandle`] alive; dropping it
+/// shuts down galoshes.
 async fn spawn_ss_with_galoshes(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
     plugin_opts: &str,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>, GaloshesHandle) {
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
     // 1. Start SS server with no plugin, ephemeral port.
     //    No TOCTOU: SsServerBuilder binds and holds the listener.
     let (ss_addr, ss_handle) = start_real_ss_server(method, password).await;
 
-    // 2. Start galoshes via garter, pointing at the SS server.
-    //    Same code path the bridge uses on the client side.
-    let chain = crate::proxy::plugin::start_plugin_chain(
-        plugin_path,
-        Some(plugin_opts),
-        &ss_addr.ip().to_string(),
-        ss_addr.port(),
-        None,
-    )
-    .await
-    .expect("start server-side galoshes");
+    // 2. Allocate a public port for galoshes (where external clients connect).
+    let public_addr = garter::chain::allocate_ports(1)
+        .expect("allocate public port for server-side galoshes")
+        .into_iter()
+        .next()
+        .expect("allocate_ports(1) returns exactly 1");
 
-    (chain.local_addr(), ss_handle, chain)
+    // 3. Spawn galoshes with server-mode SIP003 env vars.
+    //    SS_LOCAL  → SS server (galoshes connects here internally)
+    //    SS_REMOTE → public port (v2ray-plugin listens here in server mode)
+    let env = garter::PluginEnv {
+        local_host: ss_addr.ip(),
+        local_port: ss_addr.port(),
+        remote_host: public_addr.ip().to_string(),
+        remote_port: public_addr.port(),
+        plugin_options: Some(plugin_opts.to_string()),
+    };
+
+    let cancel = CancellationToken::new();
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let plugin = garter::BinaryPlugin::new(plugin_path, Some(plugin_opts));
+    let runner = garter::ChainRunner::new()
+        .add(Box::new(plugin))
+        .cancel_token(cancel.clone())
+        .on_ready(ready_tx);
+
+    let handle = tokio::spawn(async move { runner.run(env).await });
+
+    // 4. Wait for galoshes to become ready (v2ray binds the public port).
+    //    The readiness probe targets addrs[0] = env.local_addr() = ss_addr,
+    //    but that's the SS server which is already listening. We need to
+    //    wait for the PUBLIC port instead. Do a manual TCP probe.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if tokio::net::TcpStream::connect(public_addr).await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            cancel.cancel();
+            handle.abort();
+            panic!("server-side galoshes did not bind {public_addr} within 30s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Consume the readiness channel (it may fire on ss_addr, which is trivially ready).
+    drop(ready_rx);
+
+    let galoshes = GaloshesHandle {
+        _handle: handle,
+        _cancel: cancel,
+    };
+    (public_addr, ss_handle, galoshes)
+}
+
+/// Keeps the server-side galoshes alive. Dropping cancels the plugin chain.
+pub(crate) struct GaloshesHandle {
+    _handle: tokio::task::JoinHandle<Result<(), garter::Error>>,
+    _cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Locate the cargo-built `v2ray-plugin` binary in the target directory.
