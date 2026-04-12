@@ -5,11 +5,11 @@
 //! returned [`JoinHandle`]s own the server loop and must be kept alive for
 //! the duration of the test that uses them.
 
-use crate::proxy::plugin::PluginChain;
 use crate::test_support::certs::TestCerts;
 use base64::Engine as _;
 use shadowsocks::config::{Mode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
+use shadowsocks::plugin::PluginConfig;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -65,102 +65,82 @@ pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> 
     (addr, handle)
 }
 
-/// Spin up a real shadowsocks server with galoshes (websocket, no TLS)
-/// in front. Returns the public-facing socket address, the spawned server
-/// task handle, and the plugin chain (which must be kept alive).
+/// Spin up a real shadowsocks server with v2ray-plugin (websocket, no TLS)
+/// in front. The plugin listens on `public_port` (which the caller
+/// pre-allocates and passes here) and forwards to the SS server. Returns the
+/// public-facing socket address and the spawned server task handle.
 pub(crate) async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
+    public_port: u16,
     plugin_path: &str,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
-    spawn_ss_with_galoshes(method, password, plugin_path, "server;host=cloudfront.com;path=/").await
+) -> (SocketAddr, JoinHandle<()>) {
+    spawn_ss_with_plugin(
+        method,
+        password,
+        public_port,
+        plugin_path,
+        "server;host=cloudfront.com;path=/",
+    )
+    .await
 }
 
-/// Spin up a real shadowsocks server with galoshes (websocket + TLS) in
+/// Spin up a real shadowsocks server with v2ray-plugin (websocket + TLS) in
 /// front. Same shape as [`start_real_ss_server_with_plugin_ws`] but with TLS
 /// enabled and the cert+key from `certs` mounted on the server side.
 pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
     method: CipherKind,
     password: &str,
+    public_port: u16,
     plugin_path: &str,
     certs: &TestCerts,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>) {
     let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_galoshes(method, password, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
 }
 
-/// Spin up a real shadowsocks server with galoshes (QUIC transport) in
-/// front. QUIC auto-enables TLS inside galoshes's wrapped v2ray-plugin,
-/// so the cert+key pair must still be supplied.
+/// Spin up a real shadowsocks server with v2ray-plugin (QUIC transport) in
+/// front. QUIC auto-enables TLS inside v2ray-plugin
+/// ([main.go:142](../../../external/v2ray-plugin/main.go)), so the cert+key
+/// pair must still be supplied.
 pub(crate) async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,
+    public_port: u16,
     plugin_path: &str,
     certs: &TestCerts,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
+) -> (SocketAddr, JoinHandle<()>) {
     let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_galoshes(method, password, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
 }
 
-/// Start an SS server (no plugin) + galoshes independently via garter.
-///
-/// Uses `start_plugin_chain` (the same production code path the bridge
-/// uses on the client side) to spawn galoshes and wait for readiness.
-/// No TOCTOU: garter allocates the local port and the readiness probe
-/// confirms galoshes has bound before returning.
-///
-/// v2ray-plugin LISTENS on SS_LOCAL and CONNECTS to SS_REMOTE in both
-/// client and server mode (the "server" flag only changes the transport
-/// protocol direction, not the address mapping). So we pass:
-/// - `SS_LOCAL`  = garter-allocated port (galoshes listens here)
-/// - `SS_REMOTE` = SS server's internal port (galoshes forwards here)
-///
-/// The caller must keep the returned [`PluginChain`] alive; dropping it
-/// shuts down galoshes.
-async fn spawn_ss_with_galoshes(
+/// Inner helper used by every `_with_plugin_*` variant. Builds a server-side
+/// `ServerConfig`, attaches a `PluginConfig` with the given `plugin_opts`,
+/// and spawns the server loop.
+async fn spawn_ss_with_plugin(
     method: CipherKind,
     password: &str,
+    public_port: u16,
     plugin_path: &str,
     plugin_opts: &str,
-) -> (SocketAddr, JoinHandle<()>, PluginChain) {
-    // 1. Start SS server with no plugin, ephemeral port.
-    //    No TOCTOU: SsServerBuilder binds and holds the listener.
-    let (ss_addr, ss_handle) = start_real_ss_server(method, password).await;
+) -> (SocketAddr, JoinHandle<()>) {
+    let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
+    svr_cfg.set_mode(Mode::TcpOnly);
 
-    // 2. Start galoshes via garter, pointing at the SS server.
-    //    Same code path the bridge uses on the client side.
-    match crate::proxy::plugin::start_plugin_chain(
-        plugin_path,
-        Some(plugin_opts),
-        &ss_addr.ip().to_string(),
-        ss_addr.port(),
-        None,
-    )
-    .await
-    {
-        Ok(chain) => (chain.local_addr(), ss_handle, chain),
-        Err(e) => {
-            // Diagnostic: try running galoshes directly to capture its stderr.
-            let output = std::process::Command::new(plugin_path)
-                .env("SS_LOCAL_HOST", "127.0.0.1")
-                .env("SS_LOCAL_PORT", "0")
-                .env("SS_REMOTE_HOST", ss_addr.ip().to_string())
-                .env("SS_REMOTE_PORT", ss_addr.port().to_string())
-                .env("SS_PLUGIN_OPTIONS", plugin_opts)
-                .output()
-                .expect("spawn galoshes for diagnostics");
-            panic!(
-                "start server-side galoshes: {e}\n\
-                 --- diagnostic run ---\n\
-                 exit: {:?}\n\
-                 stdout: {}\n\
-                 stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-    }
+    svr_cfg.set_plugin(PluginConfig {
+        plugin: plugin_path.to_string(),
+        plugin_opts: Some(plugin_opts.to_string()),
+        plugin_args: vec![],
+        plugin_mode: Mode::TcpOnly,
+    });
+
+    let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
+
+    let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    (public_addr, handle)
 }
 
 /// Locate the cargo-built `v2ray-plugin` binary in the target directory.

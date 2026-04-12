@@ -10,6 +10,7 @@
 
 use super::{run_server_test, TestConfig};
 use crate::test_support::http_target::start_fake_sentinel;
+use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::ssserver::{
     locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
@@ -388,8 +389,13 @@ fn run_test_with_v2ray_plugin_happy_path() {
     }
 
     rt().block_on(async {
-        let (svr_addr, _svr, _chain) =
-            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, plugin_path.to_str().unwrap()).await;
+        let public_port = allocate_ephemeral_port().await;
+        let (svr_addr, _svr) =
+            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, public_port, plugin_path.to_str().unwrap())
+                .await;
+        // The SS server's plugin is spawned async; wait for it to bind the
+        // public port before letting the runner attempt preflight.
+        wait_for_port(svr_addr, Duration::from_secs(7)).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
