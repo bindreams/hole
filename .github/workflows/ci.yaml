@@ -9,6 +9,7 @@ jobs:
   lint:
     name: Lint
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
@@ -30,6 +31,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +80,7 @@ jobs:
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
