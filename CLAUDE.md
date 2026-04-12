@@ -41,14 +41,24 @@ hole path remove                  → remove hole from system PATH
 
 ### Crash recovery
 
-While a proxy is active, the bridge persists a small route-recovery state
-file at `<state_dir>/bridge-routes.json` that records the installed TUN
-name, server IP, and upstream interface. The file is cleared on clean
-shutdown. On next startup, the bridge calls `routing::recover_routes` —
-which runs *after* the IPC socket is bound — to tear down any routes
-leaked by a previous crashed run. If the in-bridge recovery fails or the
-process can't restart, `scripts/network-reset.py` reads the same state
-file and performs an equivalent cleanup from outside.
+While a proxy is active, the bridge persists two small state files for
+crash recovery, both in `<state_dir>/`:
+
+- **`bridge-routes.json`** — records the installed TUN name, server IP,
+  and upstream interface. Cleared on clean shutdown. On next startup,
+  `routing::recover_routes` tears down any routes leaked by a previous
+  crashed run.
+- **`bridge-plugins.json`** — records the PIDs and start times of plugin
+  processes (v2ray-plugin, galoshes) spawned by the bridge. Cleared on
+  clean shutdown. On next startup, `plugin_recovery::recover_plugins`
+  kills any tracked processes that are still alive (with PID-reuse
+  safety via start-time verification). The same file is also read by the
+  test harness (`DistHarness::drop`) to reap leaked plugins after tests.
+
+Both recovery functions run *after* the IPC socket is bound. If the
+in-bridge recovery fails or the process can't restart,
+`scripts/network-reset.py` reads the route state file and performs an
+equivalent cleanup from outside (plugin reaping by name as a last resort).
 
 ## Workspace layout
 
