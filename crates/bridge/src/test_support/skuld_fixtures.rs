@@ -25,12 +25,13 @@
 //! can use them interchangeably with `build_socks_harness` /
 //! `build_tun_harness`.
 
+use crate::proxy::plugin::PluginChain;
 use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
 use crate::test_support::ssserver::{
     locate_built_galoshes, start_real_ss_server, start_real_ss_server_with_plugin_quic,
-    start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_tls, GaloshesHandle, TEST_METHOD,
-    TEST_METHOD_STR, TEST_PASSWORD,
+    start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR,
+    TEST_PASSWORD,
 };
 use std::net::SocketAddr;
 
@@ -43,7 +44,7 @@ pub(crate) struct SsServerHandle {
     pub password: String,
     pub plugin: Option<String>,
     pub plugin_opts: Option<String>,
-    _plugin_chain: Option<GaloshesHandle>,
+    _plugin_chain: Option<PluginChain>,
     _runtime: tokio::runtime::Runtime,
 }
 
