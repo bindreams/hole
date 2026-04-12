@@ -65,6 +65,8 @@ jobs:
       - name: Test
         id: test
         shell: bash
+        env:
+          SKULD_DEBUG: "1"
         run: |
           set -o pipefail
           cargo nextest run --workspace 2>&1 | tee target/test-output.log
