@@ -149,28 +149,25 @@ mod platform {
     }
 
     pub fn process_start_time_impl(pid: u32) -> Option<u64> {
-        // Use sysctl KERN_PROC to get process start time.
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+        // Use proc_pidinfo(PROC_PIDTBSDINFO) to get process start time.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
 
         let ret = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as u32,
-                &mut info as *mut _ as *mut libc::c_void,
-                &mut size,
-                std::ptr::null_mut(),
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
                 0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
             )
         };
 
-        if ret != 0 || size == 0 {
+        if ret <= 0 {
             return None;
         }
 
-        let tv = info.kp_proc.p_starttime;
-        let ms = tv.tv_sec as u64 * 1000 + tv.tv_usec as u64 / 1000;
+        let ms = info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000;
         Some(ms)
     }
 }
