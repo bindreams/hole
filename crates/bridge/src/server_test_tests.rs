@@ -49,7 +49,6 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
         preflight_timeout: Duration::from_millis(500),
-        plugin_wait_timeout: Duration::from_secs(2),
         ss_connect_timeout: Duration::from_millis(800),
         sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
@@ -84,7 +83,6 @@ fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
         preflight_timeout: Duration::from_millis(500),
-        plugin_wait_timeout: Duration::from_secs(1),
         ss_connect_timeout: Duration::from_millis(500),
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
@@ -410,9 +408,8 @@ fn run_test_with_v2ray_plugin_happy_path() {
         entry.plugin = Some("v2ray-plugin".into());
 
         // Generous plugin window for cold start. The CI default of 2 s in
-        // fast_test_config is too short for v2ray-plugin's WS handshake.
+        // fast_test_config is too short for the WS handshake.
         let cfg = TestConfig {
-            plugin_wait_timeout: Duration::from_secs(7),
             plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/common", "crates/bridge", "crates/hole", "xtask", "xtask-lib"]
+exclude = ["external/galoshes"]
 resolver = "2"
 
 [workspace.lints.clippy]

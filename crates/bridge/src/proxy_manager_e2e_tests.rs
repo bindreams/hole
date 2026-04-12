@@ -127,7 +127,7 @@ fn e2e_none_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 2: SocksOnly mode with v2ray-plugin (websocket, no TLS).
+/// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 #[skuld::test(serial)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -137,12 +137,12 @@ fn e2e_ws_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 3: SocksOnly mode with v2ray-plugin (websocket + TLS).
+/// Test 3: SocksOnly mode with galoshes (websocket + TLS).
 ///
 /// `cfg(not(target_os = "windows"))` because of an upstream v2ray-core
-/// Windows TLS limitation: the user-supplied cert pool is ignored unless
-/// `DisableSystemRoot=true`, and v2ray-plugin never sets that flag in
-/// client mode. Tracked as a separate follow-up.
+/// Windows TLS limitation (galoshes wraps v2ray-plugin): the user-supplied
+/// cert pool is ignored unless `DisableSystemRoot=true`, and v2ray-plugin
+/// never sets that flag in client mode. Tracked as a separate follow-up.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn e2e_ws_tls_socks_only_roundtrip(
@@ -153,8 +153,8 @@ fn e2e_ws_tls_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 4: SocksOnly mode with v2ray-plugin (QUIC). Same Windows
-/// limitation as test 3 — QUIC auto-enables TLS inside v2ray-plugin.
+/// Test 4: SocksOnly mode with galoshes (QUIC). Same Windows
+/// limitation as test 3 — QUIC auto-enables TLS inside the wrapped v2ray-plugin.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn e2e_quic_socks_only_roundtrip(
@@ -238,7 +238,7 @@ mod tun {
         rt().block_on(run_full_tunnel_e2e(dist, ss, http));
     }
 
-    /// Test 6: Full mode with v2ray-plugin (websocket). Requires Windows
+    /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
     #[skuld::test(labels = [tun], serial)]
     fn e2e_ws_full_tunnel_roundtrip(

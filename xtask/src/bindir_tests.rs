@@ -28,6 +28,12 @@ fn fake_repo() -> tempfile::TempDir {
     };
     fs::write(v2ray.join(v2ray_name), b"fake v2ray-plugin").unwrap();
 
+    // external/galoshes/target/release/galoshes{.exe}
+    let galoshes = root.join("external").join("galoshes").join("target").join("release");
+    fs::create_dir_all(&galoshes).unwrap();
+    let galoshes_name = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
+    fs::write(galoshes.join(galoshes_name), b"fake galoshes").unwrap();
+
     // .cache/wintun/wintun.dll — Windows only
     #[cfg(target_os = "windows")]
     {
@@ -50,13 +56,16 @@ fn bindir_contains_expected_files() {
     // acknowledged here. That is the whole point of the regression test —
     // see issue #143.
     #[cfg(target_os = "windows")]
-    assert_eq!(names, vec!["hole.exe", "v2ray-plugin.exe", "wintun.dll"]);
+    assert_eq!(
+        names,
+        vec!["hole.exe", "v2ray-plugin.exe", "galoshes.exe", "wintun.dll"]
+    );
 
     #[cfg(target_os = "macos")]
-    assert_eq!(names, vec!["hole", "v2ray-plugin"]);
+    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes"]);
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    assert_eq!(names, vec!["hole", "v2ray-plugin"]);
+    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes"]);
 }
 
 #[skuld::test]

@@ -1,2 +1,4 @@
 [profile.default]
+# Warn after 10s of runtime, hard-kill after 30s (10s × 3).
+# E2E tests with real ss-server + SOCKS5 round-trips typically finish under 5s.
 slow-timeout = { period = "10s", terminate-after = 3 }

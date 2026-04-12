@@ -2,6 +2,7 @@ pub mod config;
 pub mod import;
 pub mod logging;
 pub mod paths;
+pub mod plugin;
 pub mod protocol;
 pub mod version;
 

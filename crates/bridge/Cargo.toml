@@ -12,6 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+garter = { path = "../../external/galoshes/garter" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
@@ -78,7 +79,7 @@ windows = { version = "0.62", features = [
 wintun-bindings = "0.7"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld", rev = "ce215370354a2624b5f1662c96190424df8329aa" }
+skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }
 shadowsocks-service = { version = "1", features = ["server"] }
 rcgen = "0.13"
 rand = "0.9"

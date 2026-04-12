@@ -1,0 +1,24 @@
+[package]
+name = "garter-bin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+harness = false
+
+[[bin]]
+name = "garter"
+path = "src/main.rs"
+
+[dependencies]
+garter = { path = "../garter" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+yaml_serde = "0.10"
+
+[dev-dependencies]
+skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }

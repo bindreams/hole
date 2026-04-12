@@ -6,6 +6,7 @@ pub mod group;
 pub mod ipc;
 pub mod logging;
 pub mod platform;
+pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;
 pub mod route_state;

@@ -1,0 +1,35 @@
+[package]
+name = "garter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+contracts = { workspace = true }
+async-trait = { workspace = true }
+
+[lib]
+harness = false
+
+[dev-dependencies]
+skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }
+
+[[test]]
+name = "chain_integration"
+path = "tests/chain_integration.rs"
+harness = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

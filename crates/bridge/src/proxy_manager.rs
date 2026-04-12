@@ -47,17 +47,21 @@ pub enum ProxyState {
 /// Per-cycle state owned only while a proxy is running.
 ///
 /// **Field declaration order is load-bearing.** Dispatcher drops first
-/// (closes TUN, cancels handlers), then routes (teardown commands
-/// target a live TUN since the dispatcher already closed it), then
-/// proxy (releases SS). `None` fields for SocksOnly mode where
-/// routing/dispatcher are skipped.
+/// (closes TUN, cancels handlers), then plugin chain (graceful stop via
+/// SIGTERM/CTRL_BREAK), then routes (teardown commands), then proxy
+/// (releases SS). `None` fields for SocksOnly mode where
+/// routing/dispatcher are skipped, or when no plugin is configured.
 struct RunningState<P: Proxy, R: Routing> {
     /// TCP dispatcher — owns TUN device, smoltcp, fake DNS, handler
     /// tasks. Drops FIRST. `None` in SocksOnly mode and under
     /// `#[cfg(test)]`.
     #[allow(dead_code)]
     dispatcher: Option<crate::dispatcher::Dispatcher>,
-    /// Installed routes. Dropped SECOND. `None` in SocksOnly mode.
+    /// Garter-managed plugin chain. Drops SECOND (cancel token triggers
+    /// SIP003u graceful shutdown). `None` when no plugin is configured.
+    #[allow(dead_code)]
+    plugin_chain: Option<crate::proxy::plugin::PluginChain>,
+    /// Installed routes. Dropped THIRD. `None` in SocksOnly mode.
     #[allow(dead_code)]
     routes: Option<R::Installed>,
     /// Handle on the running proxy. Dropped LAST. Drop aborts
@@ -244,8 +248,25 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// defeating crash recovery on next startup. See
     /// [`crate::routing::SystemRouting::install`] for the invariant.
     async fn start_inner(proxy: &P, routing: &R, config: &ProxyConfig) -> Result<RunningState<P, R>, ProxyError> {
-        // Build shadowsocks config (SOCKS5 only, no TUN).
-        let ss_config = build_ss_config(config)?;
+        // Start plugin chain via Garter if a plugin is configured.
+        let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
+            let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
+            let chain = crate::proxy::plugin::start_plugin_chain(
+                &plugin_path,
+                config.server.plugin_opts.as_deref(),
+                &config.server.server,
+                config.server.server_port,
+            )
+            .await?;
+            Some(chain)
+        } else {
+            None
+        };
+
+        // Build shadowsocks config. When a plugin chain is running,
+        // point ss-service at the chain's local port.
+        let plugin_local = plugin_chain.as_ref().map(|c| c.local_addr());
+        let ss_config = build_ss_config(config, plugin_local)?;
 
         // SocksOnly mode: skip everything routing-related (wintun preload,
         // DNS resolution, gateway detection, route installation). Just start
@@ -256,6 +277,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             let running_proxy = proxy.start(ss_config).await?;
             return Ok(RunningState {
                 dispatcher: None,
+                plugin_chain,
                 routes: None,
                 proxy: running_proxy,
                 server_ip: None,
@@ -312,6 +334,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
 
         Ok(RunningState {
             dispatcher,
+            plugin_chain,
             routes: Some(routes),
             proxy: running_proxy,
             server_ip: Some(server_ip),
@@ -327,6 +350,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         };
         let RunningState {
             dispatcher,
+            plugin_chain,
             proxy,
             routes,
             server_ip: _,
@@ -340,10 +364,13 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             d.shutdown().await;
         }
 
-        // 2. Graceful proxy shutdown (stops SS SOCKS5).
+        // 2. Stop plugin chain (SIP003u graceful shutdown via cancel token).
+        drop(plugin_chain);
+
+        // 3. Graceful proxy shutdown (stops SS SOCKS5).
         let res = proxy.stop().await;
 
-        // 3. Routes tear down via RAII Drop.
+        // 4. Routes tear down via RAII Drop.
         drop(routes);
 
         // Clear any error from a previous failed start. See issue #142.
