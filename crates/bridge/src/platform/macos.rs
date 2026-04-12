@@ -207,10 +207,13 @@ pub fn is_running() -> bool {
 pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy::ShadowsocksProxy::new(),
-            crate::routing::SystemRouting::new(state_dir.to_path_buf()),
-        )));
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::proxy_manager::ProxyManager::new(
+                crate::proxy::ShadowsocksProxy::new(),
+                crate::routing::SystemRouting::new(state_dir.to_path_buf()),
+            )
+            .with_state_dir(state_dir.to_path_buf()),
+        ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         // Bind BEFORE recovery — a second instance's bind() fails before it
@@ -218,9 +221,15 @@ pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
-        let state_dir_owned = state_dir.to_path_buf();
-        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_owned)).await {
+        let state_dir_routes = state_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_routes)).await {
             tracing::warn!(error = %e, "recover_routes task panicked");
+        }
+        let state_dir_plugins = state_dir.to_path_buf();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_plugins)).await
+        {
+            tracing::warn!(error = %e, "recover_plugins task panicked");
         }
 
         tokio::select! {

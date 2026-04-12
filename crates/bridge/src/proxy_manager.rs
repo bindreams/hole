@@ -90,6 +90,9 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting>
     udp_proxy_available: bool,
     /// Whether the upstream network has IPv6 connectivity.
     ipv6_bypass_available: bool,
+    /// State directory for plugin PID crash recovery. `None` in tests
+    /// that don't need crash recovery tracking.
+    state_dir: Option<std::path::PathBuf>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R> {
@@ -102,7 +105,14 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             active_config: None,
             udp_proxy_available: true,
             ipv6_bypass_available: true,
+            state_dir: None,
         }
+    }
+
+    /// Set the state directory for plugin PID crash recovery.
+    pub fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
     }
 
     pub fn state(&self) -> ProxyState {
@@ -204,7 +214,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         let result: Result<RunningState<P, R>, ProxyError> = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ProxyError::Cancelled),
-            r = Self::start_inner(&self.proxy, &self.routing, config) => r,
+            r = Self::start_inner(&self.proxy, &self.routing, config, self.state_dir.as_deref()) => r,
         };
 
         // Commit (or record the error) in the outer function, so the
@@ -247,7 +257,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// construction would otherwise leak routes with no on-disk record,
     /// defeating crash recovery on next startup. See
     /// [`crate::routing::SystemRouting::install`] for the invariant.
-    async fn start_inner(proxy: &P, routing: &R, config: &ProxyConfig) -> Result<RunningState<P, R>, ProxyError> {
+    async fn start_inner(
+        proxy: &P,
+        routing: &R,
+        config: &ProxyConfig,
+        state_dir: Option<&std::path::Path>,
+    ) -> Result<RunningState<P, R>, ProxyError> {
         // Start plugin chain via Garter if a plugin is configured.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
@@ -256,6 +271,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 config.server.plugin_opts.as_deref(),
                 &config.server.server,
                 config.server.server_port,
+                state_dir,
             )
             .await?;
             Some(chain)
@@ -364,7 +380,11 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             d.shutdown().await;
         }
 
-        // 2. Stop plugin chain (SIP003u graceful shutdown via cancel token).
+        // 2. Stop plugin chain: kill tracked PIDs explicitly, then drop
+        // (which cancels the chain and clears the state file).
+        if let Some(ref chain) = plugin_chain {
+            chain.kill_tracked();
+        }
         drop(plugin_chain);
 
         // 3. Graceful proxy shutdown (stops SS SOCKS5).

@@ -1,11 +1,13 @@
-//! Garter-based plugin lifecycle management.
-//!
-//! Replaces shadowsocks-service's built-in `PluginConfig` spawning with
-//! Garter's `BinaryPlugin` + `ChainRunner`, giving us structured log
-//! capture, SIP003u-compliant graceful shutdown, and future chain
-//! composition support.
+// Garter-based plugin lifecycle management.
+//
+// Replaces shadowsocks-service's built-in `PluginConfig` spawning with
+// Garter's `BinaryPlugin` + `ChainRunner`, giving us structured log
+// capture, SIP003u-compliant graceful shutdown, and future chain
+// composition support.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -13,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::ProxyError;
 
-/// Timeout for the plugin readiness probe (TCP connect polling).
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A running plugin chain managed by Garter.
@@ -22,10 +23,14 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// graceful shutdown. Drop cancels the token (SIP003u: SIGTERM on Unix,
 /// CTRL_BREAK on Windows, 5s drain timeout) and aborts the task as a
 /// safety net.
+///
+/// If `state_dir` is set, `Drop` clears the plugin state file — this is
+/// the clean-shutdown path that makes the startup reaper a no-op.
 pub struct PluginChain {
     handle: tokio::task::JoinHandle<garter::Result<()>>,
     cancel: CancellationToken,
     local_addr: SocketAddr,
+    state_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for PluginChain {
@@ -38,10 +43,22 @@ impl std::fmt::Debug for PluginChain {
 }
 
 impl PluginChain {
-    /// The confirmed local address where the plugin chain is listening.
-    /// ss-service should connect here instead of the real server.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Explicitly kill all tracked plugin PIDs and clear the state file.
+    /// Called from `ProxyManager::stop` before dropping the chain, so the
+    /// stop path doesn't race with the OS reaping.
+    pub fn kill_tracked(&self) {
+        let Some(ref dir) = self.state_dir else { return };
+        if let Some(state) = crate::plugin_state::load(dir) {
+            for record in &state.plugins {
+                if let Err(e) = crate::plugin_recovery::kill_pid(record.pid) {
+                    tracing::warn!(pid = record.pid, error = %e, "failed to kill tracked plugin on stop");
+                }
+            }
+        }
     }
 }
 
@@ -49,30 +66,50 @@ impl Drop for PluginChain {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.handle.abort();
+        if let Some(ref dir) = self.state_dir {
+            if let Err(e) = crate::plugin_state::clear(dir) {
+                tracing::warn!(error = %e, "failed to clear plugin state file on drop");
+            }
+        }
     }
 }
 
 /// Start a plugin chain with a single binary plugin.
 ///
-/// 1. Allocates an ephemeral local port for the chain.
-/// 2. Spawns the plugin via Garter's `BinaryPlugin` + `ChainRunner`.
-/// 3. Waits for the plugin to become ready (TCP connect probe).
-/// 4. Returns a `PluginChain` with the confirmed local address.
-///
-/// The plugin's stdout/stderr are captured by Garter as tracing events
-/// (info/warn) — they flow through the ambient tracing subscriber
-/// automatically.
+/// When `state_dir` is `Some`, plugin PIDs are recorded to
+/// `bridge-plugins.json` synchronously at spawn time (via Garter's
+/// `pid_sink` callback), enabling crash recovery on next startup.
+/// When `None`, no state is tracked (used by `server_test` for one-shot
+/// probes that die with the bridge).
 pub async fn start_plugin_chain(
     plugin_path: &str,
     plugin_opts: Option<&str>,
     server_host: &str,
     server_port: u16,
+    state_dir: Option<&Path>,
 ) -> Result<PluginChain, ProxyError> {
-    let plugin = garter::BinaryPlugin::new(plugin_path, plugin_opts);
+    let mut plugin = garter::BinaryPlugin::new(plugin_path, plugin_opts);
+
+    if let Some(dir) = state_dir {
+        let dir = dir.to_path_buf();
+        let sink: garter::PidSink = Arc::new(move |pid| {
+            let start_time = crate::plugin_recovery::process_start_time(pid).unwrap_or(0);
+            if let Err(e) = crate::plugin_state::append_record(
+                &dir,
+                crate::plugin_state::PluginRecord {
+                    pid,
+                    start_time_unix_ms: start_time,
+                },
+            ) {
+                tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
+            }
+        });
+        plugin = plugin.pid_sink(sink);
+    }
+
     let cancel = CancellationToken::new();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Allocate ephemeral port for the chain's local listener.
     let local_addr = garter::chain::allocate_ports(1)
         .map_err(|e| ProxyError::Plugin(format!("port allocation failed: {e}")))?
         .into_iter()
@@ -84,9 +121,6 @@ pub async fn start_plugin_chain(
         local_port: local_addr.port(),
         remote_host: server_host.to_string(),
         remote_port: server_port,
-        // Not consumed by ChainRunner (it reads local/remote from the env).
-        // BinaryPlugin gets the options via its own `options` field. Set here
-        // only because PluginEnv requires it for completeness.
         plugin_options: plugin_opts.map(String::from),
     };
 
@@ -97,8 +131,6 @@ pub async fn start_plugin_chain(
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    // Wait for the plugin to bind its local port. On failure, clean up the
-    // spawned task and cancel the plugin — otherwise they're orphaned.
     let local_addr = match tokio::time::timeout(READINESS_TIMEOUT, ready_rx).await {
         Ok(Ok(addr)) => addr,
         Ok(Err(_)) => {
@@ -117,6 +149,7 @@ pub async fn start_plugin_chain(
         handle,
         cancel,
         local_addr,
+        state_dir: state_dir.map(Path::to_path_buf),
     })
 }
 

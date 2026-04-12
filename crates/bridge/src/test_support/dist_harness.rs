@@ -270,6 +270,19 @@ impl Drop for DistHarness {
             let _ = child.wait();
         }
 
+        // Reap any plugin processes the bridge spawned. The state file
+        // lists exact PIDs + start times, so this is safe against PID reuse.
+        if let Some(state) = crate::plugin_state::load(self.state_dir.path()) {
+            for record in &state.plugins {
+                if let Some(actual_start) = crate::plugin_recovery::process_start_time(record.pid) {
+                    if actual_start.abs_diff(record.start_time_unix_ms) < 2000 {
+                        let _ = crate::plugin_recovery::kill_pid(record.pid);
+                    }
+                }
+            }
+            let _ = crate::plugin_state::clear(self.state_dir.path());
+        }
+
         // Remove the socket file (Unix only — Windows AF_UNIX sockets
         // are freed on close).
         #[cfg(not(windows))]
