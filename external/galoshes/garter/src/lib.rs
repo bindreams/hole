@@ -5,7 +5,7 @@ pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
 
-pub use binary::BinaryPlugin;
+pub use binary::{BinaryPlugin, PidSink};
 pub use chain::ChainRunner;
 pub use error::{Error, Result};
 pub use plugin::ChainPlugin;

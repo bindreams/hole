@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
 use garter::{BinaryPlugin, ChainRunner, PluginEnv};
 
@@ -96,6 +98,64 @@ async fn two_plugin_chain_relays_data() {
     // dropped (end of block_on), tasks are cancelled and kill_on_drop
     // terminates the child processes.
     let _ = tokio::time::timeout(Duration::from_secs(10), chain_task).await;
+}
+
+/// Verify that pid_sink fires once per binary plugin with a valid PID.
+#[skuld::test]
+async fn pid_sink_fires_once_per_binary_plugin() {
+    let mock_path = mock_plugin_path();
+    let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sink_pids = pids.clone();
+    let sink: garter::PidSink = Arc::new(move |pid| {
+        sink_pids.lock().unwrap().push(pid);
+    });
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = echo_listener.accept().await {
+            let (mut r, mut w) = tokio::io::split(stream);
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(BinaryPlugin::new(&mock_path, None).pid_sink(sink.clone())))
+        .add(Box::new(BinaryPlugin::new(&mock_path, None).pid_sink(sink.clone())))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+
+    let handle = tokio::spawn(async move { runner.run(env).await });
+
+    ready_rx.await.expect("chain should become ready");
+
+    {
+        let recorded = pids.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "expected 2 PIDs, got {recorded:?}");
+        assert_ne!(recorded[0], recorded[1], "PIDs should be different");
+        assert!(recorded[0] > 0);
+        assert!(recorded[1] > 0);
+    }
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
 fn main() {
