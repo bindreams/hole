@@ -453,11 +453,6 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 // IPv6 axis ===========================================================================================================
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
-///
-/// Skipped on macOS: shadowsocks-service's `get_local_port()` has a TOCTOU
-/// race that causes the galoshes server to fail to bind when concurrent
-/// non-serial tests grab the same port. Tracked as #197.
-#[cfg(not(target_os = "macos"))]
 #[skuld::test(labels = [ipv6], serial)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
