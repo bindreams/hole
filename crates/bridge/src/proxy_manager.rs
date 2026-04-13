@@ -488,6 +488,8 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-#[cfg(test)]
+// E2E tests skipped on Windows: DistHarness SOCKS5 connections intermittently
+// time out with WSAETIMEDOUT on GitHub Actions runners. See #200.
+#[cfg(all(test, not(target_os = "windows")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;

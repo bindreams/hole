@@ -30,11 +30,9 @@ use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
-#[cfg(not(target_os = "windows"))]
 use crate::test_support::ssserver::random_password_for;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
-#[cfg(not(target_os = "windows"))]
 use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -131,8 +129,6 @@ fn e2e_none_socks_only_roundtrip(
 
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
-/// Skipped: internal port race in shadowsocks-service's `PluginConfig` — see #197.
-#[cfg(any())]
 #[skuld::test(serial)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -144,8 +140,6 @@ fn e2e_ws_socks_only_roundtrip(
 
 /// Test 3: SocksOnly mode with galoshes (websocket + TLS).
 ///
-/// Skipped: internal port race in shadowsocks-service's `PluginConfig` — see #197.
-#[cfg(any())]
 #[skuld::test(serial)]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -157,8 +151,6 @@ fn e2e_ws_tls_socks_only_roundtrip(
 
 /// Test 4: SocksOnly mode with galoshes (QUIC).
 ///
-/// Skipped: internal port race in shadowsocks-service's `PluginConfig` — see #197.
-#[cfg(any())]
 #[skuld::test(serial)]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -243,8 +235,6 @@ mod tun {
 
     /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
-    /// Skipped: internal port race in shadowsocks-service's `PluginConfig` — see #197.
-    #[cfg(any())]
     #[skuld::test(labels = [tun], serial)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
@@ -384,8 +374,6 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
 ///
-/// Flaky on Windows CI: SOCKS5 port times out with WSAETIMEDOUT. See #199.
-#[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -424,8 +412,6 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
 ///
-/// Flaky on Windows CI: SOCKS5 port times out with WSAETIMEDOUT. See #199.
-#[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -465,8 +451,6 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// Skipped: internal port race in shadowsocks-service's `PluginConfig` — see #197.
-#[cfg(any())]
 #[skuld::test(labels = [ipv6], serial)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,

@@ -10,14 +10,12 @@
 
 use super::{run_server_test, TestConfig};
 use crate::test_support::http_target::start_fake_sentinel;
-#[cfg(any())]
 use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
-#[cfg(any())]
-use crate::test_support::ssserver::locate_built_v2ray_plugin;
-#[cfg(any())]
-use crate::test_support::ssserver::start_real_ss_server_with_plugin_ws;
-use crate::test_support::ssserver::{start_real_ss_server, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD};
+use crate::test_support::ssserver::{
+    locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
+    TEST_PASSWORD,
+};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ServerTestOutcome;
 use std::net::SocketAddr;
@@ -380,9 +378,6 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 /// **Skip-on-missing rule**: if the v2ray-plugin binary is not built, the
 /// test panics with a clear instruction. Per CLAUDE.md: fail loudly, never
 /// silently skip on missing dependencies.
-///
-/// Skipped on macOS: internal port race in PluginConfig (#197).
-#[cfg(any())]
 #[skuld::test]
 fn run_test_with_v2ray_plugin_happy_path() {
     let plugin_path = locate_built_v2ray_plugin();

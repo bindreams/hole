@@ -281,6 +281,8 @@ async fn try_sentinel(
     }
 }
 
-#[cfg(test)]
+// E2E tests skipped on Windows: DistHarness SOCKS5 connections intermittently
+// time out with WSAETIMEDOUT on GitHub Actions runners. See #200.
+#[cfg(all(test, not(target_os = "windows")))]
 #[path = "server_test_tests.rs"]
 mod server_test_tests;
