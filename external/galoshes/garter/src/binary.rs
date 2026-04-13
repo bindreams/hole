@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -9,11 +10,18 @@ use tokio_util::sync::CancellationToken;
 use crate::plugin::ChainPlugin;
 use crate::shutdown;
 
+/// Callback invoked synchronously when a binary plugin process is spawned.
+/// Receives the child PID immediately after `Command::spawn()` returns,
+/// before any `.await` point. Consumers use this to record PIDs for crash
+/// recovery (e.g. persist to a state file).
+pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
+
 /// A plugin backed by an external SIP003u binary.
 pub struct BinaryPlugin {
     path: PathBuf,
     options: Option<String>,
     name: String,
+    pid_sink: Option<PidSink>,
 }
 
 impl BinaryPlugin {
@@ -24,7 +32,14 @@ impl BinaryPlugin {
             path,
             options: options.map(String::from),
             name,
+            pid_sink: None,
         }
+    }
+
+    /// Set a callback that fires with the child PID immediately after spawn.
+    pub fn pid_sink(mut self, sink: PidSink) -> Self {
+        self.pid_sink = Some(sink);
+        self
     }
 }
 
@@ -67,6 +82,10 @@ impl ChainPlugin for BinaryPlugin {
         let mut child = cmd
             .spawn()
             .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
+
+        if let (Some(sink), Some(pid)) = (&self.pid_sink, child.id()) {
+            sink(pid);
+        }
 
         // Capture stdout
         let stdout = child.stdout.take().expect("stdout was piped");

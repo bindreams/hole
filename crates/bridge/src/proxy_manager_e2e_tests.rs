@@ -57,7 +57,24 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
 
 /// Assert that a SOCKS5 GET to `target` through `proxy_port` returns the
 /// `HttpTarget` sentinel body.
-async fn assert_socks5_roundtrip(proxy_port: u16, target_addr: SocketAddr) {
+///
+/// Sends a `Status` health check before polling the port so that a dead
+/// proxy task produces a clear assertion ("proxy reports not running")
+/// instead of a blind 10-second timeout on `wait_for_port`.
+async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, target_addr: SocketAddr) {
+    // Health check: if the proxy task exited between Start and now,
+    // the bridge's check_health() will notice and report running=false.
+    let status = harness.send(BridgeRequest::Status).await.expect("send Status");
+    match &status {
+        BridgeResponse::Status { running, error, .. } => {
+            assert!(
+                *running,
+                "proxy reports not running before SOCKS5 roundtrip (error: {error:?})"
+            );
+        }
+        other => panic!("expected Status response, got {other:?}"),
+    }
+
     let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
     // The bridge has already returned Ack from Start, but the SOCKS5
     // listener may not have reached `accept()` yet. Poll until it does.
@@ -84,13 +101,14 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
         server: entry_from(ss),
         local_port,
         tunnel_mode: TunnelMode::SocksOnly,
+        filters: vec![],
     };
 
     let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
     let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-    assert_socks5_roundtrip(local_port, http.addr).await;
+    assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
 
     let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -109,7 +127,8 @@ fn e2e_none_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 2: SocksOnly mode with v2ray-plugin (websocket, no TLS).
+/// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
+///
 #[skuld::test(serial)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -119,13 +138,8 @@ fn e2e_ws_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 3: SocksOnly mode with v2ray-plugin (websocket + TLS).
+/// Test 3: SocksOnly mode with galoshes (websocket + TLS).
 ///
-/// `cfg(not(target_os = "windows"))` because of an upstream v2ray-core
-/// Windows TLS limitation: the user-supplied cert pool is ignored unless
-/// `DisableSystemRoot=true`, and v2ray-plugin never sets that flag in
-/// client mode. Tracked as a separate follow-up.
-#[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -135,9 +149,8 @@ fn e2e_ws_tls_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 4: SocksOnly mode with v2ray-plugin (QUIC). Same Windows
-/// limitation as test 3 — QUIC auto-enables TLS inside v2ray-plugin.
-#[cfg(not(target_os = "windows"))]
+/// Test 4: SocksOnly mode with galoshes (QUIC).
+///
 #[skuld::test(serial)]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -185,6 +198,7 @@ mod tun {
             server: entry_from(ss),
             local_port,
             tunnel_mode: TunnelMode::Full,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -219,7 +233,7 @@ mod tun {
         rt().block_on(run_full_tunnel_e2e(dist, ss, http));
     }
 
-    /// Test 6: Full mode with v2ray-plugin (websocket). Requires Windows
+    /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
     #[skuld::test(labels = [tun], serial)]
     fn e2e_ws_full_tunnel_roundtrip(
@@ -247,6 +261,7 @@ fn lifecycle_start_twice_returns_error(
             server: entry_from(ss),
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -297,6 +312,7 @@ fn lifecycle_reload_changes_local_port(
             server: entry_from(ss),
             local_port: port1,
             tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -306,7 +322,7 @@ fn lifecycle_reload_changes_local_port(
             })
             .await
             .unwrap();
-        assert_socks5_roundtrip(port1, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port1, http.addr).await;
 
         let port2 = allocate_ephemeral_port().await;
         assert_ne!(port1, port2, "ephemeral allocator should give a fresh port");
@@ -316,7 +332,7 @@ fn lifecycle_reload_changes_local_port(
         };
         let resp = harness.send(BridgeRequest::Reload { config: config2 }).await.unwrap();
         assert!(matches!(resp, BridgeResponse::Ack), "reload should Ack, got {resp:?}");
-        assert_socks5_roundtrip(port2, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, port2, http.addr).await;
 
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
@@ -336,6 +352,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
             server: entry_from(ss),
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -356,6 +373,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// Test 11: chacha20-ietf-poly1305 cipher round-trips through a dist-backed
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
+///
 #[skuld::test(serial)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -381,17 +399,19 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
             },
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         harness.send(BridgeRequest::Start { config }).await.unwrap();
-        assert_socks5_roundtrip(local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
 
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
+///
 #[skuld::test(serial)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -417,11 +437,12 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
             },
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         harness.send(BridgeRequest::Start { config }).await.unwrap();
-        assert_socks5_roundtrip(local_port, http.addr).await;
+        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
 }
@@ -429,6 +450,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 // IPv6 axis ===========================================================================================================
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
+///
 #[skuld::test(labels = [ipv6], serial)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,

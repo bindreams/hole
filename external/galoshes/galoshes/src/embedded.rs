@@ -57,8 +57,19 @@ impl EmbeddedBinary {
         }
 
         // Cold start (or re-extract after mismatch): extract and verify.
-        self.extract(&target)
-            .with_context(|| format!("failed to extract {}", self.name))?;
+        match self.extract(&target) {
+            Ok(()) => {}
+            Err(extract_err) => {
+                // Another process may have completed extraction concurrently.
+                // All concurrent galoshes instances embed identical binary data
+                // (same compile), so a file written by another process is valid.
+                // Retry warm start before giving up.
+                if let Ok(verified) = self.try_verify(&target) {
+                    return Ok(verified);
+                }
+                return Err(extract_err.context(format!("failed to extract {}", self.name)));
+            }
+        }
         self.try_verify(&target)
             .with_context(|| format!("verification failed after extraction of {}", self.name))
     }
@@ -182,11 +193,16 @@ fn open_verified(path: &Path) -> Result<VerifiedBinary> {
     let raw_fd = file.as_raw_fd();
     let fd: OwnedFd = file.into();
 
-    // Use /proc/self/fd/N on Linux, /dev/fd/N on macOS.
+    // Linux: /proc/self/fd/N is a kernel-resolved symlink — works even after
+    // CLOEXEC closes the fd in the child process.
+    // Non-Linux Unix (macOS, FreeBSD, etc.): /dev/fd/N is a device node that
+    // requires the fd to be live in the process's fd table. Rust's Command
+    // sets CLOEXEC on all fds, so the fd is closed before execve and
+    // /dev/fd/N becomes invalid. Fall back to the filesystem path.
     let exec_path = if cfg!(target_os = "linux") {
         PathBuf::from(format!("/proc/self/fd/{raw_fd}"))
     } else {
-        PathBuf::from(format!("/dev/fd/{raw_fd}"))
+        path.to_path_buf()
     };
 
     Ok(VerifiedBinary {

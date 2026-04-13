@@ -85,10 +85,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::paths::default_state_dir);
-        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(crate::proxy_manager::ProxyManager::new(
-            crate::proxy::ShadowsocksProxy::new(),
-            crate::routing::SystemRouting::new(state_dir.clone()),
-        )));
+        let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::proxy_manager::ProxyManager::new(
+                crate::proxy::ShadowsocksProxy::new(),
+                crate::routing::SystemRouting::new(state_dir.clone()),
+            )
+            .with_state_dir(state_dir.clone()),
+        ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
         let socket_path = SOCKET_PATH_OVERRIDE
@@ -105,6 +108,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_for_recover)).await
         {
             tracing::warn!(error = %e, "recover_routes task panicked");
+        }
+        let state_dir_for_plugins = state_dir.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_for_plugins)).await
+        {
+            tracing::warn!(error = %e, "recover_plugins task panicked");
         }
 
         tokio::select! {

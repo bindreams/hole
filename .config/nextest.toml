@@ -1,2 +1,18 @@
 [profile.default]
+# Warn after 10s of runtime, hard-kill after 30s (10s × 3).
+# E2E tests with real ss-server + SOCKS5 round-trips typically finish under 5s.
 slow-timeout = { period = "10s", terminate-after = 3 }
+
+# Serialize ALL bridge tests. E2E tests share process-global resources (TUN
+# device, system routes, galoshes extraction dir) and the server-side plugin
+# fixture has a TOCTOU in shadowsocks-service's port allocation that concurrent
+# tests can trigger. Skuld's in-process Mutex doesn't cross process boundaries
+# under nextest, so we enforce serialization here at the scheduler level.
+#
+# Other workspace crates (hole, hole-common, xtask-lib) still run in parallel.
+[test-groups.bridge-serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(hole-bridge)'
+test-group = 'bridge-serial'

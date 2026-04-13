@@ -1,7 +1,7 @@
 use super::*;
 
-#[skuld::test]
-#[ignore] // Requires network — run manually with `cargo test -- --ignored`
+/// Flaky on Windows CI — times out at 30s. See #198.
+#[skuld::test(ignore)]
 fn bypass_socket_connects_to_loopback() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

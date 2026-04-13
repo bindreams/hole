@@ -9,6 +9,7 @@ jobs:
   lint:
     name: Lint
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
@@ -30,6 +31,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -56,24 +58,20 @@ jobs:
       - name: Build workspace (for dist-dir test fixture)
         run: cargo build --workspace
 
+      - name: Install nextest
+        shell: bash
+        run: cargo install cargo-nextest --locked
+
       - name: Test
         id: test
         shell: bash
-        run: |
-          set -o pipefail
-          cargo test --workspace 2>&1 | tee target/test-output.log
+        run: cargo nextest run --workspace
 
-      - name: Upload test output on failure
-        if: failure() && steps.test.conclusion == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: hole-test-output-${{ runner.os }}-${{ github.run_attempt }}
-          path: target/test-output.log
-          retention-days: 14
 
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:

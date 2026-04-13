@@ -349,7 +349,9 @@ async fn run_server(
     remote: SocketAddr,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let listener = TcpListener::bind(local).await.context("bind yamux server")?;
+    let listener = TcpListener::bind(local)
+        .await
+        .with_context(|| format!("bind yamux server on {local}"))?;
     tracing::info!(local = %local, "yamux server listening");
 
     loop {

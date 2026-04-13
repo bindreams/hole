@@ -4,6 +4,7 @@
 use shadowsocks_service::config::Config;
 use std::io;
 use tokio::task::JoinHandle;
+use tracing::{error, warn};
 
 use super::{Proxy, ProxyError, RunningProxy};
 
@@ -31,7 +32,18 @@ impl Proxy for ShadowsocksProxy {
         let server = shadowsocks_service::local::Server::new(config)
             .await
             .map_err(ProxyError::Runtime)?;
-        let handle = tokio::spawn(async move { server.run().await });
+        let handle = tokio::spawn(async move {
+            let result = server.run().await;
+            // server.run() contains an infinite accept loop — it should never
+            // return under normal operation. If it does, the SOCKS5 listener
+            // is dead and all proxied connections will fail. Log loudly so the
+            // bridge log captures the exact error (or the surprising Ok).
+            match &result {
+                Ok(()) => warn!("shadowsocks server task returned Ok — expected to run forever"),
+                Err(e) => error!(error = %e, "shadowsocks server task exited with error"),
+            }
+            result
+        });
         Ok(ShadowsocksRunning { handle: Some(handle) })
     }
 }
