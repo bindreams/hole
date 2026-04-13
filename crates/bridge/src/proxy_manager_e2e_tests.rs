@@ -418,6 +418,9 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
+///
+/// Flaky on Windows CI: SOCKS5 port times out with WSAETIMEDOUT. See #199.
+#[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
