@@ -30,9 +30,11 @@ use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
+#[cfg(not(target_os = "windows"))]
 use crate::test_support::ssserver::random_password_for;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+#[cfg(not(target_os = "windows"))]
 use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -381,6 +383,9 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// Test 11: chacha20-ietf-poly1305 cipher round-trips through a dist-backed
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
+///
+/// Flaky on Windows CI: SOCKS5 port times out with WSAETIMEDOUT. See #199.
+#[cfg(not(target_os = "windows"))]
 #[skuld::test(serial)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
