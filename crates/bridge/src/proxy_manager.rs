@@ -488,8 +488,10 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E tests skipped on Windows: DistHarness SOCKS5 connections intermittently
-// time out with WSAETIMEDOUT on GitHub Actions runners. See #200.
-#[cfg(all(test, not(target_os = "windows")))]
+// E2E tests skipped in CI:
+// - macOS: internal port race in shadowsocks-service PluginConfig (#197)
+// - Windows: DistHarness SOCKS5 connections time out with WSAETIMEDOUT (#200)
+// Re-enable when #197 is fixed (custom server-side galoshes launcher).
+#[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
