@@ -134,7 +134,15 @@ impl DistHarness {
             // Inherit stdout/stderr so any startup panics or tracing
             // output reach the test harness's own captured output.
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // Force debug logs in the bridge subprocess so e2e diagnostics
+            // (proxy startup transitions, in-bridge SOCKS5 self-test) are
+            // visible in the test's captured stderr. Deliberately do NOT
+            // also set RUST_LOG: `from_env_lossy()` would pick it up at
+            // equal specificity to our `add_directive` and the winner is
+            // tracing-subscriber version-dependent.
+            .env("HOLE_BRIDGE_LOG", "hole_bridge=debug,shadowsocks_service=debug")
+            .env("HOLE_BRIDGE_SELF_TEST", "1");
 
         let mut child = cmd
             .spawn()
