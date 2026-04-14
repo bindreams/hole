@@ -67,6 +67,22 @@ jobs:
         shell: bash
         run: cargo nextest run --workspace
 
+      # #200 diagnostics: upload bridge.log and netsh-trace.etl produced
+      # by `DistHarness` subprocesses. Matches files that the test
+      # harness redirected to `$RUNNER_TEMP` (see
+      # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
+      # Windows-only: the ETL capture is a no-op on macOS.
+      - name: Upload bridge logs on test failure
+        if: failure() && steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/**/bridge.log
+            ${{ runner.temp }}/**/netsh-trace.etl
+          if-no-files-found: ignore
+          retention-days: 14
+
 
   test-installer:
     name: Test installer (windows/amd64)

@@ -125,8 +125,8 @@ impl DistHarness {
             return Err(HarnessError(format!("hole binary missing from dist dir: {hole_exe:?}")));
         }
 
-        let state_dir = tempfile::tempdir()?;
-        let log_dir = tempfile::tempdir()?;
+        let state_dir = new_tempdir()?;
+        let log_dir = new_tempdir()?;
         let socket_path = Self::mint_socket_path()?;
 
         let mut cmd = Command::new(&hole_exe);
@@ -343,6 +343,27 @@ fn rand_suffix() -> String {
     use rand::Rng;
     let n: u32 = rand::rng().random();
     format!("{n:08x}")
+}
+
+/// Create a tempdir under `$RUNNER_TEMP` when set (GitHub Actions), or
+/// under the platform default otherwise (local dev).
+///
+/// Background: `tempfile::tempdir()` on Windows calls `GetTempPathW`,
+/// which returns `%TEMP%` = `C:\Users\runneradmin\AppData\Local\Temp`.
+/// GHA's `$RUNNER_TEMP` resolves to `D:\a\_temp`, and the
+/// `actions/upload-artifact` step's `path:` glob can only reach files
+/// under `$RUNNER_TEMP`. Without this redirect, CI cannot pick up
+/// `bridge.log` or `netsh-trace.etl` for forensic download after a
+/// flaked test, which is the whole point of the Commit E artifact
+/// upload in PR #207.
+fn new_tempdir() -> std::io::Result<TempDir> {
+    if let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") {
+        let base = std::path::Path::new(&runner_temp);
+        if base.is_dir() {
+            return tempfile::tempdir_in(base);
+        }
+    }
+    tempfile::tempdir()
 }
 
 // Panic-hook registry =================================================================================================
