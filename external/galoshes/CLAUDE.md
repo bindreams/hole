@@ -34,8 +34,8 @@ cargo build -p galoshes              # build galoshes (requires prior xtask step
 
 - Unit tests live in separate files: `foo_tests.rs` for `foo.rs`
 - Integration tests use the `skuld` test harness (`harness = false`) for reliable child process cleanup
-- Since `skuld` has no async support, use `tokio::runtime::Runtime::new().block_on()` inside `#[skuld::test]`
-- Tests mutating env vars use `#[serial_test::serial]`
+- Async tests use `#[skuld::test]` directly on `async fn`; the `tokio` feature is enabled in the workspace's `skuld` dep
+- Tests mutating env vars take the `env` fixture (`#[fixture] env: &skuld::EnvGuard`), which auto-serialises and reverts
 - The `mock-plugin` crate is a minimal SIP003u TCP relay for integration tests
 
 ## Platform-specific code

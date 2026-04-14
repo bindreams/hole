@@ -61,7 +61,7 @@ cargo test --workspace                                # all unit tests
 cargo test -p garter --test chain_integration         # integration test (spawns mock-plugin)
 ```
 
-Integration tests use the [skuld](https://github.com/bindreams/skuld) test harness for reliable child process cleanup. Since skuld has no async support, wrap async test bodies in `tokio::runtime::Runtime::new().block_on()`.
+Integration tests use the [skuld](https://crates.io/crates/skuld) test harness for reliable child-process cleanup and fixture injection. Async tests are written as plain `#[skuld::test] async fn ...` — the workspace enables skuld's `tokio` feature.
 
 ### Key conventions
 

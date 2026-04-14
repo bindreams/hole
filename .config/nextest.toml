@@ -6,8 +6,9 @@ slow-timeout = { period = "10s", terminate-after = 3 }
 # Serialize ALL bridge tests. E2E tests share process-global resources (TUN
 # device, system routes, galoshes extraction dir) and the server-side plugin
 # fixture has a TOCTOU in shadowsocks-service's port allocation that concurrent
-# tests can trigger. Skuld's in-process Mutex doesn't cross process boundaries
-# under nextest, so we enforce serialization here at the scheduler level.
+# NON-serial tests can trigger. Skuld v0.1.0's SQLite coordinator serializes
+# serial-marked tests across binaries, but non-serial tests in hole-bridge also
+# touch these resources, so we belt-and-suspenders at the scheduler level.
 #
 # Other workspace crates (hole, hole-common, xtask-lib) still run in parallel.
 [test-groups.bridge-serial]

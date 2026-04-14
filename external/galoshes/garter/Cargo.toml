@@ -16,7 +16,7 @@ async-trait = { workspace = true }
 harness = false
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }
+skuld = { workspace = true }
 
 [[test]]
 name = "chain_integration"

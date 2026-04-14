@@ -40,6 +40,6 @@ serde_json = "1"
 yaml_serde = "0.10"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld" }
+skuld = "0.1"
 log = "0.4"
 tempfile = "3"

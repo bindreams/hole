@@ -94,9 +94,9 @@ async fn two_plugin_chain_relays_data() {
     drop(client);
     echo_task.abort();
 
-    // Chain plugins loop on accept() indefinitely. When the runtime is
-    // dropped (end of block_on), tasks are cancelled and kill_on_drop
-    // terminates the child processes.
+    // Chain plugins loop on accept() indefinitely. When the skuld test
+    // harness drops the tokio runtime at the end of the test, tasks are
+    // cancelled and kill_on_drop terminates the child processes.
     let _ = tokio::time::timeout(Duration::from_secs(10), chain_task).await;
 }
 

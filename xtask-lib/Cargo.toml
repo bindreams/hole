@@ -17,5 +17,5 @@ anyhow = "1"
 semver = "1"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld" }
+skuld = "0.1"
 tempfile = "3"
