@@ -26,6 +26,8 @@
 
 // Labels ==============================================================================================================
 
+skuld::new_label!(pub(crate) DIST_BIN, "dist_bin");
+skuld::new_label!(pub(crate) PORT_ALLOC, "port_alloc");
 skuld::new_label!(pub(crate) TUN, "tun");
 skuld::new_label!(pub(crate) IPV6, "ipv6");
 
@@ -89,7 +91,7 @@ pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
 }
 
 /// Shadowsocks server fronted by galoshes (websocket, no TLS).
-#[skuld::fixture(scope = process)]
+#[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -110,7 +112,7 @@ pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
 }
 
 /// Shadowsocks server fronted by galoshes (websocket + TLS).
-#[skuld::fixture(scope = process)]
+#[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -137,7 +139,7 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
 
 /// Shadowsocks server fronted by galoshes (QUIC transport). QUIC
 /// auto-enables TLS inside the wrapped v2ray-plugin so the cert+key pair is required.
-#[skuld::fixture(scope = process)]
+#[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;

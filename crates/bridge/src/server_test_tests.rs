@@ -12,6 +12,7 @@ use super::{run_server_test, TestConfig};
 use crate::test_support::http_target::start_fake_sentinel;
 use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
+use crate::test_support::skuld_fixtures::PORT_ALLOC;
 use crate::test_support::ssserver::{
     locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
     TEST_PASSWORD,
@@ -378,7 +379,13 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 /// **Skip-on-missing rule**: if the v2ray-plugin binary is not built, the
 /// test panics with a clear instruction. Per CLAUDE.md: fail loudly, never
 /// silently skip on missing dependencies.
-#[skuld::test]
+///
+/// `labels = [PORT_ALLOC]` + `serial = PORT_ALLOC`: this test has the same
+/// async plugin-bind TOCTOU as the `ssserver_ws/ws_tls/quic` fixtures, but
+/// doesn't use the fixture (spawns inline). Both the label and the filter
+/// are needed for mutual exclusion with fixture-backed plugin tests — see
+/// skuld coordination's `can_start` check.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_with_v2ray_plugin_happy_path() {
     let plugin_path = locate_built_v2ray_plugin();
     if !plugin_path.is_file() {
