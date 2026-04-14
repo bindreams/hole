@@ -350,10 +350,10 @@ fn rand_suffix() -> String {
 /// Snapshot of a live `DistHarness` child that the panic hook can read
 /// without holding any reference to the harness itself.
 #[derive(Clone)]
-struct ChildInfo {
-    pid: u32,
-    socket: PathBuf,
-    log_dir: PathBuf,
+pub(crate) struct ChildInfo {
+    pub(crate) pid: u32,
+    pub(crate) socket: PathBuf,
+    pub(crate) log_dir: PathBuf,
 }
 
 /// Process-wide registry of live child processes. Used by the panic hook
@@ -367,9 +367,16 @@ fn registry() -> &'static Mutex<BTreeMap<u32, ChildInfo>> {
 
 /// Install a panic hook (idempotent across the test binary's lifetime)
 /// that, on every panic, prints each registered live `DistHarness` child's
-/// PID/socket/log_dir to stderr and dumps the last 4 KB of its bridge log
-/// file. The previous hook (typically the libtest panic printer) is
-/// chained so test output is preserved.
+/// PID/socket/log_dir to stderr and dumps the entire bridge.log contents.
+/// The previous hook (typically the libtest panic printer) is chained so
+/// test output is preserved.
+///
+/// Historical note: the dump used to be capped at the last 4 KB, which
+/// turned out to capture only ~4 ms of bridge activity in the #200
+/// repros — nowhere near wide enough to see the 5 s hang window. Nextest
+/// captures stderr per test and only prints it on failure, so the full
+/// dump is bounded in practice to a single failed test's bridge lifetime
+/// (~30 s under the nextest `terminate-after` cap).
 ///
 /// The hook reads a `OnceLock<Mutex<BTreeMap<...>>>`, NOT a `thread_local!`,
 /// because `wait_for_port` (the panicking call site) runs on whichever
@@ -385,33 +392,58 @@ fn install_panic_hook_once() {
         std::panic::set_hook(Box::new(move |info| {
             eprintln!("[DistHarness panic hook] fired: {info}");
             if let Ok(reg) = registry().lock() {
+                let mut stderr = std::io::stderr().lock();
                 for c in reg.values() {
-                    eprintln!(
-                        "[DistHarness panic hook] live harness pid={} socket={} log_dir={}",
-                        c.pid,
-                        c.socket.display(),
-                        c.log_dir.display()
-                    );
-                    let log_path = c.log_dir.join("bridge.log");
-                    match std::fs::read(&log_path) {
-                        Ok(bytes) => {
-                            let tail_from = bytes.len().saturating_sub(4096);
-                            let tail = String::from_utf8_lossy(&bytes[tail_from..]);
-                            eprintln!(
-                                "[DistHarness panic hook] ---- tail of {} ({} bytes) ----",
-                                log_path.display(),
-                                bytes.len() - tail_from
-                            );
-                            eprintln!("{}", tail);
-                            eprintln!("[DistHarness panic hook] ---- end ----");
-                        }
-                        Err(e) => eprintln!("[DistHarness panic hook] could not read {}: {}", log_path.display(), e),
-                    }
+                    dump_harness_log(&mut stderr, c);
                 }
             }
             prev(info);
         }));
     });
+}
+
+/// Write one harness's header + full bridge.log to `out`. Extracted from
+/// [`install_panic_hook_once`] so a unit test can assert on the output
+/// without redirecting the process-wide stderr.
+///
+/// All write failures are ignored: the caller is (usually) in a panic path
+/// and double-panicking via `unwrap` would replace the original panic's
+/// message with an I/O error.
+pub(crate) fn dump_harness_log(out: &mut dyn std::io::Write, c: &ChildInfo) {
+    let _ = writeln!(
+        out,
+        "[DistHarness panic hook] live harness pid={} socket={} log_dir={}",
+        c.pid,
+        c.socket.display(),
+        c.log_dir.display()
+    );
+    let log_path = c.log_dir.join("bridge.log");
+    match std::fs::read(&log_path) {
+        Ok(bytes) => {
+            let _ = writeln!(
+                out,
+                "[DistHarness panic hook] ---- full {} ({} bytes) ----",
+                log_path.display(),
+                bytes.len()
+            );
+            let _ = out.write_all(&bytes);
+            // Ensure the body is terminated by a newline so the `---- end ----`
+            // framing starts on its own line regardless of the log's trailing
+            // byte.
+            if bytes.last().is_none_or(|&b| b != b'\n') {
+                let _ = writeln!(out);
+            }
+            let _ = writeln!(out, "[DistHarness panic hook] ---- end ----");
+        }
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "[DistHarness panic hook] could not read {}: {}",
+                log_path.display(),
+                e
+            );
+        }
+    }
 }
 
 /// Poll-connect to the bridge socket until it becomes connectable, the
@@ -638,3 +670,7 @@ async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Resu
         Err(HarnessError(format!("unexpected HTTP status: {status}")))
     }
 }
+
+#[cfg(test)]
+#[path = "dist_harness_tests.rs"]
+mod dist_harness_tests;
