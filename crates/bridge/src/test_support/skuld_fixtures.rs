@@ -24,6 +24,13 @@
 //! can use them interchangeably with `build_socks_harness` /
 //! `build_tun_harness`.
 
+// Labels ==============================================================================================================
+
+skuld::new_label!(pub(crate) TUN, "tun");
+skuld::new_label!(pub(crate) IPV6, "ipv6");
+
+// Fixtures ============================================================================================================
+
 use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
 use crate::test_support::port_alloc::allocate_ephemeral_port;

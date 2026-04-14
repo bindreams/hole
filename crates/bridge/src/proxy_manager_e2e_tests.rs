@@ -19,7 +19,7 @@
 //! 6. Sends `BridgeRequest::Stop` and asserts the result.
 //!
 //! TUN tests go through the same pipeline with `tunnel_mode: Full` and are
-//! `cfg(target_os = "windows")` + `labels = [tun]` because macOS CI does
+//! `cfg(target_os = "windows")` + `labels = [TUN]` because macOS CI does
 //! not run elevated and spawning an elevated child from an unelevated
 //! test binary would fail on both OSes.
 
@@ -224,7 +224,7 @@ mod tun {
     /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows
     /// admin. TUN tests are serial because they all bind the hardcoded
     /// `hole-tun` device name.
-    #[skuld::test(labels = [tun], serial)]
+    #[skuld::test(labels = [TUN], serial)]
     fn e2e_none_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -235,7 +235,7 @@ mod tun {
 
     /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
-    #[skuld::test(labels = [tun], serial)]
+    #[skuld::test(labels = [TUN], serial)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -451,7 +451,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-#[skuld::test(labels = [ipv6], serial)]
+#[skuld::test(labels = [IPV6], serial)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,

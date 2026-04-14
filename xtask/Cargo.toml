@@ -30,5 +30,5 @@ ureq = "3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld" }
+skuld = "0.1"
 tempfile = "3"
