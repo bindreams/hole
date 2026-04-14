@@ -84,7 +84,7 @@
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{TraceTrait, UserTrace};
+use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
 use std::net::IpAddr;
 use std::thread::JoinHandle;
@@ -109,22 +109,29 @@ const AFD_PROVIDER: &str = "E53C6823-7BB8-44BB-90DC-3F86090D48A6";
 
 // Keyword masks =======================================================================================================
 
-/// Bits to exclude: `SendPath` (0x100000000), `ReceivePath` (0x200000000),
-/// `Packet` (0x40000000000). These are the per-packet data-plane firehose
-/// that is explicitly out of scope — the user-intent comment at the top of
-/// this module. Applied to both TCPIP and WFP, which define identical
-/// firehose keyword positions in their manifests.
-const FIREHOSE_EXCLUDE_MASK: u64 = 0x0000_0400_0300_0000;
+/// All TCPIP provider keywords enabled.
+///
+/// Background: the module previously excluded the `SendPath`
+/// (`0x100000000`), `ReceivePath` (`0x200000000`), and `Packet`
+/// (`0x40000000000`) keywords at the kernel level to dodge the
+/// per-packet firehose. That exclusion silently dropped the two events
+/// the #200 investigation most needs: event **1004 `TcpTcbSynSend`**
+/// and event **1077 `SendRetransmitRound`**, both of which declare
+/// `ut:SendPath` in the TCPIP manifest. See
+/// <https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>
+/// for the keyword declarations.
+///
+/// The high-volume noise is filtered one level up — at the userspace
+/// [`dispatch`] callback, by event-ID drop list
+/// ([`HIGH_VOLUME_TCPIP_EVENTS`]). That keeps connect-path /
+/// retransmit-path events visible while still silencing the truly
+/// noisy per-packet IDs.
+const TCPIP_KEYWORDS: u64 = !0u64;
 
-/// TCPIP keyword mask: everything the provider emits EXCEPT the firehose.
-/// Source: `logman query providers "Microsoft-Windows-TCPIP"` output.
-/// Rationale: the user asked for "most comprehensive" diagnostics; only
-/// the high-rate data-plane events are worth excluding at the kernel
-/// level.
-const TCPIP_KEYWORDS: u64 = !FIREHOSE_EXCLUDE_MASK;
-
-/// WFP keyword mask: everything except firehose. Same rationale as TCPIP.
-const WFP_KEYWORDS: u64 = !FIREHOSE_EXCLUDE_MASK;
+/// All WFP provider keywords enabled. Same rationale as
+/// [`TCPIP_KEYWORDS`]: we'd rather filter by event-ID at the
+/// userspace seam than drop potentially-relevant events at the kernel.
+const WFP_KEYWORDS: u64 = !0u64;
 
 /// Winsock-AFD keyword mask: all documented keywords. AFD's keywords
 /// are event classifiers (datagram vs stream, winsock-initiated vs
@@ -141,7 +148,9 @@ const AFD_KEYWORDS: u64 = !0u64;
 /// Microsoft-Windows-TCPIP | Select -Expand Events`.
 mod tcpip_events {
     pub const TCB_CONNECT_REQUESTED: u16 = 1002;
+    pub const TCB_SYN_SEND: u16 = 1004;
     pub const ACCEPT_COMPLETED: u16 = 1017;
+    pub const CONNECT_RESTRICTED_SEND: u16 = 1031;
     pub const CONNECT_COMPLETED: u16 = 1033;
     pub const CONNECT_ATTEMPT_FAILED: u16 = 1034;
     pub const CONNECT_REQUEST_TIMEOUT: u16 = 1045;
@@ -155,6 +164,20 @@ mod tcpip_events {
     pub const SEND_RETRANSMIT_ROUND: u16 = 1077;
 }
 
+/// TCPIP event IDs observed at high volume in CI logs that are not
+/// individually useful for the #200 narrative. Dropped inside
+/// [`dispatch`] to keep `HOLE_BRIDGE_LOG=debug` output readable without
+/// filtering at the kernel level (kernel filtering also masks events
+/// we care about — see [`TCPIP_KEYWORDS`]).
+///
+/// Each entry is a high-rate data-plane or internal-bookkeeping event.
+/// Sourced from the event-ID histogram of PR #207 CI run 9 bridge
+/// log. When a new Windows build adds high-volume IDs, extend this
+/// list rather than re-introducing a kernel-level keyword mask.
+const HIGH_VOLUME_TCPIP_EVENTS: &[u16] = &[
+    1300, 1324, 1370, 1371, 1391, 1396, 1397, 1443, 1454, 1551, 1589, 1590, 1626,
+];
+
 /// Retransmit count at which we escalate from info to warn. Event 1002
 /// (and 1077) carry `RexmitCount` as a `UInt32`; three retransmits on a
 /// single flow is well into "something is wrong" territory.
@@ -164,18 +187,29 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 /// RAII guard holding the live ETW session + processing thread.
 ///
-/// Drop sequence: `UserTrace::stop` → `JoinHandle::join` → the processing
-/// thread exits once the kernel acknowledges STOP, which drains the
-/// in-flight event queue. See module doc [Drain on Drop](self#drain-on-drop).
+/// Drop sequence: `query_session_stats` (read EventsLost before the
+/// handle is consumed) → `UserTrace::stop` → `JoinHandle::join` → the
+/// processing thread exits once the kernel acknowledges STOP, which
+/// drains the in-flight event queue. See module doc
+/// [Drain on Drop](self#drain-on-drop).
 pub struct EtwGuard {
     // `Option<UserTrace>` so Drop can `take()` it and consume via
     // `UserTrace::stop(self)` (which takes `self` by value).
     trace: Option<UserTrace>,
     thread: Option<JoinHandle<()>>,
+    /// Session name saved at construction time so
+    /// `query_session_stats` can look it up in Drop without holding a
+    /// reference into `trace`.
+    session_name: String,
 }
 
 impl Drop for EtwGuard {
     fn drop(&mut self) {
+        // Query first, stop second. `UserTrace::stop` consumes the trace
+        // by value, so EventsLost can only be read while the session is
+        // still live.
+        query_session_stats(&self.session_name);
+
         if let Some(trace) = self.trace.take() {
             if let Err(e) = trace.stop() {
                 warn!(error = ?e, "etw: UserTrace::stop failed during drop");
@@ -236,8 +270,21 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
 
     // Split-lifecycle: start session without the internal processing
     // thread so we own the join handle. See [Drain on Drop] in module doc.
+    //
+    // Buffer sizing: now that [`TCPIP_KEYWORDS`] = !0, kernel event
+    // volume per connect rises substantially (SendPath events are no
+    // longer dropped). Default `buffer_size` (32 KB per-processor) risks
+    // ring-buffer overflow when the test runner is under IO load. Widen
+    // to 256 KB; `max_buffer = 0` tells Windows to choose a reasonable
+    // ceiling. EventsLost is queried on [`EtwGuard::drop`] so an overrun
+    // shows up as a nonzero count in bridge.log.
+    let trace_properties = TraceProperties {
+        buffer_size: 256,
+        ..Default::default()
+    };
     let (trace, handle) = UserTrace::new()
         .named(session_name.clone())
+        .set_trace_properties(trace_properties)
         .enable(tcpip)
         .enable(wfp)
         .enable(afd)
@@ -262,7 +309,76 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
     Ok(EtwGuard {
         trace: Some(trace),
         thread: Some(thread),
+        session_name,
     })
+}
+
+/// Query the live ETW session via Win32 `ControlTraceW(QUERY)` and log
+/// `events_lost` / `buffers_written` at info level. Called from
+/// [`EtwGuard::drop`] before the session is stopped.
+///
+/// This is a cross-check for the [`TCPIP_KEYWORDS`] widening: if the
+/// widened subscription overruns the kernel ring buffer, the lost
+/// events count surfaces in bridge.log as diagnostic signal (and a
+/// prompt to raise `buffer_size` further).
+///
+/// Silently skips on query failure — the guard is in a drop path and
+/// double-panicking would hide the original error.
+fn query_session_stats(session_name: &str) {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Diagnostics::Etw::{
+        ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_PROPERTIES,
+    };
+
+    const STRING_RESERVE: usize = 1024;
+    const PROPERTIES_SIZE: usize = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * STRING_RESERVE;
+
+    let mut buffer = vec![0u8; PROPERTIES_SIZE];
+    let props = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    // SAFETY: `buffer` is a zero-initialised block large enough to hold
+    // one `EVENT_TRACE_PROPERTIES` plus 2 × 1 KB of inline strings; the
+    // field writes below are within that allocation.
+    unsafe {
+        (*props).Wnode.BufferSize = PROPERTIES_SIZE as u32;
+        (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        (*props).LogFileNameOffset = (std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + STRING_RESERVE) as u32;
+    }
+
+    let mut wide: Vec<u16> = session_name.encode_utf16().collect();
+    wide.push(0);
+
+    // SAFETY: `wide` outlives the call; `props` points into `buffer`;
+    // handle value 0 tells Windows to resolve the session by name.
+    let err = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            windows::core::PCWSTR(wide.as_ptr()),
+            props,
+            EVENT_TRACE_CONTROL_QUERY,
+        )
+    };
+
+    if err != ERROR_SUCCESS {
+        warn!(code = err.0, session = %session_name, "etw: ControlTraceW(QUERY) failed");
+        return;
+    }
+
+    // SAFETY: `props` is a valid `EVENT_TRACE_PROPERTIES` Windows just
+    // filled in with session statistics.
+    let (events_lost, buffers_written) = unsafe { ((*props).EventsLost, (*props).BuffersWritten) };
+    info!(
+        session = %session_name,
+        events_lost,
+        buffers_written,
+        "etw: session stats at stop"
+    );
+    if events_lost > 0 {
+        warn!(
+            session = %session_name,
+            events_lost,
+            "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
+        );
+    }
 }
 
 // Stale-session sweep =================================================================================================
@@ -382,6 +498,25 @@ unsafe fn read_wide_string(ptr: *const u16) -> String {
 /// Filled by [`extract_fields`] from a live `EventRecord`; consumed by
 /// [`dispatch`]. Kept free of ETW-library types so unit tests can
 /// construct one directly.
+///
+/// Field coverage notes (per
+/// <https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>):
+///
+/// - **1002 `TcbRequestConnect`**: `Tcb`, `LocalAddress`, `LocalPort`,
+///   `RemoteAddress`, `RemotePort`, `NewState`, `RexmitCount`.
+/// - **1004 `TcbSynSend`**: `Tcb`, `Seq`, no address/port fields.
+/// - **1031 `ConnectRestrictedSend`**: `Tcb`, `LocalAddress`,
+///   `LocalPort`, `RemoteAddress`, `RemotePort`, `Status`.
+/// - **1033 `ConnectTcbComplete`**: `Tcb`, `LocalAddress`, `LocalPort`,
+///   `RemoteAddress`, `RemotePort`, `Status`.
+/// - **1045 `ConnectTcbTimeout`**: `Tcb`, `Seq`, `TcbState`.
+/// - **1046 `DisconnectTcbRtoTimeout`**: `Tcb`, `Seq`.
+/// - **1077 `SendRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
+///   `SegmentSize`, `RexmitCount`.
+///
+/// The `tcb` field is a kernel-internal 64-bit TCB pointer / cookie
+/// that correlates events belonging to the same TCP connection across
+/// the connect-path, send-path, and close-path event IDs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedFields {
     pub local_port: Option<u16>,
@@ -390,6 +525,7 @@ pub(crate) struct ParsedFields {
     pub remote_addr: Option<IpAddr>,
     pub status: Option<u32>,
     pub rexmit_count: Option<u32>,
+    pub tcb: Option<u64>,
 }
 
 // SocketAddress binary decoder ========================================================================================
@@ -457,14 +593,28 @@ pub(crate) enum Emission {
 
 /// Pure function: decide whether/how to emit a tracing event for a
 /// (provider, event_id, pid, fields) tuple. Unit-testable without ETW.
+///
+/// Drops (returns `None`) for:
+/// - events from non-bridge PIDs (primary filter — cross-process ETW is
+///   not useful for #200 and adds noise),
+/// - events in [`HIGH_VOLUME_TCPIP_EVENTS`] from the TCPIP provider (the
+///   userspace replacement for the removed kernel-keyword firehose
+///   mask).
+///
+/// Note: provider discrimination is by [`GUID`] — the high-volume drop
+/// list is specific to TCPIP; same event IDs on WFP or AFD stay visible.
 pub(crate) fn dispatch(
-    _provider: GUID,
+    provider: GUID,
     event_id: u16,
     pid: u32,
     bridge_pid: u32,
     fields: &ParsedFields,
 ) -> Option<Emission> {
     if pid != bridge_pid {
+        return None;
+    }
+
+    if is_tcpip_provider(provider) && HIGH_VOLUME_TCPIP_EVENTS.contains(&event_id) {
         return None;
     }
 
@@ -486,6 +636,8 @@ pub(crate) fn dispatch(
         | tcpip_events::ABORT_COMPLETED
         | tcpip_events::CONNECT_ATTEMPT_FAILED => Some(Emission::Warn { msg: "tcp anomaly" }),
         tcpip_events::TCB_CONNECT_REQUESTED
+        | tcpip_events::TCB_SYN_SEND
+        | tcpip_events::CONNECT_RESTRICTED_SEND
         | tcpip_events::ACCEPT_COMPLETED
         | tcpip_events::CONNECT_COMPLETED
         | tcpip_events::CLOSE_ISSUED
@@ -540,6 +692,7 @@ fn extract_fields(parser: &Parser) -> ParsedFields {
         .map_or((None, None), |(a, p)| (Some(a), Some(p)));
 
     ParsedFields {
+        tcb: parser.try_parse::<u64>("Tcb").ok(),
         local_port: parser.try_parse::<u16>("LocalPort").ok().or(local_port_from_addr),
         local_addr,
         remote_port: parser.try_parse::<u16>("RemotePort").ok().or(remote_port_from_addr),
@@ -562,6 +715,7 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
             event_id,
             opcode,
             provider = %provider_id,
+            tcb = ?fields.tcb,
             local_addr = ?fields.local_addr,
             local_port = ?fields.local_port,
             remote_addr = ?fields.remote_addr,
@@ -575,6 +729,7 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
             event_id,
             opcode,
             provider = %provider_id,
+            tcb = ?fields.tcb,
             local_addr = ?fields.local_addr,
             local_port = ?fields.local_port,
             remote_addr = ?fields.remote_addr,
@@ -591,6 +746,20 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
             "etw: unknown event",
         ),
     }
+}
+
+// Provider GUID discrimination ========================================================================================
+
+/// Test whether a provider GUID identifies the Microsoft-Windows-TCPIP
+/// provider declared by [`TCPIP_PROVIDER`]. Extracted as a standalone
+/// predicate so [`dispatch`] can apply TCPIP-specific filters without
+/// string-parsing the GUID at every event.
+fn is_tcpip_provider(provider: GUID) -> bool {
+    // Parse the compile-time constant at the seam rather than duplicating
+    // the bytes. `GUID::from_u128` would require a hex literal; using the
+    // same parser the `ferrisetw::Provider::by_guid` constructor uses
+    // keeps the declarations aligned.
+    provider == GUID::from(TCPIP_PROVIDER)
 }
 
 #[cfg(test)]

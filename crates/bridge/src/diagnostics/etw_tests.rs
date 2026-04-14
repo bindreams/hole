@@ -5,11 +5,16 @@
 
 use super::*;
 
-// Use a zeroed GUID as a throwaway — dispatch ignores the provider
-// value in v1 (severity rules key on event_id). Having a concrete
-// value in tests keeps signatures honest.
+// Zeroed GUID — matches no subscribed provider, used where the test is
+// about PID filtering or severity rules and not provider-scoped filters.
 fn any_guid() -> GUID {
     GUID::from_u128(0)
+}
+
+/// TCPIP provider GUID, used by tests that check the
+/// [`HIGH_VOLUME_TCPIP_EVENTS`] drop list (which only fires for TCPIP).
+fn tcpip_guid() -> GUID {
+    GUID::from(TCPIP_PROVIDER)
 }
 
 const BRIDGE_PID: u32 = 12345;
@@ -161,6 +166,67 @@ fn dispatch_unknown_event_id_returns_unknown() {
         &ParsedFields::default(),
     );
     assert_eq!(got, Some(Emission::Unknown));
+}
+
+// High-volume TCPIP drop list =========================================================================================
+
+#[skuld::test]
+fn dispatch_drops_high_volume_tcpip_events() {
+    // Every entry in the drop list must produce None when the provider is TCPIP.
+    for &id in HIGH_VOLUME_TCPIP_EVENTS {
+        let got = dispatch(tcpip_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        assert!(
+            got.is_none(),
+            "event_id={id} is in HIGH_VOLUME_TCPIP_EVENTS; expected None from TCPIP, got {got:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn dispatch_keeps_high_volume_event_ids_on_non_tcpip_providers() {
+    // Event IDs collide across providers; a high-volume TCPIP event ID
+    // from AFD or WFP must not be dropped.
+    for &id in HIGH_VOLUME_TCPIP_EVENTS {
+        let got = dispatch(any_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        assert_eq!(
+            got,
+            Some(Emission::Unknown),
+            "event_id={id} from non-TCPIP provider should fall through to Unknown, got {got:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn dispatch_syn_send_event_is_info_not_dropped() {
+    // Event 1004 (TcpTcbSynSend) was previously filtered out by the
+    // `ut:SendPath` kernel-keyword mask. The mask has been removed;
+    // dispatch must produce an info emission for it.
+    let got = dispatch(
+        tcpip_guid(),
+        tcpip_events::TCB_SYN_SEND,
+        BRIDGE_PID,
+        BRIDGE_PID,
+        &ParsedFields::default(),
+    );
+    assert!(
+        matches!(got, Some(Emission::Info { .. })),
+        "event 1004 must be Info, got {got:?}"
+    );
+}
+
+#[skuld::test]
+fn dispatch_connect_restricted_send_event_is_info() {
+    let got = dispatch(
+        tcpip_guid(),
+        tcpip_events::CONNECT_RESTRICTED_SEND,
+        BRIDGE_PID,
+        BRIDGE_PID,
+        &ParsedFields::default(),
+    );
+    assert!(
+        matches!(got, Some(Emission::Info { .. })),
+        "event 1031 must be Info, got {got:?}"
+    );
 }
 
 // parse_socket_address ================================================================================================
