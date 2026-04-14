@@ -385,10 +385,58 @@ unsafe fn read_wide_string(ptr: *const u16) -> String {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedFields {
     pub local_port: Option<u16>,
+    pub local_addr: Option<IpAddr>,
     pub remote_port: Option<u16>,
     pub remote_addr: Option<IpAddr>,
     pub status: Option<u32>,
     pub rexmit_count: Option<u32>,
+}
+
+// SocketAddress binary decoder ========================================================================================
+
+/// Parse a Windows ETW `win:SocketAddress` binary blob into `(ip, port)`.
+///
+/// The TCPIP and Winsock-AFD manifests encode addresses as raw
+/// `SOCKADDR_IN` / `SOCKADDR_IN6` structures in little-endian wire
+/// format for the family / port fields:
+///
+/// - IPv4 (AF_INET = 2, 16 bytes): family (2B LE), port (2B **BE**),
+///   addr (4B BE), 8B padding.
+/// - IPv6 (AF_INET6 = 23, 28 bytes): family (2B LE), port (2B **BE**),
+///   flowinfo (4B), addr (16B), scope_id (4B).
+///
+/// Port is network-byte-order (big-endian) per POSIX / Winsock
+/// convention. Callers hand us the raw bytes Microsoft's manifest
+/// declares as `inType="win:Binary" outType="win:SocketAddress"`.
+///
+/// Returns `None` if bytes are too short for either family or the
+/// family field is neither AF_INET nor AF_INET6.
+pub(crate) fn parse_socket_address(bytes: &[u8]) -> Option<(IpAddr, u16)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+    match family {
+        // AF_INET
+        2 => {
+            if bytes.len() < 8 {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+            Some((IpAddr::V4(ip), port))
+        }
+        // AF_INET6
+        23 => {
+            if bytes.len() < 24 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[8..24]);
+            Some((IpAddr::V6(std::net::Ipv6Addr::from(octets)), port))
+        }
+        _ => None,
+    }
 }
 
 /// What the [`dispatch`] function decides to do with an event.
@@ -473,16 +521,29 @@ fn handle_event(record: &EventRecord, schema_locator: &SchemaLocator, bridge_pid
 /// Extract the common fields we care about from a live event. Missing
 /// fields return `None` in [`ParsedFields`] — we are best-effort about
 /// schema drift.
+///
+/// Address handling: TCPIP and Winsock-AFD encode addresses as
+/// `win:Binary` blobs with the `win:SocketAddress` outType. We decode
+/// those via [`parse_socket_address`]. A minority of events expose
+/// discrete `LocalPort` / `RemotePort` scalars; we try those too and
+/// prefer whichever resolves. Empty on both paths → `None`.
 fn extract_fields(parser: &Parser) -> ParsedFields {
+    let (local_addr, local_port_from_addr) = parser
+        .try_parse::<Vec<u8>>("LocalAddress")
+        .ok()
+        .and_then(|bytes| parse_socket_address(&bytes))
+        .map_or((None, None), |(a, p)| (Some(a), Some(p)));
+    let (remote_addr, remote_port_from_addr) = parser
+        .try_parse::<Vec<u8>>("RemoteAddress")
+        .ok()
+        .and_then(|bytes| parse_socket_address(&bytes))
+        .map_or((None, None), |(a, p)| (Some(a), Some(p)));
+
     ParsedFields {
-        local_port: parser.try_parse::<u16>("LocalPort").ok(),
-        remote_port: parser.try_parse::<u16>("RemotePort").ok(),
-        // Most events carry SocketAddress-typed RemoteAddress fields;
-        // ferrisetw's default parse returns bytes. We keep the field
-        // shape simple for v1 and leave IpAddr extraction for a future
-        // iteration — the PID + port + status + rexmit fields are
-        // sufficient for #200's narrative.
-        remote_addr: None,
+        local_port: parser.try_parse::<u16>("LocalPort").ok().or(local_port_from_addr),
+        local_addr,
+        remote_port: parser.try_parse::<u16>("RemotePort").ok().or(remote_port_from_addr),
+        remote_addr,
         status: parser.try_parse::<u32>("Status").ok(),
         rexmit_count: parser.try_parse::<u32>("RexmitCount").ok(),
     }
@@ -501,7 +562,9 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
             event_id,
             opcode,
             provider = %provider_id,
+            local_addr = ?fields.local_addr,
             local_port = ?fields.local_port,
+            remote_addr = ?fields.remote_addr,
             remote_port = ?fields.remote_port,
             status = ?fields.status,
             rexmit_count = ?fields.rexmit_count,
@@ -512,7 +575,9 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
             event_id,
             opcode,
             provider = %provider_id,
+            local_addr = ?fields.local_addr,
             local_port = ?fields.local_port,
+            remote_addr = ?fields.remote_addr,
             remote_port = ?fields.remote_port,
             status = ?fields.status,
             rexmit_count = ?fields.rexmit_count,
