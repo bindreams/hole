@@ -209,4 +209,84 @@ fn capture_windows_tcp_state(port: u16) {
         }
         Err(e) => eprintln!("[wait_for_port] netsh show interfaces spawn failed: {e}"),
     }
+
+    // Test-process TCP loopback control experiment (#200 H6 vs H8). Bind
+    // a fresh listener in the current (test) process and connect to it
+    // from another thread in the same process. If this CONTROL connect
+    // succeeds while the bridge-listener connect hangs, the broken
+    // behaviour is specific to the bridge's listener — either a WFP
+    // filter keyed on the bridge PID/port, or something process-specific
+    // to the bridge subprocess (H8). If the CONTROL also hangs, TCP
+    // loopback is broken machine-wide for the current process too,
+    // strongly implicating a leftover WFP filter or NDIS-layer state
+    // from the preceding TUN-mode test (H6/H7).
+    //
+    // Synchronous by design: we're already about to panic, we don't want
+    // to start an async runtime just for this probe.
+    match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            let ctrl_addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "<unknown>".into());
+            eprintln!("[wait_for_port] control-loopback: bound {ctrl_addr}");
+            let accept_thread = std::thread::spawn(move || {
+                listener.set_nonblocking(false).expect("set_nonblocking(false)");
+                // Accept timeout via poll: keep it simple with accept()'s
+                // blocking semantics and a hard 2s SO_TIMEOUT using
+                // set_read_timeout on the accepted stream isn't possible
+                // on the listener. So we rely on the caller dropping the
+                // listener if needed. Blocking accept is fine since the
+                // connect attempt below will either complete or panic
+                // out of this function.
+                listener.accept()
+            });
+            let addr: std::net::SocketAddr = ctrl_addr.parse().unwrap_or_else(|_| ([127, 0, 0, 1], 0).into());
+            let t0 = std::time::Instant::now();
+            match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
+                Ok(_stream) => {
+                    eprintln!(
+                        "[wait_for_port] control-loopback: connect OK in {} ms (TCP loopback works in this process)",
+                        t0.elapsed().as_millis()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[wait_for_port] control-loopback: connect FAILED in {} ms: os_code={:?} {} \
+                         (TCP loopback is BROKEN in this process — points at H6/H7)",
+                        t0.elapsed().as_millis(),
+                        e.raw_os_error(),
+                        e
+                    );
+                }
+            }
+            // Let the accept thread finish naturally or time itself out
+            // by listener drop. Best-effort — we don't block on join.
+            drop(accept_thread);
+        }
+        Err(e) => eprintln!("[wait_for_port] control-loopback: bind failed: {e}"),
+    }
+
+    // WFP filter dump (#200 H6). If wintun left a filter installed after
+    // TUN destruction, it shows up here. `show state` is usually less
+    // verbose than `show filters` (which can be 10s of MB); still, cap
+    // by truncating to the first 8 KB — if a rogue filter is present it
+    // will be near the top of the provider-keyed section.
+    match std::process::Command::new("netsh")
+        .args(["wfp", "show", "state"])
+        .output()
+    {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let preview: String = out.chars().take(8192).collect();
+            eprintln!("[wait_for_port] netsh wfp show state (first 8KB):\n{preview}");
+            if out.len() > 8192 {
+                eprintln!(
+                    "[wait_for_port] netsh wfp show state truncated (full length: {} chars)",
+                    out.len()
+                );
+            }
+        }
+        Err(e) => eprintln!("[wait_for_port] netsh wfp show state spawn failed: {e}"),
+    }
 }
