@@ -20,7 +20,6 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
         .map(|pid| FileHolder {
             pid,
             image: libproc::proc_pid::pidpath(pid as i32).ok().map(PathBuf::from),
-            verified: true,
         })
         .collect())
 }

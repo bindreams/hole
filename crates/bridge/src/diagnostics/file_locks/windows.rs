@@ -87,8 +87,13 @@ const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFO
 /// `ObjectNameInformation` class for `NtQueryObject`.
 const OBJECT_NAME_INFORMATION: OBJECT_INFORMATION_CLASS = OBJECT_INFORMATION_CLASS(1);
 
-/// Return status "buffer too small — try again with a larger one."
+/// Return statuses that mean "buffer too small — try again with a
+/// larger one." `NtQuerySystemInformation` uses `STATUS_INFO_LENGTH_MISMATCH`;
+/// `NtQueryObject` can additionally return `STATUS_BUFFER_OVERFLOW` or
+/// `STATUS_BUFFER_TOO_SMALL` for long object names.
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = NTSTATUS(0xC0000004u32 as i32);
+const STATUS_BUFFER_OVERFLOW: NTSTATUS = NTSTATUS(0x80000005u32 as i32);
+const STATUS_BUFFER_TOO_SMALL: NTSTATUS = NTSTATUS(0xC0000023u32 as i32);
 
 /// Total budget for one `find_holders` call.
 const OVERALL_BUDGET: Duration = Duration::from_secs(3);
@@ -203,9 +208,11 @@ fn query_extended_handle_information() -> io::Result<Vec<u8>> {
         if status == STATUS_INFO_LENGTH_MISMATCH {
             let next = cap.saturating_mul(2);
             if next > cap_limit {
-                tracing::warn!("handle table exceeds 256 MiB; returning partial results");
-                buf.truncate(ret_len as usize);
-                return Ok(buf);
+                // `ret_len` on failure is advisory; the buffer contents
+                // are undefined. Return empty rather than propagate
+                // zeroed bytes as if they were a valid handle table.
+                tracing::warn!("handle table exceeds 256 MiB; returning no holders (enumeration skipped)");
+                return Ok(Vec::new());
             }
             cap = next;
             continue;
@@ -217,24 +224,31 @@ fn query_extended_handle_information() -> io::Result<Vec<u8>> {
     }
 }
 
-/// View the raw buffer returned by
-/// `NtQuerySystemInformation(SystemExtendedHandleInformation)` as a
-/// slice of `SystemHandleTableEntryInfoEx` entries. Layout is:
-/// `[usize NumberOfHandles][usize Reserved][entries...]`.
-fn parse_handle_entries(buf: &[u8]) -> &[SystemHandleTableEntryInfoEx] {
-    if buf.len() < 2 * std::mem::size_of::<usize>() {
-        return &[];
+/// Parse the raw buffer returned by
+/// `NtQuerySystemInformation(SystemExtendedHandleInformation)` into
+/// owned entries via `read_unaligned`.
+///
+/// Layout: `[usize NumberOfHandles][usize Reserved][entries...]`.
+/// Windows' `HeapAlloc`-backed `Vec<u8>` is in practice 16-byte
+/// aligned, but the Rust type system doesn't guarantee that — using
+/// unaligned reads sidesteps any UB risk.
+fn parse_handle_entries(buf: &[u8]) -> Vec<SystemHandleTableEntryInfoEx> {
+    let header_size = 2 * std::mem::size_of::<usize>();
+    if buf.len() < header_size {
+        return Vec::new();
     }
-    let num = unsafe { *(buf.as_ptr() as *const usize) };
-    let entries_ptr = unsafe {
-        buf.as_ptr()
-            .add(2 * std::mem::size_of::<usize>())
-            .cast::<SystemHandleTableEntryInfoEx>()
-    };
+    let num = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const usize) };
     let entry_size = std::mem::size_of::<SystemHandleTableEntryInfoEx>();
-    let available = (buf.len() - 2 * std::mem::size_of::<usize>()) / entry_size;
+    let available = (buf.len() - header_size) / entry_size;
     let count = num.min(available);
-    unsafe { std::slice::from_raw_parts(entries_ptr, count) }
+    let mut out = Vec::with_capacity(count);
+    let base = unsafe { buf.as_ptr().add(header_size) };
+    for i in 0..count {
+        let entry =
+            unsafe { std::ptr::read_unaligned(base.add(i * entry_size) as *const SystemHandleTableEntryInfoEx) };
+        out.push(entry);
+    }
+    out
 }
 
 /// Run `NtQueryObject(ObjectNameInformation)` on a worker thread with
@@ -250,7 +264,8 @@ fn query_name_with_timeout(h: HANDLE) -> Option<String> {
         let h = HANDLE(handle_bits as *mut c_void);
         let _ = tx.send(nt_path_of_dup_handle(h));
     });
-    // On recv timeout the worker is abandoned and returns None.
+    // Returns None on either recv timeout (worker abandoned to leak)
+    // or RecvError::Disconnected (worker panicked before sending).
     rx.recv_timeout(NAME_QUERY_TIMEOUT).unwrap_or_default()
 }
 
@@ -281,7 +296,11 @@ fn nt_path_of_dup_handle(h: HANDLE) -> Option<String> {
             let slice = unsafe { std::slice::from_raw_parts(us.buffer, count) };
             return Some(String::from_utf16_lossy(slice));
         }
-        if status == STATUS_INFO_LENGTH_MISMATCH && (ret_len as usize) > buf.len() {
+        let grow = matches!(
+            status,
+            STATUS_INFO_LENGTH_MISMATCH | STATUS_BUFFER_OVERFLOW | STATUS_BUFFER_TOO_SMALL,
+        );
+        if grow && (ret_len as usize) > buf.len() {
             buf.resize(ret_len as usize, 0);
             continue;
         }
@@ -324,7 +343,7 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     };
 
     // Step 2: group candidate entries by PID (excluding self).
-    let mut by_pid: HashMap<u32, Vec<&SystemHandleTableEntryInfoEx>> = HashMap::new();
+    let mut by_pid: HashMap<u32, Vec<SystemHandleTableEntryInfoEx>> = HashMap::new();
     for entry in entries {
         if entry.object_type_index != file_type_index {
             continue;
@@ -366,7 +385,6 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
         };
         let src = Handle(src);
         let pid_deadline = Instant::now() + PER_PID_BUDGET;
-        let mut matched = false;
         for entry in &pid_entries {
             if Instant::now() >= pid_deadline {
                 break;
@@ -393,14 +411,11 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
                     holders.push(FileHolder {
                         pid,
                         image: process_image(pid),
-                        verified: true,
                     });
-                    matched = true;
                     break;
                 }
             }
         }
-        let _ = matched;
     }
 
     if inaccessible_pids > 0 {

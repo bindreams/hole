@@ -37,19 +37,19 @@ use unsupported::find_holders_impl;
 use windows::find_holders_impl;
 
 /// A process that currently holds an open handle to the target file.
+///
+/// Only verified holders are reported — for a PID that the platform
+/// impl couldn't verify (e.g. Windows PPL processes on a non-elevated
+/// session), we omit the entry rather than list a noisy "suspect" PID.
+/// Windows logs an aggregate `info!` count of inaccessible PIDs so
+/// coverage gaps are observable.
 #[derive(Debug, Clone)]
 pub struct FileHolder {
     /// The holder's process ID.
     pub pid: u32,
     /// Executable path of the holder. `None` if lookup failed — e.g. a
-    /// kernel-managed PID like `System` (PID 4), or a protected process
-    /// (PPL) that denies `PROCESS_QUERY_LIMITED_INFORMATION`.
+    /// kernel-managed PID like `System` (PID 4).
     pub image: Option<PathBuf>,
-    /// `true` when we verified the handle refers to `path`. `false`
-    /// when we could only prove "this PID holds *some* file handle"
-    /// — e.g. `DuplicateHandle` was denied by PPL protection on
-    /// Windows. Unverified holders should be presented as "suspect".
-    pub verified: bool,
 }
 
 /// Returns every process that currently holds an open handle to `path`,
@@ -67,10 +67,11 @@ pub fn find_holders(path: &Path) -> io::Result<Vec<FileHolder>> {
     find_holders_impl(path)
 }
 
-/// Log, at `tracing::error!`, every process currently holding `path`.
-/// Best-effort: canonicalization failures, enumeration errors, and
-/// empty-holder results are all logged at lower severity and don't
-/// propagate.
+/// Log every process currently holding `path` at `tracing::error!` —
+/// one line per holder. Diagnostic gaps (canonicalization failure,
+/// enumeration error, empty-holders result) are logged at `warn!` and
+/// swallowed: this helper is best-effort and must not introduce new
+/// failure modes.
 pub fn log_holders(path: &Path) {
     let canonical = match std::fs::canonicalize(path) {
         Ok(p) => p,
@@ -108,7 +109,6 @@ pub fn log_holders(path: &Path) {
         tracing::error!(
             pid = h.pid,
             image = ?h.image.as_ref().map(|p| p.display().to_string()),
-            verified = h.verified,
             file = %canonical.display(),
             "file-lock holder",
         );

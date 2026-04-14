@@ -25,10 +25,17 @@ reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `Syst
 # Spawn-time file-contention diagnostics (bindreams/hole#208) ----
 #
 # `crate::diagnostics::spawn::spawn_with_diagnostics` is the sanctioned
-# wrapper around `Command::spawn`: on `ERROR_ACCESS_DENIED` (Windows) /
-# `ETXTBSY` (Unix) it logs every process holding the target file before
-# propagating the error. Direct `.spawn()` calls bypass that and make
-# CI flakes unactionable.
+# wrapper around `Command::spawn`: on file-contention errors
+# (`ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION` on Windows,
+# `ETXTBSY` / `EBUSY` on Unix) it logs every process holding the target
+# file before propagating the error. Direct `.spawn()` calls bypass
+# that and make CI flakes unactionable.
+#
+# Scope: this lint covers `Command::spawn` only. `Command::status()`
+# and `Command::output()` also spawn internally but aren't covered
+# because none of our current call sites invoke them on the hole
+# binary (msiexec.status() targets msiexec, not hole). If that
+# changes, wrap those sites too.
 #
 # Test fixtures that spawn throwaway helpers where the diagnostic isn't
 # meaningful (e.g. a child just holding a file, or a `timeout`/`sleep`
