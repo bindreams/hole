@@ -178,4 +178,5 @@ When Windows CI fails with a timeout in `server_test_tests` or loopback connects
 - Bump timeouts in `server_test_tests.rs` without completing steps 1-5
 - Mark failing tests with `#[cfg_attr(windows, ignore)]`
 - Add `--test-threads=1` to the Windows CI invocation
-- Serialize tests via `#[skuld::test(serial)]` except for structural invariant checks
+- Serialize tests via bare `#[skuld::test(serial)]` except for structural invariant checks. Resource-contention serialization belongs on the fixture that models the resource (`#[skuld::fixture(serial = LABEL)]`) or on the test carrying the resource's label: `#[skuld::test(labels = [LABEL], serial = LABEL)]`. Labels live in `crates/bridge/src/test_support/skuld_fixtures.rs` (`DIST_BIN`, `PORT_ALLOC`, `TUN`, `IPV6`). Label names are cross-crate reserved via skuld's SQLite coordinator — adding the same label name in another crate will unintentionally serialize tests across crates.
+- Add a per-test timeout. The CI job-level `timeout-minutes: 30` at `.github/workflows/ci.yaml` is the sole global test timeout. Developers wanting local per-test hang protection can set `NEXTEST_SLOW_TIMEOUT` in their shell.

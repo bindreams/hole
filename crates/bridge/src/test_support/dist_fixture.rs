@@ -19,18 +19,24 @@
 //!
 //! ## Concurrency
 //!
-//! Skuld's process-scoped fixture implementation has a race: the setup
-//! function can be invoked concurrently from multiple threads because
-//! the "not in cache" check and the `(setup)()` call happen under
-//! different lock acquisitions in
-//! `skuld::fixture::ensure_process_fixture`. Two parallel `run_stage`
-//! calls would race on the same destination files (`remove_file` by one
-//! thread + `hard_link` by another → `os error 32` on Windows).
+//! Two layers protect `run_stage` from racing with itself:
 //!
-//! Mitigation: guard the actual staging behind a `OnceLock` inside this
-//! module. Skuld may call `dist_dir()` twice, but only the first caller
-//! runs `xtask::run_stage`; the rest observe the already-staged path.
+//! 1. **Cross-process** — `serial = DIST_BIN` on the fixture. Skuld's
+//!    SQLite coordinator blocks concurrent tests in different nextest
+//!    binaries that both depend on `dist_dir` from staging simultaneously.
+//! 2. **In-process** — a `OnceLock` around the staging call. Skuld's
+//!    process-scoped fixture cache has a narrow race: the "not in cache"
+//!    check and the `(setup)()` call happen under different lock
+//!    acquisitions in `skuld::fixture::ensure_process_fixture`, so two
+//!    threads inside a single test binary can both invoke the setup.
+//!    Without the `OnceLock`, two parallel `run_stage` calls would race
+//!    on the same destination files (`remove_file` by one thread +
+//!    `hard_link` by another → `os error 32` on Windows).
+//!
+//! Both layers are load-bearing: serial covers cross-binary, OnceLock
+//! covers within-binary.
 
+use crate::test_support::skuld_fixtures::DIST_BIN;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use xtask::Profile;
@@ -46,8 +52,9 @@ static STAGED_DIST_BIN: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 /// call — tests only borrow the path; they never mutate the directory.
 ///
 /// `deref` lets tests request the fixture as `&Path` (via `Deref::Target`)
-/// instead of `&PathBuf`.
-#[skuld::fixture(scope = process, deref)]
+/// instead of `&PathBuf`. `serial = DIST_BIN` makes tests using this
+/// fixture cross-process serial on that label.
+#[skuld::fixture(scope = process, deref, serial = DIST_BIN)]
 pub(crate) fn dist_dir() -> Result<PathBuf, String> {
     STAGED_DIST_BIN
         .get_or_init(|| {
