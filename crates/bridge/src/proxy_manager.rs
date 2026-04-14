@@ -538,16 +538,28 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E tests skipped in CI:
-// - macOS: internal port race in shadowsocks-service PluginConfig (#197).
-//   Still skipped — re-enable when #197 has a custom server-side galoshes
-//   launcher.
-// - Windows: previously skipped for #200 (DistHarness SOCKS5 connections
-//   time out with WSAETIMEDOUT). RE-ENABLED for the duration of the #200
-//   investigation PR so the new diagnostics (HOLE_BRIDGE_SELF_TEST,
-//   enriched wait_for_port histogram, Get-NetTCPConnection capture) actually
-//   fire on the runner that exhibits the flake. Re-evaluate after
-//   evidence-driven fix lands.
+// E2E test skip policy in CI:
+//
+// - **macOS**: the entire module is skipped. The galoshes test set
+//   reliably hits #197 (internal port race in shadowsocks-service's
+//   `PluginConfig`). The non-galoshes tests work but the coverage
+//   uplift from running them in isolation on macOS wasn't judged worth
+//   the module-level complexity — re-enable the module when #197 has
+//   a custom server-side launcher.
+//
+// - **Windows**: the module runs, but the *galoshes* tests inside are
+//   individually `#[cfg(not(target_os = "windows"))]`-gated because the
+//   same #197 race fires here too. Everything else (the `ssserver_none`
+//   + cipher roundtrips that were the #200 canonical repro) runs and
+//   stays green. The `#[cfg]` gating lives in
+//   `proxy_manager_e2e_tests.rs` next to each affected test so the
+//   skip reason is co-located with the test.
+//
+// - **Linux**: the module runs fully. Linux CI is the only platform
+//   where the full galoshes matrix is exercised.
+//
+// See #200 (H7 TCPIP investigation, now dormant with `diagnostics::etw`
+// permanently on) and #197 (galoshes bind race, still open).
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
