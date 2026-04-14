@@ -176,4 +176,37 @@ fn capture_windows_tcp_state(port: u16) {
             );
         }
     }
+
+    // Routing table — critical for #200 root cause. If the previous
+    // TUN-mode test left a stale `0.0.0.0/1` route pointing at a
+    // destroyed TUN adapter, SYNs to 127.0.0.1 never reach the loopback
+    // adapter. `route print -4` shows the IPv4 routing table including
+    // interface indices so we can spot rows referencing a vanished
+    // hole-tun.
+    match std::process::Command::new("route").args(["print", "-4"]).output() {
+        Ok(o) => {
+            eprintln!(
+                "[wait_for_port] route print -4:\n{}",
+                String::from_utf8_lossy(&o.stdout)
+            );
+        }
+        Err(e) => eprintln!("[wait_for_port] route print spawn failed: {e}"),
+    }
+
+    // Interface list — shows which interface indices currently exist,
+    // so we can correlate route print's interface column with live
+    // adapters (a route referencing a non-existent interface index is
+    // the #200 smoking gun).
+    match std::process::Command::new("netsh")
+        .args(["interface", "ipv4", "show", "interfaces"])
+        .output()
+    {
+        Ok(o) => {
+            eprintln!(
+                "[wait_for_port] netsh interface ipv4 show interfaces:\n{}",
+                String::from_utf8_lossy(&o.stdout)
+            );
+        }
+        Err(e) => eprintln!("[wait_for_port] netsh show interfaces spawn failed: {e}"),
+    }
 }
