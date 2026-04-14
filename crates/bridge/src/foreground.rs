@@ -42,12 +42,16 @@ async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn s
         tracing::warn!(error = %e, "recover_plugins task panicked");
     }
 
-    // Capture WFP state after recovery has had a chance to clean up.
-    // Emits a one-line INFO (always) + DEBUG detail (gated). See #200.
+    // Capture WFP + NDIS state after recovery has had a chance to clean
+    // up. Each probe emits a one-line INFO (always) + WARN on anomaly +
+    // DEBUG detail (gated). See #200.
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
             tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+        }
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::ndis::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "ndis startup snapshot task panicked");
         }
     }
 
