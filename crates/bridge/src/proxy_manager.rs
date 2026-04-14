@@ -539,9 +539,15 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 mod proxy_manager_tests;
 
 // E2E tests skipped in CI:
-// - macOS: internal port race in shadowsocks-service PluginConfig (#197)
-// - Windows: DistHarness SOCKS5 connections time out with WSAETIMEDOUT (#200)
-// Re-enable when #197 is fixed (custom server-side galoshes launcher).
-#[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
+// - macOS: internal port race in shadowsocks-service PluginConfig (#197).
+//   Still skipped — re-enable when #197 has a custom server-side galoshes
+//   launcher.
+// - Windows: previously skipped for #200 (DistHarness SOCKS5 connections
+//   time out with WSAETIMEDOUT). RE-ENABLED for the duration of the #200
+//   investigation PR so the new diagnostics (HOLE_BRIDGE_SELF_TEST,
+//   enriched wait_for_port histogram, Get-NetTCPConnection capture) actually
+//   fire on the runner that exhibits the flake. Re-evaluate after
+//   evidence-driven fix lands.
+#[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
