@@ -149,7 +149,13 @@ impl DistHarness {
             // also set RUST_LOG: `from_env_lossy()` would pick it up at
             // equal specificity to our `add_directive` and the winner is
             // tracing-subscriber version-dependent.
-            .env("HOLE_BRIDGE_LOG", "hole_bridge=debug,shadowsocks_service=debug")
+            //
+            // Single directive — `hole_common::logging::init` ultimately
+            // calls `add_directive(parse(_))` which only accepts one. The
+            // global default in common is already "info", so
+            // `shadowsocks_service` continues to emit its
+            // "TCP listening on ..." INFO line that we rely on.
+            .env("HOLE_BRIDGE_LOG", "hole_bridge=debug")
             .env("HOLE_BRIDGE_SELF_TEST", "1");
 
         let mut child = cmd
