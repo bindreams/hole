@@ -356,12 +356,26 @@ fn rand_suffix() -> String {
 /// `bridge.log` or `netsh-trace.etl` for forensic download after a
 /// flaked test, which is the whole point of the Commit E artifact
 /// upload in PR #207.
+///
+/// Fail-loud on misconfigured CI: if `RUNNER_TEMP` is set but does not
+/// point at an existing directory, that's a runner bug that must be
+/// visible — silently falling back to `%TEMP%` would let CI succeed
+/// with logs landing outside the artifact-upload glob (the exact bug
+/// Commit E was written to fix).
 fn new_tempdir() -> std::io::Result<TempDir> {
     if let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") {
         let base = std::path::Path::new(&runner_temp);
-        if base.is_dir() {
-            return tempfile::tempdir_in(base);
+        if !base.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "RUNNER_TEMP is set ({}) but is not an existing directory; \
+                     this would land test logs outside the CI artifact glob",
+                    base.display()
+                ),
+            ));
         }
+        return tempfile::tempdir_in(base);
     }
     tempfile::tempdir()
 }

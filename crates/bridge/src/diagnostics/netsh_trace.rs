@@ -39,10 +39,9 @@
 //! - `maxsize=64` is MB, circular. A 30 s bridge lifetime under the
 //!   nextest `terminate-after` cap stays well below that.
 
-use crate::diagnostics::etw::read_wide_string;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Prefix used for this module's session names. Matches the
 /// `hole-bridge-trace-<pid>` format built in [`session_name`].
@@ -116,7 +115,7 @@ impl Drop for NetshTraceGuard {
 /// bridge, then start a fresh netsh trace session for this PID and
 /// return an RAII guard.
 pub fn start(log_dir: &Path) -> Result<NetshTraceGuard, NetshTraceError> {
-    sweep_stale_sessions();
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(SESSION_PREFIX, "netsh-trace");
 
     let session = session_name();
     let etl_path = default_etl_path(log_dir);
@@ -150,96 +149,4 @@ pub fn start(log_dir: &Path) -> Result<NetshTraceGuard, NetshTraceError> {
         "netsh trace started",
     );
     Ok(NetshTraceGuard { session, etl_path })
-}
-
-/// Enumerate live ETW sessions via Win32 `QueryAllTracesW` and stop
-/// any whose name starts with [`SESSION_PREFIX`]. Mirrors the ETW
-/// consumer's sweep at
-/// [`crate::diagnostics::etw::sweep_stale_sessions`] — best-effort,
-/// warns on failure, never aborts startup.
-fn sweep_stale_sessions() {
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Diagnostics::Etw::{
-        ControlTraceW, QueryAllTracesW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES,
-    };
-
-    const MAX_SESSIONS: usize = 128;
-    const STRING_RESERVE: usize = 1024;
-    const PROPERTIES_SIZE: usize = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * STRING_RESERVE;
-
-    let mut buffer = vec![0u8; PROPERTIES_SIZE * MAX_SESSIONS];
-    let mut pointers: Vec<*mut EVENT_TRACE_PROPERTIES> = Vec::with_capacity(MAX_SESSIONS);
-    for i in 0..MAX_SESSIONS {
-        // SAFETY: we own `buffer` and lay out one properties-sized slot
-        // per index; Windows fills them in via QueryAllTracesW.
-        let p = unsafe {
-            buffer
-                .as_mut_ptr()
-                .add(i * PROPERTIES_SIZE)
-                .cast::<EVENT_TRACE_PROPERTIES>()
-        };
-        unsafe {
-            (*p).Wnode.BufferSize = PROPERTIES_SIZE as u32;
-            (*p).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            (*p).LogFileNameOffset = (std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + STRING_RESERVE) as u32;
-        }
-        pointers.push(p);
-    }
-
-    let mut session_count: u32 = 0;
-    // SAFETY: QueryAllTracesW takes an array of pre-initialised
-    // EVENT_TRACE_PROPERTIES pointers, fills them in, and writes the
-    // count to the out parameter.
-    let query_err = unsafe { QueryAllTracesW(&mut pointers, &mut session_count) };
-    if query_err != ERROR_SUCCESS {
-        warn!(code = query_err.0, "netsh-trace: QueryAllTracesW failed during sweep");
-        return;
-    }
-
-    let count = session_count as usize;
-    let mut swept = 0u32;
-    for p in pointers.iter().take(count.min(MAX_SESSIONS)).copied() {
-        // SAFETY: Windows filled in the null-terminated wide logger name
-        // at offset LoggerNameOffset within the allocation we supplied.
-        let name_ptr = unsafe {
-            (p as *const u8)
-                .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>())
-                .cast::<u16>()
-        };
-        let name = unsafe { read_wide_string(name_ptr) };
-        if !name.starts_with(SESSION_PREFIX) {
-            continue;
-        }
-
-        let mut wide: Vec<u16> = name.encode_utf16().collect();
-        wide.push(0);
-
-        // SAFETY: `wide` is null-terminated and outlives the call;
-        // `p` is valid for the duration of the sweep.
-        let stop_err = unsafe {
-            ControlTraceW(
-                CONTROLTRACE_HANDLE { Value: 0 },
-                windows::core::PCWSTR(wide.as_ptr()),
-                p,
-                EVENT_TRACE_CONTROL_STOP,
-            )
-        };
-        if stop_err == ERROR_SUCCESS {
-            info!(session = %name, "netsh-trace: swept stale session");
-            swept += 1;
-        } else {
-            warn!(session = %name, code = stop_err.0, "netsh-trace: failed to stop stale session");
-        }
-    }
-    if swept == 0 {
-        debug!("netsh-trace: no stale sessions to sweep");
-    } else {
-        // The first start after a crash often finds a leftover session
-        // that was never drained — once we've stopped them, the
-        // subsequent `netsh trace start` should succeed cleanly.
-        info!(
-            swept,
-            "netsh-trace: swept leftover sessions from prior runs; next start should succeed"
-        );
-    }
 }

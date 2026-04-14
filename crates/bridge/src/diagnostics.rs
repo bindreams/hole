@@ -21,6 +21,8 @@
 #[cfg(target_os = "windows")]
 pub mod etw;
 #[cfg(target_os = "windows")]
+pub mod etw_sweep;
+#[cfg(target_os = "windows")]
 pub mod ndis;
 #[cfg(target_os = "windows")]
 pub mod netsh_trace;

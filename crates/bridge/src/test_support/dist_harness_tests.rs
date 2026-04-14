@@ -50,6 +50,15 @@ fn dump_harness_log_emits_full_log_not_just_tail() {
         out.len(),
         &out[..out.len().min(200)]
     );
+    // Mid-body assertion: guards against a regression that re-introduces
+    // a larger-but-still-truncating tail cap (e.g. 8 KB) which would
+    // keep both sentinels but drop the middle. Requires that a filler
+    // line at ~4 KiB in the body is present.
+    assert!(
+        out.contains("filler line 050"),
+        "dump must include mid-body content, not just start+end sentinels; \
+         this protects against a regression to a larger-but-still-truncating tail cap"
+    );
     assert!(
         out.contains("SENTINEL_END"),
         "dump must include the end of the log; dump len={}",
