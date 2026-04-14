@@ -223,4 +223,60 @@ fn capture_windows_tcp_state(port: u16) {
     // here served its purpose (CI run 3 on PR #207 showed loopback is
     // broken machine-wide, ruling out H8). Removing it now keeps the
     // failure capture focused on cheap evidence we don't already have.
+
+    // ICMP loopback probe. If ping 127.0.0.1 succeeds while TCP
+    // connects hang, we're seeing the SYN-not-transmitted shape
+    // documented in microsoft/Windows-Containers#620 (Windows Server
+    // 2025 regression). If ping also hangs, the loopback adapter
+    // itself is broken.
+    //
+    // `-n 3` = 3 echo requests; `-w 500` = 500 ms per-request timeout
+    // (1.5 s total upper bound). `-4` forces IPv4 — we only care about
+    // the v4 loopback path.
+    match std::process::Command::new("ping")
+        .args(["-4", "-n", "3", "-w", "500", "127.0.0.1"])
+        .output()
+    {
+        Ok(o) => {
+            eprintln!(
+                "[wait_for_port] ping 127.0.0.1 (exit={}):\n{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout)
+            );
+        }
+        Err(e) => eprintln!("[wait_for_port] ping spawn failed: {e}"),
+    }
+
+    // UDP loopback probe. `bind 127.0.0.1:0` + `send_to
+    // 127.0.0.1:<target>` emits a datagram regardless of whether
+    // anything is listening on <target>. The outcomes differentiate:
+    //
+    //   - `Ok(n)` → packet left the socket into loopback. If TCP is
+    //     still hung, the kernel-level split is between UDP and TCP
+    //     send paths, not an adapter-wide outage.
+    //   - `Err(WSAECONNRESET)` → kernel delivered an ICMP
+    //     port-unreachable for the UDP packet. Loopback is intact;
+    //     TCP-specific state is broken.
+    //   - Blocking / hang → UDP path is broken too; the break is
+    //     deeper than transport layer.
+    match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(sock) => {
+            let _ = sock.set_write_timeout(Some(Duration::from_millis(500)));
+            let target = format!("127.0.0.1:{port}");
+            let start = Instant::now();
+            match sock.send_to(b"hole-probe", &target) {
+                Ok(n) => eprintln!(
+                    "[wait_for_port] UDP probe: send_to {target} OK ({n} bytes, {}ms)",
+                    start.elapsed().as_millis()
+                ),
+                Err(e) => eprintln!(
+                    "[wait_for_port] UDP probe: send_to {target} err: os_code={:?} kind={:?} ({}ms): {e}",
+                    e.raw_os_error(),
+                    e.kind(),
+                    start.elapsed().as_millis()
+                ),
+            }
+        }
+        Err(e) => eprintln!("[wait_for_port] UDP probe: bind 127.0.0.1:0 failed: {e}"),
+    }
 }
