@@ -82,6 +82,14 @@ Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download) lives
 in `cargo xtask deps`. `crates/hole/build.rs` is restricted to compile-time
 metadata (icon generation, git version via `xtask-lib::version`).
 
+`cargo xtask stage --with-tests --tests-out-dir <dir>` additionally stages
+workspace test binaries at stable paths (`<dir>/{crate}.test.exe`) so Windows
+Firewall can cache consent across rebuilds (bindreams/hole#210). Convention:
+`<dir>` is the sibling of `--out-dir` (e.g. `target/debug/dist/tests`). When
+two cargo targets share a name (e.g. the `hole` crate's lib and bin), the
+staged name is disambiguated to `{crate}-{kind}.test.exe`
+(`hole-lib.test.exe` + `hole-bin.test.exe`).
+
 ## Build
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow (hot-reload, foreground bridge mode).

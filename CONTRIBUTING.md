@@ -157,6 +157,23 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 cargo test --workspace
 ```
 
+### Avoiding Windows Firewall prompts on every rebuild
+
+Bridge tests bind a TCP listener on all interfaces (for TUN routing), so Windows Firewall prompts for "allow access to local networks" when the test binary starts. Cargo names test binaries `target/debug/deps/hole_bridge-{hash}.exe` with a content-hash suffix that churns on every rebuild, so Firewall never caches consent. On a fullscreen-capable setup the prompt also closes fullscreen apps.
+
+To approve once and never again:
+
+```sh
+cargo xtask stage --with-tests \
+    --out-dir target/debug/dist/bin \
+    --tests-out-dir target/debug/dist/tests
+./target/debug/dist/tests/hole_bridge.test.exe   # approve the prompt once
+```
+
+Test execution may report failures on that first run — individual tests aren't the point here. The goal is simply for `hole_bridge.test.exe` to bind its socket so Windows Firewall shows the prompt against a path that won't churn.
+
+Subsequent `cargo xtask stage --with-tests` runs reuse the same stable path, so Firewall consent persists. Re-run the staging command after each source change — the staged binary does not update automatically. When two cargo targets share a name (e.g. the `hole` crate's lib and bin), dest names get disambiguated to `hole-lib.test.exe` / `hole-bin.test.exe`. See bindreams/hole#210.
+
 ### Investigating Windows CI flakes
 
 When Windows CI fails with a timeout in `server_test_tests` or loopback connects time out unexpectedly, work through these steps IN ORDER before proposing any timeout bump. bindreams/hole#165 was debugged for multiple hours because these steps were not documented — the bug was a unit test that shelled out to `netsh` via an RAII guard that bypassed the backend trait.
