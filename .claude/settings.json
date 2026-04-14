@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(uv run --group dev pytest *)",
-      "Bash(uv run --directory msi-installer upgrade-wix *)"
+      "Bash(uv run --directory msi-installer upgrade-wix *)",
+      "Bash(cargo nextest run *)",
+      "Bash(cargo xtask deps *)",
+      "Bash(cargo xtask stage *)"
     ]
   }
 }
