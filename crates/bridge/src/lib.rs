@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod dispatcher;
 pub mod filter;
 pub mod foreground;

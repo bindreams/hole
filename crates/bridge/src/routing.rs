@@ -354,6 +354,13 @@ impl Drop for SystemRoutes {
         if let Err(e) = crate::route_state::clear(&self.state_dir) {
             warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
         }
+        // Snapshot WFP post-teardown. Emits warn when wintun-related
+        // filter references remain — the #200 smoking gun. Cheap and
+        // log-visible on user machines so bug reports carry the verdict
+        // without needing debug mode.
+        #[cfg(target_os = "windows")]
+        crate::diagnostics::wfp::log_snapshot("post-teardown");
+
         info!("SystemRoutes::drop completed");
     }
 }

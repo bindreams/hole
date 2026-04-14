@@ -116,6 +116,11 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(error = %e, "recover_plugins task panicked");
         }
 
+        // Capture WFP state after recovery. See #200 / `diagnostics::wfp`.
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+        }
+
         tokio::select! {
             result = server.run() => {
                 if let Err(e) = result {
