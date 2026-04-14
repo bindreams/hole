@@ -1,3 +1,9 @@
+// Throwaway `timeout`/`sleep` children spawned only to hold a PID for
+// the recovery logic under test. The spawn-diagnostic wrapper (#208)
+// wouldn't add value here — the children are always known-good system
+// binaries — so we suppress the `Command::spawn` lint file-wide.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 
 #[skuld::test]

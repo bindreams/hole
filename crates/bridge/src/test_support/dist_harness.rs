@@ -136,8 +136,10 @@ impl DistHarness {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let mut child = cmd
-            .spawn()
+        // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
+        // spawn failure (typically Windows Defender scanning the freshly
+        // built `hole.exe`) lands a holder list in the log. See #208.
+        let mut child = crate::diagnostics::spawn::spawn_with_diagnostics(&mut cmd)
             .map_err(|e| HarnessError(format!("failed to spawn {hole_exe:?}: {e}")))?;
 
         // Wait for the socket to become connectable before returning.

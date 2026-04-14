@@ -35,6 +35,10 @@ mod windows_live {
         let path_lit = path.to_str().expect("path utf-8");
         let script =
             format!("$f = [System.IO.File]::Open('{path_lit}', 'Open', 'Read', 'Read'); Start-Sleep 30; $f.Close()");
+        // Test fixture: we *want* the child to hold the file, so the
+        // diagnostic wrapper's holder enumeration (which is what we're
+        // testing) wouldn't be meaningful here.
+        #[allow(clippy::disallowed_methods)]
         Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdin(Stdio::null())
