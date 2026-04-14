@@ -4,7 +4,7 @@
 use shadowsocks_service::config::Config;
 use std::io;
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use super::{Proxy, ProxyError, RunningProxy};
 
@@ -29,10 +29,17 @@ impl Proxy for ShadowsocksProxy {
     type Running = ShadowsocksRunning;
 
     async fn start(&self, config: Config) -> Result<Self::Running, ProxyError> {
+        debug!("calling shadowsocks_service::local::Server::new");
         let server = shadowsocks_service::local::Server::new(config)
             .await
             .map_err(ProxyError::Runtime)?;
+        debug!("shadowsocks_service Server constructed");
+        debug!("spawning shadowsocks server.run() task");
         let handle = tokio::spawn(async move {
+            // First log inside the spawned task: a gap between
+            // "spawning" and "entered" timestamps in the bridge log
+            // means the tokio runtime is starved (#200 H1 hypothesis).
+            debug!("shadowsocks server task entered");
             let result = server.run().await;
             // server.run() contains an infinite accept loop — it should never
             // return under normal operation. If it does, the SOCKS5 listener

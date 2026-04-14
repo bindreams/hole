@@ -32,7 +32,7 @@ use hole_common::protocol::{ProxyConfig, TunnelMode};
 use std::net::IpAddr;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // State ===============================================================================================================
 
@@ -202,6 +202,14 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         config: &ProxyConfig,
         cancel: CancellationToken,
     ) -> Result<(), ProxyError> {
+        debug!(
+            local_port = config.local_port,
+            tunnel_mode = ?config.tunnel_mode,
+            plugin = ?config.server.plugin,
+            server_host = %config.server.server,
+            server_port = config.server.server_port,
+            "ProxyManager::start_cancellable entered"
+        );
         if self.running.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
@@ -211,6 +219,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // touch `self`, so dropping the future leaves `self` untouched.
         // All partial state is owned by the locally-constructed RAII
         // types inside start_inner and cleans up on drop.
+        debug!("awaiting start_inner");
         let result: Result<RunningState<P, R>, ProxyError> = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ProxyError::Cancelled),
@@ -229,6 +238,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 self.active_config = Some(config.clone());
                 self.last_error = None;
                 info!(server_ip = ?server_ip, "proxy started");
+                debug!(local_port = config.local_port, "proxy started (debug)");
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
@@ -263,6 +273,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
     ) -> Result<RunningState<P, R>, ProxyError> {
+        debug!("start_inner entered");
         // Start plugin chain via Garter if a plugin is configured.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
@@ -290,7 +301,46 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // local instance, so `shadowsocks-service::local::Server::new` will
         // only bind the SOCKS5 listener.
         if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
+            debug!(local_count = ss_config.local.len(), "calling proxy.start");
             let running_proxy = proxy.start(ss_config).await?;
+            debug!("proxy.start returned Ok");
+
+            // In-bridge SOCKS5 loopback self-test (#200 H2 vs H3 disambiguation).
+            // When the test harness sets `HOLE_BRIDGE_SELF_TEST`, spawn a task
+            // that connects to our own SOCKS5 port from inside the bridge.
+            // Compare with the test process's external connect outcome:
+            //   self-OK + ext-OK            → no bug
+            //   self-OK + ext-WSAETIMEDOUT  → cross-process loopback broken (H2)
+            //   self-WSAETIMEDOUT           → listener broken (H1/H3)
+            //   self-ECONNREFUSED           → listener never opened (H3)
+            // No pre-sleep: Server::new().await has already done bind+listen
+            // so the kernel queues SYNs into the backlog regardless of whether
+            // user-space accept() has been called. Any failure IS the signal.
+            if std::env::var_os("HOLE_BRIDGE_SELF_TEST").is_some() {
+                let port = config.local_port;
+                tokio::spawn(async move {
+                    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+                    let started = std::time::Instant::now();
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                        .await
+                    {
+                        Ok(Ok(_stream)) => info!(
+                            port,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "in-bridge self-test connect OK"
+                        ),
+                        Ok(Err(e)) => error!(
+                            port,
+                            error = %e,
+                            os_code = ?e.raw_os_error(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "in-bridge self-test connect failed"
+                        ),
+                        Err(_) => error!(port, "in-bridge self-test connect timed out after 5s"),
+                    }
+                });
+            }
+
             return Ok(RunningState {
                 dispatcher: None,
                 plugin_chain,
