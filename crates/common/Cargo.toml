@@ -17,11 +17,14 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-log = "0.2"
 tracing-appender = "0.2"
 file-rotate = "0.8"
 os_pipe = "1"
-time = { version = "0.3", features = ["serde-well-known"] }
+time = { version = "0.3", features = ["serde-well-known", "formatting"] }
+yaml_serde = "0.10"
+nu-ansi-term = "0.50"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
