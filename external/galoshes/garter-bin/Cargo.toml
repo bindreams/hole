@@ -21,4 +21,4 @@ serde = { workspace = true }
 yaml_serde = "0.10"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }
+skuld = { workspace = true }

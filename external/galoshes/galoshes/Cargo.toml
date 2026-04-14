@@ -22,7 +22,7 @@ sha2 = "0.10"
 tempfile = "3"
 
 [dev-dependencies]
-skuld = { git = "https://github.com/bindreams/skuld", features = ["tokio"] }
+skuld = { workspace = true }
 
 [build-dependencies]
 sha2 = "0.10"
