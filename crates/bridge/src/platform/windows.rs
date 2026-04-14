@@ -25,14 +25,19 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy bridge for the Hole app
 static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// State directory override set by the CLI before service dispatch.
 static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+/// Log directory override set by the CLI before service dispatch.
+/// Used by `netsh trace` ETL to land the capture file alongside
+/// `bridge.log` in the same directory.
+static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), windows_service::Error> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
     }
     STATE_DIR_OVERRIDE.set(state_dir.to_owned()).ok();
+    LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -131,6 +136,23 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             Ok(g) => Some(g),
             Err(e) => {
                 tracing::error!(error = %e, "etw consumer failed to start");
+                None
+            }
+        };
+
+        // Packet-level `netsh trace` capture, scoped to the service's
+        // run lifetime. Dropped alongside `_etw_guard`. ETL lands under
+        // the CLI-provided log_dir (falls back to the default log dir
+        // if the CLI did not pass one — defensive against a future
+        // service-dispatch path that forgets to set `LOG_DIR_OVERRIDE`).
+        let log_dir = LOG_DIR_OVERRIDE
+            .get()
+            .cloned()
+            .unwrap_or_else(hole_common::logging::default_log_dir);
+        let _netsh_trace_guard = match crate::diagnostics::netsh_trace::start(&log_dir) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::error!(error = %e, "netsh trace capture failed to start");
                 None
             }
         };

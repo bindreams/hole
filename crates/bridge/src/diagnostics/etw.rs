@@ -480,7 +480,7 @@ fn sweep_stale_sessions() {
 /// Read a null-terminated UTF-16 string from a raw pointer.
 /// # Safety
 /// Caller must ensure `ptr` points to a null-terminated UTF-16 buffer.
-unsafe fn read_wide_string(ptr: *const u16) -> String {
+pub(crate) unsafe fn read_wide_string(ptr: *const u16) -> String {
     let mut len = 0usize;
     while unsafe { *ptr.add(len) } != 0 {
         len += 1;

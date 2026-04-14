@@ -204,7 +204,15 @@ pub fn is_running() -> bool {
 }
 
 /// Run the bridge directly (called by launchd).
-pub fn run(socket_path: &std::path::Path, state_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `_log_dir` is accepted to keep the Windows/macOS service entry
+/// points parameter-compatible; on macOS there is no ETL capture so
+/// the value is unused today.
+pub fn run(
+    socket_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    _log_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(

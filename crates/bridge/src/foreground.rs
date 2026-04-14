@@ -12,12 +12,18 @@ use std::path::Path;
 /// dev exercises the real DACL/group/SDDL code — see the `dev.py` /
 /// `bridge grant-access` orchestration. Requires elevation for TUN +
 /// routing.
-pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `log_dir` is used as the destination for diagnostic artefacts (e.g.
+/// the `netsh trace` ETL on Windows). It is the same directory that the
+/// global tracing subscriber writes `bridge.log` into — so all
+/// bridge-owned files land in one place and the CI artifact-upload step
+/// can glob for them.
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir))
+    rt.block_on(run_inner(socket_path, state_dir, log_dir))
 }
 
-async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
             .with_state_dir(state_dir.to_path_buf()),
@@ -67,6 +73,21 @@ async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn s
             None
         }
     };
+
+    // Start the netsh-trace ETL capture (packet-level wire capture
+    // scoped to this process). Dropped alongside `_etw_guard`. Requires
+    // admin elevation — in CI the bridge child inherits the runneradmin
+    // token; on local dev without elevation this fails and we continue.
+    #[cfg(target_os = "windows")]
+    let _netsh_trace_guard = match crate::diagnostics::netsh_trace::start(log_dir) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::error!(error = %e, "netsh trace capture failed to start");
+            None
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let _ = log_dir; // suppress unused warning on non-Windows builds
 
     tokio::select! {
         result = server.run() => {
