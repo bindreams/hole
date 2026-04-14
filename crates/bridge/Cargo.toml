@@ -66,6 +66,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_Etw",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
     "Win32_NetworkManagement_IpHelper",
@@ -78,6 +79,7 @@ windows = { version = "0.62", features = [
 # bare-name `LoadLibraryExW("wintun.dll")` from inside shadowsocks-service
 # fires later. See crates/bridge/src/wintun.rs.
 wintun-bindings = "0.7"
+ferrisetw = "1.2.0"
 
 [dev-dependencies]
 skuld = { version = "0.1", features = ["tokio"] }

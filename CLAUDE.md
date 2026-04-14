@@ -54,11 +54,20 @@ crash recovery, both in `<state_dir>/`:
   kills any tracked processes that are still alive (with PID-reuse
   safety via start-time verification). The same file is also read by the
   test harness (`DistHarness::drop`) to reap leaked plugins after tests.
+- **ETW sessions** (Windows only) — the bridge opens a named ETW trace
+  session `hole-bridge-etw-<pid>` for in-process network diagnostics
+  (see `crates/bridge/src/diagnostics/etw.rs`). A crashed bridge leaves
+  this session alive until the machine reboots. On next startup,
+  `diagnostics::etw::sweep_stale_sessions` enumerates live sessions via
+  `QueryAllTracesW` and stops any whose name starts with
+  `hole-bridge-etw-`. Sweep is keyed on the name prefix only, safe
+  against PID reuse.
 
-Both recovery functions run *after* the IPC socket is bound. If the
+All three recovery paths run *after* the IPC socket is bound. If the
 in-bridge recovery fails or the process can't restart,
 `scripts/network-reset.py` reads the route state file and performs an
-equivalent cleanup from outside (plugin reaping by name as a last resort).
+equivalent cleanup from outside (plugin reaping by name as a last
+resort; ETW sessions are best-effort via `logman stop` from the shell).
 
 ## Workspace layout
 

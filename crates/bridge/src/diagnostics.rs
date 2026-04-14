@@ -19,6 +19,8 @@
 //   by a single snapshot even when a probe produces multi-MB output.
 
 #[cfg(target_os = "windows")]
+pub mod etw;
+#[cfg(target_os = "windows")]
 pub mod ndis;
 #[cfg(target_os = "windows")]
 pub mod wfp;
