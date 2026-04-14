@@ -62,6 +62,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
 /// proxy task produces a clear assertion ("proxy reports not running")
 /// instead of a blind 10-second timeout on `wait_for_port`.
 async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, target_addr: SocketAddr) {
+    eprintln!("[test] pid={} polling 127.0.0.1:{proxy_port}", std::process::id());
     // Health check: if the proxy task exited between Start and now,
     // the bridge's check_health() will notice and report running=false.
     let status = harness.send(BridgeRequest::Status).await.expect("send Status");

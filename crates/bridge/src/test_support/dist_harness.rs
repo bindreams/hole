@@ -38,8 +38,10 @@ use hole_common::protocol::{
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -112,6 +114,12 @@ impl DistHarness {
     /// Blocks until the bridge's IPC socket is connectable (or the
     /// spawn-ready budget expires).
     pub(crate) async fn spawn(dist_bin_dir: &Path) -> Result<Self, HarnessError> {
+        // Install the panic hook BEFORE any fallible work so that if the
+        // harness itself panics during construction, the hook still runs.
+        // Idempotent across calls — `Once::call_once` is a no-op after the
+        // first invocation.
+        install_panic_hook_once();
+
         let hole_exe = dist_bin_dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
         if !hole_exe.is_file() {
             return Err(HarnessError(format!("hole binary missing from dist dir: {hole_exe:?}")));
@@ -148,6 +156,24 @@ impl DistHarness {
             .spawn()
             .map_err(|e| HarnessError(format!("failed to spawn {hole_exe:?}: {e}")))?;
 
+        let child_pid = child.id();
+        eprintln!(
+            "[DistHarness] spawned bridge child_pid={child_pid} socket={} log_dir={}",
+            socket_path.display(),
+            log_dir.path().display()
+        );
+
+        // Register the live child for the panic hook (#200 H3 evidence).
+        // Removed in `Drop`. Key by PID — unique per running child.
+        registry().lock().expect("registry mutex").insert(
+            child_pid,
+            ChildInfo {
+                pid: child_pid,
+                socket: socket_path.clone(),
+                log_dir: log_dir.path().to_path_buf(),
+            },
+        );
+
         // Wait for the socket to become connectable before returning.
         // If the subprocess has already exited, surface that instead of
         // waiting the full 10s timeout.
@@ -156,6 +182,7 @@ impl DistHarness {
             // still limping along.
             let _ = child.kill();
             let _ = child.wait();
+            registry().lock().expect("registry mutex").remove(&child_pid);
             return Err(HarnessError(format!(
                 "bridge subprocess never bound {socket_path:?}: {e}"
             )));
@@ -230,6 +257,11 @@ impl Drop for DistHarness {
             // `shutdown()` already consumed or construction failed.
             return;
         };
+        // Remove from the panic-hook registry. PID is recorded once at
+        // spawn time; reuse it here rather than calling `child.id()` again
+        // (the docs allow returning a different PID after `wait()`).
+        let registered_pid = child.id();
+        registry().lock().expect("registry mutex").remove(&registered_pid);
 
         if let Some(client) = client {
             // Move client into a worker thread that drives a short
@@ -305,6 +337,75 @@ fn rand_suffix() -> String {
     use rand::Rng;
     let n: u32 = rand::rng().random();
     format!("{n:08x}")
+}
+
+// Panic-hook registry =================================================================================================
+
+/// Snapshot of a live `DistHarness` child that the panic hook can read
+/// without holding any reference to the harness itself.
+#[derive(Clone)]
+struct ChildInfo {
+    pid: u32,
+    socket: PathBuf,
+    log_dir: PathBuf,
+}
+
+/// Process-wide registry of live child processes. Used by the panic hook
+/// (see [`install_panic_hook_once`]) to dump the bridge log tail when a
+/// test panics on a different thread than the harness was constructed on
+/// — which is the common case under `rt().block_on(...)`.
+fn registry() -> &'static Mutex<BTreeMap<u32, ChildInfo>> {
+    static HARNESS_REGISTRY: OnceLock<Mutex<BTreeMap<u32, ChildInfo>>> = OnceLock::new();
+    HARNESS_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Install a panic hook (idempotent across the test binary's lifetime)
+/// that, on every panic, prints each registered live `DistHarness` child's
+/// PID/socket/log_dir to stderr and dumps the last 4 KB of its bridge log
+/// file. The previous hook (typically the libtest panic printer) is
+/// chained so test output is preserved.
+///
+/// The hook reads a `OnceLock<Mutex<BTreeMap<...>>>`, NOT a `thread_local!`,
+/// because `wait_for_port` (the panicking call site) runs on whichever
+/// tokio worker resumes the `.await` — almost never the thread that
+/// constructed the harness. A thread-local would always read empty.
+///
+/// On a poisoned mutex, `lock()` returns `Err` and the hook silently skips
+/// the dump rather than double-panicking.
+fn install_panic_hook_once() {
+    static PANIC_HOOK_ONCE: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK_ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            eprintln!("[DistHarness panic hook] fired: {info}");
+            if let Ok(reg) = registry().lock() {
+                for c in reg.values() {
+                    eprintln!(
+                        "[DistHarness panic hook] live harness pid={} socket={} log_dir={}",
+                        c.pid,
+                        c.socket.display(),
+                        c.log_dir.display()
+                    );
+                    let log_path = c.log_dir.join("bridge.log");
+                    match std::fs::read(&log_path) {
+                        Ok(bytes) => {
+                            let tail_from = bytes.len().saturating_sub(4096);
+                            let tail = String::from_utf8_lossy(&bytes[tail_from..]);
+                            eprintln!(
+                                "[DistHarness panic hook] ---- tail of {} ({} bytes) ----",
+                                log_path.display(),
+                                bytes.len() - tail_from
+                            );
+                            eprintln!("{}", tail);
+                            eprintln!("[DistHarness panic hook] ---- end ----");
+                        }
+                        Err(e) => eprintln!("[DistHarness panic hook] could not read {}: {}", log_path.display(), e),
+                    }
+                }
+            }
+            prev(info);
+        }));
+    });
 }
 
 /// Poll-connect to the bridge socket until it becomes connectable, the
