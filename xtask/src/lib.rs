@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub mod bindir;
 pub mod galoshes;
 pub mod stage;
+pub mod test_binaries;
 pub mod v2ray_plugin;
 pub mod wintun;
 
@@ -20,6 +21,9 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
+#[cfg(test)]
+#[path = "test_binaries_tests.rs"]
+mod test_binaries_tests;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +53,18 @@ pub enum Command {
         /// Directory to populate with the staged files. Created if missing.
         #[arg(long)]
         out_dir: PathBuf,
+
+        /// Also compile workspace test binaries and stage them at stable paths
+        /// under `--tests-out-dir`. See bindreams/hole#210 for motivation.
+        #[arg(long)]
+        with_tests: bool,
+
+        /// Directory for staged test binaries (`{crate}.test{.exe}`). Required
+        /// when `--with-tests` is set. Convention: sibling of `--out-dir`
+        /// (e.g. `target/debug/dist/tests` when `--out-dir` is
+        /// `target/debug/dist/bin`).
+        #[arg(long, requires = "with_tests")]
+        tests_out_dir: Option<PathBuf>,
     },
     /// Build the v2ray-plugin sidecar from `external/v2ray-plugin/`.
     ///
@@ -99,7 +115,26 @@ impl Profile {
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Stage { profile, out_dir } => run_stage(profile, &out_dir),
+        Command::Stage {
+            profile,
+            out_dir,
+            with_tests,
+            tests_out_dir,
+        } => {
+            // Validate the flag combination before doing any filesystem work —
+            // otherwise `--with-tests` without `--tests-out-dir` would stage
+            // the production bindir and then error, wasting the hardlink pass.
+            let tests_dir = if with_tests {
+                Some(tests_out_dir.ok_or_else(|| anyhow::anyhow!("--with-tests requires --tests-out-dir"))?)
+            } else {
+                None
+            };
+            run_stage(profile, &out_dir)?;
+            if let Some(tests_dir) = tests_dir {
+                test_binaries::stage_test_binaries(profile, &tests_dir)?;
+            }
+            Ok(())
+        }
         Command::V2rayPlugin => run_v2ray_plugin(),
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),

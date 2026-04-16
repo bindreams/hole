@@ -8159,6 +8159,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cargo_metadata",
  "clap",
  "glob",
  "sha2 0.11.0",
