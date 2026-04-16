@@ -4,14 +4,19 @@ use std::process::{Command, Stdio};
 
 #[skuld::test]
 fn spawn_with_diagnostics_passes_through_success() {
-    // Pick a binary guaranteed to exist on each platform and exit fast.
+    // Pick a command guaranteed to exist on each platform and exit fast.
+    // `/bin/sh -c "exit 0"` works on every Unix (macOS bundles /bin/sh
+    // from the base system); `whoami.exe` is a Windows system binary.
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("whoami.exe");
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         c
     } else {
-        let mut c = Command::new("/bin/true");
-        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         c
     };
     let mut child = spawn_with_diagnostics(&mut cmd).expect("spawn must succeed");

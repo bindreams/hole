@@ -239,19 +239,35 @@ fn parse_handle_entries(buf: &[u8]) -> Vec<SystemHandleTableEntryInfoEx> {
 
 /// Run `GetFileInformationByHandle` on a worker thread with a hard
 /// timeout. Returns `None` if the call fails or the worker exceeds
-/// `FILE_ID_QUERY_TIMEOUT`. `GetFileInformationByHandle` can block on
-/// named pipes and unresponsive remote files; a blocked worker is
-/// abandoned (never joined) — same pattern Process Explorer uses.
+/// `FILE_ID_QUERY_TIMEOUT`. A blocked worker is abandoned (never
+/// joined) — same pattern Process Explorer uses.
+///
+/// The worker gets its own `DuplicateHandle` copy and closes it when
+/// done; the caller keeps using `h` normally. Without this, a caller
+/// closing `h` while the worker's `GetFileInformationByHandle` is
+/// still in flight races with the kernel I/O and triggers Rust's
+/// `"operation failed to complete synchronously, aborting"` fatal
+/// runtime error.
 fn file_id_with_timeout(h: HANDLE) -> Option<FileId> {
+    let mut worker_handle = HANDLE::default();
+    let current = unsafe { GetCurrentProcess() };
+    unsafe {
+        DuplicateHandle(current, h, current, &mut worker_handle, 0, false, DUPLICATE_SAME_ACCESS).ok()?;
+    }
+    let handle_bits = worker_handle.0 as isize;
     let (tx, rx) = mpsc::channel::<Option<FileId>>();
-    let handle_bits = h.0 as isize;
     std::thread::spawn(move || {
         // Reconstruct HANDLE inside the thread — raw pointers aren't Send.
         let h = HANDLE(handle_bits as *mut c_void);
-        let _ = tx.send(file_id_of_handle(h));
+        let result = file_id_of_handle(h);
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        let _ = tx.send(result);
     });
-    // Returns None on either recv timeout (worker abandoned to leak)
-    // or RecvError::Disconnected (worker panicked before sending).
+    // Returns None on either recv timeout (worker abandoned to leak
+    // with its own handle copy — safe) or RecvError::Disconnected
+    // (worker panicked before sending).
     rx.recv_timeout(FILE_ID_QUERY_TIMEOUT).unwrap_or_default()
 }
 
