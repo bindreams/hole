@@ -4,10 +4,14 @@
 //!
 //! First, open the target file ourselves (`CreateFileW` with
 //! `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` so we
-//! coexist with AV scanners) and resolve its kernel path via
-//! `GetFinalPathNameByHandleW(VOLUME_NAME_NT)` — e.g.
-//! `\Device\HarddiskVolume3\...\hole.exe`. This is the single canonical
-//! namespace we compare against.
+//! coexist with AV scanners) and read its
+//! `BY_HANDLE_FILE_INFORMATION` via `GetFileInformationByHandle` —
+//! the `(VolumeSerialNumber, nFileIndexHigh:nFileIndexLow)` tuple
+//! uniquely identifies the file and is stable across different
+//! `CreateFile` calls to the same file. This dodges the path-form
+//! hazards of `GetFinalPathNameByHandleW` (normalization) vs
+//! `NtQueryObject(Name)` (as-opened form) disagreeing when short
+//! `BINDRE~1`-style names are in play.
 //!
 //! Next, call `NtQuerySystemInformation(SystemExtendedHandleInformation)`
 //! to dump every kernel handle. Find our own entry to discover the File
@@ -15,12 +19,12 @@
 //!
 //! Group candidate handles by owning PID. For each PID, try
 //! `OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION)`,
-//! then `DuplicateHandle`, then `NtQueryObject(ObjectNameInformation)`
-//! on each of its File handles until we match the target or the per-PID
-//! budget expires. `NtQueryObject` can block on certain handle types
-//! (named pipes, remote files) — we wrap it in a worker thread with a
-//! 100 ms timeout, the same pattern Process Explorer uses. A blocked
-//! worker is orphaned rather than joined.
+//! then `DuplicateHandle`, then `GetFileInformationByHandle` on the
+//! duplicate and compare the file-id tuple. `GetFileInformationByHandle`
+//! is synchronous on the filesystem driver; for pipes / remote files
+//! it can block, so we run it on a worker thread with a hard timeout
+//! (the same Process Explorer pattern). A blocked worker is orphaned
+//! rather than joined.
 //!
 //! When `OpenProcess(DUP_HANDLE)` is denied (non-admin session, PPL
 //! processes like Defender's MsMpEng.exe, System PID 4) we don't list
@@ -62,12 +66,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Wdk::Foundation::{NtQueryObject, OBJECT_INFORMATION_CLASS};
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, NTSTATUS};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_NT,
+    CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_DUP_HANDLE, PROCESS_NAME_FORMAT,
@@ -84,24 +87,16 @@ use windows::Win32::System::Threading::{
 /// `NtQuerySystemInformation`.
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(64);
 
-/// `ObjectNameInformation` class for `NtQueryObject`.
-const OBJECT_NAME_INFORMATION: OBJECT_INFORMATION_CLASS = OBJECT_INFORMATION_CLASS(1);
-
-/// Return statuses that mean "buffer too small — try again with a
-/// larger one." `NtQuerySystemInformation` uses `STATUS_INFO_LENGTH_MISMATCH`;
-/// `NtQueryObject` can additionally return `STATUS_BUFFER_OVERFLOW` or
-/// `STATUS_BUFFER_TOO_SMALL` for long object names.
+/// Return status "buffer too small — try again with a larger one."
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = NTSTATUS(0xC0000004u32 as i32);
-const STATUS_BUFFER_OVERFLOW: NTSTATUS = NTSTATUS(0x80000005u32 as i32);
-const STATUS_BUFFER_TOO_SMALL: NTSTATUS = NTSTATUS(0xC0000023u32 as i32);
 
 /// Total budget for one `find_holders` call.
 const OVERALL_BUDGET: Duration = Duration::from_secs(3);
 /// Budget per PID (across all its File handles).
 const PER_PID_BUDGET: Duration = Duration::from_millis(100);
-/// Timeout for a single `NtQueryObject(ObjectNameInformation)` call —
-/// may block indefinitely on named pipes / remote files.
-const NAME_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
+/// Timeout for a single `GetFileInformationByHandle` call — may block
+/// on named pipes / unresponsive remote filesystem drivers.
+const FILE_ID_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -114,16 +109,6 @@ struct SystemHandleTableEntryInfoEx {
     object_type_index: u16,
     handle_attributes: u32,
     reserved: u32,
-}
-
-/// UNICODE_STRING mirror. `NtQueryObject(ObjectNameInformation)`
-/// writes one at the start of its output buffer; the `buffer` pointer
-/// points back into that same allocation.
-#[repr(C)]
-struct UnicodeString {
-    length: u16,
-    maximum_length: u16,
-    buffer: *mut u16,
 }
 
 /// RAII wrapper that calls `CloseHandle` on drop.
@@ -168,21 +153,22 @@ fn open_target(path: &Path) -> io::Result<Handle> {
     Ok(Handle(h))
 }
 
-/// Resolve our own file handle to an NT-namespace kernel path via
-/// `GetFinalPathNameByHandleW(VOLUME_NAME_NT)`.
-fn nt_path_of_handle(h: HANDLE) -> io::Result<String> {
-    let mut buf = vec![0u16; 1024];
-    loop {
-        let len = unsafe { GetFinalPathNameByHandleW(h, &mut buf, VOLUME_NAME_NT) };
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if (len as usize) < buf.len() {
-            let nt = String::from_utf16_lossy(&buf[..len as usize]);
-            return Ok(nt);
-        }
-        buf.resize(len as usize + 1, 0);
-    }
+/// Stable identifier for a file: `(VolumeSerialNumber, FileIndex)`.
+/// All handles to the same file return the same tuple regardless of
+/// which path form they were opened with (long vs 8.3 short name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    volume: u32,
+    index: u64,
+}
+
+fn file_id_of_handle(h: HANDLE) -> Option<FileId> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(h, &mut info) }.ok()?;
+    Some(FileId {
+        volume: info.dwVolumeSerialNumber,
+        index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
 }
 
 /// Call `NtQuerySystemInformation(SystemExtendedHandleInformation)`
@@ -251,61 +237,22 @@ fn parse_handle_entries(buf: &[u8]) -> Vec<SystemHandleTableEntryInfoEx> {
     out
 }
 
-/// Run `NtQueryObject(ObjectNameInformation)` on a worker thread with
-/// a hard timeout. Returns `None` if the query fails, the handle is
-/// unnamed, or the worker exceeds `NAME_QUERY_TIMEOUT`. A blocked
-/// worker is abandoned (never joined); this is the standard Process
-/// Explorer pattern.
-fn query_name_with_timeout(h: HANDLE) -> Option<String> {
-    let (tx, rx) = mpsc::channel::<Option<String>>();
+/// Run `GetFileInformationByHandle` on a worker thread with a hard
+/// timeout. Returns `None` if the call fails or the worker exceeds
+/// `FILE_ID_QUERY_TIMEOUT`. `GetFileInformationByHandle` can block on
+/// named pipes and unresponsive remote files; a blocked worker is
+/// abandoned (never joined) — same pattern Process Explorer uses.
+fn file_id_with_timeout(h: HANDLE) -> Option<FileId> {
+    let (tx, rx) = mpsc::channel::<Option<FileId>>();
     let handle_bits = h.0 as isize;
     std::thread::spawn(move || {
         // Reconstruct HANDLE inside the thread — raw pointers aren't Send.
         let h = HANDLE(handle_bits as *mut c_void);
-        let _ = tx.send(nt_path_of_dup_handle(h));
+        let _ = tx.send(file_id_of_handle(h));
     });
     // Returns None on either recv timeout (worker abandoned to leak)
     // or RecvError::Disconnected (worker panicked before sending).
-    rx.recv_timeout(NAME_QUERY_TIMEOUT).unwrap_or_default()
-}
-
-/// Synchronous (may block) inner name query. Callers should invoke
-/// this only from a worker thread with a timeout.
-fn nt_path_of_dup_handle(h: HANDLE) -> Option<String> {
-    let mut buf = vec![0u8; 2048];
-    loop {
-        let mut ret_len: u32 = 0;
-        let status = unsafe {
-            NtQueryObject(
-                Some(h),
-                OBJECT_NAME_INFORMATION,
-                Some(buf.as_mut_ptr() as *mut _),
-                buf.len() as u32,
-                Some(&mut ret_len),
-            )
-        };
-        if status.is_ok() {
-            if buf.len() < std::mem::size_of::<UnicodeString>() {
-                return None;
-            }
-            let us = unsafe { &*(buf.as_ptr() as *const UnicodeString) };
-            if us.length == 0 || us.buffer.is_null() {
-                return None;
-            }
-            let count = (us.length as usize) / 2;
-            let slice = unsafe { std::slice::from_raw_parts(us.buffer, count) };
-            return Some(String::from_utf16_lossy(slice));
-        }
-        let grow = matches!(
-            status,
-            STATUS_INFO_LENGTH_MISMATCH | STATUS_BUFFER_OVERFLOW | STATUS_BUFFER_TOO_SMALL,
-        );
-        if grow && (ret_len as usize) > buf.len() {
-            buf.resize(ret_len as usize, 0);
-            continue;
-        }
-        return None;
-    }
+    rx.recv_timeout(FILE_ID_QUERY_TIMEOUT).unwrap_or_default()
 }
 
 /// Fetch the executable path for `pid` via
@@ -326,7 +273,8 @@ fn process_image(pid: u32) -> Option<PathBuf> {
 
 pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     let target = open_target(path)?;
-    let target_nt = nt_path_of_handle(target.get())?;
+    let target_id = file_id_of_handle(target.get())
+        .ok_or_else(|| io::Error::other("GetFileInformationByHandle failed on target"))?;
 
     let buf = query_extended_handle_information()?;
     let entries = parse_handle_entries(&buf);
@@ -356,7 +304,6 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     }
 
     let current_process = unsafe { GetCurrentProcess() };
-    let target_nt_lc = target_nt.to_ascii_lowercase();
     let overall_deadline = Instant::now() + OVERALL_BUDGET;
 
     let mut holders: Vec<FileHolder> = Vec::new();
@@ -406,8 +353,8 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
                 continue;
             }
             let dup = Handle(dup);
-            if let Some(name) = query_name_with_timeout(dup.get()) {
-                if name.to_ascii_lowercase() == target_nt_lc {
+            if let Some(id) = file_id_with_timeout(dup.get()) {
+                if id == target_id {
                     holders.push(FileHolder {
                         pid,
                         image: process_image(pid),

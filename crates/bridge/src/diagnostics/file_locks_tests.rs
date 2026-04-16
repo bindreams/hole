@@ -25,23 +25,22 @@ mod windows_live {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Spawn a PowerShell child that opens `path` for shared-read and sleeps.
-    ///
-    /// The path is embedded literally into the single-quoted PS string;
-    /// tempdir paths don't contain single quotes so this is safe.
-    /// (Passing via `--` doesn't work with `-Command` — PowerShell
-    /// concatenates trailing args into the script text.)
+    /// Spawn a native `ping` child with stdin redirected from `path`.
+    /// The child holds a read handle to `path` (inherited via stdin)
+    /// for ~30 seconds and does no I/O on it. `ping -n 30 127.0.0.1`
+    /// ships with Windows, sends one echo per second, and never reads
+    /// stdin — so the inherited file handle stays open for the full
+    /// duration. Avoids PowerShell cold-start latency on GitHub
+    /// Actions Windows runners (observed 15-30 s in CI with Defender
+    /// scanning every PS DLL load).
     fn spawn_holder(path: &Path) -> Child {
-        let path_lit = path.to_str().expect("path utf-8");
-        let script =
-            format!("$f = [System.IO.File]::Open('{path_lit}', 'Open', 'Read', 'Read'); Start-Sleep 30; $f.Close()");
-        // Test fixture: we *want* the child to hold the file, so the
-        // diagnostic wrapper's holder enumeration (which is what we're
-        // testing) wouldn't be meaningful here.
+        let file = std::fs::File::open(path).expect("open for stdin");
+        // Test fixture: we *want* the child to hold the file, so
+        // spawning through the diagnostic wrapper wouldn't add value.
         #[allow(clippy::disallowed_methods)]
-        Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdin(Stdio::null())
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::from(file))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -69,10 +68,10 @@ mod windows_live {
 
         let mut child = spawn_holder(&path);
         let child_pid = child.id();
-        // PowerShell startup is cold on GitHub Actions Windows runners —
-        // several DLL loads scanned by Defender before the script runs.
-        // Observed ~13-16 s to first File::Open in CI.
-        let holders = wait_for_holder(&path, Duration::from_secs(30));
+        // `timeout.exe` is a small native binary with the handle open
+        // from its very first moment (inherited via stdin) — poll
+        // tight, bail generously.
+        let holders = wait_for_holder(&path, Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
