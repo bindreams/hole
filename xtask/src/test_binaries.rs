@@ -174,6 +174,10 @@ fn run_cargo_test_no_run(profile: Profile) -> Result<Vec<TestArtifact>> {
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
+    // xtask can't use `hole_bridge::diagnostics::spawn::spawn_with_diagnostics`:
+    // no dep on the bridge crate, and `cargo test --no-run` is a build-host
+    // binary that isn't subject to AV-scan contention on its own executable.
+    #[allow(clippy::disallowed_methods)]
     let mut child = cmd.spawn().context("spawn `cargo test --no-run`")?;
     let stdout = child.stdout.take().expect("stdout piped");
     let reader = std::io::BufReader::new(stdout);
