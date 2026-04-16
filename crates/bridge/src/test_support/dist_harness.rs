@@ -375,7 +375,16 @@ fn new_tempdir() -> std::io::Result<TempDir> {
                 ),
             ));
         }
-        return tempfile::tempdir_in(base);
+        let mut td = tempfile::tempdir_in(base)?;
+        // CI: disable cleanup so `actions/upload-artifact@v4`'s path glob
+        // still sees bridge.log and netsh-trace.etl after DistHarness
+        // drops. The GHA runner is ephemeral — nothing to clean up from
+        // our side. PR #207 commit fc7c606 landed the artifact-upload
+        // step but the first CI repro (run 24424958826) found the glob
+        // matched nothing because TempDir::drop had already deleted
+        // everything before the upload step ran.
+        td.disable_cleanup(true);
+        return Ok(td);
     }
     tempfile::tempdir()
 }
