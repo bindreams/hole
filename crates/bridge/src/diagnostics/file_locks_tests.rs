@@ -69,9 +69,10 @@ mod windows_live {
 
         let mut child = spawn_holder(&path);
         let child_pid = child.id();
-        // PowerShell startup takes ~1-2s on a cold machine; grant enough
-        // headroom for the script to call `File::Open` before giving up.
-        let holders = wait_for_holder(&path, Duration::from_secs(15));
+        // PowerShell startup is cold on GitHub Actions Windows runners —
+        // several DLL loads scanned by Defender before the script runs.
+        // Observed ~13-16 s to first File::Open in CI.
+        let holders = wait_for_holder(&path, Duration::from_secs(30));
         let _ = child.kill();
         let _ = child.wait();
 

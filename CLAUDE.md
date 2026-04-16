@@ -18,7 +18,7 @@ All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table
 
 ### Diagnostics
 
-`crates/bridge/src/diagnostics/` carries observability helpers that attach extra context when an operation fails in a way the raw OS error doesn't explain. `diagnostics::file_locks` answers "which processes hold a handle to this file" on Windows (via `NtQuerySystemInformation(SystemExtendedHandleInformation)` + kernel-path match) and macOS (via `libproc::processes::pids_by_path`). `diagnostics::spawn::spawn_with_diagnostics` is the sanctioned wrapper around `Command::spawn`: on a file-contention error (`ERROR_ACCESS_DENIED` / `ETXTBSY`) it logs every holder of the target executable before propagating the error. A `clippy.toml` `disallowed_methods` entry forces all `Command::spawn` callers through it. See bindreams/hole#208 for the incident that motivated the wrapper.
+`crates/bridge/src/diagnostics/` carries observability helpers that attach extra context when an operation fails in a way the raw OS error doesn't explain. `diagnostics::file_locks` answers "which processes hold a handle to this file" on Windows (via `NtQuerySystemInformation(SystemExtendedHandleInformation)` + kernel-path match) and macOS (by shelling out to `lsof -F pc`). `diagnostics::spawn::spawn_with_diagnostics` is the sanctioned wrapper around `Command::spawn`: on a file-contention error (`ERROR_ACCESS_DENIED` / `ETXTBSY`) it logs every holder of the target executable before propagating the error. A `clippy.toml` `disallowed_methods` entry forces all `Command::spawn` callers through it. See bindreams/hole#208 for the incident that motivated the wrapper.
 
 ### CLI
 
