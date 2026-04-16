@@ -27,6 +27,15 @@ mod test_support;
 
 #[cfg(test)]
 fn main() {
+    // Test-binary escape hatch: when invoked with this env var set, act as a
+    // file holder — open the target path and sleep. Used by
+    // `diagnostics::file_locks` live-API tests to have a foreign process
+    // holding a file that our enumerator should find. See #208.
+    if let Ok(path) = std::env::var("HOLE_TEST_HOLD_FILE") {
+        let _f = std::fs::File::open(&path).expect("test holder: open target file");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
     skuld::run_all();
 }
 

@@ -25,26 +25,26 @@ mod windows_live {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Spawn a native `ping` child with stdin redirected from `path`.
-    /// The child holds a read handle to `path` (inherited via stdin)
-    /// for ~30 seconds and does no I/O on it. `ping -n 30 127.0.0.1`
-    /// ships with Windows, sends one echo per second, and never reads
-    /// stdin — so the inherited file handle stays open for the full
-    /// duration. Avoids PowerShell cold-start latency on GitHub
-    /// Actions Windows runners (observed 15-30 s in CI with Defender
-    /// scanning every PS DLL load).
+    /// Spawn the test binary itself as a child, signalling via env var
+    /// that it should just open `path` and sleep. Bypasses all the
+    /// external-binary hazards we hit earlier: PowerShell cold-start,
+    /// Defender DLL scan, `ping`/`timeout` inheriting overlapped stdin
+    /// that triggered Rust's "operation failed to complete synchronously"
+    /// fatal runtime error. The escape hatch lives in `main()` in
+    /// `crates/bridge/src/lib.rs`.
     fn spawn_holder(path: &Path) -> Child {
-        let file = std::fs::File::open(path).expect("open for stdin");
-        // Test fixture: we *want* the child to hold the file, so
-        // spawning through the diagnostic wrapper wouldn't add value.
+        let exe = std::env::current_exe().expect("current_exe");
+        // Test fixture: child is meant to hold the file, so the
+        // diagnostic wrapper's holder enumeration (which is what we're
+        // testing) wouldn't add value here.
         #[allow(clippy::disallowed_methods)]
-        Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
-            .stdin(Stdio::from(file))
+        Command::new(exe)
+            .env("HOLE_TEST_HOLD_FILE", path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn holder")
+            .expect("spawn self as holder")
     }
 
     fn wait_for_holder(path: &Path, deadline: Duration) -> Vec<super::super::FileHolder> {
@@ -110,24 +110,19 @@ mod macos_live {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Spawn a child that opens `path` for reading and sleeps. Returns
-    /// the child; caller must kill + wait on drop.
-    ///
-    /// Uses `sleep 30 3< '{path}'` rather than `exec 3< ...; sleep 30`
-    /// so the redirection is inherited by `sleep` directly — avoids
-    /// ambiguity between `/bin/sh` implementations that fork vs
-    /// exec-in-place for single-trailing-command scripts.
+    /// Spawn the test binary itself as a child, signalling via env var
+    /// that it should just open `path` and sleep. See
+    /// `crates/bridge/src/lib.rs` `main()` for the escape hatch.
     #[allow(clippy::disallowed_methods)] // fixture child holds by design; wrapper adds no value
     fn spawn_holder(path: &Path) -> Child {
-        let script = format!("sleep 30 3< '{}'", path.to_str().expect("path utf-8"),);
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
+        let exe = std::env::current_exe().expect("current_exe");
+        Command::new(exe)
+            .env("HOLE_TEST_HOLD_FILE", path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn holder")
+            .expect("spawn self as holder")
     }
 
     /// Poll `find_holders(path)` for up to `deadline` until at least one
