@@ -2177,6 +2177,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "handle-holders"
+version = "0.1.0"
+dependencies = [
+ "skuld",
+ "tempfile",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2377,6 +2387,7 @@ dependencies = [
  "bytes",
  "default-net",
  "garter",
+ "handle-holders",
  "hex",
  "hickory-proto",
  "hickory-resolver",

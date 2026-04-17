@@ -9,6 +9,7 @@ pub mod plugin_recovery;
 pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;
+pub mod retry;
 pub mod server_test;
 pub mod socket;
 
