@@ -2382,6 +2382,7 @@ name = "hole-bridge"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -2414,11 +2415,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tls-parser",
  "tokio",
- "tokio-socks",
  "tokio-util",
  "tower",
  "tracing",
- "tun",
  "tun-engine",
  "ureq",
  "windows 0.62.2",
@@ -6768,15 +6767,24 @@ dependencies = [
 name = "tun-engine"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bytes",
  "default-net",
  "libc",
  "serde",
  "serde_json",
  "skuld",
+ "smoltcp",
  "socket2",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-socks",
+ "tokio-util",
  "tracing",
+ "tun",
+ "tun-engine-macros",
  "windows 0.62.2",
  "wintun-bindings",
 ]

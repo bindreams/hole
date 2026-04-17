@@ -45,17 +45,15 @@ regex = "1"
 # New crates not previously in the tree.
 lru = "0.16"
 tls-parser = "0.12"
-# Filter engine Plan 2 — dispatcher dependencies.
-# tun and smoltcp are pinned to the same versions shadowsocks-service 1.24
-# uses transitively so cargo deduplicates them.
-tun = { version = "0.8", features = ["async"] }
+# Filter engine runtime deps — smoltcp types leak into HoleRouter for
+# CIDR parsing of the TUN's hard-coded v4/v6 subnets.
 smoltcp = { version = "0.12", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
 ] }
 arc-swap = "1"
-tokio-socks = "0.5"
+async-trait = "0.1"
 hickory-resolver = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]

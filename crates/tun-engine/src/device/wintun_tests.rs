@@ -108,5 +108,6 @@ fn ensure_loaded_does_not_panic() {
             // Acceptable on a host without wintun.dll on PATH or next to the
             // test binary.
         }
+        Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }

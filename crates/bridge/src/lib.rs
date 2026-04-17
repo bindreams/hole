@@ -2,6 +2,7 @@ pub mod dispatcher;
 pub mod filter;
 pub mod foreground;
 pub mod group;
+pub mod hole_router;
 pub mod ipc;
 pub mod logging;
 pub mod platform;

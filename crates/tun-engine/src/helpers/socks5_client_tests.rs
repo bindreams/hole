@@ -1,5 +1,6 @@
-use super::*;
 use std::net::Ipv4Addr;
+
+use super::*;
 
 #[skuld::test]
 fn socks5_connect_refuses_when_no_server() {

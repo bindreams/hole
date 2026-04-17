@@ -1,67 +1,43 @@
-//! TUN driver main loop — bridges the OS TUN device with the smoltcp
-//! userspace TCP/IP stack, dispatches new TCP connections to handler tasks,
-//! and serves port-53 DNS via a smoltcp UDP socket when fake DNS is active.
+//! Driver — the smoltcp-backed packet loop.
+//!
+//! Owns the real TUN device, the smoltcp `Interface`, socket set, and
+//! UDP flow table. Reads packets, dispatches TCP accepts + UDP flows to
+//! the caller-supplied [`Router`](super::Router), handles port-53 UDP via
+//! the optional [`DnsInterceptor`](super::DnsInterceptor).
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Instant as StdInstant;
 
-use arc_swap::ArcSwap;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket,
-    UdpRepr,
+    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use super::device::VirtualTunDevice;
-use super::smoltcp_stream::SmoltcpStream;
-use super::tcp_handler::{self, HandlerContext};
-use super::udp_flow::{FlowEntry, FlowHandle, FlowKey, FlowTable};
-use super::udp_handler::{self, UdpReply};
-use crate::filter::rules::RuleSet;
-use crate::filter::FakeDns;
+use super::config::EngineConfig;
+use super::dns::DnsInterceptor;
+use super::router::{Router, TcpMeta, UdpMeta};
+use super::tcp_flow::TcpFlow;
+use super::udp_flow::{FlowKey, FlowTable, UdpReply};
+use super::virtual_device::VirtualTunDevice;
+use crate::device::DeviceConfig;
 
-// Constants ===========================================================================================================
-
-/// MTU for the virtual smoltcp device (and the TUN). Slightly below
-/// typical Ethernet MTU to leave room for encapsulation.
-pub(crate) const MTU: usize = 1400;
-
-/// Maximum concurrent TCP connections.
-const MAX_CONNECTIONS: usize = 4096;
-
-/// Maximum concurrent sniffer peek operations.
-const MAX_SNIFFERS: usize = 1024;
-
-/// smoltcp TCP socket buffer sizes (per direction).
-const TCP_RX_BUF_SIZE: usize = 65536;
-const TCP_TX_BUF_SIZE: usize = 65536;
-
-/// smoltcp UDP socket buffer sizes (per direction, for DNS).
-const UDP_RX_META_SLOTS: usize = 32;
-const UDP_RX_PAYLOAD_SIZE: usize = 8192;
-const UDP_TX_META_SLOTS: usize = 32;
-const UDP_TX_PAYLOAD_SIZE: usize = 8192;
-
-/// TUN read buffer size — one IP packet.
-const TUN_BUF_SIZE: usize = MTU + 64;
-
-// Types ===============================================================================================================
+// Internal state ======================================================================================================
 
 /// Tracks a TCP connection that the driver is relaying data for between
-/// the smoltcp socket and a handler task.
+/// the smoltcp socket and the Router task.
 struct TcpConn {
-    /// Send data TO the handler task (handler reads from SmoltcpStream).
+    /// Send data TO the Router (the Router reads via `flow.read()`).
     to_handler: mpsc::Sender<Vec<u8>>,
-    /// Receive data FROM the handler task (handler writes to SmoltcpStream).
+    /// Receive data FROM the Router (the Router wrote via `flow.write()`).
     from_handler: mpsc::Receiver<Vec<u8>>,
     /// Buffered remainder from a partial `smoltcp::send_slice` call.
     /// Drained on the next relay pass before reading new data from the channel.
@@ -74,32 +50,27 @@ struct TcpListener {
     port: u16,
 }
 
-/// The main TUN driver, owning the smoltcp Interface, socket set, and TUN device.
-pub struct TunDriver {
+pub(crate) struct Driver {
     tun: tun::AsyncDevice,
     device: VirtualTunDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    fake_dns: Option<Arc<FakeDns>>,
-    udp_dns_handle: Option<SocketHandle>,
+    dns_interceptor: Option<Arc<dyn DnsInterceptor>>,
     listeners: Vec<TcpListener>,
     connections: HashMap<SocketHandle, TcpConn>,
-    /// Ports that already have a listener.
-    listened_ports: std::collections::HashSet<u16>,
+    listened_ports: HashSet<u16>,
     cancel: CancellationToken,
     conn_semaphore: Arc<Semaphore>,
     sniffer_semaphore: Arc<Semaphore>,
-    rules: Arc<ArcSwap<RuleSet>>,
-    handler_ctx: Arc<HandlerContext>,
-    /// Reference time for converting std::time::Instant to smoltcp::time::Instant.
+    router: Arc<dyn Router>,
+    config: Arc<EngineConfig>,
+    /// Reference time for converting `std::time::Instant` to
+    /// `smoltcp::time::Instant`.
     epoch: StdInstant,
 
     // UDP flow dispatching --------------------------------------------------------------------------------------------
     flow_table: FlowTable,
-    /// Channel for async flow-creation tasks to send completed entries back.
-    new_flow_tx: mpsc::Sender<(FlowKey, FlowEntry)>,
-    new_flow_rx: mpsc::Receiver<(FlowKey, FlowEntry)>,
-    /// Channel for per-flow reader tasks to send reply datagrams.
+    /// Channel per-flow Router tasks use to inject reply datagrams.
     reply_tx: mpsc::Sender<UdpReply>,
     reply_rx: mpsc::Receiver<UdpReply>,
     /// Pending reply packets to write to TUN (built from `UdpReply`).
@@ -108,52 +79,33 @@ pub struct TunDriver {
     last_sweep: StdInstant,
 }
 
-impl TunDriver {
-    /// Create a new TUN driver.
-    ///
-    /// The TUN device must already be created and configured by the caller.
-    pub fn new(
+impl Driver {
+    pub(crate) fn new(
         tun: tun::AsyncDevice,
-        fake_dns: Option<Arc<FakeDns>>,
-        rules: Arc<ArcSwap<RuleSet>>,
-        handler_ctx: Arc<HandlerContext>,
+        device_config: DeviceConfig,
+        router: Arc<dyn Router>,
+        config: Arc<EngineConfig>,
         cancel: CancellationToken,
     ) -> Self {
-        let mut device = VirtualTunDevice::new(MTU);
+        let mtu = device_config.mtu as usize;
+        let mut device = VirtualTunDevice::new(mtu);
 
-        let config = Config::new(HardwareAddress::Ip);
+        let iface_config = Config::new(HardwareAddress::Ip);
         let epoch = StdInstant::now();
         let now = SmoltcpInstant::from_millis(0);
-        let mut iface = Interface::new(config, &mut device, now);
+        let mut iface = Interface::new(iface_config, &mut device, now);
         iface.set_any_ip(true);
         iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(IpAddress::v4(10, 255, 0, 1), 24)).unwrap();
-            addrs
-                .push(IpCidr::new(IpAddress::v6(0xfd00, 0, 0, 0xff00, 0, 0, 0, 1), 64))
-                .unwrap();
+            if let Some(v4) = device_config.ipv4 {
+                addrs.push(IpCidr::Ipv4(v4)).unwrap();
+            }
+            if let Some(v6) = device_config.ipv6 {
+                addrs.push(IpCidr::Ipv6(v6)).unwrap();
+            }
         });
 
-        let mut sockets = SocketSet::new(vec![]);
+        let sockets = SocketSet::new(vec![]);
 
-        // If fake DNS is active, create a UDP socket bound to port 53.
-        let udp_dns_handle = if fake_dns.is_some() {
-            let rx_buf = udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_RX_META_SLOTS],
-                vec![0u8; UDP_RX_PAYLOAD_SIZE],
-            );
-            let tx_buf = udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_TX_META_SLOTS],
-                vec![0u8; UDP_TX_PAYLOAD_SIZE],
-            );
-            let mut udp_socket = udp::Socket::new(rx_buf, tx_buf);
-            udp_socket.bind(53).expect("binding smoltcp UDP :53");
-            let handle = sockets.add(udp_socket);
-            Some(handle)
-        } else {
-            None
-        };
-
-        let (new_flow_tx, new_flow_rx) = mpsc::channel(256);
         let (reply_tx, reply_rx) = mpsc::channel(1024);
 
         Self {
@@ -161,20 +113,17 @@ impl TunDriver {
             device,
             iface,
             sockets,
-            fake_dns,
-            udp_dns_handle,
+            dns_interceptor: config.dns_interceptor.clone(),
             listeners: Vec::new(),
             connections: HashMap::new(),
-            listened_ports: std::collections::HashSet::new(),
+            listened_ports: HashSet::new(),
             cancel,
-            conn_semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-            sniffer_semaphore: Arc::new(Semaphore::new(MAX_SNIFFERS)),
-            rules,
-            handler_ctx,
+            conn_semaphore: Arc::new(Semaphore::new(config.max_connections)),
+            sniffer_semaphore: Arc::new(Semaphore::new(config.max_sniffers)),
+            router,
+            config,
             epoch,
             flow_table: FlowTable::new(),
-            new_flow_tx,
-            new_flow_rx,
             reply_tx,
             reply_rx,
             pending_tun_writes: Vec::new(),
@@ -182,14 +131,12 @@ impl TunDriver {
         }
     }
 
-    /// Run the main driver loop. Returns when the cancellation token fires
-    /// or the TUN device is closed.
-    pub async fn run(mut self) {
-        let mut tun_buf = vec![0u8; TUN_BUF_SIZE];
-        // Poll interval ensures handler→smoltcp data is relayed even
-        // when no TUN packets are arriving (e.g. response data for
-        // established connections).
-        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(1));
+    pub(crate) async fn run(mut self) {
+        let tun_buf_size = self.config.tcp_rx_buf_size.max(2048); // safe upper bound for a single IP packet
+        let mut tun_buf = vec![0u8; tun_buf_size];
+        // Poll interval ensures handler→smoltcp data is relayed even when
+        // no TUN packets are arriving.
+        let mut poll_interval = tokio::time::interval(self.config.poll_interval);
         poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -212,13 +159,9 @@ impl TunDriver {
                     }
                     Ok(n) => {
                         let packet = &tun_buf[..n];
-
-                        // General UDP: dispatch before smoltcp sees the packet.
-                        // Returns true if the packet was consumed (non-DNS UDP).
-                        let consumed = self.handle_general_udp(packet);
+                        let consumed = self.handle_udp_packet(packet).await;
 
                         if !consumed {
-                            // TCP or DNS-UDP: set up listeners and feed to smoltcp.
                             if let Some((dst_port, proto)) = parse_ip_dst(packet) {
                                 if proto == IpProto::Tcp {
                                     self.ensure_listener(dst_port);
@@ -233,45 +176,25 @@ impl TunDriver {
                     }
                 }
             }
-            // If read_result is None, it was a poll-interval tick — we
-            // still need to run phases 2-8 to relay handler data.
 
-            // Phase 2: Poll smoltcp.
+            // Phase 2: poll smoltcp.
             self.poll_smoltcp();
-
-            // Phase 3: Handle UDP DNS (port 53).
-            self.handle_dns_udp();
-
-            // Phase 3.5: Drain completed UDP flow creations.
-            self.drain_new_flows();
-
-            // Phase 4: Accept new TCP connections from listeners that
-            // transitioned out of LISTEN state.
             self.accept_tcp_connections();
-
-            // Phase 5: Relay data between smoltcp TCP sockets and handler channels.
             self.relay_tcp_data();
-
-            // Phase 6: Clean up finished connections.
             self.cleanup_finished_connections();
-
-            // Phase 6.5: Process UDP reply datagrams into pending TUN writes.
             self.process_udp_replies();
-
-            // Phase 7: Poll smoltcp again (handler data may have produced new output).
             self.poll_smoltcp();
-
-            // Phase 8: Flush smoltcp output AND pending UDP replies to TUN.
             self.flush_to_tun().await;
 
-            // Phase 9: Sweep idle UDP flows periodically.
-            if self.last_sweep.elapsed() >= Duration::from_secs(5) {
-                self.sweep_udp_flows();
+            if self.last_sweep.elapsed() >= self.config.idle_sweep_interval {
+                let evicted = self.flow_table.sweep(self.config.udp_flow_idle_timeout);
+                if evicted > 0 {
+                    debug!(count = evicted, "swept idle UDP flows");
+                }
                 self.last_sweep = StdInstant::now();
             }
         }
 
-        // Drain phase: abort remaining handler tasks by dropping channels.
         debug!(
             "TUN driver shutting down, {} active TCP connections, {} active UDP flows",
             self.connections.len(),
@@ -280,7 +203,7 @@ impl TunDriver {
         self.flow_table.clear();
     }
 
-    // Internal methods ================================================================================================
+    // smoltcp polling =================================================================================================
 
     fn smoltcp_now(&self) -> SmoltcpInstant {
         let elapsed = self.epoch.elapsed();
@@ -292,45 +215,26 @@ impl TunDriver {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
 
-    fn handle_dns_udp(&mut self) {
-        let Some(handle) = self.udp_dns_handle else {
+    // TCP =============================================================================================================
+
+    fn ensure_listener(&mut self, port: u16) {
+        if self.listened_ports.contains(&port) {
             return;
-        };
-        let Some(fake_dns) = &self.fake_dns else {
-            return;
-        };
-
-        let udp_socket = self.sockets.get_mut::<udp::Socket>(handle);
-
-        // Process all queued datagrams.
-        while udp_socket.can_recv() {
-            let (payload, meta) = match udp_socket.recv() {
-                Ok(v) => v,
-                Err(udp::RecvError::Truncated) => continue,
-                Err(udp::RecvError::Exhausted) => break,
-            };
-
-            let response = fake_dns.handle_udp(payload);
-            if response.is_empty() {
-                continue;
-            }
-
-            // Reply to the sender.
-            let reply_endpoint = IpEndpoint {
-                addr: meta.endpoint.addr,
-                port: meta.endpoint.port,
-            };
-            if let Err(e) = udp_socket.send_slice(&response, reply_endpoint) {
-                trace!("DNS UDP reply send error: {e:?}");
-            }
         }
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; self.config.tcp_rx_buf_size]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; self.config.tcp_tx_buf_size]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        if let Err(e) = socket.listen(port) {
+            warn!("failed to listen on port {port}: {e:?}");
+            return;
+        }
+        let handle = self.sockets.add(socket);
+        self.listeners.push(TcpListener { handle, port });
+        self.listened_ports.insert(port);
     }
 
     fn accept_tcp_connections(&mut self) {
-        // Check each listener to see if it has accepted a connection
-        // (transitioned from LISTEN to ESTABLISHED or SYN-RECEIVED).
         let mut accepted = Vec::new();
-
         for listener in &self.listeners {
             let socket = self.sockets.get::<tcp::Socket>(listener.handle);
             if socket.state() != tcp::State::Listen {
@@ -339,19 +243,19 @@ impl TunDriver {
         }
 
         for (handle, port) in accepted {
-            // Remove this listener.
             self.listeners.retain(|l| l.handle != handle);
             self.listened_ports.remove(&port);
 
             let socket = self.sockets.get::<tcp::Socket>(handle);
-
-            // The local endpoint is the destination the client intended
-            // to connect to (since any_ip is enabled, smoltcp accepted
-            // the packet to an arbitrary IP).
-            let (dst_ip, dst_port) = match socket.local_endpoint() {
-                Some(ep) => (smoltcp_to_std_ip(ep.addr), ep.port),
-                None => {
-                    warn!("accepted TCP connection with no local endpoint on port {port}");
+            let (dst_ip, dst_port, src_ip, src_port) = match (socket.local_endpoint(), socket.remote_endpoint()) {
+                (Some(local), Some(remote)) => (
+                    smoltcp_to_std_ip(local.addr),
+                    local.port,
+                    smoltcp_to_std_ip(remote.addr),
+                    remote.port,
+                ),
+                _ => {
+                    warn!("accepted TCP connection with no endpoint on port {port}");
                     let socket = self.sockets.get_mut::<tcp::Socket>(handle);
                     socket.abort();
                     self.sockets.remove(handle);
@@ -360,7 +264,6 @@ impl TunDriver {
                 }
             };
 
-            // Try to acquire a connection semaphore permit.
             let permit = match self.conn_semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -373,10 +276,8 @@ impl TunDriver {
                 }
             };
 
-            // Create SmoltcpStream channels.
-            let (stream, to_handler, from_handler) = SmoltcpStream::new();
+            let (flow, to_handler, from_handler) = TcpFlow::new(Arc::clone(&self.sniffer_semaphore));
 
-            // Register the connection for relay.
             self.connections.insert(
                 handle,
                 TcpConn {
@@ -386,25 +287,24 @@ impl TunDriver {
                 },
             );
 
-            // Spawn handler task.
-            let env = tcp_handler::ConnEnv {
-                ctx: Arc::clone(&self.handler_ctx),
-                rules: Arc::clone(&self.rules),
-                fake_dns: self.fake_dns.clone(),
-                sniffer_semaphore: Arc::clone(&self.sniffer_semaphore),
-                cancel: self.cancel.clone(),
+            let meta = TcpMeta {
+                src: SocketAddr::new(src_ip, src_port),
+                dst: SocketAddr::new(dst_ip, dst_port),
             };
-
+            let router = Arc::clone(&self.router);
+            let cancel = self.cancel.clone();
             tokio::spawn(async move {
-                let result = tcp_handler::handle_tcp_connection(stream, dst_ip, dst_port, env).await;
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Ok(()),
+                    r = router.route_tcp(meta, flow) => r,
+                };
                 if let Err(e) = result {
-                    debug!("TCP handler error for {dst_ip}:{dst_port}: {e}");
+                    debug!("TCP Router error for {dst_ip}:{dst_port}: {e}");
                 }
                 drop(permit);
             });
 
-            // Re-create listener for this port for subsequent connections.
-            // Known limitation: 1-poll-interval SYN race window.
             self.ensure_listener(port);
         }
     }
@@ -417,32 +317,24 @@ impl TunDriver {
                 Some(c) => c,
                 None => continue,
             };
-
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
 
-            // Direction: smoltcp → handler (recv from socket, send to handler).
+            // Direction: smoltcp → Router.
             if socket.may_recv() {
                 let _ = socket.recv(|buf| {
                     if buf.is_empty() {
                         return (0, ());
                     }
-                    // Try to send to handler via channel. If the channel is
-                    // full, don't dequeue from the socket — this naturally
-                    // constrains the recv window.
                     match conn.to_handler.try_send(buf.to_vec()) {
                         Ok(()) => (buf.len(), ()),
                         Err(mpsc::error::TrySendError::Full(_)) => (0, ()),
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // Handler dropped. The cleanup pass will handle this.
-                            (0, ())
-                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => (0, ()),
                     }
                 });
             }
 
-            // Direction: handler → smoltcp (recv from handler, send to socket).
+            // Direction: Router → smoltcp.
             if socket.may_send() {
-                // First, drain any pending partial send from the previous pass.
                 if !conn.pending_send.is_empty() && socket.can_send() {
                     if let Ok(sent) = socket.send_slice(&conn.pending_send) {
                         if sent >= conn.pending_send.len() {
@@ -453,22 +345,18 @@ impl TunDriver {
                     }
                 }
 
-                // Then read new data from the handler channel.
                 while conn.pending_send.is_empty() && socket.can_send() {
                     match conn.from_handler.try_recv() {
                         Ok(data) => match socket.send_slice(&data) {
                             Ok(sent) if sent < data.len() => {
-                                // Partial send: buffer the remainder for next pass.
                                 conn.pending_send = data[sent..].to_vec();
                                 break;
                             }
-                            Ok(_) => {} // fully sent
+                            Ok(_) => {}
                             Err(_) => break,
                         },
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
-                            // Handler finished writing. Close the smoltcp socket's
-                            // send half so FIN gets sent.
                             socket.close();
                             break;
                         }
@@ -495,54 +383,35 @@ impl TunDriver {
         }
     }
 
-    async fn flush_to_tun(&mut self) {
-        // Flush smoltcp output (TCP + DNS UDP).
-        let packets = self.device.dequeue_tx();
-        for pkt in packets {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error: {e}");
-                break;
-            }
-        }
-        // Flush general UDP reply packets.
-        for pkt in self.pending_tun_writes.drain(..) {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error (UDP reply): {e}");
-                break;
-            }
-        }
-    }
+    // UDP =============================================================================================================
 
-    /// Ensure a TCP listener socket exists for the given port.
-    fn ensure_listener(&mut self, port: u16) {
-        if self.listened_ports.contains(&port) {
-            return;
-        }
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF_SIZE]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        if let Err(e) = socket.listen(port) {
-            warn!("failed to listen on port {port}: {e:?}");
-            return;
-        }
-        let handle = self.sockets.add(socket);
-        self.listeners.push(TcpListener { handle, port });
-        self.listened_ports.insert(port);
-    }
-
-    // UDP flow dispatching ============================================================================================
-
-    /// Handle a general (non-DNS) UDP packet. Returns `true` if the packet
-    /// was consumed and should NOT be fed to smoltcp.
-    fn handle_general_udp(&mut self, packet: &[u8]) -> bool {
+    /// Handle a UDP packet before smoltcp sees it. Returns `true` if the
+    /// packet was consumed (dispatched to the Router, or handled by the
+    /// DNS interceptor), in which case the caller must NOT feed it to
+    /// smoltcp.
+    async fn handle_udp_packet(&mut self, packet: &[u8]) -> bool {
         let parsed = match parse_ip_packet_full(packet) {
             Some(p) if p.proto == IpProto::Udp => p,
             _ => return false,
         };
 
-        // DNS (port 53) when fake DNS is active goes through smoltcp.
-        if parsed.dst_port == 53 && self.fake_dns.is_some() {
-            return false;
+        let payload_start = parsed.payload_offset.min(packet.len());
+        let payload_end = (parsed.payload_offset + parsed.payload_len).min(packet.len());
+        let payload = &packet[payload_start..payload_end];
+
+        // Port-53 DNS interception.
+        if parsed.dst_port == 53 {
+            if let Some(interceptor) = self.dns_interceptor.clone() {
+                if let Some(reply) = interceptor.intercept(payload).await {
+                    // Construct reply packet with swapped 5-tuple.
+                    let pkt = build_udp_packet(parsed.dst_ip, parsed.dst_port, parsed.src_ip, parsed.src_port, &reply);
+                    if !pkt.is_empty() {
+                        self.pending_tun_writes.push(pkt);
+                    }
+                    return true;
+                }
+                // Interceptor returned None — fall through to Router dispatch.
+            }
         }
 
         let key = FlowKey {
@@ -552,101 +421,79 @@ impl TunDriver {
             dst_port: parsed.dst_port,
         };
 
-        let payload_start = parsed.payload_offset.min(packet.len());
-        let payload_end = (parsed.payload_offset + parsed.payload_len).min(packet.len());
-        let payload = &packet[payload_start..payload_end];
-
         // Existing flow: forward the datagram.
         if let Some(entry) = self.flow_table.get_mut(&key) {
-            entry.last_activity = std::time::Instant::now();
-            match &entry.handle {
-                FlowHandle::Proxy { tx } | FlowHandle::Bypass { tx } => {
-                    let _ = tx.try_send(payload.to_vec());
-                }
-                FlowHandle::Blocked => {} // silently drop
-            }
+            entry.last_activity = StdInstant::now();
+            // Best-effort push; if the flow's channel is full, drop (UDP is lossy).
+            let _ = entry.tx.try_send(payload.to_vec());
             return true;
         }
 
-        // New flow: spawn async creation. The first datagram(s) during
-        // setup are dropped (UDP is lossy). If a second packet races while
-        // creation is in-flight, a duplicate task spawns — the later insert
-        // overwrites the earlier one harmlessly.
-        let ctx = Arc::clone(&self.handler_ctx);
-        let rules = self.rules.load_full();
-        let fake_dns = self.fake_dns.clone();
-        let reply_tx = self.reply_tx.clone();
-        let cancel = self.cancel.clone();
-        let new_flow_tx = self.new_flow_tx.clone();
+        // New flow: create a UdpFlow and spawn the Router task.
+        let flow = self.flow_table.insert_new(key, self.reply_tx.clone());
+        // Seed the first datagram into the flow.
+        if let Some(entry) = self.flow_table.get_mut(&key) {
+            let _ = entry.tx.try_send(payload.to_vec());
+        }
 
+        let meta = UdpMeta {
+            src: SocketAddr::new(parsed.src_ip, parsed.src_port),
+            dst: SocketAddr::new(parsed.dst_ip, parsed.dst_port),
+        };
+        let router = Arc::clone(&self.router);
+        let cancel = self.cancel.clone();
         tokio::spawn(async move {
-            match udp_handler::create_udp_flow(
-                key.src_ip,
-                key.src_port,
-                key.dst_ip,
-                key.dst_port,
-                &ctx,
-                &rules,
-                &fake_dns,
-                reply_tx,
-                cancel,
-            )
-            .await
-            {
-                Ok(entry) => {
-                    let _ = new_flow_tx.send((key, entry)).await;
-                }
-                Err(e) => {
-                    debug!(error = %e, dst_ip = %key.dst_ip, dst_port = key.dst_port, "failed to create UDP flow");
-                }
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Ok(()),
+                r = router.route_udp(meta, flow) => r,
+            };
+            if let Err(e) = result {
+                debug!("UDP Router error for {}:{}: {e}", parsed.dst_ip, parsed.dst_port);
             }
         });
 
         true
     }
 
-    /// Drain completed async flow creations into the flow table.
-    fn drain_new_flows(&mut self) {
-        while let Ok((key, entry)) = self.new_flow_rx.try_recv() {
-            self.flow_table.insert(key, entry);
-        }
-    }
-
-    /// Drain upstream UDP replies and build raw IP packets for TUN injection.
     fn process_udp_replies(&mut self) {
         while let Ok(reply) = self.reply_rx.try_recv() {
-            let packet = build_udp_packet(
+            let pkt = build_udp_packet(
                 reply.src_ip,
                 reply.src_port,
                 reply.dst_ip,
                 reply.dst_port,
                 &reply.payload,
             );
-            if !packet.is_empty() {
-                self.pending_tun_writes.push(packet);
+            if !pkt.is_empty() {
+                self.pending_tun_writes.push(pkt);
             }
         }
     }
 
-    /// Evict idle UDP flows and unpin their fake DNS entries.
-    fn sweep_udp_flows(&mut self) {
-        let evicted = self.flow_table.sweep(Duration::from_secs(30));
-        let count = evicted.len();
-        for entry in evicted {
-            if let (Some(ref fdns), Some(ip)) = (&self.fake_dns, entry.pinned_ip) {
-                fdns.unpin(ip);
+    // TUN I/O =========================================================================================================
+
+    async fn flush_to_tun(&mut self) {
+        // smoltcp output (TCP).
+        let packets = self.device.dequeue_tx();
+        for pkt in packets {
+            if let Err(e) = self.tun.write_all(&pkt).await {
+                trace!("TUN write error: {e}");
+                break;
             }
         }
-        if count > 0 {
-            debug!(count, "swept idle UDP flows");
+        // UDP replies + DNS intercepts.
+        for pkt in self.pending_tun_writes.drain(..) {
+            if let Err(e) = self.tun.write_all(&pkt).await {
+                trace!("TUN write error (UDP reply): {e}");
+                break;
+            }
         }
     }
 }
 
-// Helpers =============================================================================================================
+// Packet parsing ======================================================================================================
 
-/// Parse an incoming IP packet and return the destination port and protocol
-/// for TCP/UDP. Used to dynamically create smoltcp listeners.
 fn parse_ip_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     if packet.is_empty() {
         return None;
@@ -666,7 +513,6 @@ enum IpProto {
 }
 
 fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    // Minimum IPv4 header is 20 bytes.
     if packet.len() < 20 {
         return None;
     }
@@ -684,12 +530,10 @@ fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
 }
 
 fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    // IPv6 header is 40 bytes fixed.
     if packet.len() < 40 + 4 {
         return None;
     }
     let next_header = packet[6];
-    // We only handle TCP/UDP in the base header (no extension header chasing).
     let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
     match next_header {
         6 => Some((dst_port, IpProto::Tcp)),
@@ -698,22 +542,16 @@ fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     }
 }
 
-// Full packet parsing (for UDP flow dispatching) ----------------------------------------------------------------------
-
-/// Parsed fields from an IP+TCP/UDP packet header.
 struct ParsedPacket {
     src_ip: IpAddr,
     src_port: u16,
     dst_ip: IpAddr,
     dst_port: u16,
     proto: IpProto,
-    /// Byte offset where the L4 payload starts (after IP + TCP/UDP headers).
     payload_offset: usize,
-    /// Length of the L4 payload in bytes.
     payload_len: usize,
 }
 
-/// Parse an IP packet into its full 5-tuple + payload location.
 fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket> {
     if packet.is_empty() {
         return None;
@@ -734,7 +572,6 @@ fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
     let protocol = packet[9];
     let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
 
-    // Need at least IP header + 8 bytes for TCP/UDP ports + lengths.
     if packet.len() < ihl + 8 || total_len < ihl + 8 {
         return None;
     }
@@ -750,16 +587,11 @@ fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
     let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
     let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
 
-    // For UDP the payload starts right after the 8-byte UDP header.
-    // For TCP the data offset is in the TCP header itself, but we only
-    // need full parsing for UDP here.
     let (payload_offset, payload_len) = if proto == IpProto::Udp {
         let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
-        let hdr = 8; // UDP header size
+        let hdr = 8;
         (ihl + hdr, udp_len.saturating_sub(hdr))
     } else {
-        // TCP: we don't use payload_offset for TCP flow dispatching,
-        // but compute it for completeness.
         let data_offset = ((packet[ihl + 12] >> 4) as usize) * 4;
         let tcp_payload = total_len.saturating_sub(ihl + data_offset);
         (ihl + data_offset, tcp_payload)
@@ -777,7 +609,6 @@ fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
 }
 
 fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
-    // IPv6 fixed header is 40 bytes; need at least 8 more for L4 ports.
     if packet.len() < 48 {
         return None;
     }
@@ -798,7 +629,7 @@ fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
     let src_ip = IpAddr::V6(std::net::Ipv6Addr::from(src_octets));
     let dst_ip = IpAddr::V6(std::net::Ipv6Addr::from(dst_octets));
 
-    let l4_start = 40; // fixed IPv6 header
+    let l4_start = 40;
     let src_port = u16::from_be_bytes([packet[l4_start], packet[l4_start + 1]]);
     let dst_port = u16::from_be_bytes([packet[l4_start + 2], packet[l4_start + 3]]);
 
@@ -823,12 +654,12 @@ fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
     })
 }
 
-// Reply packet construction -------------------------------------------------------------------------------------------
+// Reply packet construction ===========================================================================================
 
 /// Build a raw IP+UDP packet from the given fields, with correct checksums.
 fn build_udp_packet(src_ip: IpAddr, src_port: u16, dst_ip: IpAddr, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let udp_len = 8 + payload.len();
-    let checksums = ChecksumCapabilities::default(); // compute all checksums
+    let checksums = ChecksumCapabilities::default();
 
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -888,24 +719,15 @@ fn build_udp_packet(src_ip: IpAddr, src_port: u16, dst_ip: IpAddr, dst_port: u16
             buf
         }
         _ => {
-            // Mismatched IP versions — should never happen.
             debug!("mismatched IP versions in UDP reply");
             Vec::new()
         }
     }
 }
 
-/// Convert a smoltcp `IpAddress` to a `std::net::IpAddr`.
-///
-/// smoltcp 0.12 re-exports `core::net::Ipv4Addr`/`Ipv6Addr` as its
-/// address types, so this is a trivial wrapping.
 fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
     match addr {
         IpAddress::Ipv4(v4) => IpAddr::V4(v4),
         IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
 }
-
-#[cfg(test)]
-#[path = "driver_tests.rs"]
-mod driver_tests;

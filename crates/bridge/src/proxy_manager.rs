@@ -319,7 +319,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
 
         // Discover upstream DNS servers BEFORE routes are installed, so
         // queries use the real upstream path (not the TUN).
-        let dns_servers = crate::dispatcher::upstream_dns::discover_dns_servers()
+        let dns_servers = crate::hole_router::upstream_dns::discover_dns_servers()
             .map_err(|e| ProxyError::Gateway(format!("DNS discovery failed: {e}")))?;
 
         // Compile filter rules.
