@@ -119,7 +119,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
 
 /// Test 1: SocksOnly mode, no plugin. Baseline — proves the dist harness +
 /// SocksOnly config path work end-to-end.
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn e2e_none_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -134,7 +134,7 @@ fn e2e_none_socks_only_roundtrip(
 /// `PluginConfig` port TOCTOU in `shadowsocks-service` — tracked in
 /// #197 — causes yamux-server inside galoshes to lose the bind race.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial)]
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -147,7 +147,7 @@ fn e2e_ws_socks_only_roundtrip(
 ///
 /// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial)]
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
@@ -160,7 +160,7 @@ fn e2e_ws_tls_socks_only_roundtrip(
 ///
 /// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial)]
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
@@ -233,7 +233,7 @@ mod tun {
     /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows
     /// admin. TUN tests are serial because they all bind the hardcoded
     /// `hole-tun` device name.
-    #[skuld::test(labels = [DIST_BIN, TUN], serial)]
+    #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
     fn e2e_none_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -253,7 +253,7 @@ mod tun {
     /// Keeping the function as a placeholder so the test-matrix docs
     /// stay intact; re-enable by removing this cfg once #197 lands.
     #[cfg(not(target_os = "windows"))]
-    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial)]
+    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -268,7 +268,7 @@ mod tun {
 /// Test 7: starting twice without stopping returns an error from the
 /// second start. The dist harness exposes the error payload via
 /// `BridgeResponse::Error`.
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn lifecycle_start_twice_returns_error(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -304,7 +304,7 @@ fn lifecycle_start_twice_returns_error(
 /// Test 8: stopping a bridge that never started is a clean noop. The
 /// handle subprocess goes straight from its initial Stopped state through
 /// another Stopped, returning Ack.
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
     rt().block_on(async {
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -318,7 +318,7 @@ fn lifecycle_stop_when_idle_is_noop(#[fixture(dist_dir)] dist: &Path) {
 
 /// Test 9: reload swaps the proxy config. The new local_port must bind
 /// after reload; the subprocess keeps running throughout.
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn lifecycle_reload_changes_local_port(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -359,7 +359,7 @@ fn lifecycle_reload_changes_local_port(
 /// Test 10: SocksOnly mode does not write `bridge-routes.json`. The file
 /// should not exist after Start because the state-file write path is
 /// explicitly skipped for SocksOnly.
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn lifecycle_state_file_absent_in_socks_only_mode(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -392,7 +392,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
 ///
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -430,7 +430,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
 ///
-#[skuld::test(labels = [DIST_BIN], serial)]
+#[skuld::test(labels = [DIST_BIN])]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -471,7 +471,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 ///
 /// Windows-skipped: same #197 galoshes bind race.
 #[cfg(not(target_os = "windows"))]
-#[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial)]
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
