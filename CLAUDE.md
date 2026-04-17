@@ -16,9 +16,15 @@ GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` and `Routing` traits in `crates/bridge/src/`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in `clippy.toml` via the `disallowed_methods` list. See `crates/bridge/src/proxy.rs` and `crates/bridge/src/routing.rs` for trait contracts, and bindreams/hole#165 for the incident that motivated the rule.
 
-### Diagnostics
+### Spawn-retry architecture (file-contention diagnostics)
 
-`crates/bridge/src/diagnostics/` carries observability helpers that attach extra context when an operation fails in a way the raw OS error doesn't explain. `diagnostics::file_locks` answers "which processes hold a handle to this file" on Windows (via `NtQuerySystemInformation(SystemExtendedHandleInformation)` + kernel-path match) and macOS (by shelling out to `lsof -F pc`). `diagnostics::spawn::spawn_with_diagnostics` is the sanctioned wrapper around `Command::spawn`: on a file-contention error (`ERROR_ACCESS_DENIED` / `ETXTBSY`) it logs every holder of the target executable before propagating the error. A `clippy.toml` `disallowed_methods` entry forces all `Command::spawn` callers through it. See bindreams/hole#208 for the incident that motivated the wrapper.
+Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:
+
+1. **`handle-holders` workspace crate** — pure query API: `find_holders(&Path)` returns every process currently holding the file, `log_holders(&Path)` logs them at `tracing::error!`. Windows uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` with a non-blocking `GetFileType == FILE_TYPE_DISK` pre-filter to avoid pipe/device hangs, then `DuplicateHandle` + `GetFileInformationByHandle` for file-id comparison. macOS shells out to `lsof -F pc`. Best-effort — never introduces a new failure mode.
+1. **`hole_bridge::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
+1. **`hole_bridge::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
+
+`DistHarness::spawn` composes them: `retry_if(|| cmd.spawn(), is_file_contention, 3, 500ms)`, and on terminal failure calls `handle_holders::log_holders(&hole_exe)` before propagating. See bindreams/hole#208 for the incident that motivated this.
 
 ### CLI
 
