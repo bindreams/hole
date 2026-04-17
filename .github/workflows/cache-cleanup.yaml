@@ -38,31 +38,48 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      # GitHub's per-repo Actions cache quota. Documented as 10 GiB at
+      # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy
+      # No public API exposes this number, so bump manually if the repo's plan changes.
       QUOTA_BYTES: 10737418240        # 10 GiB
       HIGH_PCT: ${{ inputs.high_watermark_pct || '70' }}
       LOW_PCT: ${{ inputs.low_watermark_pct || '50' }}
       MAX_AGE_DAYS: ${{ inputs.max_age_days || '3' }}
       DRY_RUN: ${{ inputs.dry_run || 'false' }}
     steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$HIGH_PCT"      =~ ^[0-9]+$ ]] || { echo "::error::high_watermark_pct must be a non-negative integer: $HIGH_PCT"; exit 1; }
+          [[ "$LOW_PCT"       =~ ^[0-9]+$ ]] || { echo "::error::low_watermark_pct must be a non-negative integer: $LOW_PCT"; exit 1; }
+          [[ "$MAX_AGE_DAYS"  =~ ^[0-9]+$ ]] || { echo "::error::max_age_days must be a non-negative integer: $MAX_AGE_DAYS"; exit 1; }
+          (( LOW_PCT < HIGH_PCT )) || { echo "::error::low_watermark_pct ($LOW_PCT) must be strictly less than high_watermark_pct ($HIGH_PCT)"; exit 1; }
+          (( HIGH_PCT <= 100 ))    || { echo "::error::high_watermark_pct must be <= 100: $HIGH_PCT"; exit 1; }
+
       - name: Gate on cache size
         id: gate
         shell: bash
         run: |
           set -euo pipefail
-          usage=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_size_in_bytes')
-          count=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_count')
-          [[ "$usage" =~ ^[0-9]+$ ]] || { echo "::error::unexpected usage value: $usage"; exit 1; }
-          [[ "$count" =~ ^[0-9]+$ ]] || { echo "::error::unexpected count value: $count"; exit 1; }
+          # One API call, read both fields. Using command substitution so a `gh api`
+          # failure trips `set -e`; process substitution wouldn't.
+          resp=$(gh api "repos/${GH_REPO}/actions/cache/usage" \
+            --jq '"\(.active_caches_size_in_bytes) \(.active_caches_count)"')
+          read -r usage count <<<"$resp"
+          [[ "$usage" =~ ^[0-9]+$ ]] || { echo "::error::unexpected usage value from API: $usage"; exit 1; }
+          [[ "$count" =~ ^[0-9]+$ ]] || { echo "::error::unexpected count value from API: $count"; exit 1; }
           high=$(( QUOTA_BYTES * HIGH_PCT / 100 ))
           low=$((  QUOTA_BYTES * LOW_PCT  / 100 ))
-          echo "usage=$usage  high=$high  low=$low  count=$count"
+          echo "[gate] usage=$usage high=$high low=$low count=$count"
           echo "low_bytes=$low" >> "$GITHUB_OUTPUT"
           if [[ "$usage" -lt "$high" ]]; then
             echo "below high watermark; no cleanup needed"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "above high watermark; cleanup will run"
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true"  >> "$GITHUB_OUTPUT"
+            echo "initial_usage=$usage" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Delete stale GHA cache entries (oldest-first, down to low watermark)
@@ -70,57 +87,90 @@ jobs:
         shell: bash
         env:
           LOW_BYTES: ${{ steps.gate.outputs.low_bytes }}
+          INITIAL_USAGE: ${{ steps.gate.outputs.initial_usage }}
         run: |
           set -euo pipefail
-          threshold=$(date -u -d "${MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
-          echo "Pruning entries last accessed before $threshold, down to $LOW_BYTES bytes total."
+          # Threshold as epoch seconds so lexicographic comparisons can't misbehave
+          # when GitHub's cache metadata ever gains sub-second precision.
+          threshold_epoch=$(date -u -d "${MAX_AGE_DAYS} days ago" +%s)
+          threshold_iso=$(date -u -d "@${threshold_epoch}" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Pruning entries with last_accessed_at < ${threshold_iso} (epoch ${threshold_epoch}), targeting usage < ${LOW_BYTES} bytes."
 
-          declare -A seen=()
+          # Track estimated usage locally. cache/usage is eventually consistent and
+          # can lag real state by minutes; if we trusted it exclusively, a single
+          # scheduled run could overshoot the low watermark and delete far more than
+          # intended. Subtracting each freshly-deleted entry's size_in_bytes gives
+          # a sound upper-bound estimate we can gate on.
+          usage_est=${INITIAL_USAGE}
+
+          # Dedup only *successful* processing; failed entries remain retryable
+          # on the next list page so a transient 5xx doesn't skip them permanently.
+          declare -A processed=()
           deleted=0
+          failed=0
           skipped_preview=0
 
           while : ; do
-            current=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_size_in_bytes')
-            [[ "$current" =~ ^[0-9]+$ ]] || { echo "::error::bad usage: $current"; exit 1; }
-            if [[ "$current" -lt "$LOW_BYTES" ]]; then
-              echo "reached low watermark"
+            if [[ "$usage_est" -lt "$LOW_BYTES" ]]; then
+              echo "reached low watermark (estimated usage $usage_est < $LOW_BYTES)"
               break
             fi
 
-            mapfile -t batch < <(
-              gh api "repos/${GH_REPO}/actions/caches?per_page=100&sort=last_accessed_at&direction=asc" \
-                --jq ".actions_caches[] | select(.last_accessed_at < \"$threshold\") | .id"
-            )
-            if [[ ${#batch[@]} -eq 0 ]]; then
-              echo "no entries older than $threshold remain"
+            # Fetch next page. Capture to a temp file so `gh api` failures are
+            # detected — `mapfile < <(gh api ...)` would silently swallow errors
+            # because process-substitution failures don't trip `set -e`.
+            batch_file=$(mktemp)
+            if ! gh api "repos/${GH_REPO}/actions/caches?per_page=100&sort=last_accessed_at&direction=asc" \
+              --jq ".actions_caches[] | select((.last_accessed_at | fromdateiso8601) < ${threshold_epoch}) | \"\(.id) \(.size_in_bytes)\"" \
+              > "$batch_file"; then
+              echo "::error::gh api failed when listing caches"
+              rm -f "$batch_file"
+              exit 1
+            fi
+
+            if [[ ! -s "$batch_file" ]]; then
+              echo "no entries older than ${threshold_iso} remain"
+              rm -f "$batch_file"
               break
             fi
 
             made_progress=false
-            for id in "${batch[@]}"; do
-              if [[ -n "${seen[$id]:-}" ]]; then
-                continue
+            while read -r id size; do
+              [[ -n "$id" ]] || continue
+              [[ "$id"   =~ ^[0-9]+$ ]] || { echo "::error::unexpected id from API: $id"; exit 1; }
+              [[ "$size" =~ ^[0-9]+$ ]] || { echo "::error::unexpected size for id=$id: $size"; exit 1; }
+              if [[ -n "${processed[$id]:-}" ]]; then
+                continue    # already deleted in a prior iteration; shouldn't re-appear, defensive
               fi
-              seen[$id]=1
               if [[ "$DRY_RUN" == "true" ]]; then
                 if [[ $skipped_preview -lt 20 ]]; then
-                  echo "[dry-run] would delete $id"
+                  echo "[dry-run] would delete id=$id size=$size"
                 fi
                 skipped_preview=$((skipped_preview + 1))
+                processed[$id]=1
+                usage_est=$(( usage_est - size ))
                 made_progress=true
                 continue
               fi
-              if gh cache delete "$id" >/dev/null 2>&1; then
+              # Preserve stderr for diagnostics on failure.
+              if err=$(gh cache delete "$id" 2>&1 >/dev/null); then
                 deleted=$((deleted + 1))
+                processed[$id]=1
+                usage_est=$(( usage_est - size ))
                 made_progress=true
               else
-                echo "::warning::failed to delete cache id=$id"
+                failed=$((failed + 1))
+                # Don't add to `processed`: the entry is still a deletion candidate
+                # and will re-appear on the next page fetch. If every entry in the
+                # next batch fails too, `made_progress` stays false and we bail.
+                echo "::warning::failed to delete cache id=$id: ${err:-no stderr}"
               fi
-              sleep 0.25
-            done
+              sleep 0.25    # stay well under GitHub's write secondary rate limit
+            done < "$batch_file"
+            rm -f "$batch_file"
 
             if ! $made_progress; then
-              echo "::warning::no progress in last batch (${#batch[@]} entries all failed or already seen); stopping"
+              echo "::warning::no progress in last batch; stopping (failed=$failed, deleted=$deleted)"
               break
             fi
           done
@@ -128,7 +178,7 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[dry-run] would have attempted to delete $skipped_preview entries (first 20 listed above)."
           else
-            echo "Deleted $deleted entries."
+            echo "Deleted $deleted entries (failed: $failed). Estimated remaining usage: $usage_est bytes."
           fi
 
       - name: Report post-cleanup usage
