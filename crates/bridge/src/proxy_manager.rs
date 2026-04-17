@@ -26,13 +26,16 @@
 // handed to `new`. Re-adding a getter would recreate the encapsulation
 // smell the pre-#165 `pub fn backend(&self)` carried.
 
-use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
-use crate::routing::{Routing, SystemRouting};
-use hole_common::protocol::{ProxyConfig, TunnelMode};
 use std::net::IpAddr;
 use std::time::Instant;
+
+use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::{Routing, SystemRouting};
+
+use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
 
 // State ===============================================================================================================
 
@@ -142,8 +145,8 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// intentionally surfaced for the diagnostics handler so tests can
     /// exercise the mock routing's gateway stub instead of hitting the
     /// host OS.
-    pub fn default_gateway(&self) -> Result<crate::gateway::GatewayInfo, ProxyError> {
-        self.routing.default_gateway()
+    pub fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+        self.routing.default_gateway().map_err(Into::into)
     }
 
     /// Get the list of invalid (dropped) filter rules from the current ruleset.
@@ -256,7 +259,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// or SIGKILL between `setup_routes` and `SystemRoutes`
     /// construction would otherwise leak routes with no on-disk record,
     /// defeating crash recovery on next startup. See
-    /// [`crate::routing::SystemRouting::install`] for the invariant.
+    /// [`tun_engine::routing::SystemRouting::install`] for the invariant.
     async fn start_inner(
         proxy: &P,
         routing: &R,
@@ -304,9 +307,9 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         }
 
         // Full mode: pre-load wintun.dll explicitly so we can give a
-        // descriptive error if it's missing. See crates/bridge/src/wintun.rs.
+        // descriptive error if it's missing. See tun_engine::device::wintun.
         #[cfg(target_os = "windows")]
-        crate::wintun::ensure_loaded()?;
+        tun_engine::device::wintun::ensure_loaded()?;
 
         // Resolve server hostname to IP.
         let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;

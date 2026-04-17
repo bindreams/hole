@@ -1,5 +1,5 @@
 use super::*;
-use crate::proxy::ProxyError;
+use crate::error::DeviceError;
 
 // Path resolution =====================================================================================================
 
@@ -26,7 +26,7 @@ fn resolve_returns_wintun_missing_when_absent() {
     std::fs::write(&fake_exe, b"not a real binary").unwrap();
 
     let err = resolve_wintun_path_inner(Some(fake_exe.clone())).unwrap_err();
-    let ProxyError::WintunMissing { tried } = err else {
+    let DeviceError::WintunMissing { tried } = err else {
         panic!("expected WintunMissing, got {err:?}");
     };
     // Must have tried the exe-sibling location at minimum.
@@ -39,7 +39,7 @@ fn resolve_returns_wintun_missing_when_absent() {
 #[skuld::test]
 fn resolve_returns_wintun_missing_with_no_exe() {
     let err = resolve_wintun_path_inner(None).unwrap_err();
-    let ProxyError::WintunMissing { tried } = err else {
+    let DeviceError::WintunMissing { tried } = err else {
         panic!("expected WintunMissing, got {err:?}");
     };
     // No exe → no candidates can be probed, but we still return WintunMissing
@@ -89,7 +89,7 @@ fn wintun_missing_error_message_contains_paths() {
 // the success path would mutate process-global state (the loaded module table)
 // that other tests cannot reliably reset. The empirical verification that
 // pre-loading + bare-name reload works was done out-of-band before adopting
-// this approach (see issue #141 discussion). Path resolution is the part with
+// this approach (see bindreams/hole#141). Path resolution is the part with
 // non-trivial logic, and that is fully unit-tested above.
 
 #[skuld::test]
@@ -104,10 +104,9 @@ fn ensure_loaded_does_not_panic() {
             // Cached or freshly loaded — second call must also succeed.
             ensure_loaded().unwrap();
         }
-        Err(ProxyError::WintunMissing { .. }) | Err(ProxyError::WintunLoad { .. }) => {
+        Err(DeviceError::WintunMissing { .. }) | Err(DeviceError::WintunLoad { .. }) => {
             // Acceptable on a host without wintun.dll on PATH or next to the
             // test binary.
         }
-        Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }

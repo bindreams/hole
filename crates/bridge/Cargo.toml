@@ -12,6 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+tun-engine = { path = "../tun-engine" }
 garter = { path = "../../external/galoshes/garter" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
@@ -21,7 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 thiserror = "2"
-default-net = "0.22"
 tokio-util = "0.7"
 socket2 = "0.6"
 axum = { version = "0.8", default-features = false, features = ["json"] }
@@ -68,16 +68,8 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
-# Pinned to the same minor version that shadowsocks-service 1.24 uses
-# transitively (via tun-0.8.6) so cargo deduplicates the crate. We load
-# wintun.dll explicitly here so the OS loader has it cached when the
-# bare-name `LoadLibraryExW("wintun.dll")` from inside shadowsocks-service
-# fires later. See crates/bridge/src/wintun.rs.
-wintun-bindings = "0.7"
 
 [dev-dependencies]
 skuld = { version = "0.1", features = ["tokio"] }
@@ -85,6 +77,8 @@ shadowsocks-service = { version = "1", features = ["server"] }
 rcgen = "0.13"
 rand = "0.9"
 base64 = "0.22"
+# Used by `test_support::net_discovery` for primary IPv4 detection in TUN tests.
+default-net = "0.22"
 # Library dep on the workspace task runner so the dist-directory e2e test
 # fixture can call `xtask::run_stage` directly instead of shelling out to
 # `cargo xtask stage`. The path-dep form is deliberate: if `xtask` ever

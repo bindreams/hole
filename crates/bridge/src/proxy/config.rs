@@ -51,6 +51,32 @@ pub enum ProxyError {
     Plugin(String),
 }
 
+// Error conversions from tun-engine ===================================================================================
+//
+// `Routing` trait methods return `tun_engine::RoutingError`; wintun loading
+// returns `tun_engine::DeviceError`. Bridge keeps its own `ProxyError` enum
+// as the canonical proxy-lifecycle error, mapping incoming tun-engine
+// errors into the matching variants so existing `?` propagation keeps
+// working.
+
+impl From<tun_engine::RoutingError> for ProxyError {
+    fn from(e: tun_engine::RoutingError) -> Self {
+        match e {
+            tun_engine::RoutingError::Gateway(s) => ProxyError::Gateway(s),
+            tun_engine::RoutingError::RouteSetup(s) => ProxyError::RouteSetup(s),
+        }
+    }
+}
+
+impl From<tun_engine::DeviceError> for ProxyError {
+    fn from(e: tun_engine::DeviceError) -> Self {
+        match e {
+            tun_engine::DeviceError::WintunMissing { tried } => ProxyError::WintunMissing { tried },
+            tun_engine::DeviceError::WintunLoad { path, message } => ProxyError::WintunLoad { path, message },
+        }
+    }
+}
+
 // Config builder ======================================================================================================
 
 /// TUN interface subnet (hardcoded, not configurable via IPC).
