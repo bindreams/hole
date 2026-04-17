@@ -2387,6 +2387,7 @@ dependencies = [
  "bytes",
  "default-net",
  "garter",
+ "handle-holders",
  "hex",
  "hickory-proto",
  "hickory-resolver",

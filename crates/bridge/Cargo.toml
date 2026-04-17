@@ -12,6 +12,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+handle-holders = { path = "../handle-holders" }
 garter = { path = "../../external/galoshes/garter" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
@@ -84,6 +85,7 @@ wintun-bindings = "0.7"
 
 [dev-dependencies]
 skuld = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["test-util"] }
 shadowsocks-service = { version = "1", features = ["server"] }
 rcgen = "0.13"
 rand = "0.9"

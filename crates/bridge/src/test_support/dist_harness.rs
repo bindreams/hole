@@ -38,12 +38,20 @@ use hole_common::protocol::{
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+/// Max spawn attempts when Windows Defender / macOS exec-busy holds
+/// the freshly-built `hole.exe`. Three with 500 ms exponential backoff
+/// gives a total of 500 + 1000 = 1500 ms of waiting — empirically
+/// enough to let a Defender scan release the handle.
+const MAX_SPAWN_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).expect("literal");
+const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Error returned by [`DistHarness`] operations. Test-only, panic-friendly
 /// (every error branch in a test just calls `.expect()` or `.unwrap()`).
@@ -139,8 +147,17 @@ impl DistHarness {
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly
         // built `hole.exe`) lands a holder list in the log. See #208.
-        let mut child = crate::diagnostics::spawn::spawn_with_diagnostics(&mut cmd)
-            .map_err(|e| HarnessError(format!("failed to spawn {hole_exe:?}: {e}")))?;
+        let mut child = crate::retry::retry_if(
+            || cmd.spawn(),
+            crate::retry::is_file_contention,
+            MAX_SPAWN_ATTEMPTS,
+            SPAWN_BACKOFF,
+        )
+        .await
+        .map_err(|e| {
+            handle_holders::log_holders(&hole_exe);
+            HarnessError(format!("failed to spawn {hole_exe:?}: {e}"))
+        })?;
 
         // Wait for the socket to become connectable before returning.
         // If the subprocess has already exited, surface that instead of
