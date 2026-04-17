@@ -1,0 +1,5 @@
+error: #[freeze] requires all fields to be `pub`
+ --> tests/compile_fail/non_pub_field.rs:6:5
+  |
+6 |     b: u32,
+  |     ^
