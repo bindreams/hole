@@ -29,20 +29,14 @@ jobs:
         run: prek run --all-files --show-diff-on-failure
 
   test:
-    name: Test (${{ matrix.os }}/${{ matrix.arch }}/${{ matrix.runner }})
+    name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: windows, arch: amd64, runner: windows-latest }
-          # #200 investigation: same-OS run on AWS Nitro hypervisor
-          # (instead of Azure Hyper-V) to test whether the loopback
-          # flake is hypervisor-layer or Windows-Server-2025-layer.
-          # Provisioned via cirun.io (.cirun.yml). Generous 60-minute
-          # timeout because first-time AMI provisioning can be slow.
-          - { os: windows, arch: amd64, runner: cirun-windows-2025-amd64 }
           - { os: darwin,  arch: amd64, runner: macos-15-intel }
           - { os: darwin,  arch: arm64, runner: macos-latest }
     steps:
