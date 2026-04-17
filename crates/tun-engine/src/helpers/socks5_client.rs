@@ -1,12 +1,13 @@
 //! SOCKS5 CONNECT client for the proxy dispatch path.
 
 use std::net::IpAddr;
+
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 
-/// Connect to the target through the SS SOCKS5 local.
+/// Connect to the target through a SOCKS5 upstream.
 ///
-/// - `local_port`: SS's SOCKS5 listen port on 127.0.0.1.
+/// - `local_port`: SOCKS5 server's listen port on 127.0.0.1.
 /// - `dst_ip`: the connection's destination IP (may be a fake-DNS IP).
 /// - `dst_port`: the connection's destination port.
 /// - `domain`: if available, used as the SOCKS5 target (preferred to

@@ -1,6 +1,6 @@
 use super::*;
 
-/// Flaky on Windows CI — times out at 30s. See #198.
+/// Flaky on Windows CI — times out at 30s. See bindreams/hole#198.
 #[skuld::test(ignore)]
 fn bypass_socket_connects_to_loopback() {
     let rt = tokio::runtime::Builder::new_current_thread()

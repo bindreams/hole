@@ -1,7 +1,7 @@
 //! SOCKS5 UDP Associate client for the proxy dispatch path.
 //!
 //! Implements the UDP ASSOCIATE command (RFC 1928 §4, §7) to relay UDP
-//! datagrams through the shadowsocks SOCKS5 local.
+//! datagrams through a SOCKS5 upstream.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -118,8 +118,8 @@ pub struct Socks5UdpRelay {
 }
 
 impl Socks5UdpRelay {
-    /// Perform a SOCKS5 UDP ASSOCIATE handshake against the SS local on
-    /// `127.0.0.1:{local_port}` and return the ready-to-use relay.
+    /// Perform a SOCKS5 UDP ASSOCIATE handshake against the SOCKS5 server
+    /// on `127.0.0.1:{local_port}` and return the ready-to-use relay.
     pub async fn associate(local_port: u16) -> io::Result<Self> {
         let proxy_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
 

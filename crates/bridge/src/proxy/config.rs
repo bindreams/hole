@@ -73,6 +73,8 @@ impl From<tun_engine::DeviceError> for ProxyError {
         match e {
             tun_engine::DeviceError::WintunMissing { tried } => ProxyError::WintunMissing { tried },
             tun_engine::DeviceError::WintunLoad { path, message } => ProxyError::WintunLoad { path, message },
+            tun_engine::DeviceError::TunOpen(err) => ProxyError::Runtime(err),
+            tun_engine::DeviceError::InvalidConfig(msg) => ProxyError::RouteSetup(format!("device config: {msg}")),
         }
     }
 }

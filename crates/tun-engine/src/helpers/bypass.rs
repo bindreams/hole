@@ -1,13 +1,15 @@
-//! Bypass-path socket helpers — interface binding + TCP connect.
+//! Bypass-path socket helpers — interface binding + TCP/UDP connect.
 
 use std::net::{IpAddr, SocketAddr};
 
 use tokio::net::TcpStream;
-use tun_engine::net::{bind_to_interface_v4, bind_to_interface_v6};
+
+use crate::net::{bind_to_interface_v4, bind_to_interface_v6};
 
 // Bypass TCP connect ==================================================================================================
 
-/// Open a TCP connection via the upstream interface, bypassing the TUN device.
+/// Open a TCP connection via a specific upstream interface, bypassing any
+/// TUN device on the host.
 pub async fn create_bypass_tcp(dst_ip: IpAddr, dst_port: u16, iface_index: u32) -> std::io::Result<TcpStream> {
     let dst = SocketAddr::new(dst_ip, dst_port);
     let tcp_socket = match dst_ip {
@@ -29,7 +31,7 @@ pub async fn create_bypass_tcp(dst_ip: IpAddr, dst_port: u16, iface_index: u32) 
 
 // Bypass UDP socket ===================================================================================================
 
-/// Create an unconnected UDP socket bound to the upstream interface.
+/// Create an unconnected UDP socket bound to a specific upstream interface.
 pub async fn create_bypass_udp(iface_index: u32, v6: bool) -> std::io::Result<tokio::net::UdpSocket> {
     let socket = if v6 {
         let s = socket2::Socket::new(

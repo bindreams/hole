@@ -1,6 +1,7 @@
-use super::VirtualTunDevice;
 use smoltcp::phy::{Checksum, Device, RxToken, TxToken};
 use smoltcp::time::Instant;
+
+use super::VirtualTunDevice;
 
 #[skuld::test]
 fn receive_returns_none_when_empty() {

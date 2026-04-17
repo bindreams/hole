@@ -1,8 +1,15 @@
 //! smoltcp `Device` implementation backed by in-memory queues.
+//!
+//! The engine owns this shim between the real OS TUN device and the
+//! smoltcp userspace stack: packets read from the TUN are enqueued into
+//! `rx_queue` and smoltcp pulls them via [`receive`](VirtualTunDevice::receive);
+//! packets smoltcp wants to send go into `tx_queue` and the engine drains
+//! them via [`dequeue_tx`](VirtualTunDevice::dequeue_tx) into the real TUN.
+
+use std::collections::VecDeque;
 
 use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use std::collections::VecDeque;
 
 pub struct VirtualTunDevice {
     rx_queue: VecDeque<Vec<u8>>,
@@ -30,6 +37,7 @@ impl VirtualTunDevice {
     }
 
     /// Check if there are packets waiting to be sent to the TUN.
+    #[allow(dead_code)]
     pub fn has_tx(&self) -> bool {
         !self.tx_queue.is_empty()
     }
@@ -103,5 +111,5 @@ impl<'a> phy::TxToken for TxToken<'a> {
 }
 
 #[cfg(test)]
-#[path = "device_tests.rs"]
-mod device_tests;
+#[path = "virtual_device_tests.rs"]
+mod virtual_device_tests;
