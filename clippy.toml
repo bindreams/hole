@@ -15,9 +15,9 @@ reason = "Must call sender.ready().await before send_request() (tower::Service c
 # `#[allow(clippy::disallowed_methods)]` plus a comment.
 
 [[disallowed-methods]]
-path = "crate::routing::setup_routes"
-reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in routing.rs may call this. See #165."
+path = "tun_engine::routing::setup_routes"
+reason = "Route setup must go through `Routing::install`. Only `SystemRouting::install` in tun-engine may call this. See #165."
 
 [[disallowed-methods]]
-path = "crate::routing::teardown_routes"
-reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in routing.rs and `recover_routes` may call this. See #165."
+path = "tun_engine::routing::teardown_routes"
+reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."

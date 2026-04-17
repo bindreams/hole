@@ -1,15 +1,20 @@
-// Default gateway detection — wraps the `default-net` crate.
+//! Default gateway detection — wraps the `default-net` crate.
 
 use std::net::IpAddr;
 
-/// Gateway detection result, bundling the gateway IP with the original interface name.
+use crate::net::bind_to_interface_v6;
+
+/// Gateway detection result, bundling the gateway IP with the original
+/// interface name.
 pub struct GatewayInfo {
-    /// Default gateway IP address (typically IPv4 — `default-net` does not expose IPv6 gateways on Windows).
+    /// Default gateway IP address (typically IPv4 — `default-net` does not
+    /// expose IPv6 gateways on Windows).
     pub gateway_ip: IpAddr,
     /// Platform-appropriate interface name for route commands.
     /// On Windows: friendly name (e.g., "Wi-Fi"). On macOS: BSD name (e.g., "en0").
     pub interface_name: String,
-    /// OS interface index (used by bypass socket helpers to bind to the upstream NIC).
+    /// OS interface index (used by bypass socket helpers to bind to the
+    /// upstream NIC).
     pub interface_index: u32,
     /// Whether the upstream interface can reach an IPv6 destination.
     pub ipv6_available: bool,
@@ -106,7 +111,7 @@ fn probe_ipv6(interface_index: u32) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    if crate::dispatcher::bypass::bind_to_interface_v6(&socket, interface_index).is_err() {
+    if bind_to_interface_v6(&socket, interface_index).is_err() {
         return false;
     }
     let target: std::net::SocketAddrV6 = "[2606:4700:4700::1111]:443".parse().unwrap();

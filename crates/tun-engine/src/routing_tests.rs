@@ -1,5 +1,8 @@
-use super::*;
+use std::cell::RefCell;
 use std::net::IpAddr;
+
+use super::state::{self, RouteState, STATE_FILE_NAME};
+use super::*;
 
 // Helpers =============================================================================================================
 
@@ -238,7 +241,7 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 // either making fields public or exercising `install` with real netsh —
 // the latter is exactly what the refactor disallows. The critical
 // invariant ("Drop tears down via the trait, not the free function") is
-// covered by `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
+// covered in bridge by `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
 
 // Phase classifier ====================================================================================================
 //
@@ -262,11 +265,7 @@ fn setup_and_teardown_phases_are_not_recovery() {
 
 // recover_routes_with tests ===========================================================================================
 //
-// These use an injectable command runner so the test doesn't shell out. The
-// runner records (phase, commands) into a RefCell so we can assert on it.
-
-use crate::route_state::{self, RouteState, STATE_FILE_NAME};
-use std::cell::RefCell;
+// These use an injectable command runner so the test doesn't shell out.
 
 type Captured = Vec<(String, Vec<Vec<String>>)>;
 
@@ -280,10 +279,9 @@ fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) ->
 #[skuld::test]
 fn recover_without_state_file_is_a_noop() {
     // With state-file-driven recovery, the absence of a state file
-    // means the previous run never installed any routes (the
-    // write-ordering contract in `ProxyManager::start_inner` persists
-    // the state file BEFORE any routing mutation). So recovery issues
-    // zero commands.
+    // means the previous run never installed any routes (the caller's
+    // write-ordering contract persists the state file BEFORE any
+    // routing mutation). So recovery issues zero commands.
     //
     // This is load-bearing for the e2e test harness, which runs
     // multiple bridge subprocesses in parallel: a SOCKS5-only bridge
@@ -302,13 +300,13 @@ fn recover_without_state_file_is_a_noop() {
 #[skuld::test]
 fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = RouteState {
-        version: route_state::SCHEMA_VERSION,
+    let persisted_state = RouteState {
+        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
     };
-    route_state::save(tmp.path(), &state).unwrap();
+    state::save(tmp.path(), &persisted_state).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(tmp.path(), capturing_runner(&log));
@@ -326,13 +324,13 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
 #[skuld::test]
 fn recover_clears_state_file_even_when_runner_errors() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = RouteState {
-        version: route_state::SCHEMA_VERSION,
+    let persisted_state = RouteState {
+        version: state::SCHEMA_VERSION,
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
     };
-    route_state::save(tmp.path(), &state).unwrap();
+    state::save(tmp.path(), &persisted_state).unwrap();
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };

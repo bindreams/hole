@@ -1,5 +1,6 @@
-use super::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use super::*;
 
 fn sample_ipv4() -> RouteState {
     RouteState {

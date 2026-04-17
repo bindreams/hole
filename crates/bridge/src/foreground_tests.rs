@@ -1,7 +1,5 @@
-use crate::gateway::GatewayInfo;
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use crate::proxy_manager::ProxyManager;
-use crate::routing::Routing;
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
@@ -12,6 +10,9 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
+use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::Routing;
+use tun_engine::RoutingError;
 
 // Minimal stub types used only for the foreground-run IPC smoke test.
 // None of their methods are exercised by this test — we only construct
@@ -66,12 +67,12 @@ impl StubRouting {
 
 impl Routing for StubRouting {
     type Installed = StubRoutes;
-    fn install(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<StubRoutes, ProxyError> {
+    fn install(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<StubRoutes, RoutingError> {
         Ok(StubRoutes {
             _state_dir: self.state_dir.clone(),
         })
     }
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             interface_name: "StubIf".into(),

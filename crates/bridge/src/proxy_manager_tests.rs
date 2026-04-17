@@ -1,7 +1,5 @@
 use super::*;
-use crate::gateway::GatewayInfo;
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
-use crate::routing::Routing;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
@@ -12,6 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::{self, state as route_state, Routing};
+use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
 
@@ -181,27 +182,27 @@ impl Routing for MockRouting {
         server_ip: IpAddr,
         _gateway: IpAddr,
         interface_name: &str,
-    ) -> Result<MockRoutes, ProxyError> {
+    ) -> Result<MockRoutes, RoutingError> {
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
 
         // Match `SystemRouting::install`'s critical ordering: write the
         // state file BEFORE any route mutation (or in this case, before
         // the fail flag is checked). This keeps the file-lifecycle tests
         // honest — they observe the same write-then-clear behavior.
-        let persisted = crate::route_state::RouteState {
-            version: crate::route_state::SCHEMA_VERSION,
+        let persisted = route_state::RouteState {
+            version: route_state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        crate::route_state::save(&self.state_dir, &persisted)
-            .map_err(|e| ProxyError::RouteSetup(format!("mock persist failed: {e}")))?;
+        route_state::save(&self.state_dir, &persisted)
+            .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
         if self.state.fail_install.load(Ordering::SeqCst) {
             // Defensive: match `SystemRouting::install`'s error path —
             // clear the stale file we just wrote.
-            let _ = crate::route_state::clear(&self.state_dir);
-            return Err(ProxyError::RouteSetup("mock install failure".into()));
+            let _ = route_state::clear(&self.state_dir);
+            return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
         Ok(MockRoutes {
@@ -210,9 +211,9 @@ impl Routing for MockRouting {
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(ProxyError::Gateway("mock gateway failure".into()));
+            return Err(RoutingError::Gateway("mock gateway failure".into()));
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -231,7 +232,7 @@ struct MockRoutes {
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
-        let _ = crate::route_state::clear(&self.state_dir);
+        let _ = route_state::clear(&self.state_dir);
     }
 }
 
@@ -539,7 +540,7 @@ fn stop_runs_mock_teardown_not_real_netsh() {
 /// proves a proxy_manager test path spawned a real routing subprocess.
 #[skuld::test(serial)]
 fn proxy_manager_tests_never_spawn_routing_subprocess() {
-    crate::routing::ROUTING_SUBPROCESS_SPAWN_COUNT.store(0, Ordering::SeqCst);
+    routing::ROUTING_SUBPROCESS_SPAWN_COUNT.store(0, Ordering::SeqCst);
 
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
@@ -549,7 +550,7 @@ fn proxy_manager_tests_never_spawn_routing_subprocess() {
         }
     });
 
-    let count = crate::routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst);
+    let count = routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst);
     eprintln!("proxy_manager start/stop cycles spawned {count} routing subprocesses");
     assert_eq!(
         count, 0,
@@ -638,14 +639,14 @@ fn stop_clears_last_error() {
 fn start_writes_state_file_then_stop_clears_it() {
     rt().block_on(async {
         let (mut pm, dir) = new_manager(MockProxy::new());
-        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
         assert!(!state_path.exists());
 
         pm.start(&test_config()).await.unwrap();
         assert!(state_path.exists(), "state file must exist while proxy is running");
 
         // Verify the content contains the server IP
-        let loaded = crate::route_state::load(dir.path()).unwrap();
+        let loaded = route_state::load(dir.path()).unwrap();
         assert_eq!(loaded.server_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         pm.stop().await.unwrap();
@@ -658,7 +659,7 @@ fn route_failure_clears_stale_state_file() {
     rt().block_on(async {
         let proxy = MockProxy::new();
         let dir = tempfile::tempdir().unwrap();
-        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
         let routing = MockRouting::failing_install(dir.path().to_path_buf());
 
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
@@ -696,7 +697,7 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
-        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
 
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         let token = CancellationToken::new();
@@ -734,7 +735,7 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
 fn start_cancellable_cancel_before_start_returns_immediately() {
     rt().block_on(async {
         let (mut pm, dir) = new_manager(MockProxy::new());
-        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
         let token = CancellationToken::new();
         token.cancel(); // already cancelled before start is even called
 
@@ -777,7 +778,7 @@ fn start_cancellable_dropped_future_runs_guards() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
-        let state_path = dir.path().join(crate::route_state::STATE_FILE_NAME);
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
 
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         let token = CancellationToken::new();

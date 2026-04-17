@@ -1,0 +1,5 @@
+error: #[freeze] only supports `#[derive(Default)]` on the source struct; other derives are not yet supported
+ --> tests/compile_fail/non_default_derive.rs:4:1
+  |
+4 | #[derive(Clone)]
+  | ^

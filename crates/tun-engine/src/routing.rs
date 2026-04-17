@@ -1,12 +1,16 @@
-// Route table management — platform-specific split routing.
+//! Route table management — platform-specific split routing.
 
-use crate::gateway::GatewayInfo;
-use crate::proxy::ProxyError;
+pub mod state;
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+
 use tracing::{debug, info, warn};
+
+use crate::error::RoutingError;
+use crate::gateway::{get_default_gateway_info, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
 /// Incremented once per command in [`run_commands`]. Exposed so
@@ -116,15 +120,15 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
 
 // Crash recovery ======================================================================================================
 
-/// Clean up routes left behind by a previous bridge run.
+/// Clean up routes left behind by a previous run.
 ///
-/// Called at bridge startup **after** the IPC socket bind succeeds (so a
-/// second instance can't damage the first's routing state). Removes the
-/// fixed-CIDR split routes (idempotent — harmless if absent); if a
-/// [`crate::route_state::RouteState`] file is present in `state_dir`, also
-/// removes the server bypass route described by it; finally deletes the
-/// state file. Best-effort — all errors are logged at `warn` level and
-/// the function returns `()` (there is no meaningful caller recovery).
+/// Called at startup **after** the IPC socket bind succeeds (so a second
+/// instance can't damage the first's routing state). Removes the fixed-CIDR
+/// split routes (idempotent — harmless if absent); if a [`state::RouteState`]
+/// file is present in `state_dir`, also removes the server bypass route
+/// described by it; finally deletes the state file. Best-effort — all errors
+/// are logged at `warn` level and the function returns `()` (there is no
+/// meaningful caller recovery).
 pub fn recover_routes(state_dir: &Path) {
     recover_routes_with(state_dir, run_commands);
 }
@@ -136,8 +140,6 @@ pub(crate) fn recover_routes_with<R>(state_dir: &Path, runner: R)
 where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
 {
-    use crate::proxy::TUN_DEVICE_NAME;
-
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
     // Read the state file first. If absent, there's nothing to recover —
@@ -151,11 +153,11 @@ where
     // to concurrently `netsh delete route ... hole-tun`, and a
     // SOCKS5-only bridge's recovery would rip routes out from under a
     // concurrent TUN bridge mid-flight. State-file-driven recovery is
-    // strictly sufficient: the write-ordering contract in
-    // `ProxyManager::start_inner` guarantees the state file is
-    // persisted BEFORE any route mutation, so a crashed run that
-    // installed routes MUST have left a state file behind.
-    let Some(st) = crate::route_state::load(state_dir) else {
+    // strictly sufficient: the caller's write-ordering contract
+    // guarantees the state file is persisted BEFORE any route mutation,
+    // so a crashed run that installed routes MUST have left a state file
+    // behind.
+    let Some(st) = state::load(state_dir) else {
         debug!("no route-state file found, nothing to recover");
         return;
     };
@@ -169,8 +171,10 @@ where
 
     // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
     //    absent. Runs under state-file guard so this only fires when we
-    //    have positive evidence of a prior route install.
-    let split_cmds = build_split_route_teardown_commands(TUN_DEVICE_NAME);
+    //    have positive evidence of a prior route install. Uses the TUN
+    //    name persisted in the state file (the caller controls this —
+    //    tun-engine has no opinion on naming).
+    let split_cmds = build_split_route_teardown_commands(&st.tun_name);
     if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
         warn!(error = %e, "split-route teardown failed during recovery");
     }
@@ -184,7 +188,7 @@ where
     // 3. Delete the state file regardless of command outcomes. Next
     //    startup re-runs the idempotent teardown if anything leaked
     //    past a failure.
-    if let Err(e) = crate::route_state::clear(state_dir) {
+    if let Err(e) = state::clear(state_dir) {
         warn!(error = %e, "failed to clear route-state file during recovery");
     }
 }
@@ -193,30 +197,29 @@ where
 
 /// OS routing: install split-tunnel routes and query routing state.
 ///
-/// # Bridge test-isolation contract
+/// # Test-isolation contract
 ///
 /// **All production I/O that mutates or queries the host's routing tables
-/// in bridge code MUST route through this trait.** Helper types whose
-/// `Drop` impls tear down routes must do so through the associated
-/// [`Installed`](Self::Installed) type's Drop, not by calling
-/// [`teardown_routes`] directly. The only legitimate call sites of the
-/// free functions are inside this module: [`SystemRouting::install`] and
-/// [`SystemRoutes::drop`] for the install/teardown path, and
-/// [`recover_routes`] / [`recover_routes_with`] for crash recovery.
+/// MUST route through this trait.** Helper types whose `Drop` impls tear
+/// down routes must do so through the associated [`Installed`](Self::Installed)
+/// type's Drop, not by calling [`teardown_routes`] directly. The only
+/// legitimate call sites of the free functions are inside this module:
+/// [`SystemRouting::install`] and [`SystemRoutes::drop`] for the
+/// install/teardown path, and [`recover_routes`] / [`recover_routes_with`]
+/// for crash recovery.
 ///
-/// The motivation is test isolation. [`crate::proxy_manager::ProxyManager`]
-/// is generic over `R: Routing` so unit tests can substitute
-/// `MockRouting` whose `Installed` type counts teardown invocations. A
-/// helper that bypasses the trait cannot be intercepted by the mock and
-/// will exercise real production code from unit tests. See the
-/// bindreams/hole#165 incident.
+/// The motivation is test isolation. Consumers (e.g. `hole_bridge::ProxyManager`)
+/// are generic over `R: Routing` so unit tests can substitute a mock whose
+/// `Installed` type counts teardown invocations. A helper that bypasses the
+/// trait cannot be intercepted by the mock and will exercise real production
+/// code from unit tests. See the bindreams/hole#165 incident.
 pub trait Routing: Send + Sync {
     /// RAII guard returned by [`install`](Self::install). Dropping this
     /// value tears down the routes and clears the crash-recovery state
     /// file. The real implementation ([`SystemRoutes`]) calls
-    /// [`teardown_routes`]; the mock implementation increments a
-    /// counter. No production code outside `SystemRoutes` calls the free
-    /// teardown function.
+    /// [`teardown_routes`]; a mock implementation increments a counter.
+    /// No production code outside `SystemRoutes` calls the free teardown
+    /// function.
     type Installed: Send;
 
     /// Install the split routes for the given TUN device and upstream
@@ -230,15 +233,15 @@ pub trait Routing: Send + Sync {
         server_ip: IpAddr,
         gateway: IpAddr,
         interface_name: &str,
-    ) -> Result<Self::Installed, ProxyError>;
+    ) -> Result<Self::Installed, RoutingError>;
 
     /// Returns the current default gateway that the *next* call to
     /// [`install`](Self::install) will bypass the tunnel through.
-    /// Lives on the trait (not as a free function) so `MockRouting` can
-    /// stub a predictable gateway without calling the real OS — without
-    /// this seam, every `proxy_manager` unit test would depend on the
-    /// host having a route to the Internet.
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError>;
+    /// Lives on the trait (not as a free function) so mocks can stub a
+    /// predictable gateway without calling the real OS — without this
+    /// seam, every consumer unit test would depend on the host having a
+    /// route to the Internet.
+    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -265,22 +268,19 @@ impl Routing for SystemRouting {
         server_ip: IpAddr,
         gateway: IpAddr,
         interface_name: &str,
-    ) -> Result<Self::Installed, ProxyError> {
+    ) -> Result<Self::Installed, RoutingError> {
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
         // routing mutation. A panic or SIGKILL between `setup_routes` and
         // `SystemRoutes` construction would otherwise leak routes with no
-        // on-disk record, defeating crash recovery on next startup. This
-        // invariant used to live in a comment block in ProxyManager::start;
-        // it moves here because this is now the single place where routes
-        // are actually touched.
-        let persisted = crate::route_state::RouteState {
-            version: crate::route_state::SCHEMA_VERSION,
+        // on-disk record, defeating crash recovery on next startup.
+        let persisted = state::RouteState {
+            version: state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        crate::route_state::save(&self.state_dir, &persisted)
-            .map_err(|e| ProxyError::RouteSetup(format!("failed to persist route-state: {e}")))?;
+        state::save(&self.state_dir, &persisted)
+            .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
         // Install the routes. On failure, defensively tear down whatever
         // may have been partially installed and clear the stale state
@@ -293,8 +293,8 @@ impl Routing for SystemRouting {
         if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name) {
             #[allow(clippy::disallowed_methods)] // defensive rollback inside install
             let _ = teardown_routes(tun_name, server_ip, interface_name);
-            let _ = crate::route_state::clear(&self.state_dir);
-            return Err(ProxyError::RouteSetup(e.to_string()));
+            let _ = state::clear(&self.state_dir);
+            return Err(RoutingError::RouteSetup(e.to_string()));
         }
 
         Ok(SystemRoutes {
@@ -305,8 +305,8 @@ impl Routing for SystemRouting {
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
-        crate::gateway::get_default_gateway_info().map_err(|e| ProxyError::Gateway(e.to_string()))
+    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+        get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
     }
 }
 
@@ -333,7 +333,7 @@ impl Drop for SystemRoutes {
         // path. Per-command failures above are already logged; a stale
         // state file on the next run would just trigger an idempotent
         // no-op teardown during recover_routes, so clearing is safe.
-        if let Err(e) = crate::route_state::clear(&self.state_dir) {
+        if let Err(e) = state::clear(&self.state_dir) {
             warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
         }
     }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/handle-holders", "crates/hole", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/handle-holders", "crates/hole", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
 exclude = ["external/galoshes"]
 resolver = "2"
 
