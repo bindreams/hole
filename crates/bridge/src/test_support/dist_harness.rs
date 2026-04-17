@@ -155,8 +155,12 @@ impl DistHarness {
         )
         .await
         .map_err(|e| {
+            // Capture the spawn error into the return value FIRST, then
+            // attempt the best-effort holder log — if log_holders itself
+            // blows up, we still propagate the underlying spawn failure.
+            let err = HarnessError(format!("failed to spawn {hole_exe:?}: {e}"));
             handle_holders::log_holders(&hole_exe);
-            HarnessError(format!("failed to spawn {hole_exe:?}: {e}"))
+            err
         })?;
 
         // Wait for the socket to become connectable before returning.

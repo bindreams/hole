@@ -100,6 +100,47 @@ async fn retry_if_returns_terminal_err_after_max_attempts() {
 }
 
 #[skuld::test]
+async fn retry_if_sleeps_follow_exponential_schedule() {
+    // With `tokio::time::pause()` + auto-advance, each `sleep()` resolves
+    // as soon as nothing else is pending. Capture the elapsed mock time
+    // at every `op()` invocation; the vector must match the expected
+    // backoff schedule [0, BASE, BASE + 2·BASE] = [0, BASE, 3·BASE].
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let observed: std::cell::RefCell<Vec<Duration>> = std::cell::RefCell::new(Vec::new());
+
+    let result: Result<(), io::Error> = retry_if(
+        || {
+            observed.borrow_mut().push(tokio::time::Instant::now() - start);
+            Err(io::Error::other("trigger retry"))
+        },
+        |_| true,
+        THREE,
+        BASE,
+    )
+    .await;
+
+    assert!(result.is_err());
+    let observed = observed.into_inner();
+    assert_eq!(observed.len(), 3);
+    // tokio's paused clock advances in discrete ticks, so equality is
+    // unreliable (observed overshoot of 1ms on Windows). Tolerate a
+    // small window around the exact expected schedule.
+    let tol = Duration::from_millis(5);
+    let expect_eq = |idx: usize, got: Duration, want: Duration| {
+        let low = want.saturating_sub(tol);
+        let high = want + tol;
+        assert!(
+            got >= low && got <= high,
+            "attempt {idx}: expected ~{want:?} (±{tol:?}), got {got:?}"
+        );
+    };
+    expect_eq(0, observed[0], Duration::ZERO);
+    expect_eq(1, observed[1], BASE);
+    expect_eq(2, observed[2], BASE * 3);
+}
+
+#[skuld::test]
 async fn retry_if_non_matching_predicate_does_not_retry() {
     tokio::time::pause();
     let calls = Cell::new(0u32);

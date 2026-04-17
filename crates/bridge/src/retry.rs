@@ -4,8 +4,9 @@
 //! passes.
 //!
 //! Sleep uses `tokio::time::sleep`, so callers must be on a Tokio
-//! runtime. Tests use `tokio::time::pause()` / `advance()` to avoid
-//! burning wall-clock seconds on exponential backoff.
+//! runtime. Tests use `tokio::time::pause()` so the runtime
+//! auto-advances mock time between retries instead of burning
+//! wall-clock seconds on exponential backoff.
 
 use std::io;
 use std::num::NonZeroU32;

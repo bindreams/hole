@@ -57,8 +57,8 @@ pub struct FileHolder {
 /// Returns `Ok(vec![])` when `path` doesn't exist. Returns `Err` only
 /// for unexpected OS errors while enumerating the handle table;
 /// per-process permission failures during enumeration are swallowed
-/// and the offending PID is either skipped or reported with
-/// `verified: false`.
+/// and the offending PID is omitted (Windows also logs an aggregate
+/// `info!` count of skipped PIDs so coverage gaps stay observable).
 pub fn find_holders(path: &Path) -> io::Result<Vec<FileHolder>> {
     if !path.try_exists()? {
         return Ok(Vec::new());
