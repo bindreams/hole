@@ -1,0 +1,5 @@
+error: #[freeze] does not support generic parameters yet (v1 restriction)
+ --> tests/compile_fail/generic.rs:4:15
+  |
+4 | pub struct Bad<T> {
+  |               ^
