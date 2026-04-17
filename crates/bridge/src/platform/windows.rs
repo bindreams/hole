@@ -88,7 +88,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
-                crate::routing::SystemRouting::new(state_dir.clone()),
+                tun_engine::routing::SystemRouting::new(state_dir.clone()),
             )
             .with_state_dir(state_dir.clone()),
         ));
@@ -105,7 +105,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
         let state_dir_for_recover = state_dir.clone();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_for_recover)).await
+            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_for_recover)).await
         {
             tracing::warn!(error = %e, "recover_routes task panicked");
         }

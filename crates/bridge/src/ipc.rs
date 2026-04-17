@@ -1,8 +1,9 @@
 // IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
+use tun_engine::routing::Routing;
+
 use crate::proxy::{Proxy, ProxyError};
 use crate::proxy_manager::{ProxyManager, ProxyState};
-use crate::routing::Routing;
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use axum::extract::State;

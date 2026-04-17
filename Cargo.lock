@@ -2408,10 +2408,10 @@ dependencies = [
  "tower",
  "tracing",
  "tun",
+ "tun-engine",
  "ureq",
  "windows 0.62.2",
  "windows-service",
- "wintun-bindings",
  "xtask",
 ]
 
@@ -6750,6 +6750,23 @@ dependencies = [
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",
+ "wintun-bindings",
+]
+
+[[package]]
+name = "tun-engine"
+version = "0.1.0"
+dependencies = [
+ "default-net",
+ "libc",
+ "serde",
+ "serde_json",
+ "skuld",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "windows 0.62.2",
  "wintun-bindings",
 ]
 

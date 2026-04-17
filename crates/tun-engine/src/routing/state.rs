@@ -1,20 +1,21 @@
-// Persisted route state for crash recovery.
-//
-// The bridge writes a small JSON file before mutating the routing table,
-// clears it after normal teardown, and reads it on startup to clean up
-// leaked routes from a previous crashed run. Best-effort; not a
-// multi-instance lock — see §"Known limitations" in the plan.
+//! Persisted route state for crash recovery.
+//!
+//! The caller (typically a bridge/VPN daemon) writes a small JSON file
+//! before mutating the routing table, clears it after normal teardown, and
+//! reads it on startup to clean up leaked routes from a previous crashed
+//! run. Best-effort; not a multi-instance lock.
 
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 // Types ===============================================================================================================
 
 /// Schema version for [`RouteState`]. Bump when the struct changes in a
-/// backwards-incompatible way; [`load`] rejects mismatched versions to force a
-/// fresh run rather than corrupt recovery.
+/// backwards-incompatible way; [`load`] rejects mismatched versions to force
+/// a fresh run rather than corrupt recovery.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Filename of the persisted state file under `state_dir`. Exported so
@@ -22,9 +23,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// single source of truth.
 pub const STATE_FILE_NAME: &str = "bridge-routes.json";
 
-/// Routes and interfaces the bridge installed for the current proxy run.
+/// Routes and interfaces the caller installed for the current proxy run.
 /// Persisted to `<state_dir>/bridge-routes.json` while active, cleared on
-/// clean shutdown. On next startup, the bridge reads this file to clean up
+/// clean shutdown. On next startup, recovery reads this file to clean up
 /// any routes leaked by a previous crashed run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,8 +49,8 @@ fn state_file(state_dir: &Path) -> PathBuf {
 /// `state_dir` if missing.
 ///
 /// Does NOT fsync the parent directory after the rename — power-loss
-/// durability is out of scope. The design target is process-crash
-/// recovery, not disk failure recovery.
+/// durability is out of scope. The design target is process-crash recovery,
+/// not disk failure recovery.
 pub fn save(state_dir: &Path, state: &RouteState) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
 
@@ -105,5 +106,5 @@ pub fn clear(state_dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "route_state_tests.rs"]
-mod route_state_tests;
+#[path = "state_tests.rs"]
+mod state_tests;

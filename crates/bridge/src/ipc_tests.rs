@@ -1,8 +1,6 @@
 use super::*;
-use crate::gateway::GatewayInfo;
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use crate::proxy_manager::ProxyManager;
-use crate::routing::Routing;
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::config::ServerEntry;
@@ -15,6 +13,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
+use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::{state as route_state, Routing};
+use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
 
@@ -123,26 +124,26 @@ impl Routing for MockRouting {
         server_ip: IpAddr,
         _gateway: IpAddr,
         interface_name: &str,
-    ) -> Result<MockRoutes, ProxyError> {
+    ) -> Result<MockRoutes, RoutingError> {
         // Match SystemRouting ordering: write the state file BEFORE
         // any mutation, so tests that assert on `bridge-routes.json`
         // see the same write-then-clear lifecycle as production.
-        let persisted = crate::route_state::RouteState {
-            version: crate::route_state::SCHEMA_VERSION,
+        let persisted = route_state::RouteState {
+            version: route_state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        crate::route_state::save(&self.state_dir, &persisted)
-            .map_err(|e| ProxyError::RouteSetup(format!("mock persist failed: {e}")))?;
+        route_state::save(&self.state_dir, &persisted)
+            .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
         Ok(MockRoutes {
             state_dir: self.state_dir.clone(),
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
+    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) {
-            return Err(ProxyError::Gateway("mock gateway failure".into()));
+            return Err(RoutingError::Gateway("mock gateway failure".into()));
         }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -159,7 +160,7 @@ struct MockRoutes {
 
 impl Drop for MockRoutes {
     fn drop(&mut self) {
-        let _ = crate::route_state::clear(&self.state_dir);
+        let _ = route_state::clear(&self.state_dir);
     }
 }
 
