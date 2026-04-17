@@ -32,6 +32,13 @@ jobs:
         shell: bash
         run: cargo install cargo-nextest --locked
 
+      # `dist_dir` fixture reads `target/debug/hole.exe`; only a real
+      # `cargo build` produces it (see ci.yaml). Nextest's --no-run
+      # builds test binaries, not the top-level hole binary.
+      - name: Build workspace (for dist-dir test fixture)
+        shell: bash
+        run: cargo build --workspace
+
       - name: Build test binaries
         shell: bash
         run: cargo nextest run --workspace --no-run
