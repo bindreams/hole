@@ -52,6 +52,10 @@ jobs:
 
           THRESHOLD = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
+          PAGE_SIZE = 100               # maximum supported by the API
+          DRY_PREVIEW_LIMIT = 20        # how many sample ids to echo in dry-run mode
+          DELETE_SPACING_S = 0.25       # ~240 deletes/min; well under GitHub's write secondary rate limit
+
           def gh_api(endpoint):
               return json.loads(subprocess.run(
                   ["gh", "api", "-X", "GET", endpoint],
@@ -62,20 +66,24 @@ jobs:
               # Py ≤3.10 doesn't accept trailing 'Z' in fromisoformat.
               return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-          def fetch_stale_page(limit=100):
-              """Return oldest-accessed entries older than THRESHOLD, up to `limit`.
-              Deleted entries drop off the next page 1 naturally, so we always
-              re-query page 1 rather than paginating with ?page=N.
+          def fetch_stale_page(page=1):
+              """Return (stale_entries, saw_non_stale_entry) for one page of the caches API.
+
+              The API returns entries sorted oldest-access first, so encountering any
+              non-stale entry on a page means we've passed the end of the stale set.
               """
               resp = gh_api(
                   f"repos/{REPO}/actions/caches"
-                  f"?per_page={limit}&sort=last_accessed_at&direction=asc"
+                  f"?per_page={PAGE_SIZE}&page={page}&sort=last_accessed_at&direction=asc"
               )
-              return [
-                  (e["id"], e["size_in_bytes"])
-                  for e in resp.get("actions_caches", [])
-                  if parse_iso(e["last_accessed_at"]) < THRESHOLD
-              ]
+              stale = []
+              saw_non_stale = False
+              for e in resp["actions_caches"]:
+                  if parse_iso(e["last_accessed_at"]) < THRESHOLD:
+                      stale.append((e["id"], e["size_in_bytes"]))
+                  else:
+                      saw_non_stale = True
+              return stale, saw_non_stale
 
           def delete_cache(cache_id):
               try:
@@ -89,13 +97,37 @@ jobs:
 
           print(f"Pruning entries last accessed before {THRESHOLD.isoformat()}")
 
-          processed = set()     # successfully handled — never retry
+          # ---- dry-run: enumerate all stale entries across pages --------------
+          # Since nothing gets deleted, page offsets stay stable and we can
+          # paginate normally. Stop as soon as a page contains a non-stale entry.
+          if DRY_RUN:
+              all_stale = []
+              page = 1
+              while True:
+                  batch, saw_non_stale = fetch_stale_page(page=page)
+                  if not batch and not saw_non_stale:
+                      break    # empty page = past the end
+                  all_stale.extend(batch)
+                  if saw_non_stale:
+                      break    # sorted ascending, so no more stale beyond this
+                  page += 1
+
+              for cache_id, size in all_stale[:DRY_PREVIEW_LIMIT]:
+                  print(f"[dry-run] would delete id={cache_id} size={size}")
+              more = f" (first {DRY_PREVIEW_LIMIT} of {len(all_stale)} shown above)" if len(all_stale) > DRY_PREVIEW_LIMIT else ""
+              print(f"[dry-run] would delete {len(all_stale)} entries{more}.")
+              sys.exit(0)
+
+          # ---- live prune: delete stale entries, re-fetching page 1 each time --
+          # As entries are deleted, they drop off the result set, so page 1 always
+          # contains the next-oldest undeleted entries. Stop when the page is empty
+          # or when a whole batch makes no progress (all-failed deletes).
+          processed = set()
           deleted = 0
           failed = 0
-          dry_preview = []
 
           while True:
-              batch = fetch_stale_page()
+              batch, _ = fetch_stale_page(page=1)
               if not batch:
                   print("no stale entries remain")
                   break
@@ -103,16 +135,7 @@ jobs:
               made_progress = False
               for cache_id, size in batch:
                   if cache_id in processed:
-                      # Shouldn't re-appear from a fresh fetch, but guard anyway.
-                      continue
-
-                  if DRY_RUN:
-                      if len(dry_preview) < 20:
-                          dry_preview.append((cache_id, size))
-                      processed.add(cache_id)
-                      made_progress = True
-                      continue
-
+                      continue    # defensive: shouldn't happen after successful delete
                   ok, err = delete_cache(cache_id)
                   if ok:
                       deleted += 1
@@ -120,24 +143,17 @@ jobs:
                       made_progress = True
                   else:
                       failed += 1
-                      # Don't mark as processed: a transient 5xx is retryable
-                      # on the next page fetch. If every entry in the next
-                      # batch fails too, we'll bail via `made_progress`.
+                      # Don't mark as processed: a transient 5xx is retryable on
+                      # the next page fetch. If every entry in the next batch
+                      # fails too, we bail via `made_progress`.
                       print(f"::warning::failed to delete cache id={cache_id}: {err or 'no stderr'}")
-
-                  # Stay under GitHub's write secondary rate limit (~300/min).
-                  time.sleep(0.25)
+                  time.sleep(DELETE_SPACING_S)
 
               if not made_progress:
                   print(f"::warning::no progress in last batch; stopping (failed={failed}, deleted={deleted})")
                   break
 
-          if DRY_RUN:
-              for cache_id, size in dry_preview:
-                  print(f"[dry-run] would delete id={cache_id} size={size}")
-              print(f"[dry-run] would have attempted to delete {len(processed)} entries (first 20 listed above).")
-          else:
-              print(f"Deleted {deleted} entries (failed: {failed}).")
+          print(f"Deleted {deleted} entries (failed: {failed}).")
 
       - name: Report post-cleanup usage
         shell: python
