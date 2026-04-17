@@ -47,34 +47,6 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      # Work around the #200 loopback flake. Theory (see
-      # bindreams/hole#200 CI runs 10-12): Windows Defender's real-time
-      # scan of freshly-staged `hole.exe` (rebuilt per DistHarness by
-      # `xtask::run_stage` via `remove_file` + `hard_link`) installs a
-      # kernel-mode WFP callout that silently drops loopback packets
-      # machine-wide for ~30 s. Exclude the directories that get churned
-      # and the processes that get spawned so the scan never fires.
-      # Runs on BOTH windows-latest (Server 2025) and windows-2022 —
-      # Phase 1 of this investigation proved the flake reproduces on
-      # Server 2022 as well, so the fingerprint is not OS-specific.
-      - name: Add Defender exclusions (#200 loopback flake workaround)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          try { $null = Get-MpPreference } catch {
-            throw "Defender not available on this runner; exclusion probe meaningless: $_"
-          }
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\target"
-          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
-          Add-MpPreference -ExclusionPath "C:\hostedtoolcache"
-          Add-MpPreference -ExclusionProcess "hole.exe"
-          Add-MpPreference -ExclusionProcess "v2ray-plugin.exe"
-          Add-MpPreference -ExclusionProcess "galoshes.exe"
-          Get-MpPreference | Select-Object ExclusionPath, ExclusionProcess | Format-List
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
