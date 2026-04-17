@@ -1,0 +1,135 @@
+name: "Probe 200"
+
+# Experimental workflow for #200 investigation.
+#
+# Runs the loopback-flake-prone tests one at a time, in a fixed order,
+# with a 5 s sleep between each, and `continue-on-error: true` so every
+# step runs regardless of earlier failures. Goal: observe whether a
+# consistent order produces a consistent pass/fail pattern, and whether
+# "once broken, stays broken" holds within a single job.
+#
+# Kept as a throwaway file — once we have the signal we need, delete
+# this workflow and re-enable the jobs in ci.yaml.
+
+on:
+  push:
+    branches: [azhukova/200]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: "Probe 200 (windows/amd64)"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Install nextest
+        shell: bash
+        run: cargo install cargo-nextest --locked
+
+      - name: Build test binaries
+        shell: bash
+        run: cargo nextest run --workspace --no-run
+
+      - name: "01 e2e_none_socks_only_roundtrip"
+        id: t01
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=e2e_none_socks_only_roundtrip)'
+      - name: "sleep 5s (after 01)"
+        shell: bash
+        run: sleep 5
+
+      - name: "02 e2e_none_full_tunnel_roundtrip"
+        id: t02
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=e2e_none_full_tunnel_roundtrip)'
+      - name: "sleep 5s (after 02)"
+        shell: bash
+        run: sleep 5
+
+      - name: "03 lifecycle_start_twice_returns_error"
+        id: t03
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=lifecycle_start_twice_returns_error)'
+      - name: "sleep 5s (after 03)"
+        shell: bash
+        run: sleep 5
+
+      - name: "04 lifecycle_stop_when_idle_is_noop"
+        id: t04
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=lifecycle_stop_when_idle_is_noop)'
+      - name: "sleep 5s (after 04)"
+        shell: bash
+        run: sleep 5
+
+      - name: "05 lifecycle_reload_changes_local_port"
+        id: t05
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=lifecycle_reload_changes_local_port)'
+      - name: "sleep 5s (after 05)"
+        shell: bash
+        run: sleep 5
+
+      - name: "06 lifecycle_state_file_absent_in_socks_only_mode"
+        id: t06
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=lifecycle_state_file_absent_in_socks_only_mode)'
+      - name: "sleep 5s (after 06)"
+        shell: bash
+        run: sleep 5
+
+      - name: "07 cipher_chacha20_ietf_poly1305_roundtrip"
+        id: t07
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=cipher_chacha20_ietf_poly1305_roundtrip)'
+      - name: "sleep 5s (after 07)"
+        shell: bash
+        run: sleep 5
+
+      - name: "08 cipher_2022_blake3_aes_256_gcm_roundtrip"
+        id: t08
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=cipher_2022_blake3_aes_256_gcm_roundtrip)'
+      - name: "sleep 5s (after 08)"
+        shell: bash
+        run: sleep 5
+
+      # Repeat t01 as a control: if it passes now when it passed at the
+      # start, the break self-heals; if it fails now when it passed at
+      # the start, "once broken stays broken" is confirmed.
+      - name: "09 e2e_none_socks_only_roundtrip (repeat for control)"
+        id: t09
+        continue-on-error: true
+        shell: bash
+        run: cargo nextest run -p hole-bridge -E 'test(=e2e_none_socks_only_roundtrip)'
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "#200 probe — test outcomes in fixed order"
+          echo "=========================================="
+          printf "%-3s %-55s %s\n" "01" "e2e_none_socks_only_roundtrip"                   "${{ steps.t01.outcome }}"
+          printf "%-3s %-55s %s\n" "02" "e2e_none_full_tunnel_roundtrip"                  "${{ steps.t02.outcome }}"
+          printf "%-3s %-55s %s\n" "03" "lifecycle_start_twice_returns_error"             "${{ steps.t03.outcome }}"
+          printf "%-3s %-55s %s\n" "04" "lifecycle_stop_when_idle_is_noop"                "${{ steps.t04.outcome }}"
+          printf "%-3s %-55s %s\n" "05" "lifecycle_reload_changes_local_port"             "${{ steps.t05.outcome }}"
+          printf "%-3s %-55s %s\n" "06" "lifecycle_state_file_absent_in_socks_only_mode"  "${{ steps.t06.outcome }}"
+          printf "%-3s %-55s %s\n" "07" "cipher_chacha20_ietf_poly1305_roundtrip"         "${{ steps.t07.outcome }}"
+          printf "%-3s %-55s %s\n" "08" "cipher_2022_blake3_aes_256_gcm_roundtrip"        "${{ steps.t08.outcome }}"
+          printf "%-3s %-55s %s\n" "09" "e2e_none_socks_only_roundtrip (repeat)"          "${{ steps.t09.outcome }}"
