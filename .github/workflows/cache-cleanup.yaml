@@ -1,0 +1,138 @@
+name: Cache cleanup
+
+on:
+  schedule:
+    # Daily at 03:15 UTC (off-peak for US/EU contributors).
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      high_watermark_pct:
+        description: "Only prune if cache usage is above this % of quota"
+        required: false
+        default: "70"
+      low_watermark_pct:
+        description: "Stop pruning once usage drops below this % of quota"
+        required: false
+        default: "50"
+      max_age_days:
+        description: "Never delete entries accessed within this many days"
+        required: false
+        default: "3"
+      dry_run:
+        description: "List what would be deleted, without deleting"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      QUOTA_BYTES: 10737418240        # 10 GiB
+      HIGH_PCT: ${{ inputs.high_watermark_pct || '70' }}
+      LOW_PCT: ${{ inputs.low_watermark_pct || '50' }}
+      MAX_AGE_DAYS: ${{ inputs.max_age_days || '3' }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - name: Gate on cache size
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          usage=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_size_in_bytes')
+          count=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_count')
+          [[ "$usage" =~ ^[0-9]+$ ]] || { echo "::error::unexpected usage value: $usage"; exit 1; }
+          [[ "$count" =~ ^[0-9]+$ ]] || { echo "::error::unexpected count value: $count"; exit 1; }
+          high=$(( QUOTA_BYTES * HIGH_PCT / 100 ))
+          low=$((  QUOTA_BYTES * LOW_PCT  / 100 ))
+          echo "usage=$usage  high=$high  low=$low  count=$count"
+          echo "low_bytes=$low" >> "$GITHUB_OUTPUT"
+          if [[ "$usage" -lt "$high" ]]; then
+            echo "below high watermark; no cleanup needed"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "above high watermark; cleanup will run"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete stale GHA cache entries (oldest-first, down to low watermark)
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          LOW_BYTES: ${{ steps.gate.outputs.low_bytes }}
+        run: |
+          set -euo pipefail
+          threshold=$(date -u -d "${MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Pruning entries last accessed before $threshold, down to $LOW_BYTES bytes total."
+
+          declare -A seen=()
+          deleted=0
+          skipped_preview=0
+
+          while : ; do
+            current=$(gh api "repos/${GH_REPO}/actions/cache/usage" --jq '.active_caches_size_in_bytes')
+            [[ "$current" =~ ^[0-9]+$ ]] || { echo "::error::bad usage: $current"; exit 1; }
+            if [[ "$current" -lt "$LOW_BYTES" ]]; then
+              echo "reached low watermark"
+              break
+            fi
+
+            mapfile -t batch < <(
+              gh api "repos/${GH_REPO}/actions/caches?per_page=100&sort=last_accessed_at&direction=asc" \
+                --jq ".actions_caches[] | select(.last_accessed_at < \"$threshold\") | .id"
+            )
+            if [[ ${#batch[@]} -eq 0 ]]; then
+              echo "no entries older than $threshold remain"
+              break
+            fi
+
+            made_progress=false
+            for id in "${batch[@]}"; do
+              if [[ -n "${seen[$id]:-}" ]]; then
+                continue
+              fi
+              seen[$id]=1
+              if [[ "$DRY_RUN" == "true" ]]; then
+                if [[ $skipped_preview -lt 20 ]]; then
+                  echo "[dry-run] would delete $id"
+                fi
+                skipped_preview=$((skipped_preview + 1))
+                made_progress=true
+                continue
+              fi
+              if gh cache delete "$id" >/dev/null 2>&1; then
+                deleted=$((deleted + 1))
+                made_progress=true
+              else
+                echo "::warning::failed to delete cache id=$id"
+              fi
+              sleep 0.25
+            done
+
+            if ! $made_progress; then
+              echo "::warning::no progress in last batch (${#batch[@]} entries all failed or already seen); stopping"
+              break
+            fi
+          done
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[dry-run] would have attempted to delete $skipped_preview entries (first 20 listed above)."
+          else
+            echo "Deleted $deleted entries."
+          fi
+
+      - name: Report post-cleanup usage
+        shell: bash
+        run: |
+          gh api "repos/${GH_REPO}/actions/cache/usage" \
+            --jq '"Remaining: \(.active_caches_count) entries, \(.active_caches_size_in_bytes / 1024 / 1024 | round) MB"'

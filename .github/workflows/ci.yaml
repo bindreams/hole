@@ -58,9 +58,11 @@ jobs:
       - name: Build workspace (for dist-dir test fixture)
         run: cargo build --workspace
 
+      - uses: cargo-bins/cargo-binstall@v1.18.1
+
       - name: Install nextest
         shell: bash
-        run: cargo install cargo-nextest --locked
+        run: cargo binstall --no-confirm cargo-nextest
 
       - name: Test
         id: test
