@@ -148,3 +148,44 @@ jobs:
           if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+
+  cache-health:
+    name: Cache health
+    runs-on: ubuntu-latest
+    needs: [lint, test, test-installer]
+    if: always()    # report even when prior jobs failed — those are the runs most likely to leak cache
+    permissions:
+      actions: read
+    steps:
+      - name: Warn if Actions cache above 80% of quota
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Mirrors the quota constant in cache-cleanup.yaml.
+          QUOTA_BYTES: "10737418240"       # 10 GiB
+          THRESHOLD_PCT: "80"
+        run: |
+          import json
+          import os
+          import subprocess
+
+          QUOTA = int(os.environ["QUOTA_BYTES"])
+          THRESHOLD_PCT = int(os.environ["THRESHOLD_PCT"])
+          resp = json.loads(subprocess.run(
+              ["gh", "api", "-X", "GET", f"repos/{os.environ['GH_REPO']}/actions/cache/usage"],
+              check=True, capture_output=True,
+          ).stdout)
+          usage = resp["active_caches_size_in_bytes"]
+          count = resp["active_caches_count"]
+          pct = usage * 100 // QUOTA
+          size_mb = usage // 1024 // 1024
+          print(f"Cache usage: {size_mb} MB across {count} entries ({pct}% of {QUOTA // 1024 // 1024} MB quota)")
+          if pct >= THRESHOLD_PCT:
+              print(
+                  f"::warning title=Actions cache filling up"
+                  f"::Cache at {pct}% of quota ({size_mb} MB, {count} entries). "
+                  f"cache-cleanup.yaml prunes stale entries nightly at 03:15 UTC; "
+                  f"manual trigger: gh workflow run cache-cleanup.yaml"
+              )
