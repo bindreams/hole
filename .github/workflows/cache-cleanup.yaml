@@ -6,16 +6,8 @@ on:
     - cron: "15 3 * * *"
   workflow_dispatch:
     inputs:
-      high-watermark-pct:
-        description: "Only prune if cache usage is above this % of quota"
-        required: false
-        default: "70"
-      low-watermark-pct:
-        description: "Stop pruning once usage drops below this % of quota"
-        required: false
-        default: "50"
       max-age-days:
-        description: "Never delete entries accessed within this many days"
+        description: "Delete cache entries not accessed within this many days"
         required: false
         default: "3"
       dry-run:
@@ -41,12 +33,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          # GitHub's per-repo Actions cache quota. Documented as 10 GiB at
-          # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy
-          # No public API exposes this number; bump manually if the plan changes.
-          QUOTA_BYTES: "10737418240"
-          HIGH_PCT: ${{ inputs['high-watermark-pct'] || '70' }}
-          LOW_PCT: ${{ inputs['low-watermark-pct'] || '50' }}
           MAX_AGE_DAYS: ${{ inputs['max-age-days'] || '3' }}
           DRY_RUN: ${{ inputs['dry-run'] || 'false' }}
         run: |
@@ -57,63 +43,41 @@ jobs:
           import time
           from datetime import datetime, timedelta, timezone
 
-          # ---- inputs --------------------------------------------------------
           REPO = os.environ["GH_REPO"]
-          QUOTA_BYTES = int(os.environ["QUOTA_BYTES"])
-          HIGH_PCT = int(os.environ["HIGH_PCT"])
-          LOW_PCT = int(os.environ["LOW_PCT"])
           MAX_AGE_DAYS = int(os.environ["MAX_AGE_DAYS"])
           DRY_RUN = os.environ["DRY_RUN"].lower() == "true"
 
-          # Validate: low must be strictly less than high, and high <= 100.
-          if not (0 <= LOW_PCT < HIGH_PCT <= 100):
-              sys.exit(f"::error::invalid watermarks: low={LOW_PCT} high={HIGH_PCT} (need 0 <= low < high <= 100)")
           if MAX_AGE_DAYS < 0:
               sys.exit(f"::error::max-age-days must be >= 0: {MAX_AGE_DAYS}")
 
-          HIGH_BYTES = QUOTA_BYTES * HIGH_PCT // 100
-          LOW_BYTES = QUOTA_BYTES * LOW_PCT // 100
           THRESHOLD = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
-          # ---- helpers -------------------------------------------------------
-          def gh(*args):
-              """Run `gh` and return its stdout as bytes. Raises CalledProcessError on failure."""
-              return subprocess.run(
-                  ["gh", *args], check=True, capture_output=True
-              ).stdout
-
-          def api_get(endpoint):
-              """GET a GitHub API endpoint and parse JSON."""
-              return json.loads(gh("api", "-X", "GET", endpoint))
-
-          def cache_usage():
-              """Return (size_bytes, entry_count) from the cache/usage endpoint."""
-              r = api_get(f"repos/{REPO}/actions/cache/usage")
-              return r["active_caches_size_in_bytes"], r["active_caches_count"]
+          def gh_api(endpoint):
+              return json.loads(subprocess.run(
+                  ["gh", "api", "-X", "GET", endpoint],
+                  check=True, capture_output=True,
+              ).stdout)
 
           def parse_iso(s):
-              """Parse an ISO-8601 timestamp from the GitHub API into a tz-aware datetime."""
-              # fromisoformat in Py 3.11+ accepts trailing 'Z'; earlier versions don't.
+              # Py ≤3.10 doesn't accept trailing 'Z' in fromisoformat.
               return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
           def fetch_stale_page(limit=100):
-              """Fetch up to `limit` oldest-accessed cache entries older than THRESHOLD.
-
-              Deleted entries naturally fall off the next page fetch, so we always
-              re-query from page 1 rather than paginating with ?page=N.
+              """Return oldest-accessed entries older than THRESHOLD, up to `limit`.
+              Deleted entries drop off the next page 1 naturally, so we always
+              re-query page 1 rather than paginating with ?page=N.
               """
-              resp = api_get(
+              resp = gh_api(
                   f"repos/{REPO}/actions/caches"
                   f"?per_page={limit}&sort=last_accessed_at&direction=asc"
               )
-              out = []
-              for e in resp.get("actions_caches", []):
-                  if parse_iso(e["last_accessed_at"]) < THRESHOLD:
-                      out.append((e["id"], e["size_in_bytes"]))
-              return out
+              return [
+                  (e["id"], e["size_in_bytes"])
+                  for e in resp.get("actions_caches", [])
+                  if parse_iso(e["last_accessed_at"]) < THRESHOLD
+              ]
 
           def delete_cache(cache_id):
-              """Try to delete a cache entry. Returns (ok, error_message_or_None)."""
               try:
                   subprocess.run(
                       ["gh", "cache", "delete", str(cache_id)],
@@ -123,41 +87,29 @@ jobs:
               except subprocess.CalledProcessError as e:
                   return False, (e.stderr or e.stdout or b"").decode(errors="replace").strip()
 
-          # ---- gate ----------------------------------------------------------
-          usage, count = cache_usage()
-          print(f"[gate] usage={usage} high={HIGH_BYTES} low={LOW_BYTES} count={count}")
-          if usage < HIGH_BYTES:
-              print("below high watermark; no cleanup needed")
-              sys.exit(0)
-          print(f"above high watermark; pruning entries accessed before {THRESHOLD.isoformat()}")
+          print(f"Pruning entries last accessed before {THRESHOLD.isoformat()}")
 
-          # ---- prune ---------------------------------------------------------
-          # Track estimated usage locally instead of re-polling cache/usage every
-          # iteration: the usage endpoint is eventually consistent and can lag
-          # real state by minutes, causing the loop to overshoot the low watermark.
-          usage_est = usage
-          processed = set()    # ids we've successfully deleted (or previewed in dry-run)
+          processed = set()     # successfully handled — never retry
           deleted = 0
           failed = 0
           dry_preview = []
 
-          while usage_est >= LOW_BYTES:
+          while True:
               batch = fetch_stale_page()
               if not batch:
-                  print(f"no entries older than {THRESHOLD.isoformat()} remain")
+                  print("no stale entries remain")
                   break
 
               made_progress = False
               for cache_id, size in batch:
                   if cache_id in processed:
-                      # Shouldn't re-appear from a fresh API fetch, but guard anyway.
+                      # Shouldn't re-appear from a fresh fetch, but guard anyway.
                       continue
 
                   if DRY_RUN:
                       if len(dry_preview) < 20:
                           dry_preview.append((cache_id, size))
                       processed.add(cache_id)
-                      usage_est -= size
                       made_progress = True
                       continue
 
@@ -165,32 +117,27 @@ jobs:
                   if ok:
                       deleted += 1
                       processed.add(cache_id)
-                      usage_est -= size
                       made_progress = True
                   else:
                       failed += 1
-                      # Don't mark as processed: a transient 5xx should be retryable
-                      # via the next page fetch. If every entry in the next batch
-                      # fails too, `made_progress` stays False and we bail.
+                      # Don't mark as processed: a transient 5xx is retryable
+                      # on the next page fetch. If every entry in the next
+                      # batch fails too, we'll bail via `made_progress`.
                       print(f"::warning::failed to delete cache id={cache_id}: {err or 'no stderr'}")
 
-                  # Stay under the ~300/min write secondary rate limit.
+                  # Stay under GitHub's write secondary rate limit (~300/min).
                   time.sleep(0.25)
-
-                  if usage_est < LOW_BYTES:
-                      break    # inner loop
 
               if not made_progress:
                   print(f"::warning::no progress in last batch; stopping (failed={failed}, deleted={deleted})")
                   break
 
-          # ---- report --------------------------------------------------------
           if DRY_RUN:
               for cache_id, size in dry_preview:
                   print(f"[dry-run] would delete id={cache_id} size={size}")
               print(f"[dry-run] would have attempted to delete {len(processed)} entries (first 20 listed above).")
           else:
-              print(f"Deleted {deleted} entries (failed: {failed}). Estimated remaining usage: {usage_est} bytes.")
+              print(f"Deleted {deleted} entries (failed: {failed}).")
 
       - name: Report post-cleanup usage
         shell: python
