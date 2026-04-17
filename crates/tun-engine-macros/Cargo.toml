@@ -2,6 +2,9 @@
 name = "tun-engine-macros"
 version = "0.1.0"
 edition = "2021"
+description = "Proc-macro support for the tun-engine crate (provides #[freeze])."
+repository = "https://github.com/bindreams/hole"
+license = "GPL-3.0-or-later"
 
 [lib]
 proc-macro = true
