@@ -6,19 +6,19 @@ on:
     - cron: "15 3 * * *"
   workflow_dispatch:
     inputs:
-      high_watermark_pct:
+      high-watermark-pct:
         description: "Only prune if cache usage is above this % of quota"
         required: false
         default: "70"
-      low_watermark_pct:
+      low-watermark-pct:
         description: "Stop pruning once usage drops below this % of quota"
         required: false
         default: "50"
-      max_age_days:
+      max-age-days:
         description: "Never delete entries accessed within this many days"
         required: false
         default: "3"
-      dry_run:
+      dry-run:
         description: "List what would be deleted, without deleting"
         type: boolean
         default: false
@@ -35,154 +35,176 @@ jobs:
   prune:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      # GitHub's per-repo Actions cache quota. Documented as 10 GiB at
-      # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy
-      # No public API exposes this number, so bump manually if the repo's plan changes.
-      QUOTA_BYTES: 10737418240        # 10 GiB
-      HIGH_PCT: ${{ inputs.high_watermark_pct || '70' }}
-      LOW_PCT: ${{ inputs.low_watermark_pct || '50' }}
-      MAX_AGE_DAYS: ${{ inputs.max_age_days || '3' }}
-      DRY_RUN: ${{ inputs.dry_run || 'false' }}
     steps:
-      - name: Validate inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$HIGH_PCT"      =~ ^[0-9]+$ ]] || { echo "::error::high_watermark_pct must be a non-negative integer: $HIGH_PCT"; exit 1; }
-          [[ "$LOW_PCT"       =~ ^[0-9]+$ ]] || { echo "::error::low_watermark_pct must be a non-negative integer: $LOW_PCT"; exit 1; }
-          [[ "$MAX_AGE_DAYS"  =~ ^[0-9]+$ ]] || { echo "::error::max_age_days must be a non-negative integer: $MAX_AGE_DAYS"; exit 1; }
-          (( LOW_PCT < HIGH_PCT )) || { echo "::error::low_watermark_pct ($LOW_PCT) must be strictly less than high_watermark_pct ($HIGH_PCT)"; exit 1; }
-          (( HIGH_PCT <= 100 ))    || { echo "::error::high_watermark_pct must be <= 100: $HIGH_PCT"; exit 1; }
-
-      - name: Gate on cache size
-        id: gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          # One API call, read both fields. Using command substitution so a `gh api`
-          # failure trips `set -e`; process substitution wouldn't.
-          resp=$(gh api "repos/${GH_REPO}/actions/cache/usage" \
-            --jq '"\(.active_caches_size_in_bytes) \(.active_caches_count)"')
-          read -r usage count <<<"$resp"
-          [[ "$usage" =~ ^[0-9]+$ ]] || { echo "::error::unexpected usage value from API: $usage"; exit 1; }
-          [[ "$count" =~ ^[0-9]+$ ]] || { echo "::error::unexpected count value from API: $count"; exit 1; }
-          high=$(( QUOTA_BYTES * HIGH_PCT / 100 ))
-          low=$((  QUOTA_BYTES * LOW_PCT  / 100 ))
-          echo "[gate] usage=$usage high=$high low=$low count=$count"
-          echo "low_bytes=$low" >> "$GITHUB_OUTPUT"
-          if [[ "$usage" -lt "$high" ]]; then
-            echo "below high watermark; no cleanup needed"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "above high watermark; cleanup will run"
-            echo "run=true"  >> "$GITHUB_OUTPUT"
-            echo "initial_usage=$usage" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Delete stale GHA cache entries (oldest-first, down to low watermark)
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
+      - name: Prune stale GHA cache entries
+        shell: python
         env:
-          LOW_BYTES: ${{ steps.gate.outputs.low_bytes }}
-          INITIAL_USAGE: ${{ steps.gate.outputs.initial_usage }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # GitHub's per-repo Actions cache quota. Documented as 10 GiB at
+          # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy
+          # No public API exposes this number; bump manually if the plan changes.
+          QUOTA_BYTES: "10737418240"
+          HIGH_PCT: ${{ inputs['high-watermark-pct'] || '70' }}
+          LOW_PCT: ${{ inputs['low-watermark-pct'] || '50' }}
+          MAX_AGE_DAYS: ${{ inputs['max-age-days'] || '3' }}
+          DRY_RUN: ${{ inputs['dry-run'] || 'false' }}
         run: |
-          set -euo pipefail
-          # Threshold as epoch seconds so lexicographic comparisons can't misbehave
-          # when GitHub's cache metadata ever gains sub-second precision.
-          threshold_epoch=$(date -u -d "${MAX_AGE_DAYS} days ago" +%s)
-          threshold_iso=$(date -u -d "@${threshold_epoch}" +%Y-%m-%dT%H:%M:%SZ)
-          echo "Pruning entries with last_accessed_at < ${threshold_iso} (epoch ${threshold_epoch}), targeting usage < ${LOW_BYTES} bytes."
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          from datetime import datetime, timedelta, timezone
 
-          # Track estimated usage locally. cache/usage is eventually consistent and
-          # can lag real state by minutes; if we trusted it exclusively, a single
-          # scheduled run could overshoot the low watermark and delete far more than
-          # intended. Subtracting each freshly-deleted entry's size_in_bytes gives
-          # a sound upper-bound estimate we can gate on.
-          usage_est=${INITIAL_USAGE}
+          # ---- inputs --------------------------------------------------------
+          REPO = os.environ["GH_REPO"]
+          QUOTA_BYTES = int(os.environ["QUOTA_BYTES"])
+          HIGH_PCT = int(os.environ["HIGH_PCT"])
+          LOW_PCT = int(os.environ["LOW_PCT"])
+          MAX_AGE_DAYS = int(os.environ["MAX_AGE_DAYS"])
+          DRY_RUN = os.environ["DRY_RUN"].lower() == "true"
 
-          # Dedup only *successful* processing; failed entries remain retryable
-          # on the next list page so a transient 5xx doesn't skip them permanently.
-          declare -A processed=()
-          deleted=0
-          failed=0
-          skipped_preview=0
+          # Validate: low must be strictly less than high, and high <= 100.
+          if not (0 <= LOW_PCT < HIGH_PCT <= 100):
+              sys.exit(f"::error::invalid watermarks: low={LOW_PCT} high={HIGH_PCT} (need 0 <= low < high <= 100)")
+          if MAX_AGE_DAYS < 0:
+              sys.exit(f"::error::max-age-days must be >= 0: {MAX_AGE_DAYS}")
 
-          while : ; do
-            if [[ "$usage_est" -lt "$LOW_BYTES" ]]; then
-              echo "reached low watermark (estimated usage $usage_est < $LOW_BYTES)"
-              break
-            fi
+          HIGH_BYTES = QUOTA_BYTES * HIGH_PCT // 100
+          LOW_BYTES = QUOTA_BYTES * LOW_PCT // 100
+          THRESHOLD = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
 
-            # Fetch next page. Capture to a temp file so `gh api` failures are
-            # detected — `mapfile < <(gh api ...)` would silently swallow errors
-            # because process-substitution failures don't trip `set -e`.
-            batch_file=$(mktemp)
-            if ! gh api "repos/${GH_REPO}/actions/caches?per_page=100&sort=last_accessed_at&direction=asc" \
-              --jq ".actions_caches[] | select((.last_accessed_at | fromdateiso8601) < ${threshold_epoch}) | \"\(.id) \(.size_in_bytes)\"" \
-              > "$batch_file"; then
-              echo "::error::gh api failed when listing caches"
-              rm -f "$batch_file"
-              exit 1
-            fi
+          # ---- helpers -------------------------------------------------------
+          def gh(*args):
+              """Run `gh` and return its stdout as bytes. Raises CalledProcessError on failure."""
+              return subprocess.run(
+                  ["gh", *args], check=True, capture_output=True
+              ).stdout
 
-            if [[ ! -s "$batch_file" ]]; then
-              echo "no entries older than ${threshold_iso} remain"
-              rm -f "$batch_file"
-              break
-            fi
+          def api_get(endpoint):
+              """GET a GitHub API endpoint and parse JSON."""
+              return json.loads(gh("api", "-X", "GET", endpoint))
 
-            made_progress=false
-            while read -r id size; do
-              [[ -n "$id" ]] || continue
-              [[ "$id"   =~ ^[0-9]+$ ]] || { echo "::error::unexpected id from API: $id"; exit 1; }
-              [[ "$size" =~ ^[0-9]+$ ]] || { echo "::error::unexpected size for id=$id: $size"; exit 1; }
-              if [[ -n "${processed[$id]:-}" ]]; then
-                continue    # already deleted in a prior iteration; shouldn't re-appear, defensive
-              fi
-              if [[ "$DRY_RUN" == "true" ]]; then
-                if [[ $skipped_preview -lt 20 ]]; then
-                  echo "[dry-run] would delete id=$id size=$size"
-                fi
-                skipped_preview=$((skipped_preview + 1))
-                processed[$id]=1
-                usage_est=$(( usage_est - size ))
-                made_progress=true
-                continue
-              fi
-              # Preserve stderr for diagnostics on failure.
-              if err=$(gh cache delete "$id" 2>&1 >/dev/null); then
-                deleted=$((deleted + 1))
-                processed[$id]=1
-                usage_est=$(( usage_est - size ))
-                made_progress=true
-              else
-                failed=$((failed + 1))
-                # Don't add to `processed`: the entry is still a deletion candidate
-                # and will re-appear on the next page fetch. If every entry in the
-                # next batch fails too, `made_progress` stays false and we bail.
-                echo "::warning::failed to delete cache id=$id: ${err:-no stderr}"
-              fi
-              sleep 0.25    # stay well under GitHub's write secondary rate limit
-            done < "$batch_file"
-            rm -f "$batch_file"
+          def cache_usage():
+              """Return (size_bytes, entry_count) from the cache/usage endpoint."""
+              r = api_get(f"repos/{REPO}/actions/cache/usage")
+              return r["active_caches_size_in_bytes"], r["active_caches_count"]
 
-            if ! $made_progress; then
-              echo "::warning::no progress in last batch; stopping (failed=$failed, deleted=$deleted)"
-              break
-            fi
-          done
+          def parse_iso(s):
+              """Parse an ISO-8601 timestamp from the GitHub API into a tz-aware datetime."""
+              # fromisoformat in Py 3.11+ accepts trailing 'Z'; earlier versions don't.
+              return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "[dry-run] would have attempted to delete $skipped_preview entries (first 20 listed above)."
-          else
-            echo "Deleted $deleted entries (failed: $failed). Estimated remaining usage: $usage_est bytes."
-          fi
+          def fetch_stale_page(limit=100):
+              """Fetch up to `limit` oldest-accessed cache entries older than THRESHOLD.
+
+              Deleted entries naturally fall off the next page fetch, so we always
+              re-query from page 1 rather than paginating with ?page=N.
+              """
+              resp = api_get(
+                  f"repos/{REPO}/actions/caches"
+                  f"?per_page={limit}&sort=last_accessed_at&direction=asc"
+              )
+              out = []
+              for e in resp.get("actions_caches", []):
+                  if parse_iso(e["last_accessed_at"]) < THRESHOLD:
+                      out.append((e["id"], e["size_in_bytes"]))
+              return out
+
+          def delete_cache(cache_id):
+              """Try to delete a cache entry. Returns (ok, error_message_or_None)."""
+              try:
+                  subprocess.run(
+                      ["gh", "cache", "delete", str(cache_id)],
+                      check=True, capture_output=True,
+                  )
+                  return True, None
+              except subprocess.CalledProcessError as e:
+                  return False, (e.stderr or e.stdout or b"").decode(errors="replace").strip()
+
+          # ---- gate ----------------------------------------------------------
+          usage, count = cache_usage()
+          print(f"[gate] usage={usage} high={HIGH_BYTES} low={LOW_BYTES} count={count}")
+          if usage < HIGH_BYTES:
+              print("below high watermark; no cleanup needed")
+              sys.exit(0)
+          print(f"above high watermark; pruning entries accessed before {THRESHOLD.isoformat()}")
+
+          # ---- prune ---------------------------------------------------------
+          # Track estimated usage locally instead of re-polling cache/usage every
+          # iteration: the usage endpoint is eventually consistent and can lag
+          # real state by minutes, causing the loop to overshoot the low watermark.
+          usage_est = usage
+          processed = set()    # ids we've successfully deleted (or previewed in dry-run)
+          deleted = 0
+          failed = 0
+          dry_preview = []
+
+          while usage_est >= LOW_BYTES:
+              batch = fetch_stale_page()
+              if not batch:
+                  print(f"no entries older than {THRESHOLD.isoformat()} remain")
+                  break
+
+              made_progress = False
+              for cache_id, size in batch:
+                  if cache_id in processed:
+                      # Shouldn't re-appear from a fresh API fetch, but guard anyway.
+                      continue
+
+                  if DRY_RUN:
+                      if len(dry_preview) < 20:
+                          dry_preview.append((cache_id, size))
+                      processed.add(cache_id)
+                      usage_est -= size
+                      made_progress = True
+                      continue
+
+                  ok, err = delete_cache(cache_id)
+                  if ok:
+                      deleted += 1
+                      processed.add(cache_id)
+                      usage_est -= size
+                      made_progress = True
+                  else:
+                      failed += 1
+                      # Don't mark as processed: a transient 5xx should be retryable
+                      # via the next page fetch. If every entry in the next batch
+                      # fails too, `made_progress` stays False and we bail.
+                      print(f"::warning::failed to delete cache id={cache_id}: {err or 'no stderr'}")
+
+                  # Stay under the ~300/min write secondary rate limit.
+                  time.sleep(0.25)
+
+                  if usage_est < LOW_BYTES:
+                      break    # inner loop
+
+              if not made_progress:
+                  print(f"::warning::no progress in last batch; stopping (failed={failed}, deleted={deleted})")
+                  break
+
+          # ---- report --------------------------------------------------------
+          if DRY_RUN:
+              for cache_id, size in dry_preview:
+                  print(f"[dry-run] would delete id={cache_id} size={size}")
+              print(f"[dry-run] would have attempted to delete {len(processed)} entries (first 20 listed above).")
+          else:
+              print(f"Deleted {deleted} entries (failed: {failed}). Estimated remaining usage: {usage_est} bytes.")
 
       - name: Report post-cleanup usage
-        shell: bash
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh api "repos/${GH_REPO}/actions/cache/usage" \
-            --jq '"Remaining: \(.active_caches_count) entries, \(.active_caches_size_in_bytes / 1024 / 1024 | round) MB"'
+          import json
+          import os
+          import subprocess
+
+          resp = json.loads(subprocess.run(
+              ["gh", "api", "-X", "GET", f"repos/{os.environ['GH_REPO']}/actions/cache/usage"],
+              check=True, capture_output=True,
+          ).stdout)
+          size_mb = round(resp["active_caches_size_in_bytes"] / 1024 / 1024)
+          print(f"Remaining: {resp['active_caches_count']} entries, {size_mb} MB")

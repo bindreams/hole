@@ -62,7 +62,13 @@ jobs:
 
       - name: Install nextest
         shell: bash
-        run: cargo binstall --no-confirm cargo-nextest
+        env:
+          # Authenticated GitHub API has a 5000 req/h limit; without this,
+          # binstall can hit the 60 req/h unauthenticated limit and fall
+          # back to `cargo install`, which fails because nextest's
+          # `locked-tripwire` crate requires --locked.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall --no-confirm --locked cargo-nextest
 
       - name: Test
         id: test
