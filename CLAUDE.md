@@ -14,7 +14,7 @@ GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows
 
 ### Bridge test-isolation contract
 
-All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` and `Routing` traits in `crates/bridge/src/`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in `clippy.toml` via the `disallowed_methods` list. See `crates/bridge/src/proxy.rs` and `crates/bridge/src/routing.rs` for trait contracts, and bindreams/hole#165 for the incident that motivated the rule.
+All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
 
 ### Spawn-retry architecture (file-contention diagnostics)
 
@@ -73,15 +73,18 @@ equivalent cleanup from outside (plugin reaping by name as a last resort).
 ## Workspace layout
 
 ```
-crates/common/   → hole-common (shared types: protocol, config, import)
-crates/bridge/   → hole-bridge (bridge library, no binary)
-crates/hole/     → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
-xtask/           → workspace task runner (`cargo xtask <stage|deps|version|...>`)
-xtask-lib/       → shared helper crate used by xtask AND crates/hole/build.rs
-external/        → Third-party source (git subrepos)
-msi-installer/   → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
-scripts/         → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
-ui/              → Frontend HTML/CSS/TypeScript (Vite)
+crates/common/            → hole-common (shared types: protocol, config, import)
+crates/bridge/            → hole-bridge (bridge library, no binary)
+crates/hole/              → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
+crates/tun-engine/        → general-purpose TUN + routing + packet-loop engine
+                            (consumed by hole-bridge; intended for standalone reuse)
+crates/tun-engine-macros/ → proc-macro support crate for tun-engine (`#[freeze]`)
+xtask/                    → workspace task runner (`cargo xtask <stage|deps|version|...>`)
+xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
+external/                 → Third-party source (git subrepos)
+msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
+scripts/                  → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
+ui/                       → Frontend HTML/CSS/TypeScript (Vite)
 ```
 
 Build orchestration is owned by `xtask/`. The canonical list of files that

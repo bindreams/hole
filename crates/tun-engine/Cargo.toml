@@ -2,6 +2,15 @@
 name = "tun-engine"
 version = "0.1.0"
 edition = "2021"
+description = "Cross-platform TUN device, OS routing, gateway discovery, and a smoltcp-backed packet-loop engine for building split-tunnel VPN/proxy daemons."
+readme = "README.md"
+repository = "https://github.com/bindreams/hole"
+license = "GPL-3.0-or-later"
+keywords = ["tun", "tun2socks", "vpn", "smoltcp", "routing"]
+categories = ["network-programming"]
+# Not yet published; this crate is currently consumed path-locally by
+# `hole-bridge`. When publishing to crates.io, strip the `path = "..."`
+# from `tun-engine-macros` below.
 
 [lints]
 workspace = true
