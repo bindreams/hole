@@ -26,8 +26,8 @@ static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// State directory override set by the CLI before service dispatch.
 static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// Log directory override set by the CLI before service dispatch.
-/// Used by `netsh trace` ETL to land the capture file alongside
-/// `bridge.log` in the same directory.
+/// Used by diagnostic artefacts to land alongside `bridge.log` in the
+/// same directory.
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).

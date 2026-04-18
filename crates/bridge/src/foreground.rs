@@ -15,11 +15,9 @@ use crate::proxy_manager::ProxyManager;
 /// `bridge grant-access` orchestration. Requires elevation for TUN +
 /// routing.
 ///
-/// `log_dir` is used as the destination for diagnostic artefacts (e.g.
-/// the `netsh trace` ETL on Windows). It is the same directory that the
-/// global tracing subscriber writes `bridge.log` into — so all
-/// bridge-owned files land in one place and the CI artifact-upload step
-/// can glob for them.
+/// `log_dir` is the same directory that the global tracing subscriber
+/// writes `bridge.log` into — so all bridge-owned files land in one
+/// place and the CI artifact-upload step can glob for them.
 pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_inner(socket_path, state_dir, log_dir))
