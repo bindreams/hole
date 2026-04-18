@@ -8,8 +8,6 @@ on:
 
 jobs:
   lint:
-    # TEMP: disabled on azhukova/200 for #200 probe (see probe-200.yaml).
-    if: github.head_ref != 'azhukova/200' && github.ref != 'refs/heads/azhukova/200'
     name: Lint
     runs-on: windows-latest
     timeout-minutes: 15
@@ -32,8 +30,6 @@ jobs:
         run: prek run --all-files --show-diff-on-failure
 
   test:
-    # TEMP: disabled on azhukova/200 for #200 probe (see probe-200.yaml).
-    if: github.head_ref != 'azhukova/200' && github.ref != 'refs/heads/azhukova/200'
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -67,9 +63,29 @@ jobs:
         shell: bash
         run: cargo install cargo-nextest --locked
 
-      - name: Test
-        id: test
+      # Two-pass split to work around #200: the Windows TUN test
+      # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
+      # `hole-tun` wintun adapter, which perturbs the Azure Hyper-V
+      # host's NDIS loopback packet-delivery path — once broken, it
+      # stays broken for ≥120 s. So we run non-TUN tests first and
+      # the TUN test last, so the break (if it fires) only affects
+      # the tail of the job and not a subsequent loopback-using test.
+      # Skuld's `SKULD_LABELS` env var does the filtering; see
+      # `crates/bridge/src/test_support/skuld_fixtures.rs` for the
+      # `TUN` label definition.
+      - name: Test (non-TUN)
+        id: test-non-tun
         shell: bash
+        env:
+          SKULD_LABELS: "!tun"
+        run: cargo nextest run --workspace
+
+      - name: Test (TUN, runs last for #200)
+        id: test-tun
+        if: matrix.os == 'windows'
+        shell: bash
+        env:
+          SKULD_LABELS: "tun"
         run: cargo nextest run --workspace
 
       # #200 diagnostics: upload bridge.log and netsh-trace.etl produced
@@ -78,7 +94,7 @@ jobs:
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       # Windows-only: the ETL capture is a no-op on macOS.
       - name: Upload bridge logs on test failure
-        if: failure() && steps.test.outcome == 'failure'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
@@ -90,8 +106,6 @@ jobs:
 
 
   test-installer:
-    # TEMP: disabled on azhukova/200 for #200 probe (see probe-200.yaml).
-    if: github.head_ref != 'azhukova/200' && github.ref != 'refs/heads/azhukova/200'
     name: Test installer (windows/amd64)
     runs-on: windows-latest
     timeout-minutes: 20
