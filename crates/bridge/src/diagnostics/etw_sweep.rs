@@ -1,14 +1,11 @@
-//! Shared stale-ETW-session sweep used by both
-//! [`crate::diagnostics::etw`] and
-//! [`crate::diagnostics::netsh_trace`].
+//! Stale-ETW-session sweep used by [`crate::diagnostics::etw`].
 //!
-//! Both modules need the same Win32 `QueryAllTracesW` +
-//! `ControlTraceW(STOP)` dance to clean up orphaned sessions left by a
-//! crashed prior bridge run. The only per-caller difference is the
-//! session-name prefix and a short log-target string to distinguish
-//! output in `bridge.log`. Duplicating 80 lines of unsafe Win32 ETW
-//! plumbing once per module would be a DRY violation flagged by the
-//! project's CLAUDE.md; this helper centralises the unsafe block.
+//! `QueryAllTracesW` + `ControlTraceW(STOP)` dance to clean up
+//! orphaned sessions left by a crashed prior bridge run. Factored
+//! into a helper to centralise the unsafe Win32 block; the
+//! session-name prefix and short log-target string are supplied by
+//! the caller so bridge.log output distinguishes which subsystem
+//! swept.
 
 use tracing::{debug, info, warn};
 
@@ -16,11 +13,11 @@ use tracing::{debug, info, warn};
 /// whose name starts with `prefix`. Best-effort: any failure is logged
 /// via the provided `log_target` at `warn!`, never panics.
 ///
-/// `log_target` is a short string (e.g. `"etw"`, `"netsh-trace"`) that
-/// prefixes emitted log messages so operators can distinguish which
-/// subsystem is sweeping. It's concatenated with a literal message via
-/// `format!` because `tracing`'s `target:` attribute must be a `'static`
-/// string literal and we want caller-supplied dynamic context.
+/// `log_target` is a short string (e.g. `"etw"`) that prefixes emitted
+/// log messages so operators can distinguish which subsystem is
+/// sweeping. It's concatenated with a literal message via `format!`
+/// because `tracing`'s `target:` attribute must be a `'static` string
+/// literal and we want caller-supplied dynamic context.
 pub(crate) fn sweep_sessions_with_prefix(prefix: &str, log_target: &str) {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Diagnostics::Etw::{

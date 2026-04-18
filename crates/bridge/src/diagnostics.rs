@@ -25,8 +25,6 @@ pub mod etw_sweep;
 #[cfg(target_os = "windows")]
 pub mod ndis;
 #[cfg(target_os = "windows")]
-pub mod netsh_trace;
-#[cfg(target_os = "windows")]
 pub mod wfp;
 
 /// Case-insensitive substrings used across probes to flag residue from

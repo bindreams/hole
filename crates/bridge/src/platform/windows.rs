@@ -140,23 +140,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Packet-level `netsh trace` capture, scoped to the service's
-        // run lifetime. Dropped alongside `_etw_guard`. ETL lands under
-        // the CLI-provided log_dir (falls back to the default log dir
-        // if the CLI did not pass one — defensive against a future
-        // service-dispatch path that forgets to set `LOG_DIR_OVERRIDE`).
-        let log_dir = LOG_DIR_OVERRIDE
-            .get()
-            .cloned()
-            .unwrap_or_else(hole_common::logging::default_log_dir);
-        let _netsh_trace_guard = match crate::diagnostics::netsh_trace::start(&log_dir) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                tracing::error!(error = %e, "netsh trace capture failed to start");
-                None
-            }
-        };
-
         tokio::select! {
             result = server.run() => {
                 if let Err(e) = result {

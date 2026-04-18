@@ -376,9 +376,8 @@ fn rand_suffix() -> String {
 /// GHA's `$RUNNER_TEMP` resolves to `D:\a\_temp`, and the
 /// `actions/upload-artifact` step's `path:` glob can only reach files
 /// under `$RUNNER_TEMP`. Without this redirect, CI cannot pick up
-/// `bridge.log` or `netsh-trace.etl` for forensic download after a
-/// flaked test, which is the whole point of the Commit E artifact
-/// upload in PR #207.
+/// `bridge.log` for forensic download after a flaked test, which is
+/// the whole point of the artifact-upload step in ci.yaml.
 ///
 /// Fail-loud on misconfigured CI: if `RUNNER_TEMP` is set but does not
 /// point at an existing directory, that's a runner bug that must be
@@ -409,8 +408,8 @@ fn new_tempdir() -> std::io::Result<TempDir> {
         // the glob sees normally.
         let mut td = tempfile::Builder::new().prefix("hole-e2e-").tempdir_in(base)?;
         // CI: disable cleanup so the upload-artifact step still sees
-        // bridge.log and netsh-trace.etl after DistHarness drops. The
-        // GHA runner is ephemeral — nothing to clean up from our side.
+        // bridge.log after DistHarness drops. The GHA runner is
+        // ephemeral — nothing to clean up from our side.
         td.disable_cleanup(true);
         return Ok(td);
     }

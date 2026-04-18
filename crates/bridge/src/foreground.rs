@@ -76,20 +76,7 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
         }
     };
 
-    // Start the netsh-trace ETL capture (packet-level wire capture
-    // scoped to this process). Dropped alongside `_etw_guard`. Requires
-    // admin elevation — in CI the bridge child inherits the runneradmin
-    // token; on local dev without elevation this fails and we continue.
-    #[cfg(target_os = "windows")]
-    let _netsh_trace_guard = match crate::diagnostics::netsh_trace::start(log_dir) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            tracing::error!(error = %e, "netsh trace capture failed to start");
-            None
-        }
-    };
-    #[cfg(not(target_os = "windows"))]
-    let _ = log_dir; // suppress unused warning on non-Windows builds
+    let _ = log_dir; // currently unused — reserved for future diagnostics
 
     tokio::select! {
         result = server.run() => {
