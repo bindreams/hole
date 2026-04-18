@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -70,10 +71,42 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      - name: Test
-        id: test
+      # Two-pass split to work around #200: the Windows TUN test
+      # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
+      # `hole-tun` wintun adapter, which perturbs the Azure Hyper-V
+      # host's NDIS loopback packet-delivery path — once broken, it
+      # stays broken for ≥120 s. So we run non-TUN tests first and
+      # the TUN test last, so the break (if it fires) only affects
+      # the tail of the job and not a subsequent loopback-using test.
+      # Skuld's `SKULD_LABELS` env var does the filtering; see
+      # `crates/bridge/src/test_support/skuld_fixtures.rs` for the
+      # `TUN` label definition.
+      - name: Test (non-TUN)
+        id: test-non-tun
         shell: bash
+        env:
+          SKULD_LABELS: "!tun"
         run: cargo nextest run --workspace
+
+      - name: Test (TUN, runs last for #200)
+        id: test-tun
+        if: matrix.os == 'windows'
+        shell: bash
+        env:
+          SKULD_LABELS: "tun"
+        run: cargo nextest run --workspace
+
+      # Upload bridge.log produced by `DistHarness` subprocesses. Matches
+      # files that the test harness redirected to `$RUNNER_TEMP` (see
+      # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
+      - name: Upload bridge logs on test failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/**/bridge.log
+          if-no-files-found: ignore
+          retention-days: 14
 
 
   test-installer:

@@ -25,14 +25,19 @@ pub const SERVICE_DESCRIPTION: &str = "Transparent proxy bridge for the Hole app
 static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// State directory override set by the CLI before service dispatch.
 static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+/// Log directory override set by the CLI before service dispatch.
+/// Used by diagnostic artefacts to land alongside `bridge.log` in the
+/// same directory.
+static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), windows_service::Error> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
     }
     STATE_DIR_OVERRIDE.set(state_dir.to_owned()).ok();
+    LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -115,6 +120,25 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         {
             tracing::warn!(error = %e, "recover_plugins task panicked");
         }
+
+        // Capture WFP + NDIS state after recovery. See #200 and
+        // `diagnostics::{wfp,ndis}`.
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+        }
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::ndis::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "ndis startup snapshot task panicked");
+        }
+
+        // Always-on ETW consumer. Held for the service's run lifetime;
+        // Drop stops the session and joins the processing thread.
+        let _etw_guard = match crate::diagnostics::etw::start_consumer() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::error!(error = %e, "etw consumer failed to start");
+                None
+            }
+        };
 
         tokio::select! {
             result = server.run() => {

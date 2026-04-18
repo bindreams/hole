@@ -98,21 +98,31 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
         ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
         info!(phase, cmd = cmd.join(" "), "running route command");
         let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let exit_code = output.status.code().unwrap_or(-1);
-            if recovery {
-                debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-                       "recovery command failed (expected if no leaked routes)");
-            } else {
-                // Post-#165: unit tests no longer invoke this path, so any
-                // `warn!` fired here is a real production teardown failure —
-                // not a benign test-time artifact. Framing matters: the old
-                // message trained investigators to dismiss it. See the
-                // #165 incident report.
-                warn!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-                      "route command failed — investigate if this is not a no-op idempotent teardown");
-            }
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            // Success log at debug level. Kept out of info to avoid
+            // drowning the per-run log in route noise, but visible when
+            // #200-style investigations turn on hole_bridge=debug.
+            // stdout/stderr included because netsh sometimes prints a
+            // non-empty stdout on success (e.g. "Ok.") that is still
+            // worth having in the trace.
+            debug!(phase, cmd = cmd.join(" "), exit_code,
+                   stdout = %stdout.trim(), stderr = %stderr.trim(),
+                   "route command succeeded");
+        } else if recovery {
+            debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
+                   "recovery command failed (expected if no leaked routes)");
+        } else {
+            // Post-#165: unit tests no longer invoke this path, so any
+            // `warn!` fired here is a real production teardown failure —
+            // not a benign test-time artifact. Framing matters: the old
+            // message trained investigators to dismiss it. See the
+            // #165 incident report.
+            warn!(phase, cmd = cmd.join(" "), exit_code,
+                  stdout = %stdout.trim(), stderr = %stderr.trim(),
+                  "route command failed — investigate if this is not a no-op idempotent teardown");
         }
     }
     Ok(())
@@ -324,6 +334,14 @@ pub struct SystemRoutes {
 
 impl Drop for SystemRoutes {
     fn drop(&mut self) {
+        // Unconditional entry log so we can prove this Drop actually ran
+        // on Stop (#200 T2 hypothesis: teardown skipped entirely).
+        info!(
+            tun = %self.tun_name,
+            server_ip = %self.server_ip,
+            iface = %self.interface_name,
+            "SystemRoutes::drop entered — tearing down routes"
+        );
         #[allow(clippy::disallowed_methods)] // SystemRoutes IS Routing::Installed
         if let Err(e) = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name) {
             warn!(error = %e, "route teardown failed in SystemRoutes::drop");
@@ -336,6 +354,11 @@ impl Drop for SystemRoutes {
         if let Err(e) = state::clear(&self.state_dir) {
             warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
         }
+        // Note: WFP/NDIS post-teardown snapshots live in bridge's Stop
+        // path, not here — tun-engine can't depend on the bridge's
+        // diagnostics module.
+
+        info!("SystemRoutes::drop completed");
     }
 }
 

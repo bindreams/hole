@@ -14,12 +14,16 @@ use crate::proxy_manager::ProxyManager;
 /// dev exercises the real DACL/group/SDDL code — see the `dev.py` /
 /// `bridge grant-access` orchestration. Requires elevation for TUN +
 /// routing.
-pub fn run(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `log_dir` is the same directory that the global tracing subscriber
+/// writes `bridge.log` into — so all bridge-owned files land in one
+/// place and the CI artifact-upload step can glob for them.
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir))
+    rt.block_on(run_inner(socket_path, state_dir, log_dir))
 }
 
-async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
             .with_state_dir(state_dir.to_path_buf()),
@@ -43,6 +47,34 @@ async fn run_inner(socket_path: &Path, state_dir: &Path) -> Result<(), Box<dyn s
     {
         tracing::warn!(error = %e, "recover_plugins task panicked");
     }
+
+    // Capture WFP + NDIS state after recovery has had a chance to clean
+    // up. Each probe emits a one-line INFO (always) + WARN on anomaly +
+    // DEBUG detail (gated). See #200.
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "wfp startup snapshot task panicked");
+        }
+        if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::ndis::log_snapshot("startup")).await {
+            tracing::warn!(error = %e, "ndis startup snapshot task panicked");
+        }
+    }
+
+    // Start the always-on ETW consumer. Held for the server's lifetime;
+    // Drop stops the session and joins the processing thread. Failure
+    // logs at error (not warn) — a silent ETW-broken customer machine
+    // is the opposite of the diagnostic goal. See diagnostics::etw.
+    #[cfg(target_os = "windows")]
+    let _etw_guard = match crate::diagnostics::etw::start_consumer() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::error!(error = %e, "etw consumer failed to start");
+            None
+        }
+    };
+
+    let _ = log_dir; // currently unused — reserved for future diagnostics
 
     tokio::select! {
         result = server.run() => {

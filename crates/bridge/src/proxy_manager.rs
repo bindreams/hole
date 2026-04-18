@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{Routing, SystemRouting};
 
@@ -205,6 +205,14 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         config: &ProxyConfig,
         cancel: CancellationToken,
     ) -> Result<(), ProxyError> {
+        debug!(
+            local_port = config.local_port,
+            tunnel_mode = ?config.tunnel_mode,
+            plugin = ?config.server.plugin,
+            server_host = %config.server.server,
+            server_port = config.server.server_port,
+            "ProxyManager::start_cancellable entered"
+        );
         if self.running.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
@@ -214,6 +222,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // touch `self`, so dropping the future leaves `self` untouched.
         // All partial state is owned by the locally-constructed RAII
         // types inside start_inner and cleans up on drop.
+        debug!("awaiting start_inner");
         let result: Result<RunningState<P, R>, ProxyError> = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ProxyError::Cancelled),
@@ -232,6 +241,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 self.active_config = Some(config.clone());
                 self.last_error = None;
                 info!(server_ip = ?server_ip, "proxy started");
+                debug!(local_port = config.local_port, "proxy started (debug)");
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
@@ -266,6 +276,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
     ) -> Result<RunningState<P, R>, ProxyError> {
+        debug!("start_inner entered");
         // Start plugin chain via Garter if a plugin is configured.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
@@ -293,7 +304,46 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // local instance, so `shadowsocks-service::local::Server::new` will
         // only bind the SOCKS5 listener.
         if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
+            debug!(local_count = ss_config.local.len(), "calling proxy.start");
             let running_proxy = proxy.start(ss_config).await?;
+            debug!("proxy.start returned Ok");
+
+            // In-bridge SOCKS5 loopback self-test (#200 H2 vs H3 disambiguation).
+            // When the test harness sets `HOLE_BRIDGE_SELF_TEST`, spawn a task
+            // that connects to our own SOCKS5 port from inside the bridge.
+            // Compare with the test process's external connect outcome:
+            //   self-OK + ext-OK            → no bug
+            //   self-OK + ext-WSAETIMEDOUT  → cross-process loopback broken (H2)
+            //   self-WSAETIMEDOUT           → listener broken (H1/H3)
+            //   self-ECONNREFUSED           → listener never opened (H3)
+            // No pre-sleep: Server::new().await has already done bind+listen
+            // so the kernel queues SYNs into the backlog regardless of whether
+            // user-space accept() has been called. Any failure IS the signal.
+            if std::env::var_os("HOLE_BRIDGE_SELF_TEST").is_some() {
+                let port = config.local_port;
+                tokio::spawn(async move {
+                    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+                    let started = std::time::Instant::now();
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                        .await
+                    {
+                        Ok(Ok(_stream)) => info!(
+                            port,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "in-bridge self-test connect OK"
+                        ),
+                        Ok(Err(e)) => error!(
+                            port,
+                            error = %e,
+                            os_code = ?e.raw_os_error(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "in-bridge self-test connect failed"
+                        ),
+                        Err(_) => error!(port, "in-bridge self-test connect timed out after 5s"),
+                    }
+                });
+            }
+
             return Ok(RunningState {
                 dispatcher: None,
                 plugin_chain,
@@ -396,6 +446,17 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // 4. Routes tear down via RAII Drop.
         drop(routes);
 
+        // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
+        // related references remain in either layer. Cheap and
+        // log-visible on user machines so bug reports carry the verdict
+        // without needing debug mode. Bridge owns the diagnostics
+        // module; tun-engine's SystemRoutes::drop can't call these.
+        #[cfg(target_os = "windows")]
+        {
+            crate::diagnostics::wfp::log_snapshot("post-teardown");
+            crate::diagnostics::ndis::log_snapshot("post-teardown");
+        }
+
         // Clear any error from a previous failed start. See issue #142.
         self.last_error = None;
         self.active_config = None;
@@ -491,10 +552,28 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E tests skipped in CI:
-// - macOS: internal port race in shadowsocks-service PluginConfig (#197)
-// - Windows: DistHarness SOCKS5 connections time out with WSAETIMEDOUT (#200)
-// Re-enable when #197 is fixed (custom server-side galoshes launcher).
-#[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
+// E2E test skip policy in CI:
+//
+// - **macOS**: the entire module is skipped. The galoshes test set
+//   reliably hits #197 (internal port race in shadowsocks-service's
+//   `PluginConfig`). The non-galoshes tests work but the coverage
+//   uplift from running them in isolation on macOS wasn't judged worth
+//   the module-level complexity — re-enable the module when #197 has
+//   a custom server-side launcher.
+//
+// - **Windows**: the module runs, but the *galoshes* tests inside are
+//   individually `#[cfg(not(target_os = "windows"))]`-gated because the
+//   same #197 race fires here too. Everything else (the `ssserver_none`
+//   + cipher roundtrips that were the #200 canonical repro) runs and
+//   stays green. The `#[cfg]` gating lives in
+//   `proxy_manager_e2e_tests.rs` next to each affected test so the
+//   skip reason is co-located with the test.
+//
+// - **Linux**: the module runs fully. Linux CI is the only platform
+//   where the full galoshes matrix is exercised.
+//
+// See #200 (H7 TCPIP investigation, now dormant with `diagnostics::etw`
+// permanently on) and #197 (galoshes bind race, still open).
+#[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
