@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+cargo_metadata = "0.19"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
 xtask-lib = { path = "../xtask-lib" }

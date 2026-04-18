@@ -1,9 +1,11 @@
 // Foreground bridge runner for development.
 
+use std::path::Path;
+
+use tun_engine::routing::{self, SystemRouting};
+
 use crate::proxy::ShadowsocksProxy;
 use crate::proxy_manager::ProxyManager;
-use crate::routing::SystemRouting;
-use std::path::Path;
 
 /// Run the bridge in foreground mode (for development).
 ///
@@ -38,7 +40,7 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
     // command cannot wedge the runtime while the IPC socket is bound but
     // not yet serving.
     let state_dir_routes = state_dir.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_routes)).await {
+    if let Err(e) = tokio::task::spawn_blocking(move || routing::recover_routes(&state_dir_routes)).await {
         tracing::warn!(error = %e, "recover_routes task panicked");
     }
     let state_dir_plugins = state_dir.to_path_buf();

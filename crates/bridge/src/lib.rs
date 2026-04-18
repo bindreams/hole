@@ -2,8 +2,8 @@ pub mod diagnostics;
 pub mod dispatcher;
 pub mod filter;
 pub mod foreground;
-pub mod gateway;
 pub mod group;
+pub mod hole_router;
 pub mod ipc;
 pub mod logging;
 pub mod platform;
@@ -11,12 +11,9 @@ pub mod plugin_recovery;
 pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;
-pub mod route_state;
-pub mod routing;
+pub mod retry;
 pub mod server_test;
 pub mod socket;
-#[cfg(target_os = "windows")]
-pub mod wintun;
 
 // Cross-cutting test helpers. Deviates from the sibling `foo_tests.rs`
 // convention used everywhere else in this crate because there is no

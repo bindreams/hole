@@ -14,7 +14,17 @@ GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows
 
 ### Bridge test-isolation contract
 
-All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` and `Routing` traits in `crates/bridge/src/`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in `clippy.toml` via the `disallowed_methods` list. See `crates/bridge/src/proxy.rs` and `crates/bridge/src/routing.rs` for trait contracts, and bindreams/hole#165 for the incident that motivated the rule.
+All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
+
+### Spawn-retry architecture (file-contention diagnostics)
+
+Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:
+
+1. **`handle-holders` workspace crate** — pure query API: `find_holders(&Path)` returns every process currently holding the file, `log_holders(&Path)` logs them at `tracing::error!`. Windows uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` with a non-blocking `GetFileType == FILE_TYPE_DISK` pre-filter to avoid pipe/device hangs, then `DuplicateHandle` + `GetFileInformationByHandle` for file-id comparison. macOS shells out to `lsof -F pc`. Best-effort — never introduces a new failure mode.
+1. **`hole_bridge::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
+1. **`hole_bridge::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
+
+`DistHarness::spawn` composes them: `retry_if(|| cmd.spawn(), is_file_contention, 3, 500ms)`, and on terminal failure calls `handle_holders::log_holders(&hole_exe)` before propagating. See bindreams/hole#208 for the incident that motivated this.
 
 ### CLI
 
@@ -72,15 +82,18 @@ resort; ETW sessions are best-effort via `logman stop` from the shell).
 ## Workspace layout
 
 ```
-crates/common/   → hole-common (shared types: protocol, config, import)
-crates/bridge/   → hole-bridge (bridge library, no binary)
-crates/hole/     → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
-xtask/           → workspace task runner (`cargo xtask <stage|deps|version|...>`)
-xtask-lib/       → shared helper crate used by xtask AND crates/hole/build.rs
-external/        → Third-party source (git subrepos)
-msi-installer/   → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
-scripts/         → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
-ui/              → Frontend HTML/CSS/TypeScript (Vite)
+crates/common/            → hole-common (shared types: protocol, config, import)
+crates/bridge/            → hole-bridge (bridge library, no binary)
+crates/hole/              → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
+crates/tun-engine/        → general-purpose TUN + routing + packet-loop engine
+                            (consumed by hole-bridge; intended for standalone reuse)
+crates/tun-engine-macros/ → proc-macro support crate for tun-engine (`#[freeze]`)
+xtask/                    → workspace task runner (`cargo xtask <stage|deps|version|...>`)
+xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
+external/                 → Third-party source (git subrepos)
+msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
+scripts/                  → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
+ui/                       → Frontend HTML/CSS/TypeScript (Vite)
 ```
 
 Build orchestration is owned by `xtask/`. The canonical list of files that
@@ -90,6 +103,14 @@ go into the runnable BINDIR (next to `hole.exe`) lives in
 Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download) lives
 in `cargo xtask deps`. `crates/hole/build.rs` is restricted to compile-time
 metadata (icon generation, git version via `xtask-lib::version`).
+
+`cargo xtask stage --with-tests --tests-out-dir <dir>` additionally stages
+workspace test binaries at stable paths (`<dir>/{crate}.test.exe`) so Windows
+Firewall can cache consent across rebuilds (bindreams/hole#210). Convention:
+`<dir>` is the sibling of `--out-dir` (e.g. `target/debug/dist/tests`). When
+two cargo targets share a name (e.g. the `hole` crate's lib and bin), the
+staged name is disambiguated to `{crate}-{kind}.test.exe`
+(`hole-lib.test.exe` + `hole-bin.test.exe`).
 
 ## Build
 

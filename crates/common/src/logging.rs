@@ -449,11 +449,15 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
         !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
     });
 
-    let file_layer = tracing_subscriber::fmt::layer().with_writer(file_nb).with_ansi(false);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_nb)
+        .with_ansi(false)
+        .event_format(yaml_format::YamlFormat);
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(stderr_nb)
         .with_ansi(true)
+        .event_format(yaml_format::YamlFormat)
         .with_filter(no_relay);
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -545,10 +549,10 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
         && b[9].is_ascii_digit()
 }
 
+pub(crate) mod yaml_format;
+
 #[cfg(test)]
-#[path = "logging_tests.rs"]
 pub(crate) mod logging_tests;
 
 #[cfg(test)]
-#[path = "logging_test_helpers.rs"]
 pub(crate) mod logging_test_helpers;

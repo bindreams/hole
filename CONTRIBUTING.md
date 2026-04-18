@@ -157,9 +157,28 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 cargo test --workspace
 ```
 
+### Avoiding Windows Firewall prompts on every rebuild
+
+Bridge tests bind a TCP listener on all interfaces (for TUN routing), so Windows Firewall prompts for "allow access to local networks" when the test binary starts. Cargo names test binaries `target/debug/deps/hole_bridge-{hash}.exe` with a content-hash suffix that churns on every rebuild, so Firewall never caches consent. On a fullscreen-capable setup the prompt also closes fullscreen apps.
+
+To approve once and never again:
+
+```sh
+cargo xtask stage --with-tests \
+    --out-dir target/debug/dist/bin \
+    --tests-out-dir target/debug/dist/tests
+./target/debug/dist/tests/hole_bridge.test.exe   # approve the prompt once
+```
+
+Test execution may report failures on that first run — individual tests aren't the point here. The goal is simply for `hole_bridge.test.exe` to bind its socket so Windows Firewall shows the prompt against a path that won't churn.
+
+Subsequent `cargo xtask stage --with-tests` runs reuse the same stable path, so Firewall consent persists. Re-run the staging command after each source change — the staged binary does not update automatically. When two cargo targets share a name (e.g. the `hole` crate's lib and bin), dest names get disambiguated to `hole-lib.test.exe` / `hole-bin.test.exe`. See bindreams/hole#210.
+
 ### Investigating Windows CI flakes
 
 When Windows CI fails with a timeout in `server_test_tests` or loopback connects time out unexpectedly, work through these steps IN ORDER before proposing any timeout bump. bindreams/hole#165 was debugged for multiple hours because these steps were not documented — the bug was a unit test that shelled out to `netsh` via an RAII guard that bypassed the backend trait.
+
+1. **If the failure is `Access is denied (os error 5)` on spawn**, grep the log for `file-lock holder`. `DistHarness::spawn` retries three times with 500 ms exponential backoff on file-contention errors, and on terminal failure calls `handle_holders::log_holders` to enumerate processes holding `hole.exe` (see bindreams/hole#208). Expect `MsMpEng.exe` (Windows Defender) as the typical culprit. If no holders appear but the spawn still fails, Defender is PPL-protected and our non-`SeDebugPrivilege` enumeration skipped it — the `info!` line "file-lock holder enumeration skipped PIDs we couldn't open" is the tell.
 
 1. **Grep the failing test output for `routing subprocesses` or `netsh|route add|route delete`.** The #165 fix added a regression test (`proxy_manager_tests_never_spawn_routing_subprocess`) that prints `"proxy_manager start/stop cycles spawned N routing subprocesses"` and asserts `N == 0`. If that assertion fires, a new code path has bypassed the `Routing` trait — find the new `Drop` impl or helper that calls the free `routing::setup_routes`/`teardown_routes` functions and route it through the trait. Clippy's `disallowed_methods` lint should have caught this at build time; if it didn't, the lint needs tightening.
 

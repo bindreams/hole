@@ -404,7 +404,7 @@ fn query_session_stats(session_name: &str) {
 /// Enumerate live ETW sessions via Win32 `QueryAllTracesW` and stop any
 /// whose name starts with `hole-bridge-etw-`. A crashed prior bridge
 /// leaves its session alive until the machine reboots; this sweeps it.
-/// Mirrors the crash-recovery pattern in [`crate::routing::recover_routes`]
+/// Mirrors the crash-recovery pattern in [`tun_engine::routing::recover_routes`]
 /// and [`crate::plugin_recovery::recover_plugins`] — best-effort, warns
 /// on failure, never aborts startup.
 ///

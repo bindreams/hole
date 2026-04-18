@@ -25,7 +25,7 @@ from pathlib import Path
 
 import _lib
 
-# Keep in sync with `crates/bridge/src/route_state.rs::STATE_FILE_NAME`.
+# Keep in sync with `crates/tun-engine/src/routing/state.rs::STATE_FILE_NAME`.
 STATE_FILE_NAME = "bridge-routes.json"
 
 

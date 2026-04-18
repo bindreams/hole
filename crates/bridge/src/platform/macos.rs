@@ -218,7 +218,7 @@ pub fn run(
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
-                crate::routing::SystemRouting::new(state_dir.to_path_buf()),
+                tun_engine::routing::SystemRouting::new(state_dir.to_path_buf()),
             )
             .with_state_dir(state_dir.to_path_buf()),
         ));
@@ -230,7 +230,9 @@ pub fn run(
         // runtime while the IPC socket is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
         let state_dir_routes = state_dir.to_path_buf();
-        if let Err(e) = tokio::task::spawn_blocking(move || crate::routing::recover_routes(&state_dir_routes)).await {
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_routes)).await
+        {
             tracing::warn!(error = %e, "recover_routes task panicked");
         }
         let state_dir_plugins = state_dir.to_path_buf();

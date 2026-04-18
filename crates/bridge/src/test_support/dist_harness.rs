@@ -39,6 +39,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -46,6 +47,13 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+/// Max spawn attempts when Windows Defender / macOS exec-busy holds
+/// the freshly-built `hole.exe`. Three with 500 ms exponential backoff
+/// gives a total of 500 + 1000 = 1500 ms of waiting — empirically
+/// enough to let a Defender scan release the handle.
+const MAX_SPAWN_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).expect("literal");
+const SPAWN_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Error returned by [`DistHarness`] operations. Test-only, panic-friendly
 /// (every error branch in a test just calls `.expect()` or `.unwrap()`).
@@ -158,9 +166,24 @@ impl DistHarness {
             .env("HOLE_BRIDGE_LOG", "hole_bridge=debug")
             .env("HOLE_BRIDGE_SELF_TEST", "1");
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| HarnessError(format!("failed to spawn {hole_exe:?}: {e}")))?;
+        // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
+        // spawn failure (typically Windows Defender scanning the freshly
+        // built `hole.exe`) lands a holder list in the log. See #208.
+        let mut child = crate::retry::retry_if(
+            || cmd.spawn(),
+            crate::retry::is_file_contention,
+            MAX_SPAWN_ATTEMPTS,
+            SPAWN_BACKOFF,
+        )
+        .await
+        .map_err(|e| {
+            // Capture the spawn error into the return value FIRST, then
+            // attempt the best-effort holder log — if log_holders itself
+            // blows up, we still propagate the underlying spawn failure.
+            let err = HarnessError(format!("failed to spawn {hole_exe:?}: {e}"));
+            handle_holders::log_holders(&hole_exe);
+            err
+        })?;
 
         let child_pid = child.id();
         eprintln!(

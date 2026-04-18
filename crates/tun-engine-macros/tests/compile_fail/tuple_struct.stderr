@@ -1,0 +1,5 @@
+error: #[freeze] requires a struct with named fields; tuple structs are not supported
+ --> tests/compile_fail/tuple_struct.rs:4:15
+  |
+4 | pub struct Bad(pub u32, pub u32);
+  |               ^^^^^^^^^^^^^^^^^^
