@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hole_common::config::MatchType;
 
@@ -9,8 +9,7 @@ use crate::filter::engine::{ConnInfo, L4Proto};
 
 fn ip_conn(dst: &str) -> ConnInfo {
     ConnInfo {
-        dst_ip: dst.parse().unwrap(),
-        dst_port: 443,
+        dst: SocketAddr::new(dst.parse().unwrap(), 443),
         domain: None,
         proto: L4Proto::Tcp,
     }
@@ -18,8 +17,7 @@ fn ip_conn(dst: &str) -> ConnInfo {
 
 fn dom_conn(dst: &str, domain: &str) -> ConnInfo {
     ConnInfo {
-        dst_ip: dst.parse().unwrap(),
-        dst_port: 443,
+        dst: SocketAddr::new(dst.parse().unwrap(), 443),
         domain: Some(domain.to_string()),
         proto: L4Proto::Tcp,
     }
@@ -223,8 +221,7 @@ fn exact_ip_matches_regardless_of_domain_presence() {
 fn exact_ipv4_canonicalizes_v4_mapped_v6() {
     let m = compile("1.2.3.4", MatchType::Exactly);
     let conn = ConnInfo {
-        dst_ip: IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304)),
-        dst_port: 443,
+        dst: SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304)), 443),
         domain: None,
         proto: L4Proto::Tcp,
     };
@@ -274,8 +271,7 @@ fn subnet_max_prefix_is_single_host() {
 fn subnet_canonicalizes_v4_mapped_v6() {
     let m = compile("10.0.0.0/8", MatchType::Subnet);
     let conn = ConnInfo {
-        dst_ip: IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001)),
-        dst_port: 443,
+        dst: SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001)), 443),
         domain: None,
         proto: L4Proto::Tcp,
     };
@@ -294,8 +290,7 @@ fn subnet_skips_when_family_mismatched() {
 fn loopback_ip_in_zero_subnet() {
     let m = compile("127.0.0.1", MatchType::Exactly);
     assert!(m.matches(&ConnInfo {
-        dst_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-        dst_port: 80,
+        dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80),
         domain: None,
         proto: L4Proto::Tcp,
     }));
@@ -305,8 +300,7 @@ fn loopback_ip_in_zero_subnet() {
 fn ipv6_unspecified_match() {
     let m = compile("::", MatchType::Exactly);
     assert!(m.matches(&ConnInfo {
-        dst_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        dst_port: 80,
+        dst: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 80),
         domain: None,
         proto: L4Proto::Tcp,
     }));

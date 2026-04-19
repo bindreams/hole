@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -11,10 +11,8 @@ fn rt() -> tokio::runtime::Runtime {
 
 fn key() -> FlowKey {
     FlowKey {
-        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        src_port: 12345,
-        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        dst_port: 53,
+        src: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 12345),
+        dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
     }
 }
 
@@ -91,10 +89,8 @@ fn flow_send_constructs_reply_with_swapped_tuple() {
         flow.send(b"pong").await.unwrap();
 
         let reply = reply_rx.recv().await.unwrap();
-        assert_eq!(reply.src_ip, key().dst_ip);
-        assert_eq!(reply.src_port, key().dst_port);
-        assert_eq!(reply.dst_ip, key().src_ip);
-        assert_eq!(reply.dst_port, key().src_port);
+        assert_eq!(reply.src, key().dst);
+        assert_eq!(reply.dst, key().src);
         assert_eq!(reply.payload, b"pong");
     });
 }

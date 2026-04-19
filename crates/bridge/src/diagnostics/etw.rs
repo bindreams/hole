@@ -99,7 +99,7 @@ use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::thread::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -486,7 +486,7 @@ pub(crate) struct ParsedFields {
 ///
 /// Returns `None` if bytes are too short for either family or the
 /// family field is neither AF_INET nor AF_INET6.
-pub(crate) fn parse_socket_address(bytes: &[u8]) -> Option<(IpAddr, u16)> {
+pub(crate) fn parse_socket_address(bytes: &[u8]) -> Option<SocketAddr> {
     if bytes.len() < 4 {
         return None;
     }
@@ -499,7 +499,7 @@ pub(crate) fn parse_socket_address(bytes: &[u8]) -> Option<(IpAddr, u16)> {
                 return None;
             }
             let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
-            Some((IpAddr::V4(ip), port))
+            Some(SocketAddr::new(IpAddr::V4(ip), port))
         }
         // AF_INET6
         23 => {
@@ -508,7 +508,7 @@ pub(crate) fn parse_socket_address(bytes: &[u8]) -> Option<(IpAddr, u16)> {
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&bytes[8..24]);
-            Some((IpAddr::V6(std::net::Ipv6Addr::from(octets)), port))
+            Some(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::from(octets)), port))
         }
         _ => None,
     }
@@ -623,12 +623,12 @@ fn extract_fields(parser: &Parser) -> ParsedFields {
         .try_parse::<Vec<u8>>("LocalAddress")
         .ok()
         .and_then(|bytes| parse_socket_address(&bytes))
-        .map_or((None, None), |(a, p)| (Some(a), Some(p)));
+        .map_or((None, None), |sa| (Some(sa.ip()), Some(sa.port())));
     let (remote_addr, remote_port_from_addr) = parser
         .try_parse::<Vec<u8>>("RemoteAddress")
         .ok()
         .and_then(|bytes| parse_socket_address(&bytes))
-        .map_or((None, None), |(a, p)| (Some(a), Some(p)));
+        .map_or((None, None), |sa| (Some(sa.ip()), Some(sa.port())));
 
     ParsedFields {
         tcb: parser.try_parse::<u64>("Tcb").ok(),

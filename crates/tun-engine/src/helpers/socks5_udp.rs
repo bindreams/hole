@@ -15,8 +15,9 @@ use tokio::net::{TcpStream, UdpSocket};
 ///
 /// When `domain` is `Some`, the ATYP=Domain form is used (preferred —
 /// it lets the proxy resolve the name and avoids DNS leaks). Otherwise
-/// ATYP=IPv4/IPv6 is used with `dst_ip`.
-pub fn encode_socks5_udp(dst_ip: IpAddr, dst_port: u16, domain: Option<&str>, payload: &[u8]) -> Vec<u8> {
+/// ATYP=IPv4/IPv6 is used with `dst.ip()`. In both cases the port comes
+/// from `dst.port()`.
+pub fn encode_socks5_udp(dst: SocketAddr, domain: Option<&str>, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     // RSV (2 bytes) + FRAG (1 byte)
     buf.extend_from_slice(&[0x00, 0x00, 0x00]);
@@ -30,7 +31,7 @@ pub fn encode_socks5_udp(dst_ip: IpAddr, dst_port: u16, domain: Option<&str>, pa
         buf.push(domain_bytes.len().min(255) as u8);
         buf.extend_from_slice(&domain_bytes[..domain_bytes.len().min(255)]);
     } else {
-        match dst_ip {
+        match dst.ip() {
             IpAddr::V4(v4) => {
                 buf.push(0x01); // ATYP = IPv4
                 buf.extend_from_slice(&v4.octets());
@@ -43,7 +44,7 @@ pub fn encode_socks5_udp(dst_ip: IpAddr, dst_port: u16, domain: Option<&str>, pa
     }
 
     // DST.PORT (2 bytes, big-endian)
-    buf.extend_from_slice(&dst_port.to_be_bytes());
+    buf.extend_from_slice(&dst.port().to_be_bytes());
     // DATA
     buf.extend_from_slice(payload);
     buf
@@ -51,10 +52,17 @@ pub fn encode_socks5_udp(dst_ip: IpAddr, dst_port: u16, domain: Option<&str>, pa
 
 /// Decode a SOCKS5 UDP datagram header (RFC 1928 §7).
 ///
-/// Returns `(src_ip, src_port, header_len)` so the payload starts at
+/// Returns `(src_addr, header_len)` so the payload starts at
 /// `data[header_len..]`. Returns `None` if the datagram is malformed or
 /// fragmented (FRAG != 0).
-pub fn decode_socks5_udp(data: &[u8]) -> Option<(IpAddr, u16, usize)> {
+///
+/// If the datagram's ATYP is `Domain` (0x03), the returned `SocketAddr`
+/// carries `IpAddr::V4(Ipv4Addr::UNSPECIFIED)` (i.e. `0.0.0.0`) as a
+/// sentinel — callers must NOT use it as a connect target. This is a
+/// pre-existing contract retained from the split-return shape; a richer
+/// return type distinguishing IP vs Domain is tracked as a follow-up
+/// (see bindreams/hole#229).
+pub fn decode_socks5_udp(data: &[u8]) -> Option<(SocketAddr, usize)> {
     // Minimum: RSV(2) + FRAG(1) + ATYP(1) + addr(4 for IPv4) + port(2) = 10
     if data.len() < 10 {
         return None;
@@ -74,7 +82,7 @@ pub fn decode_socks5_udp(data: &[u8]) -> Option<(IpAddr, u16, usize)> {
             }
             let ip = IpAddr::V4(Ipv4Addr::new(data[4], data[5], data[6], data[7]));
             let port = u16::from_be_bytes([data[8], data[9]]);
-            Some((ip, port, 10))
+            Some((SocketAddr::new(ip, port), 10))
         }
         0x03 => {
             // Domain: 1-byte length + domain string (we return 0.0.0.0 as IP
@@ -85,7 +93,7 @@ pub fn decode_socks5_udp(data: &[u8]) -> Option<(IpAddr, u16, usize)> {
                 return None;
             }
             let port = u16::from_be_bytes([data[4 + 1 + dlen], data[4 + 1 + dlen + 1]]);
-            Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), port, header_len))
+            Some((SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), header_len))
         }
         0x04 => {
             // IPv6: 16 bytes address
@@ -97,7 +105,7 @@ pub fn decode_socks5_udp(data: &[u8]) -> Option<(IpAddr, u16, usize)> {
             octets.copy_from_slice(&data[4..20]);
             let ip = IpAddr::V6(octets.into());
             let port = u16::from_be_bytes([data[20], data[21]]);
-            Some((ip, port, header_len))
+            Some((SocketAddr::new(ip, port), header_len))
         }
         _ => None,
     }
@@ -201,27 +209,32 @@ impl Socks5UdpRelay {
     }
 
     /// Send a datagram through the relay.
-    pub async fn send_to(&self, dst_ip: IpAddr, dst_port: u16, domain: Option<&str>, payload: &[u8]) -> io::Result<()> {
-        let pkt = encode_socks5_udp(dst_ip, dst_port, domain, payload);
+    pub async fn send_to(&self, dst: SocketAddr, domain: Option<&str>, payload: &[u8]) -> io::Result<()> {
+        let pkt = encode_socks5_udp(dst, domain, payload);
         self.socket.send(&pkt).await?;
         Ok(())
     }
 
-    /// Receive a datagram from the relay. Returns `(payload_len, src_ip, src_port)`.
+    /// Receive a datagram from the relay. Returns `(payload_len, src_addr)`.
     ///
     /// The caller's `buf` receives the full SOCKS5 UDP datagram; the payload
     /// starts at `buf[header_len..]` where `header_len` is derived from
     /// [`decode_socks5_udp`].
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, IpAddr, u16)> {
+    ///
+    /// If the reply's ATYP is `Domain`, `src_addr` carries
+    /// `IpAddr::V4(Ipv4Addr::UNSPECIFIED)` (`0.0.0.0`) as a sentinel —
+    /// callers must NOT use it as a connect target. See
+    /// [`decode_socks5_udp`] for the full contract.
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let n = self.socket.recv(buf).await?;
-        let (src_ip, src_port, header_len) =
+        let (src, header_len) =
             decode_socks5_udp(&buf[..n]).ok_or_else(|| io::Error::other("malformed SOCKS5 UDP reply"))?;
 
         // Shift payload to the front of buf for convenience.
         let payload_len = n - header_len;
         buf.copy_within(header_len..n, 0);
 
-        Ok((payload_len, src_ip, src_port))
+        Ok((payload_len, src))
     }
 
     /// The relay address returned by the SOCKS5 server.

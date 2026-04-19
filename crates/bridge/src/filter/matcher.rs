@@ -1,6 +1,6 @@
 //! Compiled matchers for `FilterRule`s.
 //!
-//! Each `Matcher` checks one connection-level field (`domain` or `dst_ip`)
+//! Each `Matcher` checks one connection-level field (`domain` or `dst`)
 //! and reports whether it matches. Construction is fallible (`compile`)
 //! because user input may be malformed; matching itself is infallible and
 //! cheap (no allocation, no I/O).
@@ -98,8 +98,8 @@ impl Matcher {
                 let got_canon = canonicalize_for_match(got);
                 re.is_match(&got_canon)
             }
-            Matcher::ExactIp(want) => canonicalize_ip(conn.dst_ip) == *want,
-            Matcher::Subnet(net) => net.contains(&canonicalize_ip(conn.dst_ip)),
+            Matcher::ExactIp(want) => canonicalize_ip(conn.dst.ip()) == *want,
+            Matcher::Subnet(net) => net.contains(&canonicalize_ip(conn.dst.ip())),
         }
     }
 }

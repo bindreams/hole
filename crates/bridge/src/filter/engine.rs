@@ -4,7 +4,7 @@
 //! terminal fallback is `Proxy` — this matches the bridge's
 //! "everything is proxied by default" contract.
 
-use std::net::IpAddr;
+use std::net::SocketAddr;
 
 use hole_common::config::FilterAction;
 
@@ -22,8 +22,7 @@ pub enum L4Proto {
 /// dispatcher fills this in immediately before calling `decide`.
 #[derive(Debug, Clone)]
 pub struct ConnInfo {
-    pub dst_ip: IpAddr,
-    pub dst_port: u16,
+    pub dst: SocketAddr,
     /// Set when the dispatcher recovered a domain via fake DNS reverse
     /// lookup or the TLS/HTTP sniffer. `None` for raw IP destinations.
     ///

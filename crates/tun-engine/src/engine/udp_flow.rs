@@ -11,31 +11,27 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 // Public ==============================================================================================================
 
-/// 5-tuple identifying a UDP flow (technically 4-tuple — the IP protocol
-/// field is implicit).
+/// 5-tuple identifying a UDP flow (src addr + src port + dst addr + dst
+/// port + implicit proto = UDP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub src_ip: IpAddr,
-    pub src_port: u16,
-    pub dst_ip: IpAddr,
-    pub dst_port: u16,
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
 }
 
 /// A UDP reply destined for the TUN side — the engine's driver wraps it
 /// into an IP+UDP packet with source/dest swapped from the Router's flow
 /// and writes it back to the TUN.
 pub(crate) struct UdpReply {
-    pub src_ip: IpAddr,
-    pub src_port: u16,
-    pub dst_ip: IpAddr,
-    pub dst_port: u16,
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
     pub payload: Vec<u8>,
 }
 
@@ -118,10 +114,8 @@ impl UdpSender {
 async fn send_reply(reply_tx: &mpsc::Sender<UdpReply>, key: FlowKey, payload: &[u8]) -> io::Result<()> {
     reply_tx
         .send(UdpReply {
-            src_ip: key.dst_ip,
-            src_port: key.dst_port,
-            dst_ip: key.src_ip,
-            dst_port: key.src_port,
+            src: key.dst,
+            dst: key.src,
             payload: payload.to_vec(),
         })
         .await

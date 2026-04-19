@@ -400,11 +400,11 @@ impl Driver {
         let payload = &packet[payload_start..payload_end];
 
         // Port-53 DNS interception.
-        if parsed.dst_port == 53 {
+        if parsed.dst.port() == 53 {
             if let Some(interceptor) = self.dns_interceptor.clone() {
                 if let Some(reply) = interceptor.intercept(payload).await {
                     // Construct reply packet with swapped 5-tuple.
-                    let pkt = build_udp_packet(parsed.dst_ip, parsed.dst_port, parsed.src_ip, parsed.src_port, &reply);
+                    let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
                     if !pkt.is_empty() {
                         self.pending_tun_writes.push(pkt);
                     }
@@ -415,10 +415,8 @@ impl Driver {
         }
 
         let key = FlowKey {
-            src_ip: parsed.src_ip,
-            src_port: parsed.src_port,
-            dst_ip: parsed.dst_ip,
-            dst_port: parsed.dst_port,
+            src: parsed.src,
+            dst: parsed.dst,
         };
 
         // Existing flow: forward the datagram.
@@ -437,8 +435,8 @@ impl Driver {
         }
 
         let meta = UdpMeta {
-            src: SocketAddr::new(parsed.src_ip, parsed.src_port),
-            dst: SocketAddr::new(parsed.dst_ip, parsed.dst_port),
+            src: parsed.src,
+            dst: parsed.dst,
         };
         let router = Arc::clone(&self.router);
         let cancel = self.cancel.clone();
@@ -449,7 +447,7 @@ impl Driver {
                 r = router.route_udp(meta, flow) => r,
             };
             if let Err(e) = result {
-                debug!("UDP Router error for {}:{}: {e}", parsed.dst_ip, parsed.dst_port);
+                debug!("UDP Router error for {}: {e}", parsed.dst);
             }
         });
 
@@ -458,13 +456,7 @@ impl Driver {
 
     fn process_udp_replies(&mut self) {
         while let Ok(reply) = self.reply_rx.try_recv() {
-            let pkt = build_udp_packet(
-                reply.src_ip,
-                reply.src_port,
-                reply.dst_ip,
-                reply.dst_port,
-                &reply.payload,
-            );
+            let pkt = build_udp_packet(reply.src, reply.dst, &reply.payload);
             if !pkt.is_empty() {
                 self.pending_tun_writes.push(pkt);
             }
@@ -543,10 +535,8 @@ fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
 }
 
 struct ParsedPacket {
-    src_ip: IpAddr,
-    src_port: u16,
-    dst_ip: IpAddr,
-    dst_port: u16,
+    src: SocketAddr,
+    dst: SocketAddr,
     proto: IpProto,
     payload_offset: usize,
     payload_len: usize,
@@ -598,10 +588,8 @@ fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
     };
 
     Some(ParsedPacket {
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        src: SocketAddr::new(src_ip, src_port),
+        dst: SocketAddr::new(dst_ip, dst_port),
         proto,
         payload_offset,
         payload_len,
@@ -644,10 +632,8 @@ fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
     };
 
     Some(ParsedPacket {
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        src: SocketAddr::new(src_ip, src_port),
+        dst: SocketAddr::new(dst_ip, dst_port),
         proto,
         payload_offset,
         payload_len,
@@ -657,11 +643,15 @@ fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
 // Reply packet construction ===========================================================================================
 
 /// Build a raw IP+UDP packet from the given fields, with correct checksums.
-fn build_udp_packet(src_ip: IpAddr, src_port: u16, dst_ip: IpAddr, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    debug_assert!(src.is_ipv4() == dst.is_ipv4(), "src/dst IP family mismatch");
+
     let udp_len = 8 + payload.len();
     let checksums = ChecksumCapabilities::default();
+    let src_port = src.port();
+    let dst_port = dst.port();
 
-    match (src_ip, dst_ip) {
+    match (src.ip(), dst.ip()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             let ip_repr = Ipv4Repr {
                 src_addr: src,
