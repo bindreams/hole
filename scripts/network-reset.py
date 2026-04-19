@@ -27,6 +27,119 @@ import _lib
 
 # Keep in sync with `crates/tun-engine/src/routing/state.rs::STATE_FILE_NAME`.
 STATE_FILE_NAME = "bridge-routes.json"
+# Keep in sync with `crates/bridge/src/dns_state.rs::STATE_FILE_NAME`.
+DNS_STATE_FILE_NAME = "bridge-dns.json"
+
+
+def load_dns_state_file() -> dict | None:
+    """Return the first valid parsed bridge-dns.json found across candidate
+    state directories, or None. Mirrors `load_state_file` but for DNS."""
+    for d in candidate_state_dirs():
+        path = d / DNS_STATE_FILE_NAME
+        if not path.exists():
+            continue
+        try:
+            with path.open() as f:
+                data = json.load(f)
+            print(f"  Found DNS state file at {path}")
+            return data
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  Skipping {path} (parse error: {e})")
+    return None
+
+
+def restore_dns_windows(state: dict) -> None:
+    print("Restoring prior DNS settings (Windows)...")
+    for adapter in state.get("adapters", []):
+        id_obj = adapter.get("id", {})
+        if id_obj.get("kind") != "windows_alias":
+            continue
+        alias = id_obj.get("value")
+        if not alias:
+            continue
+        for family, field in (("ipv4", "v4"), ("ipv6", "v6")):
+            prior = adapter.get(field, {})
+            kind = prior.get("kind")
+            if kind == "dhcp":
+                run([
+                    "netsh",
+                    "interface",
+                    family,
+                    "set",
+                    "dnsservers",
+                    f"name={alias}",
+                    "dhcp",
+                ])
+            elif kind == "none":
+                run([
+                    "netsh",
+                    "interface",
+                    family,
+                    "set",
+                    "dnsservers",
+                    f"name={alias}",
+                    "static",
+                    "none",
+                ])
+            elif kind == "static":
+                servers = prior.get("servers", [])
+                if not servers:
+                    continue
+                run([
+                    "netsh",
+                    "interface",
+                    family,
+                    "set",
+                    "dnsservers",
+                    f"name={alias}",
+                    "static",
+                    servers[0],
+                    "primary",
+                ])
+                for idx, ip in enumerate(servers[1:], start=2):
+                    run([
+                        "netsh",
+                        "interface",
+                        family,
+                        "add",
+                        "dnsservers",
+                        f"name={alias}",
+                        ip,
+                        f"index={idx}",
+                    ])
+
+
+def restore_dns_macos(state: dict) -> None:
+    print("Restoring prior DNS settings (macOS)...")
+    for adapter in state.get("adapters", []):
+        id_obj = adapter.get("id", {})
+        if id_obj.get("kind") != "macos_service_name":
+            continue
+        svc = id_obj.get("value")
+        if not svc:
+            continue
+        combined: list[str] = []
+        saw_static = False
+        for field in ("v4", "v6"):
+            prior = adapter.get(field, {})
+            if prior.get("kind") == "static":
+                saw_static = True
+                combined.extend(prior.get("servers", []))
+        if saw_static and combined:
+            run(["networksetup", "-setdnsservers", svc, *combined])
+        else:
+            run(["networksetup", "-setdnsservers", svc, "Empty"])
+
+
+def clear_dns_state_files() -> None:
+    for d in candidate_state_dirs():
+        path = d / DNS_STATE_FILE_NAME
+        if path.exists():
+            try:
+                path.unlink()
+                print(f"  Removed {path}")
+            except OSError as e:
+                print(f"  Failed to remove {path}: {e}")
 
 
 def run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -196,14 +309,25 @@ def main() -> None:
     state = load_state_file()
     print()
 
+    print("Looking for DNS-state file...")
+    dns_state = load_dns_state_file()
+    print()
+
     system = platform.system()
     if system == "Darwin":
+        if dns_state is not None:
+            restore_dns_macos(dns_state)
         reset_macos(state)
     elif system == "Windows":
+        if dns_state is not None:
+            restore_dns_windows(dns_state)
         reset_windows(state)
     else:
         print(f"Unsupported platform: {system}", file=sys.stderr)
         sys.exit(1)
+
+    if dns_state is not None:
+        clear_dns_state_files()
 
     print()
     print("Done. Test connectivity: curl -I https://example.com")
