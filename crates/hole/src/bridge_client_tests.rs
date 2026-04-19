@@ -153,6 +153,9 @@ fn send_start_receives_ack() {
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
                     filters: Vec::new(),
                     dns: hole_common::config::DnsConfig::default(),
+                    proxy_socks5: true,
+                    proxy_http: false,
+                    local_port_http: 4074,
                 },
             })
             .await
@@ -244,6 +247,9 @@ fn send_reload_receives_ack() {
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
                     filters: Vec::new(),
                     dns: hole_common::config::DnsConfig::default(),
+                    proxy_socks5: true,
+                    proxy_http: false,
+                    local_port_http: 4074,
                 },
             })
             .await
@@ -326,6 +332,9 @@ fn server_error_maps_to_bridge_response_error() {
                     tunnel_mode: hole_common::protocol::TunnelMode::Full,
                     filters: Vec::new(),
                     dns: hole_common::config::DnsConfig::default(),
+                    proxy_socks5: true,
+                    proxy_http: false,
+                    local_port_http: 4074,
                 },
             })
             .await

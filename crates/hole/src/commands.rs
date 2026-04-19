@@ -390,6 +390,9 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: config.filters.clone(),
         dns: config.dns.clone(),
+        proxy_socks5: config.proxy_socks5,
+        proxy_http: config.proxy_http,
+        local_port_http: config.local_port_http,
     })
 }
 

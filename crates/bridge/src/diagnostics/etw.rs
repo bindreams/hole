@@ -94,11 +94,13 @@
 //! the kernel level and silently dropped events 1004 and 1077, both
 //! of which are critical to the #200 narrative.
 
+use dump::{dump, DeriveDump};
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::thread::JoinHandle;
 use tracing::{debug, info, warn};
@@ -453,15 +455,25 @@ pub(crate) unsafe fn read_wide_string(ptr: *const u16) -> String {
 /// - **1077 `SendRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
 ///   `SegmentSize`, `RexmitCount`.
 ///
+/// Every event in the "has address" group above ships its IP and port
+/// atomically inside the same `win:SocketAddress` binary blob (SOCKADDR_IN
+/// / SOCKADDR_IN6), so `local` / `remote` are `Option<SocketAddr>` — not
+/// two independent `Option<IpAddr>` + `Option<u16>` pairs. A previous
+/// iteration of [`extract_fields`] also tried discrete `LocalPort` /
+/// `RemotePort` scalar fields as a fallback, but none of the subscribed
+/// events deliver a port scalar without an address blob. That fallback
+/// was removed in azhukova/240; see [`socket_addr_field`] for the
+/// replacement and its `debug!` breadcrumb. If a future Windows schema
+/// adds an event with a port-only shape, both fields will surface as
+/// `None` and the breadcrumb will surface in bridge.log.
+///
 /// The `tcb` field is a kernel-internal 64-bit TCB pointer / cookie
 /// that correlates events belonging to the same TCP connection across
 /// the connect-path, send-path, and close-path event IDs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedFields {
-    pub local_port: Option<u16>,
-    pub local_addr: Option<IpAddr>,
-    pub remote_port: Option<u16>,
-    pub remote_addr: Option<IpAddr>,
+    pub local: Option<SocketAddr>,
+    pub remote: Option<SocketAddr>,
     pub status: Option<u32>,
     pub rexmit_count: Option<u32>,
     pub tcb: Option<u64>,
@@ -615,73 +627,95 @@ fn handle_event(record: &EventRecord, schema_locator: &SchemaLocator, bridge_pid
 ///
 /// Address handling: TCPIP and Winsock-AFD encode addresses as
 /// `win:Binary` blobs with the `win:SocketAddress` outType. We decode
-/// those via [`parse_socket_address`]. A minority of events expose
-/// discrete `LocalPort` / `RemotePort` scalars; we try those too and
-/// prefer whichever resolves. Empty on both paths → `None`.
+/// those via [`parse_socket_address`] into a full `SocketAddr`. Every
+/// subscribed event in [`ParsedFields`]' coverage table either ships
+/// this blob (carrying IP and port together) or ships neither — see
+/// the `ParsedFields` doc for the full table. No subscribed event
+/// delivers a discrete `LocalPort` / `RemotePort` scalar without a
+/// matching address blob.
 fn extract_fields(parser: &Parser) -> ParsedFields {
-    let (local_addr, local_port_from_addr) = parser
-        .try_parse::<Vec<u8>>("LocalAddress")
-        .ok()
-        .and_then(|bytes| parse_socket_address(&bytes))
-        .map_or((None, None), |sa| (Some(sa.ip()), Some(sa.port())));
-    let (remote_addr, remote_port_from_addr) = parser
-        .try_parse::<Vec<u8>>("RemoteAddress")
-        .ok()
-        .and_then(|bytes| parse_socket_address(&bytes))
-        .map_or((None, None), |sa| (Some(sa.ip()), Some(sa.port())));
+    let local = socket_addr_field(parser, "LocalAddress");
+    let remote = socket_addr_field(parser, "RemoteAddress");
 
     ParsedFields {
-        tcb: parser.try_parse::<u64>("Tcb").ok(),
-        local_port: parser.try_parse::<u16>("LocalPort").ok().or(local_port_from_addr),
-        local_addr,
-        remote_port: parser.try_parse::<u16>("RemotePort").ok().or(remote_port_from_addr),
-        remote_addr,
+        local,
+        remote,
         status: parser.try_parse::<u32>("Status").ok(),
         rexmit_count: parser.try_parse::<u32>("RexmitCount").ok(),
+        tcb: parser.try_parse::<u64>("Tcb").ok(),
     }
 }
 
+/// Decode one SOCKADDR-blob field. Logs a `debug!` breadcrumb when the
+/// field is present but unparseable — a signal that ETW schema drift
+/// might be eating endpoints before they reach the emitter. Silent
+/// `None` is reserved for the expected "field absent" case.
+fn socket_addr_field(parser: &Parser, field: &str) -> Option<SocketAddr> {
+    let bytes = parser.try_parse::<Vec<u8>>(field).ok()?;
+    match parse_socket_address(&bytes) {
+        Some(sa) => Some(sa),
+        None => {
+            debug!(field, len = bytes.len(), "etw: address blob failed to parse");
+            None
+        }
+    }
+}
+
+/// YAML-shaped logging view of a decoded ETW event. Fed into
+/// [`dump!`] at emission time so the bridge log reads as block YAML
+/// (null-safe, no `Some(_)` / `None` Debug noise, kebab-case keys).
+///
+/// Distinct from [`ParsedFields`]: this struct is the *logging* shape,
+/// whereas `ParsedFields` is the *extraction* shape. They are allowed
+/// to diverge — e.g. a future change might elide `tcb` from logs
+/// without touching the extraction path.
+#[derive(DeriveDump)]
+#[dump(rename_all = "kebab-case")]
+pub(crate) struct EventView<'a> {
+    pub event_id: u16,
+    pub opcode: u8,
+    pub provider: &'a str,
+    /// Kernel TCB correlator — kept third (right after `provider`) so
+    /// readers grepping bridge.log by TCB cookie don't have to scroll past
+    /// the endpoint block.
+    pub tcb: Option<u64>,
+    pub local: Option<SocketAddr>,
+    pub remote: Option<SocketAddr>,
+    pub status: Option<u32>,
+    pub rexmit_count: Option<u32>,
+}
+
 /// Translate an [`Emission`] into the appropriate `tracing::event!`
-/// invocation. All emissions include `event_id`, `pid`, and parsed
-/// fields as structured key-values.
+/// invocation, carrying a `dump!`-rendered [`EventView`] in the
+/// `event` field. The bridge's `YamlFormat` layer renders multi-line
+/// field values as block scalars, so the YAML body lands under the
+/// event message in human-readable form.
 fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
-    let event_id = record.event_id();
-    let opcode = record.opcode();
-    let provider_id = format!("{:?}", record.provider_id());
+    let provider = provider_name(record.provider_id());
+    let view = EventView {
+        event_id: record.event_id(),
+        opcode: record.opcode(),
+        provider: &provider,
+        tcb: fields.tcb,
+        local: fields.local,
+        remote: fields.remote,
+        status: fields.status,
+        rexmit_count: fields.rexmit_count,
+    };
     match emission {
         Emission::Info { msg } => info!(
             target: "hole_bridge::diagnostics::etw",
-            event_id,
-            opcode,
-            provider = %provider_id,
-            tcb = ?fields.tcb,
-            local_addr = ?fields.local_addr,
-            local_port = ?fields.local_port,
-            remote_addr = ?fields.remote_addr,
-            remote_port = ?fields.remote_port,
-            status = ?fields.status,
-            rexmit_count = ?fields.rexmit_count,
-            msg,
+            event = %dump!(&view),
+            "{msg}",
         ),
         Emission::Warn { msg } => warn!(
             target: "hole_bridge::diagnostics::etw",
-            event_id,
-            opcode,
-            provider = %provider_id,
-            tcb = ?fields.tcb,
-            local_addr = ?fields.local_addr,
-            local_port = ?fields.local_port,
-            remote_addr = ?fields.remote_addr,
-            remote_port = ?fields.remote_port,
-            status = ?fields.status,
-            rexmit_count = ?fields.rexmit_count,
-            msg,
+            event = %dump!(&view),
+            "{msg}",
         ),
         Emission::Unknown => debug!(
             target: "hole_bridge::diagnostics::etw",
-            event_id,
-            opcode,
-            provider = %provider_id,
+            event = %dump!(&view),
             "etw: unknown event",
         ),
     }
@@ -692,13 +726,31 @@ fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
 /// Test whether a provider GUID identifies the Microsoft-Windows-TCPIP
 /// provider declared by [`TCPIP_PROVIDER`]. Extracted as a standalone
 /// predicate so [`dispatch`] can apply TCPIP-specific filters without
-/// string-parsing the GUID at every event.
+/// re-parsing the constant string at every event.
 fn is_tcpip_provider(provider: GUID) -> bool {
-    // Parse the compile-time constant at the seam rather than duplicating
-    // the bytes. `GUID::from_u128` would require a hex literal; using the
-    // same parser the `ferrisetw::Provider::by_guid` constructor uses
-    // keeps the declarations aligned.
+    // `GUID::from(&str)` parses at call time, not at compile time —
+    // `ferrisetw` doesn't expose a `const` constructor for GUIDs. This
+    // is fine for the predicate's call volume (one check per raw event,
+    // pre-drop-list); keeping the constant as a string keeps the
+    // declarations aligned with `ferrisetw::Provider::by_guid`.
     provider == GUID::from(TCPIP_PROVIDER)
+}
+
+/// Render a provider GUID as its Microsoft-assigned name, falling back to
+/// the Debug form of the raw GUID if we don't recognise it. Called once
+/// per emitted event inside [`emit`] — after the high-volume drop list has
+/// already filtered the noisy events — so the branch is not on the hot
+/// path and is allowed to allocate in the fallback arm.
+fn provider_name(provider: GUID) -> Cow<'static, str> {
+    if provider == GUID::from(TCPIP_PROVIDER) {
+        Cow::Borrowed("Microsoft-Windows-TCPIP")
+    } else if provider == GUID::from(WFP_PROVIDER) {
+        Cow::Borrowed("Microsoft-Windows-WFP")
+    } else if provider == GUID::from(AFD_PROVIDER) {
+        Cow::Borrowed("Microsoft-Windows-Winsock-AFD")
+    } else {
+        Cow::Owned(format!("{provider:?}"))
+    }
 }
 
 #[cfg(test)]

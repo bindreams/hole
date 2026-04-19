@@ -281,6 +281,9 @@ fn test_config() -> ProxyConfig {
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
         dns: hole_common::config::DnsConfig::default(),
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
     }
 }
 

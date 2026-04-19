@@ -350,7 +350,15 @@ components:
     # Documentation-only schemas (not code-generated; hand-written in Rust)
     ProxyConfig:
       type: object
-      description: "Hand-written in protocol.rs — included here for spec completeness."
+      description: |
+        Hand-written in protocol.rs — included here for spec completeness.
+
+        At least one of `proxy_socks5` / `proxy_http` must be true. When
+        `tunnel_mode == full`, `proxy_socks5` must be true (the TUN
+        dispatcher hands captured traffic to the SOCKS5 listener on
+        `local_port`). If both listeners are enabled, `local_port` and
+        `local_port_http` must differ. Any violation makes the bridge
+        reject `BridgeRequest::Start` with `BridgeResponse::Error`.
       required:
         - server
         - local_port
@@ -366,6 +374,25 @@ components:
           description: |
             Which parts of the network stack to install. Defaults to
             `full` when absent (backwards-compatible with older clients).
+        proxy_socks5:
+          type: boolean
+          default: true
+          description: |
+            Whether to bind a SOCKS5 listener on 127.0.0.1:{local_port}.
+            Must be true when tunnel_mode == full.
+        proxy_http:
+          type: boolean
+          default: false
+          description: |
+            Whether to bind an HTTP CONNECT listener on
+            127.0.0.1:{local_port_http}. HTTP CONNECT is TCP-only.
+        local_port_http:
+          type: integer
+          format: uint16
+          default: 4074
+          description: |
+            Port for the HTTP CONNECT listener. Must differ from
+            local_port when both listeners are enabled.
 
     TunnelMode:
       type: string

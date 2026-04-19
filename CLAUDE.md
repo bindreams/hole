@@ -22,6 +22,30 @@ The three drop reasons — explicit rule block, UDP-proxy-unavailable, IPv6-bypa
 
 **UDP/53 exception — the DNS forwarder.** When `DnsConfig.intercept_udp53` is enabled (default), UDP destined to port 53 is diverted to [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) *before* the cascade looks at the filter decision. The endpoint forwards the query through the [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs), which upstreams via the local shadowsocks SOCKS5 listener over the encrypted tunnel. This lets apps that hardcode DNS destinations (Chrome DoH to 8.8.8.8, systemd-resolved stub) resolve even when paired with a TCP-only plugin. Non-DNS UDP still follows the drop invariant above.
 
+### Listener selection invariants
+
+[`ProxyConfig`](crates/common/src/protocol.rs) exposes two independent
+local-listener toggles — `proxy_socks5` and `proxy_http` — plus the HTTP
+listener's own port `local_port_http` (SOCKS5 uses the long-standing
+`local_port`). [`build_ss_config`](crates/bridge/src/proxy/config.rs)
+pushes at most two `LocalInstanceConfig`s, one per enabled listener, and
+rejects three combinations up-front (returning `ProxyError` variants
+surfaced as `BridgeResponse::Error`):
+
+1. `tunnel_mode == Full && !proxy_socks5` → `TunnelRequiresSocks5`. The
+   TUN [`Dispatcher`](crates/bridge/src/dispatcher.rs) hands captured
+   traffic to the SOCKS5 listener on `local_port`; a Full-mode proxy
+   without that listener would silently lose all intercepted flows.
+1. `!proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
+1. `proxy_socks5 && proxy_http && local_port == local_port_http` →
+   `DuplicateListenerPort`. SOCKS5 and HTTP CONNECT use different
+   handshake protocols and cannot share a port.
+
+The HTTP listener's `Mode` is always `TcpOnly` regardless of
+`tunnel_mode` — HTTP CONNECT is TCP-only (RFC 7231 §4.3.6). The SOCKS5
+listener's `Mode` still tracks `tunnel_mode` (`Full` ⇒ `TcpAndUdp`,
+`SocksOnly` ⇒ `TcpOnly` per #189).
+
 ### DNS forwarder
 
 Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) would otherwise have no working DNS in full-tunnel mode — the OS sends UDP/53 into the TUN, the cascade drops it for privacy. The bridge ships a built-in DNS forwarder that carries DNS over the TCP tunnel.
@@ -62,7 +86,7 @@ hole bridge log path [--log-dir DIR] → print log file path
 hole bridge log watch [--tail N] [--log-dir DIR] → stream log output
 hole bridge grant-access [--then-send B64 | --then-send-file PATH] → create hole group, add user, write SID file (needs elevation)
 hole bridge ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
-hole proxy start --config-file PATH [--local-port PORT]            → start the proxy from a ServerEntry JSON file
+hole proxy start --config-file PATH [--local-port PORT] [--local-port-http PORT] [--no-socks5] [--http] [--tunnel-mode MODE] → start the proxy from a ServerEntry JSON file
 hole proxy stop                                                    → stop the proxy
 hole proxy test-server --config-file PATH                          → run a one-shot connectivity test against a server config
 hole upgrade                      → check for updates and install latest version (unattended)

@@ -7,7 +7,7 @@
 
 use hole_common::config::is_valid_plugin_name;
 use hole_common::protocol::ProxyConfig;
-use shadowsocks::config::ServerAddr;
+use shadowsocks::config::{Mode, ServerAddr};
 use shadowsocks::ServerConfig;
 use shadowsocks_service::config::{
     Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
@@ -49,6 +49,22 @@ pub enum ProxyError {
     WintunLoad { path: PathBuf, message: String },
     #[error("plugin error: {0}")]
     Plugin(String),
+    /// `tunnel_mode == Full` requires the SOCKS5 listener, because the
+    /// TUN dispatcher hands captured traffic to it on `local_port`.
+    #[error("tunnel_mode=full requires the SOCKS5 listener; enable proxy_socks5 or switch to tunnel_mode=socks-only")]
+    TunnelRequiresSocks5,
+    /// Both `proxy_socks5` and `proxy_http` are false — there is
+    /// nothing to listen on.
+    #[error("no local listeners enabled: at least one of proxy_socks5 / proxy_http must be true")]
+    NoListenersEnabled,
+    /// Both listeners enabled with identical ports. Each listener needs
+    /// its own port because SOCKS5 and HTTP CONNECT are different
+    /// handshake protocols.
+    #[error("local_port and local_port_http must differ when both listeners are enabled (got {port})")]
+    DuplicateListenerPort { port: u16 },
+    /// A listener is enabled but its port is 0.
+    #[error("{field} must be non-zero when the corresponding listener is enabled")]
+    InvalidListenerPort { field: &'static str },
 }
 
 // Error conversions from tun-engine ===================================================================================
@@ -89,13 +105,33 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 
 /// Build a shadowsocks-service Config from our ProxyConfig.
 ///
-/// Creates exactly one local instance: SOCKS5 on `127.0.0.1:{local_port}`.
-/// The mode depends on `tunnel_mode`:
+/// Emits one local instance per enabled listener:
 ///
-/// * **Full** — `TcpAndUdp`, so the dispatcher's UDP handler can use
-///   SOCKS5 UDP ASSOCIATE to relay datagrams through the tunnel.
-/// * **SocksOnly** — `TcpOnly`, because there is no dispatcher and nobody
-///   uses UDP ASSOCIATE. See #189 for why this matters on Windows.
+/// * **SOCKS5** (`proxy_socks5`): `127.0.0.1:{local_port}`. Mode tracks
+///   `tunnel_mode` — `Full` ⇒ `TcpAndUdp` (so the dispatcher's UDP
+///   handler can use SOCKS5 UDP ASSOCIATE to relay datagrams through
+///   the tunnel), `SocksOnly` ⇒ `TcpOnly` (see #189 — on Windows,
+///   creating the UDP server can cause `select_all` inside
+///   shadowsocks-service to drop the TCP listener when the UDP future
+///   completes early, and with no dispatcher nobody uses UDP ASSOCIATE
+///   anyway).
+/// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
+///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
+///
+/// # Validation
+///
+/// Rejected configurations (returns `ProxyError`):
+///
+/// 1. `tunnel_mode == Full && !proxy_socks5` — the TUN dispatcher needs
+///    the SOCKS5 listener to exist on `local_port`
+///    (`TunnelRequiresSocks5`).
+/// 2. `!proxy_socks5 && !proxy_http` — nothing to listen on
+///    (`NoListenersEnabled`).
+/// 3. `proxy_socks5 && proxy_http && local_port == local_port_http` —
+///    each listener needs its own port (`DuplicateListenerPort`).
+/// 4. Port `0` on an enabled listener (`InvalidListenerPort`).
+///
+/// # Plugin handling
 ///
 /// When `plugin_local` is `Some`, the server address is overridden to point
 /// at the Garter-managed plugin chain's local port. The cipher and password
@@ -106,6 +142,8 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 /// When `plugin_local` is `None`, the original server address is used as-is
 /// (no plugin, or plugin management is handled elsewhere).
 pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -> Result<Config, ProxyError> {
+    validate_listeners(config)?;
+
     let entry = &config.server;
 
     // Validate plugin name (format check, not known-plugin check).
@@ -139,28 +177,63 @@ pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -
         .server
         .push(ServerInstanceConfig::with_server_config(server_config));
 
-    // SOCKS5 local — the only local instance.
-    //
-    // Full mode: TcpAndUdp — the dispatcher's UDP handler needs SOCKS5
-    // UDP ASSOCIATE to relay datagrams through the SS tunnel.
-    //
-    // SocksOnly mode: TcpOnly — there is no dispatcher, so nobody uses
-    // UDP ASSOCIATE. Creating the UDP server on Windows can cause
-    // select_all inside shadowsocks-service to drop the TCP listener
-    // when the UDP future completes early. See #189.
-    let socks_addr: SocketAddr = format!("127.0.0.1:{}", config.local_port)
-        .parse()
-        .expect("127.0.0.1:{u16} is always a valid SocketAddr");
-    let mut socks_local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(socks_addr), ProtocolType::Socks);
-    socks_local.mode = match config.tunnel_mode {
-        hole_common::protocol::TunnelMode::Full => shadowsocks::config::Mode::TcpAndUdp,
-        hole_common::protocol::TunnelMode::SocksOnly => shadowsocks::config::Mode::TcpOnly,
-    };
-    ss_config
-        .local
-        .push(LocalInstanceConfig::with_local_config(socks_local));
+    if config.proxy_socks5 {
+        let socks_mode = match config.tunnel_mode {
+            hole_common::protocol::TunnelMode::Full => Mode::TcpAndUdp,
+            hole_common::protocol::TunnelMode::SocksOnly => Mode::TcpOnly,
+        };
+        ss_config.local.push(build_local_instance(
+            ProtocolType::Socks,
+            loopback(config.local_port),
+            socks_mode,
+        ));
+    }
+
+    if config.proxy_http {
+        // HTTP CONNECT is TCP-only; do not honour tunnel_mode here.
+        ss_config.local.push(build_local_instance(
+            ProtocolType::Http,
+            loopback(config.local_port_http),
+            Mode::TcpOnly,
+        ));
+    }
 
     Ok(ss_config)
+}
+
+fn validate_listeners(config: &ProxyConfig) -> Result<(), ProxyError> {
+    if config.tunnel_mode == hole_common::protocol::TunnelMode::Full && !config.proxy_socks5 {
+        return Err(ProxyError::TunnelRequiresSocks5);
+    }
+    if !config.proxy_socks5 && !config.proxy_http {
+        return Err(ProxyError::NoListenersEnabled);
+    }
+    if config.proxy_socks5 && config.local_port == 0 {
+        return Err(ProxyError::InvalidListenerPort { field: "local_port" });
+    }
+    if config.proxy_http && config.local_port_http == 0 {
+        return Err(ProxyError::InvalidListenerPort {
+            field: "local_port_http",
+        });
+    }
+    if config.proxy_socks5 && config.proxy_http && config.local_port == config.local_port_http {
+        return Err(ProxyError::DuplicateListenerPort {
+            port: config.local_port,
+        });
+    }
+    Ok(())
+}
+
+fn loopback(port: u16) -> SocketAddr {
+    format!("127.0.0.1:{port}")
+        .parse()
+        .expect("127.0.0.1:{u16} is always a valid SocketAddr")
+}
+
+fn build_local_instance(protocol: ProtocolType, addr: SocketAddr, mode: Mode) -> LocalInstanceConfig {
+    let mut local = LocalConfig::new_with_addr(ServerAddr::SocketAddr(addr), protocol);
+    local.mode = mode;
+    LocalInstanceConfig::with_local_config(local)
 }
 
 // Plugin resolution ===================================================================================================

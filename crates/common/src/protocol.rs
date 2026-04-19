@@ -139,6 +139,48 @@ pub struct ProxyConfig {
     /// the forwarder on upgrade.
     #[serde(default)]
     pub dns: crate::config::DnsConfig,
+    /// Whether to bind a SOCKS5 listener on `127.0.0.1:{local_port}`.
+    /// Defaults to `true` so older clients that omit the field keep their
+    /// existing behaviour. Required when `tunnel_mode == Full` (the TUN
+    /// dispatcher in `hole_bridge::dispatcher` hands captured traffic to
+    /// this listener).
+    #[serde(default = "proxy_config_defaults::proxy_socks5")]
+    pub proxy_socks5: bool,
+    /// Whether to bind an HTTP CONNECT listener on
+    /// `127.0.0.1:{local_port_http}`. Defaults to `false`. HTTP CONNECT is
+    /// TCP-only (RFC 7231 §4.3.6); UDP flows still require SOCKS5 UDP
+    /// ASSOCIATE.
+    #[serde(default)]
+    pub proxy_http: bool,
+    /// Port for the HTTP CONNECT listener when `proxy_http` is enabled.
+    /// Defaults to `4074`. Must differ from `local_port` when both
+    /// listeners are enabled (enforced at bridge start).
+    #[serde(default = "proxy_config_defaults::local_port_http")]
+    pub local_port_http: u16,
+}
+
+mod proxy_config_defaults {
+    pub(super) fn proxy_socks5() -> bool {
+        true
+    }
+    pub(super) fn local_port_http() -> u16 {
+        4074
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            server: crate::config::ServerEntry::default_placeholder(),
+            local_port: 4073,
+            tunnel_mode: TunnelMode::default(),
+            filters: Vec::new(),
+            dns: crate::config::DnsConfig::default(),
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
+        }
+    }
 }
 
 // Server test outcome =================================================================================================

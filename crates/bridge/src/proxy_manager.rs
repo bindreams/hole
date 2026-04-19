@@ -570,12 +570,20 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             return self.start(config).await;
         };
 
-        // Structural equality check (ignoring filters). A DnsConfig edit
-        // forces the slow path (full stop + start) — see plan.
+        // Structural equality check (ignoring filters). Any field that
+        // changes which listeners are bound — or where they bind — must
+        // appear here; otherwise toggling e.g. `proxy_http` on a running
+        // bridge would take the hot-swap fast path and silently leave
+        // the HTTP listener unbound. DnsConfig is included for the same
+        // reason — a DnsConfig edit must force a full stop + start so
+        // the LocalDnsServer rebinds with the new transport/servers.
         let structural_same = active.server == config.server
             && active.local_port == config.local_port
             && active.tunnel_mode == config.tunnel_mode
-            && active.dns == config.dns;
+            && active.dns == config.dns
+            && active.proxy_socks5 == config.proxy_socks5
+            && active.proxy_http == config.proxy_http
+            && active.local_port_http == config.local_port_http;
 
         if structural_same {
             // Fast path: hot-swap filter rules without restart.
@@ -687,6 +695,10 @@ mod proxy_manager_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "proxy_manager_listener_e2e_tests.rs"]
+mod proxy_manager_listener_e2e_tests;
 
 // DNS wiring helpers ==================================================================================================
 

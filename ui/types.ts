@@ -64,6 +64,7 @@ export interface Config {
   selected_server: string | null;
   filters: FilterRule[];
   local_port: number;
+  local_port_http: number;
   start_on_login: boolean;
   proxy_server_enabled: boolean;
   proxy_socks5: boolean;

@@ -146,3 +146,116 @@ fn generic_struct_works_with_dump_bound() {
         DumpValue::Map(vec![(DumpValue::String("inner".into()), DumpValue::Int(7),)])
     );
 }
+
+// Container rename_all ================================================================================================
+
+#[derive(DeriveDump)]
+#[dump(rename_all = "kebab-case")]
+struct KebabStruct {
+    field_one: i32,
+    another_field_name: i32,
+}
+
+#[skuld::test]
+fn rename_all_kebab_case_converts_field_names() {
+    let k = KebabStruct {
+        field_one: 1,
+        another_field_name: 2,
+    };
+    assert_eq!(
+        k.dump(),
+        DumpValue::Map(vec![
+            (DumpValue::String("field-one".into()), DumpValue::Int(1)),
+            (DumpValue::String("another-field-name".into()), DumpValue::Int(2)),
+        ])
+    );
+}
+
+#[derive(DeriveDump)]
+#[dump(rename_all = "kebab-case")]
+struct KebabWithOverride {
+    field_one: i32,
+    #[dump(rename = "EXPLICIT")]
+    field_two: i32,
+}
+
+#[skuld::test]
+fn field_rename_overrides_rename_all() {
+    let k = KebabWithOverride {
+        field_one: 1,
+        field_two: 2,
+    };
+    assert_eq!(
+        k.dump(),
+        DumpValue::Map(vec![
+            (DumpValue::String("field-one".into()), DumpValue::Int(1)),
+            (DumpValue::String("EXPLICIT".into()), DumpValue::Int(2)),
+        ])
+    );
+}
+
+#[derive(DeriveDump)]
+#[dump(rename_all = "kebab-case")]
+enum KebabEnum {
+    TheVariant {
+        inner_field: i32,
+        #[dump(rename = "override-me")]
+        other_field: i32,
+    },
+}
+
+#[skuld::test]
+fn rename_all_on_enum_struct_variant_with_field_override() {
+    let v = KebabEnum::TheVariant {
+        inner_field: 7,
+        other_field: 8,
+    };
+    assert_eq!(
+        v.dump(),
+        DumpValue::Map(vec![(
+            // Variant name itself is NOT renamed — documented scope decision.
+            DumpValue::String("TheVariant".into()),
+            DumpValue::Map(vec![
+                (DumpValue::String("inner-field".into()), DumpValue::Int(7)),
+                (DumpValue::String("override-me".into()), DumpValue::Int(8)),
+            ]),
+        )])
+    );
+}
+
+#[derive(DeriveDump)]
+#[dump(rename_all = "kebab-case")]
+struct RawIdentStruct {
+    r#type: i32,
+    r#for_each: i32,
+}
+
+#[skuld::test]
+fn rename_all_strips_raw_ident_prefix_before_substitution() {
+    let r = RawIdentStruct {
+        r#type: 1,
+        r#for_each: 2,
+    };
+    assert_eq!(
+        r.dump(),
+        DumpValue::Map(vec![
+            (DumpValue::String("type".into()), DumpValue::Int(1)),
+            (DumpValue::String("for-each".into()), DumpValue::Int(2)),
+        ])
+    );
+}
+
+#[derive(DeriveDump)]
+#[dump(rename_all = "snake_case")]
+struct SnakeStruct {
+    already_snake: i32,
+}
+
+#[skuld::test]
+fn rename_all_snake_case_is_noop() {
+    let s = SnakeStruct { already_snake: 42 };
+    assert_eq!(
+        s.dump(),
+        DumpValue::Map(vec![(DumpValue::String("already_snake".into()), DumpValue::Int(42))])
+    );
+}

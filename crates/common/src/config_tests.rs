@@ -325,6 +325,7 @@ fn deserialize_old_config_without_new_fields_uses_defaults() {
     assert!(config.proxy_server_enabled);
     assert!(config.proxy_socks5);
     assert!(!config.proxy_http);
+    assert_eq!(config.local_port_http, 4074);
 }
 
 #[skuld::test]
@@ -342,6 +343,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         proxy_server_enabled: false,
         proxy_socks5: false,
         proxy_http: true,
+        local_port_http: 5555,
         ..Default::default()
     };
     config.save(&path).unwrap();
@@ -353,6 +355,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(config.proxy_server_enabled, loaded.proxy_server_enabled);
     assert_eq!(config.proxy_socks5, loaded.proxy_socks5);
     assert_eq!(config.proxy_http, loaded.proxy_http);
+    assert_eq!(config.local_port_http, loaded.local_port_http);
 }
 
 #[skuld::test]
