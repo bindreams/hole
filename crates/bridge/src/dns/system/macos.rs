@@ -65,12 +65,9 @@ pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
     let mut combined: Vec<IpAddr> = Vec::new();
     let mut saw_static = false;
     for p in [&adapter.v4, &adapter.v6] {
-        match p {
-            DnsPrior::Static { servers } => {
-                saw_static = true;
-                combined.extend_from_slice(servers);
-            }
-            _ => {}
+        if let DnsPrior::Static { servers } = p {
+            saw_static = true;
+            combined.extend_from_slice(servers);
         }
     }
     if saw_static {
