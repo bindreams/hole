@@ -103,6 +103,9 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
         local_port,
         tunnel_mode: TunnelMode::SocksOnly,
         filters: vec![],
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
     };
 
     let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -208,6 +211,9 @@ mod tun {
             local_port,
             tunnel_mode: TunnelMode::Full,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -280,6 +286,9 @@ fn lifecycle_start_twice_returns_error(
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -331,6 +340,9 @@ fn lifecycle_reload_changes_local_port(
             local_port: port1,
             tunnel_mode: TunnelMode::SocksOnly,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -371,6 +383,9 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -418,6 +433,9 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
@@ -456,6 +474,9 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
             local_port,
             tunnel_mode: TunnelMode::SocksOnly,
             filters: vec![],
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();

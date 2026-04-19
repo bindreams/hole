@@ -114,6 +114,9 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
         action: ProxyAction::Start {
             config_file: std::path::PathBuf::from("/tmp/x.json"),
             local_port: 4073,
+            local_port_http: 4074,
+            no_socks5: false,
+            http: false,
             tunnel_mode: CliTunnelMode::Full,
         },
     }));
@@ -197,11 +200,13 @@ fn proxy_start_parses_with_required_args() {
     let cli =
         Cli::try_parse_from(["hole", "proxy", "start", "--config-file", "/tmp/cfg.json"]).expect("parse proxy start");
     let Some(Command::Proxy {
-        action: ProxyAction::Start {
-            config_file,
-            local_port,
-            tunnel_mode,
-        },
+        action:
+            ProxyAction::Start {
+                config_file,
+                local_port,
+                tunnel_mode,
+                ..
+            },
     }) = cli.command
     else {
         panic!("expected Command::Proxy::Start");
