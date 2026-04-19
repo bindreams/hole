@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tun_engine::{Device, Engine, MutDeviceConfig};
 
-use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, Socks5Endpoint};
+use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
 use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
@@ -44,6 +44,10 @@ impl Dispatcher {
     ///   drops UDP flows whose rule resolved to `Proxy` instead of
     ///   falling back to the clear-text bypass (privacy invariant).
     /// - `rules`: compiled filter rules.
+    /// - `local_dns_endpoint`: optional in-tunnel DNS interceptor. When
+    ///   `Some`, the router diverts UDP/53 flows to it. Callers pass
+    ///   `Some` when the `DnsConfig.intercept_udp53` flag is set and the
+    ///   forwarder has bound successfully.
     pub fn new(
         local_port: u16,
         iface_index: u32,
@@ -51,6 +55,7 @@ impl Dispatcher {
         plugin_name: Option<String>,
         plugin_supports_udp: bool,
         rules: RuleSet,
+        local_dns_endpoint: Option<LocalDnsEndpoint>,
     ) -> std::io::Result<Self> {
         // Open the TUN device.
         let v4_cidr = TUN_SUBNET
@@ -71,7 +76,13 @@ impl Dispatcher {
         let proxy = Socks5Endpoint::new(proxy_addr, plugin_name, plugin_supports_udp);
         let bypass = InterfaceEndpoint::new(iface_index, ipv6_available);
         let block = BlockEndpoint::new();
-        let router = Arc::new(HoleRouter::new(proxy, bypass, block, rules));
+        let router = Arc::new(HoleRouter::with_local_dns(
+            proxy,
+            bypass,
+            block,
+            local_dns_endpoint,
+            rules,
+        ));
 
         // Build the engine. Hole no longer registers a DnsInterceptor —
         // DNS queries traverse the tunnel like any other traffic, and

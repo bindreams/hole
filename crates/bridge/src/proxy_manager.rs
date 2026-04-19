@@ -32,7 +32,7 @@ use std::time::Instant;
 use dump::{dump, DeriveDump};
 use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{Routing, SystemRouting};
 
@@ -65,14 +65,22 @@ pub enum ProxyState {
 
 /// Per-cycle state owned only while a proxy is running.
 ///
-/// **Field declaration order is load-bearing.** Dispatcher drops first
+/// **Field declaration order is load-bearing.** DNS drops first (restores
+/// the user's OS DNS while routes + dispatcher + SS are still live so any
+/// in-flight OS DNS queries egress the restored path), then dispatcher
 /// (closes TUN, cancels handlers), then plugin chain (graceful stop via
 /// SIGTERM/CTRL_BREAK), then routes (teardown commands), then proxy
 /// (releases SS). `None` fields for SocksOnly mode where
-/// routing/dispatcher are skipped, or when no plugin is configured.
+/// routing/dispatcher/DNS are skipped, or when no plugin is configured.
 struct RunningState<P: Proxy, R: Routing> {
+    /// DNS interception: system-DNS apply + LocalDnsServer. Drops FIRST
+    /// so the user's prior resolvers are restored before anything else
+    /// tears down. `None` when DNS forwarder is disabled or in SocksOnly
+    /// mode.
+    #[allow(dead_code)]
+    dns: Option<RunningDns>,
     /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
-    /// handler tasks. Drops FIRST. `None` in SocksOnly mode and under
+    /// handler tasks. Drops SECOND. `None` in SocksOnly mode and under
     /// `#[cfg(test)]`.
     #[allow(dead_code)]
     dispatcher: Option<crate::dispatcher::Dispatcher>,
@@ -93,6 +101,41 @@ struct RunningState<P: Proxy, R: Routing> {
     udp_proxy_available: bool,
     /// Whether IPv6 bypass is available (from gateway info).
     ipv6_bypass_available: bool,
+}
+
+/// DNS interception state held for the proxy's lifetime. Drop restores
+/// system DNS (via `system::restore_all`) and clears `bridge-dns.json`,
+/// then drops `local_dns_server` (aborts its tasks, releasing the
+/// loopback port). Drop is synchronous because all underlying OS
+/// commands block; this matches the existing `SystemRoutes::drop`
+/// convention.
+struct RunningDns {
+    applied_prior: Vec<crate::dns_state::DnsPriorAdapter>,
+    /// State directory for the `bridge-dns.json` persisted file. `None`
+    /// when the caller didn't configure one (dev harness without a
+    /// state dir — a case the existing plugin / routes paths also
+    /// tolerate).
+    state_dir: Option<std::path::PathBuf>,
+    /// Held to keep the loopback `<ip>:53` bound and to keep the
+    /// forwarder tasks running. Dropped after system DNS is restored.
+    _local_dns_server: crate::dns::server::LocalDnsServer,
+}
+
+impl Drop for RunningDns {
+    fn drop(&mut self) {
+        let errors = crate::dns::system::restore_all(&self.applied_prior);
+        if !errors.is_empty() {
+            warn!(
+                count = errors.len(),
+                "RunningDns::drop: some adapters failed to restore"
+            );
+        }
+        if let Some(dir) = &self.state_dir {
+            if let Err(e) = crate::dns_state::clear(dir) {
+                warn!(error = %e, "RunningDns::drop: failed to clear bridge-dns.json");
+            }
+        }
+    }
 }
 
 // ProxyManager ========================================================================================================
@@ -371,6 +414,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             }
 
             return Ok(RunningState {
+                dns: None,
                 dispatcher: None,
                 plugin_chain,
                 routes: None,
@@ -399,6 +443,15 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Start the SS SOCKS5 proxy.
         let running_proxy = proxy.start(ss_config).await?;
 
+        // DNS forwarder wiring. Must happen BEFORE Dispatcher::new so the
+        // LocalDnsEndpoint can be passed in as a constructor argument —
+        // HoleRouter has no mutable registration API. We wire the
+        // forwarder's upstream through the just-started SS SOCKS5
+        // listener (Socks5Connector) so user filter rules that Block the
+        // resolver IP cannot strand our own queries. See `dns/mod.rs`.
+        let (local_dns_server, local_dns_endpoint) =
+            build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available).await;
+
         // Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
@@ -410,19 +463,38 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 config.server.plugin.clone(),
                 crate::proxy::plugin_supports_udp(config),
                 ruleset,
+                local_dns_endpoint,
             )?;
             Some(d)
         };
         #[cfg(test)]
         let dispatcher: Option<crate::dispatcher::Dispatcher> = {
             let _ = ruleset; // suppress unused warning
+            let _ = local_dns_endpoint;
             None
         };
 
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
+        // Apply system DNS AFTER routes install so the OS "best-route to
+        // DNS server" lookup resolves through the TUN (its DNS setting is
+        // our loopback IP). Persist the prior state to `bridge-dns.json`
+        // BEFORE mutating so a mid-apply crash leaves a recoverable file.
+        let dns_state = if let Some(srv) = local_dns_server.as_ref() {
+            apply_dns_settings(srv, &gw_info.interface_name, state_dir)
+        } else {
+            None
+        };
+
+        let dns = local_dns_server.zip(dns_state).map(|(srv, applied)| RunningDns {
+            applied_prior: applied,
+            state_dir: state_dir.map(std::path::Path::to_path_buf),
+            _local_dns_server: srv,
+        });
+
         Ok(RunningState {
+            dns,
             dispatcher,
             plugin_chain,
             routes: Some(routes),
@@ -439,6 +511,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             return Ok(());
         };
         let RunningState {
+            dns,
             dispatcher,
             plugin_chain,
             proxy,
@@ -448,6 +521,10 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             udp_proxy_available: _,
             ipv6_bypass_available: _,
         } = state;
+
+        // 0. Restore system DNS FIRST (while routes + SS are still live
+        // so any in-flight OS queries egress via the restored resolver).
+        drop(dns);
 
         // 1. Shut down dispatcher (closes TUN, cancels all handlers).
         if let Some(mut d) = dispatcher {
@@ -493,10 +570,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             return self.start(config).await;
         };
 
-        // Structural equality check (ignoring filters).
+        // Structural equality check (ignoring filters). A DnsConfig edit
+        // forces the slow path (full stop + start) — see plan.
         let structural_same = active.server == config.server
             && active.local_port == config.local_port
-            && active.tunnel_mode == config.tunnel_mode;
+            && active.tunnel_mode == config.tunnel_mode
+            && active.dns == config.dns;
 
         if structural_same {
             // Fast path: hot-swap filter rules without restart.
@@ -608,3 +687,103 @@ mod proxy_manager_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
+
+// DNS wiring helpers ==================================================================================================
+
+/// Build the local DNS server + endpoint, if the config enables it. The
+/// forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
+/// targeting the just-started SS SOCKS5 listener, so user filter rules
+/// cannot strand our own queries.
+async fn build_local_dns(
+    dns_cfg: &hole_common::config::DnsConfig,
+    local_ss_port: u16,
+    ipv6_bypass_available: bool,
+) -> (
+    Option<crate::dns::server::LocalDnsServer>,
+    Option<crate::endpoint::LocalDnsEndpoint>,
+) {
+    if !dns_cfg.enabled {
+        return (None, None);
+    }
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let socks_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_ss_port);
+    let connector = Arc::new(crate::dns::socks5_connector::Socks5Connector::new(socks_addr))
+        as Arc<dyn crate::dns::connector::UpstreamConnector>;
+    let forwarder = Arc::new(crate::dns::forwarder::DnsForwarder::new(
+        dns_cfg.clone(),
+        connector,
+        ipv6_bypass_available,
+    ));
+
+    let server = match crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder)).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "LocalDnsServer::bind_ladder failed; DNS forwarder disabled for this session");
+            return (None, None);
+        }
+    };
+    info!(addr = %server.addr(), "LocalDnsServer bound");
+
+    let endpoint = if dns_cfg.intercept_udp53 {
+        Some(crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder)))
+    } else {
+        None
+    };
+
+    (Some(server), endpoint)
+}
+
+/// Capture prior system DNS for the adapters we're about to override,
+/// persist the `bridge-dns.json` recovery file, then apply the loopback
+/// IP. Returns the captured prior state on success, which
+/// [`RunningDns::drop`] will later replay.
+fn apply_dns_settings(
+    server: &crate::dns::server::LocalDnsServer,
+    upstream_iface: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Option<Vec<crate::dns_state::DnsPriorAdapter>> {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        use crate::dns::system;
+        use crate::dns_state::{self, DnsState, SCHEMA_VERSION};
+        use crate::proxy::TUN_DEVICE_NAME;
+
+        let aliases: Vec<String> = vec![TUN_DEVICE_NAME.into(), upstream_iface.to_string()];
+        let prior = match system::capture_adapters(&aliases) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "system DNS capture failed; skipping apply");
+                return None;
+            }
+        };
+
+        // Persist BEFORE mutating so a mid-apply crash has a recoverable
+        // file. Matches the `tun_engine::routing::SystemRouting::install`
+        // precondition.
+        if let Some(dir) = state_dir {
+            let state = DnsState {
+                version: SCHEMA_VERSION,
+                chosen_loopback: server.addr(),
+                adapters: prior.clone(),
+            };
+            if let Err(e) = dns_state::save(dir, &state) {
+                warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
+            }
+        }
+
+        if let Err(e) = system::apply_loopback(&aliases, server.addr().ip()) {
+            warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
+            return None;
+        }
+
+        Some(prior)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (server, upstream_iface, state_dir);
+        None
+    }
+}
