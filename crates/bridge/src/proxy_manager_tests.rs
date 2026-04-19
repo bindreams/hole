@@ -280,6 +280,9 @@ fn test_config() -> ProxyConfig {
         local_port: 1080,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
     }
 }
 

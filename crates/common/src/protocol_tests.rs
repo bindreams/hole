@@ -21,6 +21,9 @@ fn sample_config() -> ProxyConfig {
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
         filters: Vec::new(),
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
     }
 }
 
@@ -386,6 +389,9 @@ fn proxy_config_tunnel_mode_full_roundtrips() {
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
         filters: Vec::new(),
+        proxy_socks5: true,
+        proxy_http: true,
+        local_port_http: 4074,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
@@ -399,8 +405,33 @@ fn proxy_config_tunnel_mode_socks_only_roundtrips() {
         local_port: 4073,
         tunnel_mode: TunnelMode::SocksOnly,
         filters: Vec::new(),
+        proxy_socks5: false,
+        proxy_http: true,
+        local_port_http: 5555,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, cfg);
+}
+
+#[skuld::test]
+fn proxy_config_defaults_on_deserialize() {
+    // Legacy client omitting the listener-selection fields: must default to
+    // SOCKS5-on, HTTP-off, local_port_http=4074. Wire-level backward-compat
+    // contract — do not change without a migration plan.
+    let json = r#"{
+        "server": {
+            "id": "x",
+            "name": "x",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "pw"
+        },
+        "local_port": 4073
+    }"#;
+    let cfg: ProxyConfig = serde_json::from_str(json).expect("legacy payload must parse");
+    assert!(cfg.proxy_socks5);
+    assert!(!cfg.proxy_http);
+    assert_eq!(cfg.local_port_http, 4074);
 }

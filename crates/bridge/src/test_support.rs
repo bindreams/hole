@@ -17,12 +17,14 @@
 pub(crate) mod certs;
 pub(crate) mod dist_fixture;
 pub(crate) mod dist_harness;
+pub(crate) mod http_connect_client;
 pub(crate) mod http_target;
 pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod skuld_fixtures;
 pub(crate) mod socks5_client;
 pub(crate) mod ssserver;
+pub(crate) mod udp_echo;
 
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.
 ///

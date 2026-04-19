@@ -1233,6 +1233,10 @@ td.del-cell {
   border-color: var(--accent);
 }
 
+.field-input.invalid {
+  border-color: var(--danger, #e06c75);
+}
+
 /* Settings: divider -----  */
 .setting-divider {
   border: none;

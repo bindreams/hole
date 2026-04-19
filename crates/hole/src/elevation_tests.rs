@@ -21,6 +21,9 @@ fn encode_request_roundtrips() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         },
     };
 
@@ -68,6 +71,9 @@ fn write_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         },
     };
 
@@ -103,6 +109,9 @@ fn read_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
         },
     };
 

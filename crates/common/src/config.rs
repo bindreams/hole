@@ -80,6 +80,11 @@ pub struct AppConfig {
     pub proxy_server_enabled: bool,
     pub proxy_socks5: bool,
     pub proxy_http: bool,
+    /// Port for the HTTP CONNECT listener when `proxy_http` is enabled. The
+    /// SOCKS5 listener uses `local_port`; the two must differ when both
+    /// toggles are on (enforced at bridge start by
+    /// `hole_bridge::proxy::config::build_ss_config`).
+    pub local_port_http: u16,
 }
 
 impl Default for AppConfig {
@@ -97,6 +102,7 @@ impl Default for AppConfig {
             proxy_server_enabled: true,
             proxy_socks5: true,
             proxy_http: false,
+            local_port_http: 4074,
         }
     }
 }
@@ -119,6 +125,27 @@ pub struct ServerEntry {
     /// `vpn_server`/`internet` diagnostics dots.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub validation: Option<ValidationState>,
+}
+
+impl ServerEntry {
+    /// A minimal placeholder entry used as the stand-in for `impl Default`
+    /// on `ProxyConfig` (tests and in-memory defaults). Never meant to be
+    /// sent to the bridge as a real config — `server_port` is `0` and
+    /// `password` is empty. Use it only when the `server` field is about to
+    /// be overwritten with a real entry.
+    pub fn default_placeholder() -> Self {
+        Self {
+            id: "placeholder".into(),
+            name: "placeholder".into(),
+            server: "127.0.0.1".into(),
+            server_port: 0,
+            method: "aes-256-gcm".into(),
+            password: String::new(),
+            plugin: None,
+            plugin_opts: None,
+            validation: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerEntry {

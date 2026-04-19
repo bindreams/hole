@@ -24,6 +24,9 @@ fn sample_config() -> ProxyConfig {
         local_port: 4073,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
     }
 }
 

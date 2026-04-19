@@ -57,6 +57,20 @@ pub(crate) enum ProxyAction {
         /// production default of 4073.
         #[arg(long, default_value_t = 4073)]
         local_port: u16,
+        /// Local HTTP CONNECT port the bridge should bind when
+        /// `--http` is used. Defaults to 4074. Must differ from
+        /// `--local-port` when both listeners are enabled.
+        #[arg(long, default_value_t = 4074)]
+        local_port_http: u16,
+        /// Disable the SOCKS5 listener (default: enabled). Incompatible
+        /// with `--tunnel-mode full`, since the TUN dispatcher hands
+        /// captured traffic to the SOCKS5 listener.
+        #[arg(long)]
+        no_socks5: bool,
+        /// Enable the HTTP CONNECT listener (default: disabled). HTTP
+        /// CONNECT is TCP-only; UDP still requires SOCKS5.
+        #[arg(long)]
+        http: bool,
         /// Tunnel mode. `full` installs the TUN adapter + split routes
         /// (the production default, requires elevation). `socks-only`
         /// binds only the SOCKS5 listener and skips all routing work
@@ -679,6 +693,9 @@ fn handle_proxy(action: ProxyAction) -> i32 {
         ProxyAction::Start {
             config_file,
             local_port,
+            local_port_http,
+            no_socks5,
+            http,
             tunnel_mode,
         } => {
             let entry = match read_server_entry_file(&config_file) {
@@ -694,6 +711,9 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     local_port,
                     tunnel_mode: tunnel_mode.into(),
                     filters: Vec::new(),
+                    proxy_socks5: !no_socks5,
+                    proxy_http: http,
+                    local_port_http,
                 },
             };
             match send_bridge_request_inner(request) {
