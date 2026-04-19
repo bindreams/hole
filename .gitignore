@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Git worktrees
+/.worktrees
+
 # Node.js
 node_modules/
 
