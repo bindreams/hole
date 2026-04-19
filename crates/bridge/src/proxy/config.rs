@@ -170,13 +170,25 @@ pub fn resolve_plugin_path(name: &str) -> String {
     resolve_plugin_path_inner(name, std::env::current_exe().ok())
 }
 
-/// Whether UDP can be proxied through the shadowsocks server.
+/// Whether the configured plugin can carry UDP through the SS tunnel.
 ///
 /// Returns `false` when a TCP-only plugin is configured (e.g. plain
 /// v2ray-plugin). Returns `true` for plugins with UDP support (e.g.
-/// galoshes, which uses YAMUX multiplexing). The dispatcher uses this
-/// to block UDP traffic that cannot be proxied.
-pub fn udp_proxy_available(config: &ProxyConfig) -> bool {
+/// galoshes, which uses YAMUX multiplexing), and `true` when no plugin
+/// is configured (SS itself always supports UDP).
+///
+/// This is the bridge-internal name, plumbed into
+/// [`crate::endpoint::Socks5Endpoint::supports_udp`]. The cascade in
+/// [`crate::hole_router::HoleRouter::resolve_endpoint`] uses the
+/// capability to enforce hole's privacy invariant: UDP-via-Proxy flows
+/// are dropped, not cascaded to the clear-text bypass, when this
+/// returns `false`.
+///
+/// **Naming note.** The corresponding wire-protocol field
+/// [`hole_common::protocol::BridgeResponse::Status::udp_proxy_available`]
+/// keeps its historical name for API stability. This helper uses the
+/// more accurate internal name.
+pub fn plugin_supports_udp(config: &ProxyConfig) -> bool {
     match &config.server.plugin {
         None => true,
         Some(name) => plugin::lookup(name).is_some_and(|p| p.udp_supported),

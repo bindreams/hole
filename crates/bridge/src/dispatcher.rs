@@ -6,6 +6,7 @@
 //! just hands it a prepared Device + Router and drives the engine's run
 //! loop on a background task.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::task::{AbortHandle, JoinHandle};
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tun_engine::{Device, Engine, MutDeviceConfig};
 
+use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
 use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
@@ -34,13 +36,20 @@ impl Dispatcher {
     /// - `local_port`: SS SOCKS5 listen port on 127.0.0.1.
     /// - `iface_index`: upstream interface index for bypass sockets.
     /// - `ipv6_available`: whether the upstream has IPv6.
-    /// - `udp_proxy_available`: whether the plugin (if any) supports UDP relay.
+    /// - `plugin_name`: optional human-readable plugin identifier, for
+    ///   diagnostic logs. Kept adjacent to `plugin_supports_udp` — both
+    ///   describe the plugin.
+    /// - `plugin_supports_udp`: whether the configured plugin can carry
+    ///   UDP through the SS tunnel. When `false`, the router's cascade
+    ///   drops UDP flows whose rule resolved to `Proxy` instead of
+    ///   falling back to the clear-text bypass (privacy invariant).
     /// - `rules`: compiled filter rules.
     pub fn new(
         local_port: u16,
         iface_index: u32,
         ipv6_available: bool,
-        udp_proxy_available: bool,
+        plugin_name: Option<String>,
+        plugin_supports_udp: bool,
         rules: RuleSet,
     ) -> std::io::Result<Self> {
         // Open the TUN device.
@@ -57,14 +66,12 @@ impl Dispatcher {
         })
         .map_err(|e| std::io::Error::other(format!("failed to create TUN device: {e}")))?;
 
-        // Build the HoleRouter.
-        let router = Arc::new(HoleRouter::new(
-            local_port,
-            iface_index,
-            ipv6_available,
-            udp_proxy_available,
-            rules,
-        ));
+        // Build the three endpoints and the HoleRouter.
+        let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
+        let proxy = Socks5Endpoint::new(proxy_addr, plugin_name, plugin_supports_udp);
+        let bypass = InterfaceEndpoint::new(iface_index, ipv6_available);
+        let block = BlockEndpoint::new();
+        let router = Arc::new(HoleRouter::new(proxy, bypass, block, rules));
 
         // Build the engine. Hole no longer registers a DnsInterceptor —
         // DNS queries traverse the tunnel like any other traffic, and

@@ -12,6 +12,14 @@ Single-binary design:
 
 GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
 
+### UDP policy
+
+Hole is a VPN. UDP flows whose filter decision resolves to `Proxy` are **dropped**, not bypassed, when the configured plugin cannot carry UDP (e.g. plain v2ray-plugin is TCP-only). Falling back to the clear-text upstream interface would leak the flow outside the encrypted tunnel, violating the user's VPN expectation.
+
+The invariant is structurally enforced by the cascade in [`HoleRouter::resolve_endpoint`](crates/bridge/src/hole_router.rs) — `FilterAction::Proxy` + UDP + `!Socks5Endpoint::supports_udp()` resolves to `&self.block`, never `&self.bypass`. Users who need tunneled UDP should configure a UDP-capable plugin (galoshes uses YAMUX multiplexing).
+
+The three drop reasons — explicit rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable — each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs) methods so a future reader can distinguish them in the bridge log.
+
 ### Bridge test-isolation contract
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
