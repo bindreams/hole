@@ -54,6 +54,15 @@ smoltcp = { version = "0.12", default-features = false, features = [
 ] }
 arc-swap = "1"
 async-trait = "0.1"
+# DNS forwarder — workspace-pinned direct deps; see workspace Cargo.toml.
+hickory-proto = { workspace = true }
+hickory-resolver = { workspace = true }
+hickory-server = { workspace = true }
+tokio-socks = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
