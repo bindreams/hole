@@ -108,6 +108,49 @@ impl ChainPlugin for FailingPlugin {
     }
 }
 
+/// Plugin that never exits and deliberately ignores `shutdown`. Models a
+/// long-running plugin (e.g. v2ray-plugin) for drain-timeout regression
+/// tests.
+struct StubbornPlugin {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for StubbornPlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+    ) -> crate::Result<()> {
+        std::future::pending::<crate::Result<()>>().await
+    }
+}
+
+/// Plugin that panics immediately. Exercises the `JoinError` arm of
+/// `record_exit`.
+struct PanickingPlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for PanickingPlugin {
+    fn name(&self) -> &str {
+        "panicking"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+    ) -> crate::Result<()> {
+        panic!("deliberate panic for testing")
+    }
+}
+
 // ChainRunner basic tests =====
 
 #[skuld::test]
@@ -222,4 +265,172 @@ async fn cancel_token_triggers_graceful_shutdown() {
         .unwrap();
 
     assert!(result.is_ok(), "chain should exit Ok on external cancellation");
+}
+
+// Drain-timeout semantics tests =====
+
+/// A long-running plugin (one that ignores `shutdown` and never exits on
+/// its own) must not be killed before shutdown is requested. This is the
+/// primary regression gate for the drain-timeout scope fix: pre-fix,
+/// `drain_timeout` was applied to the whole chain lifetime, so
+/// `StubbornPlugin` was aborted after ≈ drain_timeout.
+#[skuld::test]
+async fn long_running_plugin_survives_past_drain_timeout() {
+    let cancel = CancellationToken::new();
+    let drain_timeout = std::time::Duration::from_millis(200);
+
+    let runner = ChainRunner::new()
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn".into(),
+        }))
+        .cancel_token(cancel.clone())
+        .drain_timeout(drain_timeout);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+
+    let mut handle = tokio::spawn(runner.run(env));
+
+    // Wait past drain_timeout and confirm the plugin is still running.
+    tokio::time::sleep(drain_timeout * 3).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut handle)
+            .await
+            .is_err(),
+        "chain must still be running — drain_timeout must not bound the full lifetime"
+    );
+
+    // Cancel; chain should abort the stubborn plugin within drain_timeout
+    // (+ scheduler slack) and return the drain-timeout error.
+    cancel.cancel();
+    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
+        .await
+        .expect("chain should exit within drain_timeout after cancel")
+        .expect("no JoinError");
+
+    match result {
+        Err(crate::Error::Chain(msg)) if msg.contains("drain timeout expired") => {}
+        other => panic!("expected drain-timeout error, got {other:?}"),
+    }
+}
+
+/// When a plugin errors — triggering shutdown — and another plugin in the
+/// chain outlives the drain budget, the plugin-level error must take
+/// precedence over the drain-timeout error. The plugin error is the more
+/// diagnostic of the two.
+#[skuld::test]
+async fn first_error_preserved_across_drain() {
+    let drain_timeout = std::time::Duration::from_millis(200);
+
+    let runner = ChainRunner::new()
+        .add(Box::new(FailingPlugin))
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn".into(),
+        }))
+        .drain_timeout(drain_timeout);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+
+    let handle = tokio::spawn(runner.run(env));
+    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
+        .await
+        .expect("chain should exit within drain_timeout of plugin failure")
+        .expect("no JoinError");
+
+    match result {
+        Err(crate::Error::PluginExit { code: 1, .. }) => {}
+        other => panic!("expected FailingPlugin's PluginExit error to be preserved, got {other:?}"),
+    }
+}
+
+/// A single instant-exit plugin: the chain should return `Ok(())` as soon
+/// as the plugin exits, regardless of `drain_timeout`. Exercises the
+/// Phase 1 → Phase 2 transition with an empty JoinSet — the drain phase
+/// must not block on an empty set nor introduce a minimum wait time.
+#[skuld::test]
+async fn external_cancel_drains_empty_joinset_immediately() {
+    let cancel = CancellationToken::new();
+    let drain_timeout = std::time::Duration::from_secs(5);
+
+    let runner = ChainRunner::new()
+        .add(Box::new(InstantPlugin { name: "instant".into() }))
+        .cancel_token(cancel.clone())
+        .drain_timeout(drain_timeout);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+
+    let start = std::time::Instant::now();
+    let result = runner.run(env).await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "single InstantPlugin chain should return Ok(())");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "chain should return promptly (well before drain_timeout), took {elapsed:?}"
+    );
+
+    // Cancelling after the chain already exited is a no-op.
+    cancel.cancel();
+}
+
+/// External cancel fires concurrently with a plugin errors — the plugin's
+/// error must still win over any drain-timeout wrapping, regardless of
+/// which wins the Phase 1 `select!` race.
+#[skuld::test]
+async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
+    let cancel = CancellationToken::new();
+    let drain_timeout = std::time::Duration::from_millis(200);
+
+    let runner = ChainRunner::new()
+        .add(Box::new(FailingPlugin))
+        .add(Box::new(StubbornPlugin {
+            name: "stubborn".into(),
+        }))
+        .cancel_token(cancel.clone())
+        .drain_timeout(drain_timeout);
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+
+    // Fire the external cancel as close as we can to the plugin error. Whether
+    // Phase 1 observes the plugin exit first, or `shutdown.cancelled()` first,
+    // `record_exit` must still have captured `first_error` by the time the
+    // chain returns.
+    let handle = tokio::spawn(runner.run(env));
+    cancel.cancel();
+
+    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
+        .await
+        .expect("chain should exit within drain_timeout")
+        .expect("no JoinError");
+
+    match result {
+        Err(crate::Error::PluginExit { code: 1, .. }) => {}
+        other => panic!("expected FailingPlugin's PluginExit error to be preserved, got {other:?}"),
+    }
+}
+
+/// A plugin panic surfaces through `record_exit`'s `JoinError` arm as a
+/// `Chain` error whose message identifies the panic.
+#[skuld::test]
+async fn plugin_panic_surfaces_as_chain_error() {
+    let runner = ChainRunner::new()
+        .add(Box::new(PanickingPlugin))
+        .drain_timeout(std::time::Duration::from_millis(200));
+
+    let mut env = test_env();
+    env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
+
+    // Suppress the panic's backtrace noise in the test output.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = runner.run(env).await;
+    std::panic::set_hook(prev_hook);
+
+    match result {
+        Err(crate::Error::Chain(msg)) if msg.contains("panicked") => {}
+        other => panic!("expected Chain(\"...panicked...\") error, got {other:?}"),
+    }
 }

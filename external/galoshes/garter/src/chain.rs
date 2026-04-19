@@ -83,6 +83,21 @@ impl ChainRunner {
     }
 
     /// Set the drain timeout for graceful shutdown.
+    ///
+    /// Bounds the post-shutdown *drain phase* only — the interval between
+    /// shutdown being requested (via external cancel, signal, or a plugin
+    /// exiting) and force-kill of any plugins that haven't exited yet. It
+    /// does NOT bound the chain's full lifetime: a long-running plugin that
+    /// has not been asked to stop will run indefinitely regardless of this
+    /// value.
+    ///
+    /// If the drain budget expires while plugins are still running,
+    /// [`ChainRunner::run`] calls `JoinSet::abort_all` and returns
+    /// `Err(Chain("drain timeout expired"))` — unless a plugin-level error
+    /// was already captured, in which case that error takes precedence.
+    /// Note that aborted tasks are not joined before the function returns;
+    /// their underlying `Drop` impls run as the `JoinSet` is dropped, but
+    /// any terminal error produced during the abort window is lost.
     pub fn drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = timeout;
         self
@@ -172,46 +187,76 @@ impl ChainRunner {
             });
         }
 
-        // Wait for plugins to exit. Any exit (clean or error) in a multi-plugin
-        // chain means data can no longer flow, so trigger shutdown for all others.
-        // The drain timeout bounds how long we wait for remaining plugins after
-        // shutdown is first triggered.
-        let wait_result = tokio::time::timeout(self.drain_timeout, async {
-            let mut first_error: Option<crate::Error> = None;
-            while let Some(result) = set.join_next().await {
-                match result {
-                    Ok((name, Ok(()))) => {
-                        tracing::info!(plugin = %name, "exited cleanly");
-                        shutdown.cancel();
-                    }
-                    Ok((name, Err(e))) => {
-                        tracing::error!(plugin = %name, error = %e, "exited with error");
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
-                        shutdown.cancel();
-                    }
-                    Err(join_err) => {
-                        tracing::error!(error = %join_err, "plugin task panicked");
-                        if first_error.is_none() {
-                            first_error = Some(crate::Error::Chain(format!("plugin panicked: {join_err}")));
-                        }
-                        shutdown.cancel();
-                    }
+        // Phase 1: run unbounded until either all plugins exit naturally or
+        // shutdown is requested. Any plugin exit (clean or error) also fires
+        // `shutdown.cancel()` via `record_exit`, so in a multi-plugin chain
+        // the first exit drives the whole chain into Phase 2. `drain_timeout`
+        // deliberately does NOT bound this phase — a long-running plugin is
+        // expected to run until something tells it to stop.
+        let mut first_error: Option<crate::Error> = None;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                maybe_result = set.join_next() => {
+                    let Some(result) = maybe_result else { break }; // all plugins exited
+                    record_exit(result, &mut first_error, &shutdown);
                 }
             }
-            first_error
+        }
+
+        // Phase 2: drain remaining plugins, bounded by `drain_timeout`. An
+        // empty `JoinSet` completes the inner `while let` immediately without
+        // consuming any of the budget.
+        let drain_result = tokio::time::timeout(self.drain_timeout, async {
+            while let Some(result) = set.join_next().await {
+                record_exit(result, &mut first_error, &shutdown);
+            }
         })
         .await;
 
-        match wait_result {
-            Ok(Some(e)) => Err(e),
-            Ok(None) => Ok(()),
+        match drain_result {
+            Ok(()) => first_error.map_or(Ok(()), Err),
             Err(_timeout) => {
                 tracing::warn!("drain timeout expired, aborting remaining plugins");
                 set.abort_all();
-                Err(crate::Error::Chain("drain timeout expired".into()))
+                // A plugin-level error (if captured before drain) is more
+                // diagnostic than the drain-timeout error, so it takes
+                // precedence.
+                Err(first_error.unwrap_or_else(|| crate::Error::Chain("drain timeout expired".into())))
             }
+        }
+    }
+}
+
+// Helpers =============================================================
+
+/// Shared handler for a single plugin-task exit result. Updates
+/// `first_error` on a first-write-wins basis and fires `shutdown` so the
+/// rest of the chain stops. Called from both Phase 1 and Phase 2 of
+/// `ChainRunner::run`.
+fn record_exit(
+    result: Result<(String, crate::Result<()>), tokio::task::JoinError>,
+    first_error: &mut Option<crate::Error>,
+    shutdown: &CancellationToken,
+) {
+    match result {
+        Ok((name, Ok(()))) => {
+            tracing::info!(plugin = %name, "exited cleanly");
+            shutdown.cancel();
+        }
+        Ok((name, Err(e))) => {
+            tracing::error!(plugin = %name, error = %e, "exited with error");
+            if first_error.is_none() {
+                *first_error = Some(e);
+            }
+            shutdown.cancel();
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "plugin task panicked");
+            if first_error.is_none() {
+                *first_error = Some(crate::Error::Chain(format!("plugin panicked: {join_err}")));
+            }
+            shutdown.cancel();
         }
     }
 }

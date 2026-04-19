@@ -1,5 +1,6 @@
 /target
 /.cache
 /.tmp
+/.worktrees
 CLAUDE.local.md
 .claude/*.local.*
