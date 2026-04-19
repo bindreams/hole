@@ -30,6 +30,7 @@
 
 pub mod block;
 pub mod interface;
+pub mod local_dns;
 pub mod socks5;
 
 use std::io;
@@ -40,6 +41,7 @@ use tun_engine::{TcpFlow, UdpFlow};
 
 pub use block::BlockEndpoint;
 pub use interface::InterfaceEndpoint;
+pub use local_dns::LocalDnsEndpoint;
 pub use socks5::Socks5Endpoint;
 
 /// A flow-carrying mechanism. Implementations take ownership of a flow
