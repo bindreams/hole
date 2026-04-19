@@ -1,0 +1,18 @@
+[package]
+name = "dump-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Proc-macro support for the dump crate (provides #[derive(Dump)])."
+repository = "https://github.com/bindreams/hole"
+license = "GPL-3.0-or-later"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
