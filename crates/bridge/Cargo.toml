@@ -14,6 +14,7 @@ harness = false
 hole-common = { path = "../common" }
 handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
+dump = { path = "../dump" }
 garter = { path = "../../external/galoshes/garter" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"

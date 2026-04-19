@@ -2437,6 +2437,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "default-net",
+ "dump",
  "ferrisetw",
  "garter",
  "handle-holders",
