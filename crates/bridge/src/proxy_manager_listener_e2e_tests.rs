@@ -296,20 +296,33 @@ fn e2e_start_rejects_full_mode_without_socks5(
     });
 }
 
-// UDP ASSOCIATE (Windows admin only) ==================================================================================
+// UDP via TUN (Windows admin only) ====================================================================================
 //
-// Gated to Windows because it requires elevation for `TunnelMode::Full`
-// (SocksOnly hard-codes the SOCKS5 listener to `TcpOnly`, see #189 — keeping
-// that coupling in place rules out the SocksOnly path here). The matching
-// `cfg(target_os = "windows")` on the existing `mod tun` in
-// `proxy_manager_e2e_tests.rs` shows this gate is already how
-// elevated-only E2E paths run on windows-latest CI.
+// End-to-end exercise of the SOCKS5 UDP ASSOCIATE path inside the bridge:
+// the test sends a UDP datagram directly to the echo server's primary
+// non-loopback IPv4, the TUN split routes capture it, the dispatcher's
+// `Socks5Endpoint::serve_udp` opens a SOCKS5 UDP ASSOCIATE to the
+// `ss-server`, and the reply comes back via the same tunnel.
+//
+// Gated to Windows for the same reason as the existing `mod tun` in
+// `proxy_manager_e2e_tests.rs`: `TunnelMode::Full` needs elevation, and
+// `windows-latest` CI runs as `RUNNERADMIN`. The SocksOnly path is
+// unusable here because #189 forces `Mode::TcpOnly` on the SOCKS5
+// listener in SocksOnly mode.
+//
+// The test asserts a client-facing UDP round-trip, which covers the
+// entire TUN→dispatcher→Socks5Endpoint→shadowsocks-service UDP stack
+// end-to-end — including the `Mode::TcpAndUdp` flag flowing through
+// `build_ss_config`. Using 127.0.0.1 for either the client or the
+// echo server would hit the bridge's loopback bypass route and bypass
+// the TUN, defeating the point of the test — see the caveat at
+// `proxy_manager_e2e_tests.rs:184-192`.
 
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
-    use crate::test_support::socks5_client::socks5_udp_associate;
     use crate::test_support::udp_echo::UdpEchoServer;
+    use tokio::net::UdpSocket;
 
     #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
     fn e2e_socks5_udp_associate_roundtrip(
@@ -326,14 +339,19 @@ mod tun {
             let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
             start_expect_ack(&mut harness, config).await;
 
-            let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
-            wait_for_port(proxy_addr, Duration::from_secs(10)).await;
-
+            // Direct UDP send to the echo server's primary IPv4 — the
+            // bridge's TUN routes capture this and tunnel it through the
+            // ss-server via SOCKS5 UDP ASSOCIATE.
+            let client = UdpSocket::bind("0.0.0.0:0").await.expect("bind UDP client");
             let payload = b"HOLE-UDP-ASSOCIATE";
-            let reply = socks5_udp_associate(proxy_addr, echo.addr, payload)
+            client.send_to(payload, echo.addr).await.expect("send UDP");
+
+            let mut buf = vec![0u8; 65_536];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(10), client.recv_from(&mut buf))
                 .await
-                .expect("SOCKS5 UDP ASSOCIATE roundtrip");
-            assert_eq!(reply, payload, "expected UDP echo to return the payload unchanged");
+                .expect("UDP reply within 10s")
+                .expect("UDP recv");
+            assert_eq!(&buf[..n], payload, "expected UDP echo to return the payload unchanged");
 
             harness.send(BridgeRequest::Stop).await.expect("send Stop");
         });
