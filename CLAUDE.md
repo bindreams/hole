@@ -20,6 +20,30 @@ The invariant is structurally enforced by the cascade in [`HoleRouter::resolve_e
 
 The three drop reasons — explicit rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable — each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs) methods so a future reader can distinguish them in the bridge log.
 
+### Listener selection invariants
+
+[`ProxyConfig`](crates/common/src/protocol.rs) exposes two independent
+local-listener toggles — `proxy_socks5` and `proxy_http` — plus the HTTP
+listener's own port `local_port_http` (SOCKS5 uses the long-standing
+`local_port`). [`build_ss_config`](crates/bridge/src/proxy/config.rs)
+pushes at most two `LocalInstanceConfig`s, one per enabled listener, and
+rejects three combinations up-front (returning `ProxyError` variants
+surfaced as `BridgeResponse::Error`):
+
+1. `tunnel_mode == Full && !proxy_socks5` → `TunnelRequiresSocks5`. The
+   TUN [`Dispatcher`](crates/bridge/src/dispatcher.rs) hands captured
+   traffic to the SOCKS5 listener on `local_port`; a Full-mode proxy
+   without that listener would silently lose all intercepted flows.
+1. `!proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
+1. `proxy_socks5 && proxy_http && local_port == local_port_http` →
+   `DuplicateListenerPort`. SOCKS5 and HTTP CONNECT use different
+   handshake protocols and cannot share a port.
+
+The HTTP listener's `Mode` is always `TcpOnly` regardless of
+`tunnel_mode` — HTTP CONNECT is TCP-only (RFC 7231 §4.3.6). The SOCKS5
+listener's `Mode` still tracks `tunnel_mode` (`Full` ⇒ `TcpAndUdp`,
+`SocksOnly` ⇒ `TcpOnly` per #189).
+
 ### Bridge test-isolation contract
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
@@ -49,7 +73,7 @@ hole bridge log path [--log-dir DIR] → print log file path
 hole bridge log watch [--tail N] [--log-dir DIR] → stream log output
 hole bridge grant-access [--then-send B64 | --then-send-file PATH] → create hole group, add user, write SID file (needs elevation)
 hole bridge ipc-send (--base64 B64 | --request-file PATH)          → proxy a single IPC command (needs elevation)
-hole proxy start --config-file PATH [--local-port PORT]            → start the proxy from a ServerEntry JSON file
+hole proxy start --config-file PATH [--local-port PORT] [--local-port-http PORT] [--no-socks5] [--http] [--tunnel-mode MODE] → start the proxy from a ServerEntry JSON file
 hole proxy stop                                                    → stop the proxy
 hole proxy test-server --config-file PATH                          → run a one-shot connectivity test against a server config
 hole upgrade                      → check for updates and install latest version (unattended)
