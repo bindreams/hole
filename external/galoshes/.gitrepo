@@ -7,6 +7,6 @@
 	remote = https://github.com/bindreams/galoshes.git
 	branch = main
 	commit = a2cb172daca0a38adcf62b068268cb9e14d36b2d
-	parent = a4f5365e8c0c5f02d3187e8cfbb730529a577a2e
+	parent = c66ce344c94505f2d95bbdcf0daed8381c5f8317
 	method = merge
 	cmdver = 0.4.9
