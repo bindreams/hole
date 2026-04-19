@@ -7,4 +7,5 @@
 pub mod connector;
 pub mod forwarder;
 pub mod providers;
+pub mod server;
 pub mod socks5_connector;
