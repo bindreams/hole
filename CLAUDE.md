@@ -20,6 +20,19 @@ The invariant is structurally enforced by the cascade in [`HoleRouter::resolve_e
 
 The three drop reasons — explicit rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable — each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs) methods so a future reader can distinguish them in the bridge log.
 
+**UDP/53 exception — the DNS forwarder.** When `DnsConfig.intercept_udp53` is enabled (default), UDP destined to port 53 is diverted to [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) *before* the cascade looks at the filter decision. The endpoint forwards the query through the [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs), which upstreams via the local shadowsocks SOCKS5 listener over the encrypted tunnel. This lets apps that hardcode DNS destinations (Chrome DoH to 8.8.8.8, systemd-resolved stub) resolve even when paired with a TCP-only plugin. Non-DNS UDP still follows the drop invariant above.
+
+### DNS forwarder
+
+Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) would otherwise have no working DNS in full-tunnel mode — the OS sends UDP/53 into the TUN, the cascade drops it for privacy. The bridge ships a built-in DNS forwarder that carries DNS over the TCP tunnel.
+
+- [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs) — pure bytes-in/bytes-out forwarder. Supports PlainUdp / PlainTcp / DoT / DoH. Preserves the client's transaction ID so it can drop in as a forwarder for both [`LocalDnsServer`](crates/bridge/src/dns/server.rs) (OS-facing loopback:53) and [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) (in-tunnel UDP/53 intercept).
+- [`LocalDnsServer`](crates/bridge/src/dns/server.rs) — binds loopback `<ip>:53` UDP+TCP via a fallback ladder (`127.0.0.1:53` → `127.53.0.1..254:53` → fail). The bridge runs elevated, so port 53 binding never hits the privilege gate.
+- [`Socks5Connector`](crates/bridge/src/dns/socks5_connector.rs) — routes the forwarder's upstream connections through the SS SOCKS5 listener on `127.0.0.1:<ss-port>` so user filter rules that `Block` the resolver IP cannot strand the forwarder's own queries. TCP uses `tokio-socks`; UDP uses a hand-rolled SOCKS5 UDP ASSOCIATE per RFC 1928.
+- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — platform-specific capture/apply/restore. Windows uses `netsh`, macOS uses `networksetup`. Applied on both the TUN adapter and the upstream physical adapter; captured prior (v4 + v6, three shapes: static list / DHCP / none) is persisted to `bridge-dns.json` for crash recovery.
+
+**Upgrade migration**: `AppConfig` already carries `#[serde(default)]`, so existing configs without a `dns` key deserialize with `DnsConfig::default()` — which has `enabled: true`, `protocol: Https`, `servers: [1.1.1.1, 1.0.0.1]`, `intercept_udp53: true`. This enables the forwarder silently on upgrade (per user spec: "enabled on upgrade, no notification").
+
 ### Bridge test-isolation contract
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
@@ -72,6 +85,14 @@ crash recovery, both in `<state_dir>/`:
   kills any tracked processes that are still alive (with PID-reuse
   safety via start-time verification). The same file is also read by the
   test harness (`DistHarness::drop`) to reap leaked plugins after tests.
+- **`bridge-dns.json`** — records the DNS loopback bind address and the
+  prior system-DNS configuration (per adapter, per v4/v6 family: static
+  list / DHCP / none). Written after `LocalDnsServer::bind_ladder` and
+  before `SystemDnsConfig::apply`; cleared on clean shutdown. On next
+  startup, `dns::recovery::recover_dns_config` restores prior settings
+  and deletes the file. The recovery runs *before* `routing::recover_routes`
+  so a mid-recovery crash leaves the user with functional DNS + broken
+  routes rather than the harder-to-debug inverse.
 - **ETW sessions** (Windows only) — the bridge opens a named ETW trace
   session `hole-bridge-etw-<pid>` for in-process network diagnostics
   (see `crates/bridge/src/diagnostics/etw.rs`). A crashed bridge leaves
