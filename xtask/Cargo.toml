@@ -31,5 +31,5 @@ ureq = "3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-skuld = "0.1"
+skuld = { workspace = true }
 tempfile = "3"

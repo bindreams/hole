@@ -18,7 +18,7 @@ quote = "1"
 proc-macro2 = "1"
 
 [dev-dependencies]
-skuld = "0.1"
+skuld = { workspace = true }
 trybuild = "1"
 
 [[test]]

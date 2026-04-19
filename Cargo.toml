@@ -3,5 +3,8 @@ members = ["crates/common", "crates/bridge", "crates/handle-holders", "crates/ho
 exclude = ["external/galoshes"]
 resolver = "2"
 
+[workspace.dependencies]
+skuld = { version = "0.2", features = ["tokio"] }
+
 [workspace.lints.clippy]
 disallowed_methods = "deny"

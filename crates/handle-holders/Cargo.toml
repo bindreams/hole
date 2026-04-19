@@ -29,5 +29,5 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-skuld = { version = "0.1", features = ["tokio"] }
+skuld = { workspace = true }
 tempfile = "3"

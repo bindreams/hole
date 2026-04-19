@@ -422,6 +422,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boolean_expression"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52a13b46d1f5df9cd15e0215e96839bda5eb21a8718ca7e8c9e3ee168cb7e7c0"
+dependencies = [
+ "itertools",
+ "smallvec",
+]
+
+[[package]]
 name = "borsh"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2872,6 +2882,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "284f18f85651fe11e8a991b2adb42cb078325c996ed026d994719efcfca1d54b"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itoa"
@@ -5565,10 +5584,11 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "skuld"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e06310cbdf3dc4c1db21297f396f41d27c2516a4f12d78cc7dcb3e3702090f9"
+checksum = "a8d0825b5522fe0fd51aa8ba7c437859bcf3afddc17059e3f81872fc7385a599"
 dependencies = [
+ "boolean_expression",
  "clap",
  "inventory",
  "libc",
@@ -5587,9 +5607,9 @@ dependencies = [
 
 [[package]]
 name = "skuld-macros"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81615ca2f468ee03c84b12390845c27f0e5a036231ecc3ed1f7dd952544b0d88"
+checksum = "548dce223d11a154daab629ef7b02e0837d973ae713d1dfc932d842132e387ec"
 dependencies = [
  "proc-macro2",
  "quote",

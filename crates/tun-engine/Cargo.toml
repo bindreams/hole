@@ -57,4 +57,4 @@ windows = { version = "0.62", features = [
 wintun-bindings = "0.7"
 
 [dev-dependencies]
-skuld = { version = "0.1", features = ["tokio"] }
+skuld = { workspace = true }
