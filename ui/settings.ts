@@ -131,6 +131,8 @@ function wireDropdown(btnId: string, menuId: string, configKey: string, onChange
 // Port input ==========================================================================================================
 
 const portInput = document.getElementById("input-port") as HTMLInputElement;
+const portHttpInput = document.getElementById("input-port-http") as HTMLInputElement;
+const rowPortHttp = document.getElementById("row-port-http")!;
 
 function wirePortInput() {
   portInput.addEventListener("change", () => {
@@ -143,7 +145,46 @@ function wirePortInput() {
       // Revert to current config value on invalid input.
       portInput.value = String(config.local_port ?? "");
     }
+    updatePortConflictMarkers();
   });
+}
+
+function wireHttpPortInput() {
+  portHttpInput.addEventListener("change", () => {
+    if (!config) return;
+    const parsed = parseInt(portHttpInput.value, 10);
+    if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
+      config.local_port_http = parsed;
+      saveConfig();
+    } else {
+      portHttpInput.value = String(config.local_port_http ?? "");
+    }
+    updatePortConflictMarkers();
+  });
+}
+
+/**
+ * Hide/show the HTTP port row to match the HTTP toggle. The bridge
+ * ignores `local_port_http` when `proxy_http` is false, but we mirror
+ * that in the UI so users can't set a value they don't see applied.
+ */
+function updateHttpPortVisibility() {
+  if (!config) return;
+  rowPortHttp.hidden = !config.proxy_http;
+}
+
+/**
+ * Mark both port inputs as `invalid` when SOCKS5 and HTTP are both
+ * enabled and their ports collide. The bridge is the authoritative
+ * validator (see `ProxyError::DuplicateListenerPort`) — this is only a
+ * UX affordance so the user sees the problem before hitting Start.
+ */
+function updatePortConflictMarkers() {
+  if (!config) return;
+  const bothOn = !!config.proxy_socks5 && !!config.proxy_http;
+  const collide = bothOn && config.local_port === config.local_port_http;
+  portInput.classList.toggle("invalid", collide);
+  portHttpInput.classList.toggle("invalid", collide);
 }
 
 // Click-outside handler ===============================================================================================
@@ -167,8 +208,13 @@ export function initSettings() {
   wireToggle("toggle-proxy-server", "proxy_server_enabled", () => {
     updateProxyMuting();
   });
-  wireToggle("toggle-socks5", "proxy_socks5");
-  wireToggle("toggle-http", "proxy_http");
+  wireToggle("toggle-socks5", "proxy_socks5", () => {
+    updatePortConflictMarkers();
+  });
+  wireToggle("toggle-http", "proxy_http", () => {
+    updateHttpPortVisibility();
+    updatePortConflictMarkers();
+  });
 
   // Dropdowns.
   wireDropdown("select-on-startup", "menu-on-startup", "on_startup");
@@ -176,8 +222,9 @@ export function initSettings() {
     applyTheme(value);
   });
 
-  // Port input.
+  // Port inputs.
   wirePortInput();
+  wireHttpPortInput();
 
   // Close dropdowns on click outside.
   handleClickOutside();
@@ -200,8 +247,11 @@ export function renderSettings() {
   syncDropdown("select-on-startup", "menu-on-startup", config.on_startup ?? "do_not_connect");
   syncDropdown("select-theme", "menu-theme", config.theme ?? "dark");
 
-  // Port input.
+  // Port inputs.
   portInput.value = String(config.local_port ?? "");
+  portHttpInput.value = String(config.local_port_http ?? "");
+  updateHttpPortVisibility();
+  updatePortConflictMarkers();
 
   // Proxy muting.
   updateProxyMuting();
