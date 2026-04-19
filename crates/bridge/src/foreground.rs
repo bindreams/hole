@@ -34,6 +34,16 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
     // bind() fails and we exit without touching any routing state.
     let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
 
+    // DNS recovery runs *before* route recovery. Rationale: mid-recovery
+    // crash leaves the user with functional DNS + broken routes (easier
+    // diagnosis path) instead of broken DNS + functional routes. See
+    // crate::dns::recovery module docs.
+    let state_dir_dns = state_dir.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || crate::dns::recovery::recover_dns_config(&state_dir_dns)).await
+    {
+        tracing::warn!(error = %e, "recover_dns_config task panicked");
+    }
+
     // Offload route recovery to a blocking thread so a hung netsh/route
     // command cannot wedge the runtime while the IPC socket is bound but
     // not yet serving.

@@ -7,6 +7,7 @@
 pub mod connector;
 pub mod forwarder;
 pub mod providers;
+pub mod recovery;
 pub mod server;
 pub mod socks5_connector;
 pub mod system;
