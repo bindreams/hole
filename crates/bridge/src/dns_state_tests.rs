@@ -8,8 +8,8 @@ fn sample_windows_state() -> DnsState {
         chosen_loopback: SocketAddr::from(([127, 0, 0, 1], 53)),
         adapters: vec![
             DnsPriorAdapter {
-                id: AdapterId::WindowsLuid {
-                    value: 0x0001_0000_0000_0001,
+                id: AdapterId::WindowsAlias {
+                    value: "Ethernet".into(),
                 },
                 name_at_capture: "Ethernet".into(),
                 v4: DnsPrior::Static {
@@ -21,8 +21,8 @@ fn sample_windows_state() -> DnsState {
                 v6: DnsPrior::None,
             },
             DnsPriorAdapter {
-                id: AdapterId::WindowsLuid {
-                    value: 0x0002_0000_0000_0002,
+                id: AdapterId::WindowsAlias {
+                    value: "hole-tun".into(),
                 },
                 name_at_capture: "hole-tun".into(),
                 v4: DnsPrior::Dhcp,
@@ -39,9 +39,7 @@ fn sample_macos_state() -> DnsState {
         version: SCHEMA_VERSION,
         chosen_loopback: SocketAddr::from(([127, 53, 0, 1], 53)),
         adapters: vec![DnsPriorAdapter {
-            id: AdapterId::MacosServiceId {
-                value: "BE3F4D41-1234-5678-ABCD-0123456789AB".into(),
-            },
+            id: AdapterId::MacosServiceName { value: "Wi-Fi".into() },
             name_at_capture: "Wi-Fi".into(),
             v4: DnsPrior::Dhcp,
             v6: DnsPrior::None,
@@ -125,7 +123,7 @@ fn load_unknown_adapter_field_returns_none() {
         "version": SCHEMA_VERSION,
         "chosen_loopback": "127.0.0.1:53",
         "adapters": [{
-            "id": { "kind": "windows_luid", "value": 42 },
+            "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
             "v4": { "kind": "none" },
             "v6": { "kind": "none" },
@@ -143,7 +141,7 @@ fn load_unknown_dns_prior_variant_returns_none() {
         "version": SCHEMA_VERSION,
         "chosen_loopback": "127.0.0.1:53",
         "adapters": [{
-            "id": { "kind": "windows_luid", "value": 42 },
+            "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
             "v4": { "kind": "mystery_mode" },
             "v6": { "kind": "none" },
@@ -173,11 +171,14 @@ fn dns_prior_variants_serialize_snake_case() {
 
 #[skuld::test]
 fn adapter_id_variants_serialize_snake_case() {
-    let win = serde_json::to_value(AdapterId::WindowsLuid { value: 42 }).unwrap();
-    assert_eq!(win, serde_json::json!({ "kind": "windows_luid", "value": 42 }));
+    let win = serde_json::to_value(AdapterId::WindowsAlias {
+        value: "Ethernet".into(),
+    })
+    .unwrap();
+    assert_eq!(win, serde_json::json!({ "kind": "windows_alias", "value": "Ethernet" }));
 
-    let mac = serde_json::to_value(AdapterId::MacosServiceId { value: "abc".into() }).unwrap();
-    assert_eq!(mac, serde_json::json!({ "kind": "macos_service_id", "value": "abc" }));
+    let mac = serde_json::to_value(AdapterId::MacosServiceName { value: "abc".into() }).unwrap();
+    assert_eq!(mac, serde_json::json!({ "kind": "macos_service_name", "value": "abc" }));
 }
 
 #[skuld::test]
@@ -187,7 +188,7 @@ fn load_rejects_unknown_field_in_static_variant() {
         "version": SCHEMA_VERSION,
         "chosen_loopback": "127.0.0.1:53",
         "adapters": [{
-            "id": { "kind": "windows_luid", "value": 42 },
+            "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
             "v4": { "kind": "static", "servers": ["1.1.1.1"], "mystery": true },
             "v6": { "kind": "none" },
@@ -198,13 +199,13 @@ fn load_rejects_unknown_field_in_static_variant() {
 }
 
 #[skuld::test]
-fn load_rejects_unknown_field_in_macos_service_id() {
+fn load_rejects_unknown_field_in_macos_service_name() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
         "chosen_loopback": "127.0.0.1:53",
         "adapters": [{
-            "id": { "kind": "macos_service_id", "value": "abc", "extra": 1 },
+            "id": { "kind": "macos_service_name", "value": "abc", "extra": 1 },
             "name_at_capture": "Wi-Fi",
             "v4": { "kind": "none" },
             "v6": { "kind": "none" },

@@ -52,15 +52,24 @@ pub struct DnsPriorAdapter {
 /// self-describing so `scripts/network-reset.py` can dispatch on `kind`
 /// without inferring from platform. Inner field is named `value` in every
 /// variant so readers can extract it uniformly without branching on `kind`.
+///
+/// ## Why alias/name not LUID/GUID
+///
+/// `netsh` (Windows) and `networksetup` (macOS) both accept the adapter's
+/// friendly *name* as their identifier. Going through LUID (Windows) or
+/// service-GUID (macOS) would require an extra name-round-trip at restore
+/// time. Stability: interface aliases survive reboots; macOS service
+/// names survive reboots. Rename mid-session is the only failure mode,
+/// matching the plan's "skip silently on restore" semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdapterId {
-    /// Windows interface LUID as the 64-bit `NET_LUID_LH.Value` union field
-    /// (combined representation, not the bit-fielded `Info` decomposition).
-    WindowsLuid { value: u64 },
-    /// macOS network service identifier (GUID-shaped string from
-    /// `networksetup -listallnetworkservices` / `scutil`).
-    MacosServiceId { value: String },
+    /// Windows adapter friendly name (alias), e.g. "Ethernet" or "Wi-Fi".
+    /// Passed directly to `netsh interface ... name="<value>"`.
+    WindowsAlias { value: String },
+    /// macOS network service name, e.g. "Wi-Fi" or "Ethernet". Passed
+    /// directly to `networksetup -setdnsservers <value>`.
+    MacosServiceName { value: String },
 }
 
 /// Prior DNS configuration for a single adapter + address family.
