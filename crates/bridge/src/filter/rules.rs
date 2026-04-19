@@ -25,8 +25,8 @@ pub struct RuleSet {
     /// Compiled rules in the user's original order.
     pub rules: Vec<CompiledRule>,
     /// Cached: true if any rule's matcher is a domain matcher. The
-    /// dispatcher uses this to skip the sniffer/fake-DNS path entirely
-    /// when only IP rules exist.
+    /// dispatcher uses this to skip the sniffer path entirely when only
+    /// IP rules exist (no point peeking if no rule would match the name).
     pub has_domain_rules: bool,
     /// Rules that failed to compile, with their original index in the
     /// user's input and a human-readable reason.

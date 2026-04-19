@@ -10,7 +10,7 @@ fn socks5_connect_refuses_when_no_server() {
         .unwrap();
 
     let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80);
-    let result = rt.block_on(socks5_connect(1, dst, None));
+    let result = rt.block_on(socks5_connect(1, dst));
 
     assert!(result.is_err(), "expected error when no SOCKS5 server is listening");
 }

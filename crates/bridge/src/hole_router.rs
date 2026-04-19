@@ -1,22 +1,24 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires the filter engine, fake DNS, SOCKS5 proxy, and bypass socket
-//! plumbing into tun-engine's abstract `Router` shape. Owns:
+//! Wires the filter engine, SOCKS5 proxy, and bypass socket plumbing into
+//! tun-engine's abstract `Router` shape. Owns:
 //!
 //! - Hot-swappable [`RuleSet`] (for filter reloads).
-//! - Optional [`FakeDns`] for synthetic-IP DNS hijacking + reverse lookup.
-//! - Upstream DNS resolver (for bypass-path domain resolution).
 //! - Per-connection block-logging dedup.
 //!
-//! Per-connection dispatch mirrors the old `dispatcher::tcp_handler` /
-//! `dispatcher::udp_handler` sequences: peek → reverse lookup → filter
-//! decide → splice.
+//! Per-connection dispatch: peek (TCP only) → filter decide → splice. For
+//! TCP flows the sniffer at [`crate::filter::peek`] extracts TLS SNI or
+//! HTTP Host from the first ≤ 2 KiB of payload, feeding the recovered name
+//! into the filter. UDP flows have no peek equivalent and match on IP only
+//! unless a future QUIC Initial parser is added.
+//!
+//! UDP-on-TCP-only-plugin is dropped, not bypassed. See
+//! [`HoleRouter::dispatch_udp`] for the privacy invariant.
 
 pub mod block_log;
-pub mod upstream_dns;
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -24,13 +26,12 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 use tun_engine::helpers::{create_bypass_tcp, create_bypass_udp, socks5_connect, Socks5UdpRelay};
-use tun_engine::{DnsInterceptor, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender};
+use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender};
 
 use self::block_log::BlockLog;
-use self::upstream_dns::UpstreamResolver;
+use crate::filter;
 use crate::filter::engine::{decide, ConnInfo, L4Proto};
 use crate::filter::rules::RuleSet;
-use crate::filter::{self, FakeDns};
 use hole_common::config::FilterAction;
 
 // Constants ===========================================================================================================
@@ -55,12 +56,7 @@ pub struct HoleRouter {
 
     /// Hot-swappable filter rules.
     rules: Arc<ArcSwap<RuleSet>>,
-    /// Synthetic-IP DNS hijack + reverse lookup. When set, also the
-    /// engine's `DnsInterceptor`.
-    fake_dns: Option<Arc<FakeDns>>,
 
-    /// DNS resolver for the bypass path.
-    upstream_resolver: UpstreamResolver,
     /// Rate-limited block log. Uses `std::sync::Mutex` because the
     /// critical section is sub-microsecond and never held across .await.
     block_log: Mutex<BlockLog>,
@@ -69,15 +65,12 @@ pub struct HoleRouter {
 }
 
 impl HoleRouter {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         local_port: u16,
         iface_index: u32,
         ipv6_available: bool,
         udp_proxy_available: bool,
         rules: RuleSet,
-        fake_dns: Option<Arc<FakeDns>>,
-        upstream_resolver: UpstreamResolver,
     ) -> Self {
         Self {
             local_port,
@@ -85,8 +78,6 @@ impl HoleRouter {
             ipv6_available,
             udp_proxy_available,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
-            fake_dns,
-            upstream_resolver,
             block_log: Mutex::new(BlockLog::new()),
             ipv6_bypass_warned: AtomicBool::new(false),
         }
@@ -101,12 +92,6 @@ impl HoleRouter {
     pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
         self.rules.load().dropped.clone()
     }
-
-    /// Clone the fake DNS handle so the caller can also pass it as the
-    /// engine's `DnsInterceptor`.
-    pub fn fake_dns(&self) -> Option<Arc<FakeDns>> {
-        self.fake_dns.clone()
-    }
 }
 
 // Router impl =========================================================================================================
@@ -114,99 +99,33 @@ impl HoleRouter {
 #[async_trait]
 impl Router for HoleRouter {
     async fn route_tcp(&self, meta: TcpMeta, mut flow: TcpFlow) -> io::Result<()> {
-        let dst = meta.dst;
-
-        // Step 1: Port 53 fast path — DNS over TCP.
-        if dst.port() == 53 {
-            if let Some(ref dns) = self.fake_dns {
-                return dns.handle_tcp(&mut flow).await;
-            }
-        }
-
-        // Step 2: Fake DNS reverse lookup.
-        let mut domain: Option<String> = None;
-        let mut pinned = false;
-
-        if let Some(ref dns) = self.fake_dns {
-            if let Some(d) = dns.reverse_lookup(dst.ip()) {
-                domain = Some(d.to_string());
-                dns.pin(dst.ip());
-                pinned = true;
-            }
-        }
-
-        let result = self.dispatch_tcp(&mut flow, dst, &mut domain).await;
-
-        if pinned {
-            if let Some(ref dns) = self.fake_dns {
-                dns.unpin(dst.ip());
-            }
-        }
-
-        result
+        self.dispatch_tcp(&mut flow, meta.dst).await
     }
 
     async fn route_udp(&self, meta: UdpMeta, flow: UdpFlow) -> io::Result<()> {
-        let dst_ip = meta.dst.ip();
-
-        // Fake DNS reverse lookup + pin.
-        let mut domain: Option<String> = None;
-        let mut pinned = false;
-        if let Some(ref dns) = self.fake_dns {
-            if let Some(d) = dns.reverse_lookup(dst_ip) {
-                domain = Some(d.to_string());
-                dns.pin(dst_ip);
-                pinned = true;
-            }
-        }
-
-        let result = self.dispatch_udp(meta, flow, &domain).await;
-
-        if pinned {
-            if let Some(ref dns) = self.fake_dns {
-                dns.unpin(dst_ip);
-            }
-        }
-
-        result
-    }
-}
-
-// FakeDns implements DnsInterceptor for port-53 UDP hijacking =========================================================
-
-/// Wrapper so `Arc<FakeDns>` can be handed to the engine via
-/// [`EngineConfig::dns_interceptor`] without adding a `DnsInterceptor`
-/// impl inside the `filter` module (which should not depend on
-/// `tun_engine`).
-pub struct FakeDnsInterceptor(pub Arc<FakeDns>);
-
-#[async_trait]
-impl DnsInterceptor for FakeDnsInterceptor {
-    async fn intercept(&self, request: &[u8]) -> Option<Vec<u8>> {
-        let reply = self.0.handle_udp(request);
-        if reply.is_empty() {
-            None
-        } else {
-            Some(reply)
-        }
+        self.dispatch_udp(meta, flow).await
     }
 }
 
 // TCP dispatch ========================================================================================================
 
 impl HoleRouter {
-    async fn dispatch_tcp(&self, flow: &mut TcpFlow, dst: SocketAddr, domain: &mut Option<String>) -> io::Result<()> {
+    async fn dispatch_tcp(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
         let current_rules = self.rules.load();
 
-        // Sniffer peek — only when domain is unknown AND domain rules exist.
-        if domain.is_none() && current_rules.has_domain_rules {
+        // Sniffer peek — only when domain rules exist. Recovers TLS SNI or
+        // HTTP Host from the first ≤ 2 KiB of payload so domain-based rules
+        // can match.
+        let mut domain: Option<String> = None;
+        if current_rules.has_domain_rules {
             // `flow.peek` handles the sniffer-concurrency cap internally
-            // via the engine-owned semaphore. A timeout is not an error;
-            // the slice returned is whatever arrived in the window.
+            // via the engine-owned semaphore. A timeout returns `Ok(&[])`
+            // so the `if let Ok` only swallows a legitimate close-during-
+            // shutdown error, which we treat as "no peek payload".
             if let Ok(peeked) = flow.peek(PEEK_BUF_SIZE, PEEK_TIMEOUT).await {
                 if !peeked.is_empty() {
                     if let Some(sni) = filter::peek(peeked) {
-                        *domain = Some(sni);
+                        domain = Some(sni);
                     }
                 }
             }
@@ -221,8 +140,8 @@ impl HoleRouter {
         drop(current_rules);
 
         match decision.action {
-            FilterAction::Proxy => self.dispatch_tcp_proxy(flow, dst, domain).await,
-            FilterAction::Bypass => self.dispatch_tcp_bypass(flow, dst, domain).await,
+            FilterAction::Proxy => self.dispatch_tcp_proxy(flow, dst).await,
+            FilterAction::Bypass => self.dispatch_tcp_bypass(flow, dst).await,
             FilterAction::Block => {
                 let rule_index = decision.rule_index.unwrap_or(0) as u32;
                 let should_log = self.block_log.lock().unwrap().should_log(rule_index, dst);
@@ -238,58 +157,37 @@ impl HoleRouter {
         }
     }
 
-    async fn dispatch_tcp_proxy(&self, flow: &mut TcpFlow, dst: SocketAddr, domain: &Option<String>) -> io::Result<()> {
-        let mut upstream = socks5_connect(self.local_port, dst, domain.as_deref()).await?;
+    async fn dispatch_tcp_proxy(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
+        let mut upstream = socks5_connect(self.local_port, dst).await?;
         // Peeked bytes are still buffered inside `flow` — copy_bidirectional
         // will include them naturally.
         tokio::io::copy_bidirectional(flow, &mut upstream).await?;
         Ok(())
     }
 
-    async fn dispatch_tcp_bypass(
-        &self,
-        flow: &mut TcpFlow,
-        dst: SocketAddr,
-        domain: &Option<String>,
-    ) -> io::Result<()> {
-        let real_ip = self.resolve_bypass_ip(dst.ip(), domain.as_deref()).await?;
-
-        if real_ip.is_ipv6() && !self.ipv6_available {
+    async fn dispatch_tcp_bypass(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
+        if dst.is_ipv6() && !self.ipv6_available {
             if !self.ipv6_bypass_warned.swap(true, Ordering::Relaxed) {
                 warn!("IPv6 bypass requested but upstream has no IPv6; falling back to block");
             }
             return Ok(());
         }
 
-        let mut upstream = create_bypass_tcp(SocketAddr::new(real_ip, dst.port()), self.iface_index).await?;
+        let mut upstream = create_bypass_tcp(dst, self.iface_index).await?;
         tokio::io::copy_bidirectional(flow, &mut upstream).await?;
         Ok(())
-    }
-
-    async fn resolve_bypass_ip(&self, dst_ip: IpAddr, domain: Option<&str>) -> io::Result<IpAddr> {
-        let is_fake = self.fake_dns.as_ref().is_some_and(|dns| dns.is_fake_ip(dst_ip));
-        if !is_fake {
-            return Ok(dst_ip);
-        }
-        let domain =
-            domain.ok_or_else(|| io::Error::other("bypass: dst_ip is in fake DNS pool but no domain available"))?;
-        let addrs = self.upstream_resolver.resolve(domain).await?;
-        addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| io::Error::other(format!("bypass: no addresses resolved for {domain}")))
     }
 }
 
 // UDP dispatch ========================================================================================================
 
 impl HoleRouter {
-    async fn dispatch_udp(&self, meta: UdpMeta, flow: UdpFlow, domain: &Option<String>) -> io::Result<()> {
+    async fn dispatch_udp(&self, meta: UdpMeta, flow: UdpFlow) -> io::Result<()> {
         let dst = meta.dst;
 
         let conn_info = ConnInfo {
             dst,
-            domain: domain.clone(),
+            domain: None,
             proto: L4Proto::Udp,
         };
         let current_rules = self.rules.load();
@@ -298,6 +196,9 @@ impl HoleRouter {
 
         let mut action = decision.action;
 
+        // Privacy invariant: UDP that the filter said to proxy must not
+        // leak out the unprotected bypass when the plugin can't carry
+        // it. Drop instead. See the module doc.
         if action == FilterAction::Proxy && !self.udp_proxy_available {
             let mut log = self.block_log.lock().unwrap();
             if log.should_log(decision.rule_index.unwrap_or(0) as u32, dst) {
@@ -306,14 +207,7 @@ impl HoleRouter {
             action = FilterAction::Block;
         }
 
-        let real_dst = if action == FilterAction::Bypass {
-            let real_ip = self.resolve_bypass_ip(dst.ip(), domain.as_deref()).await?;
-            SocketAddr::new(real_ip, dst.port())
-        } else {
-            dst
-        };
-
-        if action == FilterAction::Bypass && real_dst.is_ipv6() && !self.ipv6_available {
+        if action == FilterAction::Bypass && dst.is_ipv6() && !self.ipv6_available {
             if !self.ipv6_bypass_warned.swap(true, Ordering::Relaxed) {
                 warn!("IPv6 bypass unavailable for UDP, blocking");
             }
@@ -321,13 +215,13 @@ impl HoleRouter {
         }
 
         match action {
-            FilterAction::Proxy => splice_udp_proxy(flow, self.local_port, real_dst, domain.clone()).await,
-            FilterAction::Bypass => splice_udp_bypass(flow, real_dst, self.iface_index).await,
+            FilterAction::Proxy => splice_udp_proxy(flow, self.local_port, dst).await,
+            FilterAction::Bypass => splice_udp_bypass(flow, dst, self.iface_index).await,
             FilterAction::Block => {
                 let rule_index = decision.rule_index.unwrap_or(0) as u32;
                 let mut log = self.block_log.lock().unwrap();
                 if log.should_log(rule_index, dst) {
-                    info!(%dst, domain = ?domain, "blocked UDP flow");
+                    info!(%dst, "blocked UDP flow");
                 }
                 // Dropping the flow ends route_udp; any further datagrams
                 // for the 5-tuple silently fail to enqueue until the
@@ -341,12 +235,7 @@ impl HoleRouter {
 // UDP splice helpers ==================================================================================================
 
 /// Relay a UdpFlow through the SS SOCKS5 UDP Associate channel.
-async fn splice_udp_proxy(
-    mut flow: UdpFlow,
-    local_port: u16,
-    dst: SocketAddr,
-    domain: Option<String>,
-) -> io::Result<()> {
+async fn splice_udp_proxy(mut flow: UdpFlow, local_port: u16, dst: SocketAddr) -> io::Result<()> {
     let relay = Arc::new(Socks5UdpRelay::associate(local_port).await?);
 
     // Reader task: pull replies from the relay and inject back into the flow.
@@ -363,7 +252,7 @@ async fn splice_udp_proxy(
 
     // Forwarder: pull inbound datagrams from the flow, send via relay.
     while let Some(payload) = flow.recv().await {
-        if relay.send_to(dst, domain.as_deref(), &payload).await.is_err() {
+        if relay.send_to(dst, &payload).await.is_err() {
             break;
         }
     }

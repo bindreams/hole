@@ -209,8 +209,8 @@ impl Socks5UdpRelay {
     }
 
     /// Send a datagram through the relay.
-    pub async fn send_to(&self, dst: SocketAddr, domain: Option<&str>, payload: &[u8]) -> io::Result<()> {
-        let pkt = encode_socks5_udp(dst, domain, payload);
+    pub async fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        let pkt = encode_socks5_udp(dst, None, payload);
         self.socket.send(&pkt).await?;
         Ok(())
     }

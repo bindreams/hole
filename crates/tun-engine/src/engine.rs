@@ -10,10 +10,10 @@
 //!     c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
 //!     c.ipv6 = Some("fd00::ff00:1/64".parse().unwrap());
 //! })?;
-//! let router = Arc::new(HoleRouter::new(...));
+//! let router = Arc::new(my_router);
 //! let engine = Engine::build(device, router, |c| {
 //!     c.max_connections = 4096;
-//!     c.dns_interceptor = Some(Arc::new(FakeDns::with_defaults()));
+//!     // Optional: c.dns_interceptor = Some(Arc::new(my_dns_interceptor));
 //! })?;
 //! engine.run(cancel_token).await;
 //! ```

@@ -198,9 +198,8 @@ fn canonicalize_domain(input: &str) -> Result<String, CompileError> {
 /// runs IDNA normalization + lowercase + trailing-dot strip. On any
 /// failure (malformed Unicode, idna error, empty string), returns the
 /// trimmed input lowercased verbatim — we never reject a connection
-/// just because the sniffer/fake-DNS handed us something we couldn't
-/// canonicalize, since rule compilation has already rejected its own
-/// malformed inputs.
+/// just because the sniffer handed us something we couldn't canonicalize,
+/// since rule compilation has already rejected its own malformed inputs.
 ///
 /// This is exposed publicly so the dispatcher (Plans 2/3) can call it
 /// once per connection at `ConnInfo` construction time. The matcher

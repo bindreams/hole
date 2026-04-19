@@ -1,11 +1,15 @@
 //! Connection-level domain sniffer.
 //!
-//! When the dispatcher (Plans 2/3) accepts a new TCP connection and
-//! the fake DNS reverse lookup misses, it peeks the first ~2 KiB of
-//! payload and asks the sniffer to extract a domain. The sniffer
-//! tries TLS SNI first (covers ~all HTTPS/DoH/DoT/SMTPS/IMAPS), then
-//! HTTP Host header (covers plaintext HTTP). If neither matches, the
+//! When the dispatcher accepts a new TCP connection it peeks the first
+//! ~2 KiB of payload and asks the sniffer to extract a destination domain.
+//! The sniffer tries TLS SNI first (covers ~all HTTPS/DoH/DoT/SMTPS/IMAPS),
+//! then HTTP Host header (covers plaintext HTTP). If neither matches, the
 //! connection falls through to IP-only matching.
+//!
+//! This is hole's primary name-recovery mechanism — the previous FakeDns
+//! reverse-lookup path was dropped with the shift to peek-first rule
+//! matching. QUIC/UDP and non-TLS/non-HTTP TCP are IP-only as a
+//! documented trade-off.
 //!
 //! Both submodules are pure functions over a `&[u8]` buffer. Tests
 //! exercise them with static fixtures of real ClientHellos and HTTP

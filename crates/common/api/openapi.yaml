@@ -225,8 +225,6 @@ components:
         - blocked
         - sniffer_hits
         - sniffer_misses
-        - fake_dns_queries
-        - fake_dns_reverse_hits
         - active_udp_flows
         - udp_drops_backpressure
       properties:
@@ -251,14 +249,6 @@ components:
           format: uint64
           minimum: 0
         sniffer_misses:
-          type: integer
-          format: uint64
-          minimum: 0
-        fake_dns_queries:
-          type: integer
-          format: uint64
-          minimum: 0
-        fake_dns_reverse_hits:
           type: integer
           format: uint64
           minimum: 0
