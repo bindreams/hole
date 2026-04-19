@@ -22,6 +22,7 @@ fn sample_config() -> ProxyConfig {
         local_port: 4073,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: vec![],
+        dns: hole_common::config::DnsConfig::default(),
     }
 }
 

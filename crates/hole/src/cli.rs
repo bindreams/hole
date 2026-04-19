@@ -694,6 +694,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     local_port,
                     tunnel_mode: tunnel_mode.into(),
                     filters: Vec::new(),
+                    dns: hole_common::config::DnsConfig::default(),
                 },
             };
             match send_bridge_request_inner(request) {

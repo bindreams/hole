@@ -21,6 +21,7 @@ fn sample_config() -> ProxyConfig {
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
         filters: Vec::new(),
+        dns: crate::config::DnsConfig::default(),
     }
 }
 
@@ -386,6 +387,7 @@ fn proxy_config_tunnel_mode_full_roundtrips() {
         local_port: 4073,
         tunnel_mode: TunnelMode::Full,
         filters: Vec::new(),
+        dns: crate::config::DnsConfig::default(),
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
@@ -399,6 +401,7 @@ fn proxy_config_tunnel_mode_socks_only_roundtrips() {
         local_port: 4073,
         tunnel_mode: TunnelMode::SocksOnly,
         filters: Vec::new(),
+        dns: crate::config::DnsConfig::default(),
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();

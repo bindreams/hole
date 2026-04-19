@@ -377,6 +377,83 @@ fn theme_all_variants_roundtrip() {
     }
 }
 
+// DNS config ==========================================================================================================
+
+#[skuld::test]
+fn dns_config_default_is_doh_cloudflare() {
+    let cfg = DnsConfig::default();
+    assert!(cfg.enabled);
+    assert_eq!(cfg.protocol, DnsProtocol::Https);
+    assert!(cfg.intercept_udp53);
+    assert_eq!(cfg.servers.len(), 2);
+    assert_eq!(cfg.servers[0], "1.1.1.1".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(cfg.servers[1], "1.0.0.1".parse::<std::net::IpAddr>().unwrap());
+}
+
+#[skuld::test]
+fn deserialize_without_dns_field_uses_default() {
+    // Pre-DnsConfig configs omit the field entirely. Must deserialize cleanly
+    // with DnsConfig::default() applied on upgrade — "enabled on upgrade,
+    // no notification" migration decision.
+    let json = r#"{"servers": [], "local_port": 4073, "enabled": false}"#;
+    let config: AppConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.dns, DnsConfig::default());
+    assert!(config.dns.enabled);
+}
+
+#[skuld::test]
+fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config.json");
+    let config = AppConfig {
+        dns: DnsConfig {
+            enabled: false,
+            servers: vec!["9.9.9.9".parse().unwrap(), "149.112.112.112".parse().unwrap()],
+            protocol: DnsProtocol::Tls,
+            intercept_udp53: false,
+        },
+        ..Default::default()
+    };
+    config.save(&path).unwrap();
+    let loaded = AppConfig::load(&path).unwrap();
+    assert_eq!(config.dns, loaded.dns);
+}
+
+#[skuld::test]
+fn dns_protocol_variants_serialize_as_snake_case() {
+    assert_eq!(serde_json::to_string(&DnsProtocol::PlainUdp).unwrap(), r#""plain_udp""#);
+    assert_eq!(serde_json::to_string(&DnsProtocol::PlainTcp).unwrap(), r#""plain_tcp""#);
+    assert_eq!(serde_json::to_string(&DnsProtocol::Tls).unwrap(), r#""tls""#);
+    assert_eq!(serde_json::to_string(&DnsProtocol::Https).unwrap(), r#""https""#);
+}
+
+#[skuld::test]
+fn dns_protocol_variants_all_roundtrip() {
+    for variant in [
+        DnsProtocol::PlainUdp,
+        DnsProtocol::PlainTcp,
+        DnsProtocol::Tls,
+        DnsProtocol::Https,
+    ] {
+        let json = serde_json::to_string(&variant).unwrap();
+        let parsed: DnsProtocol = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, parsed);
+    }
+}
+
+#[skuld::test]
+fn dns_config_accepts_mixed_v4_v6_servers() {
+    let cfg = DnsConfig {
+        enabled: true,
+        servers: vec!["1.1.1.1".parse().unwrap(), "2606:4700:4700::1111".parse().unwrap()],
+        protocol: DnsProtocol::Https,
+        intercept_udp53: true,
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let parsed: DnsConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(cfg, parsed);
+    assert!(parsed.servers[1].is_ipv6());
+}
+
 // Plugin name validation ==============================================================================================
 
 #[skuld::test]

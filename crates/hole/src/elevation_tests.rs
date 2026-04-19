@@ -21,6 +21,7 @@ fn encode_request_roundtrips() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            dns: hole_common::config::DnsConfig::default(),
         },
     };
 
@@ -68,6 +69,7 @@ fn write_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            dns: hole_common::config::DnsConfig::default(),
         },
     };
 
@@ -103,6 +105,7 @@ fn read_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
+            dns: hole_common::config::DnsConfig::default(),
         },
     };
 

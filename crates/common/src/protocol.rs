@@ -133,6 +133,12 @@ pub struct ProxyConfig {
     /// (no filtering — all captured traffic proxied).
     #[serde(default)]
     pub filters: Vec<FilterRule>,
+    /// Built-in DNS forwarder configuration. Defaults to
+    /// [`DnsConfig::default()`] (enabled, DoH to Cloudflare). Older clients
+    /// that don't send this field get the default, which silently enables
+    /// the forwarder on upgrade.
+    #[serde(default)]
+    pub dns: crate::config::DnsConfig,
 }
 
 // Server test outcome =================================================================================================

@@ -389,6 +389,7 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         local_port: config.local_port,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: config.filters.clone(),
+        dns: config.dns.clone(),
     })
 }
 
