@@ -14,6 +14,7 @@ harness = false
 
 [dependencies]
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
