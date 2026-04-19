@@ -133,6 +133,12 @@ pub struct ProxyConfig {
     /// (no filtering — all captured traffic proxied).
     #[serde(default)]
     pub filters: Vec<FilterRule>,
+    /// Built-in DNS forwarder configuration. Defaults to
+    /// [`DnsConfig::default()`] (enabled, DoH to Cloudflare). Older clients
+    /// that don't send this field get the default, which silently enables
+    /// the forwarder on upgrade.
+    #[serde(default)]
+    pub dns: crate::config::DnsConfig,
     /// Whether to bind a SOCKS5 listener on `127.0.0.1:{local_port}`.
     /// Defaults to `true` so older clients that omit the field keep their
     /// existing behaviour. Required when `tunnel_mode == Full` (the TUN
@@ -169,6 +175,7 @@ impl Default for ProxyConfig {
             local_port: 4073,
             tunnel_mode: TunnelMode::default(),
             filters: Vec::new(),
+            dns: crate::config::DnsConfig::default(),
             proxy_socks5: true,
             proxy_http: false,
             local_port_http: 4074,

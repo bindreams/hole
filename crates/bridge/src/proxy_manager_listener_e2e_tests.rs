@@ -49,6 +49,7 @@ fn base_config(ss: &SsServerHandle, local_port: u16, local_port_http: u16) -> Pr
         local_port,
         tunnel_mode: TunnelMode::SocksOnly,
         filters: vec![],
+        dns: hole_common::config::DnsConfig::default(),
         proxy_socks5: true,
         proxy_http: false,
         local_port_http,

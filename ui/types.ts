@@ -44,6 +44,21 @@ export interface FilterRule {
   action: "proxy" | "bypass" | "block";
 }
 
+/// DNS upstream transport. Mirrors the Rust `DnsProtocol` enum in
+/// `crates/common/src/config.rs`. Values are snake_case to match the
+/// serde representation on the wire.
+export type DnsProtocol = "plain_udp" | "plain_tcp" | "tls" | "https";
+
+/// Built-in DNS forwarder configuration. Mirrors the Rust `DnsConfig`
+/// struct in `crates/common/src/config.rs`. Saved as part of
+/// `Config.dns`; the bridge reads it at proxy start.
+export interface DnsConfig {
+  enabled: boolean;
+  servers: string[];
+  protocol: DnsProtocol;
+  intercept_udp53: boolean;
+}
+
 export interface Config {
   servers: Server[];
   selected_server: string | null;
@@ -56,6 +71,7 @@ export interface Config {
   proxy_http: boolean;
   on_startup: string;
   theme: string;
+  dns?: DnsConfig;
   [key: string]: unknown;
 }
 

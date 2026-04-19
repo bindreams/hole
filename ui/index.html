@@ -141,6 +141,38 @@
                   </div>
                 </div>
               </div>
+              <hr class="setting-divider">
+              <div class="setting-row">
+                <span class="setting-label">DNS forwarder</span>
+                <div class="setting-control">
+                  <div class="toggle" id="toggle-dns-enabled"></div>
+                </div>
+              </div>
+              <div class="setting-nested" id="dns-nested">
+                <div class="setting-row">
+                  <span class="setting-label">Protocol</span>
+                  <div class="setting-control">
+                    <div class="custom-select-wrap">
+                      <div class="custom-select-btn" id="select-dns-protocol">DNS over HTTPS</div>
+                      <div class="custom-select-menu" id="menu-dns-protocol">
+                        <div class="custom-select-opt" data-value="plain-udp">Plain UDP</div>
+                        <div class="custom-select-opt" data-value="plain-tcp">Plain TCP</div>
+                        <div class="custom-select-opt" data-value="tls">DNS over TLS</div>
+                        <div class="custom-select-opt selected" data-value="https">DNS over HTTPS</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="setting-row">
+                  <span class="setting-label">Intercept UDP/53 to other servers</span>
+                  <div class="setting-control">
+                    <div class="toggle" id="toggle-dns-intercept"></div>
+                  </div>
+                </div>
+                <div class="setting-row setting-note">
+                  <span class="setting-label">Settings apply on reconnect. Edit the config file to change server list.</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>

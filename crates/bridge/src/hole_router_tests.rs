@@ -11,9 +11,13 @@ use super::*;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, Socks5Endpoint};
+use std::sync::Arc;
+
+use crate::dns::connector::DirectConnector;
+use crate::dns::forwarder::DnsForwarder;
+use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
-use hole_common::config::FilterAction;
+use hole_common::config::{DnsConfig, DnsProtocol, FilterAction};
 
 fn v4(s: &str, port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(s.parse::<Ipv4Addr>().unwrap()), port)
@@ -97,6 +101,14 @@ enum ExpectedEndpoint {
     Drop { reason: &'static str },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DnsExpectedEndpoint {
+    Proxy,
+    Bypass,
+    LocalDns,
+    Drop { reason: &'static str },
+}
+
 fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
     match d {
         Dispatch::Endpoint(e) => {
@@ -117,6 +129,46 @@ fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
             ExpectedEndpoint::Drop { reason }
         }
     }
+}
+
+fn classify_with_dns(d: Dispatch<'_>, router: &HoleRouter) -> DnsExpectedEndpoint {
+    match d {
+        Dispatch::Endpoint(e) => {
+            if std::ptr::eq(e as *const _ as *const (), &router.proxy as *const _ as *const ()) {
+                DnsExpectedEndpoint::Proxy
+            } else if std::ptr::eq(e as *const _ as *const (), &router.bypass as *const _ as *const ()) {
+                DnsExpectedEndpoint::Bypass
+            } else {
+                DnsExpectedEndpoint::LocalDns
+            }
+        }
+        Dispatch::Drop(r) => {
+            let reason = match r {
+                DropReason::RuleBlock { .. } => "rule_block",
+                DropReason::UdpProxyUnavailable { .. } => "udp_proxy_unavailable",
+                DropReason::Ipv6BypassUnreachable { .. } => "ipv6_bypass_unreachable",
+            };
+            DnsExpectedEndpoint::Drop { reason }
+        }
+    }
+}
+
+fn sample_dns_cfg() -> DnsConfig {
+    DnsConfig {
+        enabled: true,
+        servers: vec!["192.0.2.1".parse().unwrap()],
+        protocol: DnsProtocol::PlainUdp,
+        intercept_udp53: true,
+    }
+}
+
+fn router_with_local_dns(proxy_udp: bool, bypass_v6: bool) -> HoleRouter {
+    let proxy = Socks5Endpoint::new(v4("127.0.0.1", 1080), Some("test-plugin".into()), proxy_udp);
+    let bypass = InterfaceEndpoint::new(1, bypass_v6);
+    let block = BlockEndpoint::new();
+    let fwd = Arc::new(DnsForwarder::new(sample_dns_cfg(), Arc::new(DirectConnector), true));
+    let local_dns = LocalDnsEndpoint::new(fwd);
+    HoleRouter::with_local_dns(proxy, bypass, block, Some(local_dns), RuleSet::default())
 }
 
 #[skuld::test]
@@ -210,6 +262,100 @@ fn cascade_table() {
             "resolve_endpoint({action:?}, {l4:?}, {dst}, proxy_udp={proxy_udp}, bypass_v6={bypass_v6})"
         );
     }
+}
+
+// BlockEndpoint log-methods — rate-limit and one-shot behavior ========================================================
+
+// LocalDns interception ===============================================================================================
+
+#[skuld::test]
+fn udp53_to_external_ip_intercepted_when_local_dns_present() {
+    let r = router_with_local_dns(false, true);
+    // UDP/53 to an external resolver — normally this would be dropped by
+    // the UDP-proxy-unavailable invariant (proxy_udp=false), but the
+    // LocalDnsEndpoint precedes the action cascade.
+    let got = classify_with_dns(
+        r.resolve_endpoint(FilterAction::Proxy, L4Proto::Udp, v4("8.8.8.8", 53), Some(0)),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::LocalDns);
+}
+
+#[skuld::test]
+fn udp53_intercepted_even_when_rule_says_block() {
+    // The hardcoded-DoH case: user has a rule `Block 1.1.1.1`, but Chrome
+    // hits 1.1.1.1:53 for DoH. We still serve via local DNS.
+    let r = router_with_local_dns(true, true);
+    let got = classify_with_dns(
+        r.resolve_endpoint(FilterAction::Block, L4Proto::Udp, v4("1.1.1.1", 53), Some(0)),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::LocalDns);
+}
+
+#[skuld::test]
+fn udp53_intercepted_even_when_rule_says_bypass() {
+    let r = router_with_local_dns(true, true);
+    let got = classify_with_dns(
+        r.resolve_endpoint(FilterAction::Bypass, L4Proto::Udp, v4("8.8.4.4", 53), Some(0)),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::LocalDns);
+}
+
+#[skuld::test]
+fn tcp53_not_intercepted_even_with_local_dns() {
+    // TCP/53 is out of scope for LocalDnsEndpoint (could be AXFR etc.).
+    let r = router_with_local_dns(true, true);
+    let got = classify_with_dns(
+        r.resolve_endpoint(FilterAction::Proxy, L4Proto::Tcp, v4("1.1.1.1", 53), Some(0)),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::Proxy);
+}
+
+#[skuld::test]
+fn udp53_v6_destination_also_intercepted() {
+    let r = router_with_local_dns(false, false);
+    let got = classify_with_dns(
+        r.resolve_endpoint(
+            FilterAction::Proxy,
+            L4Proto::Udp,
+            v6("2001:4860:4860::8888", 53),
+            Some(0),
+        ),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::LocalDns);
+}
+
+#[skuld::test]
+fn udp53_without_local_dns_keeps_existing_behavior() {
+    // When local_dns is None (intercept_udp53 disabled), the cascade
+    // reverts to the pre-refactor behavior: Proxy + UDP + !proxy_udp
+    // drops via the privacy invariant.
+    let r = router_with(false, true);
+    let got = classify(
+        r.resolve_endpoint(FilterAction::Proxy, L4Proto::Udp, v4("8.8.8.8", 53), Some(0)),
+        &r,
+    );
+    assert_eq!(
+        got,
+        ExpectedEndpoint::Drop {
+            reason: "udp_proxy_unavailable"
+        }
+    );
+}
+
+#[skuld::test]
+fn udp_non53_not_intercepted_by_local_dns() {
+    // Non-53 UDP should not hit LocalDnsEndpoint even when it's present.
+    let r = router_with_local_dns(true, true);
+    let got = classify_with_dns(
+        r.resolve_endpoint(FilterAction::Proxy, L4Proto::Udp, v4("8.8.8.8", 443), Some(0)),
+        &r,
+    );
+    assert_eq!(got, DnsExpectedEndpoint::Proxy);
 }
 
 // BlockEndpoint log-methods — rate-limit and one-shot behavior ========================================================

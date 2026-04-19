@@ -48,7 +48,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta};
 
-use crate::endpoint::{BlockEndpoint, Endpoint, InterfaceEndpoint, Socks5Endpoint};
+use crate::endpoint::{BlockEndpoint, Endpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter;
 use crate::filter::engine::{decide, ConnInfo, L4Proto};
 use crate::filter::rules::RuleSet;
@@ -68,6 +68,11 @@ pub struct HoleRouter {
     proxy: Socks5Endpoint,
     bypass: InterfaceEndpoint,
     block: BlockEndpoint,
+    /// Optional in-tunnel DNS interceptor. When present *and*
+    /// `DnsConfig.intercept_udp53 == true`, the cascade diverts UDP/53
+    /// flows to this endpoint instead of the proxy. `None` disables
+    /// interception (user config or SocksOnly mode).
+    local_dns: Option<LocalDnsEndpoint>,
     rules: Arc<ArcSwap<RuleSet>>,
 }
 
@@ -77,6 +82,26 @@ impl HoleRouter {
             proxy,
             bypass,
             block,
+            local_dns: None,
+            rules: Arc::new(ArcSwap::from_pointee(rules)),
+        }
+    }
+
+    /// Construct with an in-tunnel DNS interceptor attached. When
+    /// `Some(_)`, the UDP/53 cascade diverts to `local_dns` before
+    /// falling through to the proxy path. `None` disables interception.
+    pub fn with_local_dns(
+        proxy: Socks5Endpoint,
+        bypass: InterfaceEndpoint,
+        block: BlockEndpoint,
+        local_dns: Option<LocalDnsEndpoint>,
+        rules: RuleSet,
+    ) -> Self {
+        Self {
+            proxy,
+            bypass,
+            block,
+            local_dns,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
         }
     }
@@ -126,6 +151,16 @@ impl HoleRouter {
         rule_index: Option<u32>,
     ) -> Dispatch<'_> {
         let rule_index = rule_index.unwrap_or(0);
+        // Intercept UDP/53 *before* the action cascade — a LocalDnsEndpoint
+        // takes precedence over any FilterAction decision. This ensures
+        // the forwarder answers even for flows whose rule would otherwise
+        // Block/Bypass/Proxy (e.g. a user rule `Block 8.8.8.8` still sends
+        // Chrome's hardcoded-DoH DNS through the local forwarder).
+        if l4 == L4Proto::Udp && dst.port() == 53 {
+            if let Some(local) = self.local_dns.as_ref() {
+                return Dispatch::Endpoint(local);
+            }
+        }
         match action {
             FilterAction::Proxy => {
                 // Privacy invariant: if proxy can't carry this UDP flow,

@@ -711,6 +711,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     local_port,
                     tunnel_mode: tunnel_mode.into(),
                     filters: Vec::new(),
+                    dns: hole_common::config::DnsConfig::default(),
                     proxy_socks5: !no_socks5,
                     proxy_http: http,
                     local_port_http,

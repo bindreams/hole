@@ -1,5 +1,6 @@
 use crate::protocol::ServerTestOutcome;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::Path;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -58,6 +59,62 @@ pub enum Theme {
     System,
 }
 
+// DNS forwarder =======================================================================================================
+
+/// Transport used by the built-in DNS forwarder when talking upstream to
+/// [`DnsConfig::servers`].
+///
+/// `PlainUdp` works only when the configured plugin can carry UDP (galoshes)
+/// OR the upstream IP is covered by a bypass rule — otherwise the
+/// forwarder's own UDP/53 queries are dropped by the HoleRouter the same way
+/// the original bug drops OS queries. `PlainTcp`, `Tls`, `Https` all go over
+/// TCP and ride through any plugin.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsProtocol {
+    PlainUdp,
+    PlainTcp,
+    Tls,
+    #[default]
+    Https,
+}
+
+/// Built-in DNS forwarder configuration.
+///
+/// The bridge binds a loopback DNS server when `enabled`, reconfigures the
+/// OS resolver to point at it, and forwards queries upstream via
+/// [`DnsProtocol`]. Queries travel through the shadowsocks SOCKS5 listener,
+/// so they're carried over the TCP tunnel even when the plugin is TCP-only.
+///
+/// `servers` is ordered: the first entry is primary, subsequent entries are
+/// tried on failure. The UI currently renders exactly two rows
+/// (primary + secondary), but the model accepts any number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsConfig {
+    pub enabled: bool,
+    pub servers: Vec<IpAddr>,
+    pub protocol: DnsProtocol,
+    /// When `true`, the HoleRouter redirects any in-tunnel UDP/53 flow to
+    /// the loopback forwarder (not only queries to the OS-configured
+    /// resolver). Catches apps that hardcode DNS destinations like
+    /// Chrome's Secure DNS to `8.8.8.8`.
+    pub intercept_udp53: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers: vec![
+                IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
+            ],
+            protocol: DnsProtocol::Https,
+            intercept_udp53: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
@@ -80,6 +137,7 @@ pub struct AppConfig {
     pub proxy_server_enabled: bool,
     pub proxy_socks5: bool,
     pub proxy_http: bool,
+    pub dns: DnsConfig,
     /// Port for the HTTP CONNECT listener when `proxy_http` is enabled. The
     /// SOCKS5 listener uses `local_port`; the two must differ when both
     /// toggles are on (enforced at bridge start by
@@ -102,6 +160,7 @@ impl Default for AppConfig {
             proxy_server_enabled: true,
             proxy_socks5: true,
             proxy_http: false,
+            dns: DnsConfig::default(),
             local_port_http: 4074,
         }
     }
