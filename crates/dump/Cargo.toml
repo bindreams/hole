@@ -1,0 +1,21 @@
+[package]
+name = "dump"
+version = "0.1.0"
+edition = "2021"
+description = "YAML-shaped representation for logging, analogous to Python's dump() alongside str()/repr()."
+repository = "https://github.com/bindreams/hole"
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+base64 = "0.22"
+dump-macros = { path = "../dump-macros" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+skuld = { workspace = true }

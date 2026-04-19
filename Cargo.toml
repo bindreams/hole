@@ -1,10 +1,12 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/handle-holders", "crates/hole", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/handle-holders", "crates/hole", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
 exclude = ["external/galoshes"]
 resolver = "2"
 
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
+insta = { version = "1", features = ["yaml"] }
+trybuild = "1"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

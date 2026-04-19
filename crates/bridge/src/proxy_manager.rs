@@ -29,6 +29,7 @@
 use std::net::IpAddr;
 use std::time::Instant;
 
+use dump::{dump, DeriveDump};
 use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -36,6 +37,21 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{Routing, SystemRouting};
 
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
+
+/// Non-secret diagnostic view of a proxy-start event — suitable for
+/// YAML-shaped logging via `dump!`. Deliberately excludes password /
+/// PSK fields; `ServerEntry` itself is not `Dump` so it cannot be
+/// dropped into a log by mistake.
+#[derive(DeriveDump)]
+struct ProxyStartedDiag<'a> {
+    server_ip: Option<IpAddr>,
+    server_host: &'a str,
+    server_port: u16,
+    local_port: u16,
+    tunnel_mode: &'a str,
+    udp_proxy_available: bool,
+    ipv6_bypass_available: bool,
+}
 
 // State ===============================================================================================================
 
@@ -237,11 +253,21 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
                 self.ipv6_bypass_available = state.ipv6_bypass_available;
+                let udp_proxy_available = self.udp_proxy_available;
+                let ipv6_bypass_available = self.ipv6_bypass_available;
                 self.running = Some(state);
                 self.active_config = Some(config.clone());
                 self.last_error = None;
-                info!(server_ip = ?server_ip, "proxy started");
-                debug!(local_port = config.local_port, "proxy started (debug)");
+                let diag = ProxyStartedDiag {
+                    server_ip,
+                    server_host: &config.server.server,
+                    server_port: config.server.server_port,
+                    local_port: config.local_port,
+                    tunnel_mode: tunnel_mode_label(&config.tunnel_mode),
+                    udp_proxy_available,
+                    ipv6_bypass_available,
+                };
+                info!(started = %dump!(&diag), "proxy started");
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
@@ -541,6 +567,16 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> 
         })?;
 
     Ok(addr.ip())
+}
+
+/// Stable human-readable label for a `TunnelMode` — used by
+/// `ProxyStartedDiag` so the dump output doesn't vary with Debug
+/// formatting changes.
+fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
+    match mode {
+        TunnelMode::Full => "full",
+        TunnelMode::SocksOnly => "socks_only",
+    }
 }
 
 #[cfg(test)]

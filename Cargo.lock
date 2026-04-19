@@ -1389,6 +1389,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dump"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "dump-macros",
+ "serde",
+ "skuld",
+]
+
+[[package]]
+name = "dump-macros"
+version = "0.1.0"
+dependencies = [
+ "dump",
+ "proc-macro2",
+ "quote",
+ "skuld",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2416,6 +2437,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "default-net",
+ "dump",
  "ferrisetw",
  "garter",
  "handle-holders",
