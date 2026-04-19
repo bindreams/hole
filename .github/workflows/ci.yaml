@@ -88,6 +88,26 @@ jobs:
           SKULD_LABELS: "!tun"
         run: cargo nextest run --workspace
 
+      # `external/galoshes/` is a vendored sub-workspace (hole's root Cargo.toml
+      # has `exclude = ["external/galoshes"]`), so the steps above don't cover
+      # it. Run garter's tests explicitly to catch regressions in the vendored
+      # copy — e.g. the `drain_timeout` bug that silently killed v2ray-plugin
+      # ~5s after proxy start (bindreams/galoshes#19). Scoped to `-p garter` so
+      # we don't require the Go toolchain for galoshes/build.rs's v2ray-plugin
+      # binary. Runs BEFORE the TUN step on Windows because the TUN step breaks
+      # NDIS loopback for ≥120s (see #200/#207), and garter's integration tests
+      # bind 127.0.0.1 listeners. The mock-plugin prebuild mirrors galoshes'
+      # own CI pattern — `chain_integration.rs` shells out to `cargo build -p
+      # mock-plugin` at runtime, and prebuilding keeps the test's cargo-within-
+      # nextest invocation predictable.
+      - name: Build galoshes mock-plugin (vendored sub-workspace)
+        shell: bash
+        run: cargo build --manifest-path external/galoshes/Cargo.toml -p mock-plugin
+
+      - name: Test galoshes (vendored sub-workspace, garter only)
+        shell: bash
+        run: cargo nextest run --manifest-path external/galoshes/Cargo.toml -p garter
+
       - name: Test (TUN, runs last for #200)
         id: test-tun
         if: matrix.os == 'windows'

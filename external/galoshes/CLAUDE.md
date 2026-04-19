@@ -43,7 +43,7 @@ cargo build -p galoshes              # build galoshes (requires prior xtask step
 - Unix: `libc` for SIGTERM, file permissions (`0o700`/`0o500`), `/proc/self/fd/N` for fd-pinned exec
 - Windows: `windows` crate (safe Rust) for `GenerateConsoleCtrlEvent`, Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), `OpenProcess`/`TerminateProcess`, `share_mode(1)` for deny-write file handles
 - Signal handling: Unix SIGTERM+SIGINT, Windows Ctrl+C
-- Graceful shutdown: 5s drain timeout (configurable via `ChainRunner::drain_timeout`)
+- Graceful shutdown: 5s drain timeout (configurable via `ChainRunner::drain_timeout`). The timeout bounds only the post-shutdown drain phase — the chain's own lifetime is unbounded, long-running plugins run until explicitly stopped.
 
 ## SIP003 option format
 
