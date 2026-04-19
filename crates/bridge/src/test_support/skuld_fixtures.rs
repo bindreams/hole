@@ -26,10 +26,14 @@
 
 // Labels ==============================================================================================================
 
-skuld::new_label!(pub(crate) DIST_BIN, "dist_bin");
-skuld::new_label!(pub(crate) PORT_ALLOC, "port_alloc");
-skuld::new_label!(pub(crate) TUN, "tun");
-skuld::new_label!(pub(crate) IPV6, "ipv6");
+#[skuld::label]
+pub(crate) const DIST_BIN: skuld::Label;
+#[skuld::label]
+pub(crate) const PORT_ALLOC: skuld::Label;
+#[skuld::label]
+pub(crate) const TUN: skuld::Label;
+#[skuld::label]
+pub(crate) const IPV6: skuld::Label;
 
 // Fixtures ============================================================================================================
 

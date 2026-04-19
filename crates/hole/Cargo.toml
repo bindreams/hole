@@ -56,7 +56,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-skuld = "0.1"
+skuld = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
