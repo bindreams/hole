@@ -2420,8 +2420,6 @@ dependencies = [
  "garter",
  "handle-holders",
  "hex",
- "hickory-proto",
- "hickory-resolver",
  "hole-common",
  "http",
  "http-body-util",

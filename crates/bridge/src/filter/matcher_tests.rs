@@ -311,7 +311,7 @@ fn ipv6_unspecified_match() {
 #[skuld::test]
 fn matches_uncanonicalized_uppercase_connection_domain() {
     // Compile-side rule is normalized; the dispatcher hands the
-    // matcher a raw uppercase string from the sniffer/fake DNS.
+    // matcher a raw uppercase string from the sniffer.
     let m = compile("example.com", MatchType::Exactly);
     assert!(m.matches(&dom_conn("1.2.3.4", "Example.COM")));
 }

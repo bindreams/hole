@@ -19,8 +19,6 @@ impl Default for FilterMetrics {
             blocked: 0,
             sniffer_hits: 0,
             sniffer_misses: 0,
-            fake_dns_queries: 0,
-            fake_dns_reverse_hits: 0,
             active_udp_flows: 0,
             udp_drops_backpressure: 0,
         }

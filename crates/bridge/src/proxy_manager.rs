@@ -55,8 +55,8 @@ pub enum ProxyState {
 /// (releases SS). `None` fields for SocksOnly mode where
 /// routing/dispatcher are skipped, or when no plugin is configured.
 struct RunningState<P: Proxy, R: Routing> {
-    /// TCP dispatcher — owns TUN device, smoltcp, fake DNS, handler
-    /// tasks. Drops FIRST. `None` in SocksOnly mode and under
+    /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
+    /// handler tasks. Drops FIRST. `None` in SocksOnly mode and under
     /// `#[cfg(test)]`.
     #[allow(dead_code)]
     dispatcher: Option<crate::dispatcher::Dispatcher>,
@@ -367,11 +367,6 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Query the OS default gateway via the routing provider.
         let gw_info = routing.default_gateway()?;
 
-        // Discover upstream DNS servers BEFORE routes are installed, so
-        // queries use the real upstream path (not the TUN).
-        let dns_servers = crate::hole_router::upstream_dns::discover_dns_servers()
-            .map_err(|e| ProxyError::Gateway(format!("DNS discovery failed: {e}")))?;
-
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
 
@@ -388,13 +383,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 gw_info.ipv6_available,
                 crate::proxy::udp_proxy_available(config),
                 ruleset,
-                &dns_servers,
             )?;
             Some(d)
         };
         #[cfg(test)]
         let dispatcher: Option<crate::dispatcher::Dispatcher> = {
-            let _ = (ruleset, dns_servers); // suppress unused warnings
+            let _ = ruleset; // suppress unused warning
             None
         };
 

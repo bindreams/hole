@@ -34,11 +34,10 @@ bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 ureq = { version = "3", features = ["json"] }
 tempfile = "3"
-# Filter engine dependencies (Plan 1 of 4 — see issue #162).
-# All are already pulled in transitively via shadowsocks-service; we promote
-# them to direct deps so the filter module can `use` them. Pinned to the same
-# minor versions that shadowsocks-service 1.24 uses to avoid duplication.
-hickory-proto = "0.25"
+# Filter engine dependencies. All except `lru` and `tls-parser` are already
+# pulled in transitively via shadowsocks-service; promoted to direct deps so
+# the filter module can `use` them. Pinned to the same minor versions that
+# shadowsocks-service 1.24 uses to avoid duplication.
 idna = "1"
 ipnet = "2"
 regex = "1"
@@ -54,7 +53,6 @@ smoltcp = { version = "0.12", default-features = false, features = [
 ] }
 arc-swap = "1"
 async-trait = "0.1"
-hickory-resolver = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

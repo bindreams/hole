@@ -6,7 +6,6 @@
 //! just hands it a prepared Device + Router and drives the engine's run
 //! loop on a background task.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use tokio::task::{AbortHandle, JoinHandle};
@@ -15,9 +14,7 @@ use tracing::{debug, warn};
 use tun_engine::{Device, Engine, MutDeviceConfig};
 
 use crate::filter::rules::RuleSet;
-use crate::filter::FakeDns;
-use crate::hole_router::upstream_dns::UpstreamResolver;
-use crate::hole_router::{FakeDnsInterceptor, HoleRouter};
+use crate::hole_router::HoleRouter;
 use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
 
 /// The main dispatcher — owns the TUN device (via the engine driver)
@@ -39,25 +36,13 @@ impl Dispatcher {
     /// - `ipv6_available`: whether the upstream has IPv6.
     /// - `udp_proxy_available`: whether the plugin (if any) supports UDP relay.
     /// - `rules`: compiled filter rules.
-    /// - `dns_servers`: upstream DNS server IPs (discovered before TUN up).
     pub fn new(
         local_port: u16,
         iface_index: u32,
         ipv6_available: bool,
         udp_proxy_available: bool,
         rules: RuleSet,
-        dns_servers: &[IpAddr],
     ) -> std::io::Result<Self> {
-        // Fake DNS: only when domain rules exist.
-        let fake_dns = if rules.has_domain_rules {
-            Some(Arc::new(FakeDns::with_defaults()))
-        } else {
-            None
-        };
-
-        // Upstream resolver for bypass-path domain resolution.
-        let upstream_resolver = UpstreamResolver::new(dns_servers);
-
         // Open the TUN device.
         let v4_cidr = TUN_SUBNET
             .parse()
@@ -79,21 +64,14 @@ impl Dispatcher {
             ipv6_available,
             udp_proxy_available,
             rules,
-            fake_dns,
-            upstream_resolver,
         ));
 
-        // Build the engine. If fake DNS is active, register the
-        // interceptor so port-53 UDP is answered without going through
-        // Router::route_udp.
+        // Build the engine. Hole no longer registers a DnsInterceptor —
+        // DNS queries traverse the tunnel like any other traffic, and
+        // names are recovered from TLS/HTTP peek at connect time.
         let router_for_engine: Arc<dyn tun_engine::Router> = router.clone();
-        let router_for_dns = router.clone();
-        let engine = Engine::build(device, router_for_engine, |c| {
-            if let Some(fdns) = router_for_dns.fake_dns() {
-                c.dns_interceptor = Some(Arc::new(FakeDnsInterceptor(fdns)));
-            }
-        })
-        .map_err(|e| std::io::Error::other(format!("failed to build engine: {e}")))?;
+        let engine = Engine::build(device, router_for_engine, |_c| {})
+            .map_err(|e| std::io::Error::other(format!("failed to build engine: {e}")))?;
 
         // Cancellation token drives shutdown.
         let cancel = CancellationToken::new();

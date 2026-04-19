@@ -8,22 +8,14 @@ use tokio_socks::tcp::Socks5Stream;
 /// Connect to the target through a SOCKS5 upstream.
 ///
 /// - `local_port`: SOCKS5 server's listen port on 127.0.0.1.
-/// - `dst`: the connection's destination address (IP may be a fake-DNS IP).
-/// - `domain`: if available, used as the SOCKS5 target (preferred to
-///   prevent DNS leaks).
-pub async fn socks5_connect(local_port: u16, dst: SocketAddr, domain: Option<&str>) -> std::io::Result<TcpStream> {
+/// - `dst`: the connection's destination address. The SOCKS5 server
+///   connects to exactly this `(IP, port)` — the caller is responsible
+///   for any name resolution upstream of this helper.
+pub async fn socks5_connect(local_port: u16, dst: SocketAddr) -> std::io::Result<TcpStream> {
     let proxy_addr = format!("127.0.0.1:{local_port}");
-    let stream = match domain {
-        Some(d) => {
-            let target = format!("{d}:{}", dst.port());
-            Socks5Stream::connect(proxy_addr.as_str(), target.as_str())
-                .await
-                .map_err(|e| std::io::Error::other(format!("SOCKS5 connect (domain) failed: {e}")))?
-        }
-        None => Socks5Stream::connect(proxy_addr.as_str(), dst)
-            .await
-            .map_err(|e| std::io::Error::other(format!("SOCKS5 connect (IP) failed: {e}")))?,
-    };
+    let stream = Socks5Stream::connect(proxy_addr.as_str(), dst)
+        .await
+        .map_err(|e| std::io::Error::other(format!("SOCKS5 connect failed: {e}")))?;
     Ok(stream.into_inner())
 }
 
