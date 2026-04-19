@@ -615,3 +615,7 @@ mod proxy_manager_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "proxy_manager_listener_e2e_tests.rs"]
+mod proxy_manager_listener_e2e_tests;
