@@ -13,6 +13,7 @@ workspace = true
 harness = false
 
 [dependencies]
+base64 = "0.22"
 
 [dev-dependencies]
 skuld = { workspace = true }

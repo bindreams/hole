@@ -11,10 +11,14 @@
 //! macro, YAML formatter, derive macro, and built-in impls ship in
 //! subsequent commits.
 
+mod display;
 mod dump_trait;
+mod format;
 mod value;
 
+pub use display::DumpDisplay;
 pub use dump_trait::Dump;
+pub use format::YamlFormatter;
 pub use value::{tag, DumpValue};
 
 #[cfg(test)]
