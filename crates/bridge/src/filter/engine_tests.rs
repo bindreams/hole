@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use hole_common::config::{FilterAction, FilterRule, MatchType};
 
@@ -17,8 +17,7 @@ fn rule(addr: &str, kind: MatchType, action: FilterAction) -> FilterRule {
 
 fn conn(dst: &str, port: u16, domain: Option<&str>) -> ConnInfo {
     ConnInfo {
-        dst_ip: dst.parse::<IpAddr>().unwrap(),
-        dst_port: port,
+        dst: SocketAddr::new(dst.parse::<IpAddr>().unwrap(), port),
         domain: domain.map(|s| s.to_string()),
         proto: L4Proto::Tcp,
     }

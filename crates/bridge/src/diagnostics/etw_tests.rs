@@ -242,7 +242,10 @@ fn parse_socket_address_ipv4_loopback_port_8080() {
         0, 0, 0, 0, 0, 0, 0, 0, // sin_zero padding
     ];
     let got = parse_socket_address(&bytes);
-    assert_eq!(got, Some((IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080)));
+    assert_eq!(
+        got,
+        Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080))
+    );
 }
 
 #[skuld::test]
@@ -254,7 +257,13 @@ fn parse_socket_address_ipv4_arbitrary_port() {
         0, 0, 0, 0, 0, 0, 0, 0,
     ];
     let got = parse_socket_address(&bytes);
-    assert_eq!(got, Some((IpAddr::V4(std::net::Ipv4Addr::new(10, 20, 30, 40)), 49152)));
+    assert_eq!(
+        got,
+        Some(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 20, 30, 40)),
+            49152
+        ))
+    );
 }
 
 #[skuld::test]
@@ -272,7 +281,7 @@ fn parse_socket_address_ipv6_loopback() {
 
     let got = parse_socket_address(&bytes);
     let expected_addr = std::net::Ipv6Addr::LOCALHOST;
-    assert_eq!(got, Some((IpAddr::V6(expected_addr), 80)));
+    assert_eq!(got, Some(SocketAddr::new(IpAddr::V6(expected_addr), 80)));
 }
 
 #[skuld::test]

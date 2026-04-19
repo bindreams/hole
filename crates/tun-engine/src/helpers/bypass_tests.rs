@@ -11,7 +11,7 @@ fn bypass_socket_connects_to_loopback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // interface_index=1 is typically the loopback on both Windows and macOS.
-        let (connect_result, _accept) = tokio::join!(create_bypass_tcp(addr.ip(), addr.port(), 1), listener.accept());
+        let (connect_result, _accept) = tokio::join!(create_bypass_tcp(addr, 1), listener.accept());
         assert!(
             connect_result.is_ok(),
             "bypass connect failed: {:?}",
