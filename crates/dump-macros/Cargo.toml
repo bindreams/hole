@@ -16,3 +16,12 @@ workspace = true
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
+
+[dev-dependencies]
+dump = { path = "../dump" }
+skuld = { workspace = true }
+
+[[test]]
+name = "derive_tests"
+path = "tests/derive_tests.rs"
+harness = false

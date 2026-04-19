@@ -21,6 +21,7 @@ mod serde_bridge;
 mod value;
 
 pub use display::DumpDisplay;
+pub use dump_macros::Dump as DeriveDump;
 pub use dump_trait::Dump;
 pub use format::YamlFormatter;
 pub use value::{tag, DumpValue};

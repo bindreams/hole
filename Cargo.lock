@@ -1393,6 +1393,7 @@ name = "dump"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dump-macros",
  "serde",
  "skuld",
 ]
@@ -1401,8 +1402,10 @@ dependencies = [
 name = "dump-macros"
 version = "0.1.0"
 dependencies = [
+ "dump",
  "proc-macro2",
  "quote",
+ "skuld",
  "syn 2.0.117",
 ]
 
