@@ -1,34 +1,54 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires the filter engine, SOCKS5 proxy, and bypass socket plumbing into
-//! tun-engine's abstract `Router` shape. Owns:
+//! Wires three [`Endpoint`](crate::endpoint::Endpoint) mechanisms into
+//! the filter engine and TUN dispatch shape of `tun-engine`:
 //!
-//! - Hot-swappable [`RuleSet`] (for filter reloads).
-//! - Per-connection block-logging dedup.
+//! - `proxy`: [`Socks5Endpoint`](crate::endpoint::Socks5Endpoint) —
+//!   flows that should go through the SS tunnel.
+//! - `bypass`: [`InterfaceEndpoint`](crate::endpoint::InterfaceEndpoint) —
+//!   flows that should egress via the real upstream interface.
+//! - `block`: [`BlockEndpoint`](crate::endpoint::BlockEndpoint) —
+//!   flows that should be dropped.
 //!
-//! Per-connection dispatch: peek (TCP only) → filter decide → splice. For
-//! TCP flows the sniffer at [`crate::filter::peek`] extracts TLS SNI or
-//! HTTP Host from the first ≤ 2 KiB of payload, feeding the recovered name
-//! into the filter. UDP flows have no peek equivalent and match on IP only
-//! unless a future QUIC Initial parser is added.
+//! ## Role vs. mechanism
 //!
-//! UDP-on-TCP-only-plugin is dropped, not bypassed. See
-//! [`HoleRouter::dispatch_udp`] for the privacy invariant.
+//! Field names encode *role* (why we chose this endpoint for the flow —
+//! the [`FilterAction`](hole_common::config::FilterAction) variant).
+//! Field types encode *mechanism* (how the endpoint carries bytes). The
+//! cascade in [`HoleRouter::resolve_endpoint`] maps role → mechanism.
+//!
+//! ## Per-flow dispatch
+//!
+//! 1. TCP only: peek ≤ 2 KiB and run the TLS SNI / HTTP Host sniffer to
+//!    recover a domain (see [`crate::filter::sniffer`]). UDP has no peek
+//!    equivalent and always matches on IP.
+//! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
+//! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
+//!    [`HoleRouter::resolve_endpoint`], logging any drop reason via the
+//!    `BlockEndpoint`'s dedicated log methods.
+//! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
+//!
+//! ## UDP-drop privacy invariant
+//!
+//! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to
+//! `&self.block`, **not** `&self.bypass`. This is deliberate: falling
+//! back to the clear-text bypass would leak UDP outside the encrypted
+//! tunnel, violating the user's VPN expectation. Users who need
+//! tunneled UDP should configure a UDP-capable plugin (galoshes). See
+//! [`BlockEndpoint`](crate::endpoint::BlockEndpoint) for the drop
+//! logging.
 
 pub mod block_log;
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
-use tun_engine::helpers::{create_bypass_tcp, create_bypass_udp, socks5_connect, Socks5UdpRelay};
-use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender};
+use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta};
 
-use self::block_log::BlockLog;
+use crate::endpoint::{BlockEndpoint, Endpoint, InterfaceEndpoint, Socks5Endpoint};
 use crate::filter;
 use crate::filter::engine::{decide, ConnInfo, L4Proto};
 use crate::filter::rules::RuleSet;
@@ -45,41 +65,19 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 // HoleRouter ==========================================================================================================
 
 pub struct HoleRouter {
-    /// SS SOCKS5 local port on 127.0.0.1.
-    local_port: u16,
-    /// Upstream interface index for bypass sockets.
-    iface_index: u32,
-    /// Whether the upstream interface has IPv6 connectivity.
-    ipv6_available: bool,
-    /// Whether the current proxy config supports UDP relay (no v2ray-plugin).
-    udp_proxy_available: bool,
-
-    /// Hot-swappable filter rules.
+    proxy: Socks5Endpoint,
+    bypass: InterfaceEndpoint,
+    block: BlockEndpoint,
     rules: Arc<ArcSwap<RuleSet>>,
-
-    /// Rate-limited block log. Uses `std::sync::Mutex` because the
-    /// critical section is sub-microsecond and never held across .await.
-    block_log: Mutex<BlockLog>,
-    /// One-time flag: emitted when IPv6 bypass falls back to block.
-    ipv6_bypass_warned: AtomicBool,
 }
 
 impl HoleRouter {
-    pub fn new(
-        local_port: u16,
-        iface_index: u32,
-        ipv6_available: bool,
-        udp_proxy_available: bool,
-        rules: RuleSet,
-    ) -> Self {
+    pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, block: BlockEndpoint, rules: RuleSet) -> Self {
         Self {
-            local_port,
-            iface_index,
-            ipv6_available,
-            udp_proxy_available,
+            proxy,
+            bypass,
+            block,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
-            block_log: Mutex::new(BlockLog::new()),
-            ipv6_bypass_warned: AtomicBool::new(false),
         }
     }
 
@@ -91,6 +89,91 @@ impl HoleRouter {
     /// Invalid (dropped) rules from the current ruleset.
     pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
         self.rules.load().dropped.clone()
+    }
+}
+
+// Cascade =============================================================================================================
+
+/// A flow whose cascade resolved to a drop, tagged with the reason so the
+/// caller can pick the right log path before dropping.
+#[derive(Debug, Clone, Copy)]
+enum DropReason {
+    /// The user's rule explicitly said `Block`.
+    RuleBlock { rule_index: u32 },
+    /// `FilterAction::Proxy` + UDP + the plugin cannot carry UDP.
+    /// Privacy invariant — we refuse to leak UDP to the bypass.
+    UdpProxyUnavailable { rule_index: u32 },
+    /// `FilterAction::Bypass` + IPv6 destination + upstream has no IPv6.
+    Ipv6BypassUnreachable { rule_index: u32 },
+}
+
+/// Cascade output: either a concrete endpoint to serve the flow, or a
+/// drop reason for the router to log before dropping.
+enum Dispatch<'a> {
+    Endpoint(&'a dyn Endpoint),
+    Drop(DropReason),
+}
+
+impl HoleRouter {
+    /// Map a [`FilterAction`] + flow shape to a concrete endpoint, or to
+    /// a drop reason when the cascade's privacy / reachability invariants
+    /// preclude carrying the flow.
+    fn resolve_endpoint(
+        &self,
+        action: FilterAction,
+        l4: L4Proto,
+        dst: SocketAddr,
+        rule_index: Option<u32>,
+    ) -> Dispatch<'_> {
+        let rule_index = rule_index.unwrap_or(0);
+        match action {
+            FilterAction::Proxy => {
+                // Privacy invariant: if proxy can't carry this UDP flow,
+                // drop it. Do NOT fall back to the clear-text bypass.
+                if l4 == L4Proto::Udp && !self.proxy.supports_udp() {
+                    return Dispatch::Drop(DropReason::UdpProxyUnavailable { rule_index });
+                }
+                Dispatch::Endpoint(&self.proxy)
+            }
+            FilterAction::Bypass => {
+                if dst.is_ipv6() && !self.bypass.supports_ipv6_dst() {
+                    return Dispatch::Drop(DropReason::Ipv6BypassUnreachable { rule_index });
+                }
+                Dispatch::Endpoint(&self.bypass)
+            }
+            FilterAction::Block => Dispatch::Drop(DropReason::RuleBlock { rule_index }),
+        }
+    }
+
+    /// Log a drop reason before the flow is released. Uses per-reason
+    /// methods on `BlockEndpoint` so the log wording distinguishes
+    /// explicit-rule from privacy from reachability drops.
+    fn log_drop(&self, reason: DropReason, dst: SocketAddr, domain: Option<&str>, l4: L4Proto) {
+        match (reason, l4) {
+            (DropReason::RuleBlock { rule_index }, L4Proto::Tcp) => {
+                self.block.log_rule_block_tcp(rule_index, dst, domain);
+            }
+            (DropReason::RuleBlock { rule_index }, L4Proto::Udp) => {
+                self.block.log_rule_block_udp(rule_index, dst);
+            }
+            (DropReason::UdpProxyUnavailable { rule_index }, L4Proto::Udp) => {
+                self.block
+                    .log_udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
+            }
+            (DropReason::UdpProxyUnavailable { .. }, L4Proto::Tcp) => {
+                // Cascade never produces this combination (the invariant
+                // is UDP-only). Stay silent rather than emitting a misleading
+                // log; the debug_assert makes the contract explicit in tests.
+                debug_assert!(false, "UdpProxyUnavailable produced for TCP flow");
+            }
+            (DropReason::Ipv6BypassUnreachable { rule_index }, l4) => {
+                let l4_label = match l4 {
+                    L4Proto::Tcp => "tcp",
+                    L4Proto::Udp => "udp",
+                };
+                self.block.log_ipv6_bypass_unreachable(rule_index, dst, l4_label);
+            }
+        }
     }
 }
 
@@ -139,43 +222,19 @@ impl HoleRouter {
         let decision = decide(&current_rules, &conn_info);
         drop(current_rules);
 
-        match decision.action {
-            FilterAction::Proxy => self.dispatch_tcp_proxy(flow, dst).await,
-            FilterAction::Bypass => self.dispatch_tcp_bypass(flow, dst).await,
-            FilterAction::Block => {
-                let rule_index = decision.rule_index.unwrap_or(0) as u32;
-                let should_log = self.block_log.lock().unwrap().should_log(rule_index, dst);
-                if should_log {
-                    match domain.as_deref() {
-                        Some(d) => debug!("blocked {d} ({dst}) by rule #{rule_index}"),
-                        None => debug!("blocked {dst} by rule #{rule_index}"),
-                    }
-                }
+        match self.resolve_endpoint(
+            decision.action,
+            L4Proto::Tcp,
+            dst,
+            decision.rule_index.map(|i| i as u32),
+        ) {
+            Dispatch::Endpoint(endpoint) => endpoint.serve_tcp(flow, dst).await,
+            Dispatch::Drop(reason) => {
+                self.log_drop(reason, dst, domain.as_deref(), L4Proto::Tcp);
                 // Drop the flow — smoltcp sends RST.
                 Ok(())
             }
         }
-    }
-
-    async fn dispatch_tcp_proxy(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
-        let mut upstream = socks5_connect(self.local_port, dst).await?;
-        // Peeked bytes are still buffered inside `flow` — copy_bidirectional
-        // will include them naturally.
-        tokio::io::copy_bidirectional(flow, &mut upstream).await?;
-        Ok(())
-    }
-
-    async fn dispatch_tcp_bypass(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
-        if dst.is_ipv6() && !self.ipv6_available {
-            if !self.ipv6_bypass_warned.swap(true, Ordering::Relaxed) {
-                warn!("IPv6 bypass requested but upstream has no IPv6; falling back to block");
-            }
-            return Ok(());
-        }
-
-        let mut upstream = create_bypass_tcp(dst, self.iface_index).await?;
-        tokio::io::copy_bidirectional(flow, &mut upstream).await?;
-        Ok(())
     }
 }
 
@@ -194,35 +253,15 @@ impl HoleRouter {
         let decision = decide(&current_rules, &conn_info);
         drop(current_rules);
 
-        let mut action = decision.action;
-
-        // Privacy invariant: UDP that the filter said to proxy must not
-        // leak out the unprotected bypass when the plugin can't carry
-        // it. Drop instead. See the module doc.
-        if action == FilterAction::Proxy && !self.udp_proxy_available {
-            let mut log = self.block_log.lock().unwrap();
-            if log.should_log(decision.rule_index.unwrap_or(0) as u32, dst) {
-                warn!(%dst, "UDP proxy unavailable (v2ray-plugin), blocking");
-            }
-            action = FilterAction::Block;
-        }
-
-        if action == FilterAction::Bypass && dst.is_ipv6() && !self.ipv6_available {
-            if !self.ipv6_bypass_warned.swap(true, Ordering::Relaxed) {
-                warn!("IPv6 bypass unavailable for UDP, blocking");
-            }
-            action = FilterAction::Block;
-        }
-
-        match action {
-            FilterAction::Proxy => splice_udp_proxy(flow, self.local_port, dst).await,
-            FilterAction::Bypass => splice_udp_bypass(flow, dst, self.iface_index).await,
-            FilterAction::Block => {
-                let rule_index = decision.rule_index.unwrap_or(0) as u32;
-                let mut log = self.block_log.lock().unwrap();
-                if log.should_log(rule_index, dst) {
-                    info!(%dst, "blocked UDP flow");
-                }
+        match self.resolve_endpoint(
+            decision.action,
+            L4Proto::Udp,
+            dst,
+            decision.rule_index.map(|i| i as u32),
+        ) {
+            Dispatch::Endpoint(endpoint) => endpoint.serve_udp(flow, dst).await,
+            Dispatch::Drop(reason) => {
+                self.log_drop(reason, dst, None, L4Proto::Udp);
                 // Dropping the flow ends route_udp; any further datagrams
                 // for the 5-tuple silently fail to enqueue until the
                 // engine's idle sweep evicts the entry.
@@ -230,59 +269,6 @@ impl HoleRouter {
             }
         }
     }
-}
-
-// UDP splice helpers ==================================================================================================
-
-/// Relay a UdpFlow through the SS SOCKS5 UDP Associate channel.
-async fn splice_udp_proxy(mut flow: UdpFlow, local_port: u16, dst: SocketAddr) -> io::Result<()> {
-    let relay = Arc::new(Socks5UdpRelay::associate(local_port).await?);
-
-    // Reader task: pull replies from the relay and inject back into the flow.
-    let relay_rx = Arc::clone(&relay);
-    let sender: UdpSender = flow.sender();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok((n, _src)) = relay_rx.recv_from(&mut buf).await {
-            if sender.send(&buf[..n]).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Forwarder: pull inbound datagrams from the flow, send via relay.
-    while let Some(payload) = flow.recv().await {
-        if relay.send_to(dst, &payload).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Relay a UdpFlow through a bypass UDP socket bound to an upstream
-/// interface.
-async fn splice_udp_bypass(mut flow: UdpFlow, dst: SocketAddr, iface_index: u32) -> io::Result<()> {
-    let socket = create_bypass_udp(iface_index, dst.is_ipv6()).await?;
-    socket.connect(dst).await?;
-    let socket = Arc::new(socket);
-
-    let socket_rx = Arc::clone(&socket);
-    let sender: UdpSender = flow.sender();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok(n) = socket_rx.recv(&mut buf).await {
-            if sender.send(&buf[..n]).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(payload) = flow.recv().await {
-        if socket.send(&payload).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -351,7 +351,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 proxy: running_proxy,
                 server_ip: None,
                 started_at: Instant::now(),
-                udp_proxy_available: crate::proxy::udp_proxy_available(config),
+                udp_proxy_available: crate::proxy::plugin_supports_udp(config),
                 ipv6_bypass_available: false,
             });
         }
@@ -381,7 +381,8 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 config.local_port,
                 gw_info.interface_index,
                 gw_info.ipv6_available,
-                crate::proxy::udp_proxy_available(config),
+                config.server.plugin.clone(),
+                crate::proxy::plugin_supports_udp(config),
                 ruleset,
             )?;
             Some(d)
@@ -402,7 +403,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             proxy: running_proxy,
             server_ip: Some(server_ip),
             started_at: Instant::now(),
-            udp_proxy_available: crate::proxy::udp_proxy_available(config),
+            udp_proxy_available: crate::proxy::plugin_supports_udp(config),
             ipv6_bypass_available: gw_info.ipv6_available,
         })
     }

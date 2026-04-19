@@ -126,13 +126,12 @@ pub struct Socks5UdpRelay {
 }
 
 impl Socks5UdpRelay {
-    /// Perform a SOCKS5 UDP ASSOCIATE handshake against the SOCKS5 server
-    /// on `127.0.0.1:{local_port}` and return the ready-to-use relay.
-    pub async fn associate(local_port: u16) -> io::Result<Self> {
-        let proxy_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
-
+    /// Perform a SOCKS5 UDP ASSOCIATE handshake against `proxy` and return
+    /// the ready-to-use relay. `proxy` is the full SOCKS5 server address
+    /// (usually loopback for an in-process SS listener; not constrained).
+    pub async fn associate(proxy: SocketAddr) -> io::Result<Self> {
         // Step 1: TCP connect to SOCKS5 server.
-        let mut control = TcpStream::connect(proxy_addr).await?;
+        let mut control = TcpStream::connect(proxy).await?;
 
         // Step 2: Auth negotiation — NO AUTH (method 0x00).
         control.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -192,7 +191,7 @@ impl Socks5UdpRelay {
         // Replace 0.0.0.0 with localhost (shadowsocks-rust returns 0.0.0.0
         // when it means "same host as the control connection").
         let relay_addr = if relay_addr.ip().is_unspecified() {
-            SocketAddr::new(proxy_addr.ip(), relay_addr.port())
+            SocketAddr::new(proxy.ip(), relay_addr.port())
         } else {
             relay_addr
         };

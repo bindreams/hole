@@ -1,5 +1,6 @@
 pub mod diagnostics;
 pub mod dispatcher;
+pub mod endpoint;
 pub mod filter;
 pub mod foreground;
 pub mod group;

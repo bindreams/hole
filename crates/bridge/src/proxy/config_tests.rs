@@ -27,28 +27,28 @@ fn sample_config() -> ProxyConfig {
 
 #[skuld::test]
 fn udp_available_without_plugin() {
-    assert!(udp_proxy_available(&sample_config()));
+    assert!(plugin_supports_udp(&sample_config()));
 }
 
 #[skuld::test]
 fn udp_unavailable_with_v2ray_plugin() {
     let mut cfg = sample_config();
     cfg.server.plugin = Some("v2ray-plugin".into());
-    assert!(!udp_proxy_available(&cfg));
+    assert!(!plugin_supports_udp(&cfg));
 }
 
 #[skuld::test]
 fn udp_available_with_galoshes() {
     let mut cfg = sample_config();
     cfg.server.plugin = Some("galoshes".into());
-    assert!(udp_proxy_available(&cfg));
+    assert!(plugin_supports_udp(&cfg));
 }
 
 #[skuld::test]
 fn udp_unavailable_with_unknown_plugin() {
     let mut cfg = sample_config();
     cfg.server.plugin = Some("some-custom-plugin".into());
-    assert!(!udp_proxy_available(&cfg));
+    assert!(!plugin_supports_udp(&cfg));
 }
 
 #[skuld::test]
