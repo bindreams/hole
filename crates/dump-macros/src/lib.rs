@@ -5,11 +5,23 @@
 //!
 //! - Field: `#[dump(skip)]`, `#[dump(rename = "...")]`,
 //!   `#[dump(secret)]`.
-//! - Container: (none yet.)
+//! - Container: `#[dump(rename_all = "kebab-case" | "snake_case")]`.
 //!
-//! Future commits may add `rename_all`, `flatten`, `via`, and `tag`.
-//! The derive emits absolute paths (`::dump::...`) so it works from any
-//! downstream crate.
+//! ## `rename_all` scope
+//!
+//! `rename_all` applies to **struct field names** and **struct-variant
+//! field names** only. Enum variant names themselves are never rewritten
+//! (use `#[dump(rename = "...")]` on the variant if you need this).
+//!
+//! The rename is a plain `_` → `-` substitution — there is no
+//! camelCase / PascalCase splitting. A field named `fooBar` stays as
+//! `fooBar` under `kebab-case`; use `#[dump(rename = "foo-bar")]`
+//! explicitly. Raw identifiers (`r#type`) have their `r#` prefix
+//! stripped before the substitution runs, matching what the YAML key
+//! should look like to a reader.
+//!
+//! Future commits may add `flatten`, `via`, and `tag`. The derive emits
+//! absolute paths (`::dump::...`) so it works from any downstream crate.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -35,9 +47,10 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
     }
     let (impl_gen, type_gen, where_clause) = generics.split_for_impl();
 
+    let container = parse_container_attrs(&input.attrs)?;
     let body = match &input.data {
-        Data::Struct(s) => gen_struct(s)?,
-        Data::Enum(e) => gen_enum(e, name)?,
+        Data::Struct(s) => gen_struct(s, &container)?,
+        Data::Enum(e) => gen_enum(e, name, &container)?,
         Data::Union(_) => {
             return Err(syn::Error::new_spanned(name, "Dump cannot be derived for unions"));
         }
@@ -51,6 +64,59 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     })
+}
+
+#[derive(Clone, Copy, Default)]
+enum RenameRule {
+    #[default]
+    None,
+    KebabCase,
+    SnakeCase,
+}
+
+impl RenameRule {
+    /// Apply the rename rule to a raw `Ident::to_string()` value. Strips
+    /// the `r#` raw-identifier prefix first so the resulting YAML key
+    /// reflects the reader's mental model, not Rust's escape syntax.
+    fn apply(self, s: String) -> String {
+        let s = s.strip_prefix("r#").map(str::to_owned).unwrap_or(s);
+        match self {
+            RenameRule::None | RenameRule::SnakeCase => s,
+            RenameRule::KebabCase => s.replace('_', "-"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ContainerConfig {
+    rename_all: RenameRule,
+}
+
+fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerConfig> {
+    let mut c = ContainerConfig::default();
+    for attr in attrs {
+        if !attr.path().is_ident("dump") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                let s: LitStr = meta.value()?.parse()?;
+                c.rename_all = match s.value().as_str() {
+                    "kebab-case" => RenameRule::KebabCase,
+                    "snake_case" => RenameRule::SnakeCase,
+                    other => {
+                        return Err(meta.error(format!(
+                            "unknown `rename_all` value {other:?}; expected \"kebab-case\" or \"snake_case\""
+                        )));
+                    }
+                };
+            } else {
+                return Err(meta.error("unknown container-level `dump` attribute"));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(c)
 }
 
 #[derive(Default)]
@@ -93,7 +159,7 @@ fn wrap_secret(expr: TokenStream2, secret: bool) -> TokenStream2 {
     }
 }
 
-fn gen_struct(s: &DataStruct) -> syn::Result<TokenStream2> {
+fn gen_struct(s: &DataStruct, container: &ContainerConfig) -> syn::Result<TokenStream2> {
     match &s.fields {
         Fields::Named(named) => {
             let mut entries = Vec::new();
@@ -103,7 +169,9 @@ fn gen_struct(s: &DataStruct) -> syn::Result<TokenStream2> {
                     continue;
                 }
                 let ident = f.ident.as_ref().unwrap();
-                let key = cfg.rename.unwrap_or_else(|| ident.to_string());
+                let key = cfg
+                    .rename
+                    .unwrap_or_else(|| container.rename_all.apply(ident.to_string()));
                 let value = wrap_secret(quote! { ::dump::Dump::dump(&self.#ident) }, cfg.secret);
                 entries.push(quote! {
                     (::dump::DumpValue::String(#key.into()), #value)
@@ -132,7 +200,7 @@ fn gen_struct(s: &DataStruct) -> syn::Result<TokenStream2> {
     }
 }
 
-fn gen_enum(e: &DataEnum, name: &Ident) -> syn::Result<TokenStream2> {
+fn gen_enum(e: &DataEnum, name: &Ident, container: &ContainerConfig) -> syn::Result<TokenStream2> {
     let mut arms = Vec::new();
     for v in &e.variants {
         let vname = &v.ident;
@@ -184,7 +252,7 @@ fn gen_enum(e: &DataEnum, name: &Ident) -> syn::Result<TokenStream2> {
                         continue;
                     }
                     let fi = f.ident.as_ref().unwrap();
-                    let key = cfg.rename.unwrap_or_else(|| fi.to_string());
+                    let key = cfg.rename.unwrap_or_else(|| container.rename_all.apply(fi.to_string()));
                     let value = wrap_secret(quote! { ::dump::Dump::dump(#fi) }, cfg.secret);
                     entries.push(quote! {
                         (::dump::DumpValue::String(#key.into()), #value)
