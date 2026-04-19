@@ -1,6 +1,14 @@
 // Settings section: toggle switches, custom dropdowns, theme switching, proxy config.
 
 import { config, saveConfig } from "./main";
+import type { DnsConfig, DnsProtocol } from "./types";
+
+const DNS_DEFAULT: DnsConfig = {
+  enabled: true,
+  servers: ["1.1.1.1", "1.0.0.1"],
+  protocol: "https",
+  intercept_udp53: true,
+};
 
 // Theme management ====================================================================================================
 
@@ -34,6 +42,7 @@ function applyTheme(value: string) {
 // Proxy muting ========================================================================================================
 
 const proxyNested = document.getElementById("proxy-nested")!;
+const dnsNested = document.getElementById("dns-nested")!;
 
 function updateProxyMuting() {
   if (!config) return;
@@ -42,6 +51,27 @@ function updateProxyMuting() {
   } else {
     proxyNested.classList.add("muted");
   }
+}
+
+function currentDns(): DnsConfig {
+  return (config?.dns as DnsConfig | undefined) ?? DNS_DEFAULT;
+}
+
+function updateDnsMuting() {
+  const dns = currentDns();
+  if (dns.enabled) {
+    dnsNested.classList.remove("muted");
+  } else {
+    dnsNested.classList.add("muted");
+  }
+}
+
+function patchDns(partial: Partial<DnsConfig>) {
+  if (!config) return;
+  const next: DnsConfig = { ...currentDns(), ...partial };
+  config.dns = next;
+  updateDnsMuting();
+  saveConfig();
 }
 
 // Toggle component ====================================================================================================
@@ -179,8 +209,54 @@ export function initSettings() {
   // Port input.
   wirePortInput();
 
+  // DNS forwarder controls.
+  wireDnsControls();
+
   // Close dropdowns on click outside.
   handleClickOutside();
+}
+
+/**
+ * Wire the DNS forwarder UI. The sub-setting group (`#dns-nested`) mirrors
+ * the proxy-server muting pattern: when the enable toggle is off, the
+ * nested controls are visually greyed.
+ */
+function wireDnsControls() {
+  const enabledEl = document.getElementById("toggle-dns-enabled")!;
+  enabledEl.addEventListener("click", () => {
+    const on = !enabledEl.classList.contains("on");
+    enabledEl.classList.toggle("on", on);
+    patchDns({ enabled: on });
+  });
+
+  const interceptEl = document.getElementById("toggle-dns-intercept")!;
+  interceptEl.addEventListener("click", () => {
+    const on = !interceptEl.classList.contains("on");
+    interceptEl.classList.toggle("on", on);
+    patchDns({ intercept_udp53: on });
+  });
+
+  // DNS protocol dropdown — kebab-to-snake with the same helper used by
+  // the theme/on-startup dropdowns; maps "plain-udp" → "plain_udp", etc.
+  const btn = document.getElementById("select-dns-protocol")!;
+  const menu = document.getElementById("menu-dns-protocol")!;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    for (const m of document.querySelectorAll(".custom-select-menu.open")) {
+      if (m !== menu) m.classList.remove("open");
+    }
+    menu.classList.toggle("open");
+  });
+  for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
+    opt.addEventListener("click", (e) => {
+      e.stopPropagation();
+      for (const o of menu.querySelectorAll(".custom-select-opt")) o.classList.remove("selected");
+      opt.classList.add("selected");
+      btn.textContent = opt.textContent;
+      menu.classList.remove("open");
+      patchDns({ protocol: kebabToSnake(opt.dataset.value ?? "") as DnsProtocol });
+    });
+  }
 }
 
 /**
@@ -205,6 +281,13 @@ export function renderSettings() {
 
   // Proxy muting.
   updateProxyMuting();
+
+  // DNS forwarder state.
+  const dns = currentDns();
+  document.getElementById("toggle-dns-enabled")!.classList.toggle("on", dns.enabled);
+  document.getElementById("toggle-dns-intercept")!.classList.toggle("on", dns.intercept_udp53);
+  syncDropdown("select-dns-protocol", "menu-dns-protocol", dns.protocol);
+  updateDnsMuting();
 
   // Theme.
   applyTheme(config.theme ?? "dark");
