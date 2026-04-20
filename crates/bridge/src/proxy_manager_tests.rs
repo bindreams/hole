@@ -848,3 +848,60 @@ fn reload_when_not_running_starts() {
         pm.stop().await.unwrap();
     });
 }
+
+// Phase-1 instrumentation tests for #247 ==============================================================================
+
+/// Smoke-test: `apply_dns_settings` emits an INFO log `"apply_dns_settings done"`
+/// with an `elapsed_ms` field. Phase-2 observation of #247 depends on this
+/// line appearing at INFO so users don't need to raise the log level to
+/// diagnose the ~10s stall.
+///
+/// Uses a nonexistent upstream interface name so the underlying `netsh` /
+/// `networksetup` calls fail fast (adapter not found), but the wrapping
+/// instrumentation still emits the diagnostic.
+#[skuld::test]
+fn apply_dns_settings_emits_done_info_log() {
+    use crate::dns::connector::DirectConnector;
+    use crate::dns::forwarder::DnsForwarder;
+    use crate::dns::server::LocalDnsServer;
+    use crate::test_support::log_capture::VecWriter;
+    use hole_common::config::DnsConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    rt().block_on(async {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
+        let _guard = subscriber.set_default();
+
+        // Bind LocalDnsServer to an ephemeral loopback port so the test
+        // doesn't fight with anything else on :53.
+        let forwarder = Arc::new(DnsForwarder::new(
+            DnsConfig::default(),
+            Arc::new(DirectConnector),
+            false,
+        ));
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
+
+        let _ = apply_dns_settings(&srv, "hole-test-nonexistent-iface-xyz", None).await;
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("apply_dns_settings done"),
+            "expected 'apply_dns_settings done' in INFO log; got:\n{output}"
+        );
+        assert!(
+            output.contains("elapsed_ms"),
+            "expected 'elapsed_ms' in INFO log; got:\n{output}"
+        );
+        assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
+    });
+}

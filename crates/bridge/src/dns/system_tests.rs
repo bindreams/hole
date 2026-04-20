@@ -6,6 +6,82 @@ use std::net::{IpAddr, Ipv4Addr};
 #[cfg(target_os = "windows")]
 use std::net::Ipv6Addr;
 
+// Timing-log instrumentation tests (#247) =============================================================================
+//
+// These tests verify that Phase 1 diagnostic logs fire. They live outside
+// the `windows_parsers` / `macos_parsers` modules because they exercise
+// real OS command invocations (netsh / networksetup), which the parser
+// tests deliberately avoid.
+
+#[cfg(target_os = "windows")]
+mod windows_timing_logs {
+    use crate::dns::system::windows::flush_dns_cache;
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// `flush_dns_cache` must emit a `DEBUG` log with an `elapsed_ms`
+    /// field so Phase 2 observation can see how long `ipconfig /flushdns`
+    /// actually takes. This is the minimum-viable timing probe — if this
+    /// test regresses, the entire Phase-1 diagnostic story is broken.
+    #[skuld::test]
+    fn flush_dns_cache_emits_elapsed_ms_debug_log() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _guard = subscriber.set_default();
+
+        flush_dns_cache();
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("elapsed_ms"),
+            "expected 'elapsed_ms' field in captured log; got:\n{output}"
+        );
+        assert!(output.contains("DEBUG"), "expected DEBUG-level log; got:\n{output}");
+        assert!(
+            output.contains("flush_dns_cache"),
+            "expected 'flush_dns_cache' target/message in log; got:\n{output}"
+        );
+    }
+
+    /// `capture_adapters` must emit per-alias DEBUG timing logs so a slow
+    /// netsh query against a freshly-created TUN adapter is visible in
+    /// Phase 2 logs. Uses a nonexistent adapter name so the test doesn't
+    /// depend on any specific network configuration — `netsh show` will
+    /// return "not found" quickly, and the timing log fires regardless.
+    #[skuld::test]
+    fn capture_adapters_emits_per_alias_elapsed_ms_debug_log() {
+        use crate::dns::system::capture_adapters;
+
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _guard = subscriber.set_default();
+
+        let _ = capture_adapters(&["hole-test-bogus-adapter-xyz".to_string()]);
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("elapsed_ms"),
+            "expected 'elapsed_ms' in captured log; got:\n{output}"
+        );
+        assert!(
+            output.contains("hole-test-bogus-adapter-xyz"),
+            "expected alias in log; got:\n{output}"
+        );
+    }
+}
+
 // Windows parser tests ================================================================================================
 
 #[cfg(target_os = "windows")]

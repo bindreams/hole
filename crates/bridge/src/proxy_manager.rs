@@ -482,7 +482,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // our loopback IP). Persist the prior state to `bridge-dns.json`
         // BEFORE mutating so a mid-apply crash leaves a recoverable file.
         let dns_state = if let Some(srv) = local_dns_server.as_ref() {
-            apply_dns_settings(srv, &gw_info.interface_name, state_dir)
+            apply_dns_settings(srv, &gw_info.interface_name, state_dir).await
         } else {
             None
         };
@@ -752,13 +752,41 @@ async fn build_local_dns(
 /// persist the `bridge-dns.json` recovery file, then apply the loopback
 /// IP. Returns the captured prior state on success, which
 /// [`RunningDns::drop`] will later replay.
-fn apply_dns_settings(
+///
+/// Async because the underlying platform functions shell out to
+/// `netsh` / `networksetup` via `std::process::Command`. Keeping the
+/// body sync today (see `dns::system::windows`) blocks a tokio worker
+/// thread for the full duration, which #247 observed stalling the
+/// `start_inner` path by ~10s. The `async fn` signature is a
+/// Phase-1 no-behavior-change prerequisite for a Phase-4 swap to
+/// `tokio::process::Command`.
+///
+/// Instrumented with an `info_span!("apply_dns_settings")` entered via
+/// `.instrument()`. The happy-path exit logs
+/// `info!(elapsed_ms = ..., "apply_dns_settings done")` so Phase-2
+/// observation of #247 sees the total at INFO without needing to raise
+/// the log level — per-sub-call `elapsed_ms` lines live at DEBUG inside
+/// `dns::system::windows`.
+async fn apply_dns_settings(
     server: &crate::dns::server::LocalDnsServer,
     upstream_iface: &str,
     state_dir: Option<&std::path::Path>,
 ) -> Option<Vec<crate::dns_state::DnsPriorAdapter>> {
+    use tracing::Instrument;
+    let span = tracing::info_span!("apply_dns_settings", upstream_iface = %upstream_iface);
+    async { apply_dns_settings_body(server, upstream_iface, state_dir) }
+        .instrument(span)
+        .await
+}
+
+fn apply_dns_settings_body(
+    server: &crate::dns::server::LocalDnsServer,
+    upstream_iface: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Option<Vec<crate::dns_state::DnsPriorAdapter>> {
+    let started = Instant::now();
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
+    let result = {
         use crate::dns::system;
         use crate::dns_state::{self, DnsState, SCHEMA_VERSION};
         use crate::proxy::TUN_DEVICE_NAME;
@@ -792,10 +820,16 @@ fn apply_dns_settings(
         }
 
         Some(prior)
-    }
+    };
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
+    let result: Option<Vec<crate::dns_state::DnsPriorAdapter>> = {
         let _ = (server, upstream_iface, state_dir);
         None
-    }
+    };
+
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "apply_dns_settings done"
+    );
+    result
 }
