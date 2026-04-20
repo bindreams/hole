@@ -185,14 +185,16 @@ fn socks5_full_mode_is_tcp_and_udp() {
 }
 
 #[skuld::test]
-fn socks5_socks_only_mode_is_tcp_only() {
-    // Keeps #189 regression pinned: SocksOnly must not enable UDP on the
-    // SOCKS5 listener.
+fn socks5_socks_only_mode_is_tcp_and_udp() {
+    // Post-#250: SocksOnly exposes UDP-ASSOCIATE to local SOCKS5 clients
+    // (hev-socks5-tunnel, ss-tunnel, proxychains-ng UDP, the in-bridge
+    // DNS forwarder's UDP path). Pre-#250 this asserted TcpOnly under
+    // #189's mis-attributed select_all hypothesis.
     let mut cfg = sample_config();
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
     let ss_config = build_ss_config(&cfg, None).unwrap();
     let socks = &ss_config.local[0].config;
-    assert!(matches!(socks.mode, Mode::TcpOnly));
+    assert!(matches!(socks.mode, Mode::TcpAndUdp));
 }
 
 // Validation errors ---------------------------------------------------------------------------------------------------

@@ -91,12 +91,13 @@ fn full_mode_socks5_is_tcp_and_udp() {
 }
 
 #[skuld::test]
-fn socks_only_mode_socks5_is_tcp_only() {
+fn socks_only_mode_socks5_is_tcp_and_udp() {
+    // Post-#250: SocksOnly listener also exposes UDP-ASSOCIATE.
     let mut cfg = sample_config();
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
     let ss = build_ss_config(&cfg, None).unwrap();
     let mode = ss.local[0].config.mode;
-    assert_eq!(format!("{mode:?}"), "TcpOnly");
+    assert_eq!(format!("{mode:?}"), "TcpAndUdp");
 }
 
 #[skuld::test]
