@@ -16,6 +16,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,12 +51,24 @@ impl Socks5Connector {
 #[async_trait]
 impl UpstreamConnector for Socks5Connector {
     async fn connect_tcp(&self, target: SocketAddr) -> io::Result<BoxedStream> {
-        let stream = Socks5Stream::connect(self.socks5_listener, target)
-            .await
-            .map_err(|e| io::Error::other(format!("SOCKS5 CONNECT to {target}: {e}")))?;
-        // `into_inner()` returns the underlying `TcpStream` — after the
-        // CONNECT handshake the relay is a pure byte pipe.
-        Ok(Box::new(stream.into_inner()))
+        // Time the SOCKS5 handshake + CONNECT — per #248, this separates
+        // "SOCKS5 handshake took 3s" from "handshake instant, but TLS
+        // EOF'd immediately after" in the Phase-2 breakdown.
+        let started = Instant::now();
+        let result = Socks5Stream::connect(self.socks5_listener, target).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(stream) => {
+                tracing::debug!(%target, elapsed_ms, "Socks5Connector::connect_tcp");
+                // `into_inner()` returns the underlying `TcpStream` — after
+                // the CONNECT handshake the relay is a pure byte pipe.
+                Ok(Box::new(stream.into_inner()))
+            }
+            Err(e) => {
+                tracing::debug!(%target, elapsed_ms, error = %e, "Socks5Connector::connect_tcp failed");
+                Err(io::Error::other(format!("SOCKS5 CONNECT to {target}: {e}")))
+            }
+        }
     }
 
     async fn connect_udp(&self, target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
