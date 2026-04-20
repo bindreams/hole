@@ -307,9 +307,10 @@ fn e2e_start_rejects_full_mode_without_socks5(
 //
 // Gated to Windows for the same reason as the existing `mod tun` in
 // `proxy_manager_e2e_tests.rs`: `TunnelMode::Full` needs elevation, and
-// `windows-latest` CI runs as `RUNNERADMIN`. The SocksOnly path is
-// unusable here because #189 forces `Mode::TcpOnly` on the SOCKS5
-// listener in SocksOnly mode.
+// `windows-latest` CI runs as `RUNNERADMIN`. The SocksOnly UDP path is
+// covered by `mod socks_only_udp` below — it runs on every job
+// (Linux + Windows pass-1; the galoshes variant is additionally
+// Windows-skipped under #197).
 //
 // The test asserts a client-facing UDP round-trip, which covers the
 // entire TUN→dispatcher→Socks5Endpoint→shadowsocks-service UDP stack
@@ -354,6 +355,83 @@ mod tun {
                 .expect("UDP recv");
             assert_eq!(&buf[..n], payload, "expected UDP echo to return the payload unchanged");
 
+            harness.send(BridgeRequest::Stop).await.expect("send Stop");
+        });
+    }
+}
+
+// UDP via SocksOnly ===================================================================================================
+//
+// End-to-end exercise of SOCKS5 UDP ASSOCIATE in `TunnelMode::SocksOnly`,
+// where there is no TUN dispatcher and no loopback bypass route. The
+// test client opens UDP-ASSOCIATE through the bridge's SOCKS5 listener
+// at `127.0.0.1:<socks_port>`, the bridge relays datagrams via the SS
+// tunnel to the upstream ss-server, the ss-server sends them on to the
+// loopback echo, and replies follow the reverse path.
+//
+// Two variants:
+// * `e2e_socks_only_udp_associate_no_plugin` — direct ss tunnel.
+// * `e2e_socks_only_udp_associate_galoshes` — UDP through galoshes'
+//   YAMUX-multiplexed plugin chain. Skipped on Windows under #197 (same
+//   `PluginConfig` bind race that gates `e2e_ws_socks_only_roundtrip`).
+//
+// Both labeled `[DIST_BIN]` (no `TUN`) → run in pass-1
+// (`SKULD_LABELS="!tun"`) where loopback delivery is intact (PR #207).
+// The galoshes variant additionally carries `PORT_ALLOC` because
+// `ssserver_ws` is `serial = PORT_ALLOC`.
+
+mod socks_only_udp {
+    use super::*;
+    use crate::test_support::socks5_client::socks5_udp_associate;
+    use crate::test_support::udp_echo::UdpEchoServer;
+
+    async fn run_udp_roundtrip(socks_addr: SocketAddr) {
+        let echo = UdpEchoServer::start_loopback().await.expect("UDP echo bind");
+        wait_for_port(socks_addr, Duration::from_secs(10)).await;
+        let payload = b"HOLE-SOCKS-ONLY-UDP";
+        let echoed = tokio::time::timeout(
+            Duration::from_secs(5),
+            socks5_udp_associate(socks_addr, echo.addr, payload),
+        )
+        .await
+        .expect("UDP-ASSOCIATE within 5s")
+        .expect("UDP-ASSOCIATE roundtrip");
+        assert_eq!(echoed, payload, "expected UDP echo to return the payload unchanged");
+    }
+
+    #[skuld::test(labels = [DIST_BIN])]
+    fn e2e_socks_only_udp_associate_no_plugin(
+        #[fixture(dist_dir)] dist: &Path,
+        #[fixture(ssserver_none)] ss: &SsServerHandle,
+    ) {
+        rt().block_on(async {
+            let socks_port = allocate_ephemeral_port().await;
+            let http_port = allocate_ephemeral_port().await;
+            let config = base_config(ss, socks_port, http_port);
+
+            let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+            start_expect_ack(&mut harness, config).await;
+            run_udp_roundtrip(format!("127.0.0.1:{socks_port}").parse().unwrap()).await;
+            harness.send(BridgeRequest::Stop).await.expect("send Stop");
+        });
+    }
+
+    /// Skipped on Windows: same #197 galoshes `PluginConfig` bind race as
+    /// `e2e_ws_socks_only_roundtrip`. Lift this gate once #197 is fixed.
+    #[cfg(not(target_os = "windows"))]
+    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
+    fn e2e_socks_only_udp_associate_galoshes(
+        #[fixture(dist_dir)] dist: &Path,
+        #[fixture(ssserver_ws)] ss: &SsServerHandle,
+    ) {
+        rt().block_on(async {
+            let socks_port = allocate_ephemeral_port().await;
+            let http_port = allocate_ephemeral_port().await;
+            let config = base_config(ss, socks_port, http_port);
+
+            let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+            start_expect_ack(&mut harness, config).await;
+            run_udp_roundtrip(format!("127.0.0.1:{socks_port}").parse().unwrap()).await;
             harness.send(BridgeRequest::Stop).await.expect("send Stop");
         });
     }

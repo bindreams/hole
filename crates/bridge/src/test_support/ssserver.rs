@@ -44,7 +44,7 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
 /// running server task. The server relays anything the client asks for.
 pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
     let mut svr_cfg = ServerConfig::new(("127.0.0.1", 0u16), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly); // skip UDP — the runner is TCP-only
+    svr_cfg.set_mode(Mode::TcpAndUdp);
 
     let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
 
@@ -125,13 +125,13 @@ async fn spawn_ss_with_plugin(
     plugin_opts: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
     let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly);
+    svr_cfg.set_mode(Mode::TcpAndUdp);
 
     svr_cfg.set_plugin(PluginConfig {
         plugin: plugin_path.to_string(),
         plugin_opts: Some(plugin_opts.to_string()),
         plugin_args: vec![],
-        plugin_mode: Mode::TcpOnly,
+        plugin_mode: Mode::TcpAndUdp,
     });
 
     let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
