@@ -1,32 +1,31 @@
-//! Ephemeral TCP port allocation helpers.
+//! Ephemeral TCP port allocation + liveness probe helpers for tests.
 //!
-//! Tests need unique ephemeral ports for SOCKS5 local binds, v2ray-plugin
-//! public-facing bindings, and similar. The kernel's own ephemeral-port
-//! allocator is the source of truth; these helpers wrap the "bind to 0,
-//! read port, drop" pattern with a consistent TOCTOU caveat.
+//! Port allocation delegates to [`hole_common::port_alloc::free_port`],
+//! which runs one bind probe per transport and retries Windows-specific
+//! bind races (WSAEACCES, EADDRINUSE, EADDRNOTAVAIL) internally. Callers
+//! needing cross-test serialization still use the `PORT_ALLOC` skuld
+//! label — `free_port`'s TOCTOU window (between probe drop and the real
+//! owner's bind) is identical to the kernel allocator's.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 
-/// Pre-allocate a TCP port number and immediately drop the listener. The
-/// port is used to construct a bind address before the real owner binds.
-/// There is a tiny TOCTOU window between drop and the real bind; in practice
-/// the kernel does not reissue freshly-released ports immediately.
+use hole_common::port_alloc::{self, Protocols};
+
+/// Pre-allocate a TCP port number on loopback and immediately drop the
+/// holder. The port is used to construct a bind address before the real
+/// owner binds. There is a tiny TOCTOU window between drop and the real
+/// bind; in practice the kernel does not reissue freshly-released ports
+/// immediately, and `PORT_ALLOC`-serialized fixtures don't race each
+/// other for the same port.
+///
+/// Delegates to `hole_common::port_alloc::free_port` for the retry
+/// around Windows-specific bind races.
 pub(crate) async fn allocate_ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Synchronous version for use from non-async test bodies. Same TOCTOU
-/// semantics as [`allocate_ephemeral_port`].
-pub(crate) fn allocate_ephemeral_port_sync() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-    // listener drops here — port is released.
+    port_alloc::free_port(IpAddr::V4(Ipv4Addr::LOCALHOST), Protocols::TCP)
+        .await
+        .expect("allocate ephemeral TCP port")
 }
 
 /// Poll-connect to `addr` until either a TCP connection succeeds or
