@@ -51,6 +51,13 @@ impl LocalDnsServer {
     /// OS-assigned ports, which callers never want: system DNS clients
     /// need UDP and TCP on the same address.
     pub async fn bind(addr: SocketAddr, forwarder: Arc<DnsForwarder>) -> io::Result<Self> {
+        Self::bind_once(addr, forwarder).await
+    }
+
+    /// Single-shot bind of a UDP + TCP pair on `addr`. No retry — the
+    /// caller decides whether to retry on a fresh port (`bind` with port
+    /// 0) or walk a ladder (`bind_ladder` with fixed port 53).
+    async fn bind_once(addr: SocketAddr, forwarder: Arc<DnsForwarder>) -> io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let actual_addr = udp.local_addr()?;
         let tcp = TcpListener::bind(actual_addr).await?;
