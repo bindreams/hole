@@ -4,6 +4,7 @@ pub mod logging;
 pub mod paths;
 pub mod plugin;
 pub mod protocol;
+pub mod retry;
 pub mod version;
 
 #[cfg(test)]
