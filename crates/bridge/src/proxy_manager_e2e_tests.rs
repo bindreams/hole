@@ -420,7 +420,9 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
     rt().block_on(async {
         let method = CipherKind::CHACHA20_POLY1305;
         let password = random_password_for(method);
-        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
+        let ss_port = allocate_ephemeral_port().await;
+        let (ss_addr, _ss_handle) =
+            crate::test_support::ssserver::start_real_ss_server(method, &password, ss_port).await;
 
         let local_port = allocate_ephemeral_port().await;
         let config = ProxyConfig {
@@ -462,7 +464,9 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     rt().block_on(async {
         let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
         let password = random_password_for(method);
-        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
+        let ss_port = allocate_ephemeral_port().await;
+        let (ss_addr, _ss_handle) =
+            crate::test_support::ssserver::start_real_ss_server(method, &password, ss_port).await;
 
         let local_port = allocate_ephemeral_port().await;
         let config = ProxyConfig {
