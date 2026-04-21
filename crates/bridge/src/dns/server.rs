@@ -15,11 +15,24 @@
 //! TCP fails on an IP, both are released and the ladder moves on — this
 //! avoids a split-brain state where system DNS clients might only reach
 //! one transport).
+//!
+//! Ephemeral-port callers of [`LocalDnsServer::bind`] (port 0, used by
+//! tests) go through a retry wrapper around
+//! [`hole_common::port_alloc::free_port`] to absorb the Windows-specific
+//! bind race where the OS's independent TCP/UDP excluded-port-range
+//! tables disagree. Fixed-port callers ([`LocalDnsServer::bind_ladder`]
+//! with port 53) bypass the wrapper: retrying a fixed port in place is
+//! futile because the excluded-range state doesn't change per-attempt,
+//! so the ladder's "move to the next IP" is the correct escape instead.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
+use hole_common::port_alloc::{self, Protocols};
+use hole_common::retry::{is_bind_race, retry_if_async};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
@@ -28,6 +41,13 @@ use crate::dns::forwarder::DnsForwarder;
 
 /// DNS port. Both UDP and TCP use 53 per RFC 1035.
 const DNS_PORT: u16 = 53;
+
+/// Attempts the ephemeral-port retry wrapper makes around `bind_once`
+/// before giving up. Each attempt re-enters `free_port` which itself
+/// retries up to `port_alloc::MAX_BIND_ATTEMPTS` on the probe step — so
+/// the total worst-case bind attempts is nested. Five outer attempts
+/// mirrors `port_alloc`'s inner budget.
+const BIND_EPHEMERAL_RETRY_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
 
 /// Maximum inbound DNS message (both UDP and TCP). DNS over UDP is
 /// capped at 512 bytes (or EDNS0's max_udp_payload) but we accept up to
@@ -50,8 +70,34 @@ impl LocalDnsServer {
     /// passing `port = 0` would otherwise hand the two sockets distinct
     /// OS-assigned ports, which callers never want: system DNS clients
     /// need UDP and TCP on the same address.
+    ///
+    /// When `addr.port() == 0` the bind is wrapped in a retry loop that
+    /// delegates port selection to
+    /// [`hole_common::port_alloc::free_port`] on each attempt. This
+    /// absorbs the Windows `WSAEACCES` race where the OS's independent
+    /// TCP/UDP excluded-port-range tables reject a freshly-allocated
+    /// port on the paired transport. Fixed-port callers skip the
+    /// wrapper — retry in place is futile (state doesn't change
+    /// per-attempt), and the `bind_ladder` walker is the correct escape.
     pub async fn bind(addr: SocketAddr, forwarder: Arc<DnsForwarder>) -> io::Result<Self> {
-        Self::bind_once(addr, forwarder).await
+        if addr.port() == 0 {
+            let ip = addr.ip();
+            retry_if_async(
+                || {
+                    let forwarder = Arc::clone(&forwarder);
+                    async move {
+                        let port = port_alloc::free_port(ip, Protocols::TCP | Protocols::UDP).await?;
+                        Self::bind_once(SocketAddr::new(ip, port), forwarder).await
+                    }
+                },
+                is_bind_race,
+                BIND_EPHEMERAL_RETRY_ATTEMPTS,
+                Duration::ZERO,
+            )
+            .await
+        } else {
+            Self::bind_once(addr, forwarder).await
+        }
     }
 
     /// Single-shot bind of a UDP + TCP pair on `addr`. No retry — the

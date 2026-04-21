@@ -22,12 +22,11 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
-use std::time::Duration;
 
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, info, warn};
 
-use crate::retry::{is_bind_race, retry_if_async};
+use crate::retry::is_bind_race;
 
 bitflags::bitflags! {
     /// Set of IP transports a port must be simultaneously free for.
@@ -91,70 +90,101 @@ pub async fn free_port(ip: IpAddr, protocols: Protocols) -> io::Result<u16> {
         ));
     }
 
-    let attempt = std::cell::Cell::new(0u32);
-    let last_port = std::cell::Cell::new(None::<u16>);
     let n = MAX_BIND_ATTEMPTS.get();
+    let mut last_err: Option<io::Error> = None;
+    let mut last_port: Option<u16> = None;
 
-    let result = retry_if_async(
-        || {
-            let current = attempt.get();
-            attempt.set(current + 1);
-            let last_port = &last_port;
-            async move {
-                if current > 0 {
-                    info!(
-                        target: "hole_common::port_alloc",
-                        attempt = current,
-                        max_attempts = n,
-                        ip = %ip,
-                        protocols = %protocols,
-                        last_port = last_port.get().unwrap_or(0),
-                        reason = "bind_race",
-                        "free_port_retry"
-                    );
-                }
-                // TCP first when available — arbitrary ordering; if a
-                // caller needs UDP-only the fallback picks UDP.
-                let primary = if protocols.contains(Protocols::TCP) {
-                    Protocols::TCP
-                } else {
-                    Protocols::UDP
-                };
-                let port = probe_bind(SocketAddr::new(ip, 0), primary).await?;
-                last_port.set(Some(port));
-                let rest = protocols.difference(primary);
-                if !rest.is_empty() {
-                    ensure_port_free(SocketAddr::new(ip, port), rest).await?;
-                }
-                Ok::<u16, io::Error>(port)
+    // TCP first when available — arbitrary ordering; if a caller needs
+    // UDP-only the fallback picks UDP.
+    let primary = if protocols.contains(Protocols::TCP) {
+        Protocols::TCP
+    } else {
+        Protocols::UDP
+    };
+    let rest = protocols.difference(primary);
+
+    for attempt in 0..n {
+        if attempt > 0 {
+            info!(
+                target: "hole_common::port_alloc",
+                attempt = attempt,
+                max_attempts = n,
+                ip = %ip,
+                protocols = %protocols,
+                last_port = last_port.unwrap_or(0),
+                reason = "bind_race",
+                "free_port_retry"
+            );
+        }
+        let port = match probe_bind(SocketAddr::new(ip, 0), primary).await {
+            Ok(p) => p,
+            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
+                last_port = None;
+                last_err = Some(e);
+                continue;
             }
-        },
-        is_bind_race,
-        MAX_BIND_ATTEMPTS,
-        Duration::ZERO,
-    )
-    .await;
-
-    let attempts = attempt.get();
-    match &result {
-        Ok(port) => debug!(
-            target: "hole_common::port_alloc",
-            ip = %ip,
-            port = port,
-            protocols = %protocols,
-            attempts = attempts,
-            "free_port ok"
-        ),
-        Err(e) => warn!(
-            target: "hole_common::port_alloc",
-            ip = %ip,
-            protocols = %protocols,
-            attempts = attempts,
-            error = %e,
-            "free_port exhausted"
-        ),
+            Err(e) => {
+                warn!(
+                    target: "hole_common::port_alloc",
+                    ip = %ip,
+                    protocols = %protocols,
+                    attempts = attempt + 1,
+                    error = %e,
+                    "free_port exhausted"
+                );
+                return Err(e);
+            }
+        };
+        last_port = Some(port);
+        if rest.is_empty() {
+            debug!(
+                target: "hole_common::port_alloc",
+                ip = %ip,
+                port = port,
+                protocols = %protocols,
+                attempts = attempt + 1,
+                "free_port ok"
+            );
+            return Ok(port);
+        }
+        match ensure_port_free(SocketAddr::new(ip, port), rest).await {
+            Ok(()) => {
+                debug!(
+                    target: "hole_common::port_alloc",
+                    ip = %ip,
+                    port = port,
+                    protocols = %protocols,
+                    attempts = attempt + 1,
+                    "free_port ok"
+                );
+                return Ok(port);
+            }
+            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
+                last_err = Some(e);
+            }
+            Err(e) => {
+                warn!(
+                    target: "hole_common::port_alloc",
+                    ip = %ip,
+                    protocols = %protocols,
+                    attempts = attempt + 1,
+                    error = %e,
+                    "free_port exhausted"
+                );
+                return Err(e);
+            }
+        }
     }
-    result
+    let err = last_err.expect("NonZeroU32 guarantees at least one attempt recorded an error");
+    warn!(
+        target: "hole_common::port_alloc",
+        ip = %ip,
+        protocols = %protocols,
+        attempts = n,
+        error = %err,
+        "free_port exhausted"
+    );
+    Err(err)
 }
 
 /// Probe whether `addr.port()` is free for every transport in
