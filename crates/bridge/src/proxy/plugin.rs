@@ -5,11 +5,13 @@
 // capture, SIP003u-compliant graceful shutdown, and future chain
 // composition support.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hole_common::plugin::plugin_protocols;
+use hole_common::port_alloc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -81,7 +83,14 @@ impl Drop for PluginChain {
 /// `pid_sink` callback), enabling crash recovery on next startup.
 /// When `None`, no state is tracked (used by `server_test` for one-shot
 /// probes that die with the bridge).
+///
+/// `plugin_name` selects the protocol set for the local port allocation
+/// — UDP-capable plugins (galoshes) need the port verified for both TCP
+/// and UDP so their internal dual bind on the local address can't hit
+/// the Windows cross-protocol excluded-port race. See
+/// [`hole_common::plugin::plugin_protocols`].
 pub async fn start_plugin_chain(
+    plugin_name: &str,
     plugin_path: &str,
     plugin_opts: Option<&str>,
     server_host: &str,
@@ -110,11 +119,15 @@ pub async fn start_plugin_chain(
     let cancel = CancellationToken::new();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    let local_addr = garter::chain::allocate_ports(1)
-        .map_err(|e| ProxyError::Plugin(format!("port allocation failed: {e}")))?
-        .into_iter()
-        .next()
-        .expect("allocate_ports(1) returns exactly 1 port");
+    // Allocate via hole-common's `free_port` (was `garter::chain::allocate_ports`).
+    // Supersedes garter's internal TCP-only allocator so UDP-capable plugins
+    // (galoshes) get a port verified on both TCP and UDP. Retry for Windows
+    // WSAEACCES / EADDRINUSE / EADDRNOTAVAIL is handled inside `free_port`.
+    let ip: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let port = port_alloc::free_port(ip, plugin_protocols(plugin_name))
+        .await
+        .map_err(|e| ProxyError::Plugin(format!("port allocation failed: {e}")))?;
+    let local_addr = SocketAddr::new(ip, port);
 
     let env = garter::PluginEnv {
         local_host: local_addr.ip(),
