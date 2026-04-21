@@ -66,10 +66,22 @@ All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table
 Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:
 
 1. **`handle-holders` workspace crate** — pure query API: `find_holders(&Path)` returns every process currently holding the file, `log_holders(&Path)` logs them at `tracing::error!`. Windows uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` with a non-blocking `GetFileType == FILE_TYPE_DISK` pre-filter to avoid pipe/device hangs, then `DuplicateHandle` + `GetFileInformationByHandle` for file-id comparison. macOS shells out to `lsof -F pc`. Best-effort — never introduces a new failure mode.
-1. **`hole_bridge::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
-1. **`hole_bridge::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
+1. **`hole_common::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
+1. **`hole_common::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
 
 `DistHarness::spawn` composes them: `retry_if(|| cmd.spawn(), is_file_contention, 3, 500ms)`, and on terminal failure calls `handle_holders::log_holders(&hole_exe)` before propagating. See bindreams/hole#208 for the incident that motivated this.
+
+### Port allocation
+
+Getting a free port for local binding or SIP003 subprocess handoff goes through `hole_common::port_alloc` ([crates/common/src/port_alloc.rs](crates/common/src/port_alloc.rs)):
+
+- `Protocols` — bitflag set of `TCP | UDP`. `hole_common::plugin::plugin_protocols(name)` maps a plugin's `udp_supported` bit to the right set.
+- `free_port(ip, protocols) -> io::Result<u16>` — finds a port free for every transport in `protocols`. Multi-transport is implemented as "pick via one transport, verify the rest via `ensure_port_free`, retry on mismatch." Retries internally on `ErrorKind::AddrInUse | PermissionDenied | AddrNotAvailable` (the [`is_bind_race`](crates/common/src/retry.rs) predicate). Terminal `WARN` log on exhaustion.
+- `ensure_port_free(addr, protocols)` — pure probe without allocation; binds one socket per transport and drops.
+
+`LocalDnsServer::bind` ([crates/bridge/src/dns/server.rs](crates/bridge/src/dns/server.rs)) wraps the port-0 path in a second `retry_if_async(is_bind_race)` loop around `free_port` + `bind_once` to absorb the TOCTOU between `free_port`'s probe-drop and the real UDP+TCP pair bind. Fixed-port callers (`bind_ladder` on port 53) skip the wrapper — retry in place is futile, the ladder is the correct escape.
+
+The retry exists because Windows maintains **independent TCP/UDP excluded-port-range tables** (Hyper-V / WSL / Docker Desktop reservations, visible via `netsh int ipv4 show excludedportrange`); an OS-picked ephemeral port for one transport may be reserved for the other and the paired bind transiently fails. Galoshes's `garter::chain::allocate_one_port` hits the same class of bug — see bindreams/galoshes#21 for the deterministic `SO_EXCLUSIVEADDRUSE`-wildcard reproducer.
 
 ### CLI
 
