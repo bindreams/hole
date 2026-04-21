@@ -19,6 +19,7 @@ pub(crate) mod dist_fixture;
 pub(crate) mod dist_harness;
 pub(crate) mod http_connect_client;
 pub(crate) mod http_target;
+pub(crate) mod log_capture;
 pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod skuld_fixtures;

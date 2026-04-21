@@ -87,6 +87,9 @@ ferrisetw = "1.2.0"
 [dev-dependencies]
 skuld = { workspace = true }
 tokio = { version = "1", features = ["test-util"] }
+# For in-process log capture in tests — verifies the diagnostic spans and
+# per-call `elapsed_ms` debug logs added for #247.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 shadowsocks-service = { version = "1", features = ["server"] }
 rcgen = "0.13"
 rand = "0.9"

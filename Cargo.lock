@@ -2537,6 +2537,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "tun-engine",
  "ureq",
  "webpki-roots",

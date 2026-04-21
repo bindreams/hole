@@ -17,6 +17,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::process::Command;
+use std::time::Instant;
 
 use super::AppliedAdapter;
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
@@ -29,6 +30,7 @@ const NETSH: &str = "netsh";
 /// that don't exist (e.g. the TUN alias hasn't been created yet) are
 /// silently skipped.
 pub fn capture_adapters(aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> {
+    let started = Instant::now();
     let mut out = Vec::with_capacity(aliases.len());
     for alias in aliases {
         match capture_one(alias) {
@@ -41,6 +43,12 @@ pub fn capture_adapters(aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> 
             }
         }
     }
+    tracing::debug!(
+        aliases = aliases.len(),
+        captured = out.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "capture_adapters"
+    );
     Ok(out)
 }
 
@@ -49,6 +57,7 @@ pub fn capture_adapters(aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> 
 /// Callers flush the DNS cache separately (via [`flush_dns_cache`]) once
 /// the full adapter list is applied.
 pub fn apply_loopback(aliases: &[String], loopback_ip: IpAddr) -> io::Result<Vec<AppliedAdapter>> {
+    let started = Instant::now();
     let mut applied = Vec::with_capacity(aliases.len());
     for alias in aliases {
         if let Err(e) = set_dns_ipv4(alias, Some(loopback_ip)) {
@@ -61,15 +70,29 @@ pub fn apply_loopback(aliases: &[String], loopback_ip: IpAddr) -> io::Result<Vec
         });
     }
     flush_dns_cache();
+    tracing::debug!(
+        aliases = aliases.len(),
+        applied = applied.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "apply_loopback"
+    );
     Ok(applied)
 }
 
 /// Run `ipconfig /flushdns`. Best-effort; a failure here is a log line,
 /// not a return value.
+///
+/// Emits a DEBUG `elapsed_ms` log so Phase-2 observation of #247 can see
+/// how long `ipconfig /flushdns` actually takes on the user's machine —
+/// it is notoriously slow on Windows (often 1-5s) and was the prime
+/// suspect for the 10s stall.
 pub fn flush_dns_cache() {
+    let started = Instant::now();
     let res = Command::new("ipconfig").arg("/flushdns").output();
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "ipconfig /flushdns failed");
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match res {
+        Ok(_) => tracing::debug!(elapsed_ms, "flush_dns_cache"),
+        Err(e) => tracing::warn!(error = %e, elapsed_ms, "ipconfig /flushdns failed"),
     }
 }
 
@@ -89,11 +112,24 @@ pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
 // Capture =============================================================================================================
 
 fn capture_one(alias: &str) -> io::Result<Option<DnsPriorAdapter>> {
+    let started = Instant::now();
     let v4 = match show_dnsservers("ipv4", alias)? {
         Some(out) => parse_netsh_dnsservers(&out),
-        None => return Ok(None),
+        None => {
+            tracing::debug!(
+                %alias,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "capture_one: adapter not found"
+            );
+            return Ok(None);
+        }
     };
     let v6 = show_dnsservers("ipv6", alias)?.map(|o| parse_netsh_dnsservers(&o));
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "capture_one"
+    );
     Ok(Some(DnsPriorAdapter {
         id: AdapterId::WindowsAlias {
             value: alias.to_string(),
@@ -105,10 +141,17 @@ fn capture_one(alias: &str) -> io::Result<Option<DnsPriorAdapter>> {
 }
 
 fn show_dnsservers(family: &str, alias: &str) -> io::Result<Option<String>> {
+    let started = Instant::now();
     let output = Command::new(NETSH)
         .args(["interface", family, "show", "dnsservers"])
         .arg(format!("name={alias}"))
         .output()?;
+    tracing::debug!(
+        %alias,
+        %family,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "show_dnsservers"
+    );
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // netsh emits "The system cannot find the file specified." on a
@@ -200,6 +243,7 @@ pub(super) fn parse_netsh_dnsservers(stdout: &str) -> DnsPrior {
 // Apply ===============================================================================================================
 
 fn set_dns_ipv4(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
+    let started = Instant::now();
     let mut cmd = Command::new(NETSH);
     cmd.args(["interface", "ipv4", "set", "dnsservers"])
         .arg(format!("name={alias}"));
@@ -212,6 +256,11 @@ fn set_dns_ipv4(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
         }
     }
     let status = cmd.status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "set_dns_ipv4"
+    );
     if !status.success() {
         return Err(io::Error::other(format!("netsh set dnsservers failed: {status}")));
     }
@@ -219,11 +268,17 @@ fn set_dns_ipv4(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
 }
 
 fn set_dhcp_ipv4(alias: &str) -> io::Result<()> {
+    let started = Instant::now();
     let status = Command::new(NETSH)
         .args(["interface", "ipv4", "set", "dnsservers"])
         .arg(format!("name={alias}"))
         .arg("dhcp")
         .status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "set_dhcp_ipv4"
+    );
     if !status.success() {
         return Err(io::Error::other(format!("netsh set dnsservers dhcp failed: {status}")));
     }
@@ -231,12 +286,18 @@ fn set_dhcp_ipv4(alias: &str) -> io::Result<()> {
 }
 
 fn add_dns_ipv4(alias: &str, ip: IpAddr, index: u32) -> io::Result<()> {
+    let started = Instant::now();
     let status = Command::new(NETSH)
         .args(["interface", "ipv4", "add", "dnsservers"])
         .arg(format!("name={alias}"))
         .arg(ip.to_string())
         .arg(format!("index={index}"))
         .status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "add_dns_ipv4"
+    );
     if !status.success() {
         return Err(io::Error::other(format!("netsh add dnsservers failed: {status}")));
     }
@@ -244,6 +305,7 @@ fn add_dns_ipv4(alias: &str, ip: IpAddr, index: u32) -> io::Result<()> {
 }
 
 fn set_dns_ipv6(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
+    let started = Instant::now();
     let mut cmd = Command::new(NETSH);
     cmd.args(["interface", "ipv6", "set", "dnsservers"])
         .arg(format!("name={alias}"));
@@ -256,6 +318,11 @@ fn set_dns_ipv6(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
         }
     }
     let status = cmd.status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "set_dns_ipv6"
+    );
     if !status.success() {
         return Err(io::Error::other(format!("netsh set dnsservers v6 failed: {status}")));
     }
@@ -263,11 +330,17 @@ fn set_dns_ipv6(alias: &str, ip: Option<IpAddr>) -> io::Result<()> {
 }
 
 fn set_dhcp_ipv6(alias: &str) -> io::Result<()> {
+    let started = Instant::now();
     let status = Command::new(NETSH)
         .args(["interface", "ipv6", "set", "dnsservers"])
         .arg(format!("name={alias}"))
         .arg("dhcp")
         .status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "set_dhcp_ipv6"
+    );
     if !status.success() {
         return Err(io::Error::other(format!(
             "netsh set dnsservers v6 dhcp failed: {status}"
@@ -277,12 +350,18 @@ fn set_dhcp_ipv6(alias: &str) -> io::Result<()> {
 }
 
 fn add_dns_ipv6(alias: &str, ip: IpAddr, index: u32) -> io::Result<()> {
+    let started = Instant::now();
     let status = Command::new(NETSH)
         .args(["interface", "ipv6", "add", "dnsservers"])
         .arg(format!("name={alias}"))
         .arg(ip.to_string())
         .arg(format!("index={index}"))
         .status()?;
+    tracing::debug!(
+        %alias,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "add_dns_ipv6"
+    );
     if !status.success() {
         return Err(io::Error::other(format!("netsh add dnsservers v6 failed: {status}")));
     }
