@@ -153,13 +153,49 @@ crates/hole/              → hole (Tauri app + CLI + bridge entry point, binary
 crates/tun-engine/        → general-purpose TUN + routing + packet-loop engine
                             (consumed by hole-bridge; intended for standalone reuse)
 crates/tun-engine-macros/ → proc-macro support crate for tun-engine (`#[freeze]`)
+crates/garter/            → SIP003u plugin-chain runner library (ChainPlugin trait,
+                            BinaryPlugin, ChainRunner). Apache-2.0. Ex-galoshes.
+crates/garter-bin/        → `garter` binary (YAML-config-driven plugin chainer for
+                            plugin developers; NOT shipped in Hole's MSI). Apache-2.0.
+crates/galoshes/          → bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP relay
+                            with embedded v2ray-plugin (SHA256-verified at compile
+                            time). Apache-2.0. Shipped alongside hole.exe.
+crates/mock-plugin/       → minimal SIP003u TCP echo plugin for garter integration
+                            tests. Apache-2.0.
 xtask/                    → workspace task runner (`cargo xtask <stage|deps|version|...>`)
 xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
-external/                 → Third-party source (git subrepos)
+external/                 → Third-party source (git subrepos): `v2ray-plugin` (Go).
 msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 scripts/                  → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
 ui/                       → Frontend HTML/CSS/TypeScript (Vite)
 ```
+
+The ex-Galoshes crates (`garter`, `garter-bin`, `galoshes`, `mock-plugin`)
+are Apache-2.0 per-crate — see [NOTICES.md](NOTICES.md) for the
+attribution. Hole's own crates are GPL-3.0-or-later; combined binary
+distributions produced by this workspace (`hole.exe`, `hole.msi`,
+bundled `galoshes.exe`) ship as a whole under GPL-3.0 per Apache→GPL
+one-way compatibility.
+
+### v2ray-plugin embedding
+
+The `galoshes` crate embeds the v2ray-plugin Go binary into its own
+executable at compile time:
+
+1. Go source lives at [external/v2ray-plugin/](external/v2ray-plugin/)
+   (git subrepo of `shadowsocks/v2ray-plugin`).
+1. `cargo xtask v2ray-plugin` (or `cargo xtask deps`, which calls it
+   first) builds the Go source into
+   `.cache/v2ray-plugin/v2ray-plugin-<host-target-triple>[.exe]`.
+1. [`crates/galoshes/build.rs`](crates/galoshes/build.rs) reads that
+   cache file, computes its SHA-256, and emits `V2RAY_PLUGIN_PATH` +
+   `V2RAY_SHA256` as env vars the crate `include_bytes!`s. At runtime,
+   `galoshes` re-hashes the embedded bytes and refuses to run on
+   mismatch — compile-time binary integrity.
+1. `output_name()` in `xtask/src/v2ray_plugin.rs` maps the host target
+   triple to the expected cache filename; it covers all six target
+   triples in the CI matrix (Hole's Windows/macOS set plus ex-Galoshes
+   Linux x64/arm64 and Windows-arm64).
 
 Build orchestration is owned by `xtask/`. The canonical list of files that
 go into the runnable BINDIR (next to `hole.exe`) lives in
