@@ -2,13 +2,16 @@
 name = "garter"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+thiserror = "2"
 contracts = { workspace = true }
 async-trait = { workspace = true }
 
@@ -33,3 +36,7 @@ windows = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+socket2 = "0.6"
+windows = { version = "0.61", features = ["Win32_Networking_WinSock"] }

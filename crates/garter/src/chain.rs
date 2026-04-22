@@ -34,13 +34,38 @@ fn allocate_one_port() -> crate::Result<SocketAddr> {
         let addr = listener.local_addr()?;
         drop(listener);
 
+        #[cfg(all(test, windows))]
+        test_hook::fire(addr.port());
+
         match std::net::TcpListener::bind(addr) {
             Ok(l) => {
                 drop(l);
                 return Ok(addr);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tracing::debug!(attempt, port = addr.port(), "port was taken, retrying");
+            // `AddrInUse` — another socket grabbed the port between drop and rebind.
+            // `PermissionDenied` — Windows `WSAEACCES`: typically a shift in the
+            // TCP dynamic excluded-port range (Hyper-V / WSL2 / Docker Desktop
+            // reservations, visible via `netsh int ipv4 show excludedportrange`),
+            // or another socket claiming the port with `SO_EXCLUSIVEADDRUSE` on a
+            // wildcard interface.
+            // `AddrNotAvailable` — same excluded-port-range class; distinct from
+            // `WSAEACCES` only in whether the kernel rejects the bind at the
+            // address-reservation layer or the permission layer.
+            // All three are transient probe-races; retry on a fresh ephemeral port.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::AddrNotAvailable
+                ) =>
+            {
+                tracing::debug!(
+                    attempt,
+                    port = addr.port(),
+                    kind = ?e.kind(),
+                    "port unavailable, retrying"
+                );
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -228,7 +253,7 @@ impl ChainRunner {
     }
 }
 
-// Helpers =============================================================
+// Helpers =============================================================================================================
 
 /// Shared handler for a single plugin-task exit result. Updates
 /// `first_error` on a first-write-wins basis and fires `shutdown` so the
@@ -286,5 +311,49 @@ async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) -> Option<Soc
             }
             () = shutdown.cancelled() => return None,
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) mod test_hook {
+    use std::cell::RefCell;
+
+    type HookFn = Box<dyn FnMut(u16)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<HookFn>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install a callback that fires between `drop(listener)` and the rebind
+    /// inside `allocate_one_port`. Only valid when the caller of
+    /// `allocate_ports` runs synchronously on the same thread that called
+    /// `set`. Do NOT use this hook with `ChainRunner::run` on a
+    /// multi-threaded tokio runtime — `allocate_ports` would then fire on a
+    /// worker thread with an empty `HOOK` and the injection is silently
+    /// skipped.
+    pub(crate) fn set<F: FnMut(u16) + 'static>(f: F) -> Guard {
+        HOOK.with(|h| {
+            assert!(
+                h.borrow().is_none(),
+                "test_hook::set called with a hook already installed"
+            );
+            *h.borrow_mut() = Some(Box::new(f));
+        });
+        Guard
+    }
+
+    pub(crate) fn fire(port: u16) {
+        HOOK.with(|h| {
+            if let Some(cb) = h.borrow_mut().as_mut() {
+                cb(port);
+            }
+        });
     }
 }

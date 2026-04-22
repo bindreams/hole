@@ -121,7 +121,7 @@ impl EmbeddedBinary {
     }
 }
 
-// Helpers =====
+// Helpers =============================================================================================================
 
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -133,7 +133,7 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// Platform: runtime_dir =====
+// Platform: runtime_dir ===============================================================================================
 
 #[cfg(target_os = "linux")]
 fn runtime_dir() -> Result<PathBuf> {
@@ -167,7 +167,7 @@ fn runtime_dir() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join("galoshes"))
 }
 
-// Platform: permissions =====
+// Platform: permissions ===============================================================================================
 
 #[cfg(unix)]
 fn set_dir_permissions(path: &Path) -> Result<()> {
@@ -183,7 +183,7 @@ fn set_file_permissions(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to set permissions on {}", path.display()))
 }
 
-// Platform: open_verified =====
+// Platform: open_verified =============================================================================================
 
 #[cfg(unix)]
 fn open_verified(path: &Path) -> Result<VerifiedBinary> {

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
-// Protocol framing =====
+// Protocol framing ====================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamTag {
@@ -56,7 +56,7 @@ pub fn deframe_udp_datagram(buf: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&buf[2..2 + len], &buf[2 + len..]))
 }
 
-// Driver =====
+// Driver ==============================================================================================================
 
 type OpenStreamReply = tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;
 
@@ -151,7 +151,7 @@ async fn open_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> Result<yamux::S
     rx.await.map_err(|_| yamux::ConnectionError::Closed)?
 }
 
-// TCP/UDP relay helpers =====
+// TCP/UDP relay helpers ===============================================================================================
 
 /// Relay between a tokio TCP stream and a yamux stream (bidirectional).
 async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -> Result<()> {
@@ -203,7 +203,7 @@ async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -
     Ok(())
 }
 
-// Client mode =====
+// Client mode =========================================================================================================
 
 async fn connect_with_backoff(addr: SocketAddr, shutdown: &CancellationToken) -> Option<TcpStream> {
     let mut delay = Duration::from_millis(100);
@@ -341,7 +341,7 @@ async fn run_client(
     }
 }
 
-// Server mode =====
+// Server mode =========================================================================================================
 
 async fn run_server(
     config: yamux::Config,
@@ -422,7 +422,7 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
     Ok(())
 }
 
-// Plugin =====
+// Plugin ==============================================================================================================
 
 pub struct YamuxPlugin {
     config: yamux::Config,

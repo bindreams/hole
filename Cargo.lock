@@ -1909,17 +1909,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "galoshes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "contracts",
+ "futures",
+ "garter",
+ "sha2 0.10.9",
+ "skuld",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "yamux",
+]
+
+[[package]]
 name = "garter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "contracts",
  "libc",
+ "skuld",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "garter-bin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "garter",
+ "serde",
+ "skuld",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -3486,6 +3521,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-plugin"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3636,6 +3678,12 @@ name = "nodrop"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72ef4a56884ca558e5ddb05a1d1e7e1bfd9a68d9ed024c21704cc98872dae1bb"
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -5865,6 +5913,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7570,6 +7624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "web_atoms"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8594,6 +8658,22 @@ dependencies = [
  "libyaml-rs",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "yamux"
+version = "0.13.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.4",
+ "static_assertions",
+ "web-time",
 ]
 
 [[package]]
