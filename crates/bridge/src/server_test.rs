@@ -216,6 +216,7 @@ async fn maybe_start_plugin(
     // `None` for state_dir: test-server probes are one-shot and die with
     // the bridge; no crash recovery tracking needed.
     let chain = crate::proxy::plugin::start_plugin_chain(
+        plugin_name,
         &plugin_path,
         entry.plugin_opts.as_deref(),
         &server_host,

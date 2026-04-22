@@ -32,3 +32,24 @@ fn is_known_false_for_unknown() {
     assert!(!plugin::is_known("foobar"));
     assert!(!plugin::is_known(""));
 }
+
+#[skuld::test]
+fn plugin_protocols_v2ray_is_tcp_only() {
+    use crate::port_alloc::Protocols;
+    assert_eq!(plugin::plugin_protocols("v2ray-plugin"), Protocols::TCP);
+}
+
+#[skuld::test]
+fn plugin_protocols_galoshes_is_tcp_and_udp() {
+    use crate::port_alloc::Protocols;
+    assert_eq!(plugin::plugin_protocols("galoshes"), Protocols::TCP | Protocols::UDP);
+}
+
+#[skuld::test]
+fn plugin_protocols_unknown_defaults_to_tcp() {
+    use crate::port_alloc::Protocols;
+    // Conservative default — unknown plugins are treated as TCP-only to
+    // match the `udp_supported: false` default for unregistered names.
+    assert_eq!(plugin::plugin_protocols("xyzzy"), Protocols::TCP);
+    assert_eq!(plugin::plugin_protocols(""), Protocols::TCP);
+}

@@ -23,8 +23,10 @@ tracing-appender = "0.2"
 file-rotate = "0.8"
 os_pipe = "1"
 time = { version = "0.3", features = ["serde-well-known", "formatting"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 yaml_serde = "0.10"
 nu-ansi-term = "0.50"
+bitflags = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -46,3 +48,4 @@ yaml_serde = "0.10"
 skuld = { workspace = true }
 log = "0.4"
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

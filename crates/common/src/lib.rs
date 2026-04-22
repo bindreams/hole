@@ -3,7 +3,9 @@ pub mod import;
 pub mod logging;
 pub mod paths;
 pub mod plugin;
+pub mod port_alloc;
 pub mod protocol;
+pub mod retry;
 pub mod version;
 
 #[cfg(test)]

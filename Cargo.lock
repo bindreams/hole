@@ -2550,6 +2550,7 @@ dependencies = [
 name = "hole-common"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "dirs 6.0.0",
  "file-rotate",
  "libc",
@@ -2564,6 +2565,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "time",
+ "tokio",
  "tracing",
  "tracing-appender",
  "tracing-log",

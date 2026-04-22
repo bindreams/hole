@@ -169,9 +169,9 @@ impl DistHarness {
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly
         // built `hole.exe`) lands a holder list in the log. See #208.
-        let mut child = crate::retry::retry_if(
+        let mut child = hole_common::retry::retry_if(
             || cmd.spawn(),
-            crate::retry::is_file_contention,
+            hole_common::retry::is_file_contention,
             MAX_SPAWN_ATTEMPTS,
             SPAWN_BACKOFF,
         )

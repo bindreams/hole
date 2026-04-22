@@ -183,3 +183,17 @@ async fn bind_fails_when_port_in_use_on_preferred_ip() {
     let res = LocalDnsServer::bind(busy_addr, fwd).await;
     assert!(res.is_err(), "bind should fail on busy port");
 }
+
+// NOTE on deterministic WSAEACCES coverage: a time-bounded stress loop
+// on `LocalDnsServer::bind(127.0.0.1:0)` conflates two distinct failure
+// modes — the excluded-port-range race our retry wrapper absorbs, and
+// local-host TIME_WAIT ephemeral-pool exhaustion under rapid bind/drop
+// cycling, which no amount of port-alloc retry can fix (once the pool
+// is drained, further picks will also be drained). Galoshes#21 uses a
+// `SO_EXCLUSIVEADDRUSE`-wildcard test hook to deterministically force
+// `WSAEACCES` without relying on OS state. A matching hook in
+// `bind_once` (firing between the UDP and TCP bind) would let us test
+// the retry wrapper deterministically — tracked as a follow-up. Until
+// then, `drop_releases_udp_and_tcp_ports` above is the unit-test
+// regression for the port-0 wrapper, and real-world coverage comes
+// from main-push CI on Windows.

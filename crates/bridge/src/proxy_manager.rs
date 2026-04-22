@@ -350,6 +350,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
             let chain = crate::proxy::plugin::start_plugin_chain(
+                plugin_name,
                 &plugin_path,
                 config.server.plugin_opts.as_deref(),
                 &config.server.server,
