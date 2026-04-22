@@ -71,10 +71,10 @@ pub enum Command {
     /// Output goes into `<repo>/.cache/v2ray-plugin/`. Replaces the previous
     /// build.rs side effect.
     V2rayPlugin,
-    /// Build the galoshes sidecar from `external/galoshes/`.
+    /// Build the galoshes sidecar (workspace member `crates/galoshes/`).
     ///
-    /// Builds galoshes' embedded v2ray-plugin first (independent version),
-    /// then the galoshes binary itself in release mode.
+    /// Expects v2ray-plugin to have been built first into `.cache/v2ray-plugin/`
+    /// (the `deps` command runs v2ray-plugin → galoshes in that order).
     Galoshes,
     /// Download and verify wintun.dll on Windows.
     ///

@@ -28,8 +28,8 @@ fn fake_repo() -> tempfile::TempDir {
     };
     fs::write(v2ray.join(v2ray_name), b"fake v2ray-plugin").unwrap();
 
-    // external/galoshes/target/release/galoshes{.exe}
-    let galoshes = root.join("external").join("galoshes").join("target").join("release");
+    // target/release/galoshes{.exe} (unified workspace target dir)
+    let galoshes = root.join("target").join("release");
     fs::create_dir_all(&galoshes).unwrap();
     let galoshes_name = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
     fs::write(galoshes.join(galoshes_name), b"fake galoshes").unwrap();

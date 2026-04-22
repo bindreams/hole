@@ -60,14 +60,10 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     files.push(BindirFile::new(v2ray_src, v2ray_dest));
 
     // 3. galoshes sidecar. Built by `cargo xtask galoshes` into
-    //    `external/galoshes/target/release/galoshes{.exe}`.
+    //    `target/release/galoshes{.exe}` (the unified workspace target dir
+    //    now that galoshes is a regular workspace member at `crates/galoshes/`).
     let galoshes_name = format!("galoshes{exe_suffix}");
-    let galoshes_src = repo_root
-        .join("external")
-        .join("galoshes")
-        .join("target")
-        .join("release")
-        .join(&galoshes_name);
+    let galoshes_src = repo_root.join("target").join("release").join(&galoshes_name);
     files.push(BindirFile::new(galoshes_src, galoshes_name));
 
     // 4. wintun.dll — Windows-only. Downloaded by `cargo xtask wintun` into

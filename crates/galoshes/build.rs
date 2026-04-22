@@ -5,8 +5,12 @@ fn main() {
 
     let target = std::env::var("TARGET").unwrap();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    // `CARGO_MANIFEST_DIR` is `<repo>/crates/galoshes`; walk up twice to
+    // reach the workspace root where `xtask v2ray-plugin` writes the
+    // built binary under `.cache/v2ray-plugin/`.
     let cache_dir = PathBuf::from(&manifest_dir)
         .parent()
+        .and_then(|p| p.parent())
         .unwrap()
         .join(".cache/v2ray-plugin");
 
