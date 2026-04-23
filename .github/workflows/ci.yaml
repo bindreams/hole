@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     name: Lint
@@ -26,16 +30,22 @@ jobs:
       - name: Install prek
         run: uv tool install prek
 
+      # cargo-clippy is skipped here because it's run per-platform in the
+      # build job (see ci.yaml below). cargo-fmt stays active — it is
+      # platform-independent, one Windows invocation covers the workspace.
       - name: Run linters
+        env:
+          SKIP: cargo-clippy
         run: prek run --all-files --show-diff-on-failure
 
-  # One matrix over every host platform we compile on. Each step below
-  # decides whether it applies to the current (os, arch) — Hole-only
-  # steps (full workspace clippy / build / tests) skip Linux and
-  # Windows-arm64 since Hole doesn't ship on those. The matrix itself
-  # stays dumb about which project supports which platform.
-  test:
-    name: Test (${{ matrix.os }}/${{ matrix.arch }})
+  # Per-platform build job: compiles clippy + test binaries once and publishes
+  # them as a platform-scoped artifact (`build-<os>-<arch>`). Test jobs below
+  # download the archive and run filtered tests without invoking the Rust
+  # toolchain. See .tmp/claude/plans/i-want-to-refactor-polymorphic-catmull.md
+  # for the full design (esp. the matrix `needs:` trade-off: compile errors
+  # in any crate fail `build[P]` and skip all `test-*[P]` cells).
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -67,29 +77,156 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      # Galoshes-only testing runs on platforms Hole doesn't ship on
-      # (Linux x64/arm64, Windows-arm64). On the Hole-supported platforms
-      # the subsequent `Test (non-TUN)` step covers these via `--workspace`.
-      - name: Test (galoshes crates)
-        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
-        shell: bash
-        run: cargo nextest run -p garter -p garter-bin -p galoshes -p mock-plugin
-
-      # === Hole-supported platforms only: windows/amd64 + darwin/{amd64,arm64} ===
-
-      - name: Clippy
+      # Clippy coverage is platform-gated the same way as before: full
+      # workspace on Hole platforms (windows/amd64, darwin/*); ex-Galoshes
+      # crates only on platforms Hole doesn't ship on.
+      - name: Clippy (Hole workspace)
         if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # cargo clippy uses `cargo check`, which leaves binary outputs under
-      # `target/debug/deps/hole-<hash>.exe` but does NOT create the
-      # top-level `target/debug/hole[.exe]` copy. The bridge crate's e2e
-      # test fixture (`dist_dir`) calls `xtask::run_stage` to hardlink
-      # `target/debug/hole[.exe]` into `target/debug/dist/bin/`, so we
-      # need a real `cargo build` to produce it.
-      - name: Build workspace (for dist-dir test fixture)
+      - name: Clippy (ex-Galoshes only)
+        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
+        run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin --all-targets -- -D warnings
+
+      # Produce a portable nextest archive. Hole platforms archive the whole
+      # workspace; non-Hole platforms archive only the ex-Galoshes crates
+      # (Hole's Tauri app + platform-gated crates don't compile on Linux
+      # or windows-arm64).
+      - name: Build test archive (Hole workspace)
         if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
-        run: cargo build --workspace
+        shell: bash
+        run: |
+          mkdir -p .ci-artifacts
+          cargo nextest archive --workspace --archive-file .ci-artifacts/tests.tar.zst
+
+      - name: Build test archive (ex-Galoshes only)
+        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
+        shell: bash
+        run: |
+          mkdir -p .ci-artifacts
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file .ci-artifacts/tests.tar.zst
+
+      # Hole e2e tests (`DistHarness`) expect `target/debug/dist/bin/hole[.exe]`
+      # + sidecars + wintun.dll staged. No --with-tests — stable test paths are
+      # a local-dev Firewall-consent optimization that fresh CI VMs don't need.
+      - name: Stage dist/bin (runtime assets for e2e tests)
+        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
+        shell: bash
+        run: |
+          cargo xtask stage --out-dir target/debug/dist
+          cp -r target/debug/dist .ci-artifacts/dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: .ci-artifacts/
+          retention-days: 3
+          if-no-files-found: error
+
+  # Three per-project test jobs, all consuming the `build-<os>-<arch>` artifact
+  # and running `cargo nextest run --archive-file`. They install the nextest
+  # binary via taiki-e/install-action (no Rust toolchain needed) and skip the
+  # `setup-build` composite action entirely.
+  test-garter:
+    name: Test garter (${{ matrix.os }}/${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nextest (pre-built binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/build
+
+      # `cargo nextest run --archive-file` refuses `-p`; the archive's
+      # package set is frozen at build time. Filter by `-E package(...)`
+      # instead.
+      - name: Run tests
+        shell: bash
+        run: >
+          cargo nextest run
+          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --workspace-remap "${{ github.workspace }}"
+          -E 'package(garter) + package(garter-bin) + package(mock-plugin)'
+
+  test-galoshes:
+    name: Test galoshes (${{ matrix.os }}/${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nextest (pre-built binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/build
+
+      - name: Run tests
+        shell: bash
+        run: >
+          cargo nextest run
+          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --workspace-remap "${{ github.workspace }}"
+          -E 'package(galoshes)'
+
+  test-hole:
+    name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nextest (pre-built binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/build
 
       # Two-pass split to work around #200: the Windows TUN test
       # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
@@ -100,14 +237,22 @@ jobs:
       # the tail of the job and not a subsequent loopback-using test.
       # Skuld's `SKULD_LABELS` env var does the filtering; see
       # `crates/bridge/src/test_support/skuld_fixtures.rs` for the
-      # `TUN` label definition.
+      # `TUN` label definition. Under the new per-project job layout,
+      # test-hole owns its own VM — Galoshes/Garter tests on other
+      # runners cannot be poisoned by TUN's NDIS perturbation.
       - name: Test (non-TUN)
-        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
         id: test-non-tun
         shell: bash
         env:
           SKULD_LABELS: "!tun"
-        run: cargo nextest run --workspace
+        run: >
+          cargo nextest run
+          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --workspace-remap "${{ github.workspace }}"
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
 
       - name: Test (TUN, runs last for #200)
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
@@ -115,13 +260,20 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
-        run: cargo nextest run --workspace
+        run: >
+          cargo nextest run
+          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --workspace-remap "${{ github.workspace }}"
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       - name: Upload bridge logs on test failure
-        if: (matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')) && failure()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
@@ -207,7 +359,7 @@ jobs:
   cache-health:
     name: Cache health
     runs-on: ubuntu-latest
-    needs: [lint, test, test-installer]
+    needs: [lint, build, test-garter, test-galoshes, test-hole, test-installer]
     if: always()    # report even when prior jobs failed — those are the runs most likely to leak cache
     permissions:
       actions: read
