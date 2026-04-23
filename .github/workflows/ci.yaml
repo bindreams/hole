@@ -106,6 +106,13 @@ jobs:
           mkdir -p ci-artifacts
           cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file ci-artifacts/tests.tar.zst
 
+      # `cargo nextest archive` builds test targets but NOT regular binaries.
+      # `xtask stage` needs `target/debug/hole[.exe]` present, so do a proper
+      # build first. sccache dedupes dep compilation against the archive step.
+      - name: Build hole binary (for dist staging)
+        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
+        run: cargo build --workspace
+
       # Hole e2e tests (`DistHarness`) expect `target/debug/dist/bin/hole[.exe]`
       # + sidecars + wintun.dll staged. No --with-tests — stable test paths are
       # a local-dev Firewall-consent optimization that fresh CI VMs don't need.
