@@ -96,15 +96,15 @@ jobs:
         if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
         shell: bash
         run: |
-          mkdir -p .ci-artifacts
-          cargo nextest archive --workspace --archive-file .ci-artifacts/tests.tar.zst
+          mkdir -p ci-artifacts
+          cargo nextest archive --workspace --archive-file ci-artifacts/tests.tar.zst
 
       - name: Build test archive (ex-Galoshes only)
         if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
         shell: bash
         run: |
-          mkdir -p .ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file .ci-artifacts/tests.tar.zst
+          mkdir -p ci-artifacts
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file ci-artifacts/tests.tar.zst
 
       # Hole e2e tests (`DistHarness`) expect `target/debug/dist/bin/hole[.exe]`
       # + sidecars + wintun.dll staged. No --with-tests — stable test paths are
@@ -114,13 +114,13 @@ jobs:
         shell: bash
         run: |
           cargo xtask stage --out-dir target/debug/dist
-          cp -r target/debug/dist .ci-artifacts/dist
+          cp -r target/debug/dist ci-artifacts/dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: .ci-artifacts/
+          path: ci-artifacts/
           retention-days: 3
           if-no-files-found: error
 
