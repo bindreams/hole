@@ -39,23 +39,28 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
     }
 }
 
-/// Spin up a real shadowsocks server bound to `127.0.0.1:0` with the given
-/// cipher/password. Returns the bound TCP address and a handle to the
-/// running server task. The server relays anything the client asks for.
-pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
-    let mut svr_cfg = ServerConfig::new(("127.0.0.1", 0u16), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly); // skip UDP — the runner is TCP-only
+/// Spin up a real shadowsocks server bound to `127.0.0.1:public_port` with
+/// the given cipher/password. Returns the bound TCP address and a handle to
+/// the running server task. The server relays anything the client asks for.
+///
+/// The caller must pre-allocate `public_port` (via
+/// [`crate::test_support::port_alloc::allocate_ephemeral_port`]) instead of
+/// passing 0: shadowsocks-rust's `ServerBuilder` clones `svr_cfg` when
+/// constructing both `TcpServer` and `UdpServer`. With port 0 each side
+/// would bind to a *different* kernel-allocated port, so UDP datagrams
+/// addressed at the TCP port (the only address the bridge knows) would
+/// arrive at a port with no UDP listener and be silently dropped.
+pub(crate) async fn start_real_ss_server(
+    method: CipherKind,
+    password: &str,
+    public_port: u16,
+) -> (SocketAddr, JoinHandle<()>) {
+    let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
+    svr_cfg.set_mode(Mode::TcpAndUdp);
 
     let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
 
-    // Read the bound address BEFORE moving `server` into the spawn closure.
-    // The `&TcpServer` borrow ends at the semicolon.
-    let addr = server
-        .tcp_server()
-        .expect("TCP mode is enabled, tcp_server should exist")
-        .local_addr()
-        .unwrap();
-
+    let addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
     let handle = tokio::spawn(async move {
         // Server::run consumes self and only ever returns Err on teardown
         // ("server exited unexpectedly"). The test ignores the error.
@@ -125,13 +130,13 @@ async fn spawn_ss_with_plugin(
     plugin_opts: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
     let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpOnly);
+    svr_cfg.set_mode(Mode::TcpAndUdp);
 
     svr_cfg.set_plugin(PluginConfig {
         plugin: plugin_path.to_string(),
         plugin_opts: Some(plugin_opts.to_string()),
         plugin_args: vec![],
-        plugin_mode: Mode::TcpOnly,
+        plugin_mode: Mode::TcpAndUdp,
     });
 
     let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();

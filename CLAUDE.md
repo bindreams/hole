@@ -43,8 +43,12 @@ surfaced as `BridgeResponse::Error`):
 
 The HTTP listener's `Mode` is always `TcpOnly` regardless of
 `tunnel_mode` — HTTP CONNECT is TCP-only (RFC 7231 §4.3.6). The SOCKS5
-listener's `Mode` still tracks `tunnel_mode` (`Full` ⇒ `TcpAndUdp`,
-`SocksOnly` ⇒ `TcpOnly` per #189).
+listener's `Mode` is always `TcpAndUdp`: in Full mode the dispatcher
+relays UDP through SOCKS5 UDP ASSOCIATE, and in SocksOnly mode the
+listener exposes UDP ASSOCIATE to local SOCKS5 clients. Pre-#250 the
+SocksOnly path was forced to `TcpOnly` under #189's mis-attributed
+"select_all" hypothesis; the real fix for the original symptom is PR
+#207's two-pass test ordering (#200).
 
 ### DNS forwarder
 

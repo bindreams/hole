@@ -80,10 +80,18 @@ pub(crate) fn test_certs() -> Result<TestCerts, String> {
 }
 
 /// Plain shadowsocks server, no plugin.
-#[skuld::fixture(scope = process)]
+///
+/// `serial = PORT_ALLOC` because `start_real_ss_server` requires a
+/// pre-allocated port (see the docstring there for why) — and pre-allocation
+/// has a TOCTOU window with concurrent fixture inits.
+#[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let (addr, _handle) = runtime.block_on(start_real_ss_server(TEST_METHOD, TEST_PASSWORD));
+    let addr = runtime.block_on(async {
+        let public_port = allocate_ephemeral_port().await;
+        let (addr, _handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, public_port).await;
+        addr
+    });
     Ok(SsServerHandle {
         addr,
         method: TEST_METHOD_STR,

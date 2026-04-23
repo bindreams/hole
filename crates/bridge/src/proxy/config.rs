@@ -107,14 +107,21 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 ///
 /// Emits one local instance per enabled listener:
 ///
-/// * **SOCKS5** (`proxy_socks5`): `127.0.0.1:{local_port}`. Mode tracks
-///   `tunnel_mode` — `Full` ⇒ `TcpAndUdp` (so the dispatcher's UDP
-///   handler can use SOCKS5 UDP ASSOCIATE to relay datagrams through
-///   the tunnel), `SocksOnly` ⇒ `TcpOnly` (see #189 — on Windows,
-///   creating the UDP server can cause `select_all` inside
-///   shadowsocks-service to drop the TCP listener when the UDP future
-///   completes early, and with no dispatcher nobody uses UDP ASSOCIATE
-///   anyway).
+/// * **SOCKS5** (`proxy_socks5`): `127.0.0.1:{local_port}`, always
+///   `TcpAndUdp`. In Full mode the TUN dispatcher uses UDP ASSOCIATE
+///   to relay datagrams through the SS tunnel; in SocksOnly mode the
+///   listener exposes UDP ASSOCIATE to local SOCKS5 clients
+///   (hev-socks5-tunnel, ss-tunnel, proxychains-ng UDP, …).
+///
+///   Pre-#250, SocksOnly forced `TcpOnly` under #189's "select_all
+///   drops the TCP listener when UDP completes early" attribution.
+///   That attribution had no log evidence — `LogTracer` was never
+///   installed so shadowsocks-service's `log::*!` events were silently
+///   dropped. The original symptom was actually wintun-induced
+///   loopback breakage on the Azure-hosted Windows runner (#200), and
+///   it was correctly addressed by PR #207's two-pass test ordering
+///   (`SKULD_LABELS=tun` runs last so loopback-using tests precede
+///   any wintun adapter destruction).
 /// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
 ///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
 ///
@@ -178,14 +185,10 @@ pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -
         .push(ServerInstanceConfig::with_server_config(server_config));
 
     if config.proxy_socks5 {
-        let socks_mode = match config.tunnel_mode {
-            hole_common::protocol::TunnelMode::Full => Mode::TcpAndUdp,
-            hole_common::protocol::TunnelMode::SocksOnly => Mode::TcpOnly,
-        };
         ss_config.local.push(build_local_instance(
             ProtocolType::Socks,
             loopback(config.local_port),
-            socks_mode,
+            Mode::TcpAndUdp,
         ));
     }
 
