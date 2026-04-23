@@ -1,7 +1,15 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/handle-holders", "crates/hole", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
-exclude = ["external/galoshes"]
+members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/mock-plugin", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
 resolver = "2"
+
+[workspace.package]
+# Galoshes crates (moved into `crates/` via the monorepo merge) reference
+# `edition.workspace = true`; providing it here keeps their manifests
+# resolvable. `license` is deliberately NOT set at the workspace level —
+# Hole's crates are GPL-3.0-or-later, ex-Galoshes crates retain
+# Apache-2.0, and each crate declares its own. See NOTICES.md for the
+# Galoshes attribution preserved under Apache-2.0 §4(c).
+edition = "2021"
 
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
@@ -17,6 +25,10 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
 rustls-pki-types = "1"
 webpki-roots = "1"
+# Shared across ex-Galoshes crates; Hole-side crates can opt in via `{ workspace = true }` too.
+anyhow = "1"
+async-trait = "0.1"
+contracts = "0.6"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

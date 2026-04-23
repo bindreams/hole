@@ -1,0 +1,31 @@
+[package]
+name = "galoshes"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+garter = { path = "../garter" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+contracts = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+yamux = "0.13"
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+skuld = { workspace = true }
+
+[build-dependencies]
+sha2 = "0.10"

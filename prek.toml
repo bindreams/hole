@@ -68,7 +68,10 @@ repo = "https://github.com/pre-commit/pre-commit-hooks"
 rev = "v5.0.0"
 hooks = [
   { id = "check-executables-have-shebangs" },
-  { id = "check-shebang-scripts-are-executable" },
+  # Rust inner attributes start with `#![...]`, which the shebang detector
+  # mistakes for `#!/...`. Exclude .rs from this hook (matches how galoshes
+  # worked pre-merge).
+  { id = "check-shebang-scripts-are-executable", exclude_types = ["rust"] },
   { id = "mixed-line-ending", args = ["--fix=lf"] },
 ]
 

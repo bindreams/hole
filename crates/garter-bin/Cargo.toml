@@ -1,0 +1,27 @@
+[package]
+name = "garter-bin"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[[bin]]
+name = "garter"
+path = "src/main.rs"
+
+[dependencies]
+garter = { path = "../garter" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+yaml_serde = "0.10"
+
+[dev-dependencies]
+skuld = { workspace = true }

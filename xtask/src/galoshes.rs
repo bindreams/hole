@@ -1,57 +1,26 @@
-//! Build the galoshes sidecar from `external/galoshes/`.
+//! Build the galoshes sidecar. Post-monorepo-merge, galoshes is a
+//! regular workspace member at `crates/galoshes/`; it embeds the
+//! v2ray-plugin binary produced by [`super::v2ray_plugin::build`]
+//! (which writes to `<repo>/.cache/v2ray-plugin/`, where galoshes's
+//! `build.rs` picks it up).
 //!
-//! Galoshes embeds its own v2ray-plugin at compile time, so we first build
-//! v2ray-plugin inside the galoshes workspace, then build galoshes itself.
-//!
-//! Output: `external/galoshes/target/release/galoshes{.exe}`.
+//! Output: `<repo>/target/release/galoshes{.exe}`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// Build (or rebuild) the galoshes binary.
-///
-/// Steps:
-/// 1. Build galoshes' embedded v2ray-plugin via its own xtask.
-/// 2. Build the galoshes binary in release mode.
+/// Build (or rebuild) the galoshes binary in release mode. Assumes the
+/// v2ray-plugin binary has already been produced at
+/// `<repo>/.cache/v2ray-plugin/` by [`super::v2ray_plugin::build`] (which
+/// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
-    let galoshes_root = repo_root.join("external").join("galoshes");
-    if !galoshes_root.join("Cargo.toml").is_file() {
-        bail!(
-            "galoshes workspace not found at {}. Did `git subrepo clone` run?",
-            galoshes_root.display()
-        );
-    }
-
-    build_embedded_v2ray_plugin(&galoshes_root)?;
-    build_galoshes_binary(&galoshes_root)
-}
-
-/// Build v2ray-plugin inside the galoshes workspace using its own xtask.
-fn build_embedded_v2ray_plugin(galoshes_root: &Path) -> Result<()> {
-    let status = Command::new("cargo")
-        .args(["xtask", "v2ray-plugin"])
-        .current_dir(galoshes_root)
-        .status()
-        .context("failed to run `cargo xtask v2ray-plugin` in galoshes workspace")?;
-
-    if !status.success() {
-        bail!(
-            "`cargo xtask v2ray-plugin` in galoshes failed with exit code {}",
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
-}
-
-/// Build the galoshes binary in release mode.
-fn build_galoshes_binary(galoshes_root: &Path) -> Result<PathBuf> {
     let status = Command::new("cargo")
         .args(["build", "--release", "-p", "galoshes"])
-        .current_dir(galoshes_root)
+        .current_dir(repo_root)
         .status()
-        .context("failed to run `cargo build -p galoshes` in galoshes workspace")?;
+        .context("failed to run `cargo build -p galoshes`")?;
 
     if !status.success() {
         bail!(
@@ -61,7 +30,7 @@ fn build_galoshes_binary(galoshes_root: &Path) -> Result<PathBuf> {
     }
 
     let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
-    let binary = galoshes_root
+    let binary = repo_root
         .join("target")
         .join("release")
         .join(format!("galoshes{exe_suffix}"));
