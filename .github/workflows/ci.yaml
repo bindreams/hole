@@ -29,6 +29,11 @@ jobs:
       - name: Run linters
         run: prek run --all-files --show-diff-on-failure
 
+  # One matrix over every host platform we compile on. Each step below
+  # decides whether it applies to the current (os, arch) — Hole-only
+  # steps (full workspace clippy / build / tests) skip Linux and
+  # Windows-arm64 since Hole doesn't ship on those. The matrix itself
+  # stays dumb about which project supports which platform.
   test:
     name: Test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -40,24 +45,15 @@ jobs:
           - { os: windows, arch: amd64, runner: windows-latest }
           - { os: darwin,  arch: amd64, runner: macos-15-intel }
           - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-build
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # cargo clippy uses `cargo check`, which leaves binary outputs under
-      # `target/debug/deps/hole-<hash>.exe` but does NOT create the
-      # top-level `target/debug/hole[.exe]` copy. The bridge crate's e2e
-      # test fixture (`dist_dir`) calls `xtask::run_stage` to hardlink
-      # `target/debug/hole[.exe]` into `target/debug/dist/bin/`, so we
-      # need a real `cargo build` to produce it.
-      - name: Build workspace (for dist-dir test fixture)
-        run: cargo build --workspace
 
       - uses: cargo-bins/cargo-binstall@v1.18.1
 
@@ -71,6 +67,30 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
+      # Galoshes-only testing runs on platforms Hole doesn't ship on
+      # (Linux x64/arm64, Windows-arm64). On the Hole-supported platforms
+      # the subsequent `Test (non-TUN)` step covers these via `--workspace`.
+      - name: Test (galoshes crates)
+        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
+        shell: bash
+        run: cargo nextest run -p garter -p garter-bin -p galoshes -p mock-plugin
+
+      # === Hole-supported platforms only: windows/amd64 + darwin/{amd64,arm64} ===
+
+      - name: Clippy
+        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # cargo clippy uses `cargo check`, which leaves binary outputs under
+      # `target/debug/deps/hole-<hash>.exe` but does NOT create the
+      # top-level `target/debug/hole[.exe]` copy. The bridge crate's e2e
+      # test fixture (`dist_dir`) calls `xtask::run_stage` to hardlink
+      # `target/debug/hole[.exe]` into `target/debug/dist/bin/`, so we
+      # need a real `cargo build` to produce it.
+      - name: Build workspace (for dist-dir test fixture)
+        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
+        run: cargo build --workspace
+
       # Two-pass split to work around #200: the Windows TUN test
       # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
       # `hole-tun` wintun adapter, which perturbs the Azure Hyper-V
@@ -82,6 +102,7 @@ jobs:
       # `crates/bridge/src/test_support/skuld_fixtures.rs` for the
       # `TUN` label definition.
       - name: Test (non-TUN)
+        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
         id: test-non-tun
         shell: bash
         env:
@@ -89,8 +110,8 @@ jobs:
         run: cargo nextest run --workspace
 
       - name: Test (TUN, runs last for #200)
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
-        if: matrix.os == 'windows'
         shell: bash
         env:
           SKULD_LABELS: "tun"
@@ -100,7 +121,7 @@ jobs:
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       - name: Upload bridge logs on test failure
-        if: failure()
+        if: (matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')) && failure()
         uses: actions/upload-artifact@v4
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
@@ -183,46 +204,10 @@ jobs:
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
 
 
-  # Extra platform coverage for the ex-Galoshes crates (garter, garter-bin,
-  # galoshes, mock-plugin). Hole itself only ships on Windows/macOS, so its
-  # main `test` job above doesn't run on Linux or Windows-arm64. Galoshes
-  # historically tested on the full Rust host matrix; we preserve that
-  # coverage here so the galoshes/garter code keeps its multi-platform
-  # signal post-merge even though Hole's release surface stays unchanged.
-  test-galoshes:
-    name: Test (galoshes crates ${{ matrix.os }}/${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: ./.github/actions/setup-build
-
-      - uses: cargo-bins/cargo-binstall@v1.18.1
-
-      - name: Install nextest
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo binstall --no-confirm --locked cargo-nextest
-
-      - name: Test galoshes crates
-        shell: bash
-        run: cargo nextest run -p garter -p garter-bin -p galoshes -p mock-plugin
-
   cache-health:
     name: Cache health
     runs-on: ubuntu-latest
-    needs: [lint, test, test-installer, test-galoshes]
+    needs: [lint, test, test-installer]
     if: always()    # report even when prior jobs failed — those are the runs most likely to leak cache
     permissions:
       actions: read
