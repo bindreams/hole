@@ -906,6 +906,97 @@ fn apply_dns_settings_emits_done_info_log() {
     });
 }
 
+// Phase 4 #247 — TUN skipped from capture, kept in apply ==============================================================
+//
+// The TUN adapter is created by `routing.install` immediately before
+// `apply_dns_settings` runs. Its prior DNS is whatever Windows defaults a
+// brand-new adapter to — unknowable and uninteresting. Calling
+// `netsh show dnsservers` against a freshly-created adapter is also the
+// slowest case on Windows (observed in Phase 2 as part of the 11.3s stall
+// in #247). So capture runs on upstream only; apply still runs on both.
+//
+// Test strategy: DEBUG-level log capture, assert the per-alias lines from
+// `dns::system::windows` show the expected asymmetry.
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
+    use crate::dns::connector::DirectConnector;
+    use crate::dns::forwarder::DnsForwarder;
+    use crate::dns::server::LocalDnsServer;
+    use crate::test_support::log_capture::VecWriter;
+    use hole_common::config::DnsConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    rt().block_on(async {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _guard = subscriber.set_default();
+
+        let forwarder = Arc::new(DnsForwarder::new(
+            DnsConfig::default(),
+            Arc::new(DirectConnector),
+            false,
+        ));
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
+
+        // Upstream alias uses a distinctive name so we can grep for it.
+        let _ = apply_dns_settings(&srv, "hole-p4-test-upstream-xyz", None).await;
+
+        let output = writer.snapshot_string();
+
+        // CAPTURE side: only the upstream alias appears. The TUN alias
+        // `hole-tun` must NOT appear in any `capture_one` / `show_dnsservers`
+        // line, because we no longer query its prior state.
+        let capture_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("show_dnsservers") || l.contains("capture_one"))
+            .collect();
+        assert!(
+            !capture_lines.is_empty(),
+            "expected at least one capture-side DEBUG line; got:\n{output}"
+        );
+        for line in &capture_lines {
+            assert!(
+                !line.contains("alias=hole-tun "),
+                "capture ran on TUN — expected to be skipped. line: {line}"
+            );
+        }
+        assert!(
+            capture_lines
+                .iter()
+                .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
+            "capture should have run on upstream alias; got:\n{output}"
+        );
+
+        // APPLY side: the TUN alias DOES appear — we still set loopback DNS
+        // on the TUN so the OS's best-route-to-DNS lookup lands on 127.x.
+        let apply_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("set_dns_ipv4") || l.contains("set_dns_ipv6"))
+            .collect();
+        assert!(
+            apply_lines.iter().any(|l| l.contains("alias=hole-tun")),
+            "apply should have run on TUN alias; got:\n{output}"
+        );
+        assert!(
+            apply_lines
+                .iter()
+                .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
+            "apply should have run on upstream alias; got:\n{output}"
+        );
+    });
+}
+
 // Phase 1 #248 — forwarder self-test tests ============================================================================
 //
 // `build_local_dns` fires a detached post-bind self-test (via

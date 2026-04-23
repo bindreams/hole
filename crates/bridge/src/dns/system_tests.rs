@@ -21,32 +21,27 @@ mod windows_timing_logs {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
     use tracing_subscriber::util::SubscriberInitExt;
 
-    /// `flush_dns_cache` must emit a `DEBUG` log with an `elapsed_ms`
-    /// field so Phase 2 observation can see how long `ipconfig /flushdns`
-    /// actually takes. This is the minimum-viable timing probe — if this
-    /// test regresses, the entire Phase-1 diagnostic story is broken.
+    /// Phase-4 (#247): `flush_dns_cache` must return immediately. The
+    /// flush itself runs on a detached `std::thread::spawn`'d thread so
+    /// `apply_loopback` and `RunningDns::drop` never block on the 1-5s
+    /// `ipconfig /flushdns` wall-clock. Phase-2 observation confirmed
+    /// flushdns was a major contributor to the 11.3s stall.
+    ///
+    /// The elapsed-ms DEBUG log still fires inside the spawned thread
+    /// so Phase-2 observation stays intact — we just can't assert on it
+    /// from here because `set_default` is thread-local (the spawned
+    /// thread doesn't inherit the subscriber). The contract-level
+    /// assertion below is the load-bearing one.
     #[skuld::test]
-    fn flush_dns_cache_emits_elapsed_ms_debug_log() {
-        let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-        );
-        let _guard = subscriber.set_default();
-
+    fn flush_dns_cache_returns_immediately() {
+        let start = std::time::Instant::now();
         flush_dns_cache();
-
-        let output = writer.snapshot_string();
+        let elapsed = start.elapsed();
         assert!(
-            output.contains("elapsed_ms"),
-            "expected 'elapsed_ms' field in captured log; got:\n{output}"
-        );
-        assert!(output.contains("DEBUG"), "expected DEBUG-level log; got:\n{output}");
-        assert!(
-            output.contains("flush_dns_cache"),
-            "expected 'flush_dns_cache' target/message in log; got:\n{output}"
+            elapsed < std::time::Duration::from_millis(50),
+            "flush_dns_cache must return immediately (fire-and-forget); \
+             returned after {elapsed:?} — if flushdns is still blocking callers, \
+             the teardown-side flush in RunningDns::drop will stall too."
         );
     }
 
