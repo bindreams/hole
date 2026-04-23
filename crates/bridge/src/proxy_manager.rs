@@ -901,8 +901,23 @@ fn apply_dns_settings_body(
         use crate::dns_state::{self, DnsState, SCHEMA_VERSION};
         use crate::proxy::TUN_DEVICE_NAME;
 
-        let aliases: Vec<String> = vec![TUN_DEVICE_NAME.into(), upstream_iface.to_string()];
-        let prior = match system::capture_adapters(&aliases) {
+        // Capture runs on the upstream adapter only. The TUN adapter is
+        // fresh (just created by `routing.install`); its prior DNS state
+        // is definitionally "whatever Windows defaults a brand-new adapter
+        // to" — unknowable and uninteresting, and Phase-2 observation of
+        // #247 identified `netsh show dnsservers` against a newly-created
+        // TUN as one of the slowest sub-calls in the 11.3s stall.
+        //
+        // Apply runs on both adapters: the TUN still needs its DNS set to
+        // the loopback IP so the OS's "best-route to DNS server" lookup
+        // picks our forwarder when the TUN becomes the primary interface.
+        // On teardown, the TUN is destroyed with the routes so there is
+        // nothing to restore there — `RunningDns::drop` only replays the
+        // captured prior (upstream-only).
+        let capture_aliases: Vec<String> = vec![upstream_iface.to_string()];
+        let apply_aliases: Vec<String> = vec![TUN_DEVICE_NAME.into(), upstream_iface.to_string()];
+
+        let prior = match system::capture_adapters(&capture_aliases) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "system DNS capture failed; skipping apply");
@@ -924,7 +939,7 @@ fn apply_dns_settings_body(
             }
         }
 
-        if let Err(e) = system::apply_loopback(&aliases, server.addr().ip()) {
+        if let Err(e) = system::apply_loopback(&apply_aliases, server.addr().ip()) {
             warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
             return None;
         }

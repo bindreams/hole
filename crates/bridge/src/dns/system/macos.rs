@@ -46,10 +46,17 @@ pub fn apply_loopback(services: &[String], loopback_ip: IpAddr) -> io::Result<Ve
     Ok(applied)
 }
 
-/// Flush the macOS DNS cache (dscacheutil + mDNSResponder signal).
+/// Flush the macOS DNS cache as a **fire-and-forget** background op
+/// (dscacheutil + mDNSResponder signal). Returns immediately.
+///
+/// Mirrors the Windows implementation — see [`super::windows::flush_dns_cache`]
+/// for the Phase-4 rationale (#247) and the symmetry argument for setup vs
+/// teardown.
 pub fn flush_dns_cache() {
-    let _ = Command::new("dscacheutil").arg("-flushcache").status();
-    let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+    std::thread::spawn(|| {
+        let _ = Command::new("dscacheutil").arg("-flushcache").status();
+        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+    });
 }
 
 pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {

@@ -79,21 +79,42 @@ pub fn apply_loopback(aliases: &[String], loopback_ip: IpAddr) -> io::Result<Vec
     Ok(applied)
 }
 
-/// Run `ipconfig /flushdns`. Best-effort; a failure here is a log line,
-/// not a return value.
+/// Run `ipconfig /flushdns` as a **fire-and-forget** background
+/// operation. Returns immediately; callers never block on the flush.
 ///
-/// Emits a DEBUG `elapsed_ms` log so Phase-2 observation of #247 can see
-/// how long `ipconfig /flushdns` actually takes on the user's machine —
-/// it is notoriously slow on Windows (often 1-5s) and was the prime
-/// suspect for the 10s stall.
+/// Why detached (Phase 4 #247): `ipconfig /flushdns` is notoriously slow
+/// on Windows — often 1-5 seconds, and was a significant chunk of the
+/// 11.3s apply stall observed in #247. Nothing downstream actually
+/// depends on the flush having completed: the preceding `netsh set
+/// dnsservers` has already invalidated the per-adapter cache for the
+/// aliases we just changed. The OS-wide DNS client cache staleness
+/// tradeoff is documented in the PR body.
+///
+/// Symmetry note: this is fire-and-forget on both setup (the
+/// `apply_loopback` call path) and teardown (`RunningDns::drop` →
+/// `super::restore_all`) sides. If one side blocked and the other
+/// didn't, start would be fast while stop would be slow — inconsistent
+/// from a UX perspective.
+///
+/// Uses `std::thread::spawn` rather than `tokio::task::spawn_blocking`
+/// so callers need no runtime handle — `RunningDns::drop` is sync and
+/// cannot reach a tokio runtime. The thread calls `Command::output()`,
+/// which reaps the spawned `Child` on its own `Drop`, so no process
+/// leak if the bridge exits before the flush returns.
+///
+/// The DEBUG `elapsed_ms` log is emitted from inside the spawned thread
+/// so Phase 2 can still observe `ipconfig` wall-clock latency even
+/// though the caller isn't blocked by it.
 pub fn flush_dns_cache() {
-    let started = Instant::now();
-    let res = Command::new("ipconfig").arg("/flushdns").output();
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match res {
-        Ok(_) => tracing::debug!(elapsed_ms, "flush_dns_cache"),
-        Err(e) => tracing::warn!(error = %e, elapsed_ms, "ipconfig /flushdns failed"),
-    }
+    std::thread::spawn(|| {
+        let started = Instant::now();
+        let res = Command::new("ipconfig").arg("/flushdns").output();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match res {
+            Ok(_) => tracing::debug!(elapsed_ms, "flush_dns_cache"),
+            Err(e) => tracing::warn!(error = %e, elapsed_ms, "ipconfig /flushdns failed"),
+        }
+    });
 }
 
 /// Restore one adapter. Invoked from [`super::restore_all`].
