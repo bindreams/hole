@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hole_common::config::{DnsConfig, DnsProtocol};
 use rustls::pki_types::ServerName;
@@ -25,6 +25,81 @@ use tokio::time::timeout;
 
 use crate::dns::connector::UpstreamConnector;
 use crate::dns::providers;
+
+// Typed errors ========================================================================================================
+
+/// Which layer of the upstream stack emitted the error. Lets Phase-2
+/// observation of #248 distinguish SOCKS5-layer failures from TLS
+/// handshake failures from mid-stream I/O EOFs — all of which currently
+/// surface as a bare `io::Error` with message `"tls handshake eof"` or
+/// similar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamLayer {
+    /// TCP or UDP connect. For `Socks5Connector`, this includes the
+    /// SOCKS5 handshake+CONNECT — those errors come back wrapped inside
+    /// an `io::Error`; the source chain reveals the SOCKS5-specific
+    /// message. `DirectConnector` failures hit here as
+    /// `ConnectionRefused` / timeouts.
+    Connect,
+    /// TLS handshake (DoT / DoH).
+    Tls,
+    /// HTTP response parsing (DoH).
+    Http,
+    /// Post-handshake read / write on the upstream stream.
+    Io,
+}
+
+impl UpstreamLayer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+            Self::Http => "http",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Tagged upstream failure: `{ layer, source, elapsed_ms }`. Logged via
+/// [`DnsForwarder::log_upstream_failure`] with the `source`-walk as a
+/// `caused_by=...` field. `io::Error` itself is `!Clone`, so `UpstreamErr`
+/// cannot be `Clone` — consumed once on the log path.
+#[derive(Debug)]
+pub struct UpstreamErr {
+    pub layer: UpstreamLayer,
+    pub source: io::Error,
+    pub elapsed_ms: u64,
+}
+
+impl UpstreamErr {
+    fn new(layer: UpstreamLayer, source: io::Error) -> Self {
+        Self {
+            layer,
+            source,
+            elapsed_ms: 0,
+        }
+    }
+}
+
+/// Walk `std::error::Error::source()` and join the chain with ` -> `.
+/// Used as the `caused_by=...` log field so Phase 2 sees the inner
+/// io::ErrorKind (e.g. `ConnectionRefused`, `UnexpectedEof`) instead of
+/// just the outer message.
+fn format_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = format!("{e}");
+    let mut current = e.source();
+    while let Some(c) = current {
+        s.push_str(&format!(" -> {c}"));
+        current = c.source();
+    }
+    s
+}
 
 /// Upstream port for plain DNS (RFC 1035) and DoT (RFC 7858).
 const DNS_PORT_PLAIN: u16 = 53;
@@ -86,49 +161,101 @@ impl DnsForwarder {
                 continue;
             }
 
-            match self.forward_one(server, query).await {
+            let target = SocketAddr::new(server, default_port(self.config.protocol));
+            match self.forward_one(target, query).await {
                 Ok(reply) => return reply,
-                Err(e) => {
-                    self.log_once(server, &format!("upstream failed: {e}"));
-                }
+                Err(e) => self.log_upstream_failure(server, &e),
             }
         }
 
         synthesize_servfail(query)
     }
 
-    async fn forward_one(&self, server: IpAddr, query: &[u8]) -> io::Result<Vec<u8>> {
+    /// Single-attempt forward against `target`. Callers build `target` from
+    /// the config'd server plus the protocol's well-known port; the
+    /// test-only `forward_with_ports` builds it from an ephemeral port so
+    /// stubs don't need privilege to bind 53/853/443.
+    async fn forward_one(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+        let started = Instant::now();
         let fut = async {
             match self.config.protocol {
-                DnsProtocol::PlainUdp => self.forward_udp(server, query).await,
-                DnsProtocol::PlainTcp => self.forward_tcp(server, query).await,
-                DnsProtocol::Tls => self.forward_tls(server, query).await,
-                DnsProtocol::Https => self.forward_https(server, query).await,
+                DnsProtocol::PlainUdp => self.forward_udp(target, query).await,
+                DnsProtocol::PlainTcp => self.forward_tcp(target, query).await,
+                DnsProtocol::Tls => self.forward_tls(target, query).await,
+                DnsProtocol::Https => self.forward_https(target, query).await,
             }
         };
-        match timeout(UPSTREAM_TIMEOUT, fut).await {
+        let result = match timeout(UPSTREAM_TIMEOUT, fut).await {
             Ok(res) => res,
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "upstream timeout")),
-        }
+            Err(_) => Err(UpstreamErr::new(
+                UpstreamLayer::Io,
+                io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+            )),
+        };
+        result.map_err(|mut e| {
+            e.elapsed_ms = started.elapsed().as_millis() as u64;
+            e
+        })
     }
 
+    /// Log a server-static message exactly once per server IP. Used for
+    /// invariant-static conditions like "IPv6 server skipped because no
+    /// IPv6 bypass is available" where a counter/summary would be noise —
+    /// the condition cannot change without a reconfigure.
     fn log_once(&self, server: IpAddr, msg: &str) {
         let mut set = self.logged_servers.lock().expect("poisoned");
         if set.insert(server) {
             tracing::warn!(%server, protocol = ?self.config.protocol, "{msg}");
         }
     }
+
+    /// Log an upstream failure with the typed layer tag + elapsed + source
+    /// chain. Per-server deduplication mirrors `log_once` — Phase 4 of
+    /// #248 will replace this with log-first-3-then-summarize-every-60s
+    /// (tracked in the plan, separate PR).
+    fn log_upstream_failure(&self, server: IpAddr, e: &UpstreamErr) {
+        let mut set = self.logged_servers.lock().expect("poisoned");
+        if set.insert(server) {
+            tracing::warn!(
+                %server,
+                protocol = ?self.config.protocol,
+                layer = %e.layer,
+                elapsed_ms = e.elapsed_ms,
+                caused_by = %format_error_chain(&e.source),
+                "upstream failed"
+            );
+        }
+    }
+}
+
+/// Well-known port per protocol. Split out so `forward_with_ports` (test
+/// helper) can reuse the mapping.
+fn default_port(protocol: DnsProtocol) -> u16 {
+    match protocol {
+        DnsProtocol::PlainUdp | DnsProtocol::PlainTcp => DNS_PORT_PLAIN,
+        DnsProtocol::Tls => DNS_PORT_TLS,
+        DnsProtocol::Https => DNS_PORT_HTTPS,
+    }
 }
 
 // Transport: plain UDP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_udp(&self, server: IpAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-        let target = SocketAddr::new(server, DNS_PORT_PLAIN);
-        let socket = self.connector.connect_udp(target).await?;
-        socket.send(query).await?;
+    async fn forward_udp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+        let socket = self
+            .connector
+            .connect_udp(target)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
+        socket
+            .send(query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
         let mut buf = vec![0u8; MAX_REPLY_SIZE];
-        let n = socket.recv(&mut buf).await?;
+        let n = socket
+            .recv(&mut buf)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -137,35 +264,55 @@ impl DnsForwarder {
 // Transport: plain TCP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_tcp(&self, server: IpAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-        let target = SocketAddr::new(server, DNS_PORT_PLAIN);
-        let stream = self.connector.connect_tcp(target).await?;
-        exchange_tcp_framed(stream, query).await
+    async fn forward_tcp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+        let stream = self
+            .connector
+            .connect_tcp(target)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
+        exchange_tcp_framed(stream, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoT (TLS over TCP) =======================================================================================
 
 impl DnsForwarder {
-    async fn forward_tls(&self, server: IpAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-        let target = SocketAddr::new(server, DNS_PORT_TLS);
-        let stream = self.connector.connect_tcp(target).await?;
-        let server_name = tls_server_name_for(server)?;
+    async fn forward_tls(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+        let stream = self
+            .connector
+            .connect_tcp(target)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
+        let server_name = tls_server_name_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
         let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let tls = connector.connect(server_name, stream).await?;
-        exchange_tcp_framed(tls, query).await
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        exchange_tcp_framed(tls, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoH (HTTP/1.1 over TLS) ==================================================================================
 
 impl DnsForwarder {
-    async fn forward_https(&self, server: IpAddr, query: &[u8]) -> io::Result<Vec<u8>> {
-        let target = SocketAddr::new(server, DNS_PORT_HTTPS);
-        let (server_name, path_and_host) = https_target_for(server)?;
-        let stream = self.connector.connect_tcp(target).await?;
+    async fn forward_https(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+        let (server_name, path_and_host) =
+            https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
+        let stream = self
+            .connector
+            .connect_tcp(target)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
         let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let mut tls = connector.connect(server_name, stream).await?;
+        let mut tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
 
         let (host, path) = path_and_host;
         let mut req = Vec::with_capacity(256 + query.len());
@@ -183,14 +330,19 @@ impl DnsForwarder {
         .unwrap();
         req.extend_from_slice(query);
 
-        tls.write_all(&req).await?;
-        tls.flush().await?;
+        tls.write_all(&req)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
+        tls.flush().await.map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
 
         let mut resp = Vec::with_capacity(4096);
         // Cap reads so a misbehaving server can't OOM us.
-        tls.take((MAX_REPLY_SIZE * 4) as u64).read_to_end(&mut resp).await?;
+        tls.take((MAX_REPLY_SIZE * 4) as u64)
+            .read_to_end(&mut resp)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
 
-        parse_http_dns_response(&resp)
+        parse_http_dns_response(&resp).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))
     }
 }
 

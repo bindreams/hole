@@ -740,6 +740,14 @@ async fn build_local_dns(
     };
     info!(addr = %server.addr(), "LocalDnsServer bound");
 
+    // Fire a detached self-test so Phase-2 observation of #248 can tell
+    // "forwarder works at bind time; later query failures are downstream"
+    // from "forwarder is fundamentally broken right now". Spawned via
+    // `tokio::spawn` so a dead upstream cannot stall `start_inner` by the
+    // retry budget — the contract is that `build_local_dns` returns
+    // regardless of self-test outcome.
+    spawn_forwarder_self_test(Arc::clone(&forwarder), dns_cfg.servers.clone());
+
     let endpoint = if dns_cfg.intercept_udp53 {
         Some(crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder)))
     } else {
@@ -747,6 +755,107 @@ async fn build_local_dns(
     };
 
     (Some(server), endpoint)
+}
+
+/// Spawn a detached task that exercises the forwarder against its first
+/// configured server. Log-only — never propagates, never blocks
+/// [`build_local_dns`]. Runs 3 attempts with a 1500ms per-attempt
+/// timeout, wrapped in a 5s outer budget (3 × 1500 = 4.5s < 5s with
+/// slack). No back-off: the retry is to absorb plugin-handshake settle
+/// at cold start, which completes or doesn't within ~2s.
+///
+/// Target name: `example.com A`. NXDOMAIN counts as success — the
+/// self-test is a path probe, not a correctness probe.
+fn spawn_forwarder_self_test(
+    forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
+    servers: Vec<std::net::IpAddr>,
+) {
+    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
+    const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const ATTEMPTS: u32 = 3;
+
+    let Some(&first_server) = servers.first() else {
+        info!("forwarder self-test skipped: no servers configured");
+        return;
+    };
+
+    tokio::spawn(async move {
+        let query = sample_self_test_query();
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(OUTER_BUDGET, async {
+            let mut last_err: Option<String> = None;
+            for attempt in 1..=ATTEMPTS {
+                match tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)).await {
+                    Ok(reply) => {
+                        // Treat "any well-formed DNS reply" as success. SERVFAIL
+                        // means upstream explicitly failed (bad), but NXDOMAIN /
+                        // NoError+empty means the path works (good). Distinguish
+                        // via the RCODE nibble.
+                        if reply.len() >= 12 && (reply[3] & 0x0F) != 2 {
+                            return SelfTestOutcome::Ok { attempts: attempt };
+                        }
+                        last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+                    }
+                    Err(_) => last_err = Some(format!("attempt {attempt} timed out after {PER_ATTEMPT:?}")),
+                }
+            }
+            SelfTestOutcome::Failed {
+                attempts: ATTEMPTS,
+                reason: last_err.unwrap_or_else(|| "unknown".into()),
+            }
+        })
+        .await
+        .unwrap_or(SelfTestOutcome::Failed {
+            attempts: ATTEMPTS,
+            reason: format!("outer timeout after {OUTER_BUDGET:?}"),
+        });
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            SelfTestOutcome::Ok { attempts } => {
+                info!(
+                    %first_server,
+                    attempts,
+                    elapsed_ms,
+                    "forwarder self-test ok"
+                );
+            }
+            SelfTestOutcome::Failed { attempts, reason } => {
+                info!(
+                    %first_server,
+                    attempts,
+                    elapsed_ms,
+                    reason,
+                    "forwarder self-test failed"
+                );
+            }
+        }
+    });
+}
+
+enum SelfTestOutcome {
+    Ok { attempts: u32 },
+    Failed { attempts: u32, reason: String },
+}
+
+/// Build a minimal wire-format DNS query: `example.com A`. Used by
+/// [`spawn_forwarder_self_test`] — hardcoded hostname is acceptable
+/// because the forwarder self-test is an internal probe, never a user-
+/// visible config. NXDOMAIN on this name still proves the path works.
+fn sample_self_test_query() -> Vec<u8> {
+    let mut q = Vec::with_capacity(32);
+    q.extend_from_slice(&0x0001_u16.to_be_bytes()); // id
+    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    q.push(7);
+    q.extend_from_slice(b"example");
+    q.push(3);
+    q.extend_from_slice(b"com");
+    q.push(0);
+    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+    q
 }
 
 /// Capture prior system DNS for the adapters we're about to override,

@@ -905,3 +905,143 @@ fn apply_dns_settings_emits_done_info_log() {
         assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
     });
 }
+
+// Phase 1 #248 — forwarder self-test tests ============================================================================
+//
+// `build_local_dns` fires a detached post-bind self-test (via
+// `spawn_forwarder_self_test`) so Phase 2 observation can tell
+// "forwarder works at bind time" from "forwarder is fundamentally
+// broken". These tests assert log output + the detach contract
+// (spawn_forwarder_self_test must return immediately; the spawned task
+// runs in the background).
+
+#[cfg(test)]
+mod self_test {
+    use super::*;
+    use crate::dns::connector::{BoxedStream, UpstreamConnector, UpstreamUdp};
+    use crate::dns::forwarder::DnsForwarder;
+    use crate::test_support::log_capture::VecWriter;
+    use async_trait::async_trait;
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    use std::io;
+    use std::sync::Arc as SArc;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// A connector that immediately fails every connect. Drives the
+    /// dead-upstream path in tests — the forwarder will fail every
+    /// attempt, but the spawned self-test must not stall the caller.
+    struct DeadConnector;
+    #[async_trait]
+    impl UpstreamConnector for DeadConnector {
+        async fn connect_tcp(&self, _target: std::net::SocketAddr) -> io::Result<BoxedStream> {
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
+        }
+        async fn connect_udp(&self, _target: std::net::SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
+        }
+    }
+
+    fn test_dns_cfg() -> DnsConfig {
+        DnsConfig {
+            enabled: true,
+            servers: vec!["127.0.0.1".parse().unwrap()],
+            protocol: DnsProtocol::PlainTcp,
+            intercept_udp53: true,
+        }
+    }
+
+    /// Core contract: `spawn_forwarder_self_test` must return to its caller
+    /// immediately regardless of how slow the self-test itself is. The
+    /// 3×1500ms + 5s budget runs on a detached tokio task; the caller is
+    /// never blocked.
+    #[skuld::test]
+    fn spawn_forwarder_self_test_returns_immediately() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let start = std::time::Instant::now();
+                spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_millis(100),
+                    "spawn_forwarder_self_test must return immediately (tokio::spawn is \
+                     non-blocking); returned after {elapsed:?}"
+                );
+            });
+    }
+
+    /// When `dns_cfg.servers` is empty, the self-test must log a `skipped`
+    /// line and never call into the forwarder.
+    #[skuld::test]
+    fn self_test_empty_servers_logs_skipped() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
+        let _guard = subscriber.set_default();
+
+        // Current-thread runtime so `tokio::spawn` in
+        // `spawn_forwarder_self_test` schedules on the test thread —
+        // `set_default` is thread-local; a multi-thread runtime would
+        // run the spawned task on a worker without the subscriber.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                spawn_forwarder_self_test(forwarder, vec![]);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("forwarder self-test skipped: no servers configured"),
+            "expected skipped log; got:\n{output}"
+        );
+    }
+
+    /// Dead upstream → self-test must log `forwarder self-test failed` at
+    /// INFO with `attempts=3`. This is the signal Phase 2 uses to know the
+    /// tunnel itself is broken, not a transient later issue.
+    #[skuld::test]
+    fn self_test_dead_upstream_logs_failed() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
+        let _guard = subscriber.set_default();
+
+        // Current-thread runtime — see `self_test_empty_servers_logs_skipped`
+        // for why the shared multi-thread `rt()` doesn't work here.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
+                // Wait for the self-test to exhaust retries. 3 × 1500ms =
+                // 4.5s worst case; give it a little extra for CI jitter.
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            });
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("forwarder self-test failed"),
+            "expected 'forwarder self-test failed' in log; got:\n{output}"
+        );
+        assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
+    }
+}

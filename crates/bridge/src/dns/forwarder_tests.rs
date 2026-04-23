@@ -319,31 +319,11 @@ impl DnsForwarder {
                 DnsProtocol::Https => 443,
             });
             let target = SocketAddr::new(server, port);
-            let fut = async {
-                match self.config.protocol {
-                    DnsProtocol::PlainUdp => {
-                        let s = self.connector.connect_udp(target).await?;
-                        s.send(query).await?;
-                        let mut buf = vec![0u8; MAX_REPLY_SIZE];
-                        let n = s.recv(&mut buf).await?;
-                        buf.truncate(n);
-                        Ok::<Vec<u8>, io::Error>(buf)
-                    }
-                    DnsProtocol::PlainTcp => {
-                        let s = self.connector.connect_tcp(target).await?;
-                        exchange_tcp_framed(s, query).await
-                    }
-                    DnsProtocol::Tls | DnsProtocol::Https => {
-                        // Ephemeral-port TLS stubs are out of scope for unit tests — these branches
-                        // would need a full rustls server setup. Covered by integration tests.
-                        self.forward_one(server, query).await
-                    }
-                }
-            };
-            match timeout(UPSTREAM_TIMEOUT, fut).await {
-                Ok(Ok(reply)) => return reply,
-                Ok(Err(e)) => self.log_once(server, &format!("upstream failed: {e}")),
-                Err(_) => self.log_once(server, "upstream timeout"),
+            // Delegate to the production `forward_one` — now `SocketAddr`-shaped,
+            // so ephemeral-port stubs work without any in-test protocol inlining.
+            match self.forward_one(target, query).await {
+                Ok(reply) => return reply,
+                Err(e) => self.log_upstream_failure(server, &e),
             }
         }
         synthesize_servfail(query)
@@ -480,4 +460,120 @@ fn question_end_normal_name() {
 fn question_end_rejects_truncated() {
     let q = b"\x07example"; // no null terminator
     assert!(question_end(q).is_none());
+}
+
+// Phase 1 #248 — typed error + source-chain logging ===================================================================
+//
+// These tests drive the introduction of `UpstreamLayer` + `UpstreamErr` in
+// `forwarder.rs`, plus the `layer=...`, `elapsed_ms=...`, `caused_by=...`
+// fields on the "upstream failed" warn log line. Phase 2 observation uses
+// these fields to tell SOCKS5-layer failures from TLS-layer failures from
+// mid-tunnel EOFs, all of which surface as bare `tls handshake eof` today.
+
+#[cfg(test)]
+mod typed_error_logs {
+    use super::*;
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// Closed TCP upstream + PlainTcp protocol → the "upstream failed" log
+    /// line must include `layer=connect` and `elapsed_ms=<n>`, so Phase 2
+    /// observation can tell connect-level failures from mid-stream ones.
+    #[skuld::test]
+    async fn closed_tcp_upstream_logs_connect_layer_and_elapsed_ms() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = subscriber.set_default();
+
+        let dead = unused_tcp_port().await;
+        let fwd = DnsForwarder::new(
+            build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
+            Arc::new(DirectConnector),
+            true,
+        );
+        let _ = fwd.forward_on_port(&sample_query(0x0001), dead.port()).await;
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("upstream failed"),
+            "expected 'upstream failed' log; got:\n{output}"
+        );
+        assert!(
+            output.contains("layer=connect"),
+            "expected 'layer=connect'; got:\n{output}"
+        );
+        assert!(output.contains("elapsed_ms"), "expected 'elapsed_ms'; got:\n{output}");
+    }
+
+    /// The `caused_by` field must surface `std::error::Error::source()` so
+    /// Phase 2 sees the underlying error kind (e.g. `ConnectionRefused`)
+    /// not just the outer display message.
+    #[skuld::test]
+    async fn upstream_failure_log_includes_caused_by_chain() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = subscriber.set_default();
+
+        let dead = unused_tcp_port().await;
+        let fwd = DnsForwarder::new(
+            build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
+            Arc::new(DirectConnector),
+            true,
+        );
+        let _ = fwd.forward_on_port(&sample_query(0x0002), dead.port()).await;
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("caused_by"),
+            "expected 'caused_by' field in log; got:\n{output}"
+        );
+    }
+
+    /// TCP stub that accepts then closes immediately → forwarder sees EOF
+    /// while reading the framed reply. With `PlainTcp`, this is the `Io`
+    /// layer (not `Connect` — we got past the connect, we hit an EOF on
+    /// read).
+    #[skuld::test]
+    async fn tcp_accept_then_close_logs_io_layer() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = subscriber.set_default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let fwd = DnsForwarder::new(
+            build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
+            Arc::new(DirectConnector),
+            true,
+        );
+        let _ = fwd.forward_on_port(&sample_query(0x0003), addr.port()).await;
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("layer=io"),
+            "expected 'layer=io' for EOF mid-exchange; got:\n{output}"
+        );
+    }
 }
