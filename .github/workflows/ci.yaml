@@ -234,6 +234,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Hole tests include `tun-engine-macros` trybuild `compile_fail` tests
+      # that invoke rustc at test time. A minimal toolchain is required here
+      # (garter/galoshes test jobs don't need this).
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
         with:
