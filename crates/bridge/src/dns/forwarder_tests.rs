@@ -1,3 +1,4 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -259,11 +260,14 @@ async fn ipv6_upstream_skipped_when_no_v6_bypass() {
     assert_ne!(reply[3] & 0x0F, 2);
 }
 
-// Dedup ===============================================================================================================
+// Throttle ============================================================================================================
 
 #[skuld::test]
-async fn duplicate_server_in_list_logs_only_once() {
-    // Two identical dead addresses. Without dedup we'd log twice.
+async fn duplicate_server_in_list_creates_one_throttle_entry() {
+    // Two identical dead addresses share one per-IP throttle entry.
+    // The throttle counts `logged + suppressed` per server — in #248's
+    // Phase-2 shape, a single failure burst against the same server does
+    // not duplicate state across the map.
     let dead_addr = unused_tcp_port().await;
     let fwd = DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), dead_addr.ip()]),
@@ -272,9 +276,57 @@ async fn duplicate_server_in_list_logs_only_once() {
     );
     let q = sample_query(0x0001);
     let _ = fwd.forward_with_ports(&q, &[dead_addr.port(), dead_addr.port()]).await;
-    // logged_servers should contain exactly one entry.
-    let set = fwd.logged_servers.lock().unwrap();
-    assert_eq!(set.len(), 1, "duplicate server logged only once");
+    let map = fwd.failure_throttle.lock().unwrap();
+    assert_eq!(map.len(), 1, "duplicate server has one throttle entry");
+    let state = map.get(&dead_addr.ip()).expect("throttle entry exists");
+    // Both attempts were below the full-limit, so both were logged in
+    // full — but `suppressed` remains 0 since we never crossed the
+    // limit.
+    assert_eq!(state.logged, 2, "both attempts counted as logged");
+    assert_eq!(state.suppressed, 0, "under limit, nothing suppressed");
+}
+
+#[skuld::test]
+async fn throttle_logs_first_n_then_suppresses() {
+    // The #248 bug was fully invisible after the first-per-server log
+    // line because of dedup-forever. This test pins the replacement
+    // behavior: first LOG_FULL_LIMIT=3 failures log in full, subsequent
+    // ones are counted as suppressed.
+    let dead_addr = unused_tcp_port().await;
+    let fwd = DnsForwarder::new(
+        build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+    );
+    let q = sample_query(0x0002);
+    // 5 attempts against the same server.
+    for _ in 0..5 {
+        let _ = fwd.forward_with_ports(&q, &[dead_addr.port()]).await;
+    }
+    let map = fwd.failure_throttle.lock().unwrap();
+    let state = map.get(&dead_addr.ip()).expect("throttle entry exists");
+    assert_eq!(state.logged, LOG_FULL_LIMIT, "first LOG_FULL_LIMIT logged in full");
+    assert_eq!(state.suppressed, 5 - LOG_FULL_LIMIT, "remainder suppressed");
+}
+
+// Error-chain errno extraction ========================================================================================
+
+#[skuld::test]
+fn first_os_errno_walks_nested_io_error() {
+    // Simulate the tokio-rustls shape: outer io::Error wrapping an
+    // inner io::Error that carries a raw_os_error (as rustls would from
+    // a real ECONNRESET on the underlying stream).
+    let inner = io::Error::from_raw_os_error(10054); // WSAECONNRESET
+    let outer = io::Error::other(inner);
+    assert_eq!(first_os_errno(&outer), Some(10054));
+}
+
+#[skuld::test]
+fn first_os_errno_returns_none_for_pure_custom_error() {
+    // tokio-rustls's `tls handshake eof` is a Custom error with no
+    // inner raw_os_error — represents a graceful FIN, not an RST.
+    let e = io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof");
+    assert_eq!(first_os_errno(&e), None);
 }
 
 // Short-query safety ==================================================================================================
@@ -310,7 +362,7 @@ impl DnsForwarder {
         }
         for (i, &server) in self.config.servers.iter().enumerate() {
             if server.is_ipv6() && !self.ipv6_bypass_available {
-                self.log_once(server, "skipping IPv6 upstream (no IPv6 bypass available)");
+                self.log_ipv6_skip_once(server);
                 continue;
             }
             let port = ports.get(i).copied().unwrap_or(match self.config.protocol {

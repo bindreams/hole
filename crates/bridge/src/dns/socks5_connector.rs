@@ -24,7 +24,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_socks::tcp::Socks5Stream;
 
-use crate::dns::connector::{BoxedStream, UpstreamConnector, UpstreamUdp};
+use crate::dns::connector::{ConnectedStream, CountingStream, UpstreamConnector, UpstreamUdp};
 
 const SOCKS5_VER: u8 = 0x05;
 const SOCKS5_NO_AUTH: u8 = 0x00;
@@ -50,7 +50,7 @@ impl Socks5Connector {
 
 #[async_trait]
 impl UpstreamConnector for Socks5Connector {
-    async fn connect_tcp(&self, target: SocketAddr) -> io::Result<BoxedStream> {
+    async fn connect_tcp(&self, target: SocketAddr) -> io::Result<ConnectedStream> {
         // Time the SOCKS5 handshake + CONNECT — per #248, this separates
         // "SOCKS5 handshake took 3s" from "handshake instant, but TLS
         // EOF'd immediately after" in the Phase-2 breakdown.
@@ -61,8 +61,15 @@ impl UpstreamConnector for Socks5Connector {
             Ok(stream) => {
                 tracing::debug!(%target, elapsed_ms, "Socks5Connector::connect_tcp");
                 // `into_inner()` returns the underlying `TcpStream` — after
-                // the CONNECT handshake the relay is a pure byte pipe.
-                Ok(Box::new(stream.into_inner()))
+                // the CONNECT handshake the relay is a pure byte pipe. Wrap
+                // in a CountingStream so the forwarder can read post-SOCKS5
+                // byte counts on TLS-layer failure (diagnostic for #248).
+                let counting = CountingStream::new(stream.into_inner());
+                let counters = counting.counters();
+                Ok(ConnectedStream {
+                    stream: Box::new(counting),
+                    counters,
+                })
             }
             Err(e) => {
                 tracing::debug!(%target, elapsed_ms, error = %e, "Socks5Connector::connect_tcp failed");

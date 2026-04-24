@@ -1009,7 +1009,7 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::connector::{BoxedStream, UpstreamConnector, UpstreamUdp};
+    use crate::dns::connector::{ConnectedStream, UpstreamConnector, UpstreamUdp};
     use crate::dns::forwarder::DnsForwarder;
     use crate::test_support::log_capture::VecWriter;
     use async_trait::async_trait;
@@ -1026,7 +1026,7 @@ mod self_test {
     struct DeadConnector;
     #[async_trait]
     impl UpstreamConnector for DeadConnector {
-        async fn connect_tcp(&self, _target: std::net::SocketAddr) -> io::Result<BoxedStream> {
+        async fn connect_tcp(&self, _target: std::net::SocketAddr) -> io::Result<ConnectedStream> {
             Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
         }
         async fn connect_udp(&self, _target: std::net::SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
