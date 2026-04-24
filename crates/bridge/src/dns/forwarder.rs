@@ -11,7 +11,7 @@
 //! upstream interface has no IPv6 connectivity — matches the spec in the
 //! plan.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -23,16 +23,16 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::dns::connector::UpstreamConnector;
+use crate::dns::connector::{StreamCounters, UpstreamConnector};
 use crate::dns::providers;
 
 // Typed errors ========================================================================================================
 
-/// Which layer of the upstream stack emitted the error. Lets Phase-2
-/// observation of #248 distinguish SOCKS5-layer failures from TLS
-/// handshake failures from mid-stream I/O EOFs — all of which currently
-/// surface as a bare `io::Error` with message `"tls handshake eof"` or
-/// similar.
+/// Which layer of the upstream stack emitted the error. Lets #248
+/// observation distinguish SOCKS5-layer failures from TLS handshake
+/// failures from mid-stream I/O EOFs from outer-budget timeout
+/// cancellation — all of which previously surfaced as a bare `io::Error`
+/// with message `"tls handshake eof"` or similar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamLayer {
     /// TCP or UDP connect. For `Socks5Connector`, this includes the
@@ -47,6 +47,11 @@ pub enum UpstreamLayer {
     Http,
     /// Post-handshake read / write on the upstream stream.
     Io,
+    /// Outer `UPSTREAM_TIMEOUT` budget fired. Distinct from `Io` so
+    /// observers can tell "inner future completed with error at 2573ms"
+    /// from "outer timer cancelled the future at exactly 3000ms" —
+    /// different root causes, different fixes. Ref #248.
+    Timeout,
 }
 
 impl UpstreamLayer {
@@ -56,6 +61,7 @@ impl UpstreamLayer {
             Self::Tls => "tls",
             Self::Http => "http",
             Self::Io => "io",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -66,24 +72,67 @@ impl std::fmt::Display for UpstreamLayer {
     }
 }
 
-/// Tagged upstream failure: `{ layer, source, elapsed_ms }`. Logged via
-/// [`DnsForwarder::log_upstream_failure`] with the `source`-walk as a
-/// `caused_by=...` field. `io::Error` itself is `!Clone`, so `UpstreamErr`
-/// cannot be `Clone` — consumed once on the log path.
+/// Tagged upstream failure: `{ layer, source, elapsed_ms }` plus optional
+/// diagnostic context captured at the point of failure. `io::Error` is
+/// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
+/// log path.
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
     pub source: io::Error,
+    /// Wall-clock from `forward_one`'s `Instant::now()` to error emission.
+    /// Bounded above by [`UPSTREAM_TIMEOUT`].
     pub elapsed_ms: u64,
+    /// Time from `forward_one` start to return of `connector.connect_tcp`.
+    /// `Some` whenever the TCP/SOCKS5-level connection completed
+    /// (Tls/Io/Http failures); `None` when we errored at `Connect` or
+    /// `Timeout` fired before connect completed.
+    pub socks5_ms: Option<u64>,
+    /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`.
+    /// `Some` on `Tls`/`Io`/`Http` layers; `None` otherwise.
+    pub tls_ms: Option<u64>,
+    /// Raw bytes written to / read from the underlying TCP stream,
+    /// observed by [`crate::dns::connector::CountingStream`]. `None` when
+    /// connect failed (no stream existed). Post-SOCKS5 byte counts —
+    /// what a DoH server would see.
+    pub tcp_wrote: Option<u64>,
+    pub tcp_read: Option<u64>,
+    /// First `io::Error::raw_os_error()` found walking
+    /// `std::error::Error::source()` from `source`. Distinguishes FIN
+    /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
+    /// with no errno) from RST (`WSAECONNRESET=10054`) and friends.
+    pub os_errno: Option<i32>,
 }
 
 impl UpstreamErr {
-    fn new(layer: UpstreamLayer, source: io::Error) -> Self {
+    pub fn new(layer: UpstreamLayer, source: io::Error) -> Self {
+        let os_errno = first_os_errno(&source);
         Self {
             layer,
             source,
             elapsed_ms: 0,
+            socks5_ms: None,
+            tls_ms: None,
+            tcp_wrote: None,
+            tcp_read: None,
+            os_errno,
         }
+    }
+
+    fn with_socks5_ms(mut self, ms: u64) -> Self {
+        self.socks5_ms = Some(ms);
+        self
+    }
+
+    fn with_tls_ms(mut self, ms: u64) -> Self {
+        self.tls_ms = Some(ms);
+        self
+    }
+
+    fn with_counters(mut self, c: &StreamCounters) -> Self {
+        self.tcp_read = Some(c.read());
+        self.tcp_wrote = Some(c.written());
+        self
     }
 }
 
@@ -99,6 +148,33 @@ fn format_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
         current = c.source();
     }
     s
+}
+
+/// Walk `std::error::Error::source()` looking for the first
+/// `io::Error::raw_os_error()` value. Needed because tokio-rustls wraps
+/// its own `tls handshake eof` around a synthesized inner `io::Error`
+/// that has no errno — but if the root is a real socket error
+/// (`WSAECONNRESET` on Windows) it's further down the chain.
+///
+/// Special-cases `io::Error`: its `Error::source()` impl skips the
+/// Custom-wrapper and delegates to the *inner* error's `source()`,
+/// which would hide the inner `io::Error` entirely. Use `get_ref()` to
+/// descend through nested `io::Error` directly.
+fn first_os_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<io::Error>() {
+            if let Some(errno) = io_err.raw_os_error() {
+                return Some(errno);
+            }
+            if let Some(inner) = io_err.get_ref() {
+                current = Some(inner);
+                continue;
+            }
+        }
+        current = err.source();
+    }
+    None
 }
 
 /// Upstream port for plain DNS (RFC 1035) and DoT (RFC 7858).
@@ -119,6 +195,63 @@ const MAX_REPLY_SIZE: usize = 16 * 1024;
 /// SERVFAIL rcode per RFC 1035 §4.1.1.
 const RCODE_SERVFAIL: u8 = 2;
 
+// Log throttle ========================================================================================================
+
+/// Max full log lines per server before suppressing.
+const LOG_FULL_LIMIT: u32 = 3;
+/// Minimum interval between summary lines per server.
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-server state for log-first-N-then-summarize. Replaces the previous
+/// per-server dedup-forever `log_once` on the upstream-failure path, which
+/// hid all but the first failure per server IP and blocked Phase-2
+/// observation of #248.
+///
+/// - First [`LOG_FULL_LIMIT`] failures per server are logged in full.
+/// - After that, a rolling summary line `upstream failed (N suppressed
+///   since first, window=Xs)` is emitted at most every
+///   [`SUMMARY_INTERVAL`], driven lazily by the next failure event.
+///
+/// Summary is lazy-not-timer: if failures stop, the residual suppressed
+/// count never gets flushed — acceptable tradeoff for avoiding a
+/// background task, and consistent with "the error was transient" being
+/// a valid outcome.
+#[derive(Debug)]
+struct ThrottleState {
+    logged: u32,
+    suppressed: u32,
+    first_at: Instant,
+    last_summary_at: Instant,
+}
+
+impl ThrottleState {
+    fn new(now: Instant) -> Self {
+        Self {
+            logged: 0,
+            suppressed: 0,
+            first_at: now,
+            last_summary_at: now,
+        }
+    }
+}
+
+/// Outcome of consulting the throttle for a new failure. Returned from
+/// the mutex-scoped decision function so the tracing macro invocation
+/// happens *outside* the lock (keeps the critical section short and
+/// avoids any surprise reentrancy).
+enum ThrottleDecision {
+    /// Emit the full log line, first/second/... occurrence.
+    LogFull,
+    /// Suppress; nothing to emit.
+    Suppress,
+    /// Suppress the current failure itself, but emit the rolling
+    /// summary line with the counts snapshot from the prior window.
+    SuppressAndSummary {
+        suppressed_count: u32,
+        window_elapsed: Duration,
+    },
+}
+
 // Public API ==========================================================================================================
 
 pub struct DnsForwarder {
@@ -126,10 +259,15 @@ pub struct DnsForwarder {
     connector: Arc<dyn UpstreamConnector>,
     tls_config: Arc<ClientConfig>,
     ipv6_bypass_available: bool,
-    /// Dedup state for per-server WARN log lines. Held in a `std::Mutex`
-    /// (never across an `await`) — each forward() call either hits or
-    /// misses the set and moves on.
-    logged_servers: Mutex<HashSet<IpAddr>>,
+    /// Per-server throttle state for upstream-failure logs. Held in a
+    /// `std::Mutex` (never across an `await`) — each forward() call
+    /// either hits or misses the map and moves on.
+    failure_throttle: Mutex<HashMap<IpAddr, ThrottleState>>,
+    /// Per-server set for the config-static IPv6-skip log. Separate
+    /// from [`Self::failure_throttle`] because the IPv6-skip condition
+    /// cannot change without a reconfigure; log-first-1-forever is
+    /// correct there.
+    ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
 }
 
 impl DnsForwarder {
@@ -143,7 +281,8 @@ impl DnsForwarder {
             connector,
             tls_config,
             ipv6_bypass_available,
-            logged_servers: Mutex::new(HashSet::new()),
+            failure_throttle: Mutex::new(HashMap::new()),
+            ipv6_skip_logged: Mutex::new(HashSet::new()),
         }
     }
 
@@ -157,7 +296,7 @@ impl DnsForwarder {
 
         for &server in &self.config.servers {
             if server.is_ipv6() && !self.ipv6_bypass_available {
-                self.log_once(server, "skipping IPv6 upstream (no IPv6 bypass available)");
+                self.log_ipv6_skip_once(server);
                 continue;
             }
 
@@ -171,10 +310,10 @@ impl DnsForwarder {
         synthesize_servfail(query)
     }
 
-    /// Single-attempt forward against `target`. Callers build `target` from
-    /// the config'd server plus the protocol's well-known port; the
-    /// test-only `forward_with_ports` builds it from an ephemeral port so
-    /// stubs don't need privilege to bind 53/853/443.
+    /// Single-attempt forward against `target`. Callers build `target`
+    /// from the config'd server plus the protocol's well-known port;
+    /// the test-only `forward_with_ports` builds it from an ephemeral
+    /// port so stubs don't need privilege to bind 53/853/443.
     async fn forward_one(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
         let started = Instant::now();
         let fut = async {
@@ -188,7 +327,7 @@ impl DnsForwarder {
         let result = match timeout(UPSTREAM_TIMEOUT, fut).await {
             Ok(res) => res,
             Err(_) => Err(UpstreamErr::new(
-                UpstreamLayer::Io,
+                UpstreamLayer::Timeout,
                 io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
             )),
         };
@@ -198,32 +337,81 @@ impl DnsForwarder {
         })
     }
 
-    /// Log a server-static message exactly once per server IP. Used for
-    /// invariant-static conditions like "IPv6 server skipped because no
-    /// IPv6 bypass is available" where a counter/summary would be noise —
-    /// the condition cannot change without a reconfigure.
-    fn log_once(&self, server: IpAddr, msg: &str) {
-        let mut set = self.logged_servers.lock().expect("poisoned");
-        if set.insert(server) {
-            tracing::warn!(%server, protocol = ?self.config.protocol, "{msg}");
-        }
-    }
-
-    /// Log an upstream failure with the typed layer tag + elapsed + source
-    /// chain. Per-server deduplication mirrors `log_once` — Phase 4 of
-    /// #248 will replace this with log-first-3-then-summarize-every-60s
-    /// (tracked in the plan, separate PR).
-    fn log_upstream_failure(&self, server: IpAddr, e: &UpstreamErr) {
-        let mut set = self.logged_servers.lock().expect("poisoned");
+    /// Log a config-static server-skip message exactly once per server
+    /// IP. Used only for the IPv6-no-bypass case where the condition
+    /// cannot change without a reconfigure, so a rolling summary would
+    /// be noise.
+    fn log_ipv6_skip_once(&self, server: IpAddr) {
+        let mut set = self.ipv6_skip_logged.lock().expect("poisoned");
         if set.insert(server) {
             tracing::warn!(
                 %server,
                 protocol = ?self.config.protocol,
-                layer = %e.layer,
-                elapsed_ms = e.elapsed_ms,
-                caused_by = %format_error_chain(&e.source),
-                "upstream failed"
+                "skipping IPv6 upstream (no IPv6 bypass available)"
             );
+        }
+    }
+
+    /// Log an upstream failure with the typed layer tag + elapsed + source
+    /// chain + optional per-layer diagnostic context. Per-server
+    /// log-first-N-then-summarize throttle; see [`ThrottleState`].
+    fn log_upstream_failure(&self, server: IpAddr, e: &UpstreamErr) {
+        let decision = {
+            let mut map = self.failure_throttle.lock().expect("poisoned");
+            let now = Instant::now();
+            let state = map.entry(server).or_insert_with(|| ThrottleState::new(now));
+
+            if state.logged < LOG_FULL_LIMIT {
+                state.logged += 1;
+                ThrottleDecision::LogFull
+            } else {
+                state.suppressed += 1;
+                let since_summary = now.duration_since(state.last_summary_at);
+                if since_summary >= SUMMARY_INTERVAL {
+                    let count = state.suppressed;
+                    let window = now.duration_since(state.first_at);
+                    state.suppressed = 0;
+                    state.last_summary_at = now;
+                    ThrottleDecision::SuppressAndSummary {
+                        suppressed_count: count,
+                        window_elapsed: window,
+                    }
+                } else {
+                    ThrottleDecision::Suppress
+                }
+            }
+        };
+
+        match decision {
+            ThrottleDecision::LogFull => {
+                tracing::warn!(
+                    %server,
+                    protocol = ?self.config.protocol,
+                    layer = %e.layer,
+                    elapsed_ms = e.elapsed_ms,
+                    budget_ms = UPSTREAM_TIMEOUT.as_millis() as u64,
+                    socks5_ms = ?e.socks5_ms,
+                    tls_ms = ?e.tls_ms,
+                    tcp_wrote = ?e.tcp_wrote,
+                    tcp_read = ?e.tcp_read,
+                    os_errno = ?e.os_errno,
+                    caused_by = %format_error_chain(&e.source),
+                    "upstream failed"
+                );
+            }
+            ThrottleDecision::Suppress => {}
+            ThrottleDecision::SuppressAndSummary {
+                suppressed_count,
+                window_elapsed,
+            } => {
+                tracing::warn!(
+                    %server,
+                    protocol = ?self.config.protocol,
+                    suppressed = suppressed_count,
+                    window_s = window_elapsed.as_secs(),
+                    "upstream failed (summary — full logging resumed at next interval)"
+                );
+            }
         }
     }
 }
@@ -265,14 +453,19 @@ impl DnsForwarder {
 
 impl DnsForwarder {
     async fn forward_tcp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
-        let stream = self
+        let socks5_start = Instant::now();
+        let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        exchange_tcp_framed(stream, query)
-            .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
+        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
+        let (stream, counters) = connected.into_parts();
+        exchange_tcp_framed(stream, query).await.map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Io, e)
+                .with_socks5_ms(socks5_ms)
+                .with_counters(&counters)
+        })
     }
 }
 
@@ -280,20 +473,35 @@ impl DnsForwarder {
 
 impl DnsForwarder {
     async fn forward_tls(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
-        let stream = self
+        let socks5_start = Instant::now();
+        let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let server_name = tls_server_name_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let tls = connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
-        exchange_tcp_framed(tls, query)
-            .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
+        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
+        let (stream, counters) = connected.into_parts();
+
+        let server_name = tls_server_name_for(target.ip()).map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Tls, e)
+                .with_socks5_ms(socks5_ms)
+                .with_counters(&counters)
+        })?;
+        let tls_start = Instant::now();
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
+        let tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Tls, e)
+                .with_socks5_ms(socks5_ms)
+                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
+                .with_counters(&counters)
+        })?;
+        let tls_ms = tls_start.elapsed().as_millis() as u64;
+        exchange_tcp_framed(tls, query).await.map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Io, e)
+                .with_socks5_ms(socks5_ms)
+                .with_tls_ms(tls_ms)
+                .with_counters(&counters)
+        })
     }
 }
 
@@ -303,16 +511,25 @@ impl DnsForwarder {
     async fn forward_https(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
-        let stream = self
+
+        let socks5_start = Instant::now();
+        let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let mut tls = connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
+        let (stream, counters) = connected.into_parts();
+
+        let tls_start = Instant::now();
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
+        let mut tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Tls, e)
+                .with_socks5_ms(socks5_ms)
+                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
+                .with_counters(&counters)
+        })?;
+        let tls_ms = tls_start.elapsed().as_millis() as u64;
 
         let (host, path) = path_and_host;
         let mut req = Vec::with_capacity(256 + query.len());
@@ -330,19 +547,28 @@ impl DnsForwarder {
         .unwrap();
         req.extend_from_slice(query);
 
-        tls.write_all(&req)
-            .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
-        tls.flush().await.map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
+        let io_err = |e: io::Error| {
+            UpstreamErr::new(UpstreamLayer::Io, e)
+                .with_socks5_ms(socks5_ms)
+                .with_tls_ms(tls_ms)
+                .with_counters(&counters)
+        };
+        tls.write_all(&req).await.map_err(io_err)?;
+        tls.flush().await.map_err(io_err)?;
 
         let mut resp = Vec::with_capacity(4096);
         // Cap reads so a misbehaving server can't OOM us.
         tls.take((MAX_REPLY_SIZE * 4) as u64)
             .read_to_end(&mut resp)
             .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
+            .map_err(io_err)?;
 
-        parse_http_dns_response(&resp).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))
+        parse_http_dns_response(&resp).map_err(|e| {
+            UpstreamErr::new(UpstreamLayer::Http, e)
+                .with_socks5_ms(socks5_ms)
+                .with_tls_ms(tls_ms)
+                .with_counters(&counters)
+        })
     }
 }
 
