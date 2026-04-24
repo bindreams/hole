@@ -88,19 +88,11 @@ jobs:
         if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
         run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin --all-targets -- -D warnings
 
-      # Produce a portable nextest archive. Hole platforms archive the whole
-      # workspace; non-Hole platforms archive only the ex-Galoshes crates
-      # (Hole's Tauri app + platform-gated crates don't compile on Linux
-      # or windows-arm64).
-      - name: Build test archive (Hole workspace)
-        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
-        shell: bash
-        run: |
-          mkdir -p ci-artifacts
-          cargo nextest archive --workspace --archive-file ci-artifacts/tests.tar.zst
-
-      - name: Build test archive (ex-Galoshes only)
-        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
+      # Archive only the ex-Galoshes crates — they're the only consumers
+      # via test-garter and test-galoshes on all platforms. Hole crates'
+      # compileability is already covered by `Clippy (Hole workspace)`
+      # above; test-hole runs in its own build+test job below.
+      - name: Build test archive (ex-Galoshes crates)
         shell: bash
         run: |
           mkdir -p ci-artifacts
