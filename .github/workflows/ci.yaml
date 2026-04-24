@@ -165,14 +165,16 @@ jobs:
 
       # `cargo nextest run --archive-file` refuses `-p`; the archive's
       # package set is frozen at build time. Filter by `-E package(...)`
-      # instead.
+      # instead. `target/debug/` must exist because skuld writes its
+      # test-coordination SQLite DB at `<workspace>/target/debug/.skuld.db`.
       - name: Run tests
         shell: bash
-        run: >
-          cargo nextest run
-          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
-          --workspace-remap "${{ github.workspace }}"
-          -E 'package(garter) + package(garter-bin) + package(mock-plugin)'
+        run: |
+          mkdir -p target/debug
+          cargo nextest run \
+            --archive-file "${{ runner.temp }}/build/tests.tar.zst" \
+            --workspace-remap "${{ github.workspace }}" \
+            -E 'package(garter) + package(garter-bin) + package(mock-plugin)'
 
   test-galoshes:
     name: Test galoshes (${{ matrix.os }}/${{ matrix.arch }})
@@ -204,11 +206,12 @@ jobs:
 
       - name: Run tests
         shell: bash
-        run: >
-          cargo nextest run
-          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
-          --workspace-remap "${{ github.workspace }}"
-          -E 'package(galoshes)'
+        run: |
+          mkdir -p target/debug
+          cargo nextest run \
+            --archive-file "${{ runner.temp }}/build/tests.tar.zst" \
+            --workspace-remap "${{ github.workspace }}" \
+            -E 'package(galoshes)'
 
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
@@ -247,6 +250,10 @@ jobs:
       # `TUN` label definition. Under the new per-project job layout,
       # test-hole owns its own VM — Galoshes/Garter tests on other
       # runners cannot be poisoned by TUN's NDIS perturbation.
+      - name: Prepare target/debug for skuld DB
+        shell: bash
+        run: mkdir -p target/debug
+
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
