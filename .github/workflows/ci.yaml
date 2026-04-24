@@ -113,23 +113,29 @@ jobs:
         if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
         run: cargo build --workspace
 
-      # Hole e2e tests (`DistHarness`) expect `target/debug/dist/bin/hole[.exe]`
-      # + sidecars + wintun.dll staged. No --with-tests — stable test paths are
-      # a local-dev Firewall-consent optimization that fresh CI VMs don't need.
-      - name: Stage dist/bin (runtime assets for e2e tests)
-        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
-        shell: bash
-        run: |
-          cargo xtask stage --out-dir target/debug/dist
-          cp -r target/debug/dist ci-artifacts/dist
-
+      # Hole e2e tests in the bridge crate use `dist_fixture`, which at test
+      # time invokes `xtask::run_stage` to hardlink the BINDIR files into
+      # `target/debug/dist/bin/`. `run_stage` reads its sources from
+      # `target/debug/hole[.exe]`, `target/debug/galoshes[.exe]`, and
+      # `.cache/{v2ray-plugin,wintun}/`. Those files were produced by
+      # `cargo build --workspace` + `cargo xtask deps` above; include them in
+      # the artifact so the fixture finds them on the test runner.
+      # Non-Hole platforms don't have target/debug/hole etc.; `if-no-files-found: ignore`
+      # lets the upload succeed with just the test archive.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ci-artifacts/
+          path: |
+            ci-artifacts/tests.tar.zst
+            target/debug/hole
+            target/debug/hole.exe
+            target/release/galoshes
+            target/release/galoshes.exe
+            .cache/v2ray-plugin/
+            .cache/wintun/
           retention-days: 3
-          if-no-files-found: error
+          if-no-files-found: ignore
 
   # Three per-project test jobs, all consuming the `build-<os>-<arch>` artifact
   # and running `cargo nextest run --archive-file`. They install the nextest
@@ -161,7 +167,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/build
+          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
 
       # `cargo nextest run --archive-file` refuses `-p`; the archive's
       # package set is frozen at build time. Filter by `-E package(...)`
@@ -172,7 +178,7 @@ jobs:
         run: |
           mkdir -p target/debug
           cargo nextest run \
-            --archive-file "${{ runner.temp }}/build/tests.tar.zst" \
+            --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(garter) + package(garter-bin) + package(mock-plugin)'
 
@@ -202,14 +208,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/build
+          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
 
       - name: Run tests
         shell: bash
         run: |
           mkdir -p target/debug
           cargo nextest run \
-            --archive-file "${{ runner.temp }}/build/tests.tar.zst" \
+            --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(galoshes)'
 
@@ -236,7 +242,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/build
+          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
 
       # Two-pass split to work around #200: the Windows TUN test
       # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
@@ -261,7 +267,7 @@ jobs:
           SKULD_LABELS: "!tun"
         run: >
           cargo nextest run
-          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --archive-file ci-artifacts/tests.tar.zst
           --workspace-remap "${{ github.workspace }}"
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
@@ -276,7 +282,7 @@ jobs:
           SKULD_LABELS: "tun"
         run: >
           cargo nextest run
-          --archive-file "${{ runner.temp }}/build/tests.tar.zst"
+          --archive-file ci-artifacts/tests.tar.zst
           --workspace-remap "${{ github.workspace }}"
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
