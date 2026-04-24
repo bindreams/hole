@@ -106,36 +106,15 @@ jobs:
           mkdir -p ci-artifacts
           cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file ci-artifacts/tests.tar.zst
 
-      # `cargo nextest archive` builds test targets but NOT regular binaries.
-      # `xtask stage` needs `target/debug/hole[.exe]` present, so do a proper
-      # build first. sccache dedupes dep compilation against the archive step.
-      - name: Build hole binary (for dist staging)
-        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
-        run: cargo build --workspace
-
-      # Hole e2e tests in the bridge crate use `dist_fixture`, which at test
-      # time invokes `xtask::run_stage` to hardlink the BINDIR files into
-      # `target/debug/dist/bin/`. `run_stage` reads its sources from
-      # `target/debug/hole[.exe]`, `target/debug/galoshes[.exe]`, and
-      # `.cache/{v2ray-plugin,wintun}/`. Those files were produced by
-      # `cargo build --workspace` + `cargo xtask deps` above; include them in
-      # the artifact so the fixture finds them on the test runner.
-      # Non-Hole platforms don't have target/debug/hole etc.; `if-no-files-found: ignore`
-      # lets the upload succeed with just the test archive.
+      # The artifact is consumed by test-garter and test-galoshes only;
+      # test-hole does its own build (#266 tracks unifying that).
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            ci-artifacts/tests.tar.zst
-            target/debug/hole
-            target/debug/hole.exe
-            target/release/galoshes
-            target/release/galoshes.exe
-            .cache/v2ray-plugin/
-            .cache/wintun/
+          path: ci-artifacts/tests.tar.zst
           retention-days: 3
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # Three per-project test jobs, all consuming the `build-<os>-<arch>` artifact
   # and running `cargo nextest run --archive-file`. They install the nextest
@@ -167,7 +146,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
+          path: ci-artifacts
 
       # `cargo nextest run --archive-file` refuses `-p`; the archive's
       # package set is frozen at build time. Filter by `-E package(...)`
@@ -208,7 +187,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
+          path: ci-artifacts
 
       - name: Run tests
         shell: bash
@@ -219,11 +198,16 @@ jobs:
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(galoshes)'
 
+  # test-hole runs a fresh build + nextest run (no archive). Hole tests have
+  # too many environmental couplings (trybuild --offline registry, dist_fixture
+  # workspace state, ipc_tests) for the archive-then-test pattern to work
+  # reliably without significant additional plumbing. #266 tracks moving
+  # test-hole onto archive once the couplings are addressed; for now this
+  # matches the pre-refactor build+test shape, scoped to Hole crates.
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
-    needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -233,26 +217,21 @@ jobs:
           - { os: darwin,  arch: arm64, runner: macos-latest }
     steps:
       - uses: actions/checkout@v6
-
-      # Hole tests include `tun-engine-macros` trybuild `compile_fail` tests
-      # that invoke rustc at test time and pull crates (e.g. `quote`) from
-      # the local cargo registry cache in `--offline` mode. Need both the
-      # Rust toolchain and a populated registry; garter/galoshes test jobs
-      # don't need either.
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Populate cargo registry cache (for trybuild --offline)
-        run: cargo fetch --locked
-
-      - name: Install nextest (pre-built binary)
-        uses: taiki-e/install-action@v2
         with:
-          tool: nextest
+          fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: .  # restore to workspace root so target/debug/* + .cache/* land correctly for dist_fixture
+      - uses: ./.github/actions/setup-build
+
+      - uses: cargo-bins/cargo-binstall@v1.18.1
+
+      - name: Install nextest
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall --no-confirm --locked cargo-nextest
+
+      - name: Build workspace
+        run: cargo build --workspace
 
       # Two-pass split to work around #200: the Windows TUN test
       # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
@@ -261,15 +240,6 @@ jobs:
       # stays broken for ≥120 s. So we run non-TUN tests first and
       # the TUN test last, so the break (if it fires) only affects
       # the tail of the job and not a subsequent loopback-using test.
-      # Skuld's `SKULD_LABELS` env var does the filtering; see
-      # `crates/bridge/src/test_support/skuld_fixtures.rs` for the
-      # `TUN` label definition. Under the new per-project job layout,
-      # test-hole owns its own VM — Galoshes/Garter tests on other
-      # runners cannot be poisoned by TUN's NDIS perturbation.
-      - name: Prepare target/debug for skuld DB
-        shell: bash
-        run: mkdir -p target/debug
-
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
@@ -277,8 +247,6 @@ jobs:
           SKULD_LABELS: "!tun"
         run: >
           cargo nextest run
-          --archive-file ci-artifacts/tests.tar.zst
-          --workspace-remap "${{ github.workspace }}"
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
@@ -292,8 +260,6 @@ jobs:
           SKULD_LABELS: "tun"
         run: >
           cargo nextest run
-          --archive-file ci-artifacts/tests.tar.zst
-          --workspace-remap "${{ github.workspace }}"
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
