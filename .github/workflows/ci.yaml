@@ -235,9 +235,14 @@ jobs:
       - uses: actions/checkout@v6
 
       # Hole tests include `tun-engine-macros` trybuild `compile_fail` tests
-      # that invoke rustc at test time. A minimal toolchain is required here
-      # (garter/galoshes test jobs don't need this).
+      # that invoke rustc at test time and pull crates (e.g. `quote`) from
+      # the local cargo registry cache in `--offline` mode. Need both the
+      # Rust toolchain and a populated registry; garter/galoshes test jobs
+      # don't need either.
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Populate cargo registry cache (for trybuild --offline)
+        run: cargo fetch --locked
 
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
