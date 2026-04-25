@@ -87,6 +87,32 @@ Getting a free port for local binding or SIP003 subprocess handoff goes through 
 
 The retry exists because Windows maintains **independent TCP/UDP excluded-port-range tables** (Hyper-V / WSL / Docker Desktop reservations, visible via `netsh int ipv4 show excludedportrange`); an OS-picked ephemeral port for one transport may be reserved for the other and the paired bind transiently fails. Galoshes's `garter::chain::allocate_one_port` hits the same class of bug — see bindreams/galoshes#21 for the deterministic `SO_EXCLUSIVEADDRUSE`-wildcard reproducer.
 
+### Logging directives
+
+`HOLE_BRIDGE_LOG` accepts a comma-separated list of `tracing` filter
+directives, all of which are honored
+([`crates/bridge/src/logging.rs`](crates/bridge/src/logging.rs)). The
+default is `hole_bridge=info`. Examples:
+
+- `HOLE_BRIDGE_LOG=hole_bridge=debug` — bridge-only debug.
+- `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
+  bridge debug + shadowsocks-service per-relay byte counts. The TRACE
+  line shape from
+  [`shadowsocks-service local/utils.rs`](https://docs.rs/shadowsocks-service/1.24.0/src/shadowsocks_service/local/utils.rs.html)
+  is `tcp tunnel <peer> <-> <target> (proxied) closed, L2R N bytes, R2L M bytes`. Load-bearing diagnostic for #248-class tunnel issues
+  ("did the plugin chain receive any bytes back?"). `LogTracer` is
+  installed automatically via `tracing-subscriber 0.3`'s default
+  features so `log::*!` events from third-party crates surface as
+  tracing events.
+
+`RUST_LOG` is also honored (read by
+`EnvFilter::from_env_lossy()` upstream of `add_directive`); both
+compose. Setting `shadowsocks_service=trace` in production is
+expensive — Full-tunnel mode + heavy browsing produces roughly one
+TRACE line per TCP connection (≥100/sec under Chrome). Use for
+debugging sessions only; `bridge.log` rotates via
+`MAX_LOG_BYTES`/`MAX_ROTATED_LOGS` so the cap is bounded.
+
 ### CLI
 
 ```

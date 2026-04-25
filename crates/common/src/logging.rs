@@ -384,12 +384,37 @@ const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 /// With a value of 1, the on-disk layout is `<name>` (current) + `<name>.1` (previous).
 const MAX_ROTATED_LOGS: usize = 1;
 
-/// Initialize logging.
+/// Initialize logging with one caller-supplied filter directive.
 ///
-/// Creates `log_dir` if it doesn't exist. Returns a guard that must be held
-/// for the process lifetime to ensure logs are flushed and the relay reader
-/// threads stay alive.
+/// Thin wrapper around [`init_multi`] preserved for callers that only have
+/// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
+/// guard that must be held for the process lifetime to ensure logs are
+/// flushed and the relay reader threads stay alive.
 pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogGuard {
+    init_multi(log_dir, log_filename, [default_directive])
+}
+
+/// Initialize logging with one or more caller-supplied filter directives.
+///
+/// Each directive is parsed and added to the env filter via
+/// `EnvFilter::add_directive`, in the order given. Later directives override
+/// earlier ones at equal specificity per `tracing-subscriber`'s rules.
+///
+/// The global default of `info` is set first; `RUST_LOG` (read by
+/// `from_env_lossy`) is layered next; the caller's directives are layered on
+/// top; finally `hole::logging=debug` is pinned so the logging subsystem
+/// itself emits lifecycle events.
+///
+/// Use this rather than [`init`] when the caller wants to honor a
+/// comma-separated env var like
+/// `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
+/// `init` accepts only one directive and silently dropping the rest is the
+/// kind of thing that hides production diagnostics (#248).
+pub fn init_multi<I>(log_dir: &Path, log_filename: &str, directives: I) -> LogGuard
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
     let _ = std::fs::create_dir_all(log_dir);
     cleanup_legacy_daily_logs(log_dir, log_filename);
 
@@ -431,16 +456,19 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
 
     // Global default is INFO so third-party crates (shadowsocks-service,
     // hickory, hyper, etc.) emit useful startup/warning diagnostics without
-    // needing per-crate directives. The caller's `default_directive` can
-    // still override specific crates (e.g. "hole_bridge=debug").
+    // needing per-crate directives. Caller directives are layered on top,
+    // each one independently parseable (e.g. `hole_bridge=debug` and
+    // `shadowsocks_service=trace` together).
     //
     // `hole::logging=debug` is the only pin below INFO — it lets the
     // logging subsystem itself emit debug-level lifecycle events.
-    let env_filter = EnvFilter::builder()
+    let mut env_filter = EnvFilter::builder()
         .with_default_directive("info".parse().expect("valid directive"))
-        .from_env_lossy()
-        .add_directive(default_directive.parse().expect("valid tracing directive"))
-        .add_directive("hole::logging=debug".parse().expect("valid directive"));
+        .from_env_lossy();
+    for d in directives {
+        env_filter = env_filter.add_directive(d.as_ref().parse().expect("valid tracing directive"));
+    }
+    let env_filter = env_filter.add_directive("hole::logging=debug".parse().expect("valid directive"));
 
     // Filter that excludes the relay's own events from the stderr layer to
     // prevent any feedback loop in either direction. The file layer has no
