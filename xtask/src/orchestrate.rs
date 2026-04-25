@@ -184,12 +184,13 @@ fn join_platforms(plats: &[Platform]) -> String {
 
 // ===== Self-relocate (Windows) =======================================================================================
 
-/// Stash directory under the cargo target directory where relocated copies of
-/// the running xtask binary live. We pick a sibling of the running exe so the
-/// path is local to whatever target tree we were launched from, and so cargo
-/// clean wipes us along with everything else.
+/// Stash directory (relative to the cargo `target/<profile>/` dir) where
+/// relocated copies of the running xtask binary live. Sibling of the running
+/// exe so the path is local to whatever target tree we were launched from,
+/// and so `cargo clean` wipes us along with everything else. Naming follows
+/// the project's `.tmp/<role>/` convention (`/var/run/`-style).
 #[cfg(windows)]
-const STASH_SUBDIR: &str = ".tmp-running";
+const STASH_SUBDIR: &[&str] = &[".tmp", "run"];
 
 /// On Windows, rename the running xtask binary out of the way so that
 /// recursive `cargo xtask <X>` invocations triggered by manifest steps don't
@@ -225,7 +226,10 @@ fn relocate_self_windows() -> Result<()> {
     let parent = current
         .parent()
         .ok_or_else(|| anyhow!("running xtask {current:?} has no parent directory"))?;
-    let stash = parent.join(STASH_SUBDIR);
+    let mut stash = parent.to_path_buf();
+    for c in STASH_SUBDIR {
+        stash.push(c);
+    }
     std::fs::create_dir_all(&stash).with_context(|| format!("creating stash dir {}", stash.display()))?;
 
     // Prune older relocated copies whose owning process has exited (so the
