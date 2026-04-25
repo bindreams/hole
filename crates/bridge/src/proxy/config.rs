@@ -115,13 +115,16 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 ///
 ///   Pre-#250, SocksOnly forced `TcpOnly` under #189's "select_all
 ///   drops the TCP listener when UDP completes early" attribution.
-///   That attribution had no log evidence — `LogTracer` was never
-///   installed so shadowsocks-service's `log::*!` events were silently
-///   dropped. The original symptom was actually wintun-induced
-///   loopback breakage on the Azure-hosted Windows runner (#200), and
-///   it was correctly addressed by PR #207's two-pass test ordering
-///   (`SKULD_LABELS=tun` runs last so loopback-using tests precede
-///   any wintun adapter destruction).
+///   That attribution had no log evidence: `LogTracer` *is* installed
+///   (via `tracing-subscriber`'s default features → `try_init`), but
+///   the bridge's `HOLE_BRIDGE_LOG` parser dropped every directive
+///   after the first comma, so `shadowsocks_service=*` directives in
+///   a multi-crate filter were silently lost. #267 fixes that. The
+///   original symptom for #189 was actually wintun-induced loopback
+///   breakage on the Azure-hosted Windows runner (#200), correctly
+///   addressed by PR #207's two-pass test ordering (`SKULD_LABELS=tun`
+///   runs last so loopback-using tests precede any wintun adapter
+///   destruction).
 /// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
 ///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
 ///
