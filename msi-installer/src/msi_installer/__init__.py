@@ -7,7 +7,6 @@ Usage: uv run --directory msi-installer build
 """
 
 import hashlib
-import os
 import platform
 import re
 import shutil
@@ -53,29 +52,22 @@ def cargo_build(console: Console) -> None:
 
 
 def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
-    """Stage the runnable BINDIR via the xtask `stage` subcommand.
+    """Stage the runnable BINDIR via `cargo xtask stage`.
 
     The canonical list of files (hole.exe + v2ray-plugin.exe + wintun.dll on
     Windows) lives in `xtask/src/bindir.rs::bindir_files()`. dev.py and this
     function both call into the same xtask subcommand, so adding a new BINDIR
     file is a one-line change in xtask and both consumers pick it up
     automatically. See issue #143.
-
-    When invoked under the build.yaml orchestrator (`cargo xtask build
-    hole-msi`), the `$XTASK` env var holds the path to the running xtask
-    binary; we invoke it directly instead of going through `cargo xtask`,
-    which on Windows would re-link xtask.exe and fail with ERROR_ACCESS_DENIED
-    (the parent process holds an exclusive lock).
     """
-    xtask_bin = os.environ.get("XTASK")
-    if xtask_bin:
-        cmd = [xtask_bin, "stage", "--profile", "release", "--out-dir", str(stage_dir)]
-    else:
-        cmd = ["cargo", "xtask", "stage", "--profile", "release", "--out-dir", str(stage_dir)]
-    console.print(f"[bold]Staging installer files[/] to {stage_dir} (via {cmd[0]} stage)")
-    result = subprocess.run(cmd, cwd=root)
+    console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
+    result = subprocess.run(
+        ["cargo", "xtask", "stage", "--profile", "release", "--out-dir",
+         str(stage_dir)],
+        cwd=root,
+    )
     if result.returncode != 0:
-        raise BuildError(f"xtask stage failed with exit code {result.returncode}")
+        raise BuildError(f"cargo xtask stage failed with exit code {result.returncode}")
 
 
 # Version ==============================================================================================================

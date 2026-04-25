@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::manifest::{Manifest, Platform};
-use crate::orchestrate::{execute, render_list, Plan, Verb};
+use crate::orchestrate::{execute, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
 pub mod galoshes;
@@ -110,26 +110,16 @@ pub enum Command {
     ///
     /// `cargo xtask build <name>` resolves the dependency DAG, filters to
     /// targets applicable to the host platform, and runs each target's
-    /// `build:` steps in topological order. `--all` selects every non-test
-    /// target applicable to the host.
-    Build {
-        /// Target name (e.g. `hole`, `galoshes`, `hole-msi`).
-        target: Option<String>,
-        /// Build every non-test target applicable to the host platform.
-        #[arg(long, conflicts_with = "target")]
-        all: bool,
-    },
-    /// Run a test target declared in `build.yaml` (and build its deps first).
+    /// `build:` steps in topological order. `--all` builds every target
+    /// applicable to the host platform.
     ///
-    /// Test targets are first-class entries with names ending in `-tests`
-    /// (`hole-tests`, `galoshes-tests`, etc.). `cargo xtask test <name>`
-    /// builds the dep tree (which includes the corresponding `*` build target)
-    /// and then runs the test target's steps. `--all` selects every test
-    /// target applicable to the host.
-    Test {
-        /// Test target name (e.g. `hole-tests`).
+    /// Test targets (names ending in `-tests`) are regular build targets
+    /// that produce test binaries; running those binaries is the caller's
+    /// concern (typically `cargo nextest run`), not xtask's.
+    Build {
+        /// Target name (e.g. `hole`, `galoshes`, `hole-msi`, `hole-tests`).
         target: Option<String>,
-        /// Run every test target applicable to the host platform.
+        /// Build every target applicable to the host platform.
         #[arg(long, conflicts_with = "target")]
         all: bool,
     },
@@ -182,7 +172,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Deps => run_deps(),
         Command::Version { check, exact } => run_version(check, exact),
         Command::Build { target, all } => run_build(target, all),
-        Command::Test { target, all } => run_test(target, all),
         Command::List => run_list(),
     }
 }
@@ -226,21 +215,12 @@ pub fn run_deps() -> Result<()> {
 }
 
 pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
-    run_orchestrated(Verb::Build, target, all)
-}
+    // Move ourselves out of `target/<profile>/xtask.exe` *before* spawning any
+    // subprocess that might shell out to `cargo xtask <X>`. Without this,
+    // cargo's relink path tries to overwrite our running binary on Windows
+    // and fails with ERROR_ACCESS_DENIED. No-op on POSIX.
+    relocate_self_if_windows()?;
 
-pub fn run_test(target: Option<String>, all: bool) -> Result<()> {
-    run_orchestrated(Verb::Test, target, all)
-}
-
-pub fn run_list() -> Result<()> {
-    let (manifest, _repo_root) = load_manifest()?;
-    let host = Platform::host();
-    print!("{}", render_list(&manifest, host));
-    Ok(())
-}
-
-fn run_orchestrated(verb: Verb, target: Option<String>, all: bool) -> Result<()> {
     let (manifest, repo_root) = load_manifest()?;
     let host = Platform::host().ok_or_else(|| {
         anyhow!(
@@ -253,23 +233,10 @@ fn run_orchestrated(verb: Verb, target: Option<String>, all: bool) -> Result<()>
     let roots: Vec<&str> = match (target, all) {
         (Some(name), false) => {
             let target = manifest.get(&name).ok_or_else(|| anyhow!("unknown target: {name:?}"))?;
-            // Verb mismatch: explicitly reject `build hole-tests` /
-            // `test hole`. Either is a category error.
-            match (verb, target.is_test()) {
-                (Verb::Build, true) => {
-                    return Err(anyhow!("{name:?} is a test target — use `cargo xtask test {name}`"));
-                }
-                (Verb::Test, false) => {
-                    return Err(anyhow!(
-                        "{name:?} is not a test target — use `cargo xtask build {name}`"
-                    ));
-                }
-                _ => {}
-            }
             vec![target.name.as_str()]
         }
         (None, true) => plan
-            .targets_for_verb(verb)
+            .target_names()
             .into_iter()
             .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
             .collect(),
@@ -280,18 +247,19 @@ fn run_orchestrated(verb: Verb, target: Option<String>, all: bool) -> Result<()>
     };
 
     if roots.is_empty() {
-        println!(
-            "xtask: no {} targets apply to host platform {host}",
-            match verb {
-                Verb::Build => "build",
-                Verb::Test => "test",
-            }
-        );
+        println!("xtask: no targets apply to host platform {host}");
         return Ok(());
     }
 
     let order = plan.order_for(&roots, host)?;
     execute(&plan, &order, &repo_root)
+}
+
+pub fn run_list() -> Result<()> {
+    let (manifest, _repo_root) = load_manifest()?;
+    let host = Platform::host();
+    print!("{}", render_list(&manifest, host));
+    Ok(())
 }
 
 fn load_manifest() -> Result<(Manifest, PathBuf)> {

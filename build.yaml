@@ -1,4 +1,4 @@
-# Hole build manifest — single source of truth for `cargo xtask build|test|list`.
+# Hole build manifest — single source of truth for `cargo xtask build|list`.
 #
 # Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
 # and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
@@ -13,23 +13,22 @@
 # `process: [...]` for direct subprocess spawn (no shell). Per-step
 # `environment:` appends to inherited env. CWD is repo root.
 #
-# `$XTASK` env var (set by the orchestrator before each step) is the path to
-# the running xtask binary. Use it instead of `cargo xtask <subcommand>` —
-# `cargo run` would re-link xtask.exe, and the running parent holds an
-# exclusive lock on Windows (ERROR_ACCESS_DENIED). Direct invocation skips
-# the rebuild check.
+# `*-tests` targets are regular build targets that produce test binaries —
+# they do NOT run tests. Running tests is the caller's concern (typically
+# `cargo nextest run`), the same way running `hole.exe` is not part of
+# building it.
 
 targets:
   v2ray-plugin:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: '"$XTASK" v2ray-plugin'
+    build: cargo xtask v2ray-plugin
 
   galoshes:
     depends: v2ray-plugin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: '"$XTASK" galoshes'
+    build: cargo xtask galoshes
 
   garter:
     platforms:
@@ -53,23 +52,18 @@ targets:
     # silently install the wrong-arch DLL. Lift this once xtask::wintun
     # picks per-host-arch.
     platforms: [windows/amd64]
-    build: '"$XTASK" wintun'
+    build: cargo xtask wintun
 
   hole:
     # Builds the hole executable + sidecars in debug profile and stages the
     # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
     # via msi-installer / tauri, which run their own `cargo build --release`
     # — so `hole` itself is what you build for development and tests.
-    #
-    # `--exclude xtask`: the orchestrator IS xtask, running from
-    # target/debug/xtask.exe. A `--workspace` build that re-links xtask hits
-    # ERROR_ACCESS_DENIED on Windows (the parent holds an exclusive lock).
-    # Skipping xtask is correct anyway: it's already built (we're running it).
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - cargo build --workspace --exclude xtask
-      - '"$XTASK" stage --profile debug --out-dir target/debug/dist'
+      - cargo build --workspace
+      - cargo xtask stage --profile debug --out-dir target/debug/dist
 
   hole-msi:
     # NOT a dependent of `hole`. The msi-installer Python entry point does its
@@ -89,61 +83,40 @@ targets:
     build: npx tauri build
 
   # ===== Test targets =======================================================
-  # Convention: name ends in `-tests`. Depends on the corresponding build
-  # target. Targeted by `cargo xtask test <name>` and `cargo xtask test --all`.
+  # Convention: name ends in `-tests`. Compile test binaries only — the
+  # orchestrator never runs them. CI / dev invokes `cargo nextest run` (with
+  # whatever runtime filters / SKULD_LABELS env it wants) after building.
 
   hole-tests:
-    # Non-TUN pass — applies to every platform on which Hole builds.
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
-    build:
-      bash:
-        command: >
-          cargo nextest run
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
-              + package(tun-engine) + package(tun-engine-macros)
-              + package(dump) + package(dump-macros)
-              + package(handle-holders)'
-        environment: { SKULD_LABELS: "!tun" }
-
-  hole-tun-tests:
-    # TUN pass — Windows-only. Split out from `hole-tests` because of #200:
-    # the TUN test creates and destroys a `hole-tun` wintun adapter, which
-    # perturbs Azure Hyper-V's NDIS loopback packet-delivery path. Running it
-    # last (and only on Windows, where TUN tests exist) preserves the v1 rule
-    # of no per-step platform filters.
-    depends: hole
-    platforms: [windows/amd64]
-    build:
-      bash:
-        command: >
-          cargo nextest run
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
-              + package(tun-engine) + package(tun-engine-macros)
-              + package(dump) + package(dump-macros)
-              + package(handle-holders)'
-        environment: { SKULD_LABELS: "tun" }
+    build: >
+      cargo nextest run --no-run
+      -E 'package(hole) + package(hole-bridge) + package(hole-common)
+          + package(tun-engine) + package(tun-engine-macros)
+          + package(dump) + package(dump-macros)
+          + package(handle-holders)'
 
   galoshes-tests:
     depends: galoshes
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run -p galoshes
+    build: cargo nextest run --no-run -p galoshes
 
   garter-tests:
     depends: garter
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run -p garter
+    build: cargo nextest run --no-run -p garter
 
   garter-bin-tests:
     depends: garter-bin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run -p garter-bin
+    build: cargo nextest run --no-run -p garter-bin
 
   mock-plugin-tests:
     depends: mock-plugin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run -p mock-plugin
+    build: cargo nextest run --no-run -p mock-plugin

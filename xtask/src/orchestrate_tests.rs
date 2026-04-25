@@ -191,26 +191,20 @@ targets:
 }
 
 #[skuld::test]
-fn verb_partition_splits_on_tests_suffix() {
+fn target_names_returns_declaration_order() {
     let m = manifest(
         r"
 targets:
-  hole:
+  zulu:
     platforms: windows/amd64
-  hole-tests:
+  alpha:
     platforms: windows/amd64
-  galoshes:
-    platforms: windows/amd64
-  galoshes-tests:
+  mike:
     platforms: windows/amd64
 ",
     );
     let plan = Plan::new(&m).unwrap();
-
-    let build_targets = plan.targets_for_verb(Verb::Build);
-    assert_eq!(build_targets, vec!["hole", "galoshes"]);
-    let test_targets = plan.targets_for_verb(Verb::Test);
-    assert_eq!(test_targets, vec!["hole-tests", "galoshes-tests"]);
+    assert_eq!(plan.target_names(), vec!["zulu", "alpha", "mike"]);
 }
 
 #[skuld::test]
@@ -300,20 +294,6 @@ fn run_step_bash_environment_overrides_inherited() {
     let step = Step::Bash {
         command: r#"[ "$HOLE_TEST_VAR" = "set-from-step" ]"#.to_string(),
         environment: env,
-    };
-    run_step(&step, dir.path()).unwrap();
-}
-
-#[skuld::test]
-fn run_step_bash_xtask_env_var_is_set() {
-    // `$XTASK` must be exported to bash steps so the manifest can invoke
-    // the running xtask binary directly (instead of `cargo xtask <X>`,
-    // which on Windows triggers a rebuild that fails because the parent
-    // holds an exclusive lock on the binary).
-    let dir = tempfile::tempdir().unwrap();
-    let step = Step::Bash {
-        command: r#"[ -n "$XTASK" ] && [ -f "$XTASK" ]"#.to_string(),
-        environment: Default::default(),
     };
     run_step(&step, dir.path()).unwrap();
 }

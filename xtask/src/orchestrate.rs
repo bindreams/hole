@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -113,14 +114,10 @@ impl<'m> Plan<'m> {
             .ok_or_else(|| anyhow!("unknown target: {name:?}"))
     }
 
-    /// Return target names matching a verb filter, in declaration order.
-    /// `verb` is `Verb::Build` (non-test targets) or `Verb::Test` (test targets).
-    pub fn targets_for_verb(&self, verb: Verb) -> Vec<&str> {
-        self.manifest
-            .iter()
-            .filter(|t| verb.matches(t.is_test()))
-            .map(|t| t.name.as_str())
-            .collect()
+    /// Return all target names declared in the manifest, in declaration order.
+    /// Used by `cargo xtask build --all`.
+    pub fn target_names(&self) -> Vec<&str> {
+        self.manifest.iter().map(|t| t.name.as_str()).collect()
     }
 
     /// Compute the topologically-sorted set of targets reachable from `roots`
@@ -184,23 +181,96 @@ fn join_platforms(plats: &[Platform]) -> String {
     plats.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
 }
 
-// ===== Verbs =========================================================================================================
+// ===== Self-relocate (Windows) =======================================================================================
 
-/// Which subset of targets a `--all` invocation operates on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Verb {
-    /// Non-test targets (`build`).
-    Build,
-    /// Test targets (`test`, name ends with `-tests`).
-    Test,
+/// Stash directory under the cargo target directory where relocated copies of
+/// the running xtask binary live. We pick a sibling of the running exe so the
+/// path is local to whatever target tree we were launched from, and so cargo
+/// clean wipes us along with everything else.
+const STASH_SUBDIR: &str = ".tmp-running";
+
+/// On Windows, rename the running xtask binary out of the way so that
+/// recursive `cargo xtask <X>` invocations triggered by manifest steps don't
+/// fail with ERROR_ACCESS_DENIED when cargo tries to overwrite the running
+/// `target/<profile>/xtask.exe`.
+///
+/// **The mechanism:** Windows allows renaming a running `.exe` (modern loader
+/// opens images with `FILE_SHARE_DELETE`). The running process keeps mapping
+/// the file content (FCB) via its existing handle; only the directory entry
+/// moves. Once the old dirent is gone, cargo's "delete-then-create" rebuild
+/// path succeeds — it sees no file to delete and freshly hardlinks
+/// `deps/xtask-<hash>.exe` into place.
+///
+/// On non-Windows platforms this is a no-op: POSIX permits replacing running
+/// binaries through ordinary unlink+create, so the lock issue doesn't exist.
+///
+/// Best-effort: failures here propagate as errors so the caller can decide,
+/// but we tolerate "another xtask process beat me to it" (NotFound on rename).
+pub fn relocate_self_if_windows() -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        relocate_self_windows()
+    }
 }
 
-impl Verb {
-    pub fn matches(self, is_test: bool) -> bool {
-        match self {
-            Verb::Build => !is_test,
-            Verb::Test => is_test,
+#[cfg(windows)]
+fn relocate_self_windows() -> Result<()> {
+    let current = std::env::current_exe().context("locating current xtask binary")?;
+    let parent = current
+        .parent()
+        .ok_or_else(|| anyhow!("running xtask {current:?} has no parent directory"))?;
+    let stash = parent.join(STASH_SUBDIR);
+    std::fs::create_dir_all(&stash).with_context(|| format!("creating stash dir {}", stash.display()))?;
+
+    // Prune older relocated copies whose owning process has exited (so the
+    // file is no longer mapped). On Windows, `remove_file` on a still-mapped
+    // image fails with ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION; success
+    // means the file was unlocked and is now gone. Best-effort: log + ignore
+    // anything we can't classify.
+    if let Ok(read) = std::fs::read_dir(&stash) {
+        for entry in read.flatten() {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if matches!(e.kind(), io::ErrorKind::PermissionDenied) => {
+                    // Locked: another xtask is still running with this binary mapped.
+                }
+                Err(e) => {
+                    eprintln!("xtask: warning: could not prune {}: {e}", entry.path().display());
+                }
+            }
         }
+    }
+
+    // Pick a unique stash name. PID + nanos is collision-free in practice
+    // and easy to read in a directory listing.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = current.file_stem().and_then(|s| s.to_str()).unwrap_or("xtask");
+    let ext = current.extension().and_then(|s| s.to_str()).unwrap_or("exe");
+    let new_path = stash.join(format!("{stem}-{pid}-{nanos}.{ext}"));
+
+    match std::fs::rename(&current, &new_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Another xtask process renamed it before us. Our process keeps
+            // mapping the file content via its open handle; only the dirent
+            // we expected to find is missing. Continue.
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "relocating running xtask {} -> {}",
+                current.display(),
+                new_path.display()
+            )
+        }),
     }
 }
 
@@ -212,20 +282,12 @@ impl Verb {
 /// returns `Err` with a message naming the step and exit code; the caller
 /// (the build driver) propagates that via fail-fast.
 pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
-    // Expose the current xtask binary's path so manifest steps can invoke
-    // xtask subcommands without going through `cargo xtask` (which is a
-    // `cargo run` alias). On Windows, `cargo run` would re-link xtask.exe,
-    // and the running parent process holds an exclusive lock on it →
-    // ERROR_ACCESS_DENIED. Direct binary invocation skips the rebuild check.
-    let xtask_exe = std::env::current_exe().context("locating current xtask binary")?;
-
     match step {
         Step::Bash { command, environment } => {
             let mut cmd = Command::new(resolve_bash()?);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
             cmd.arg("-e").arg("-c").arg(command).current_dir(repo_root);
-            cmd.env("XTASK", &xtask_exe);
             for (k, v) in environment {
                 cmd.env(k, v);
             }
@@ -237,7 +299,6 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
                 .ok_or_else(|| anyhow!("process step has empty args list"))?;
             let mut cmd = Command::new(program);
             cmd.args(rest).current_dir(repo_root);
-            cmd.env("XTASK", &xtask_exe);
             for (k, v) in environment {
                 cmd.env(k, v);
             }

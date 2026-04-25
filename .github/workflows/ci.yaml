@@ -222,21 +222,40 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      # `hole-tests` declares depends: hole, so the orchestrator runs the
-      # full chain (v2ray-plugin → galoshes → wintun → cargo build) before
-      # nextest. The non-TUN / TUN split is encoded in build.yaml as two
-      # targets — see #200 for the NDIS-loopback corruption that motivated
-      # running TUN tests last.
+      # Compile test binaries via the orchestrator (resolves the full DAG:
+      # v2ray-plugin → galoshes → wintun → hole → hole-tests) but don't run
+      # them yet — running tests is not part of the build process. The two
+      # nextest invocations below execute the pre-built binaries with
+      # different SKULD_LABELS filters; see #200 for the NDIS-loopback
+      # corruption that motivates running TUN tests last (Windows only).
+      - name: Build hole test binaries
+        shell: bash
+        run: cargo xtask build hole-tests
+
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
-        run: cargo xtask test hole-tests
+        env:
+          SKULD_LABELS: "!tun"
+        run: >
+          cargo nextest run
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
 
       - name: Test (TUN, runs last for #200)
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
         shell: bash
-        run: cargo xtask test hole-tun-tests
+        env:
+          SKULD_LABELS: "tun"
+        run: >
+          cargo nextest run
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
