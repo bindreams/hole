@@ -5,11 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::manifest::{Manifest, Platform};
+use crate::orchestrate::{execute, render_list, Plan, Verb};
 
 pub mod bindir;
 pub mod galoshes;
+pub mod manifest;
+pub mod orchestrate;
 pub mod stage;
 pub mod test_binaries;
 pub mod v2ray_plugin;
@@ -18,6 +23,12 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "manifest_tests.rs"]
+mod manifest_tests;
+#[cfg(test)]
+#[path = "orchestrate_tests.rs"]
+mod orchestrate_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
@@ -95,6 +106,36 @@ pub enum Command {
         #[arg(long, requires = "check")]
         exact: bool,
     },
+    /// Build a target declared in `build.yaml` (and its transitive deps).
+    ///
+    /// `cargo xtask build <name>` resolves the dependency DAG, filters to
+    /// targets applicable to the host platform, and runs each target's
+    /// `build:` steps in topological order. `--all` selects every non-test
+    /// target applicable to the host.
+    Build {
+        /// Target name (e.g. `hole`, `galoshes`, `hole-msi`).
+        target: Option<String>,
+        /// Build every non-test target applicable to the host platform.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+    },
+    /// Run a test target declared in `build.yaml` (and build its deps first).
+    ///
+    /// Test targets are first-class entries with names ending in `-tests`
+    /// (`hole-tests`, `galoshes-tests`, etc.). `cargo xtask test <name>`
+    /// builds the dep tree (which includes the corresponding `*` build target)
+    /// and then runs the test target's steps. `--all` selects every test
+    /// target applicable to the host.
+    Test {
+        /// Test target name (e.g. `hole-tests`).
+        target: Option<String>,
+        /// Run every test target applicable to the host platform.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+    },
+    /// List every target declared in `build.yaml` with its platforms and
+    /// host-platform applicability.
+    List,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -140,6 +181,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Wintun => run_wintun(),
         Command::Deps => run_deps(),
         Command::Version { check, exact } => run_version(check, exact),
+        Command::Build { target, all } => run_build(target, all),
+        Command::Test { target, all } => run_test(target, all),
+        Command::List => run_list(),
     }
 }
 
@@ -179,6 +223,83 @@ pub fn run_deps() -> Result<()> {
     run_galoshes()?;
     run_wintun()?;
     Ok(())
+}
+
+pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
+    run_orchestrated(Verb::Build, target, all)
+}
+
+pub fn run_test(target: Option<String>, all: bool) -> Result<()> {
+    run_orchestrated(Verb::Test, target, all)
+}
+
+pub fn run_list() -> Result<()> {
+    let (manifest, _repo_root) = load_manifest()?;
+    let host = Platform::host();
+    print!("{}", render_list(&manifest, host));
+    Ok(())
+}
+
+fn run_orchestrated(verb: Verb, target: Option<String>, all: bool) -> Result<()> {
+    let (manifest, repo_root) = load_manifest()?;
+    let host = Platform::host().ok_or_else(|| {
+        anyhow!(
+            "host platform not in the known set (windows/darwin/linux × amd64/arm64); \
+             cannot orchestrate"
+        )
+    })?;
+    let plan = Plan::new(&manifest)?;
+
+    let roots: Vec<&str> = match (target, all) {
+        (Some(name), false) => {
+            let target = manifest.get(&name).ok_or_else(|| anyhow!("unknown target: {name:?}"))?;
+            // Verb mismatch: explicitly reject `build hole-tests` /
+            // `test hole`. Either is a category error.
+            match (verb, target.is_test()) {
+                (Verb::Build, true) => {
+                    return Err(anyhow!("{name:?} is a test target — use `cargo xtask test {name}`"));
+                }
+                (Verb::Test, false) => {
+                    return Err(anyhow!(
+                        "{name:?} is not a test target — use `cargo xtask build {name}`"
+                    ));
+                }
+                _ => {}
+            }
+            vec![target.name.as_str()]
+        }
+        (None, true) => plan
+            .targets_for_verb(verb)
+            .into_iter()
+            .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
+            .collect(),
+        (Some(_), true) => unreachable!("clap rejects --all with a positional target"),
+        (None, false) => {
+            return Err(anyhow!("specify a target name or pass --all"));
+        }
+    };
+
+    if roots.is_empty() {
+        println!(
+            "xtask: no {} targets apply to host platform {host}",
+            match verb {
+                Verb::Build => "build",
+                Verb::Test => "test",
+            }
+        );
+        return Ok(());
+    }
+
+    let order = plan.order_for(&roots, host)?;
+    execute(&plan, &order, &repo_root)
+}
+
+fn load_manifest() -> Result<(Manifest, PathBuf)> {
+    let repo_root = repo_root()?;
+    let path = repo_root.join("build.yaml");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading manifest at {}", path.display()))?;
+    let manifest = Manifest::parse(&text).with_context(|| format!("parsing manifest at {}", path.display()))?;
+    Ok((manifest, repo_root))
 }
 
 pub fn run_version(check: bool, exact: bool) -> Result<()> {

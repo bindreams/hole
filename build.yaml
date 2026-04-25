@@ -1,0 +1,134 @@
+# Hole build manifest — single source of truth for `cargo xtask build|test|list`.
+#
+# Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
+# and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
+# under "Build". Design rationale: docs ../i-want-to-brainstorm-zippy-lightning.md.
+#
+# Platform shape: `<os>/<arch>` (Docker / GOOS-style), where
+#   os   ∈ {windows, darwin, linux}
+#   arch ∈ {amd64, arm64}
+# (matching the project's release-artifact naming convention).
+#
+# Steps default to bash. Bare strings are shorthand for `bash: <string>`. Use
+# `process: [...]` for direct subprocess spawn (no shell). Per-step
+# `environment:` appends to inherited env. CWD is repo root.
+
+targets:
+  v2ray-plugin:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo xtask v2ray-plugin
+
+  galoshes:
+    depends: v2ray-plugin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo xtask galoshes
+
+  garter:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p garter
+
+  garter-bin:
+    depends: garter
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p garter-bin
+
+  mock-plugin:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p mock-plugin
+
+  wintun:
+    platforms: [windows/amd64, windows/arm64]
+    build: cargo xtask wintun
+
+  hole:
+    # Builds the hole executable + sidecars in debug profile and stages the
+    # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
+    # via msi-installer / tauri, which run their own `cargo build --release`
+    # — so `hole` itself is what you build for development and tests.
+    depends: [galoshes, wintun]
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    build:
+      - cargo build --workspace
+      - cargo xtask stage --profile debug --out-dir target/debug/dist
+
+  hole-msi:
+    depends: hole
+    platforms: [windows/amd64]
+    # The msi-installer Python entry point internally re-runs `cargo build
+    # --release` and `cargo xtask stage --profile release`; the WiX toolchain
+    # acquisition stays inside msi-installer. The `cargo build` is shared via
+    # cargo's fingerprint cache when invoked twice (debug from `hole`, release
+    # from msi-installer).
+    build: uv run --directory msi-installer build
+
+  hole-dmg:
+    depends: hole
+    platforms: [darwin/amd64, darwin/arm64]
+    # Tauri internally runs `cargo build --release`; cargo incremental shares
+    # dependency artifacts with the debug build done by `hole`.
+    build: npx tauri build
+
+  # ===== Test targets =======================================================
+  # Convention: name ends in `-tests`. Depends on the corresponding build
+  # target. Targeted by `cargo xtask test <name>` and `cargo xtask test --all`.
+
+  hole-tests:
+    # Non-TUN pass — applies to every platform on which Hole builds.
+    depends: hole
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    build:
+      bash:
+        command: >
+          cargo nextest run
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
+        environment: { SKULD_LABELS: "!tun" }
+
+  hole-tun-tests:
+    # TUN pass — Windows-only. Split out from `hole-tests` because of #200:
+    # the TUN test creates and destroys a `hole-tun` wintun adapter, which
+    # perturbs Azure Hyper-V's NDIS loopback packet-delivery path. Running it
+    # last (and only on Windows, where TUN tests exist) preserves the v1 rule
+    # of no per-step platform filters.
+    depends: hole
+    platforms: [windows/amd64]
+    build:
+      bash:
+        command: >
+          cargo nextest run
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
+        environment: { SKULD_LABELS: "tun" }
+
+  galoshes-tests:
+    depends: galoshes
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run -p galoshes
+
+  garter-tests:
+    depends: garter
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run -p garter
+
+  garter-bin-tests:
+    depends: garter-bin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run -p garter-bin
+
+  mock-plugin-tests:
+    depends: mock-plugin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run -p mock-plugin

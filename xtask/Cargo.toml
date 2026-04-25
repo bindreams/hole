@@ -30,6 +30,12 @@ sha2 = "0.11"
 ureq = "3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
+# `cargo xtask build|test|list` (build.yaml manifest + DAG orchestration).
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
+indexmap = { version = "2", features = ["serde"] }
+petgraph = "0.8"
+
 [dev-dependencies]
 skuld = { workspace = true }
 tempfile = "3"

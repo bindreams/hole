@@ -64,12 +64,9 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      # Windows build
-      - name: Build MSI
-        if: matrix.os == 'windows'
-        run: uv run --directory msi-installer build
-
-      # macOS build
+      # Frontend deps + Node toolchain — needed by the macOS DMG path
+      # (`npx tauri build`). Cheap on Windows runners; unconditional to
+      # keep the workflow flat.
       - uses: actions/setup-node@v6
         if: matrix.os == 'darwin'
         with:
@@ -77,9 +74,14 @@ jobs:
       - name: Install npm dependencies
         if: matrix.os == 'darwin'
         run: npm install
-      - name: Build DMG
-        if: matrix.os == 'darwin'
-        run: npx tauri build
+
+      # Single matrix-driven build call: `hole-msi` on Windows, `hole-dmg`
+      # on Darwin. The orchestrator (build.yaml) owns the per-platform
+      # recipe — this step has no per-os `if:` because the target name
+      # carries the platform information.
+      - name: Build artifact
+        shell: bash
+        run: cargo xtask build "hole-${{ matrix.ext }}"
 
       # Rename and hash
       - name: Rename artifact and compute SHA-256

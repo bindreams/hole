@@ -219,7 +219,16 @@ crates/galoshes/          → bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP 
                             time). Apache-2.0. Shipped alongside hole.exe.
 crates/mock-plugin/       → minimal SIP003u TCP echo plugin for garter integration
                             tests. Apache-2.0.
-xtask/                    → workspace task runner (`cargo xtask <stage|deps|version|...>`)
+build.yaml                → declarative build-target manifest (the DAG of `hole`,
+                            `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, etc.)
+                            consumed by `cargo xtask build|test|list`. Schema in
+                            xtask/src/manifest.rs; orchestration in xtask/src/orchestrate.rs.
+xtask/                    → workspace task runner. Top-level commands:
+                            - `cargo xtask build <name> | --all`  — orchestrate from build.yaml
+                            - `cargo xtask test  <name> | --all`  — same, for `*-tests` targets
+                            - `cargo xtask list`                  — print the target table
+                            Primitive subcommands stay available for one-off use:
+                            `cargo xtask <stage|deps|v2ray-plugin|galoshes|wintun|version|...>`
 xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
 external/                 → Third-party source (git subrepos): `v2ray-plugin` (Go).
 msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
@@ -278,11 +287,13 @@ Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 
 ```sh
 npm install                      # install frontend dependencies (first time only)
-cargo xtask deps                 # build v2ray-plugin from Go + download wintun (one-time, cached)
-cargo build --workspace          # all crates
+cargo xtask build hole           # deps + cargo build (debug) + stage — single command
 uv run scripts/dev.py            # dev mode (see CONTRIBUTING.md)
-cargo test --workspace           # all tests
+cargo xtask test --all           # all test targets applicable to host platform
 ```
+
+`build.yaml` at the repo root is the single source of truth for the build
+graph. `cargo xtask list` prints the full target table.
 
 ### Windows installer
 

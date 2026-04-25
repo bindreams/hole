@@ -222,40 +222,21 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      - name: Build workspace
-        run: cargo build --workspace
-
-      # Two-pass split to work around #200: the Windows TUN test
-      # (`e2e_none_full_tunnel_roundtrip`) creates and destroys a
-      # `hole-tun` wintun adapter, which perturbs the Azure Hyper-V
-      # host's NDIS loopback packet-delivery path — once broken, it
-      # stays broken for ≥120 s. So we run non-TUN tests first and
-      # the TUN test last, so the break (if it fires) only affects
-      # the tail of the job and not a subsequent loopback-using test.
+      # `hole-tests` declares depends: hole, so the orchestrator runs the
+      # full chain (v2ray-plugin → galoshes → wintun → cargo build) before
+      # nextest. The non-TUN / TUN split is encoded in build.yaml as two
+      # targets — see #200 for the NDIS-loopback corruption that motivated
+      # running TUN tests last.
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
-        env:
-          SKULD_LABELS: "!tun"
-        run: >
-          cargo nextest run
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
-              + package(tun-engine) + package(tun-engine-macros)
-              + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+        run: cargo xtask test hole-tests
 
       - name: Test (TUN, runs last for #200)
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
         shell: bash
-        env:
-          SKULD_LABELS: "tun"
-        run: >
-          cargo nextest run
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
-              + package(tun-engine) + package(tun-engine-macros)
-              + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+        run: cargo xtask test hole-tun-tests
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
@@ -287,7 +268,7 @@ jobs:
         run: uv run --group dev pytest -v
 
       - name: Build MSI
-        run: uv run --directory msi-installer build
+        run: cargo xtask build hole-msi
 
       - name: Smoke-test binary
         run: target\release\hole.exe version

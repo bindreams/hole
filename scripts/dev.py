@@ -108,25 +108,19 @@ def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None)
 
 
 def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
-    """Build the workspace and run xtask deps (wintun + v2ray-plugin).
+    """Build the `hole` target via the orchestrator.
 
-    Both run as the invoking user so `target/` and `.cache/` are not owned
-    by root on macOS-under-sudo.
+    `cargo xtask build hole` walks the build.yaml DAG: v2ray-plugin → galoshes
+    + wintun → cargo build (debug) → stage. Replaces the prior `cargo xtask
+    deps` + `cargo build` sequence with a single declarative invocation. The
+    per-pid stage that follows in main() is dev.py-specific and stays separate.
+
+    Runs as the invoking user so `target/` and `.cache/` are not owned by root
+    on macOS-under-sudo.
     """
-    print(f"{BOLD}Fetching runtime deps (cargo xtask deps)...{RESET}")
+    print(f"{BOLD}Building hole (cargo xtask build hole)...{RESET}")
     result = subprocess.run(
-        [cargo, "xtask", "deps"],
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-        env=drop_env({**os.environ}, target_user),
-        **drop_kwargs(target_user),
-    )
-    if result.returncode != 0:
-        sys.exit(result.returncode)
-
-    print(f"{BOLD}Building workspace...{RESET}")
-    result = subprocess.run(
-        [cargo, "build"],
+        [cargo, "xtask", "build", "hole"],
         stdout=sys.stdout,
         stderr=sys.stderr,
         env=drop_env({**os.environ}, target_user),
