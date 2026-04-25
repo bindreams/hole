@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(windows)]
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
@@ -187,6 +188,7 @@ fn join_platforms(plats: &[Platform]) -> String {
 /// the running xtask binary live. We pick a sibling of the running exe so the
 /// path is local to whatever target tree we were launched from, and so cargo
 /// clean wipes us along with everything else.
+#[cfg(windows)]
 const STASH_SUBDIR: &str = ".tmp-running";
 
 /// On Windows, rename the running xtask binary out of the way so that
