@@ -140,6 +140,24 @@ inherit user shell env, so the gate is meant for `scripts/dev.py` and
 hand-run `hole bridge run`. Cost: an extra loopback round-trip per
 byte, fine for a debugging session, inappropriate as default.
 
+### Plugin debug logging (always-on)
+
+`crates/bridge/src/proxy/plugin.rs::inject_plugin_debug_logging` always
+appends a debug-level log directive to the plugin's `SS_PLUGIN_OPTIONS`
+when the plugin's syntax is known:
+
+- `v2ray-plugin` → appends `;loglevel=debug`. v2ray-plugin honors the
+  last occurrence of any duplicate key, so this overrides a user's
+  earlier `loglevel=warning`.
+
+The cost is paid in `bridge.log` volume; the bridge captures plugin
+stderr via `garter::binary` and routes it through the tracing
+subscriber, so users still filter normally via `HOLE_BRIDGE_LOG`. The
+diagnostic value (catching plugin-side handshake / dial / WebSocket
+failures) is high — plugin-process invisibility was the recurring
+blocker on #248-class tunnel issues. Future binary plugins can extend
+the match arm in `inject_plugin_debug_logging`.
+
 ### CLI
 
 ```
