@@ -17,15 +17,15 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ### Workspace layout
 
-| Directory        | Crate/Purpose                                                       |
-| ---------------- | ------------------------------------------------------------------- |
-| `crates/common/` | `hole-common` — shared types: protocol, config, logging             |
-| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)        |
-| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`) |
-| `xtask/`         | workspace task runner (`cargo xtask <stage\|deps\|version\|...>`)   |
-| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`        |
-| `external/`      | Third-party source (git subrepos)                                   |
-| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                 |
+| Directory        | Crate/Purpose                                                                            |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                  |
+| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                             |
+| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                      |
+| `xtask/`         | workspace task runner (`cargo xtask <build\|test\|list\|stage\|...>`) — see `build.yaml` |
+| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                             |
+| `external/`      | Third-party source (git subrepos)                                                        |
+| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                      |
 
 ### Logging
 
@@ -96,9 +96,8 @@ If you prefer separate terminals or need more control:
 Windows (elevated PowerShell):
 
 ```powershell
-cargo xtask deps                                                          # build v2ray-plugin + download wintun
-cargo build
-cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"   # populates BINDIR (hole.exe + sidecars + wintun.dll)
+cargo xtask build hole                                                    # deps + cargo build (debug) + stage to target/debug/dist
+cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"   # per-session BINDIR (hole.exe + sidecars + wintun.dll)
 & "$env:TEMP\hole-dev-manual\hole.exe" bridge grant-access                # create hole group, add user
 & "$env:TEMP\hole-dev-manual\hole.exe" bridge run `
     --socket-path "$env:TEMP\hole-dev.sock" `
@@ -108,14 +107,19 @@ cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"   # popu
 macOS (under sudo):
 
 ```sh
-cargo xtask deps                                                          # build v2ray-plugin
-cargo build
-cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # populates BINDIR (hole + sidecars)
+cargo xtask build hole                                                    # deps + cargo build (debug) + stage to target/debug/dist
+cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # per-session BINDIR (hole + sidecars)
 "$TMPDIR/hole-dev-manual/hole" bridge grant-access                        # create hole group, add user
 "$TMPDIR/hole-dev-manual/hole" bridge run \
     --socket-path "$TMPDIR/hole-dev.sock" \
     --state-dir   "$TMPDIR/hole-dev-state"
 ```
+
+`cargo xtask build hole` walks the `build.yaml` DAG: it builds v2ray-plugin
+(Go), galoshes (workspace member), downloads wintun on Windows, then runs
+`cargo build --workspace` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
+table; `cargo xtask build|test --all` builds or runs every target applicable
+to the host platform.
 
 **Terminal 2 — Vite + GUI (unelevated):**
 

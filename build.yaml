@@ -1,0 +1,122 @@
+# Hole build manifest — single source of truth for `cargo xtask build|list`.
+#
+# Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
+# and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
+# under "Build". Design rationale: docs ../i-want-to-brainstorm-zippy-lightning.md.
+#
+# Platform shape: `<os>/<arch>` (Docker / GOOS-style), where
+#   os   ∈ {windows, darwin, linux}
+#   arch ∈ {amd64, arm64}
+# (matching the project's release-artifact naming convention).
+#
+# Steps default to bash. Bare strings are shorthand for `bash: <string>`. Use
+# `process: [...]` for direct subprocess spawn (no shell). Per-step
+# `environment:` appends to inherited env. CWD is repo root.
+#
+# `*-tests` targets are regular build targets that produce test binaries —
+# they do NOT run tests. Running tests is the caller's concern (typically
+# `cargo nextest run`), the same way running `hole.exe` is not part of
+# building it.
+
+targets:
+  v2ray-plugin:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo xtask v2ray-plugin
+
+  galoshes:
+    depends: v2ray-plugin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo xtask galoshes
+
+  garter:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p garter
+
+  garter-bin:
+    depends: garter
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p garter-bin
+
+  mock-plugin:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo build --release -p mock-plugin
+
+  wintun:
+    # Restricted to windows/amd64 because xtask::wintun unconditionally
+    # extracts the amd64 DLL from the upstream zip — windows/arm64 would
+    # silently install the wrong-arch DLL. Lift this once xtask::wintun
+    # picks per-host-arch.
+    platforms: [windows/amd64]
+    build: cargo xtask wintun
+
+  hole:
+    # Builds the hole executable + sidecars in debug profile and stages the
+    # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
+    # via msi-installer / tauri, which run their own `cargo build --release`
+    # — so `hole` itself is what you build for development and tests.
+    depends: [galoshes, wintun]
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    build:
+      - cargo build --workspace
+      - cargo xtask stage --profile debug --out-dir target/debug/dist
+
+  hole-msi:
+    # NOT a dependent of `hole`. The msi-installer Python entry point does its
+    # own `cargo build --release` + `cargo xtask stage --profile release`, so
+    # depending on `hole` (debug) would force a redundant debug compile that
+    # nothing consumes. We depend instead on the same sidecars `hole` does, so
+    # the MSI build still has v2ray-plugin, galoshes, and wintun.dll on disk.
+    depends: [galoshes, wintun]
+    platforms: [windows/amd64]
+    build: uv run --directory msi-installer build
+
+  hole-dmg:
+    # Same logic as hole-msi: tauri does its own `cargo build --release`. No
+    # wintun dep on darwin (it doesn't apply to that platform).
+    depends: galoshes
+    platforms: [darwin/amd64, darwin/arm64]
+    build: npx tauri build
+
+  # ===== Test targets =======================================================
+  # Convention: name ends in `-tests`. Compile test binaries only — the
+  # orchestrator never runs them. CI / dev invokes `cargo nextest run` (with
+  # whatever runtime filters / SKULD_LABELS env it wants) after building.
+
+  hole-tests:
+    depends: hole
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    build: >
+      cargo nextest run --no-run
+      -E 'package(hole) + package(hole-bridge) + package(hole-common)
+          + package(tun-engine) + package(tun-engine-macros)
+          + package(dump) + package(dump-macros)
+          + package(handle-holders)'
+
+  galoshes-tests:
+    depends: galoshes
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p galoshes
+
+  garter-tests:
+    depends: garter
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p garter
+
+  garter-bin-tests:
+    depends: garter-bin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p garter-bin
+
+  mock-plugin-tests:
+    depends: mock-plugin
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p mock-plugin
