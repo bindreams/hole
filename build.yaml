@@ -60,10 +60,15 @@ targets:
     # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
     # via msi-installer / tauri, which run their own `cargo build --release`
     # — so `hole` itself is what you build for development and tests.
+    #
+    # `--exclude xtask`: the orchestrator IS xtask, running from
+    # target/debug/xtask.exe. A `--workspace` build that re-links xtask hits
+    # ERROR_ACCESS_DENIED on Windows (the parent holds an exclusive lock).
+    # Skipping xtask is correct anyway: it's already built (we're running it).
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - cargo build --workspace
+      - cargo build --workspace --exclude xtask
       - '"$XTASK" stage --profile debug --out-dir target/debug/dist'
 
   hole-msi:
