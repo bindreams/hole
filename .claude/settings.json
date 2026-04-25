@@ -4,6 +4,7 @@
       "Bash(uv run --group dev pytest *)",
       "Bash(uv run --directory msi-installer upgrade-wix *)",
       "Bash(cargo nextest run *)",
+      "Bash(cargo nextest archive *)",
       "Bash(cargo xtask deps *)",
       "Bash(cargo xtask stage *)",
       "Bash(gh workflow run ci.yaml)",

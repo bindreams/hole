@@ -1,12 +1,17 @@
 //! Live-API tests that need a real foreign process holding the target file.
 //!
 //! Integration-test target, not a unit test module, because
-//! `env!("CARGO_BIN_EXE_hold_file")` is only set for `tests/*.rs`.
+//! `CARGO_BIN_EXE_hold_file` is only set for `tests/*.rs`.
 //! The tiny `hold_file` bin (see `src/bin/hold_file.rs`) opens the
 //! path passed via the `HOLD_FILE` env var and sleeps, so we can
 //! observe it as a file holder without re-invoking a full test
 //! binary (which re-initializes skuld/tokio/tracing and tripped a
 //! Rust runtime abort in earlier attempts).
+//!
+//! Read `CARGO_BIN_EXE_hold_file` at runtime (via `env::var`) instead of
+//! compile-time (`env!`) so the test works when nextest runs the binary
+//! from a downloaded archive on a different machine — nextest extracts
+//! bin targets to a fresh temp dir and sets the env var to that path.
 
 use handle_holders::{find_holders, FileHolder};
 use std::io::Write;
@@ -19,7 +24,8 @@ fn main() {
 }
 
 fn spawn_holder(path: &Path) -> Child {
-    let exe = env!("CARGO_BIN_EXE_hold_file");
+    let exe = std::env::var("CARGO_BIN_EXE_hold_file")
+        .expect("CARGO_BIN_EXE_hold_file should be set by cargo test / nextest");
     Command::new(exe)
         .env("HOLD_FILE", path)
         .stdin(Stdio::null())
