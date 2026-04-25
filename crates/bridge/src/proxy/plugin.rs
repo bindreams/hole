@@ -97,7 +97,18 @@ pub async fn start_plugin_chain(
     server_port: u16,
     state_dir: Option<&Path>,
 ) -> Result<PluginChain, ProxyError> {
-    let mut plugin = garter::BinaryPlugin::new(plugin_path, plugin_opts);
+    // Inject a debug-level log directive into the plugin's
+    // SS_PLUGIN_OPTIONS unconditionally — Hole owns plugin stderr (it's
+    // captured into `bridge.log` by `garter::binary`) and filters it via
+    // `HOLE_BRIDGE_LOG`, so the cost of always-on debug logs is paid by
+    // log-volume, not user UX. The diagnostic value (catching
+    // plugin-side handshake / dial / WebSocket failures) is high.
+    //
+    // Per-plugin syntax differs; for plugins we don't have a known
+    // directive for, the options pass through unchanged.
+    let merged_opts = inject_plugin_debug_logging(plugin_name, plugin_opts);
+    let merged_opts_arg = merged_opts.as_deref();
+    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts_arg);
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();
@@ -134,7 +145,10 @@ pub async fn start_plugin_chain(
         local_port: local_addr.port(),
         remote_host: server_host.to_string(),
         remote_port: server_port,
-        plugin_options: plugin_opts.map(String::from),
+        // Use the merged options here too so any environment-source path
+        // for SS_PLUGIN_OPTIONS sees the same loglevel directive as the
+        // direct `cmd.env` set in `BinaryPlugin::run`.
+        plugin_options: merged_opts.clone(),
     };
 
     // #267: when `HOLE_BRIDGE_PLUGIN_TAP=1` is set, wrap the plugin in a
@@ -181,6 +195,99 @@ pub async fn start_plugin_chain(
         local_addr,
         state_dir: state_dir.map(Path::to_path_buf),
     })
+}
+
+/// Append a debug-level log directive to a plugin's `SS_PLUGIN_OPTIONS`
+/// when the directive shape is known for that plugin.
+///
+/// Hole captures plugin stderr via `garter::binary` and routes it through
+/// the bridge's tracing subscriber, so the cost of always-on plugin
+/// debug logs is paid in `bridge.log` volume rather than user-visible
+/// noise. The diagnostic value (catching plugin-side handshake / dial /
+/// WebSocket failures) is high — the lack of plugin diagnostics has
+/// been the recurring blocker on #248-class tunnel issues.
+///
+/// Per-plugin syntax differs:
+///
+/// - **`v2ray-plugin`**: appends `loglevel=debug` (semicolon-separated;
+///   v2ray-plugin honors the LAST occurrence of any duplicate key, so a
+///   user's earlier `loglevel=warning` still loses to our debug).
+/// - Anything else: pass through unchanged. (`galoshes` is a Rust
+///   `ChainPlugin` and not started via this binary path; future binary
+///   plugins can be added here.)
+fn inject_plugin_debug_logging(plugin_name: &str, opts: Option<&str>) -> Option<String> {
+    match plugin_name {
+        "v2ray-plugin" => Some(append_sip003_directive(opts, "loglevel=debug")),
+        _ => opts.map(String::from),
+    }
+}
+
+/// Append a `key=value` directive to a SIP003-style options string,
+/// inserting the `;` separator when needed. An empty / `None` input
+/// becomes just the directive.
+fn append_sip003_directive(opts: Option<&str>, directive: &str) -> String {
+    match opts {
+        None | Some("") => directive.to_string(),
+        Some(existing) => {
+            let trimmed = existing.trim_end_matches(';');
+            format!("{trimmed};{directive}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod inject_tests {
+    use super::*;
+
+    #[skuld::test]
+    fn v2ray_plugin_no_opts_gets_loglevel_debug() {
+        assert_eq!(
+            inject_plugin_debug_logging("v2ray-plugin", None).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn v2ray_plugin_existing_opts_get_loglevel_appended() {
+        assert_eq!(
+            inject_plugin_debug_logging("v2ray-plugin", Some("host=example.com;path=/foo")).as_deref(),
+            Some("host=example.com;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn v2ray_plugin_user_loglevel_warning_overridden_by_appended_debug() {
+        // v2ray-plugin honors the LAST occurrence; appended debug wins.
+        assert_eq!(
+            inject_plugin_debug_logging("v2ray-plugin", Some("loglevel=warning;path=/foo")).as_deref(),
+            Some("loglevel=warning;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn v2ray_plugin_trailing_semicolon_collapsed() {
+        assert_eq!(
+            inject_plugin_debug_logging("v2ray-plugin", Some("host=example.com;")).as_deref(),
+            Some("host=example.com;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn v2ray_plugin_empty_string_treated_as_no_opts() {
+        assert_eq!(
+            inject_plugin_debug_logging("v2ray-plugin", Some("")).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn unknown_plugin_passes_through_unchanged() {
+        assert_eq!(
+            inject_plugin_debug_logging("some-future-plugin", Some("k=v")).as_deref(),
+            Some("k=v")
+        );
+        assert_eq!(inject_plugin_debug_logging("some-future-plugin", None), None);
+    }
 }
 
 #[cfg(test)]
