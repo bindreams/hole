@@ -20,10 +20,17 @@ harness = false
 
 [dev-dependencies]
 skuld = { workspace = true }
+socket2 = "0.6"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[test]]
 name = "chain_integration"
 path = "tests/chain_integration.rs"
+harness = false
+
+[[test]]
+name = "tap_integration"
+path = "tests/tap_integration.rs"
 harness = false
 
 [target.'cfg(unix)'.dependencies]
@@ -38,5 +45,4 @@ windows = { version = "0.61", features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
-socket2 = "0.6"
 windows = { version = "0.61", features = ["Win32_Networking_WinSock"] }

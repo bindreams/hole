@@ -137,8 +137,25 @@ pub async fn start_plugin_chain(
         plugin_options: plugin_opts.map(String::from),
     };
 
+    // #267: when `HOLE_BRIDGE_PLUGIN_TAP=1` is set, wrap the plugin in a
+    // counting tap so per-connection byte flow becomes visible in
+    // `bridge.log` (`bytes_to_plugin`, `bytes_from_plugin`, `ttfb_ms`,
+    // `close_kind`). Dev-mode only — env vars do not survive into
+    // SCM/launchd service contexts. Off by default; the extra loopback
+    // hop is cheap on debug-mode reproduction but inappropriate at
+    // browser-traffic scale.
+    let plugin: Box<dyn garter::ChainPlugin> = if std::env::var_os("HOLE_BRIDGE_PLUGIN_TAP").is_some() {
+        tracing::info!(
+            plugin = plugin_name,
+            "HOLE_BRIDGE_PLUGIN_TAP=1: wrapping plugin in TapPlugin"
+        );
+        Box::new(garter::TapPlugin::wrap(Box::new(plugin)))
+    } else {
+        Box::new(plugin)
+    };
+
     let runner = garter::ChainRunner::new()
-        .add(Box::new(plugin))
+        .add(plugin)
         .cancel_token(cancel.clone())
         .on_ready(ready_tx);
 

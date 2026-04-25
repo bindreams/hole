@@ -113,6 +113,33 @@ TRACE line per TCP connection (≥100/sec under Chrome). Use for
 debugging sessions only; `bridge.log` rotates via
 `MAX_LOG_BYTES`/`MAX_ROTATED_LOGS` so the cap is bounded.
 
+### Plugin tap (HOLE_BRIDGE_PLUGIN_TAP)
+
+When the bridge's local SOCKS5 listener relays a connection to the
+plugin chain, the boundary in between is normally invisible — the
+plugin process (`v2ray-plugin`, `galoshes`) runs out-of-process and
+its network I/O is not captured by the bridge's ETW consumer. Setting
+`HOLE_BRIDGE_PLUGIN_TAP=1` interposes
+[`garter::TapPlugin`](crates/garter/src/tap.rs) between
+shadowsocks-service and the inner plugin. Per-TCP-connection it logs:
+
+- `bytes_to_plugin` / `bytes_from_plugin` — raw byte counts in each
+  direction, observed by [`garter::CountingStream`](crates/garter/src/counting.rs).
+- `ttfb_ms` — milliseconds from `accept` to the first non-zero
+  upstream read. `None` means the connection closed without ever
+  receiving a byte from the plugin chain — the load-bearing diagnostic
+  for #248-class "tunnel returns nothing" cases.
+- `close_kind` — taxonomy of how the connection ended (`graceful`,
+  `rst`, `abort`, `eof`, `timeout`, `broken_pipe`, `other`),
+  cross-platform via Win32+POSIX errno mapping.
+- `close_dir` is implicit in the byte-count asymmetry: if
+  `bytes_inbound_read != bytes_inbound_written` an inflight cancel hit.
+
+**Dev-mode only.** Service-mode bridges (Windows SCM / launchd) do not
+inherit user shell env, so the gate is meant for `scripts/dev.py` and
+hand-run `hole bridge run`. Cost: an extra loopback round-trip per
+byte, fine for a debugging session, inappropriate as default.
+
 ### CLI
 
 ```
