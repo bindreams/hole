@@ -212,12 +212,20 @@ impl Verb {
 /// returns `Err` with a message naming the step and exit code; the caller
 /// (the build driver) propagates that via fail-fast.
 pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
+    // Expose the current xtask binary's path so manifest steps can invoke
+    // xtask subcommands without going through `cargo xtask` (which is a
+    // `cargo run` alias). On Windows, `cargo run` would re-link xtask.exe,
+    // and the running parent process holds an exclusive lock on it →
+    // ERROR_ACCESS_DENIED. Direct binary invocation skips the rebuild check.
+    let xtask_exe = std::env::current_exe().context("locating current xtask binary")?;
+
     match step {
         Step::Bash { command, environment } => {
             let mut cmd = Command::new(resolve_bash()?);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
             cmd.arg("-e").arg("-c").arg(command).current_dir(repo_root);
+            cmd.env("XTASK", &xtask_exe);
             for (k, v) in environment {
                 cmd.env(k, v);
             }
@@ -229,6 +237,7 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
                 .ok_or_else(|| anyhow!("process step has empty args list"))?;
             let mut cmd = Command::new(program);
             cmd.args(rest).current_dir(repo_root);
+            cmd.env("XTASK", &xtask_exe);
             for (k, v) in environment {
                 cmd.env(k, v);
             }

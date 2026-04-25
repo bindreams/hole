@@ -12,18 +12,24 @@
 # Steps default to bash. Bare strings are shorthand for `bash: <string>`. Use
 # `process: [...]` for direct subprocess spawn (no shell). Per-step
 # `environment:` appends to inherited env. CWD is repo root.
+#
+# `$XTASK` env var (set by the orchestrator before each step) is the path to
+# the running xtask binary. Use it instead of `cargo xtask <subcommand>` —
+# `cargo run` would re-link xtask.exe, and the running parent holds an
+# exclusive lock on Windows (ERROR_ACCESS_DENIED). Direct invocation skips
+# the rebuild check.
 
 targets:
   v2ray-plugin:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo xtask v2ray-plugin
+    build: '"$XTASK" v2ray-plugin'
 
   galoshes:
     depends: v2ray-plugin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo xtask galoshes
+    build: '"$XTASK" galoshes'
 
   garter:
     platforms:
@@ -47,7 +53,7 @@ targets:
     # silently install the wrong-arch DLL. Lift this once xtask::wintun
     # picks per-host-arch.
     platforms: [windows/amd64]
-    build: cargo xtask wintun
+    build: '"$XTASK" wintun'
 
   hole:
     # Builds the hole executable + sidecars in debug profile and stages the
@@ -58,7 +64,7 @@ targets:
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
       - cargo build --workspace
-      - cargo xtask stage --profile debug --out-dir target/debug/dist
+      - '"$XTASK" stage --profile debug --out-dir target/debug/dist'
 
   hole-msi:
     # NOT a dependent of `hole`. The msi-installer Python entry point does its

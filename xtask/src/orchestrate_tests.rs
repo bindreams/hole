@@ -305,6 +305,20 @@ fn run_step_bash_environment_overrides_inherited() {
 }
 
 #[skuld::test]
+fn run_step_bash_xtask_env_var_is_set() {
+    // `$XTASK` must be exported to bash steps so the manifest can invoke
+    // the running xtask binary directly (instead of `cargo xtask <X>`,
+    // which on Windows triggers a rebuild that fails because the parent
+    // holds an exclusive lock on the binary).
+    let dir = tempfile::tempdir().unwrap();
+    let step = Step::Bash {
+        command: r#"[ -n "$XTASK" ] && [ -f "$XTASK" ]"#.to_string(),
+        environment: Default::default(),
+    };
+    run_step(&step, dir.path()).unwrap();
+}
+
+#[skuld::test]
 fn run_step_process_fails_on_nonzero_exit() {
     let dir = tempfile::tempdir().unwrap();
     // Use a command that's available on every CI platform via `cargo` (always
