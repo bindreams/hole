@@ -11,11 +11,13 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
-use petgraph::algo::toposort;
+use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
@@ -64,42 +66,44 @@ impl<'m> Plan<'m> {
         match toposort(&self.graph, None) {
             Ok(_) => Ok(()),
             Err(cycle) => {
-                let bad = self.graph[cycle.node_id()].clone();
-                // The petgraph error names one node on the cycle but not the
-                // full ring. Walk back along incoming edges from `bad` until we
-                // return to it, recording the path. The walk is bounded by
-                // node count.
-                let path = self.cycle_path_through(cycle.node_id());
+                let bad = cycle.node_id();
+                // `toposort` only names one node on the cycle, not the full
+                // ring. Use Tarjan SCC to recover every node in the strongly
+                // connected component containing `bad` — that's the full
+                // cycle (or the cycle's super-cycle, in the case of two
+                // overlapping cycles sharing a node).
+                let scc = self
+                    .scc_containing(bad)
+                    .unwrap_or_else(|| vec![self.graph[bad].clone()]);
                 Err(anyhow!(
-                    "dependency cycle detected through target {bad:?}: {}",
-                    path.join(" -> ")
+                    "dependency cycle detected through target {:?}: {}",
+                    self.graph[bad],
+                    scc.join(" -> ")
                 ))
             }
         }
     }
 
-    /// Walk back along *incoming* edges from `start` (a node known to be on a
-    /// cycle) until we revisit `start`, returning the path of names.
-    fn cycle_path_through(&self, start: NodeIndex) -> Vec<String> {
-        let mut path = vec![self.graph[start].clone()];
-        let mut cur = start;
-        // Bounded walk: at most one full pass through the graph.
-        for _ in 0..self.graph.node_count() {
-            let Some(prev) = self
-                .graph
-                .edges_directed(cur, Direction::Incoming)
-                .next()
-                .map(|e| e.source())
-            else {
-                return path;
-            };
-            path.push(self.graph[prev].clone());
-            if prev == start {
-                return path;
+    /// Return the names of all nodes in the strongly-connected component that
+    /// contains `node`, or `None` if no SCC of size > 1 contains it (which
+    /// would only happen for a self-loop with no other members — we still
+    /// report that as the offender).
+    fn scc_containing(&self, node: NodeIndex) -> Option<Vec<String>> {
+        for component in tarjan_scc(&self.graph) {
+            if !component.contains(&node) {
+                continue;
             }
-            cur = prev;
+            // SCC of size 1 is a real cycle only if it has a self-loop.
+            let is_cycle = component.len() > 1
+                || self
+                    .graph
+                    .edges_directed(node, Direction::Outgoing)
+                    .any(|e| e.target() == node);
+            if is_cycle {
+                return Some(component.into_iter().map(|n| self.graph[n].clone()).collect());
+            }
         }
-        path
+        None
     }
 
     fn node(&self, name: &str) -> Result<NodeIndex> {
@@ -210,7 +214,7 @@ impl Verb {
 pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
     match step {
         Step::Bash { command, environment } => {
-            let mut cmd = Command::new(resolve_bash());
+            let mut cmd = Command::new(resolve_bash()?);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
             cmd.arg("-e").arg("-c").arg(command).current_dir(repo_root);
@@ -246,14 +250,14 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
 /// interchangeable.
 ///
 /// Resolution order on Windows:
-/// 1. `$HOLE_BUILD_BASH` env var — explicit override for non-standard installs.
+/// 1. `$HOLE_BUILD_BASH` env var — explicit override.
 /// 2. Common Git Bash install paths.
-/// 3. Bare `bash` — last resort; works on hosts where `where bash` resolves to
-///    Git Bash (e.g. GitHub-hosted `windows-latest` runners with `shell: bash`
-///    semantics, where the runner has Git Bash earlier on PATH than WSL).
-fn resolve_bash() -> OsString {
+/// 3. Error out with a clear message — never fall through to bare `bash`,
+///    because that would silently pick up `C:\Windows\System32\bash.exe`
+///    (the WSL launcher) on systems without Git Bash.
+fn resolve_bash() -> Result<OsString> {
     if let Some(p) = std::env::var_os("HOLE_BUILD_BASH") {
-        return p;
+        return Ok(p);
     }
     #[cfg(windows)]
     {
@@ -266,11 +270,19 @@ fn resolve_bash() -> OsString {
         ];
         for c in CANDIDATES {
             if PathBuf::from(c).is_file() {
-                return OsString::from(c);
+                return Ok(OsString::from(c));
             }
         }
+        bail!(
+            "could not locate Git Bash on Windows. Tried: {}. \
+             Set HOLE_BUILD_BASH=<path-to-bash.exe> or install Git for Windows.",
+            CANDIDATES.join(", ")
+        );
     }
-    OsString::from("bash")
+    #[cfg(not(windows))]
+    {
+        Ok(OsString::from("bash"))
+    }
 }
 
 fn run(mut cmd: Command, label: &str) -> Result<()> {

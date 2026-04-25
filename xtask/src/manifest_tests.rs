@@ -370,9 +370,95 @@ targets:
     platforms: windows/amd64
   foo-tests:
     platforms: windows/amd64
+  foo-test:
+    platforms: windows/amd64
+  pretests:
+    platforms: windows/amd64
 ",
     )
     .unwrap();
+    // Only the exact `-tests` suffix qualifies as a test target. `-test`
+    // (singular) and the bare suffix `tests` (no dash) are NOT test targets;
+    // adding either by accident shouldn't silently flip CI behavior.
     assert!(!m.get("foo").unwrap().is_test());
     assert!(m.get("foo-tests").unwrap().is_test());
+    assert!(!m.get("foo-test").unwrap().is_test());
+    assert!(!m.get("pretests").unwrap().is_test());
+}
+
+#[skuld::test]
+fn empty_matrix_os_axis_rejected() {
+    let err = parse(
+        r"
+targets:
+  foo:
+    platforms:
+      matrix:
+        os: []
+        arch: [amd64]
+",
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("os") && msg.contains("at least one"),
+        "expected empty-matrix-os error, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn empty_matrix_arch_axis_rejected() {
+    let err = parse(
+        r"
+targets:
+  foo:
+    platforms:
+      matrix:
+        os: [windows]
+        arch: []
+",
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("arch") && msg.contains("at least one"),
+        "expected empty-matrix-arch error, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn unknown_field_in_platform_matrix_rejected() {
+    let err = parse(
+        r"
+targets:
+  foo:
+    platforms:
+      matrix:
+        os: [windows]
+        arch: [amd64]
+        typo: [x]
+",
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("typo") || msg.contains("unknown field"),
+        "expected unknown-field rejection, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn production_build_yaml_parses() {
+    // Regression guard: any change to build.yaml that breaks parsing or
+    // structural validation (missing dep, typo'd platform, dup platform)
+    // should fail this test, not silently break CI.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    // Sanity: a few targets we always expect to exist.
+    for name in ["v2ray-plugin", "galoshes", "hole", "hole-msi", "hole-dmg", "hole-tests"] {
+        assert!(
+            m.get(name).is_some(),
+            "production build.yaml is missing expected target {name:?}"
+        );
+    }
 }

@@ -264,31 +264,44 @@ targets:
     assert!(lines[2].contains("hole-dmg") && lines[2].ends_with("no"));
 }
 
+// `run_step` tests assume bash is available — Git Bash on Windows runners,
+// system bash on macOS / Linux. These are unconditional: per CLAUDE.md, tests
+// must not silently skip on missing dependencies.
+
 #[skuld::test]
 fn run_step_bash_succeeds_on_zero_exit() {
-    // Trivial bash command. Skipped on platforms without bash on PATH.
-    if which_bash_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let step = Step::Bash {
-            command: "true".to_string(),
-            environment: Default::default(),
-        };
-        run_step(&step, dir.path()).unwrap();
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let step = Step::Bash {
+        command: "true".to_string(),
+        environment: Default::default(),
+    };
+    run_step(&step, dir.path()).unwrap();
 }
 
 #[skuld::test]
 fn run_step_bash_fails_on_nonzero_exit() {
-    if which_bash_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let step = Step::Bash {
-            command: "exit 7".to_string(),
-            environment: Default::default(),
-        };
-        let err = run_step(&step, dir.path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("exit"), "expected exit-status error, got: {msg}");
-    }
+    let dir = tempfile::tempdir().unwrap();
+    let step = Step::Bash {
+        command: "exit 7".to_string(),
+        environment: Default::default(),
+    };
+    let err = run_step(&step, dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exit"), "expected exit-status error, got: {msg}");
+}
+
+#[skuld::test]
+fn run_step_bash_environment_overrides_inherited() {
+    // The step's `environment:` map should take effect (and also drive the
+    // SKULD_LABELS-style usage in build.yaml).
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOLE_TEST_VAR".to_string(), "set-from-step".to_string());
+    let step = Step::Bash {
+        command: r#"[ "$HOLE_TEST_VAR" = "set-from-step" ]"#.to_string(),
+        environment: env,
+    };
+    run_step(&step, dir.path()).unwrap();
 }
 
 #[skuld::test]
@@ -318,12 +331,32 @@ fn run_step_process_empty_args_errors() {
     assert!(msg.contains("empty"), "expected empty-args error, got: {msg}");
 }
 
-fn which_bash_exists() -> bool {
-    std::process::Command::new("bash")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+#[skuld::test]
+fn cycle_detection_diverging_cycle_lists_full_scc() {
+    // `c -> b -> a -> b` (a points back to b, not c). c has an inbound edge
+    // from outside the cycle (and the toposort error names some node in the
+    // SCC). The error message must report all SCC members, not wander off
+    // into the non-cycle tail.
+    let m = Manifest::parse(
+        r"
+targets:
+  a:
+    depends: b
+    platforms: windows/amd64
+  b:
+    depends: a
+    platforms: windows/amd64
+  c:
+    depends: b
+    platforms: windows/amd64
+",
+    )
+    .unwrap();
+    let err = Plan::new(&m).unwrap_err();
+    let msg = format!("{err:#}");
+    // The SCC is {a, b}; c is on a path leading to it but not part of the cycle.
+    assert!(
+        msg.contains("a") && msg.contains("b") && !msg.contains("\"c\""),
+        "expected cycle to list a and b but not c, got: {msg}"
+    );
 }

@@ -42,7 +42,11 @@ targets:
     build: cargo build --release -p mock-plugin
 
   wintun:
-    platforms: [windows/amd64, windows/arm64]
+    # Restricted to windows/amd64 because xtask::wintun unconditionally
+    # extracts the amd64 DLL from the upstream zip — windows/arm64 would
+    # silently install the wrong-arch DLL. Lift this once xtask::wintun
+    # picks per-host-arch.
+    platforms: [windows/amd64]
     build: cargo xtask wintun
 
   hole:
@@ -57,20 +61,20 @@ targets:
       - cargo xtask stage --profile debug --out-dir target/debug/dist
 
   hole-msi:
-    depends: hole
+    # NOT a dependent of `hole`. The msi-installer Python entry point does its
+    # own `cargo build --release` + `cargo xtask stage --profile release`, so
+    # depending on `hole` (debug) would force a redundant debug compile that
+    # nothing consumes. We depend instead on the same sidecars `hole` does, so
+    # the MSI build still has v2ray-plugin, galoshes, and wintun.dll on disk.
+    depends: [galoshes, wintun]
     platforms: [windows/amd64]
-    # The msi-installer Python entry point internally re-runs `cargo build
-    # --release` and `cargo xtask stage --profile release`; the WiX toolchain
-    # acquisition stays inside msi-installer. The `cargo build` is shared via
-    # cargo's fingerprint cache when invoked twice (debug from `hole`, release
-    # from msi-installer).
     build: uv run --directory msi-installer build
 
   hole-dmg:
-    depends: hole
+    # Same logic as hole-msi: tauri does its own `cargo build --release`. No
+    # wintun dep on darwin (it doesn't apply to that platform).
+    depends: galoshes
     platforms: [darwin/amd64, darwin/arm64]
-    # Tauri internally runs `cargo build --release`; cargo incremental shares
-    # dependency artifacts with the debug build done by `hole`.
     build: npx tauri build
 
   # ===== Test targets =======================================================

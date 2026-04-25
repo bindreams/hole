@@ -187,8 +187,10 @@ pub enum Step {
 //   - { bash: <string> }  ↔ { bash: { command: <string> } }
 // Symmetric collapse for `process:` (bare list ↔ { process: { args: [...] } }).
 
+// `deny_unknown_fields` only applies to struct-shaped variants and structs;
+// it's a no-op on untagged enums themselves.
 #[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 enum StepRaw {
     Bare(String),
     Tagged(TaggedStepRaw),
@@ -204,7 +206,7 @@ enum TaggedStepRaw {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 enum BashRaw {
     Short(String),
     Full {
@@ -215,7 +217,7 @@ enum BashRaw {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(untagged)]
 enum ProcessRaw {
     Args(Vec<String>),
     Full {
@@ -338,20 +340,28 @@ enum PlatformsRaw {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlatformMatrix {
     os: Vec<Os>,
     arch: Vec<Arch>,
 }
 
 impl PlatformsRaw {
-    fn into_vec(self) -> Vec<Platform> {
+    fn into_vec(self) -> Result<Vec<Platform>> {
         match self {
-            PlatformsRaw::Single(p) => vec![p],
-            PlatformsRaw::List(v) => v,
+            PlatformsRaw::Single(p) => Ok(vec![p]),
+            PlatformsRaw::List(v) => Ok(v),
             PlatformsRaw::Matrix(m) => {
-                m.os.into_iter()
+                if m.os.is_empty() {
+                    return Err(anyhow!("platforms.matrix.os must list at least one os"));
+                }
+                if m.arch.is_empty() {
+                    return Err(anyhow!("platforms.matrix.arch must list at least one arch"));
+                }
+                Ok(m.os
+                    .into_iter()
                     .flat_map(|os| m.arch.iter().map(move |&arch| Platform::new(os, arch)))
-                    .collect()
+                    .collect())
             }
         }
     }
@@ -438,7 +448,7 @@ impl Manifest {
         let mut targets = IndexMap::with_capacity(raw.targets.len());
         for (name, t) in raw.targets {
             let depends = t.depends.map(DependsRaw::into_vec).unwrap_or_default();
-            let platforms = t.platforms.into_vec();
+            let platforms = t.platforms.into_vec().with_context(|| format!("in target {name:?}"))?;
             let build = t.build.map(BuildRaw::into_steps).unwrap_or_default();
 
             // Reject platform duplicates inside one target — silent dedup would
