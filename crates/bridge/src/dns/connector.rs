@@ -10,23 +10,26 @@
 //!   cannot strand the forwarder.
 //!
 //! The trait returns [`ConnectedStream`] — a `BoxedStream` paired with
-//! two `AtomicU64` byte counters observed by a [`CountingStream`] wrapper
-//! around the underlying socket. The counters are what lets the forwarder
-//! log `tcp_wrote` / `tcp_read` on a TLS-layer failure in #248
+//! [`StreamCounters`] observed by a [`CountingStream`] wrapper around
+//! the underlying socket. The counters are what lets the forwarder log
+//! `tcp_wrote` / `tcp_read` on a TLS-layer failure in #248
 //! diagnostics: `read=0` means the peer FIN'd before sending a byte;
 //! `read=<small>` means mid-handshake close; `read=<KBs>` means full
 //! handshake bytes delivered then close.
+//!
+//! `CountingStream` and `StreamCounters` were lifted to
+//! [`garter::counting`] in #267 so the new `TapPlugin` decorator and
+//! this DNS forwarder can share one wrapper. Apache → GPL one-way
+//! direction is preserved.
 
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
+
+pub use garter::counting::{CountingStream, StreamCounters};
 
 /// Bidirectional byte stream used by every TCP-based DNS transport
 /// (`PlainTcp`, `Tls`, `Https`). Requiring `Unpin` keeps the
@@ -40,24 +43,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> AsyncDuplex for T {}
 /// [`CountingStream`] before boxing, so its byte counts are observable
 /// via the paired [`StreamCounters`].
 pub type BoxedStream = Box<dyn AsyncDuplex>;
-
-/// Per-stream byte counters handed back by a connector alongside the
-/// stream itself. Cheap to clone (two `Arc` bumps).
-#[derive(Debug, Default, Clone)]
-pub struct StreamCounters {
-    read_bytes: Arc<AtomicU64>,
-    write_bytes: Arc<AtomicU64>,
-}
-
-impl StreamCounters {
-    pub fn read(&self) -> u64 {
-        self.read_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn written(&self) -> u64 {
-        self.write_bytes.load(Ordering::Relaxed)
-    }
-}
 
 /// A stream paired with its byte counters. Returned by
 /// [`UpstreamConnector::connect_tcp`]; callers keep the counters to read
@@ -73,61 +58,6 @@ impl ConnectedStream {
     /// error path.
     pub fn into_parts(self) -> (BoxedStream, StreamCounters) {
         (self.stream, self.counters)
-    }
-}
-
-/// Wraps an `AsyncRead + AsyncWrite` and increments a pair of
-/// `Arc<AtomicU64>` counters on every successful `poll_read` / `poll_write`
-/// call. Counts raw bytes on the wrapped stream, *not* decoded-TLS bytes —
-/// for SOCKS5-wrapped streams the bytes counted are post-SOCKS5-CONNECT
-/// payload bytes, i.e. what a DoH server / plain-TCP peer would see.
-pub struct CountingStream<S> {
-    inner: S,
-    counters: StreamCounters,
-}
-
-impl<S> CountingStream<S> {
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            counters: StreamCounters::default(),
-        }
-    }
-
-    pub fn counters(&self) -> StreamCounters {
-        self.counters.clone()
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &res {
-            let delta = (buf.filled().len() - before) as u64;
-            if delta > 0 {
-                self.counters.read_bytes.fetch_add(delta, Ordering::Relaxed);
-            }
-        }
-        res
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &res {
-            self.counters.write_bytes.fetch_add(*n as u64, Ordering::Relaxed);
-        }
-        res
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

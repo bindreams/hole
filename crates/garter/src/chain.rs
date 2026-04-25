@@ -291,7 +291,10 @@ fn record_exit(
 ///
 /// Each connect attempt races against the shutdown token so that a
 /// cancellation during an OS-level TCP timeout is not delayed.
-async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) -> Option<SocketAddr> {
+///
+/// `pub(crate)` so the [`crate::tap`] module can reuse the same backoff
+/// schedule when waiting for the inner plugin to bind.
+pub(crate) async fn poll_ready(addr: SocketAddr, shutdown: CancellationToken) -> Option<SocketAddr> {
     let mut delay = Duration::from_millis(10);
     let max_delay = Duration::from_secs(1);
 
