@@ -59,7 +59,11 @@ If the dev bridge is killed before clean shutdown and your internet breaks, run 
 
 - Rust toolchain
 - Go toolchain (for v2ray-plugin, built by `cargo xtask deps`)
-- Node.js (for frontend tooling)
+- Node.js ≥24 (constraint pinned via `engines.node` in [package.json](package.json); current Active LTS)
+
+### npm dependency management
+
+`scripts/dev.py` runs `npm install`, which updates `package-lock.json` to match `package.json` whenever the two have drifted. PR-time CI runs `npm ci` via the `frontend-build` xtask target, which is strict — it fails if `package-lock.json` and `package.json` are inconsistent. **If you modify `package.json` directly, commit the resulting `package-lock.json` change in the same commit, or CI will reject the PR.** Renovate handles routine npm updates automatically (see [.github/renovate.json](.github/renovate.json)).
 
 ## Development
 

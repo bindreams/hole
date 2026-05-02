@@ -82,6 +82,19 @@ targets:
     platforms: [darwin/amd64, darwin/arm64]
     build: npx tauri build
 
+  frontend-build:
+    # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-independent
+    # output, so we run on the cheapest CI host (linux/amd64) only. The
+    # `Frontend check` CI job pairs this with `npm run check` (tsc --noEmit) as
+    # a sibling step — the type-check is intentionally NOT here because it
+    # produces no artifact, and build.yaml targets are build-only by convention.
+    # Not depended on by hole-msi/hole-dmg: Tauri's beforeBuildCommand runs
+    # `npm run build` itself at packaging time.
+    platforms: linux/amd64
+    build:
+      - npm ci --no-audit --no-fund
+      - npm run build
+
   # ===== Test targets =======================================================
   # Convention: name ends in `-tests`. Compile test binaries only — the
   # orchestrator never runs them. CI / dev invokes `cargo nextest run` (with
