@@ -292,8 +292,7 @@ def drop_kwargs(target: tuple[int, int, str, str] | None) -> dict:
         # macOS Directory Services unreachable — corporate machines can
         # transiently lose LDAP. Drop the group rather than crash; the
         # GUI will fall back to root-only IPC and surface its own error.
-        print(f"{YELLOW}warning: failed to look up 'hole' group: {e}{RESET}",
-              file=sys.stderr)
+        print(f"{YELLOW}warning: failed to look up 'hole' group: {e}{RESET}", file=sys.stderr)
     return {"user": uid, "group": gid, "extra_groups": extra_groups}
 
 

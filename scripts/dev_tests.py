@@ -30,14 +30,15 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 # `dev.py` imports `_lib` at module load and `_lib.require_elevation()` is
 # normally called from `main()`. Tests do not call `main`, but we still need
 # to satisfy the import. A minimal `_lib` stub keeps the import side-effect
-# free without requiring sudo / a target user.
-sys.modules.setdefault(
-    "_lib",
-    types.SimpleNamespace(
-        require_elevation=lambda: None,
-        sudo_target_user=lambda: None,
-    ),
-)
+# free without requiring sudo / a target user. Use `types.ModuleType` rather
+# than `SimpleNamespace` so `sys.modules["_lib"]` matches its declared type.
+_lib_stub = types.ModuleType("_lib")
+# `setattr` bypasses ty's static attribute check (ModuleType has no
+# declared `require_elevation` / `sudo_target_user`); the attrs are
+# created dynamically and read from `dev.py` at module-load time.
+setattr(_lib_stub, "require_elevation", lambda: None)
+setattr(_lib_stub, "sudo_target_user", lambda: None)
+sys.modules.setdefault("_lib", _lib_stub)
 
 _spec = importlib.util.spec_from_file_location("dev", str(_SCRIPTS_DIR / "dev.py"))
 assert _spec and _spec.loader, "failed to locate scripts/dev.py"
@@ -63,9 +64,7 @@ def test_hole_absent_returns_empty_list():
 
 
 def test_directory_services_failure_returns_empty_list(capsys):
-    with mock.patch.object(
-        dev.grp, "getgrnam", side_effect=OSError("DS unreachable")
-    ):
+    with mock.patch.object(dev.grp, "getgrnam", side_effect=OSError("DS unreachable")):
         kw = dev.drop_kwargs((501, 20, "alice", "/Users/alice"))
     assert kw == {"user": 501, "group": 20, "extra_groups": []}
     # Surface the failure to the user — silently dropping `hole` would
