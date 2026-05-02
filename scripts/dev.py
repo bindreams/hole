@@ -51,6 +51,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# `grp` is POSIX-only. dev.py is also invoked on Windows from an elevated
+# PowerShell, where `_lib.sudo_target_user()` returns None and `drop_kwargs`
+# short-circuits before touching `grp`. Gate the import so module load
+# succeeds on Windows.
+if sys.platform != "win32":
+    import grp
+
 import _lib
 
 # ANSI colors ==========================================================================================================
@@ -254,16 +261,40 @@ def shutdown(procs: list[subprocess.Popen]) -> None:
 def drop_kwargs(target: tuple[int, int, str, str] | None) -> dict:
     """Return Popen kwargs that drop privileges to `target` on POSIX.
 
-    `extra_groups` is set to the TARGET user's full group list (via
-    `os.getgrouplist`), NOT root's supplementary groups and NOT empty —
-    we need hole-group membership in the GUI to open the production
-    IPC socket on macOS.
+    `extra_groups` contains only the `hole` group when it exists, not the
+    target user's full supplementary group list. The GUI needs `hole`
+    membership to open the production IPC socket (root:hole 0660 — see
+    `apply_socket_permissions` in `crates/bridge/src/ipc.rs`); no other
+    supplementary group gates anything dev.py's children touch. Passing
+    the full `os.getgrouplist` would also exceed macOS's NGROUPS_MAX
+    (16) on directory-managed accounts and crash subprocess with
+    `ValueError: too many groups`.
+
+    dev.py runs as root, so `setgroups([hole_gid])` succeeds even if the
+    target user is not yet listed in the `hole` group's member list —
+    the kernel honors root's setgroups regardless of on-disk
+    membership. This gives the GUI `hole` permissions on first launch
+    after `bridge grant-access` with no logout/login cycle.
+
+    The literal `"hole"` matches `crates/bridge/src/group.rs::GROUP_NAME`.
     """
     if target is None:
         return {}
-    uid, gid, user, _ = target
-    groups = os.getgrouplist(user, gid)
-    return {"user": uid, "group": gid, "extra_groups": groups}
+    uid, gid, _user, _ = target
+    extra_groups: list[int] = []
+    try:
+        extra_groups.append(grp.getgrnam("hole").gr_gid)
+    except KeyError:
+        # Group not yet created (the first three privilege-drop calls
+        # happen before `bridge grant-access` creates the group).
+        pass
+    except OSError as e:
+        # macOS Directory Services unreachable — corporate machines can
+        # transiently lose LDAP. Drop the group rather than crash; the
+        # GUI will fall back to root-only IPC and surface its own error.
+        print(f"{YELLOW}warning: failed to look up 'hole' group: {e}{RESET}",
+              file=sys.stderr)
+    return {"user": uid, "group": gid, "extra_groups": extra_groups}
 
 
 def drop_env(env: dict, target: tuple[int, int, str, str] | None) -> dict:
