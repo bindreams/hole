@@ -342,3 +342,37 @@ jobs:
           if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+  # Renovate npm safety gate: builds the Vite bundle (via the `frontend-build`
+  # xtask target) and type-checks (via npm run check) on every PR. Required
+  # status check for npm dependency PRs to automerge — see .github/renovate.json.
+  # Single platform: `npm run check`/`vite build` are platform-independent;
+  # the per-OS Tauri shell is exercised by the release pipeline.
+  frontend-check:
+    name: Frontend check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+
+      - name: Build frontend
+        run: cargo xtask build frontend-build
+
+      - name: Type-check frontend
+        run: npm run check

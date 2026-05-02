@@ -455,10 +455,49 @@ fn production_build_yaml_parses() {
     let yaml = include_str!("../../build.yaml");
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
     // Sanity: a few targets we always expect to exist.
-    for name in ["v2ray-plugin", "galoshes", "hole", "hole-msi", "hole-dmg", "hole-tests"] {
+    for name in [
+        "v2ray-plugin",
+        "galoshes",
+        "hole",
+        "hole-msi",
+        "hole-dmg",
+        "hole-tests",
+        "frontend-build",
+    ] {
         assert!(
             m.get(name).is_some(),
             "production build.yaml is missing expected target {name:?}"
         );
     }
+}
+
+#[skuld::test]
+fn frontend_build_target_shape() {
+    // The Renovate npm safety gate (see Frontend check CI job) depends on
+    // `frontend-build` producing ui/dist/ on linux/amd64 with strict-lockfile
+    // semantics. Pin the shape so a future edit can't silently weaken the gate.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let t = m.get("frontend-build").expect("frontend-build target missing");
+
+    assert_eq!(t.platforms, vec![Platform::new(Os::Linux, Arch::Amd64)]);
+    assert_eq!(
+        t.build,
+        vec![
+            Step::Bash {
+                command: "npm ci --no-audit --no-fund".to_string(),
+                environment: HashMap::new(),
+            },
+            Step::Bash {
+                command: "npm run build".to_string(),
+                environment: HashMap::new(),
+            },
+        ],
+    );
+    // Adding a `depends:` would silently start compiling Rust on every PR
+    // (the gate is supposed to be JS-only). Adding a `-tests` suffix would
+    // flip Target::is_test() and change `cargo xtask {build,test} --all`
+    // selection. Both are load-bearing.
+    assert_eq!(t.depends, Vec::<String>::new());
+    assert!(!t.is_test());
 }

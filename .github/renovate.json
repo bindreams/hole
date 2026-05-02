@@ -3,7 +3,7 @@
   "extends": ["config:recommended"],
   "schedule": ["before 9am on monday"],
   "minimumReleaseAge": "7 days",
-  "postUpdateOptions": ["gomodTidy"],
+  "postUpdateOptions": ["gomodTidy", "npmDedupe"],
   "platformAutomerge": true,
   "customManagers": [
     {
@@ -45,9 +45,16 @@
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
     },
     {
-      "description": "Disable npm — no lockfile committed",
+      "description": "Group npm updates",
       "matchManagers": ["npm"],
-      "enabled": false
+      "groupName": "npm",
+      "automerge": true,
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "lockFileMaintenance": {
+        "enabled": true,
+        "automerge": true,
+        "schedule": ["before 9am on monday"]
+      }
     }
   ]
 }
