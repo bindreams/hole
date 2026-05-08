@@ -17,15 +17,15 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ### Workspace layout
 
-| Directory        | Crate/Purpose                                                                            |
-| ---------------- | ---------------------------------------------------------------------------------------- |
-| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                  |
-| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                             |
-| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                      |
+| Directory        | Crate/Purpose                                                                           |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                 |
+| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                            |
+| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                     |
 | `xtask/`         | workspace task runner (`cargo xtask <build\|run\|list\|stage\|...>`) — see `build.yaml` |
-| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                             |
-| `external/`      | Third-party source (git subrepos)                                                        |
-| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                      |
+| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                            |
+| `external/`      | Third-party source (git subrepos)                                                       |
+| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                     |
 
 ### Logging
 

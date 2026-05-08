@@ -594,7 +594,13 @@ fn production_build_yaml_parses() {
     // targets all carry a canonical local nextest invocation. Removing any of
     // these would re-fragment runner knowledge across CI / scripts / docs.
     assert!(m.get("hole").unwrap().has_run(), "hole must declare run: (dev mode)");
-    for tests in ["hole-tests", "galoshes-tests", "garter-tests", "garter-bin-tests", "mock-plugin-tests"] {
+    for tests in [
+        "hole-tests",
+        "galoshes-tests",
+        "garter-tests",
+        "garter-bin-tests",
+        "mock-plugin-tests",
+    ] {
         assert!(
             m.get(tests).unwrap().has_run(),
             "{tests:?} must declare run: (canonical nextest invocation)"
