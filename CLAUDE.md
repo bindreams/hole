@@ -248,12 +248,15 @@ crates/galoshes/          → bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP 
 crates/mock-plugin/       → minimal SIP003u TCP echo plugin for garter integration
                             tests. Apache-2.0.
 build.yaml                → declarative build-target manifest (the DAG of `hole`,
-                            `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, etc.)
-                            consumed by `cargo xtask build|test|list`. Schema in
+                            `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, `clippy-*`,
+                            `prek`, `frontend-check`, etc.) consumed by
+                            `cargo xtask build|run|list`. Schema in
                             xtask/src/manifest.rs; orchestration in xtask/src/orchestrate.rs.
 xtask/                    → workspace task runner. Top-level commands:
-                            - `cargo xtask build <name> | --all`  — orchestrate from build.yaml
-                            - `cargo xtask test  <name> | --all`  — same, for `*-tests` targets
+                            - `cargo xtask build <name> | --all`  — run a target's `build:` steps
+                            - `cargo xtask run <name>`            — run a target's `run:` steps
+                                                                    (tests, linters, dev mode);
+                                                                    invokes the build cascade first
                             - `cargo xtask list`                  — print the target table
                             Primitive subcommands stay available for one-off use:
                             `cargo xtask <stage|deps|v2ray-plugin|galoshes|wintun|version|...>`
@@ -316,8 +319,8 @@ Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
 ```sh
 npm install                      # install frontend dependencies (first time only)
 cargo xtask build hole           # deps + cargo build (debug) + stage — single command
-uv run scripts/dev.py            # dev mode (see CONTRIBUTING.md)
-cargo xtask test --all           # all test targets applicable to host platform
+cargo xtask run hole             # dev mode (= build hole + uv run scripts/dev.py)
+cargo xtask run hole-tests       # canonical local nextest invocation for hole crates
 ```
 
 `build.yaml` at the repo root is the single source of truth for the build

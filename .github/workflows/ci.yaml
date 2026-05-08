@@ -33,10 +33,9 @@ jobs:
       # cargo-clippy is skipped here because it's run per-platform in the
       # build job (see ci.yaml below). cargo-fmt stays active — it is
       # platform-independent, one Windows invocation covers the workspace.
+      # SKIP=cargo-clippy lives in the prek target's `run.environment:`.
       - name: Run linters
-        env:
-          SKIP: cargo-clippy
-        run: prek run --all-files --show-diff-on-failure
+        run: cargo xtask run prek
 
   # Per-platform build job: compiles clippy + test binaries once and publishes
   # them as a platform-scoped artifact (`build-<os>-<arch>`). Test jobs below
@@ -77,16 +76,19 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      # Clippy coverage is platform-gated the same way as before: full
-      # workspace on Hole platforms (windows/amd64, darwin/*); ex-Galoshes
-      # crates only on platforms Hole doesn't ship on.
+      # Clippy coverage is platform-gated by the targets' `platforms:` lists.
+      # `clippy-hole` covers Hole platforms (windows/amd64, darwin/*) with
+      # `--workspace`; `clippy-ex-galoshes` covers the platforms Hole doesn't
+      # ship on (linux/*, windows/arm64) with the ex-Galoshes -p filter set.
+      # The `if:` gates here just suppress the "doesn't apply to host" error
+      # from xtask on the wrong-platform half of the matrix.
       - name: Clippy (Hole workspace)
         if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo xtask run clippy-hole
 
       - name: Clippy (ex-Galoshes only)
         if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
-        run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin --all-targets -- -D warnings
+        run: cargo xtask run clippy-ex-galoshes
 
       # Archive only the ex-Galoshes crates — they're the only consumers
       # via test-garter and test-galoshes on all platforms. Hole crates'
@@ -343,11 +345,14 @@ jobs:
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
 
-  # Renovate npm safety gate: builds the Vite bundle (via the `frontend-build`
-  # xtask target) and type-checks (via npm run check) on every PR. Required
-  # status check for npm dependency PRs to automerge — see .github/renovate.json.
-  # Single platform: `npm run check`/`vite build` are platform-independent;
-  # the per-OS Tauri shell is exercised by the release pipeline.
+  # Renovate npm safety gate: builds the Vite bundle (via `cargo xtask build
+  # frontend-build`) and type-checks (via `cargo xtask run frontend-check`,
+  # which does its own `npm ci` + `npm run check` — tsc reads source directly
+  # so it doesn't need the Vite bundle as a dep). Both steps are required
+  # status checks for npm dependency PRs to automerge — see
+  # .github/renovate.json. Single platform: `npm run check` / `vite build`
+  # are platform-independent; the per-OS Tauri shell is exercised by the
+  # release pipeline.
   frontend-check:
     name: Frontend check
     runs-on: ubuntu-latest
@@ -375,4 +380,4 @@ jobs:
         run: cargo xtask build frontend-build
 
       - name: Type-check frontend
-        run: npm run check
+        run: cargo xtask run frontend-check

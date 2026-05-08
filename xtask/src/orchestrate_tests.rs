@@ -238,7 +238,7 @@ targets:
 }
 
 #[skuld::test]
-fn render_list_shows_host_applicability() {
+fn render_list_shows_host_applicability_and_runnable() {
     let m = manifest(
         r"
 targets:
@@ -246,16 +246,37 @@ targets:
     platforms: windows/amd64
   hole-dmg:
     platforms: [darwin/amd64, darwin/arm64]
+  prek:
+    platforms: windows/amd64
+    run: prek run
 ",
     );
     let host = Platform::new(Os::Windows, Arch::Amd64);
     let out = render_list(&m, Some(host));
     // Header + one line per target.
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 3);
-    assert!(lines[0].contains("TARGET") && lines[0].contains("HOST"));
-    assert!(lines[1].contains("hole-msi") && lines[1].ends_with("yes"));
-    assert!(lines[2].contains("hole-dmg") && lines[2].ends_with("no"));
+    assert_eq!(lines.len(), 4);
+    assert!(
+        lines[0].contains("TARGET") && lines[0].contains("HOST") && lines[0].contains("RUN?"),
+        "header missing column: {}",
+        lines[0]
+    );
+    // Build-only target on host: yes / (empty run mark).
+    assert!(lines[1].contains("hole-msi") && lines[1].contains(" yes "));
+    assert!(
+        !lines[1].trim_end().ends_with('*'),
+        "hole-msi has no run: but is marked runnable: {}",
+        lines[1]
+    );
+    // Build-only target off host: no / (empty run mark).
+    assert!(lines[2].contains("hole-dmg") && lines[2].contains(" no "));
+    // Runnable target: trailing `*` marker. trim_end to ignore any column padding.
+    assert!(lines[3].contains("prek"));
+    assert!(
+        lines[3].trim_end().ends_with('*'),
+        "prek declares run: but is not marked runnable: {}",
+        lines[3]
+    );
 }
 
 // `run_step` tests assume bash is available — Git Bash on Windows runners,
@@ -323,6 +344,212 @@ fn run_step_process_empty_args_errors() {
     let err = run_step(&step, dir.path()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("empty"), "expected empty-args error, got: {msg}");
+}
+
+// ===== execute_run ===================================================================================================
+//
+// `cargo xtask run <name>` semantics: build cascade for the target first, then
+// the target's own `run:` steps. Runs do not depend on other runs.
+
+fn host_platform() -> Platform {
+    // Tests in this module use bash steps that only need a working shell, so
+    // the actual host doesn't matter for behavior — we just need a `Platform`
+    // that matches the synthetic manifests' `platforms:` lists. Resolve from
+    // the real host so we don't accidentally encode the test host into the
+    // manifest's platform set.
+    Platform::host().expect("test host must be in the known platform set")
+}
+
+fn host_yaml() -> &'static str {
+    // String form of the host platform — `<os>/<arch>` — for use inside the
+    // raw-YAML test fixtures.
+    let p = host_platform();
+    Box::leak(format!("{p}").into_boxed_str())
+}
+
+#[skuld::test]
+fn execute_run_executes_build_cascade_then_run() {
+    // Synthesize a target whose build step writes a sentinel file and whose
+    // run step reads it back. If the build cascade is skipped, the run step
+    // exits non-zero and the test fails.
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("sentinel.txt");
+    let sentinel_str = sentinel.to_string_lossy().replace('\\', "/");
+
+    let yaml = format!(
+        r#"
+targets:
+  foo:
+    platforms: {host}
+    build:
+      - bash: 'echo built > "{sentinel}"'
+    run:
+      - bash: 'test "$(cat "{sentinel}")" = built'
+"#,
+        host = host_yaml(),
+        sentinel = sentinel_str,
+    );
+    let m = Manifest::parse(&yaml).unwrap();
+    let plan = Plan::new(&m).unwrap();
+    execute_run(&plan, "foo", host_platform(), dir.path()).unwrap();
+    // Sentinel must be on disk after run_run returns.
+    assert!(sentinel.exists(), "expected build to have created sentinel");
+}
+
+#[skuld::test]
+fn execute_run_does_not_cascade_other_runs() {
+    // Pins the framework rule: "runs do not depend on other runs". A child
+    // target depends on a parent for *build*; running the child must NOT
+    // invoke the parent's `run:` steps.
+    //
+    // Setup: parent's run: writes a "parent-ran" file; child's run: writes a
+    // "child-ran" file. After running child, only "child-ran" must exist.
+    let dir = tempfile::tempdir().unwrap();
+    let parent_marker = dir.path().join("parent-ran");
+    let child_marker = dir.path().join("child-ran");
+    let parent_str = parent_marker.to_string_lossy().replace('\\', "/");
+    let child_str = child_marker.to_string_lossy().replace('\\', "/");
+
+    let yaml = format!(
+        r#"
+targets:
+  parent:
+    platforms: {host}
+    build:
+      - bash: 'true'
+    run:
+      - bash: 'touch "{parent}"'
+  child:
+    depends: parent
+    platforms: {host}
+    build:
+      - bash: 'true'
+    run:
+      - bash: 'touch "{child}"'
+"#,
+        host = host_yaml(),
+        parent = parent_str,
+        child = child_str,
+    );
+    let m = Manifest::parse(&yaml).unwrap();
+    let plan = Plan::new(&m).unwrap();
+    execute_run(&plan, "child", host_platform(), dir.path()).unwrap();
+
+    assert!(child_marker.exists(), "child's run: must have executed");
+    assert!(
+        !parent_marker.exists(),
+        "parent's run: must NOT have executed — runs do not cascade"
+    );
+}
+
+#[skuld::test]
+fn execute_run_errors_on_empty_run() {
+    // A target with no `run:` steps cannot be run. Pin the exact message so
+    // shell scripts piping into stderr stay stable.
+    let m = manifest(&format!(
+        r"
+targets:
+  build-only:
+    platforms: {host}
+    build: 'true'
+",
+        host = host_yaml(),
+    ));
+    let plan = Plan::new(&m).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let err = execute_run(&plan, "build-only", host_platform(), dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(r#"target "build-only" has no run steps defined"#),
+        "expected exact empty-run message, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn execute_run_errors_on_unknown_target() {
+    let m = manifest(&format!(
+        r"
+targets:
+  foo:
+    platforms: {host}
+",
+        host = host_yaml(),
+    ));
+    let plan = Plan::new(&m).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let err = execute_run(&plan, "nonexistent", host_platform(), dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(r#"unknown target: "nonexistent""#),
+        "expected exact unknown-target message, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn execute_run_errors_on_platform_mismatch() {
+    // Pick a non-host platform deterministically: if host is windows, use
+    // darwin; otherwise use windows. The target declares only the non-host
+    // platform, so order_for should reject it.
+    let host = host_platform();
+    let other = if host.os == Os::Windows {
+        Platform::new(Os::Darwin, Arch::Arm64)
+    } else {
+        Platform::new(Os::Windows, Arch::Amd64)
+    };
+
+    let yaml = format!(
+        r#"
+targets:
+  off-host:
+    platforms: {other}
+    run: 'true'
+"#,
+    );
+    let m = Manifest::parse(&yaml).unwrap();
+    let plan = Plan::new(&m).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let err = execute_run(&plan, "off-host", host, dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not apply to host platform") && msg.contains("off-host"),
+        "expected platform-mismatch message, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn execute_run_aborts_on_build_failure() {
+    // Build step returns non-zero. Run step would create a marker file; that
+    // marker must NOT exist after the call (the build failure must abort
+    // before any run step executes).
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran-anyway");
+    let marker_str = marker.to_string_lossy().replace('\\', "/");
+
+    let yaml = format!(
+        r#"
+targets:
+  foo:
+    platforms: {host}
+    build:
+      - bash: 'exit 7'
+    run:
+      - bash: 'touch "{marker}"'
+"#,
+        host = host_yaml(),
+        marker = marker_str,
+    );
+    let m = Manifest::parse(&yaml).unwrap();
+    let plan = Plan::new(&m).unwrap();
+    let err = execute_run(&plan, "foo", host_platform(), dir.path()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("building target") && msg.contains("foo"),
+        "expected build-context error, got: {msg}"
+    );
+    assert!(
+        !marker.exists(),
+        "run step executed despite build failure (marker file present)"
+    );
 }
 
 #[skuld::test]

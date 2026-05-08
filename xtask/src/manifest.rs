@@ -1,4 +1,4 @@
-//! `build.yaml` manifest: target registry for `cargo xtask build|test|list`.
+//! `build.yaml` manifest: target registry for `cargo xtask build|run|list`.
 //!
 //! See `build.yaml` at the repo root for the user-facing schema and the
 //! `i-want-to-brainstorm-zippy-lightning` design doc for the rationale.
@@ -267,6 +267,7 @@ pub struct Target {
     pub depends: Vec<String>,
     pub platforms: Vec<Platform>,
     pub build: Vec<Step>,
+    pub run: Vec<Step>,
 }
 
 impl Target {
@@ -276,16 +277,18 @@ impl Target {
         self.platforms.contains(&platform)
     }
 
-    /// Returns `true` if this target's name marks it as a test target (suffix
-    /// `-tests`). Used by `cargo xtask {build,test} --all` to filter.
-    pub fn is_test(&self) -> bool {
-        self.name.ends_with("-tests")
+    /// Returns `true` if this target declares any `run:` steps. The
+    /// `cargo xtask list` output marks runnable targets in the `RUN?` column.
+    pub fn has_run(&self) -> bool {
+        !self.run.is_empty()
     }
 }
 
 // Raw shape for a target — the post-deserialization step is normalizing
 // `Option<DependsRaw>` and `Option<BuildRaw>` into `Vec<...>` and resolving
-// `PlatformsRaw` into `Vec<Platform>`.
+// `PlatformsRaw` into `Vec<Platform>`. `run:` reuses `BuildRaw` because the
+// underlying shape (one step or a list of steps) is identical; the type's
+// name describes structure, not semantics.
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -295,6 +298,8 @@ struct TargetRaw {
     platforms: PlatformsRaw,
     #[serde(default)]
     build: Option<BuildRaw>,
+    #[serde(default)]
+    run: Option<BuildRaw>,
 }
 
 #[derive(Deserialize)]
@@ -450,6 +455,7 @@ impl Manifest {
             let depends = t.depends.map(DependsRaw::into_vec).unwrap_or_default();
             let platforms = t.platforms.into_vec().with_context(|| format!("in target {name:?}"))?;
             let build = t.build.map(BuildRaw::into_steps).unwrap_or_default();
+            let run = t.run.map(BuildRaw::into_steps).unwrap_or_default();
 
             // Reject platform duplicates inside one target — silent dedup would
             // hide a real authoring mistake.
@@ -467,6 +473,7 @@ impl Manifest {
                     depends,
                     platforms,
                     build,
+                    run,
                 },
             );
         }
