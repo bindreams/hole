@@ -32,6 +32,7 @@ use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use crate::test_support::ssserver::random_password_for;
 use hole_common::config::ServerEntry;
+use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
@@ -97,7 +98,7 @@ async fn assert_socks5_roundtrip(harness: &mut DistHarness, proxy_port: u16, tar
 /// Full template: start a bridge subprocess, send Start with the given
 /// `ProxyConfig`, do a SOCKS5 round-trip, send Stop, assert Ack.
 async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
-    let local_port = allocate_ephemeral_port().await;
+    let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
     let config = ProxyConfig {
         server: entry_from(ss),
         local_port,
@@ -206,7 +207,7 @@ mod tun {
     }
 
     async fn run_full_tunnel_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
-        let local_port = allocate_ephemeral_port().await;
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: entry_from(ss),
             local_port,
@@ -282,7 +283,7 @@ fn lifecycle_start_twice_returns_error(
     #[fixture(ssserver_none)] ss: &SsServerHandle,
 ) {
     rt().block_on(async {
-        let local_port = allocate_ephemeral_port().await;
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: entry_from(ss),
             local_port,
@@ -337,7 +338,7 @@ fn lifecycle_reload_changes_local_port(
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
     rt().block_on(async {
-        let port1 = allocate_ephemeral_port().await;
+        let port1 = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config1 = ProxyConfig {
             server: entry_from(ss),
             local_port: port1,
@@ -358,7 +359,7 @@ fn lifecycle_reload_changes_local_port(
             .unwrap();
         assert_socks5_roundtrip(&mut harness, port1, http.addr).await;
 
-        let port2 = allocate_ephemeral_port().await;
+        let port2 = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         assert_ne!(port1, port2, "ephemeral allocator should give a fresh port");
         let config2 = ProxyConfig {
             local_port: port2,
@@ -381,7 +382,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
     #[fixture(ssserver_none)] ss: &SsServerHandle,
 ) {
     rt().block_on(async {
-        let local_port = allocate_ephemeral_port().await;
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: entry_from(ss),
             local_port,
@@ -412,7 +413,10 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 /// SocksOnly bridge. Uses a one-shot real ss-server spawned in-test because
 /// the process-scoped `ssserver_*` fixtures are pinned to `aes-256-gcm`.
 ///
-#[skuld::test(labels = [DIST_BIN])]
+/// `[PORT_ALLOC] + serial = PORT_ALLOC`: the test inline-spawns an SS
+/// server (no `ssserver_*` fixture), so it does not inherit the
+/// label and must declare it explicitly. See `PORT_ALLOC`'s docstring.
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial = PORT_ALLOC)]
 fn cipher_chacha20_ietf_poly1305_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -420,11 +424,9 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
     rt().block_on(async {
         let method = CipherKind::CHACHA20_POLY1305;
         let password = random_password_for(method);
-        let ss_port = allocate_ephemeral_port().await;
-        let (ss_addr, _ss_handle) =
-            crate::test_support::ssserver::start_real_ss_server(method, &password, ss_port).await;
+        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
 
-        let local_port = allocate_ephemeral_port().await;
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: ServerEntry {
                 id: "cipher-test".into(),
@@ -456,7 +458,10 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
 /// Test 12: 2022-blake3-aes-256-gcm cipher round-trip. Enabled via the
 /// `aead-cipher-2022` feature on `shadowsocks-service`.
 ///
-#[skuld::test(labels = [DIST_BIN])]
+/// `[PORT_ALLOC] + serial = PORT_ALLOC`: same rationale as
+/// `cipher_chacha20_ietf_poly1305_roundtrip` — inline-spawned SS
+/// server, no `ssserver_*` fixture to propagate the label from.
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC], serial = PORT_ALLOC)]
 fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(http_target_ipv4)] http: &HttpTarget,
@@ -464,11 +469,9 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     rt().block_on(async {
         let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
         let password = random_password_for(method);
-        let ss_port = allocate_ephemeral_port().await;
-        let (ss_addr, _ss_handle) =
-            crate::test_support::ssserver::start_real_ss_server(method, &password, ss_port).await;
+        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
 
-        let local_port = allocate_ephemeral_port().await;
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: ServerEntry {
                 id: "cipher-test".into(),
