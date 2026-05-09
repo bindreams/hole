@@ -80,12 +80,22 @@ Three independent layers compose to handle transient file-contention on `Command
 Getting a free port for local binding or SIP003 subprocess handoff goes through `hole_common::port_alloc` ([crates/common/src/port_alloc.rs](crates/common/src/port_alloc.rs)):
 
 - `Protocols` — bitflag set of `TCP | UDP`. `hole_common::plugin::plugin_protocols(name)` maps a plugin's `udp_supported` bit to the right set.
-- `free_port(ip, protocols) -> io::Result<u16>` — finds a port free for every transport in `protocols`. Multi-transport is implemented as "pick via one transport, verify the rest via `ensure_port_free`, retry on mismatch." Retries internally on `ErrorKind::AddrInUse | PermissionDenied | AddrNotAvailable` (the [`is_bind_race`](crates/common/src/retry.rs) predicate). Terminal `WARN` log on exhaustion.
+- `bind_with_retry(ip, protocols, attempts, op) -> io::Result<(u16, T)>` — **the canonical entry point.** Allocates a port, calls `op(port)`, and retries the whole (allocate, bind) cycle on `is_bind_race` errors. Three production sites use it: `LocalDnsServer::bind`, `start_plugin_chain`, and `test_support::ssserver::start_real_ss_server*`.
+- `free_port(ip, protocols) -> io::Result<u16>` — primitive: finds a port free for every transport in `protocols`. Multi-transport is implemented as "pick via one transport, verify the rest via `ensure_port_free`, retry on mismatch." Retries internally on `ErrorKind::AddrInUse | PermissionDenied | AddrNotAvailable` (the [`is_bind_race`](crates/common/src/retry.rs) predicate). Terminal `WARN` log on exhaustion. **Direct callers are rejected by clippy `disallowed_methods`** — use `bind_with_retry` instead, or suppress with `#[allow]` + comment when the port must be returned to the caller before the bind happens (`test_support::port_alloc::allocate_ephemeral_port` is the sanctioned exception). See bindreams/hole#285.
 - `ensure_port_free(addr, protocols)` — pure probe without allocation; binds one socket per transport and drops.
 
-`LocalDnsServer::bind` ([crates/bridge/src/dns/server.rs](crates/bridge/src/dns/server.rs)) wraps the port-0 path in a second `retry_if_async(is_bind_race)` loop around `free_port` + `bind_once` to absorb the TOCTOU between `free_port`'s probe-drop and the real UDP+TCP pair bind. Fixed-port callers (`bind_ladder` on port 53) skip the wrapper — retry in place is futile, the ladder is the correct escape.
+`LocalDnsServer::bind` ([crates/bridge/src/dns/server.rs](crates/bridge/src/dns/server.rs)) routes port-0 callers through `bind_with_retry` to absorb the TOCTOU between `free_port`'s probe-drop and the real UDP+TCP pair bind. Fixed-port callers (`bind_ladder` on port 53) skip the wrapper — retry in place is futile, the ladder is the correct escape.
 
 The retry exists because Windows maintains **independent TCP/UDP excluded-port-range tables** (Hyper-V / WSL / Docker Desktop reservations, visible via `netsh int ipv4 show excludedportrange`); an OS-picked ephemeral port for one transport may be reserved for the other and the paired bind transiently fails. Galoshes's `garter::chain::allocate_one_port` hits the same class of bug — see bindreams/galoshes#21 for the deterministic `SO_EXCLUSIVEADDRUSE`-wildcard reproducer.
+
+**Scope of `bind_with_retry`.** The retry catches `is_bind_race` errors that surface from `op` as `io::Error`. Out-of-process binders (plugin subprocesses) report bind failures through other channels and are *not* retried by the wrapper. The retry-asymmetry per consumer:
+
+- **`LocalDnsServer::bind`** (no plugin) — load-bearing. UDP+TCP bind synchronously inside `op`; bind races propagate as `io::Error` and are retried.
+- **`start_real_ss_server`** (no plugin) — load-bearing. `SsServerBuilder::build` binds TCP+UDP synchronously; bind races propagate as `io::Error` (this is what fixed #285).
+- **`start_real_ss_server_with_plugin_*`** — structural-consistency only. The public_port is bound by the plugin subprocess after `build()` returns Ok; a public-port WSAEACCES surfaces as a `wait_for_port` timeout / connection refused, never as `io::Error`. The wrapper here only catches races on the SS-side rendezvous loopback port. Per-protocol correctness comes from the right `Protocols` argument.
+- **`start_plugin_chain`** — structural-consistency only. Plugin subprocess binds out-of-process; failures arrive as `ProxyError::Plugin(...)` via oneshot timeout / exit-before-ready and are converted to non-bind-race `io::Error::other` so they propagate immediately.
+
+The actual race-mitigation for the structural-consistency sites comes from `free_port`'s internal probe-side retries.
 
 ### Logging directives
 

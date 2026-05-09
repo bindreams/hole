@@ -22,6 +22,7 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use hole_common::config::ServerEntry;
+use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -133,8 +134,8 @@ fn e2e_socks5_only_http_port_unbound(
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
     rt().block_on(async {
-        let socks_port = allocate_ephemeral_port().await;
-        let http_port = allocate_ephemeral_port().await;
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
         let config = base_config(ss, socks_port, http_port);
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -157,8 +158,8 @@ fn e2e_http_only_socks_port_unbound(
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
     rt().block_on(async {
-        let socks_port = allocate_ephemeral_port().await;
-        let http_port = allocate_ephemeral_port().await;
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
         let mut config = base_config(ss, socks_port, http_port);
         config.proxy_socks5 = false;
         config.proxy_http = true;
@@ -183,8 +184,8 @@ fn e2e_both_listeners_bound(
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
     rt().block_on(async {
-        let socks_port = allocate_ephemeral_port().await;
-        let http_port = allocate_ephemeral_port().await;
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
         let mut config = base_config(ss, socks_port, http_port);
         config.proxy_http = true;
 
@@ -214,8 +215,8 @@ fn e2e_reload_toggling_http_listener_rebinds(
     #[fixture(http_target_ipv4)] http: &HttpTarget,
 ) {
     rt().block_on(async {
-        let socks_port = allocate_ephemeral_port().await;
-        let http_port = allocate_ephemeral_port().await;
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
         let config = base_config(ss, socks_port, http_port);
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -245,8 +246,14 @@ fn e2e_reload_toggling_http_listener_rebinds(
 #[skuld::test(labels = [DIST_BIN])]
 fn e2e_start_rejects_no_listeners(#[fixture(dist_dir)] dist: &Path, #[fixture(ssserver_none)] ss: &SsServerHandle) {
     rt().block_on(async {
-        let port = allocate_ephemeral_port().await;
-        let mut config = base_config(ss, port, port + 1);
+        // Both listeners disabled — no actual bind happens, so any
+        // Protocols choice would work, but keep TCP+UDP for the SOCKS5
+        // slot per the SOCKS5-listener-is-TcpAndUdp invariant.
+        // Allocate two distinct ports rather than `port + 1` to avoid
+        // wraparound to 0 when the first allocation hits 65535.
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
+        let mut config = base_config(ss, socks_port, http_port);
         config.proxy_socks5 = false;
         config.proxy_http = false;
 
@@ -262,7 +269,9 @@ fn e2e_start_rejects_no_listeners(#[fixture(dist_dir)] dist: &Path, #[fixture(ss
 #[skuld::test(labels = [DIST_BIN])]
 fn e2e_start_rejects_same_port(#[fixture(dist_dir)] dist: &Path, #[fixture(ssserver_none)] ss: &SsServerHandle) {
     rt().block_on(async {
-        let port = allocate_ephemeral_port().await;
+        // Same-port collision test: the port slot is the SOCKS5 listener
+        // (`local_port`), allocated as TCP+UDP per the invariant.
+        let port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let mut config = base_config(ss, port, port);
         config.proxy_http = true;
 
@@ -281,8 +290,8 @@ fn e2e_start_rejects_full_mode_without_socks5(
     #[fixture(ssserver_none)] ss: &SsServerHandle,
 ) {
     rt().block_on(async {
-        let socks_port = allocate_ephemeral_port().await;
-        let http_port = allocate_ephemeral_port().await;
+        let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let http_port = allocate_ephemeral_port(Protocols::TCP).await;
         let mut config = base_config(ss, socks_port, http_port);
         config.proxy_socks5 = false;
         config.proxy_http = true;
@@ -333,8 +342,8 @@ mod tun {
     ) {
         rt().block_on(async {
             let echo = UdpEchoServer::start().await.expect("UDP echo server bind");
-            let socks_port = allocate_ephemeral_port().await;
-            let http_port = allocate_ephemeral_port().await;
+            let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+            let http_port = allocate_ephemeral_port(Protocols::TCP).await;
             let mut config = base_config(ss, socks_port, http_port);
             config.tunnel_mode = TunnelMode::Full;
 
@@ -405,8 +414,8 @@ mod socks_only_udp {
         #[fixture(ssserver_none)] ss: &SsServerHandle,
     ) {
         rt().block_on(async {
-            let socks_port = allocate_ephemeral_port().await;
-            let http_port = allocate_ephemeral_port().await;
+            let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+            let http_port = allocate_ephemeral_port(Protocols::TCP).await;
             let config = base_config(ss, socks_port, http_port);
 
             let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
@@ -425,8 +434,8 @@ mod socks_only_udp {
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
     ) {
         rt().block_on(async {
-            let socks_port = allocate_ephemeral_port().await;
-            let http_port = allocate_ephemeral_port().await;
+            let socks_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+            let http_port = allocate_ephemeral_port(Protocols::TCP).await;
             let config = base_config(ss, socks_port, http_port);
 
             let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");

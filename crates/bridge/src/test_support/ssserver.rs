@@ -1,17 +1,21 @@
 //! In-process shadowsocks server fixtures.
 //!
-//! Each helper spins up a real `shadowsocks_service::server::Server` bound to
-//! `127.0.0.1:0` (or a caller-chosen port when a plugin is in front). The
-//! returned [`JoinHandle`]s own the server loop and must be kept alive for
-//! the duration of the test that uses them.
+//! Each helper spins up a real `shadowsocks_service::server::Server`
+//! bound to a loopback port the fixture allocates and binds in a single
+//! retry-wrapped operation via
+//! [`hole_common::port_alloc::bind_with_retry`], mirroring the
+//! [`crate::dns::server::LocalDnsServer::bind`] pattern. The returned
+//! [`JoinHandle`]s own the server loop and must be kept alive for the
+//! duration of the test that uses them.
 
 use crate::test_support::certs::TestCerts;
 use base64::Engine as _;
+use hole_common::port_alloc::{self, Protocols};
 use shadowsocks::config::{Mode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::plugin::PluginConfig;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 
@@ -39,28 +43,37 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
     }
 }
 
-/// Spin up a real shadowsocks server bound to `127.0.0.1:public_port` with
-/// the given cipher/password. Returns the bound TCP address and a handle to
-/// the running server task. The server relays anything the client asks for.
+/// Spin up a real shadowsocks server on a freshly-allocated loopback
+/// port with the given cipher/password. Returns the bound TCP address
+/// and a handle to the running server task. The server relays anything
+/// the client asks for.
 ///
-/// The caller must pre-allocate `public_port` (via
-/// [`crate::test_support::port_alloc::allocate_ephemeral_port`]) instead of
-/// passing 0: shadowsocks-rust's `ServerBuilder` clones `svr_cfg` when
-/// constructing both `TcpServer` and `UdpServer`. With port 0 each side
-/// would bind to a *different* kernel-allocated port, so UDP datagrams
-/// addressed at the TCP port (the only address the bridge knows) would
-/// arrive at a port with no UDP listener and be silently dropped.
-pub(crate) async fn start_real_ss_server(
-    method: CipherKind,
-    password: &str,
-    public_port: u16,
-) -> (SocketAddr, JoinHandle<()>) {
-    let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpAndUdp);
+/// The fixture owns port allocation and the bind, retrying both as a
+/// unit via [`port_alloc::bind_with_retry`]. This absorbs the residual
+/// probe-drop-to-bind TOCTOU on Windows, where independent TCP/UDP
+/// excluded-port-range tables can reject a freshly-allocated port on
+/// the paired transport. shadowsocks-rust's `ServerBuilder` clones
+/// `svr_cfg` when constructing both `TcpServer` and `UdpServer`, so
+/// passing port 0 would hand the two sockets distinct kernel-allocated
+/// ports — the explicit allocation here keeps them on the same port.
+pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
+    let (port, server) = port_alloc::bind_with_retry(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Protocols::TCP | Protocols::UDP,
+        port_alloc::BIND_RETRY_ATTEMPTS,
+        |port| {
+            let password = password.to_string();
+            async move {
+                let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
+                svr_cfg.set_mode(Mode::TcpAndUdp);
+                SsServerBuilder::new(svr_cfg).build().await
+            }
+        },
+    )
+    .await
+    .expect("start_real_ss_server: bind/build failed after retries");
 
-    let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
-
-    let addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let handle = tokio::spawn(async move {
         // Server::run consumes self and only ever returns Err on teardown
         // ("server exited unexpectedly"). The test ignores the error.
@@ -71,19 +84,18 @@ pub(crate) async fn start_real_ss_server(
 }
 
 /// Spin up a real shadowsocks server with v2ray-plugin (websocket, no TLS)
-/// in front. The plugin listens on `public_port` (which the caller
-/// pre-allocates and passes here) and forwards to the SS server. Returns the
-/// public-facing socket address and the spawned server task handle.
+/// in front. Returns the public-facing socket address and the spawned
+/// server task handle. The plugin's public listen port is verified for
+/// `Protocols::TCP` only — WS is TCP per RFC 6455.
 pub(crate) async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
-    public_port: u16,
     plugin_path: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
     spawn_ss_with_plugin(
         method,
         password,
-        public_port,
+        Protocols::TCP,
         plugin_path,
         "server;host=cloudfront.com;path=/",
     )
@@ -96,52 +108,77 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws(
 pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
     method: CipherKind,
     password: &str,
-    public_port: u16,
     plugin_path: &str,
     certs: &TestCerts,
 ) -> (SocketAddr, JoinHandle<()>) {
     let opts = format!("server;host=cloudfront.com;path=/;tls;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts).await
 }
 
 /// Spin up a real shadowsocks server with v2ray-plugin (QUIC transport) in
 /// front. QUIC auto-enables TLS inside v2ray-plugin
 /// ([main.go:142](../../../external/v2ray-plugin/main.go)), so the cert+key
-/// pair must still be supplied.
+/// pair must still be supplied. The plugin's public listen port is verified
+/// for `Protocols::UDP` because QUIC runs over UDP.
 pub(crate) async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,
-    public_port: u16,
     plugin_path: &str,
     certs: &TestCerts,
 ) -> (SocketAddr, JoinHandle<()>) {
     let opts = format!("server;host=cloudfront.com;mode=quic;{}", certs.plugin_opts_fragment());
-    spawn_ss_with_plugin(method, password, public_port, plugin_path, &opts).await
+    spawn_ss_with_plugin(method, password, Protocols::UDP, plugin_path, &opts).await
 }
 
-/// Inner helper used by every `_with_plugin_*` variant. Builds a server-side
-/// `ServerConfig`, attaches a `PluginConfig` with the given `plugin_opts`,
+/// Inner helper used by every `_with_plugin_*` variant. Allocates +
+/// binds the public port on the right [`Protocols`] for the plugin
+/// transport, builds a server-side `ServerConfig` with `PluginConfig`,
 /// and spawns the server loop.
+///
+/// **Retry-asymmetry note.** `bind_with_retry`'s outer retry catches
+/// `is_bind_race` errors that surface as `io::Error` from
+/// [`SsServerBuilder::build`]. For the plugin variants the public_port
+/// bind happens inside the **plugin subprocess**, after `build()`
+/// returns Ok — a public-port WSAEACCES surfaces as a `wait_for_port`
+/// timeout / connection refused, never as an `io::Error`. The wrapper
+/// here only catches races on the SS-side rendezvous loopback port
+/// that shadowsocks-rust's `Plugin::start` allocates synchronously
+/// (the long-standing #197 race class). Per-protocol correctness on
+/// the public port comes from the right `protocols` argument, not
+/// from the retry. See bindreams/hole#285 §"Where the fix actually
+/// lands".
 async fn spawn_ss_with_plugin(
     method: CipherKind,
     password: &str,
-    public_port: u16,
+    protocols: Protocols,
     plugin_path: &str,
     plugin_opts: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
-    let mut svr_cfg = ServerConfig::new(("127.0.0.1", public_port), password.to_string(), method).unwrap();
-    svr_cfg.set_mode(Mode::TcpAndUdp);
+    let (port, server) = port_alloc::bind_with_retry(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        protocols,
+        port_alloc::BIND_RETRY_ATTEMPTS,
+        |port| {
+            let password = password.to_string();
+            let plugin_path = plugin_path.to_string();
+            let plugin_opts = plugin_opts.to_string();
+            async move {
+                let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
+                svr_cfg.set_mode(Mode::TcpAndUdp);
+                svr_cfg.set_plugin(PluginConfig {
+                    plugin: plugin_path,
+                    plugin_opts: Some(plugin_opts),
+                    plugin_args: vec![],
+                    plugin_mode: Mode::TcpAndUdp,
+                });
+                SsServerBuilder::new(svr_cfg).build().await
+            }
+        },
+    )
+    .await
+    .expect("spawn_ss_with_plugin: bind/build failed after retries");
 
-    svr_cfg.set_plugin(PluginConfig {
-        plugin: plugin_path.to_string(),
-        plugin_opts: Some(plugin_opts.to_string()),
-        plugin_args: vec![],
-        plugin_mode: Mode::TcpAndUdp,
-    });
-
-    let server = SsServerBuilder::new(svr_cfg).build().await.unwrap();
-
-    let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
+    let public_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
     });

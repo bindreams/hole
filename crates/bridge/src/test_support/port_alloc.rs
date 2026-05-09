@@ -1,4 +1,4 @@
-//! Ephemeral TCP port allocation + liveness probe helpers for tests.
+//! Ephemeral port allocation + liveness probe helpers for tests.
 //!
 //! Port allocation delegates to [`hole_common::port_alloc::free_port`],
 //! which runs one bind probe per transport and retries Windows-specific
@@ -6,6 +6,14 @@
 //! needing cross-test serialization still use the `PORT_ALLOC` skuld
 //! label — `free_port`'s TOCTOU window (between probe drop and the real
 //! owner's bind) is identical to the kernel allocator's.
+//!
+//! For callers that bind in-process and can use a closure shape, prefer
+//! [`hole_common::port_alloc::bind_with_retry`] instead — it absorbs
+//! the residual probe-drop-to-bind TOCTOU by retrying on `is_bind_race`
+//! errors. This module's [`allocate_ephemeral_port`] is reserved for
+//! the case where the port is handed across a process boundary (e.g.
+//! to a `DistHarness` subprocess via JSON config) before the real bind
+//! happens; the closure shape can't fit there. See bindreams/hole#285.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -13,19 +21,32 @@ use std::time::{Duration, Instant};
 
 use hole_common::port_alloc::{self, Protocols};
 
-/// Pre-allocate a TCP port number on loopback and immediately drop the
-/// holder. The port is used to construct a bind address before the real
-/// owner binds. There is a tiny TOCTOU window between drop and the real
-/// bind; in practice the kernel does not reissue freshly-released ports
-/// immediately, and `PORT_ALLOC`-serialized fixtures don't race each
-/// other for the same port.
+/// Pre-allocate a port number on loopback verified free for every
+/// transport in `protocols`, and immediately drop the holder. The port
+/// is used to construct a bind address before the real owner binds.
+/// There is a tiny TOCTOU window between drop and the real bind;
+/// `PORT_ALLOC`-serialized fixtures don't race each other for the same
+/// port.
 ///
-/// Delegates to `hole_common::port_alloc::free_port` for the retry
-/// around Windows-specific bind races.
-pub(crate) async fn allocate_ephemeral_port() -> u16 {
-    port_alloc::free_port(IpAddr::V4(Ipv4Addr::LOCALHOST), Protocols::TCP)
+/// Callers must declare the right `protocols` set: a TCP-only probe
+/// followed by a TCP+UDP bind invites the Windows independent
+/// excluded-port-range race that #285 exists to prevent. For SOCKS5
+/// listener ports use `Protocols::TCP | Protocols::UDP` (the bridge
+/// SOCKS5 listener is structurally `Mode::TcpAndUdp`); for HTTP CONNECT
+/// listener ports use `Protocols::TCP`.
+///
+/// Direct delegation to `free_port` is suppressed-disallowed (see
+/// workspace `clippy.toml`) — this helper is the explicit exception
+/// because the port must be returned to the caller for external
+/// configuration before the bind happens.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this helper is the canonical exception to the bind_with_retry rule: the port is handed across a process boundary via JSON config"
+)]
+pub(crate) async fn allocate_ephemeral_port(protocols: Protocols) -> u16 {
+    port_alloc::free_port(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols)
         .await
-        .expect("allocate ephemeral TCP port")
+        .expect("allocate ephemeral port")
 }
 
 /// Poll-connect to `addr` until either a TCP connection succeeds or

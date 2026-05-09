@@ -10,7 +10,7 @@
 
 use super::{run_server_test, TestConfig};
 use crate::test_support::http_target::start_fake_sentinel;
-use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
+use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
 use crate::test_support::ssserver::{
@@ -63,11 +63,15 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
 /// raw TCP connect (no shadowsocks handshake), and verify both addresses are
 /// loopback. This guards against fixture-API drift in `shadowsocks-service`
 /// — if it stops compiling, every other test in this file fails too.
-#[skuld::test]
+///
+/// `[PORT_ALLOC] + serial = PORT_ALLOC` because the test inline-calls
+/// `start_real_ss_server` (which allocates a loopback port) without
+/// going through an `ssserver_*` fixture, so the label does not
+/// propagate transitively. See `PORT_ALLOC`'s docstring.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn fixture_starts_real_ss_server() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         assert!(svr_addr.ip().is_loopback(), "server bound to non-loopback");
         assert_ne!(svr_addr.port(), 0, "server port not assigned");
 
@@ -95,11 +99,10 @@ fn preflight_only_config() -> TestConfig {
 /// Test 1: happy path. Real server, valid credentials, fake sentinel that
 /// returns a HTTP-prefixed response. Should produce
 /// [`ServerTestOutcome::Reachable`] with `latency_ms >= 1`.
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_reachable_for_valid_credentials() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -184,11 +187,10 @@ fn run_test_returns_tcp_refused_for_closed_port() {
 /// different password. The server's AEAD decrypt fails on the address frame,
 /// it closes the stream, and the runner observes EOF on its first read →
 /// [`ServerTestOutcome::TunnelHandshakeFailed`].
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_tunnel_handshake_failed_for_wrong_password() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -213,11 +215,10 @@ fn run_test_returns_tunnel_handshake_failed_for_wrong_password() {
 /// Server is started with `aes-256-gcm`; runner uses `chacha20-ietf-poly1305`.
 /// Same observable behavior as test 5 — the AEAD frame fails to decrypt and
 /// the server closes the stream.
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_tunnel_handshake_failed_for_wrong_cipher() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -240,11 +241,10 @@ fn run_test_returns_tunnel_handshake_failed_for_wrong_cipher() {
 /// Test 7: sentinel mismatch — bytes flow back, but they don't start with
 /// `"HTTP"`. The test must encode the first ~5 bytes as hex and report
 /// [`ServerTestOutcome::SentinelMismatch`].
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_sentinel_mismatch_for_garbage_response() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         // Six all-zero bytes — definitely not "HTTP".
         let (sentinel_a, _sa) = start_fake_sentinel(vec![0u8, 0, 0, 0, 0, 0]).await;
         let (sentinel_b, _sb) = start_fake_sentinel(vec![0u8, 0, 0, 0, 0, 0]).await;
@@ -278,11 +278,10 @@ fn run_test_returns_sentinel_mismatch_for_garbage_response() {
 /// fake sentinel, forwards the HEAD request, receives EOF on its upstream
 /// half, and closes the tunnel side. The runner observes EOF on its first
 /// read → [`ServerTestOutcome::ServerCannotReachInternet`].
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_server_cannot_reach_internet_when_sentinels_close_empty() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         // Empty response — fake sentinel reads our HEAD, writes nothing,
         // closes its socket. This is the cleanest simulation of "upstream
         // accepted connection but had nothing to say".
@@ -311,11 +310,10 @@ fn run_test_returns_server_cannot_reach_internet_when_sentinels_close_empty() {
 /// is not on PATH and not next to any plugin directory. `Plugin::start`
 /// returns Err immediately, surfaced as
 /// [`ServerTestOutcome::PluginStartFailed`].
-#[skuld::test]
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
     rt().block_on(async {
-        let port = crate::test_support::port_alloc::allocate_ephemeral_port().await;
-        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, port).await;
+        let (svr_addr, _svr) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -403,10 +401,8 @@ fn run_test_with_v2ray_plugin_happy_path() {
     }
 
     rt().block_on(async {
-        let public_port = allocate_ephemeral_port().await;
         let (svr_addr, _svr) =
-            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, public_port, plugin_path.to_str().unwrap())
-                .await;
+            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, plugin_path.to_str().unwrap()).await;
         // The SS server's plugin is spawned async; wait for it to bind the
         // public port before letting the runner attempt preflight.
         wait_for_port(svr_addr, Duration::from_secs(7)).await;

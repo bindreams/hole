@@ -28,6 +28,34 @@
 
 #[skuld::label]
 pub(crate) const DIST_BIN: skuld::Label;
+
+/// Mutual exclusion for ephemeral-port allocation.
+///
+/// Tests that allocate ports without going through a serialized
+/// fixture must carry this label *and* `serial = PORT_ALLOC`, so
+/// concurrent test bodies don't pick the same port at the same instant
+/// — `free_port`'s probe-drop is not OS-synchronized across threads.
+///
+/// **Skuld serial vs label propagation.** Skuld merges a consumed
+/// fixture's `serial` into the test's effective serial constraint, so
+/// a test consuming `[fixture(ssserver_*)]` (each marked `serial =
+/// PORT_ALLOC`) inherits the serial gate transitively — its execution
+/// blocks against fixture init that holds the same serial slot. The
+/// **label list** itself does NOT propagate: only the `serial`
+/// constraint does. Tests that need to participate in `PORT_ALLOC`
+/// mutual exclusion as a label-bearing party (so other `serial =
+/// PORT_ALLOC` tests block against them too) must declare the label
+/// explicitly. See `cipher_chacha20_*_roundtrip`, the `run_test_*`
+/// family in `server_test_tests.rs`, and
+/// `run_test_with_v2ray_plugin_happy_path` for examples.
+///
+/// After bindreams/hole#285 the four `ssserver_*` fixtures own their
+/// own (allocate, bind) retry loop via
+/// [`hole_common::port_alloc::bind_with_retry`], so the
+/// pre-allocate-then-bind TOCTOU window the label originally protected
+/// inside fixture init is gone. The label remains because per memory's
+/// "no feature regressions for test flakes" rule, the serialization
+/// stays until a soak run proves it's safe to remove.
 #[skuld::label]
 pub(crate) const PORT_ALLOC: skuld::Label;
 #[skuld::label]
@@ -39,7 +67,6 @@ pub(crate) const IPV6: skuld::Label;
 
 use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
-use crate::test_support::port_alloc::allocate_ephemeral_port;
 use crate::test_support::ssserver::{
     locate_built_galoshes, start_real_ss_server, start_real_ss_server_with_plugin_quic,
     start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR,
@@ -79,17 +106,13 @@ pub(crate) fn test_certs() -> Result<TestCerts, String> {
     Ok(crate::test_support::certs::generate_test_certs())
 }
 
-/// Plain shadowsocks server, no plugin.
-///
-/// `serial = PORT_ALLOC` because `start_real_ss_server` requires a
-/// pre-allocated port (see the docstring there for why) — and pre-allocation
-/// has a TOCTOU window with concurrent fixture inits.
+/// Plain shadowsocks server, no plugin. `serial = PORT_ALLOC` per the
+/// label's docstring above.
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let addr = runtime.block_on(async {
-        let public_port = allocate_ephemeral_port().await;
-        let (addr, _handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD, public_port).await;
+        let (addr, _handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
         addr
     });
     Ok(SsServerHandle {
@@ -108,9 +131,7 @@ pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let addr = runtime.block_on(async {
-        let public_port = allocate_ephemeral_port().await;
-        let (addr, _handle) =
-            start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, public_port, &plugin_path).await;
+        let (addr, _handle) = start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, &plugin_path).await;
         addr
     });
     Ok(SsServerHandle {
@@ -134,9 +155,8 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
         path_for_plugin_opts(&certs.key_path)
     );
     let addr = runtime.block_on(async {
-        let public_port = allocate_ephemeral_port().await;
         let (addr, _handle) =
-            start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, public_port, &plugin_path, certs).await;
+            start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await;
         addr
     });
     Ok(SsServerHandle {
@@ -161,9 +181,8 @@ pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<
         path_for_plugin_opts(&certs.key_path)
     );
     let addr = runtime.block_on(async {
-        let public_port = allocate_ephemeral_port().await;
         let (addr, _handle) =
-            start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, public_port, &plugin_path, certs).await;
+            start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await;
         addr
     });
     Ok(SsServerHandle {

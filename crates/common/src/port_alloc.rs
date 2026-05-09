@@ -3,14 +3,27 @@
 //! excluded-port-range tables, WSAEADDRINUSE from `SO_EXCLUSIVEADDRUSE`
 //! wildcard holders, WSAEADDRNOTAVAIL from the same reservation layer).
 //!
-//! Three consumers in the bridge:
+//! [`bind_with_retry`] is the canonical entry point: it composes
+//! [`free_port`] (which probes once per transport with internal retry
+//! on probe-side races) with a caller-supplied bind closure, and retries
+//! the whole (allocate, bind) cycle on [`is_bind_race`] errors that
+//! surface from the closure. This absorbs the residual TOCTOU between
+//! `free_port`'s probe-drop and the real owner's bind.
+//!
+//! Three consumers in the bridge route through `bind_with_retry`:
 //!
 //! * [`crate::dns::server::LocalDnsServer::bind`][0] (via hole-bridge) —
 //!   UDP+TCP on the same ephemeral loopback port.
-//! * `test_support::port_alloc::allocate_ephemeral_port` — subprocess
-//!   port handoff in tests.
 //! * `proxy::plugin::start_plugin_chain` — SIP003 plugin port (TCP or
 //!   TCP+UDP depending on plugin's `udp_supported` bit).
+//! * `test_support::ssserver::start_real_ss_server*` — in-process
+//!   shadowsocks server fixtures.
+//!
+//! Direct `free_port` callers must explicitly justify why the
+//! `bind_with_retry` closure shape doesn't fit, suppressing the
+//! `disallowed_methods` clippy lint (see workspace `clippy.toml`). The
+//! one current case is `test_support::port_alloc::allocate_ephemeral_port`,
+//! which hands the port across a process boundary via JSON config.
 //!
 //! [0]: https://github.com/bindreams/hole/blob/main/crates/bridge/src/dns/server.rs
 //!
@@ -239,6 +252,96 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
         ),
     }
     result.map(|a| a.port())
+}
+
+/// Default outer-retry budget for [`bind_with_retry`]. Five matches the
+/// inner [`MAX_BIND_ATTEMPTS`] budget — worst-case 25 attempts. Each
+/// attempt is fast for in-process binders (one OS bind + drop). Callers
+/// that pay per-attempt subprocess startup cost should pass a smaller
+/// budget explicitly.
+pub const BIND_RETRY_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
+
+/// Run `op(port)` against a freshly-allocated port on `ip` that is
+/// verified free for every transport in `protocols`. Retries the whole
+/// (allocate, bind) cycle on [`is_bind_race`] errors up to `attempts`.
+/// Returns the bound port and `op`'s value on success.
+///
+/// **Scope.** `bind_with_retry` only retries `is_bind_race` errors that
+/// surface from `op` as `io::Error`. Out-of-process binders (e.g. plugin
+/// subprocesses that bind the port themselves) report bind failures
+/// through other channels (oneshot timeout, exit code, stderr); those
+/// are not retried here. Use `bind_with_retry` for structural consistency
+/// at every ephemeral-bind site, but expect the retry to be load-bearing
+/// only for in-process binders.
+///
+/// `op` is `Fn` rather than `FnMut`: each retry re-invokes it
+/// independently and per-call state should be created inside the
+/// closure rather than carried across attempts.
+///
+/// Logging mirrors [`free_port`]: outer retries emit `info!`, exhaustion
+/// emits `warn!`, target `hole_common::port_alloc`.
+pub async fn bind_with_retry<T, F, Fut>(
+    ip: IpAddr,
+    protocols: Protocols,
+    attempts: NonZeroU32,
+    op: F,
+) -> io::Result<(u16, T)>
+where
+    F: Fn(u16) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let n = attempts.get();
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..n {
+        if attempt > 0 {
+            info!(
+                target: "hole_common::port_alloc",
+                attempt = attempt,
+                max_attempts = n,
+                ip = %ip,
+                protocols = %protocols,
+                "bind_with_retry retry"
+            );
+        }
+        // bind_with_retry IS the canonical caller of free_port — the
+        // disallowed_methods lint rule applies to higher-level callers
+        // that should be using this wrapper. See workspace `clippy.toml`.
+        #[allow(clippy::disallowed_methods)]
+        let port = free_port(ip, protocols).await?;
+        match op(port).await {
+            Ok(value) => return Ok((port, value)),
+            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
+                last_err = Some(e);
+            }
+            Err(e) => {
+                // Two cases reach this arm: (a) the final retry's
+                // bind-race exhausted the budget, (b) any attempt
+                // returned a non-bind-race error. Only (a) is "retry
+                // exhausted"; (b) is immediate propagation.
+                if is_bind_race(&e) && attempt + 1 == n {
+                    warn!(
+                        target: "hole_common::port_alloc",
+                        attempts = n,
+                        ip = %ip,
+                        protocols = %protocols,
+                        error = %e,
+                        "bind_with_retry exhausted"
+                    );
+                }
+                return Err(e);
+            }
+        }
+    }
+    let err = last_err.expect("NonZeroU32 guarantees at least one attempt recorded an error");
+    warn!(
+        target: "hole_common::port_alloc",
+        attempts = n,
+        ip = %ip,
+        protocols = %protocols,
+        error = %err,
+        "bind_with_retry exhausted"
+    );
+    Err(err)
 }
 
 #[cfg(test)]

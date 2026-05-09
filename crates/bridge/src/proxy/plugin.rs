@@ -89,6 +89,17 @@ impl Drop for PluginChain {
 /// and UDP so their internal dual bind on the local address can't hit
 /// the Windows cross-protocol excluded-port race. See
 /// [`hole_common::plugin::plugin_protocols`].
+///
+/// Goes through [`port_alloc::bind_with_retry`] for structural
+/// consistency with the other ephemeral-bind sites in the workspace.
+/// The retry envelope is decorative for this site: the plugin
+/// subprocess binds `local_addr` itself, so a Windows excluded-range
+/// failure surfaces as a `ProxyError::Plugin` (oneshot timeout / exit
+/// before ready) rather than an `io::Error`, and `is_bind_race` cannot
+/// classify it. Plugin failures are converted to `io::Error::other`
+/// (non-bind-race), which `bind_with_retry` propagates immediately.
+/// `free_port`'s internal probe-side retry covers the practical
+/// exposure. See bindreams/hole#285 §"Where the fix actually lands".
 pub async fn start_plugin_chain(
     plugin_name: &str,
     plugin_path: &str,
@@ -107,8 +118,69 @@ pub async fn start_plugin_chain(
     // Per-plugin syntax differs; for plugins we don't have a known
     // directive for, the options pass through unchanged.
     let merged_opts = inject_plugin_debug_logging(plugin_name, plugin_opts);
-    let merged_opts_arg = merged_opts.as_deref();
-    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts_arg);
+    let protocols = plugin_protocols(plugin_name);
+
+    let (_port, (handle, cancel, ready_addr)) = port_alloc::bind_with_retry(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        protocols,
+        port_alloc::BIND_RETRY_ATTEMPTS,
+        |port| {
+            // The Fn closure cannot move `merged_opts` (owned String) into
+            // an `async move`; clone per attempt instead. `&str`/`&Path`
+            // arguments are Copy and pass through unchanged.
+            let merged_opts = merged_opts.clone();
+            async move {
+                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                spawn_plugin_runner_at(
+                    plugin_name,
+                    plugin_path,
+                    merged_opts.as_deref(),
+                    local_addr,
+                    server_host,
+                    server_port,
+                    state_dir,
+                )
+                .await
+                .map_err(proxy_err_to_io_err)
+            }
+        },
+    )
+    .await
+    .map_err(|e| ProxyError::Plugin(format!("plugin chain start failed: {e}")))?;
+
+    Ok(PluginChain {
+        handle,
+        cancel,
+        local_addr: ready_addr,
+        state_dir: state_dir.map(Path::to_path_buf),
+    })
+}
+
+/// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
+/// (with optional `pid_sink`), wraps in `TapPlugin` when
+/// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
+/// and awaits readiness with a 30-second timeout. On failure runs
+/// `cancel.cancel(); handle.abort()` so a retried attempt by
+/// `bind_with_retry` doesn't leak the previous attempt's task. On
+/// success returns `(handle, cancel, ready_addr)` — the caller wraps
+/// these in a [`PluginChain`].
+async fn spawn_plugin_runner_at(
+    plugin_name: &str,
+    plugin_path: &str,
+    merged_opts: Option<&str>,
+    local_addr: SocketAddr,
+    server_host: &str,
+    server_port: u16,
+    state_dir: Option<&Path>,
+) -> Result<
+    (
+        tokio::task::JoinHandle<garter::Result<()>>,
+        CancellationToken,
+        SocketAddr,
+    ),
+    ProxyError,
+> {
+    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts);
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();
@@ -130,16 +202,6 @@ pub async fn start_plugin_chain(
     let cancel = CancellationToken::new();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Allocate via hole-common's `free_port` (was `garter::chain::allocate_ports`).
-    // Supersedes garter's internal TCP-only allocator so UDP-capable plugins
-    // (galoshes) get a port verified on both TCP and UDP. Retry for Windows
-    // WSAEACCES / EADDRINUSE / EADDRNOTAVAIL is handled inside `free_port`.
-    let ip: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let port = port_alloc::free_port(ip, plugin_protocols(plugin_name))
-        .await
-        .map_err(|e| ProxyError::Plugin(format!("port allocation failed: {e}")))?;
-    let local_addr = SocketAddr::new(ip, port);
-
     let env = garter::PluginEnv {
         local_host: local_addr.ip(),
         local_port: local_addr.port(),
@@ -148,7 +210,7 @@ pub async fn start_plugin_chain(
         // Use the merged options here too so any environment-source path
         // for SS_PLUGIN_OPTIONS sees the same loglevel directive as the
         // direct `cmd.env` set in `BinaryPlugin::run`.
-        plugin_options: merged_opts.clone(),
+        plugin_options: merged_opts.map(String::from),
     };
 
     // #267: when `HOLE_BRIDGE_PLUGIN_TAP=1` is set, wrap the plugin in a
@@ -175,7 +237,7 @@ pub async fn start_plugin_chain(
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    let local_addr = match tokio::time::timeout(READINESS_TIMEOUT, ready_rx).await {
+    let ready_addr = match tokio::time::timeout(READINESS_TIMEOUT, ready_rx).await {
         Ok(Ok(addr)) => addr,
         Ok(Err(_)) => {
             cancel.cancel();
@@ -189,12 +251,24 @@ pub async fn start_plugin_chain(
         }
     };
 
-    Ok(PluginChain {
-        handle,
-        cancel,
-        local_addr,
-        state_dir: state_dir.map(Path::to_path_buf),
-    })
+    Ok((handle, cancel, ready_addr))
+}
+
+/// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into a
+/// non-bind-race [`io::Error`] so [`port_alloc::bind_with_retry`]
+/// propagates it immediately. Plugin failures (subprocess exit before
+/// ready, readiness timeout) are not bind races we can deterministically
+/// retry through; only `free_port`'s own probe failures (already
+/// retried inside `bind_with_retry`) trigger the outer retry.
+///
+/// `spawn_plugin_runner_at` only emits `ProxyError::Plugin`; the
+/// `unreachable!` arm is the contract guard. Future contributors who
+/// add new variants must update this site to map them appropriately.
+fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
+    match e {
+        ProxyError::Plugin(msg) => std::io::Error::other(msg),
+        other => unreachable!("spawn_plugin_runner_at only emits ProxyError::Plugin, got: {other}"),
+    }
 }
 
 /// Append a debug-level log directive to a plugin's `SS_PLUGIN_OPTIONS`
