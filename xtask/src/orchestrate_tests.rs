@@ -1,5 +1,8 @@
+use clap::Parser;
+
 use crate::manifest::*;
 use crate::orchestrate::*;
+use crate::Cli;
 
 fn manifest(yaml: &str) -> Manifest {
     Manifest::parse(yaml).unwrap()
@@ -360,11 +363,10 @@ fn host_platform() -> Platform {
     Platform::host().expect("test host must be in the known platform set")
 }
 
-fn host_yaml() -> &'static str {
+fn host_yaml() -> String {
     // String form of the host platform — `<os>/<arch>` — for use inside the
     // raw-YAML test fixtures.
-    let p = host_platform();
-    Box::leak(format!("{p}").into_boxed_str())
+    host_platform().to_string()
 }
 
 #[skuld::test]
@@ -579,5 +581,41 @@ targets:
     assert!(
         msg.contains("a") && msg.contains("b") && !msg.contains("\"c\""),
         "expected cycle to list a and b but not c, got: {msg}"
+    );
+}
+
+// ===== CLI shape =====================================================================================================
+//
+// The framework explicitly forbids `cargo xtask run --all`; "run everything"
+// is not a meaningful operation. Pin this at the clap-parse level so a
+// future edit that adds `#[arg(long)] all: bool` to `Command::Run` is
+// rejected by the test suite, not silently merged.
+
+#[skuld::test]
+fn cli_run_rejects_all_flag() {
+    let err = match Cli::try_parse_from(["xtask", "run", "--all"]) {
+        Ok(_) => panic!("expected --all to be rejected on the run subcommand"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--all") || msg.contains("unexpected"),
+        "expected --all to be rejected on the run subcommand, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn cli_run_requires_target_positional() {
+    // No positional → clap MissingRequiredArgument. This pins that we use a
+    // required positional rather than `Option<String>`-with-runtime-check.
+    let err = match Cli::try_parse_from(["xtask", "run"]) {
+        Ok(_) => panic!("expected `xtask run` (no positional) to be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "expected MissingRequiredArgument, got: {:?}",
+        err.kind()
     );
 }

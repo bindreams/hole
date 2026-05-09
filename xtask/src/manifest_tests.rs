@@ -714,3 +714,46 @@ fn frontend_build_target_shape() {
     assert_eq!(t.depends, Vec::<String>::new());
     assert!(!t.has_run());
 }
+
+#[skuld::test]
+fn tests_targets_run_matches_build_minus_no_run() {
+    // Each `*-tests` target's `run:` is the canonical local nextest invocation
+    // — the same command line as its `build:` minus `--no-run`. CI doesn't
+    // exercise these `run:` blocks (test-hole / test-garter / test-galoshes
+    // use SKULD_LABELS / archive-based paths instead), so a typo in any of
+    // them would only surface when a developer runs `cargo xtask run X-tests`.
+    // Pin the symmetry here so a manifest edit that drifts run from build is
+    // caught at unit-test time.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+
+    for name in ["hole-tests", "galoshes-tests", "garter-tests", "garter-bin-tests", "mock-plugin-tests"] {
+        let t = m.get(name).unwrap_or_else(|| panic!("{name:?} target missing"));
+        assert_eq!(
+            t.build.len(),
+            1,
+            "{name:?} build is expected to be a single nextest invocation"
+        );
+        assert_eq!(t.run.len(), 1, "{name:?} run is expected to be a single nextest invocation");
+        let (Step::Bash { command: build_cmd, .. }, Step::Bash { command: run_cmd, .. }) = (&t.build[0], &t.run[0])
+        else {
+            panic!("{name:?}: build/run must be Bash steps");
+        };
+        // Trim and normalize whitespace before comparing — YAML's `>` folded
+        // scalar collapses newlines into spaces, but the resulting strings can
+        // still differ by trailing whitespace from line continuations.
+        let build_normalized: String = build_cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+        let run_normalized: String = run_cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected_run = build_normalized.replace(" --no-run", "");
+        assert_eq!(
+            run_normalized, expected_run,
+            "{name:?}: run command must equal build command with `--no-run` removed.\n  \
+             build (normalized): {build_normalized:?}\n  \
+             expected run: {expected_run:?}\n  \
+             actual run (normalized): {run_normalized:?}"
+        );
+        // Sanity: build must contain --no-run, run must not.
+        assert!(build_cmd.contains("--no-run"), "{name:?} build must contain --no-run");
+        assert!(!run_cmd.contains("--no-run"), "{name:?} run must not contain --no-run");
+    }
+}
