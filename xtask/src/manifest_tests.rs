@@ -727,14 +727,24 @@ fn tests_targets_run_matches_build_minus_no_run() {
     let yaml = include_str!("../../build.yaml");
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
 
-    for name in ["hole-tests", "galoshes-tests", "garter-tests", "garter-bin-tests", "mock-plugin-tests"] {
+    for name in [
+        "hole-tests",
+        "galoshes-tests",
+        "garter-tests",
+        "garter-bin-tests",
+        "mock-plugin-tests",
+    ] {
         let t = m.get(name).unwrap_or_else(|| panic!("{name:?} target missing"));
         assert_eq!(
             t.build.len(),
             1,
             "{name:?} build is expected to be a single nextest invocation"
         );
-        assert_eq!(t.run.len(), 1, "{name:?} run is expected to be a single nextest invocation");
+        assert_eq!(
+            t.run.len(),
+            1,
+            "{name:?} run is expected to be a single nextest invocation"
+        );
         let (Step::Bash { command: build_cmd, .. }, Step::Bash { command: run_cmd, .. }) = (&t.build[0], &t.run[0])
         else {
             panic!("{name:?}: build/run must be Bash steps");
