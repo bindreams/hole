@@ -24,10 +24,13 @@ fn disabled_image_has_correct_dimensions() {
 }
 
 #[skuld::test]
-fn enabled_and_disabled_differ() {
+fn enabled_and_disabled_match() {
+    // Per user spec: disabled is currently rendered identically to
+    // enabled. If a designer-provided disabled variant lands later,
+    // flip this back to assert_ne!.
     let enabled = tray_image(TrayState::Enabled);
     let disabled = tray_image(TrayState::Disabled);
-    assert_ne!(enabled.rgba(), disabled.rgba());
+    assert_eq!(enabled.rgba(), disabled.rgba());
 }
 
 #[cfg(target_os = "windows")]

@@ -40,36 +40,27 @@ pub fn tray_image(state: TrayState) -> Image<'static> {
 
 // macOS ===============================================================================================================
 
+// Enabled and Disabled intentionally resolve to the same bytes (user
+// spec 2026-05-10: the designer hasn't shipped a separate disabled
+// design). The `TrayState` enum is kept so a future design can drop in
+// at this dispatch site without API churn at every call site.
 #[cfg(target_os = "macos")]
-fn macos_image(state: TrayState) -> Image<'static> {
-    const ENABLED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-template.rgba"));
-    const DISABLED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-template.rgba"));
+fn macos_image(_state: TrayState) -> Image<'static> {
+    const TEMPLATE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-template.rgba"));
     const SIZE: u32 = 36;
-
-    let rgba = match state {
-        TrayState::Enabled => ENABLED,
-        TrayState::Disabled => DISABLED,
-    };
-    Image::new(rgba, SIZE, SIZE)
+    Image::new(TEMPLATE, SIZE, SIZE)
 }
 
 // Windows =============================================================================================================
 
+// See `macos_image` re: identical bytes for Enabled/Disabled.
 #[cfg(target_os = "windows")]
-fn windows_image(state: TrayState) -> Image<'static> {
-    const ENABLED_DARK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-dark.rgba"));
-    const ENABLED_LIGHT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-enabled-light.rgba"));
-    const DISABLED_DARK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-dark.rgba"));
-    const DISABLED_LIGHT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-disabled-light.rgba"));
+fn windows_image(_state: TrayState) -> Image<'static> {
+    const DARK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-dark.rgba"));
+    const LIGHT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-light.rgba"));
     const SIZE: u32 = 32;
 
-    let is_light = is_light_taskbar();
-    let rgba = match (state, is_light) {
-        (TrayState::Enabled, false) => ENABLED_DARK,
-        (TrayState::Enabled, true) => ENABLED_LIGHT,
-        (TrayState::Disabled, false) => DISABLED_DARK,
-        (TrayState::Disabled, true) => DISABLED_LIGHT,
-    };
+    let rgba = if is_light_taskbar() { LIGHT } else { DARK };
     Image::new(rgba, SIZE, SIZE)
 }
 
