@@ -23,6 +23,29 @@ pub fn add_user_to_group(username: &str) -> io::Result<()> {
     os::add_user_to_group(username)
 }
 
+/// Returns `true` if a local group with the given name exists.
+///
+/// macOS: wraps POSIX `getgrnam(3)` (locale-independent; queries the same
+/// `opendirectoryd` backend `dseditgroup` writes to). A name containing a
+/// NUL byte is, by definition, not a valid POSIX group name and returns
+/// `false` rather than panicking.
+///
+/// Used internally by `create_group` and `delete_group` for EAFP-style
+/// idempotency. `pub(crate)` for the test module.
+#[cfg(target_os = "macos")]
+pub(crate) fn group_exists(name: &str) -> bool {
+    // A name with an embedded NUL is not a valid POSIX group name; libc
+    // would see only the prefix. Return `false` rather than panic.
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: getgrnam returns a pointer into a libc-owned process-wide
+    // static buffer (or NULL). We only `is_null`-check, never dereference
+    // — so concurrent callers racing the static buffer cannot corrupt our
+    // observation. The CString outlives the call.
+    unsafe { !libc::getgrnam(cname.as_ptr()).is_null() }
+}
+
 /// Detect the real interactive user behind an elevated session.
 ///
 /// On macOS: reads `SUDO_USER`, then `stat -f %Su /dev/console`, then `logname`.
@@ -52,47 +75,50 @@ mod os {
     use std::io;
     use std::process::Command;
 
-    use super::GROUP_NAME;
+    use super::{GROUP_NAME, group_exists};
 
     pub fn create_group() -> io::Result<()> {
+        // EAFP: just try to create. On macOS `dseditgroup -o create` is
+        // non-idempotent — when the record already exists it tries to prompt
+        // ("Operation cancelled because record could not be replaced", or
+        // "Create called on existing record - do you want to overwrite, y or
+        // n :", depending on whether stdin is a tty) and exits non-zero. We
+        // can't tell that case apart from a real failure by parsing stderr
+        // (the messages are localized). Instead, on failure we ask `getgrnam`
+        // whether the group exists; if it does, our caller's intent is met
+        // and we return success — broadening the success condition from
+        // "create succeeded" to "the group exists at end of attempt", which
+        // is what idempotency requires.
         let output = Command::new("dseditgroup")
             .args(["-o", "create", GROUP_NAME])
             .output()?;
 
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // "already exists" is not an error for our purposes
-        if stderr.contains("already exists") {
+        if output.status.success() || group_exists(GROUP_NAME) {
             return Ok(());
         }
 
         Err(io::Error::other(format!(
             "dseditgroup create failed: {}",
-            stderr.trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
 
     pub fn delete_group() -> io::Result<()> {
+        // EAFP, mirror of `create_group`: macOS `dseditgroup -o delete` on a
+        // missing group exits non-zero with a localized "not found" stderr.
+        // Use `getgrnam` to verify post-failure and avoid stderr-substring
+        // matching that breaks under non-English locales.
         let output = Command::new("dseditgroup")
             .args(["-o", "delete", GROUP_NAME])
             .output()?;
 
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Group not found is not an error for deletion
-        if stderr.contains("not found") {
+        if output.status.success() || !group_exists(GROUP_NAME) {
             return Ok(());
         }
 
         Err(io::Error::other(format!(
             "dseditgroup delete failed: {}",
-            stderr.trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
 

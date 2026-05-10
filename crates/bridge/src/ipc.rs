@@ -660,14 +660,16 @@ pub fn installer_user_sid_path() -> std::path::PathBuf {
 /// # Testing
 ///
 /// This function is not covered by a unit test. Its idempotence is a
-/// property of the primitives it composes: `group::create_group` and
-/// `group::add_user_to_group` are documented as idempotent on
-/// "already exists" errors (see their implementations in `group.rs`),
-/// and `std::fs::write` on the SID file path unconditionally overwrites.
-/// An end-to-end test would require elevation (to actually call
-/// `dseditgroup` / `net localgroup`), so we don't add one — elevation is
-/// a runtime dependency, not a test-harness dependency. Integration
-/// coverage is provided by the install-service Verification step.
+/// property of the primitives it composes: `group::create_group` is
+/// idempotent (macOS: verifies post-failure with `getgrnam(3)`;
+/// Windows: detects error code 1379) and `group::add_user_to_group`
+/// is idempotent (macOS: `dseditgroup -o edit -a` is naturally
+/// idempotent; Windows: detects error code 1378). `std::fs::write` on
+/// the SID file path unconditionally overwrites. An end-to-end test
+/// would require elevation (to actually call `dseditgroup` /
+/// `net localgroup`), so we don't add one — elevation is a runtime
+/// dependency, not a test-harness dependency. Integration coverage is
+/// provided by the install-service Verification step.
 pub fn prepare_ipc_access() -> std::io::Result<()> {
     crate::group::create_group()?;
     let user = crate::group::installing_username()?;
@@ -767,8 +769,11 @@ fn apply_socket_permissions(path: &Path) {
     // Look up the 'hole' group GID
     let group_name = CString::new(crate::group::GROUP_NAME).expect("GROUP_NAME verified at compile time");
     // SAFETY: `group_name` is a valid null-terminated CString kept alive for the
-    // call. getgrnam returns a pointer to static (thread-local) storage which we
-    // read immediately and do not cache.
+    // call. getgrnam returns a pointer into a libc-owned process-wide static
+    // buffer; per POSIX it is not thread-safe (see also `group::os::group_exists`).
+    // We read `gr_gid` below before any other libc call could overwrite that
+    // buffer, and the bridge's apply-socket-permissions path is single-threaded
+    // at this point.
     let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
 
     if grp.is_null() {
