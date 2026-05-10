@@ -184,12 +184,15 @@ fn generate_tray_icons(icons_dir: &Path) {
         }
     }
 
+    // No build-time padding: the SVG is the source of truth for the
+    // icon's internal margins. If breathing room is needed, adjust the
+    // SVG's viewBox-relative artwork instead of compensating here.
     match target_os.as_str() {
         "windows" => {
             for variant in ["dark", "light"] {
                 let svg_path = icons_dir.join(format!("tray-windows-{variant}.svg"));
                 let tree = parse_svg(&svg_path);
-                let mut rgba = render_to_rgba_padded(&tree, 32, 1);
+                let mut rgba = render_to_rgba(&tree, 32);
                 unpremultiply_rgba(&mut rgba);
                 std::fs::write(out_dir.join(format!("tray-{variant}.rgba")), &rgba).unwrap();
             }
@@ -197,7 +200,7 @@ fn generate_tray_icons(icons_dir: &Path) {
         "macos" => {
             let svg_path = icons_dir.join("tray-macos.svg");
             let tree = parse_svg(&svg_path);
-            let mut rgba = render_to_rgba_padded(&tree, 36, 2);
+            let mut rgba = render_to_rgba(&tree, 36);
             unpremultiply_rgba(&mut rgba);
             let template = luminance_to_alpha(&rgba);
             std::fs::write(out_dir.join("tray-template.rgba"), &template).unwrap();
@@ -210,31 +213,6 @@ fn parse_svg(svg_path: &Path) -> resvg::usvg::Tree {
     let svg_data = std::fs::read(svg_path).unwrap_or_else(|e| panic!("failed to read {}: {e}", svg_path.display()));
     resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default())
         .unwrap_or_else(|e| panic!("failed to parse {}: {e}", svg_path.display()))
-}
-
-/// Render an SVG tree into an RGBA buffer of `target_size`, with `padding` px on each side.
-fn render_to_rgba_padded(tree: &resvg::usvg::Tree, target_size: u32, padding: u32) -> Vec<u8> {
-    debug_assert!(
-        2 * padding < target_size,
-        "padding must be less than half of target_size"
-    );
-    let content_size = target_size - 2 * padding;
-    let mut content_pixmap = resvg::tiny_skia::Pixmap::new(content_size, content_size).unwrap();
-    let scale_x = content_size as f32 / tree.size().width();
-    let scale_y = content_size as f32 / tree.size().height();
-    let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
-    resvg::render(tree, transform, &mut content_pixmap.as_mut());
-
-    let mut canvas = resvg::tiny_skia::Pixmap::new(target_size, target_size).unwrap();
-    canvas.draw_pixmap(
-        padding as i32,
-        padding as i32,
-        content_pixmap.as_ref(),
-        &resvg::tiny_skia::PixmapPaint::default(),
-        resvg::tiny_skia::Transform::identity(),
-        None,
-    );
-    canvas.data().to_vec()
 }
 
 /// Convert premultiplied RGBA to straight RGBA.
