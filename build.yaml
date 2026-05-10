@@ -1,8 +1,9 @@
-# Hole build manifest — single source of truth for `cargo xtask build|list`.
+# Hole build manifest — single source of truth for `cargo xtask build|run|list`.
 #
 # Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
 # and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
-# under "Build". Design rationale: docs ../i-want-to-brainstorm-zippy-lightning.md.
+# under "Build". Design rationale: docs ../i-want-to-brainstorm-zippy-lightning.md
+# (and ../i-want-to-explore-joyful-lynx.md for the `run:` field).
 #
 # Platform shape: `<os>/<arch>` (Docker / GOOS-style), where
 #   os   ∈ {windows, darwin, linux}
@@ -13,10 +14,20 @@
 # `process: [...]` for direct subprocess spawn (no shell). Per-step
 # `environment:` appends to inherited env. CWD is repo root.
 #
-# `*-tests` targets are regular build targets that produce test binaries —
-# they do NOT run tests. Running tests is the caller's concern (typically
-# `cargo nextest run`), the same way running `hole.exe` is not part of
-# building it.
+# Two phases per target:
+#   build:  produce the artifact this target is named after. May depend on
+#           other targets' builds (`depends:` chains them).
+#   run:    perform the work this target is named after — execute the test
+#           binary, run the linter, launch dev mode. Optional; missing run:
+#           means the target is a pure artifact. `cargo xtask run X` always
+#           invokes the build cascade for X first; runs do NOT depend on
+#           other runs.
+#
+# `*-tests` targets keep their `--no-run` build for compile-only validation,
+# and their `run:` carries the canonical local nextest invocation. CI may
+# still hand-roll its own nextest call (e.g. archive-based paths in
+# test-garter / test-galoshes, or SKULD_LABELS gating in test-hole) where CI
+# policy diverges from the canonical local invocation.
 
 targets:
   v2ray-plugin:
@@ -59,11 +70,18 @@ targets:
     # canonical BINDIR. Release builds happen inside `hole-msi` / `hole-dmg`
     # via msi-installer / tauri, which run their own `cargo build --release`
     # — so `hole` itself is what you build for development and tests.
+    #
+    # `cargo xtask run hole` launches dev mode via scripts/dev.py. dev.py
+    # itself runs `cargo xtask build hole` internally, but the build cascade
+    # above will have just executed it, so dev.py's own invocation no-ops via
+    # cargo's incremental cache. Cheap, no special handling needed. Requires
+    # elevation (sudo / Run As Administrator) — same precondition as today.
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
       - cargo build --workspace
       - cargo xtask stage --profile debug --out-dir target/debug/dist
+    run: uv run scripts/dev.py
 
   hole-msi:
     # NOT a dependent of `hole`. The msi-installer Python entry point does its
@@ -85,20 +103,19 @@ targets:
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-independent
     # output, so we run on the cheapest CI host (linux/amd64) only. The
-    # `Frontend check` CI job pairs this with `npm run check` (tsc --noEmit) as
-    # a sibling step — the type-check is intentionally NOT here because it
-    # produces no artifact, and build.yaml targets are build-only by convention.
-    # Not depended on by hole-msi/hole-dmg: Tauri's beforeBuildCommand runs
-    # `npm run build` itself at packaging time.
+    # type-check (`cargo xtask run frontend-check`) is a separate target —
+    # tsc reads source directly and produces no artifact. Not depended on by
+    # hole-msi / hole-dmg: Tauri's beforeBuildCommand runs `npm run build`
+    # itself at packaging time.
     platforms: linux/amd64
     build:
       - npm ci --no-audit --no-fund
       - npm run build
 
   # ===== Test targets =======================================================
-  # Convention: name ends in `-tests`. Compile test binaries only — the
-  # orchestrator never runs them. CI / dev invokes `cargo nextest run` (with
-  # whatever runtime filters / SKULD_LABELS env it wants) after building.
+  # `build:` compiles test binaries (--no-run); `run:` is the canonical local
+  # nextest invocation. CI may diverge — see test-hole's SKULD_LABELS gating
+  # and the archive-based test-garter / test-galoshes jobs.
 
   hole-tests:
     depends: hole
@@ -109,27 +126,78 @@ targets:
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
           + package(handle-holders)'
+    run: >
+      cargo nextest run
+      -E 'package(hole) + package(hole-bridge) + package(hole-common)
+          + package(tun-engine) + package(tun-engine-macros)
+          + package(dump) + package(dump-macros)
+          + package(handle-holders)'
 
   galoshes-tests:
     depends: galoshes
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build: cargo nextest run --no-run -p galoshes
+    run: cargo nextest run -p galoshes
 
   garter-tests:
     depends: garter
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build: cargo nextest run --no-run -p garter
+    run: cargo nextest run -p garter
 
   garter-bin-tests:
     depends: garter-bin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build: cargo nextest run --no-run -p garter-bin
+    run: cargo nextest run -p garter-bin
 
   mock-plugin-tests:
     depends: mock-plugin
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build: cargo nextest run --no-run -p mock-plugin
+    run: cargo nextest run -p mock-plugin
+
+  # ===== Lint & check targets ==============================================
+  # No build phase; the tool's incremental cache is the build. Each is a
+  # first-class runnable invoked via `cargo xtask run <name>`, replacing the
+  # CI yaml's hand-rolled invocations.
+
+  clippy-hole:
+    # Hole platforms only. On the Hole platforms the entire workspace
+    # compiles, so `--workspace` is correct.
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    run: cargo clippy --workspace --all-targets -- -D warnings
+
+  clippy-ex-galoshes:
+    # Hole crates use windows/macos cfg-gates that don't compile on linux or
+    # windows/arm64; on those platforms scope clippy to the ex-Galoshes
+    # crates only via -p filters. The two clippy- targets together cover the
+    # full 6-platform CI matrix without overlap.
+    platforms: [linux/amd64, linux/arm64, windows/arm64]
+    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin --all-targets -- -D warnings
+
+  prek:
+    # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in
+    # the per-platform clippy-* targets above. Platforms wide-open so devs on
+    # any host can `cargo xtask run prek` locally; CI's lint job pins its own
+    # runner, the target's platform list doesn't dictate where CI runs it.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run:
+      - bash:
+          command: prek run --all-files --show-diff-on-failure
+          environment: { SKIP: cargo-clippy }
+
+  frontend-check:
+    # tsc --noEmit. Platform-independent (tsc doesn't care about host OS).
+    # No `depends: frontend-build` — tsc reads source files directly; the
+    # Vite bundle is an artifact, not an input to the type-check.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run:
+      - npm ci --no-audit --no-fund
+      - npm run check

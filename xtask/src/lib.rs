@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::manifest::{Manifest, Platform};
-use crate::orchestrate::{execute, relocate_self_if_windows, render_list, Plan};
+use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
 pub mod galoshes;
@@ -40,8 +40,8 @@ mod test_binaries_tests;
 #[command(
     name = "xtask",
     about = "Workspace task runner for the hole project",
-    long_about = "Single source of truth for build orchestration that would otherwise be \
-                  duplicated across build.rs, scripts/dev.py, and msi-installer."
+    long_about = "Single source of truth for build and run orchestration that would otherwise \
+                  be duplicated across build.rs, CI yaml, scripts/dev.py, and msi-installer."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -112,10 +112,6 @@ pub enum Command {
     /// targets applicable to the host platform, and runs each target's
     /// `build:` steps in topological order. `--all` builds every target
     /// applicable to the host platform.
-    ///
-    /// Test targets (names ending in `-tests`) are regular build targets
-    /// that produce test binaries; running those binaries is the caller's
-    /// concern (typically `cargo nextest run`), not xtask's.
     Build {
         /// Target name (e.g. `hole`, `galoshes`, `hole-msi`, `hole-tests`).
         target: Option<String>,
@@ -123,8 +119,20 @@ pub enum Command {
         #[arg(long, conflicts_with = "target")]
         all: bool,
     },
-    /// List every target declared in `build.yaml` with its platforms and
-    /// host-platform applicability.
+    /// Run a target's `run:` steps after invoking the full build cascade for
+    /// that target. Targets without `run:` are an error.
+    ///
+    /// "Run" performs the work the target is named after: `hole-tests` runs
+    /// the test binaries, `hole` launches dev mode, `clippy-hole` runs
+    /// clippy. Runs do not depend on other runs — `cargo xtask run X` builds
+    /// `X` and its deps, then runs only `X`'s `run:` steps. There is no
+    /// `--all`: "run everything" is not a meaningful operation.
+    Run {
+        /// Target name (e.g. `hole`, `hole-tests`, `clippy-hole`, `prek`).
+        target: String,
+    },
+    /// List every target declared in `build.yaml` with its platforms,
+    /// host-platform applicability, and a `*` marker for runnables.
     List,
 }
 
@@ -172,6 +180,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Deps => run_deps(),
         Command::Version { check, exact } => run_version(check, exact),
         Command::Build { target, all } => run_build(target, all),
+        Command::Run { target } => run_run(target),
         Command::List => run_list(),
     }
 }
@@ -253,6 +262,23 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
 
     let order = plan.order_for(&roots, host)?;
     execute(&plan, &order, &repo_root)
+}
+
+pub fn run_run(target: String) -> Result<()> {
+    // Same Windows self-relocate dance as `run_build`: build steps may shell
+    // out to recursive `cargo xtask <X>` invocations, and on Windows cargo's
+    // relink path can't overwrite the running xtask.exe.
+    relocate_self_if_windows()?;
+
+    let (manifest, repo_root) = load_manifest()?;
+    let host = Platform::host().ok_or_else(|| {
+        anyhow!(
+            "host platform not in the known set (windows/darwin/linux × amd64/arm64); \
+             cannot orchestrate"
+        )
+    })?;
+    let plan = Plan::new(&manifest)?;
+    execute_run(&plan, &target, host, &repo_root)
 }
 
 pub fn run_list() -> Result<()> {

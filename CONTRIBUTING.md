@@ -17,15 +17,15 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 
 ### Workspace layout
 
-| Directory        | Crate/Purpose                                                                            |
-| ---------------- | ---------------------------------------------------------------------------------------- |
-| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                  |
-| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                             |
-| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                      |
-| `xtask/`         | workspace task runner (`cargo xtask <build\|test\|list\|stage\|...>`) — see `build.yaml` |
-| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                             |
-| `external/`      | Third-party source (git subrepos)                                                        |
-| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                      |
+| Directory        | Crate/Purpose                                                                           |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                 |
+| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                            |
+| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                     |
+| `xtask/`         | workspace task runner (`cargo xtask <build\|run\|list\|stage\|...>`) — see `build.yaml` |
+| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                            |
+| `external/`      | Third-party source (git subrepos)                                                       |
+| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                     |
 
 ### Logging
 
@@ -81,13 +81,16 @@ Dev mode creates a **real TUN interface** and modifies the routing table — it 
 
 ```sh
 # Windows: from an elevated PowerShell
-uv run scripts/dev.py
+cargo xtask run hole
 
-# macOS
-sudo uv run scripts/dev.py
+# macOS — build first as your user, then elevate to run.
+cargo xtask build hole
+sudo cargo xtask run hole
 ```
 
-This builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
+`cargo xtask run hole` builds the `hole` target and then launches `scripts/dev.py`, which builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
+
+**Why the explicit `cargo xtask build hole` on macOS.** `cargo xtask run` always invokes the build cascade for the target before its `run:` steps; under `sudo` that cascade runs as root and would leave `target/` and `target/debug/dist/` files owned by root. `dev.py` already drops privileges around its own internal `cargo xtask build hole` (see lines 130-134 / 336-340 in [scripts/dev.py](scripts/dev.py)), but the orchestrator's pre-cascade fires *before* dev.py gets control. Running `cargo xtask build hole` unprivileged first warms the cargo cache so the elevated `run` cascade is a no-op, sidestepping the ownership issue. Windows is unaffected — UAC elevation is token-based and all subprocesses naturally share the same user identity.
 
 On macOS, `dev.py` detects `SUDO_USER` and drops privileges for the GUI and Vite subprocesses (via POSIX `setuid`/`setgid` + `extra_groups`) so they read your real `~/Library` config while the bridge inherits root. On Windows, UAC elevation is token-based, so all subprocesses naturally share the same user identity — no drop is needed.
 
@@ -130,8 +133,10 @@ cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # per-
 `cargo xtask build hole` walks the `build.yaml` DAG: it builds v2ray-plugin
 (Go), galoshes (workspace member), downloads wintun on Windows, then runs
 `cargo build --workspace` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
-table; `cargo xtask build|test --all` builds or runs every target applicable
-to the host platform.
+table; `cargo xtask build --all` builds every target applicable to the host
+platform; `cargo xtask run <name>` builds and then performs the named
+target's `run:` action — running tests (`hole-tests`), linters
+(`clippy-hole`, `prek`, `frontend-check`), or dev mode (`hole`).
 
 **Terminal 2 — Vite + GUI (unelevated):**
 

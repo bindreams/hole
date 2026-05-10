@@ -5,6 +5,9 @@
 //! 2. Computes a topologically-sorted subgraph of targets reachable from the
 //!    selection that apply to the host platform.
 //! 3. Executes each target's `build:` steps in order, fail-fast.
+//! 4. For `cargo xtask run <name>`, follows up with the target's `run:` steps
+//!    after the build cascade (a "run" performs the work the target is named
+//!    after; runs do not depend on other runs).
 //!
 //! Pure orchestration only — no incremental / up-to-date checks. The leaf
 //! commands (`cargo build`, `cargo xtask v2ray-plugin`, etc.) own that.
@@ -367,7 +370,7 @@ fn run(mut cmd: Command, label: &str) -> Result<()> {
         .stderr(Stdio::inherit());
     let status = cmd.status().with_context(|| format!("spawning {label}"))?;
     if !status.success() {
-        return Err(anyhow!("{label} failed: exit status {}", status));
+        return Err(anyhow!("{label} failed: exit status {status}"));
     }
     Ok(())
 }
@@ -396,13 +399,46 @@ pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Run a target's `run:` steps after the full build cascade for that target.
+///
+/// The cascade order matches `cargo xtask build <target>`: every transitive
+/// build dep applicable to `host`, in topological order, then the target's
+/// own `build:` steps. Once that succeeds, the target's `run:` steps execute.
+///
+/// Errors:
+/// - `unknown target: {name:?}` if `target_name` isn't declared.
+/// - `target {name:?} has no run steps defined` if the target's `run:` is
+///   empty. Checked before any platform-applicability work — running a
+///   target without `run:` is a manifest error, not a host-specific issue.
+/// - The platform-applicability message from [`Plan::order_for`] if the
+///   target doesn't apply to `host`.
+/// - Any step's failure aborts the cascade with `while building target X` or
+///   `while running target X` context.
+pub fn execute_run(plan: &Plan<'_>, target_name: &str, host: Platform, repo_root: &Path) -> Result<()> {
+    let target = plan
+        .manifest
+        .get(target_name)
+        .ok_or_else(|| anyhow!("unknown target: {target_name:?}"))?;
+    if target.run.is_empty() {
+        bail!("target {target_name:?} has no run steps defined");
+    }
+    let order = plan.order_for(&[target_name], host)?;
+    execute(plan, &order, repo_root)?;
+
+    println!("xtask: ==== running target {target_name} ====");
+    for step in &target.run {
+        run_step(step, repo_root).with_context(|| format!("while running target {target_name}"))?;
+    }
+    Ok(())
+}
+
 // ===== List output ===================================================================================================
 
 /// Render the table printed by `cargo xtask list`. Returns a string for ease
 /// of testing; the caller is responsible for `print!`.
 pub fn render_list(manifest: &Manifest, host: Option<Platform>) -> String {
     let mut out = String::new();
-    let header = format!("{:<22} {:<46} HOST", "TARGET", "PLATFORMS");
+    let header = format!("{:<22} {:<46} {:<5} RUN?", "TARGET", "PLATFORMS", "HOST");
     out.push_str(&header);
     out.push('\n');
     for t in manifest.iter() {
@@ -412,7 +448,8 @@ pub fn render_list(manifest: &Manifest, host: Option<Platform>) -> String {
             Some(_) => "no",
             None => "?",
         };
-        out.push_str(&format!("{:<22} {:<46} {}\n", t.name, plats, host_mark));
+        let run_mark = if t.has_run() { "*" } else { "" };
+        out.push_str(&format!("{:<22} {:<46} {:<5} {}\n", t.name, plats, host_mark, run_mark));
     }
     out
 }
