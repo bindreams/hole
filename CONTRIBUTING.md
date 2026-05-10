@@ -83,11 +83,14 @@ Dev mode creates a **real TUN interface** and modifies the routing table — it 
 # Windows: from an elevated PowerShell
 cargo xtask run hole
 
-# macOS
+# macOS — build first as your user, then elevate to run.
+cargo xtask build hole
 sudo cargo xtask run hole
 ```
 
 `cargo xtask run hole` builds the `hole` target and then launches `scripts/dev.py`, which builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
+
+**Why the explicit `cargo xtask build hole` on macOS.** `cargo xtask run` always invokes the build cascade for the target before its `run:` steps; under `sudo` that cascade runs as root and would leave `target/` and `target/debug/dist/` files owned by root. `dev.py` already drops privileges around its own internal `cargo xtask build hole` (see lines 130-134 / 336-340 in [scripts/dev.py](scripts/dev.py)), but the orchestrator's pre-cascade fires *before* dev.py gets control. Running `cargo xtask build hole` unprivileged first warms the cargo cache so the elevated `run` cascade is a no-op, sidestepping the ownership issue. Windows is unaffected — UAC elevation is token-based and all subprocesses naturally share the same user identity.
 
 On macOS, `dev.py` detects `SUDO_USER` and drops privileges for the GUI and Vite subprocesses (via POSIX `setuid`/`setgid` + `extra_groups`) so they read your real `~/Library` config while the bridge inherits root. On Windows, UAC elevation is token-based, so all subprocesses naturally share the same user identity — no drop is needed.
 
