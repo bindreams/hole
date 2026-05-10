@@ -75,7 +75,7 @@ mod os {
     use std::io;
     use std::process::Command;
 
-    use super::{GROUP_NAME, group_exists};
+    use super::{group_exists, GROUP_NAME};
 
     pub fn create_group() -> io::Result<()> {
         // EAFP: just try to create. On macOS `dseditgroup -o create` is
