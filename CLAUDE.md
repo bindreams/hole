@@ -370,4 +370,12 @@ Each release also includes `SHA256SUMS` (hash manifest) and `SHA256SUMS.minisig`
 
 ## Icons
 
-Source icons are `crates/hole/icons/icon.svg` (app icon) and `crates/hole/icons/tray-{enabled,disabled}.svg` (tray icons). The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.
+Source icons under `crates/hole/icons/` are split per platform:
+
+- `icon-windows.svg` / `icon-macos.svg` — app icons; `build.rs` selects by `CARGO_CFG_TARGET_OS`.
+- `tray-windows-{light,dark}.svg` — tray icons for light/dark Windows taskbars (selected at runtime via the `SystemUsesLightTheme` registry value).
+- `tray-macos.svg` — macOS tray template; luminance-to-alpha by `build.rs`, then `icon_as_template(true)` at the Tauri layer.
+
+`TrayState::Disabled` currently aliases to `Enabled` — both resolve to the same bytes in [crates/hole/src/tray_icons.rs](crates/hole/src/tray_icons.rs). The enum is preserved so a designer-supplied disabled variant can drop in without API churn at call sites.
+
+The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 256 256">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: url(#radial-gradient-3);
+      }
+
+      .cls-1, .cls-2, .cls-3 {
+        mix-blend-mode: multiply;
+      }
+
+      .cls-2 {
+        fill: url(#radial-gradient);
+      }
+
+      .cls-4 {
+        isolation: isolate;
+      }
+
+      .cls-3 {
+        fill: url(#radial-gradient-2);
+      }
+    </style>
+    <radialGradient id="radial-gradient" cx="144" cy="120.19" fx="144" fy="120.19" r="109.44" gradientUnits="userSpaceOnUse">
+      <stop offset=".15" stop-color="#000"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="radial-gradient-2" cx="93.46" cy="134.37" fx="93.46" fy="134.37" r="90.9" xlink:href="#radial-gradient"/>
+    <radialGradient id="radial-gradient-3" cx="116.73" cy="143.1" fx="116.73" fy="143.1" r="90.9" xlink:href="#radial-gradient"/>
+  </defs>
+  <g class="cls-4">
+    <g id="Layer_1" data-name="Layer 1">
+      <g>
+        <circle class="cls-2" cx="144" cy="120.19" r="109.44"/>
+        <circle class="cls-3" cx="93.46" cy="134.37" r="90.9"/>
+        <circle class="cls-1" cx="116.73" cy="143.1" r="90.9"/>
+        <circle cx="129.82" cy="129.28" r="67.21"/>
+      </g>
+    </g>
+  </g>
+</svg>

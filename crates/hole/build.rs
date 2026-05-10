@@ -2,16 +2,28 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let icons_dir = Path::new("icons");
-    let svg_path = icons_dir.join("icon.svg");
 
-    println!("cargo:rerun-if-changed={}", svg_path.display());
+    // Rerun on any SVG change in icons/, not just the ones the active
+    // target reads. Designers iterating across platforms (or hosts
+    // toggling target_os via incremental builds) shouldn't get stale
+    // outputs. Watching the directory mtime catches additions/removals
+    // that don't touch existing files.
+    println!("cargo:rerun-if-changed={}", icons_dir.display());
+    for entry in std::fs::read_dir(icons_dir).expect("failed to read icons dir") {
+        let path = entry
+            .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", icons_dir.display()))
+            .path();
+        if path.extension().and_then(|e| e.to_str()) == Some("svg") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 
     let repo_root = git_repo_root();
     let cache_icons_dir = repo_root.join(".cache").join("icons");
     std::fs::create_dir_all(&cache_icons_dir).expect("failed to create .cache/icons/");
 
     emit_version_env(&repo_root);
-    generate_icons(&svg_path, &cache_icons_dir);
+    generate_icons(icons_dir, &cache_icons_dir);
     generate_tray_icons(icons_dir);
 
     // Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download)
@@ -74,25 +86,34 @@ fn emit_version_env(repo_root: &Path) {
 
 // Icons ===============================================================================================================
 
-fn generate_icons(svg_path: &Path, out_dir: &Path) {
-    let svg_data = std::fs::read(svg_path).expect("failed to read icon.svg");
-    let tree =
-        resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default()).expect("failed to parse icon.svg");
+fn generate_icons(icons_dir: &Path, out_dir: &Path) {
+    // Always produce platform-correct ICO and ICNS regardless of host.
+    // ICO is consumed by Windows bundles, ICNS by macOS. Reading the
+    // wrong SVG into either would silently ship the wrong design on a
+    // cross-bundle (e.g. `tauri build` targeting macOS from a Windows
+    // host). Tauri's manifest references both files unconditionally —
+    // the tauri_build validation step needs them present on every host.
+    let win_tree = parse_svg(&icons_dir.join("icon-windows.svg"));
+    let mac_tree = parse_svg(&icons_dir.join("icon-macos.svg"));
 
-    // Generate PNGs at required sizes
+    render_ico(&win_tree, &out_dir.join("icon.ico"));
+
+    // ICNS: render the macOS SVG to 128×128 PNG and wrap in a minimal
+    // ic07 container.
+    let mac_128_png = render_png_in_memory(&mac_tree, 128);
+    write_icns(&out_dir.join("icon.icns"), &mac_128_png);
+
+    // PNG fallbacks (referenced unconditionally by tauri.conf.json,
+    // used as window icon on the host platform). Render from the
+    // host's SVG so a host-resident GUI window shows the right design.
+    let host_tree = match std::env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() {
+        "windows" => &win_tree,
+        "macos" => &mac_tree,
+        other => panic!("app icon not provided for target_os={other}"),
+    };
     for size in [32u32, 128] {
-        let png_path = out_dir.join(format!("{size}x{size}.png"));
-        render_png(&tree, size, &png_path);
+        render_png(host_tree, size, &out_dir.join(format!("{size}x{size}.png")));
     }
-
-    // Generate ICO (contains 16x16 + 32x32 + 256x256)
-    let ico_path = out_dir.join("icon.ico");
-    render_ico(&tree, &ico_path);
-
-    // Generate ICNS (Tauri expects it but only uses on macOS)
-    let icns_path = out_dir.join("icon.icns");
-    let png_data = std::fs::read(out_dir.join("128x128.png")).unwrap();
-    write_icns(&icns_path, &png_data);
 }
 
 fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
@@ -105,13 +126,19 @@ fn render_to_rgba(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
 }
 
 fn render_png(tree: &resvg::usvg::Tree, size: u32, path: &Path) {
+    std::fs::write(path, render_png_in_memory(tree, size)).unwrap();
+}
+
+fn render_png_in_memory(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
     let rgba = render_to_rgba(tree, size);
-    let file = std::fs::File::create(path).unwrap();
-    let mut encoder = png::Encoder::new(file, size, size);
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, size, size);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().unwrap();
     writer.write_image_data(&rgba).unwrap();
+    drop(writer);
+    buf
 }
 
 fn render_ico(tree: &resvg::usvg::Tree, path: &Path) {
@@ -144,43 +171,45 @@ fn generate_tray_icons(icons_dir: &Path) {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    for name in ["tray-enabled", "tray-disabled"] {
-        let svg_path = icons_dir.join(format!("{name}.svg"));
-        println!("cargo:rerun-if-changed={}", svg_path.display());
-
-        let svg_data =
-            std::fs::read(&svg_path).unwrap_or_else(|e| panic!("failed to read {}: {e}", svg_path.display()));
-        let tree = resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default())
-            .unwrap_or_else(|e| panic!("failed to parse {name}.svg: {e}"));
-
-        match target_os.as_str() {
-            "macos" => generate_tray_icons_macos(&tree, &out_dir, name),
-            "windows" => generate_tray_icons_windows(&tree, &out_dir, name),
-            other => println!("cargo:warning=tray icon generation not implemented for {other}"),
+    // Clean any pre-rename tray rgba files left by a previous incremental
+    // build. include_bytes! cites only the new names, so stale files
+    // would silently bloat OUT_DIR.
+    if let Ok(read) = std::fs::read_dir(&out_dir) {
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("tray-") && name.ends_with(".rgba") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
+    }
+
+    match target_os.as_str() {
+        "windows" => {
+            for variant in ["dark", "light"] {
+                let svg_path = icons_dir.join(format!("tray-windows-{variant}.svg"));
+                let tree = parse_svg(&svg_path);
+                let mut rgba = render_to_rgba_padded(&tree, 32, 1);
+                unpremultiply_rgba(&mut rgba);
+                std::fs::write(out_dir.join(format!("tray-{variant}.rgba")), &rgba).unwrap();
+            }
+        }
+        "macos" => {
+            let svg_path = icons_dir.join("tray-macos.svg");
+            let tree = parse_svg(&svg_path);
+            let mut rgba = render_to_rgba_padded(&tree, 36, 2);
+            unpremultiply_rgba(&mut rgba);
+            let template = luminance_to_alpha(&rgba);
+            std::fs::write(out_dir.join("tray-template.rgba"), &template).unwrap();
+        }
+        other => println!("cargo:warning=tray icon generation not implemented for {other}"),
     }
 }
 
-fn generate_tray_icons_macos(tree: &resvg::usvg::Tree, out_dir: &Path, name: &str) {
-    let mut rgba = render_to_rgba_padded(tree, 36, 2);
-    unpremultiply_rgba(&mut rgba);
-    let template = luminance_to_alpha(&rgba);
-    let path = out_dir.join(format!("{name}-template.rgba"));
-    std::fs::write(&path, &template).unwrap();
-}
-
-fn generate_tray_icons_windows(tree: &resvg::usvg::Tree, out_dir: &Path, name: &str) {
-    let mut rgba = render_to_rgba_padded(tree, 32, 1);
-    unpremultiply_rgba(&mut rgba);
-
-    // Dark taskbar variant: light artwork on transparent (as rendered)
-    let dark_path = out_dir.join(format!("{name}-dark.rgba"));
-    std::fs::write(&dark_path, &rgba).unwrap();
-
-    // Light taskbar variant: invert RGB, keep alpha
-    let light = invert_colors(&rgba);
-    let light_path = out_dir.join(format!("{name}-light.rgba"));
-    std::fs::write(&light_path, &light).unwrap();
+fn parse_svg(svg_path: &Path) -> resvg::usvg::Tree {
+    let svg_data = std::fs::read(svg_path).unwrap_or_else(|e| panic!("failed to read {}: {e}", svg_path.display()));
+    resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default())
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", svg_path.display()))
 }
 
 /// Render an SVG tree into an RGBA buffer of `target_size`, with `padding` px on each side.
@@ -237,20 +266,6 @@ fn luminance_to_alpha(rgba: &[u8]) -> Vec<u8> {
         let a = src[3] as u32;
         let lum = (r * 77 + g * 150 + b * 29) >> 8;
         dst[3] = ((lum * a + 127) / 255) as u8;
-    }
-    out
-}
-
-/// Invert RGB channels of straight RGBA, keeping alpha unchanged.
-fn invert_colors(rgba: &[u8]) -> Vec<u8> {
-    let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
-        if pixel[3] == 0 {
-            continue;
-        }
-        pixel[0] = 255 - pixel[0];
-        pixel[1] = 255 - pixel[1];
-        pixel[2] = 255 - pixel[2];
     }
     out
 }
