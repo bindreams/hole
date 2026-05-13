@@ -49,15 +49,38 @@ crates/
   common/    hole-common — shared types (protocol, config, import)
   bridge/    hole-bridge — privileged bridge library
   hole/      hole        — Tauri app + CLI + bridge entry point (binary name: "hole")
+  garter/    garter      — SIP003u plugin-chain runner library (Apache-2.0, on crates.io)
+  garter-bin/ garter-bin — `garter` CLI binary for plugin developers (Apache-2.0)
+  galoshes/  galoshes    — bundled+standalone SIP003u plugin (yamux + v2ray-plugin) (Apache-2.0)
 xtask/      workspace task runner (`cargo xtask <stage|deps|version|...>`)
 xtask-lib/  shared helper crate used by xtask AND crates/hole/build.rs
 external/
-  v2ray-plugin/  v2ray-plugin source (git subrepo)
+  v2ray-plugin/  v2ray-plugin source (git-subrepo of shadowsocks/v2ray-plugin)
 msi-installer/  WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 ui/             Frontend HTML/CSS/JS
 scripts/        Utility scripts
 tests/       E2E test specs (WebDriverIO)
 ```
+
+## Distributions
+
+Four independent release tracks, each tagged as
+`releases/<product>/v<X.Y.Z>` with its own GitHub release. Detail in
+[CLAUDE.md](CLAUDE.md#releases):
+
+- **`hole`** — Tauri GUI for end users. MSI + DMG installers signed via
+  minisign for auto-update integrity.
+- **`galoshes`** — standalone SIP003u plugin binaries for shadowsocks
+  server operators who want to pair non-Hole servers with Hole clients.
+  6 platforms (windows amd64/arm64, darwin amd64/arm64, linux
+  amd64/arm64). Apache-2.0.
+- **`garter`** — plugin-chain runner library on
+  [crates.io/crates/garter](https://crates.io/crates/garter), plus
+  `garter` CLI binaries via GitHub release for plugin developers.
+  Apache-2.0.
+- **`v2ray-plugin`** — Hole-patched v2ray-plugin builds matching
+  shadowsocks/v2ray-plugin upstream's release-asset shape, for users
+  who want our security patches on a non-Hole shadowsocks deployment.
 
 ## Testing
 

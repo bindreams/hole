@@ -231,22 +231,39 @@ resort; ETW sessions are best-effort via `logman stop` from the shell).
 
 ## Workspace layout
 
+Each publishable workspace member declares a release group in
+`[package.metadata.hole-release].group` (see "Releases" above) — column 3
+of this layout. `publish = false` means the crate is not pushed to
+crates.io; the group still controls its version lock.
+
 ```
-crates/common/            → hole-common (shared types: protocol, config, import)
-crates/bridge/            → hole-bridge (bridge library, no binary)
-crates/hole/              → hole (Tauri app + CLI + bridge entry point, binary name: "hole")
-crates/tun-engine/        → general-purpose TUN + routing + packet-loop engine
-                            (consumed by hole-bridge; intended for standalone reuse)
-crates/tun-engine-macros/ → proc-macro support crate for tun-engine (`#[freeze]`)
-crates/garter/            → SIP003u plugin-chain runner library (ChainPlugin trait,
-                            BinaryPlugin, ChainRunner). Apache-2.0. Ex-galoshes.
-crates/garter-bin/        → `garter` binary (YAML-config-driven plugin chainer for
-                            plugin developers; NOT shipped in Hole's MSI). Apache-2.0.
-crates/galoshes/          → bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP relay
-                            with embedded v2ray-plugin (SHA256-verified at compile
-                            time). Apache-2.0. Shipped alongside hole.exe.
-crates/mock-plugin/       → minimal SIP003u TCP echo plugin for garter integration
-                            tests. Apache-2.0.
+crates/common/            → hole-common.  GPL-3.0, hole group, publish=false.
+                            Shared types: protocol, config, import.
+crates/bridge/            → hole-bridge.  GPL-3.0, hole group, publish=false.
+                            Bridge library, no binary.
+crates/hole/              → hole.         GPL-3.0, hole group, publish=false.
+                            Tauri app + CLI + bridge entry point, binary name: "hole".
+crates/tun-engine/        → tun-engine.   GPL-3.0, hole group, publish=false.
+                            General-purpose TUN + routing + packet-loop engine.
+crates/tun-engine-macros/ → tun-engine-macros. GPL-3.0, hole group, publish=false.
+                            Proc-macro support crate for tun-engine (`#[freeze]`).
+crates/dump/              → dump.         GPL-3.0, hole group, publish=false.
+                            YAML-shaped representation for logging (dump trichotomy).
+crates/dump-macros/       → dump-macros.  GPL-3.0, hole group, publish=false.
+                            Proc-macro support for `dump` (#[derive(Dump)]).
+crates/handle-holders/    → handle-holders. GPL-3.0, hole group, publish=false.
+                            File-handle introspection (Windows NtQuery / macOS lsof).
+crates/garter/            → garter.       Apache-2.0, garter group, **published to crates.io**.
+                            SIP003u plugin-chain runner library (ChainPlugin, ChainRunner).
+crates/garter-bin/        → garter-bin.   Apache-2.0, garter group, publish=false.
+                            `garter` binary (YAML-config-driven plugin chainer for
+                            plugin developers; NOT shipped in Hole's MSI).
+crates/galoshes/          → galoshes.     Apache-2.0, galoshes group, publish=false.
+                            Bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP relay
+                            with embedded v2ray-plugin (SHA256-verified at compile time).
+                            Shipped alongside hole.exe AND released standalone for servers.
+crates/mock-plugin/       → mock-plugin.  Apache-2.0, no group, publish=false.
+                            Minimal SIP003u TCP echo plugin for garter integration tests.
 build.yaml                → declarative build-target manifest (the DAG of `hole`,
                             `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, `clippy-*`,
                             `prek`, `frontend-check`, etc.) consumed by
@@ -261,7 +278,10 @@ xtask/                    → workspace task runner. Top-level commands:
                             Primitive subcommands stay available for one-off use:
                             `cargo xtask <stage|deps|v2ray-plugin|galoshes|wintun|version|...>`
 xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
-external/                 → Third-party source (git subrepos): `v2ray-plugin` (Go).
+external/                 → Third-party source (git-subrepos via ingydotnet/git-subrepo,
+                            not git submodules): `v2ray-plugin` (Go). v2ray-plugin
+                            release-group version lives at
+                            external/v2ray-plugin/version.toml.
 msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 scripts/                  → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
 ui/                       → Frontend HTML/CSS/TypeScript (Vite)
@@ -279,8 +299,12 @@ one-way compatibility.
 The `galoshes` crate embeds the v2ray-plugin Go binary into its own
 executable at compile time:
 
-1. Go source lives at [external/v2ray-plugin/](external/v2ray-plugin/)
-   (git subrepo of `shadowsocks/v2ray-plugin`).
+1. Go source lives at [external/v2ray-plugin/](external/v2ray-plugin/),
+   managed as a `git-subrepo` of `shadowsocks/v2ray-plugin` (the ingydotnet
+   tool, not `git submodule`). Pull upstream changes with
+   `git subrepo pull external/v2ray-plugin`. Hole-local security/feature
+   patches land as ordinary commits on top. `git subrepo push` is not
+   used — we do not contribute back automatically.
 1. `cargo xtask v2ray-plugin` (or `cargo xtask deps`, which calls it
    first) builds the Go source into
    `.cache/v2ray-plugin/v2ray-plugin-<host-target-triple>[.exe]`.
@@ -353,20 +377,65 @@ cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build vali
 
 ## Releases
 
-Release assets follow GOOS/GOARCH naming, OS first:
+Four independent release tracks, one per product. Each tags as
+`releases/<product>/v<X.Y.Z>` and has its own draft+publish workflow pair.
+Version per group is declared in each crate's
+`[package.metadata.hole-release].group` and enforced workspace-wide by
+`xtask-lib::version` (publishable-but-ungrouped crates are rejected;
+within-group versions must match).
 
-- `hole-{version}-windows-amd64.msi`
-- `hole-{version}-darwin-arm64.dmg`
-- `hole-{version}-darwin-amd64.dmg`
+| Product        | Group members                                                                                      | Artifacts                                                                | Signed         | crates.io     |
+| -------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
+| `hole`         | `hole, hole-common, hole-bridge, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders` | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
+| `galoshes`     | `galoshes`                                                                                         | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
+| `garter`       | `garter, garter-bin`                                                                               | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
+| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`)                               | Upstream-parity tar.gz set + `SHA256SUMS`                                | No             | n/a           |
 
-Each release also includes `SHA256SUMS` (hash manifest) and `SHA256SUMS.minisig` (minisign signature). The auto-updater matches assets by these suffixes and verifies integrity via the signed manifest.
+Asset naming:
 
-### Release workflow
+- hole: `hole-{version}-{os}-{arch}.{msi,dmg}` (unchanged)
+- galoshes: `galoshes-{version}-{os}-{arch}[.exe]`
+- garter: `garter-{version}-{os}-{arch}[.exe]` (binary from `garter-bin`)
+- v2ray-plugin: `v2ray-plugin-{os}-{arch}-v{version}.tar.gz` (matches upstream's exact shape)
 
-1. Trigger the **Draft Release** workflow with the version (e.g. `1.0.0`)
-1. CI builds all platforms, creates a draft release with `SHA256SUMS`
-1. Sign: `uv run scripts/sign-release.py v1.0.0`
-1. Trigger the **Publish Release** workflow — verifies the signature, publishes the release (creates the git tag)
+### Why only hole is signed
+
+`hole` is auto-updated end-user software — supply-chain integrity matters.
+The other products are either embedded into hole (so their bytes are
+covered by hole's signature) or built-from-source by their consumers
+(server operators, plugin developers) who can pin SHA256 against
+`SHA256SUMS` directly.
+
+### Why draft/publish split for every track
+
+Draft does all reversible preparation (build, test, hash, upload to
+draft release) — the "engineer" workflow. Publish does irreversible
+public actions (tag creation, `cargo publish` for garter, latest-flip)
+— the "boss" workflow. The split exists for every product to keep one
+sanity-check gate before irreversible work, not just for hole's signing
+step.
+
+### Per-product release workflows
+
+- **hole**: `draft-release-hole.yaml` → `scripts/sign-release.py <version>` → `publish-release-hole.yaml`. Tag created at publish.
+- **galoshes**: `draft-release-galoshes.yaml` → `publish-release-galoshes.yaml`. No signing.
+- **garter**: `draft-release-garter.yaml` (also runs `cargo publish --dry-run -p garter` for early failure) → `publish-release-garter.yaml`. Publish workflow is idempotent: it queries crates.io's API to see whether the version already exists (200) and skips the `cargo publish` step if so, so a re-run after a partial-failure resumes cleanly. A `dry_run: true` input runs `cargo publish --dry-run` and exits without touching crates.io or the tag.
+- **v2ray-plugin**: `draft-release-v2ray-plugin.yaml` → `publish-release-v2ray-plugin.yaml`. The matrix matches shadowsocks/v2ray-plugin upstream's release platform list — currently darwin amd64/arm64, linux amd64/arm64, windows amd64 (5 platforms). When upstream changes its set, edit the matrix and the SHA256SUMS line count in the draft workflow. Hole-local v2ray-plugin patches land via `git subrepo pull external/v2ray-plugin` followed by ordinary commits.
+
+### Version model (`cargo xtask version`)
+
+```
+cargo xtask version                                     # table of every group's resolved version
+cargo xtask version --group <hole|garter|galoshes|v2ray-plugin>            # one group's display version
+cargo xtask version --check --group <name>              # validate Cargo.toml vs nearest tag (one-bump-ahead OK)
+cargo xtask version --check --group <name> --exact      # validate exact match (release CI uses this)
+```
+
+When a group has no `releases/<group>/v...` tag yet (bootstrap state),
+the non-`--exact` check accepts any version; `--exact` errors loudly.
+
+The legacy `v0.1.0` tag predates this scheme; per-group tag-glob lookups
+ignore it.
 
 ## Icons
 
