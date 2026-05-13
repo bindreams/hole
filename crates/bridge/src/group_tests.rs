@@ -28,6 +28,39 @@ mod windows {
     }
 }
 
+// macOS-specific tests ================================================================================================
+
+#[cfg(target_os = "macos")]
+mod macos {
+    /// Per-process suffix for the "missing group" test name. Vanishingly
+    /// unlikely to collide with a real group on the test machine, even
+    /// under parallel runs. macOS local-group names cap around 32 chars;
+    /// `hole_test_missing_<10-digit pid>` fits.
+    fn missing_group_name() -> String {
+        format!("hole_test_missing_{}", std::process::id())
+    }
+
+    /// `getgrnam("wheel")` must return a record on every macOS install
+    /// (uid 0's primary group). Locale-independent — runs in CI under any user.
+    #[skuld::test]
+    fn group_exists_finds_wheel() {
+        assert!(crate::group::group_exists("wheel"));
+    }
+
+    /// `getgrnam` must return NULL (→ false) for a clearly-nonexistent name.
+    #[skuld::test]
+    fn group_exists_returns_false_for_missing() {
+        assert!(!crate::group::group_exists(&missing_group_name()));
+    }
+
+    /// A name with an embedded NUL is not a valid POSIX group name and
+    /// returns `false` rather than panicking.
+    #[skuld::test]
+    fn group_exists_returns_false_for_name_with_nul() {
+        assert!(!crate::group::group_exists("foo\0bar"));
+    }
+}
+
 // Cross-platform tests ================================================================================================
 
 #[skuld::test]
