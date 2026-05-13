@@ -463,9 +463,74 @@ fn multi_component_bump_rejected() {
     assert!(!is_valid_next(&v(1, 0, 0), &v(1, 1, 1)));
 }
 
+// validate_against_tag ================================================================================================
+//
+// These tests exercise the bootstrap path (no tag yet) since we cannot
+// easily create real tags inside a tempdir without spawning git init.
+// The error path (--exact without a tag) is structural and worth pinning.
+
+#[skuld::test]
+fn validate_against_tag_bootstrap_no_tag_accepts_anything() {
+    // Empty repo with no tags at all → nearest_tag_version returns Ok(None).
+    // Non-exact validate_against_tag must then accept the Cargo.toml version.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "0.1.0", "hole"),
+    );
+
+    init_git_repo(root);
+
+    let resolved = validate_against_tag(root, Group::Hole, false).unwrap();
+    assert_eq!(resolved, v(0, 1, 0));
+}
+
+#[skuld::test]
+fn validate_against_tag_bootstrap_no_tag_with_exact_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "0.1.0", "hole"),
+    );
+
+    init_git_repo(root);
+
+    let err = validate_against_tag(root, Group::Hole, true).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("no `releases/hole/v...` tag yet"), "msg was: {msg}");
+}
+
+fn init_git_repo(root: &Path) {
+    use std::process::Command;
+    fn git(root: &Path, args: &[&str]) {
+        let s = Command::new("git").args(args).current_dir(root).status().unwrap();
+        assert!(s.success(), "git {} failed in {}", args.join(" "), root.display());
+    }
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.email", "test@example.invalid"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "--quiet", "-m", "init"]);
+}
+
 // display_version =====================================================================================================
 //
-// We don't unit-test display_version directly because it shells out to `git`
-// and depends on the on-disk state of an actual repo. The fallback to
-// "0.0.0-unknown" on failure means it can be called from build.rs without
-// risk of panic, which is the contract that matters.
+// We don't unit-test display_version's full happy path directly because
+// it shells out to `git` and depends on the on-disk state of an actual
+// repo. The fallback to "0.0.0-unknown" on failure means it can be called
+// from build.rs without risk of panic, which is the contract that matters.
+// Bootstrap behavior is exercised via validate_against_tag above.

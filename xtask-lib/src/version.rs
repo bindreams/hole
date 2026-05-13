@@ -238,38 +238,61 @@ pub fn cargo_toml_version_for_group(repo_root: &Path, group: Group) -> Result<Ve
 
 // Tag computation =====================================================================================================
 
-/// Return the nearest ancestor tag matching `group`'s tag glob, parsed
-/// to strict semver.
+/// Return the highest-versioned tag in `group`'s namespace that is also
+/// an ancestor of HEAD, parsed to strict semver. Returns `Ok(None)` when
+/// no such tag exists (bootstrap state).
 ///
-/// Returns `Ok(None)` when no matching tag exists in the repo (bootstrap
-/// state, before the group's first release). Returns `Err` for any other
-/// failure (git not installed, parse error on a malformed tag, etc.).
+/// Implemented via structural git probes (`git tag --list <glob>` for
+/// enumeration, `git merge-base --is-ancestor` for ancestry) rather than
+/// parsing `git describe` stderr — robust against locale and git-version
+/// drift in message strings (see CLAUDE.md `feedback_no_string_parsing_hacks.md`).
 pub fn nearest_tag_version(repo_root: &Path, group: Group) -> Result<Option<Version>> {
+    Ok(nearest_ancestor_tag(repo_root, group)?.map(|(v, _)| v))
+}
+
+/// Same as `nearest_tag_version` but returns both the parsed semver and
+/// the full tag name (`releases/<group>/v<X.Y.Z>`). Used by
+/// `display_version_inner` for distance/dirty computation.
+fn nearest_ancestor_tag(repo_root: &Path, group: Group) -> Result<Option<(Version, String)>> {
     let glob = group.tag_glob();
-    let output = Command::new("git")
-        .args(["describe", "--tags", "--match", &glob, "--abbrev=0"])
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("failed to spawn git describe for group '{group}'"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // `git describe` exits non-zero with these stderrs when no tag matches the glob.
-        if stderr.contains("No names found")
-            || stderr.contains("No tags can describe")
-            || stderr.contains("cannot describe")
-        {
-            return Ok(None);
+    let listed = run_git(repo_root, &["tag", "--list", &glob])?;
+
+    let mut candidates: Vec<(Version, String)> = Vec::new();
+    for line in listed.lines() {
+        let tag = line.trim();
+        if tag.is_empty() {
+            continue;
         }
-        bail!(
-            "git describe for group '{group}' failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        );
+        let Ok(v) = parse_tag_to_version(tag, group) else {
+            // Malformed tag matching the glob — ignore. Lenient by design:
+            // a hand-created `releases/hole/v1.0.0-rc1` should not poison
+            // the rest of the lookup.
+            continue;
+        };
+        if is_ancestor_of_head(repo_root, tag)? {
+            candidates.push((v, tag.to_string()));
+        }
     }
-    let tag = String::from_utf8(output.stdout)
-        .with_context(|| format!("git describe output not utf-8 for group '{group}'"))?;
-    let tag = tag.trim();
-    Ok(Some(parse_tag_to_version(tag, group)?))
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(candidates.into_iter().next())
+}
+
+fn is_ancestor_of_head(repo_root: &Path, tag: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", tag, "HEAD"])
+        .current_dir(repo_root)
+        .status()
+        .with_context(|| format!("failed to spawn `git merge-base --is-ancestor {tag} HEAD`"))?;
+    // Exit 0 = ancestor, 1 = not ancestor, anything else = error. The
+    // structural exit-code split (vs stderr-matching) is the whole point
+    // of preferring this over `git describe`.
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(other) => bail!("git merge-base --is-ancestor exited {other} for tag '{tag}'"),
+        None => bail!("git merge-base --is-ancestor terminated by signal for tag '{tag}'"),
+    }
 }
 
 fn parse_tag_to_version(tag: &str, group: Group) -> Result<Version> {
@@ -324,49 +347,64 @@ pub fn validate_against_tag(repo_root: &Path, group: Group, exact: bool) -> Resu
 /// Compute a display version string for `group` suitable for `<binary>
 /// version` CLI output and the `*_VERSION` env vars baked into binaries.
 ///
-/// Returns the Cargo.toml version when it matches the nearest tag exactly
-/// and the worktree is clean. Otherwise appends `-snapshot+git.<hash>`
-/// and `.dirty` suffixes as appropriate.
-///
-/// Falls back to `0.0.0-unknown` if anything fails (so build.rs never panics).
+/// - When HEAD is exactly at the group's most recent ancestor tag and the
+///   worktree is clean, returns that version (e.g. `1.2.3`).
+/// - When HEAD is downstream of a tag, returns `<tag-version>-snapshot+git.<hash>`.
+/// - When the worktree is dirty, appends `.dirty`.
+/// - When no tag exists for the group yet (bootstrap state), falls back
+///   to the Cargo.toml version with a `-dev+git.<hash>` suffix instead
+///   of `0.0.0-unknown`. This preserves a meaningful version string for
+///   dev builds before the group's first release tag is cut.
+/// - If git or workspace parsing fails entirely, falls back to
+///   `0.0.0-unknown` so build.rs never panics.
 pub fn display_version(repo_root: &Path, group: Group) -> String {
     display_version_inner(repo_root, group).unwrap_or_else(|_| "0.0.0-unknown".to_string())
 }
 
 fn display_version_inner(repo_root: &Path, group: Group) -> Result<String> {
-    let glob = group.tag_glob();
-    let desc = run_git(repo_root, &["describe", "--tags", "--match", &glob, "--long"])?;
-    let desc = desc.trim();
+    let dirty_suffix = if is_worktree_dirty(repo_root) { ".dirty" } else { "" };
 
-    // Output shape: <tag>-<distance>-g<short-hash>
-    let parts: Vec<&str> = desc.rsplitn(3, '-').collect();
-    if parts.len() != 3 {
-        bail!("unexpected git describe output: {desc}");
-    }
-    let tag = parts[2];
-    let distance: u64 = parts[1].parse().with_context(|| format!("bad distance in '{desc}'"))?;
+    let mut version = match nearest_ancestor_tag(repo_root, group)? {
+        Some((tag_version, tag_name)) => {
+            // Distance = commits between tag and HEAD.
+            let count = run_git(repo_root, &["rev-list", "--count", &format!("{tag_name}..HEAD")])?;
+            let distance: u64 = count
+                .trim()
+                .parse()
+                .with_context(|| format!("bad rev-list output: {}", count.trim()))?;
+            if distance > 0 {
+                let full_hash = run_git(repo_root, &["rev-parse", "HEAD"])?;
+                format!("{tag_version}-snapshot+git.{}", full_hash.trim())
+            } else {
+                tag_version.to_string()
+            }
+        }
+        None => {
+            // No per-group tag yet. Fall back to Cargo.toml version + git
+            // hash so dev builds report something meaningful instead of
+            // 0.0.0-unknown. The `-dev` discriminator distinguishes this
+            // from `-snapshot` (which is "downstream of a known release").
+            let cargo_ver = cargo_toml_version_for_group(repo_root, group)?;
+            let full_hash = run_git(repo_root, &["rev-parse", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{cargo_ver}-dev+git.{full_hash}")
+        }
+    };
 
-    let parsed = parse_tag_to_version(tag, group)?;
-    let mut version = parsed.to_string();
+    version.push_str(dirty_suffix);
+    Ok(version)
+}
 
-    if distance > 0 {
-        let full_hash = run_git(repo_root, &["rev-parse", "HEAD"])?;
-        version = format!("{version}-snapshot+git.{}", full_hash.trim());
-    }
-
-    // Worktree dirtiness on tracked files only — matches `git describe --dirty`.
-    let dirty = Command::new("git")
+/// Worktree dirtiness on tracked files only — matches `git describe --dirty`.
+fn is_worktree_dirty(repo_root: &Path) -> bool {
+    Command::new("git")
         .args(["diff-index", "--quiet", "HEAD", "--"])
         .current_dir(repo_root)
         .status()
         .map(|s| !s.success())
-        .unwrap_or(false);
-
-    if dirty {
-        version.push_str(".dirty");
-    }
-
-    Ok(version)
+        .unwrap_or(false)
 }
 
 // is_valid_next =======================================================================================================
