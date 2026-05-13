@@ -1,10 +1,10 @@
-name: Publish Release
+name: Publish Release (hole)
 
 on:
   workflow_dispatch:
     inputs: &inputs
       version:
-        description: "Release version (e.g. 1.0.0)"
+        description: "hole release version (e.g. 1.0.0)"
         required: true
         type: string
   workflow_call:
@@ -27,7 +27,7 @@ jobs:
           V="${{ inputs.version }}"
           V="${V#v}"
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
-          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=releases/hole/v${V}" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists with signature
         run: |
