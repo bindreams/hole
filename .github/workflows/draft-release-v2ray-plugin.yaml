@@ -1,0 +1,159 @@
+name: Draft Release (v2ray-plugin)
+
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: "v2ray-plugin release version (e.g. 0.1.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs: *inputs
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          V="${V#releases/v2ray-plugin/v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Create local tag for build
+        run: git tag "releases/v2ray-plugin/v${{ steps.version.outputs.version }}"
+
+      - name: Validate version.toml matches version
+        run: cargo xtask version --check --exact --group v2ray-plugin
+
+  # Native-runner matrix. The set is intersected with shadowsocks/v2ray-plugin's
+  # upstream release platform list — anything upstream ships AND that we have
+  # a native runner for. Upstream historically ships darwin amd64/arm64, linux
+  # amd64/arm64 (and 386/arm/mips, which we don't cover), and windows amd64
+  # (no arm64). Updating this list when upstream changes platforms is a
+  # workflow-file edit. The publish workflow does not re-validate.
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest    }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel    }
+          - { os: darwin,  arch: arm64, runner: macos-latest      }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest     }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm  }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: external/v2ray-plugin/go.mod
+
+      - name: Build v2ray-plugin (native)
+        shell: bash
+        run: cargo xtask v2ray-plugin
+
+      # Stage with upstream's exact filename convention:
+      #   v2ray-plugin-{os}-{arch}-v{version}.tar.gz
+      # containing a single bare binary at the archive root, matching
+      # shadowsocks/v2ray-plugin's release layout so the artifact is
+      # drop-in compatible.
+      - name: Stage with upstream's naming + tar.gz
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          OS="${{ matrix.os }}"
+          ARCH="${{ matrix.arch }}"
+
+          # cargo xtask v2ray-plugin produces .cache/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}
+          # We need to find that file regardless of the actual host triple.
+          shopt -s nullglob
+          SRCS=(.cache/v2ray-plugin/v2ray-plugin-*)
+          if [ "${#SRCS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one v2ray-plugin binary in .cache/, got ${#SRCS[@]}: ${SRCS[*]}"
+            exit 1
+          fi
+          SRC="${SRCS[0]}"
+          # Inside the tarball the binary keeps upstream's bare name. Windows
+          # gets .exe per upstream convention.
+          INNER="v2ray-plugin"
+          if [ "$OS" = "windows" ]; then INNER="v2ray-plugin.exe"; fi
+          STAGE_DIR="staging"
+          mkdir -p "$STAGE_DIR"
+          cp "$SRC" "$STAGE_DIR/$INNER"
+
+          ARCHIVE="v2ray-plugin-${OS}-${ARCH}-v${VERSION}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$STAGE_DIR" "$INNER"
+          rm -r "$STAGE_DIR"
+
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256line"
+          echo "Artifact: $ARCHIVE"
+          cat "${ARCHIVE}.sha256line"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: v2ray-plugin-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            v2ray-plugin-*.tar.gz
+            v2ray-plugin-*.tar.gz.sha256line
+
+  release:
+    name: Create draft release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: v2ray-plugin-*
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          cat *.sha256line > SHA256SUMS
+          rm *.sha256line
+
+          lines=$(wc -l < SHA256SUMS)
+          if [ "$lines" -ne 5 ]; then
+            echo "::error::Expected 5 entries in SHA256SUMS (5-platform upstream-parity matrix), got $lines"
+            exit 1
+          fi
+
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TAG="releases/v2ray-plugin/v${VERSION}"
+          gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "v2ray-plugin v${VERSION}" \
+            --target "${{ github.sha }}" \
+            v2ray-plugin-* SHA256SUMS
+          echo "Draft release created: https://github.com/${{ github.repository }}/releases/tag/$TAG"
