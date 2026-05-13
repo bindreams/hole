@@ -1930,6 +1930,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "xtask-lib",
  "yamux",
 ]
 
@@ -1961,6 +1962,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xtask-lib",
  "yaml_serde",
 ]
 
@@ -8668,6 +8670,7 @@ dependencies = [
  "semver",
  "skuld",
  "tempfile",
+ "toml 0.8.2",
 ]
 
 [[package]]

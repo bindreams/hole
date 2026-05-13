@@ -80,7 +80,7 @@ fn emit_version_env(repo_root: &Path) {
     println!("cargo:rerun-if-changed={}", git_dir.join("refs").join("tags").display());
     println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
 
-    let version = xtask_lib::version::display_version(repo_root);
+    let version = xtask_lib::version::display_version(repo_root, xtask_lib::version::Group::Hole);
     println!("cargo:rustc-env=HOLE_VERSION={version}");
 }
 

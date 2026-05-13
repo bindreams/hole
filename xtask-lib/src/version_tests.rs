@@ -1,8 +1,389 @@
 use crate::version::*;
 use semver::Version;
+use std::path::Path;
 
 fn v(major: u64, minor: u64, patch: u64) -> Version {
     Version::new(major, minor, patch)
+}
+
+// Workspace fixture helpers ===========================================================================================
+
+fn write(path: impl AsRef<Path>, content: &str) {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+fn cargo_with_group(name: &str, version: &str, group: &str) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "{version}"
+
+[package.metadata.hole-release]
+group = "{group}"
+"#
+    )
+}
+
+fn cargo_with_group_publish_false(name: &str, version: &str, group: &str) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "{version}"
+publish = false
+
+[package.metadata.hole-release]
+group = "{group}"
+"#
+    )
+}
+
+fn cargo_publish_false_no_group(name: &str, version: &str) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "{version}"
+publish = false
+"#
+    )
+}
+
+fn cargo_publishable_no_group(name: &str, version: &str) -> String {
+    format!(
+        r#"[package]
+name = "{name}"
+version = "{version}"
+"#
+    )
+}
+
+// Group ===============================================================================================================
+
+#[skuld::test]
+fn group_parse_known() {
+    assert_eq!(Group::parse("hole").unwrap(), Group::Hole);
+    assert_eq!(Group::parse("garter").unwrap(), Group::Garter);
+    assert_eq!(Group::parse("galoshes").unwrap(), Group::Galoshes);
+    assert_eq!(Group::parse("v2ray-plugin").unwrap(), Group::V2rayPlugin);
+}
+
+#[skuld::test]
+fn group_parse_unknown_rejected() {
+    let err = Group::parse("nonsense").unwrap_err();
+    assert!(err.to_string().contains("unknown release group"));
+}
+
+#[skuld::test]
+fn group_tag_glob() {
+    assert_eq!(Group::Hole.tag_glob(), "releases/hole/v[0-9]*.[0-9]*.[0-9]*");
+    assert_eq!(Group::Garter.tag_glob(), "releases/garter/v[0-9]*.[0-9]*.[0-9]*");
+}
+
+#[skuld::test]
+fn group_tag_prefix() {
+    assert_eq!(Group::Hole.tag_prefix(), "releases/hole/v");
+    assert_eq!(Group::V2rayPlugin.tag_prefix(), "releases/v2ray-plugin/v");
+}
+
+#[skuld::test]
+fn group_all_lists_four() {
+    assert_eq!(Group::all().len(), 4);
+}
+
+// read_workspace_versions =============================================================================================
+
+#[skuld::test]
+fn workspace_versions_happy_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "b", "g"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("b").join("Cargo.toml"),
+        &cargo_with_group("b", "1.2.3", "hole"),
+    );
+    write(
+        root.join("g").join("Cargo.toml"),
+        &cargo_with_group("g", "0.5.0", "garter"),
+    );
+
+    let ws = read_workspace_versions(root).unwrap();
+    assert_eq!(ws.by_group.get(&Group::Hole), Some(&v(1, 2, 3)));
+    assert_eq!(ws.by_group.get(&Group::Garter), Some(&v(0, 5, 0)));
+}
+
+#[skuld::test]
+fn workspace_versions_within_group_inconsistency_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "b"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("b").join("Cargo.toml"),
+        &cargo_with_group("b", "1.2.4", "hole"),
+    );
+
+    let err = read_workspace_versions(root).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("group 'hole'"), "msg was: {msg}");
+    assert!(msg.contains("inconsistent"));
+}
+
+#[skuld::test]
+fn workspace_versions_cross_group_drift_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["h", "g"]
+"#,
+    );
+    write(
+        root.join("h").join("Cargo.toml"),
+        &cargo_with_group("h", "1.0.0", "hole"),
+    );
+    write(
+        root.join("g").join("Cargo.toml"),
+        &cargo_with_group("g", "0.3.5", "garter"),
+    );
+
+    let ws = read_workspace_versions(root).unwrap();
+    assert_eq!(ws.by_group.get(&Group::Hole), Some(&v(1, 0, 0)));
+    assert_eq!(ws.by_group.get(&Group::Garter), Some(&v(0, 3, 5)));
+}
+
+#[skuld::test]
+fn workspace_versions_drift_prevention_publishable_without_group_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "rogue"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("rogue").join("Cargo.toml"),
+        &cargo_publishable_no_group("rogue", "1.2.3"),
+    );
+
+    let err = read_workspace_versions(root).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("publishable"), "msg was: {msg}");
+    assert!(msg.contains("hole-release"), "msg was: {msg}");
+}
+
+#[skuld::test]
+fn workspace_versions_publish_false_without_group_allowed() {
+    // Internal tooling: publish=false AND no group. Treated as ungrouped, skipped.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "tool"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("tool").join("Cargo.toml"),
+        &cargo_publish_false_no_group("tool", "0.0.0"),
+    );
+
+    let ws = read_workspace_versions(root).unwrap();
+    assert_eq!(ws.by_group.get(&Group::Hole), Some(&v(1, 2, 3)));
+    // tool's 0.0.0 version is not counted toward anything.
+}
+
+#[skuld::test]
+fn workspace_versions_publish_false_with_group_counted() {
+    // Internal lib crate: publish=false but PART of a group (its version
+    // is locked with the group). Confirms orthogonality of publish=false
+    // and group membership.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a", "b"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("b").join("Cargo.toml"),
+        &cargo_with_group_publish_false("b", "1.2.4", "hole"), // different version
+    );
+
+    // Inconsistency must still fire (1.2.3 vs 1.2.4) — publish=false does not exempt.
+    let err = read_workspace_versions(root).unwrap_err();
+    assert!(format!("{err:#}").contains("inconsistent"));
+}
+
+#[skuld::test]
+fn workspace_versions_v2ray_plugin_from_external_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("external").join("v2ray-plugin").join("version.toml"),
+        "version = \"5.3.0\"\n",
+    );
+
+    let ws = read_workspace_versions(root).unwrap();
+    assert_eq!(ws.by_group.get(&Group::V2rayPlugin), Some(&v(5, 3, 0)));
+}
+
+#[skuld::test]
+fn workspace_versions_v2ray_plugin_rejects_pre_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+    write(
+        root.join("external").join("v2ray-plugin").join("version.toml"),
+        "version = \"5.3.0-rc1\"\n",
+    );
+
+    let err = read_workspace_versions(root).unwrap_err();
+    assert!(format!("{err:#}").contains("strict MAJOR.MINOR.PATCH"));
+}
+
+#[skuld::test]
+fn workspace_versions_unknown_group_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "nonsense"),
+    );
+
+    let err = read_workspace_versions(root).unwrap_err();
+    assert!(format!("{err:#}").contains("unknown release group"));
+}
+
+#[skuld::test]
+fn workspace_versions_rejects_pre_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3-beta", "hole"),
+    );
+
+    let err = read_workspace_versions(root).unwrap_err();
+    assert!(format!("{err:#}").contains("strict MAJOR.MINOR.PATCH"));
+}
+
+#[skuld::test]
+fn workspace_versions_rejects_glob_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["crates/*"]
+"#,
+    );
+    let err = read_workspace_versions(root).unwrap_err();
+    assert!(format!("{err:#}").contains("glob"));
+}
+
+// cargo_toml_version_for_group ========================================================================================
+
+#[skuld::test]
+fn version_for_group_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+
+    assert_eq!(cargo_toml_version_for_group(root, Group::Hole).unwrap(), v(1, 2, 3));
+}
+
+#[skuld::test]
+fn version_for_group_missing_group_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["a"]
+"#,
+    );
+    write(
+        root.join("a").join("Cargo.toml"),
+        &cargo_with_group("a", "1.2.3", "hole"),
+    );
+
+    let err = cargo_toml_version_for_group(root, Group::Garter).unwrap_err();
+    assert!(format!("{err:#}").contains("garter"));
 }
 
 // is_valid_next =======================================================================================================
@@ -80,162 +461,6 @@ fn skip_minor_rejected() {
 #[skuld::test]
 fn multi_component_bump_rejected() {
     assert!(!is_valid_next(&v(1, 0, 0), &v(1, 1, 1)));
-}
-
-// cargo_toml_version ==================================================================================================
-
-#[skuld::test]
-fn cargo_toml_version_consistent() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a", "b"]
-"#,
-    )
-    .unwrap();
-
-    for member in ["a", "b"] {
-        std::fs::create_dir_all(root.join(member)).unwrap();
-        std::fs::write(
-            root.join(member).join("Cargo.toml"),
-            "[package]\nname = \"x\"\nversion = \"1.2.3\"\n",
-        )
-        .unwrap();
-    }
-
-    let v = cargo_toml_version(root).unwrap();
-    assert_eq!(v, Version::new(1, 2, 3));
-}
-
-#[skuld::test]
-fn cargo_toml_version_inconsistent_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a", "b"]
-"#,
-    )
-    .unwrap();
-
-    std::fs::create_dir_all(root.join("a")).unwrap();
-    std::fs::write(
-        root.join("a").join("Cargo.toml"),
-        "[package]\nname = \"a\"\nversion = \"1.2.3\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.join("b")).unwrap();
-    std::fs::write(
-        root.join("b").join("Cargo.toml"),
-        "[package]\nname = \"b\"\nversion = \"1.2.4\"\n",
-    )
-    .unwrap();
-
-    let err = cargo_toml_version(root).unwrap_err();
-    assert!(err.to_string().contains("inconsistent"));
-}
-
-#[skuld::test]
-fn cargo_toml_version_rejects_pre_release() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a"]
-"#,
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.join("a")).unwrap();
-    std::fs::write(
-        root.join("a").join("Cargo.toml"),
-        "[package]\nname = \"a\"\nversion = \"1.2.3-beta\"\n",
-    )
-    .unwrap();
-
-    let err = cargo_toml_version(root).unwrap_err();
-    assert!(err.to_string().contains("strict MAJOR.MINOR.PATCH"));
-}
-
-#[skuld::test]
-fn cargo_toml_version_skips_publish_false_members() {
-    // Mirrors the real workspace: 3 publishable crates at one version, 2
-    // internal tooling crates with publish = false. Even if the tooling
-    // crates have a different (or stale) version, the publishable version
-    // is what's returned and no inconsistency error fires.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a", "b", "tool", "tool-lib"]
-"#,
-    )
-    .unwrap();
-
-    for (member, version) in [("a", "1.2.3"), ("b", "1.2.3")] {
-        std::fs::create_dir_all(root.join(member)).unwrap();
-        std::fs::write(
-            root.join(member).join("Cargo.toml"),
-            format!("[package]\nname = \"{member}\"\nversion = \"{version}\"\n"),
-        )
-        .unwrap();
-    }
-    // Tooling crates: stale version (0.0.0), publish = false. MUST be skipped.
-    for member in ["tool", "tool-lib"] {
-        std::fs::create_dir_all(root.join(member)).unwrap();
-        std::fs::write(
-            root.join(member).join("Cargo.toml"),
-            format!("[package]\nname = \"{member}\"\nversion = \"0.0.0\"\npublish = false\n"),
-        )
-        .unwrap();
-    }
-
-    let v = cargo_toml_version(root).unwrap();
-    assert_eq!(v, Version::new(1, 2, 3));
-}
-
-#[skuld::test]
-fn cargo_toml_version_rejects_when_only_publish_false_members() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["only-tool"]
-"#,
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.join("only-tool")).unwrap();
-    std::fs::write(
-        root.join("only-tool").join("Cargo.toml"),
-        "[package]\nname = \"only-tool\"\nversion = \"0.0.0\"\npublish = false\n",
-    )
-    .unwrap();
-    let err = cargo_toml_version(root).unwrap_err();
-    assert!(err.to_string().contains("publishable"));
-}
-
-#[skuld::test]
-fn cargo_toml_version_rejects_glob_members() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["crates/*"]
-"#,
-    )
-    .unwrap();
-    let err = cargo_toml_version(root).unwrap_err();
-    assert!(err.to_string().contains("glob"));
 }
 
 // display_version =====================================================================================================

@@ -95,11 +95,20 @@ pub enum Command {
     ///
     /// Currently: `v2ray-plugin` + `galoshes` + `wintun`.
     Deps,
-    /// Print or validate the workspace version. Replaces scripts/check-version.py.
+    /// Print or validate the workspace version for a release group.
+    ///
+    /// Each release group (`hole`, `garter`, `galoshes`, `v2ray-plugin`)
+    /// has its own version, declared in member Cargo.tomls via
+    /// `[package.metadata.hole-release].group` and validated against the
+    /// nearest `releases/<group>/v<X.Y.Z>` git tag.
     Version {
-        /// Validate Cargo.toml version against the nearest git tag instead of
-        /// printing the display version.
-        #[arg(long)]
+        /// Release group to operate on. Required for `--check`. Without
+        /// `--group`, prints a table of every group's resolved version.
+        #[arg(long, value_parser = parse_group_arg)]
+        group: Option<xtask_lib::version::Group>,
+        /// Validate Cargo.toml version against the nearest git tag for
+        /// the named group instead of printing it.
+        #[arg(long, requires = "group")]
         check: bool,
         /// With `--check`, require an exact tag/Cargo.toml match (instead of
         /// allowing one bump ahead). Used by the release CI workflow.
@@ -178,7 +187,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::Deps => run_deps(),
-        Command::Version { check, exact } => run_version(check, exact),
+        Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
         Command::Run { target } => run_run(target),
         Command::List => run_list(),
@@ -296,13 +305,26 @@ fn load_manifest() -> Result<(Manifest, PathBuf)> {
     Ok((manifest, repo_root))
 }
 
-pub fn run_version(check: bool, exact: bool) -> Result<()> {
+fn parse_group_arg(s: &str) -> Result<xtask_lib::version::Group, String> {
+    xtask_lib::version::Group::parse(s).map_err(|e| e.to_string())
+}
+
+pub fn run_version(group: Option<xtask_lib::version::Group>, check: bool, exact: bool) -> Result<()> {
     let repo_root = repo_root()?;
-    if check {
-        let v = xtask_lib::version::validate_against_tag(&repo_root, exact)?;
-        println!("{v}");
-    } else {
-        println!("{}", xtask_lib::version::display_version(&repo_root));
+    match (group, check) {
+        (Some(group), true) => {
+            let v = xtask_lib::version::validate_against_tag(&repo_root, group, exact)?;
+            println!("{v}");
+        }
+        (Some(group), false) => {
+            println!("{}", xtask_lib::version::display_version(&repo_root, group));
+        }
+        (None, _) => {
+            // No group: print a table of every group's display version.
+            for &group in xtask_lib::version::Group::all() {
+                println!("{group}\t{}", xtask_lib::version::display_version(&repo_root, group));
+            }
+        }
     }
     Ok(())
 }

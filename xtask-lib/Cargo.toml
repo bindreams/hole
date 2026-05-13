@@ -15,6 +15,7 @@ harness = false
 [dependencies]
 anyhow = "1"
 semver = "1"
+toml = "0.8"
 
 [dev-dependencies]
 skuld = { workspace = true }

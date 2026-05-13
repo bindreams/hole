@@ -1,4 +1,4 @@
-exclude = "^external/"
+exclude = "^external/(?!v2ray-plugin/version\\.toml$)"
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
 # Local hooks ==========================================================================================================
@@ -30,12 +30,36 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
-id = "check-version"
-name = "check Cargo.toml version vs git tag"
-entry = "cargo xtask version --check"
+id = "check-version-hole"
+name = "check hole group Cargo.toml version vs git tag"
+entry = "cargo xtask version --check --group hole"
 language = "system"
 pass_filenames = false
-always_run = true
+files = "^(Cargo\\.toml|crates/(hole|common|bridge|tun-engine|tun-engine-macros|dump|dump-macros|handle-holders)/Cargo\\.toml)$"
+
+[[repos.hooks]]
+id = "check-version-garter"
+name = "check garter group Cargo.toml version vs git tag"
+entry = "cargo xtask version --check --group garter"
+language = "system"
+pass_filenames = false
+files = "^(Cargo\\.toml|crates/(garter|garter-bin)/Cargo\\.toml)$"
+
+[[repos.hooks]]
+id = "check-version-galoshes"
+name = "check galoshes group Cargo.toml version vs git tag"
+entry = "cargo xtask version --check --group galoshes"
+language = "system"
+pass_filenames = false
+files = "^(Cargo\\.toml|crates/galoshes/Cargo\\.toml)$"
+
+[[repos.hooks]]
+id = "check-version-v2ray-plugin"
+name = "check v2ray-plugin version vs git tag"
+entry = "cargo xtask version --check --group v2ray-plugin"
+language = "system"
+pass_filenames = false
+files = "^external/v2ray-plugin/version\\.toml$"
 
 [[repos.hooks]]
 id = "check-workspace-lints"

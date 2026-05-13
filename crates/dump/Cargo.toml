@@ -2,9 +2,13 @@
 name = "dump"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "YAML-shaped representation for logging, analogous to Python's dump() alongside str()/repr()."
 repository = "https://github.com/bindreams/hole"
 license = "GPL-3.0-or-later"
+
+[package.metadata.hole-release]
+group = "hole"
 
 [lints]
 workspace = true

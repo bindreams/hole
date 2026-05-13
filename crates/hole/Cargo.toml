@@ -2,6 +2,10 @@
 name = "hole"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[package.metadata.hole-release]
+group = "hole"
 
 [lints]
 workspace = true
