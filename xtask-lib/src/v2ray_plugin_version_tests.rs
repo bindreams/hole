@@ -205,6 +205,22 @@ fn sequence_increment_within_base_accepted() {
 }
 
 #[skuld::test]
+fn sequence_equal_to_latest_accepted() {
+    // After-release stable state: version.toml equals the most recent
+    // same-base hole.N tag. This is valid until the next bump (the
+    // maintainer hasn't decided what comes next yet). Mirrors the
+    // hole/garter/galoshes validator's "Cargo.toml == nearest tag" path.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_version_toml(root, "1.3.3-hole.1");
+    init_git_repo(root);
+    create_tag(root, "releases/v2ray-plugin/v1.3.3-hole.1");
+
+    let v = validate_against_tag(root, false).unwrap();
+    assert_eq!(v.pre.as_str(), "hole.1");
+}
+
+#[skuld::test]
 fn sequence_new_base_after_hole_iterations_accepted() {
     // Prior 1.3.3-hole.2, current 1.3.4-hole.1 → accept (new base, no
     // same-base hole.K → max_existing = 0 → expected N = 1).

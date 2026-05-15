@@ -121,6 +121,26 @@ jobs:
           echo "SHA256SUMS:"
           cat SHA256SUMS
 
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: source
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Generate per-track release notes
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TAG="releases/garter/v${VERSION}"
+          uv run source/scripts/generate-release-notes.py garter \
+            --new-tag "$TAG" \
+            --head "${{ github.sha }}" \
+            --repo-root source \
+            > release-notes.md
+          echo "--- release-notes.md ---"
+          cat release-notes.md
+          echo "--- end ---"
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,7 +150,7 @@ jobs:
           TAG="releases/garter/v${VERSION}"
           gh release create "$TAG" \
             --draft \
-            --generate-notes \
+            --notes-file release-notes.md \
             --title "garter v${VERSION}" \
             --target "${{ github.sha }}" \
             garter-* SHA256SUMS

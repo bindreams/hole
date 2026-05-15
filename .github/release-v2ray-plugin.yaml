@@ -1,0 +1,43 @@
+# Per-track release notes config for the `v2ray-plugin` release group.
+# Consumed by scripts/generate-release-notes.py at release time.
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+
+initial_release: |
+  Initial release of `v2ray-plugin` as a standalone Hole-published
+  track. See #291 for the four-track release decoupling rationale and
+  CLAUDE.md "Releases > Per-product release workflows > v2ray-plugin"
+  for the lineage versioning scheme (`X.Y.Z` for upstream-tagged
+  releases, `X.Y.Z-hole.N` for Hole iterations between upstream tags).
+
+# Notes: a v2ray-plugin release commonly contains zero Hole-authored
+# changes (it ships upstream's master as of the last `git subrepo pull`,
+# with no Hole-local commits in `external/v2ray-plugin/` in between). In
+# that case the script emits a body that explicitly says "no commits in
+# this range touched the v2ray-plugin track; upstream-only changes since
+# <prev>" rather than misleading empty output.
+include_paths:
+  - external/v2ray-plugin/**
+  - .github/workflows/draft-release-v2ray-plugin.yaml
+  - .github/workflows/publish-release-v2ray-plugin.yaml
+  - .github/release-v2ray-plugin.yaml
+
+categories:
+  - title: "🚀 Features"
+    types: [feat]
+  - title: "🐛 Bug Fixes"
+    types: [fix]
+  - title: "⚡ Performance"
+    types: [perf]
+  - title: "♻️ Refactors"
+    types: [refactor]
+  - title: "📚 Documentation"
+    types: [docs]
+  - title: "🔧 Build & CI"
+    types: [build, ci]
+  - title: "🧪 Tests"
+    types: [test]
+  - title: "🧹 Chores"
+    types: [chore, style, revert]
+  - title: "Other"
+    types: []
