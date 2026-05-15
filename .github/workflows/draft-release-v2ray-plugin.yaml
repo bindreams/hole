@@ -108,7 +108,7 @@ jobs:
           tar -czf "$ARCHIVE" -C "$STAGE_DIR" "$INNER"
           rm -r "$STAGE_DIR"
 
-          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256line"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256line"
           echo "Artifact: $ARCHIVE"
           cat "${ARCHIVE}.sha256line"
 
