@@ -384,12 +384,12 @@ Version per group is declared in each crate's
 `xtask-lib::version` (publishable-but-ungrouped crates are rejected;
 within-group versions must match).
 
-| Product        | Group members                                                                                      | Artifacts                                                                | Signed         | crates.io     |
-| -------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
-| `hole`         | `hole, hole-common, hole-bridge, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders` | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
-| `galoshes`     | `galoshes`                                                                                         | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
-| `garter`       | `garter, garter-bin`                                                                               | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
-| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`)                               | Upstream-parity tar.gz set + `SHA256SUMS`                                | No             | n/a           |
+| Product        | Group members                                                                                       | Artifacts                                                                | Signed         | crates.io     |
+| -------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
+| `hole`         | `hole, hole-common, hole-bridge, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders`  | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
+| `galoshes`     | `galoshes`                                                                                          | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
+| `garter`       | `garter, garter-bin`                                                                                | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
+| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`, lineage form `X.Y.Z[-hole.N]`) | 6-platform tar.gz set (upstream parity + windows-arm64) + `SHA256SUMS`   | No             | n/a           |
 
 Asset naming:
 
@@ -418,9 +418,25 @@ step.
 ### Per-product release workflows
 
 - **hole**: `draft-release-hole.yaml` → `scripts/sign-release.py <version>` → `publish-release-hole.yaml`. Tag created at publish.
+
 - **galoshes**: `draft-release-galoshes.yaml` → `publish-release-galoshes.yaml`. No signing.
+
 - **garter**: `draft-release-garter.yaml` (also runs `cargo publish --dry-run -p garter` for early failure) → `publish-release-garter.yaml`. Publish workflow is idempotent: it queries crates.io's API to see whether the version already exists (200) and skips the `cargo publish` step if so, so a re-run after a partial-failure resumes cleanly. A `dry_run: true` input runs `cargo publish --dry-run` and exits without touching crates.io or the tag.
-- **v2ray-plugin**: `draft-release-v2ray-plugin.yaml` → `publish-release-v2ray-plugin.yaml`. The matrix matches shadowsocks/v2ray-plugin upstream's release platform list — currently darwin amd64/arm64, linux amd64/arm64, windows amd64 (5 platforms). When upstream changes its set, edit the matrix and the SHA256SUMS line count in the draft workflow. Hole-local v2ray-plugin patches land via `git subrepo pull external/v2ray-plugin` followed by ordinary commits.
+
+- **v2ray-plugin**: `draft-release-v2ray-plugin.yaml` → `publish-release-v2ray-plugin.yaml`. The matrix is upstream's release platform set — darwin amd64/arm64, linux amd64/arm64, windows amd64 — **plus windows-arm64**, which upstream doesn't ship but we already build and transitively test via galoshes-on-windows-arm64 (galoshes embeds v2ray-plugin). 6 platforms total. When upstream changes its set, edit the matrix and the SHA256SUMS line count in the draft workflow. Hole-local v2ray-plugin patches land via `git subrepo pull external/v2ray-plugin` followed by ordinary commits.
+
+  **Lineage versioning.** v2ray-plugin's version (`external/v2ray-plugin/version.toml`) follows the convention `X.Y.Z` (we vendor upstream's `vX.Y.Z` release exactly) or `X.Y.Z-hole.N` (we vendor upstream-master between two upstream tags, with `N` counting our successive Hole-side release iterations against the same `X.Y.Z` base). Per semver, `X.Y.Z-hole.N` orders strictly above `X.Y.Z-1`'s artifacts and strictly below upstream's eventual `vX.Y.Z` — capturing exactly the "between releases" semantic. Precedent: Go modules' pseudo-versions use the same `X.Y.(Z+1)-pre` shape.
+
+  Worked example: our current vendored commit `e9af1cd` is 5 upstream-master commits past `v1.3.2` (including a v2ray-core v4→v5 migration). Bump base = `1.3.3` (next patch after upstream's last tag), iteration = `1` (first Hole release of this base) → `version = "1.3.3-hole.1"`.
+
+  **Maintainer rules** (xtask-lib/src/v2ray_plugin_version.rs enforces shape + sequence; bases are your call):
+
+  - When pulling upstream-master between two upstream tags: set `X.Y.Z` to upstream's next-patch-after-last-tag and `N` to 1 (or increment if you've cut a prior Hole release against the same base).
+  - When pulling at an upstream tag exactly: set version to that tag's bare `X.Y.Z` (no `-hole.N` suffix).
+  - On each successive Hole release with the same `X.Y.Z` base, increment `N` by exactly 1 (no gaps). The validator rejects skips.
+  - The validator does NOT cross-check against upstream's tag history (we don't have upstream's git data locally); the maintainer is responsible for picking the right `X.Y.Z` base.
+
+  **Display-version note.** Dev builds downstream of `releases/v2ray-plugin/v1.3.3-hole.1` produce `1.3.3-hole.1-snapshot+git.<hash>`. This is valid semver — the `-snapshot` extends the pre-release identifier — and intentional. Two dashes before `+git.` is not a bug.
 
 ### Version model (`cargo xtask version`)
 

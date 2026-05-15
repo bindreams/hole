@@ -32,7 +32,9 @@ jobs:
           V="${{ inputs.version }}"
           V="${V#v}"
           V="${V#releases/v2ray-plugin/v}"
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          # Accept X.Y.Z (bare) or X.Y.Z-hole.N (positive integer). See
+          # xtask-lib/src/v2ray_plugin_version.rs for the rule and rationale.
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-hole\.[1-9][0-9]*)?$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Create local tag for build
@@ -41,12 +43,14 @@ jobs:
       - name: Validate version.toml matches version
         run: cargo xtask version --check --exact --group v2ray-plugin
 
-  # Native-runner matrix. The set is intersected with shadowsocks/v2ray-plugin's
-  # upstream release platform list — anything upstream ships AND that we have
-  # a native runner for. Upstream historically ships darwin amd64/arm64, linux
-  # amd64/arm64 (and 386/arm/mips, which we don't cover), and windows amd64
-  # (no arm64). Updating this list when upstream changes platforms is a
-  # workflow-file edit. The publish workflow does not re-validate.
+  # Native-runner matrix. Upstream shadowsocks/v2ray-plugin's latest release
+  # ships darwin amd64/arm64, linux amd64/arm64 (and 386/arm/mips, which we
+  # don't cover), and windows amd64 — no windows-arm64. We add windows-arm64
+  # ourselves because galoshes (which embeds v2ray-plugin) builds and tests
+  # on all 6 platforms including windows-arm64, so the windows-arm64
+  # v2ray-plugin binary is already produced and transitively exercised; we
+  # just ship the same artifact here. Updating this list when upstream
+  # changes platforms is a workflow-file edit.
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     needs: validate
@@ -56,6 +60,7 @@ jobs:
       matrix:
         include:
           - { os: windows, arch: amd64, runner: windows-latest    }
+          - { os: windows, arch: arm64, runner: windows-11-arm    }
           - { os: darwin,  arch: amd64, runner: macos-15-intel    }
           - { os: darwin,  arch: arm64, runner: macos-latest      }
           - { os: linux,   arch: amd64, runner: ubuntu-latest     }
@@ -135,8 +140,8 @@ jobs:
           rm *.sha256line
 
           lines=$(wc -l < SHA256SUMS)
-          if [ "$lines" -ne 5 ]; then
-            echo "::error::Expected 5 entries in SHA256SUMS (5-platform upstream-parity matrix), got $lines"
+          if [ "$lines" -ne 6 ]; then
+            echo "::error::Expected 6 entries in SHA256SUMS (5 upstream-parity platforms + windows-arm64), got $lines"
             exit 1
           fi
 

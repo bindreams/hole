@@ -27,7 +27,8 @@ jobs:
           V="${{ inputs.version }}"
           V="${V#v}"
           V="${V#releases/v2ray-plugin/v}"
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          # Accept X.Y.Z (bare) or X.Y.Z-hole.N. See draft workflow + xtask-lib/src/v2ray_plugin_version.rs.
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-hole\.[1-9][0-9]*)?$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
           echo "tag=releases/v2ray-plugin/v${V}" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists
