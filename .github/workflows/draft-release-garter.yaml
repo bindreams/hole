@@ -1,0 +1,137 @@
+name: Draft Release (garter)
+
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: "garter release version (e.g. 0.1.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs: *inputs
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate version + cargo publish --dry-run
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          V="${V#releases/garter/v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Create local tag for build
+        run: git tag "releases/garter/v${{ steps.version.outputs.version }}"
+
+      - name: Validate Cargo.toml matches version
+        run: cargo xtask version --check --exact --group garter
+
+      # Surface any crates.io publish blockers (missing metadata, syntax,
+      # path-dep that won't resolve) BEFORE we build artifacts.
+      - name: cargo publish --dry-run for garter library
+        run: cargo publish --dry-run -p garter
+
+  build:
+    name: Build garter-bin (${{ matrix.os }}/${{ matrix.arch }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest    }
+          - { os: windows, arch: arm64, runner: windows-11-arm    }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel    }
+          - { os: darwin,  arch: arm64, runner: macos-latest      }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest     }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm  }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create local tag for build
+        run: git tag "releases/garter/v${{ needs.validate.outputs.version }}"
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Build garter-bin (release)
+        shell: bash
+        run: cargo xtask build garter-bin
+
+      # garter-bin's binary is named `garter` (per CLAUDE.md / Cargo.toml
+      # `[[bin]] name = "garter"`). The release-asset name carries the
+      # crate's release-group as the user-visible prefix.
+      - name: Rename artifact and compute SHA-256
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          EXT=""
+          if [ "${{ matrix.os }}" = "windows" ]; then EXT=".exe"; fi
+          ASSET="garter-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
+
+          mv "target/release/garter${EXT}" "$ASSET"
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256line"
+          echo "Artifact: $ASSET"
+          cat "${ASSET}.sha256line"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: garter-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            garter-*
+            garter-*.sha256line
+
+  release:
+    name: Create draft release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: garter-*
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          cat *.sha256line > SHA256SUMS
+          rm *.sha256line
+
+          lines=$(wc -l < SHA256SUMS)
+          if [ "$lines" -ne 6 ]; then
+            echo "::error::Expected 6 entries in SHA256SUMS (6-platform matrix), got $lines"
+            exit 1
+          fi
+
+          echo "SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TAG="releases/garter/v${VERSION}"
+          gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "garter v${VERSION}" \
+            --target "${{ github.sha }}" \
+            garter-* SHA256SUMS
+          echo "Draft release created: https://github.com/${{ github.repository }}/releases/tag/$TAG"

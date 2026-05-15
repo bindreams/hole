@@ -66,6 +66,20 @@ pub struct UpdateInfo {
 
 const REPO: &str = "bindreams/hole";
 
+/// Tag-name prefix for hole's release track. Per the four-track release
+/// model (#291), other products (`galoshes`, `garter`, `v2ray-plugin`)
+/// use their own `releases/<product>/v...` prefixes and must be ignored
+/// by the hole auto-updater.
+const HOLE_TAG_PREFIX: &str = "releases/hole/v";
+
+/// Parse a hole release tag name. Returns `None` for tags that do not
+/// belong to hole's release track (other products' tags, or any
+/// non-release tag).
+fn parse_hole_tag(tag: &str) -> Option<ReleaseVersion> {
+    let stripped = tag.strip_prefix(HOLE_TAG_PREFIX)?;
+    ReleaseVersion::parse(stripped).ok()
+}
+
 /// Check GitHub for an available update.
 ///
 /// This is a blocking function — call from `spawn_blocking`.
@@ -151,7 +165,10 @@ pub(crate) fn candidate_tags(
     let mut candidates: Vec<(ReleaseVersion, String)> = tags
         .iter()
         .filter_map(|t| {
-            let ver = ReleaseVersion::parse(&t.name).ok()?;
+            // Filter to hole's track only (`releases/hole/v...`). Other product
+            // tracks live alongside in the same repo and must not trigger hole
+            // auto-updates.
+            let ver = parse_hole_tag(&t.name)?;
             let dominated = if is_snapshot { ver >= *current } else { ver > *current };
             dominated.then(|| (ver, t.name.clone()))
         })
@@ -175,7 +192,7 @@ pub(crate) fn release_qualifies(release: &GitHubRelease) -> Option<UpdateInfo> {
     let sha256sums = release.assets.iter().find(|a| a.name == "SHA256SUMS")?;
     let sha256sums_minisig = release.assets.iter().find(|a| a.name == "SHA256SUMS.minisig")?;
 
-    let version = ReleaseVersion::parse(&release.tag_name).ok()?;
+    let version = parse_hole_tag(&release.tag_name)?;
 
     Some(UpdateInfo {
         version,

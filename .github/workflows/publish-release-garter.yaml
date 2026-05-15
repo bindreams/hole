@@ -1,0 +1,116 @@
+name: Publish Release (garter)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "garter release version (e.g. 0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Run `cargo publish --dry-run` and exit before tag work"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Verify, publish to crates.io, tag
+    runs-on: ubuntu-latest
+    # 30 minutes is generous for the cargo-publish + crates.io indexing
+    # wait (typically completes in seconds-to-minutes). If indexing takes
+    # longer, that's a crates.io outage; the timeout surfaces it instead
+    # of letting the runner hang for 6 hours.
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          V="${V#releases/garter/v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=releases/garter/v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is not a draft"
+            exit 1
+          fi
+
+      - name: Dry-run path
+        if: ${{ inputs.dry_run }}
+        run: |
+          cargo publish --dry-run -p garter
+          echo "dry_run=true; not publishing or tagging"
+
+      # Check if this version is already on crates.io. The HTTP API returns
+      # 200 for an existing version and 404 for a missing one. Anything else
+      # is treated as a transient failure and fails the workflow loudly.
+      - name: Check if garter version already on crates.io
+        id: crates_io
+        if: ${{ !inputs.dry_run }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          URL="https://crates.io/api/v1/crates/garter/${VERSION}"
+          CODE=$(curl -sf -o /dev/null -w '%{http_code}' -X GET "$URL" || true)
+          echo "HTTP status: $CODE"
+          case "$CODE" in
+            200) echo "already_published=true"  >> "$GITHUB_OUTPUT" ;;
+            404) echo "already_published=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "::error::Unexpected HTTP status $CODE from crates.io for garter ${VERSION}"; exit 1 ;;
+          esac
+
+      - name: cargo publish (only when not already on crates.io)
+        if: ${{ !inputs.dry_run && steps.crates_io.outputs.already_published == 'false' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p garter
+
+      # crates.io accepts `cargo publish` and indexes asynchronously
+      # (seconds to minutes). If we flip the GitHub release to published
+      # immediately, downstream users may see the release announcement
+      # before `cargo install garter` works. Wait until the API confirms
+      # the version is indexed before continuing.
+      #
+      # No artificial loop cap: the workflow's job-level timeout below
+      # is the hard ceiling. crates.io indexing is well-behaved; the only
+      # reason this would time out is a real outage, in which case the
+      # tag-creation step below should not run either.
+      - name: Wait for crates.io to index the new version
+        if: ${{ !inputs.dry_run }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          URL="https://crates.io/api/v1/crates/garter/${VERSION}"
+          while true; do
+            CODE=$(curl -sf -o /dev/null -w '%{http_code}' -X GET "$URL" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "garter ${VERSION} is indexed on crates.io"
+              break
+            fi
+            echo "Still indexing... (HTTP $CODE)"
+            sleep 10
+          done
+
+      - name: Publish GitHub release (and create tag)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release edit "$TAG" --draft=false --latest=false
+          echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"

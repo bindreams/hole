@@ -5,9 +5,16 @@
 # ///
 """Sign a draft GitHub release's SHA256SUMS and upload the signature.
 
+Only `hole` releases are signed (minisign supply-chain integrity for the
+auto-updated binary distribution); `galoshes`, `garter`, and `v2ray-plugin`
+ship unsigned per release-pipeline decisions in #291.
+
 Usage:
-    uv run scripts/sign-release.py v1.0.0
-    uv run scripts/sign-release.py v1.0.0 --secret-key ~/path/to/minisign.key
+    uv run scripts/sign-release.py 1.0.0
+    uv run scripts/sign-release.py 1.0.0 --secret-key ~/path/to/minisign.key
+
+The script accepts the bare semver and prepends the `releases/hole/v` tag
+prefix internally.
 """
 
 import argparse
@@ -20,15 +27,16 @@ from pathlib import Path
 
 REPO = "bindreams/hole"
 EXPECTED_INSTALLER_COUNT = 3
+TAG_PREFIX = "releases/hole/v"
 
 
 def normalize_tag(tag: str) -> str:
-    """Strip optional 'v' prefix and validate semver format. Returns 'v'-prefixed tag."""
-    version = tag.removeprefix("v")
+    """Strip optional 'v'/'releases/hole/v' prefix and validate semver. Returns full tag."""
+    version = tag.removeprefix(TAG_PREFIX).removeprefix("v")
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         print(f"error: invalid version: {tag!r} (expected MAJOR.MINOR.PATCH)", file=sys.stderr)
         sys.exit(1)
-    return f"v{version}"
+    return f"{TAG_PREFIX}{version}"
 
 
 def validate_sha256sums(path: Path) -> None:
@@ -121,16 +129,20 @@ if __name__ == "__main__":
 # Tests (run with pytest) ==============================================================================================
 
 
-def test_normalize_tag_with_prefix():
-    assert normalize_tag("v1.0.0") == "v1.0.0"
+def test_normalize_tag_with_v_prefix():
+    assert normalize_tag("v1.0.0") == "releases/hole/v1.0.0"
 
 
 def test_normalize_tag_without_prefix():
-    assert normalize_tag("1.0.0") == "v1.0.0"
+    assert normalize_tag("1.0.0") == "releases/hole/v1.0.0"
+
+
+def test_normalize_tag_with_full_prefix():
+    assert normalize_tag("releases/hole/v1.0.0") == "releases/hole/v1.0.0"
 
 
 def test_normalize_tag_large_numbers():
-    assert normalize_tag("v10.20.30") == "v10.20.30"
+    assert normalize_tag("v10.20.30") == "releases/hole/v10.20.30"
 
 
 def test_normalize_tag_invalid():

@@ -1,0 +1,46 @@
+name: Publish Release (v2ray-plugin)
+
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: "v2ray-plugin release version (e.g. 0.1.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs: *inputs
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          V="${V#releases/v2ray-plugin/v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "tag=releases/v2ray-plugin/v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is not a draft"
+            exit 1
+          fi
+
+      - name: Publish release
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release edit "$TAG" --draft=false --latest=false
+          echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"
