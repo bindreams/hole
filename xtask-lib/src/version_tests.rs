@@ -1,3 +1,4 @@
+use crate::test_support::init_git_repo;
 use crate::version::*;
 use semver::Version;
 use std::path::Path;
@@ -249,51 +250,11 @@ members = ["a", "b"]
     assert!(format!("{err:#}").contains("inconsistent"));
 }
 
-#[skuld::test]
-fn workspace_versions_v2ray_plugin_from_external_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a"]
-"#,
-    );
-    write(
-        root.join("a").join("Cargo.toml"),
-        &cargo_with_group("a", "1.2.3", "hole"),
-    );
-    write(
-        root.join("external").join("v2ray-plugin").join("version.toml"),
-        "version = \"5.3.0\"\n",
-    );
-
-    let ws = read_workspace_versions(root).unwrap();
-    assert_eq!(ws.by_group.get(&Group::V2rayPlugin), Some(&v(5, 3, 0)));
-}
-
-#[skuld::test]
-fn workspace_versions_v2ray_plugin_rejects_pre_release() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    write(
-        root.join("Cargo.toml"),
-        r#"[workspace]
-members = ["a"]
-"#,
-    );
-    write(
-        root.join("a").join("Cargo.toml"),
-        &cargo_with_group("a", "1.2.3", "hole"),
-    );
-    write(
-        root.join("external").join("v2ray-plugin").join("version.toml"),
-        "version = \"5.3.0-rc1\"\n",
-    );
-
-    let err = read_workspace_versions(root).unwrap_err();
-    assert!(format!("{err:#}").contains("strict MAJOR.MINOR.PATCH"));
-}
+// The two v2ray-plugin-specific tests that used to live here
+// (workspace_versions_v2ray_plugin_from_external_file,
+// workspace_versions_v2ray_plugin_rejects_pre_release) moved to
+// v2ray_plugin_version_tests.rs alongside the dedicated module, since
+// read_workspace_versions no longer populates Group::V2rayPlugin.
 
 #[skuld::test]
 fn workspace_versions_unknown_group_rejected() {
@@ -512,19 +473,6 @@ members = ["a"]
     let err = validate_against_tag(root, Group::Hole, true).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("no `releases/hole/v...` tag yet"), "msg was: {msg}");
-}
-
-fn init_git_repo(root: &Path) {
-    use std::process::Command;
-    fn git(root: &Path, args: &[&str]) {
-        let s = Command::new("git").args(args).current_dir(root).status().unwrap();
-        assert!(s.success(), "git {} failed in {}", args.join(" "), root.display());
-    }
-    git(root, &["init", "--quiet"]);
-    git(root, &["config", "user.email", "test@example.invalid"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "."]);
-    git(root, &["commit", "--quiet", "-m", "init"]);
 }
 
 // display_version =====================================================================================================
