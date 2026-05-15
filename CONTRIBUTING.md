@@ -63,6 +63,42 @@ Any code that needs an ephemeral port and follows up with an OS bind (TCP listen
 
 **Scope.** `bind_with_retry` retries `is_bind_race` errors that surface through the closure as `io::Error`. Out-of-process binders (plugin subprocesses) report bind failures through other channels (oneshot timeout, exit code) — not retried by the wrapper. For those sites use `bind_with_retry` for structural consistency; the actual race-mitigation comes from `free_port`'s internal probe-side retries. The three current consumers — [`LocalDnsServer::bind`](crates/bridge/src/dns/server.rs), [`start_plugin_chain`](crates/bridge/src/proxy/plugin.rs), and [`test_support::ssserver::start_real_ss_server*`](crates/bridge/src/test_support/ssserver.rs) — all route through it.
 
+## Commit messages — Conventional Commits
+
+This repository squash-merges every PR, so the PR title becomes the
+commit subject on `main`. PR titles MUST follow the
+[Conventional Commits](https://www.conventionalcommits.org/) format:
+
+```
+<type>(<scope>)?: <description>
+```
+
+`type` is one of: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
+`test`, `build`, `ci`, `chore`, `revert`. `scope` is optional and
+identifies an area or crate (`bridge`, `xtask`, `release`, etc.). A
+trailing `!` (e.g. `feat(api)!: …`) flags a breaking change.
+
+Examples that match this convention:
+
+- `feat(bridge): add HTTPS DoH support to DNS forwarder`
+- `fix(release): use sha256sum (cross-platform) instead of shasum`
+- `refactor(xtask-lib): per-product version groups`
+- `chore(deps): bump tokio from 1.52 to 1.53`
+
+Enforcement: a CI check on every PR validates the title against the
+allowed types and shape (see [.github/workflows/semantic-pr.yaml](.github/workflows/semantic-pr.yaml)).
+A non-conforming title fails the check; rename via `gh pr edit <N> --title "..."`
+or the web UI and the check re-runs automatically.
+
+Why it matters operationally: the type prefix drives per-track release
+notes categorization. `scripts/generate-release-notes.py` reads each
+track's `.github/release-<track>.yaml` config, filters squash-commits
+by file paths the PR touched, and groups them under their type's
+heading (Features / Bug fixes / etc.). A PR without a recognizable type
+prefix is grouped under "Other" rather than dropped — so the existing
+non-conforming history before this policy landed remains visible — but
+new PRs must conform via the CI gate.
+
 ## Prerequisites
 
 - Rust toolchain

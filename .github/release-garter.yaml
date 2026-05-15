@@ -1,0 +1,38 @@
+# Per-track release notes config for the `garter` release group.
+# Consumed by scripts/generate-release-notes.py at release time.
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+
+initial_release: |
+  Initial release of `garter`, the SIP003u plugin-chain runner library
+  + `garter` CLI binary for plugin developers. Library is published to
+  crates.io; CLI ships as a 6-platform binary via GitHub release. See
+  #291 for the four-track release decoupling rationale.
+
+include_paths:
+  - crates/garter/**
+  - crates/garter-bin/**
+  - crates/mock-plugin/**
+  - .github/workflows/draft-release-garter.yaml
+  - .github/workflows/publish-release-garter.yaml
+  - .github/release-garter.yaml
+
+categories:
+  - title: "🚀 Features"
+    types: [feat]
+  - title: "🐛 Bug Fixes"
+    types: [fix]
+  - title: "⚡ Performance"
+    types: [perf]
+  - title: "♻️ Refactors"
+    types: [refactor]
+  - title: "📚 Documentation"
+    types: [docs]
+  - title: "🔧 Build & CI"
+    types: [build, ci]
+  - title: "🧪 Tests"
+    types: [test]
+  - title: "🧹 Chores"
+    types: [chore, style, revert]
+  - title: "Other"
+    types: []

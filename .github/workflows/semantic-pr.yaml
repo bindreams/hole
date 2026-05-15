@@ -1,0 +1,49 @@
+name: Semantic PR Title
+
+# Enforces the Conventional Commits convention on PR titles. Since this
+# repo squash-merges every PR, the PR title becomes the commit subject on
+# main, and the type prefix drives per-track release-notes categorization
+# (see scripts/generate-release-notes.py).
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+
+# `on: pull_request` (vs `pull_request_target`) runs the workflow from the
+# PR's branch using the default read-only GITHUB_TOKEN. We don't need
+# write access (the action only reads the PR title), and using
+# `pull_request` lets the workflow itself be validated by its own PR at
+# introduction time. From a security standpoint there's nothing
+# exploitable in this workflow: it doesn't check out PR code, doesn't run
+# untrusted scripts, doesn't expose secrets.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Allowed types match the CONTRIBUTING.md list and
+          # .github/release-*.yaml categorization buckets. If you add a
+          # new type here, also add a category for it in every
+          # per-track release config (or let it fall into "Other").
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false

@@ -1,0 +1,37 @@
+# Per-track release notes config for the `galoshes` release group.
+# Consumed by scripts/generate-release-notes.py at release time.
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+
+initial_release: |
+  Initial release of the standalone `galoshes` SIP003u plugin for
+  shadowsocks server operators. See #291 for the four-track release
+  decoupling rationale.
+
+include_paths:
+  - crates/galoshes/**
+  - crates/garter/**
+  - external/v2ray-plugin/**
+  - .github/workflows/draft-release-galoshes.yaml
+  - .github/workflows/publish-release-galoshes.yaml
+  - .github/release-galoshes.yaml
+
+categories:
+  - title: "🚀 Features"
+    types: [feat]
+  - title: "🐛 Bug Fixes"
+    types: [fix]
+  - title: "⚡ Performance"
+    types: [perf]
+  - title: "♻️ Refactors"
+    types: [refactor]
+  - title: "📚 Documentation"
+    types: [docs]
+  - title: "🔧 Build & CI"
+    types: [build, ci]
+  - title: "🧪 Tests"
+    types: [test]
+  - title: "🧹 Chores"
+    types: [chore, style, revert]
+  - title: "Other"
+    types: []

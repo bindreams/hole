@@ -134,13 +134,19 @@ pub fn validate_against_tag(repo_root: &Path, exact: bool) -> Result<Version> {
     };
 
     // Sequence-no-gap rule. Find the highest existing hole.K tag that
-    // shares the same X.Y.Z base. The bootstrap pivot — `max_existing`
-    // defaults to 0 when no same-base hole.K tags exist — is what makes
-    // a single equality (`n == max_existing + 1`) handle both the
-    // bootstrap-reject case (N >= 2 when no tags exist) and the
-    // mid-sequence-skip-reject case (existing hole.K, current N != K+1).
+    // shares the same X.Y.Z base. `max_existing` defaults to 0 when no
+    // same-base hole.K tags exist (bootstrap pivot). The current
+    // version is accepted when it equals `max_existing` (after-release
+    // stable state — same as the most recent tag, hasn't been bumped
+    // yet) or `max_existing + 1` (preparing the next release). Any
+    // other value is a gap (`N > max_existing + 1`) or a regression
+    // (`N < max_existing`).
+    //
     // Do NOT simplify to "no tags → no constraint" — that breaks the
-    // bootstrap-reject path.
+    // bootstrap-reject path. In bootstrap state (max_existing = 0),
+    // current N == 0 is impossible (hole_iteration requires N >= 1), so
+    // the only accepted N is 1. Same single equality, same correct
+    // semantics for both bootstrap and mid-sequence states.
     let all_tags = ancestor_tags(repo_root, Group::V2rayPlugin)?;
     let max_existing = all_tags
         .iter()
@@ -149,16 +155,15 @@ pub fn validate_against_tag(repo_root: &Path, exact: bool) -> Result<Version> {
         .max()
         .unwrap_or(0);
 
-    let expected = max_existing + 1;
-    if n != expected {
+    if n != max_existing && n != max_existing + 1 {
         bail!(
             "v2ray-plugin sequence violation: version.toml is `{current}` (hole.{n}), \
-             but the next valid hole iteration for base {}.{}.{} is hole.{expected} \
-             (max existing hole.K with this base = {max_existing}). \
-             Tags must increment by 1 with no gaps.",
+             but valid hole iterations for base {}.{}.{} are hole.{max_existing} \
+             (current latest) or hole.{} (next). Tags must increment by 1 with no gaps.",
             current.major,
             current.minor,
-            current.patch
+            current.patch,
+            max_existing + 1
         );
     }
 
