@@ -8,7 +8,9 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["msi-installer/src/msi_installer/wix-toolchain\\.toml$"],
+      "managerFilePatterns": [
+        "/msi-installer/src/msi_installer/wix-toolchain\\.toml$/"
+      ],
       "matchStrings": [
         "version\\s*=\\s*\"(?<currentValue>[^\"]+)\"\\n.*github\\.com/(?<depName>[^/]+/[^/]+)/"
       ],
