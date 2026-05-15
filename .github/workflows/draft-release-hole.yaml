@@ -96,7 +96,7 @@ jobs:
             mv target/release/bundle/dmg/*.dmg "$ASSET"
           fi
 
-          shasum -a 256 "$ASSET" > "${ASSET}.sha256line"
+          sha256sum "$ASSET" > "${ASSET}.sha256line"
           echo "Artifact: $ASSET"
           cat "${ASSET}.sha256line"
 
