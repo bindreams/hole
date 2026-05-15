@@ -1,0 +1,64 @@
+# Per-track release notes config for the `hole` release group.
+# Consumed by scripts/generate-release-notes.py at release time.
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits" for the
+# PR-title convention this config relies on.
+
+# Initial-release stub. Used when no prior `releases/hole/v...` tag
+# exists on the branch. The script emits this verbatim instead of the
+# usual since-last-tag listing.
+initial_release: |
+  Initial release of the `hole` track. See #291 for the four-track
+  release decoupling rationale and CLAUDE.md "Releases" for the
+  versioning scheme.
+
+# A commit is included in this track's notes if it modified any file
+# matching one of these globs. Globs use fnmatch semantics
+# (`**` recursive, `*` non-slash wildcard).
+include_paths:
+  - crates/hole/**
+  - crates/common/**
+  - crates/bridge/**
+  - crates/tun-engine/**
+  - crates/tun-engine-macros/**
+  - crates/dump/**
+  - crates/dump-macros/**
+  - crates/handle-holders/**
+  - xtask/**
+  - xtask-lib/**
+  - msi-installer/**
+  - ui/**
+  - scripts/**
+  - .github/workflows/draft-release-hole.yaml
+  - .github/workflows/publish-release-hole.yaml
+  - .github/release-hole.yaml
+  - CLAUDE.md
+  - CONTRIBUTING.md
+  - README.md
+  - Cargo.toml
+  - Cargo.lock
+  - build.yaml
+  - prek.toml
+
+# Each commit is placed under the first category whose `types` list
+# contains the commit's Conventional Commit type. Commits without a
+# recognizable type prefix go under `Other` (last).
+categories:
+  - title: "🚀 Features"
+    types: [feat]
+  - title: "🐛 Bug Fixes"
+    types: [fix]
+  - title: "⚡ Performance"
+    types: [perf]
+  - title: "♻️ Refactors"
+    types: [refactor]
+  - title: "📚 Documentation"
+    types: [docs]
+  - title: "🔧 Build & CI"
+    types: [build, ci]
+  - title: "🧪 Tests"
+    types: [test]
+  - title: "🧹 Chores"
+    types: [chore, style, revert]
+  - title: "Other"
+    types: []
