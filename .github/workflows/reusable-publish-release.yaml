@@ -1,0 +1,173 @@
+name: Reusable Publish Release
+
+# Common scaffolding for the four per-track `publish-release-*.yaml`
+# workflows. Per-track callers pass inputs gating the optional steps
+# (minisign verification for hole, crates.io publish + indexing wait
+# for garter, etc.).
+#
+# See #321 (introduction) and CLAUDE.md "Releases" for context.
+
+on:
+  workflow_call:
+    inputs:
+      track:
+        description: "Release track (hole | galoshes | garter | v2ray-plugin)"
+        required: true
+        type: string
+      version:
+        description: "Release version (e.g. 1.0.0 or 1.3.3-hole.1)"
+        required: true
+        type: string
+      version-regex:
+        description: "Bash regex for validating the normalized version"
+        required: true
+        type: string
+      latest:
+        description: "Pass to `gh release edit --latest`. 'true' for hole, 'false' for others"
+        required: true
+        type: string
+      verify-signature:
+        description: "If true, require SHA256SUMS.minisig on the draft and verify it (hole only)"
+        required: false
+        type: boolean
+        default: false
+      crates-publish:
+        description: "If true, `cargo publish` the crate to crates.io after draft verification (garter only)"
+        required: false
+        type: boolean
+        default: false
+      crates-name:
+        description: "Crate name to publish (required if crates-publish is true)"
+        required: false
+        type: string
+        default: ""
+      dry-run:
+        description: "If true, run `cargo publish --dry-run` only and exit (garter only)"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Normalize and validate version
+        id: version
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          V="${V#releases/${{ inputs.track }}/v}"
+          if [[ ! "$V" =~ ${{ inputs.version-regex }} ]]; then
+            echo "::error::Invalid version: '${{ inputs.version }}' (regex: ${{ inputs.version-regex }})"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=releases/${{ inputs.track }}/v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          RELEASE_JSON=$(gh release view "$TAG" --json isDraft,assets)
+          IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is not a draft"
+            exit 1
+          fi
+
+          if [ "${{ inputs.verify-signature }}" = "true" ]; then
+            HAS_MINISIG=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name == "SHA256SUMS.minisig") | .name')
+            if [ -z "$HAS_MINISIG" ]; then
+              echo "::error::SHA256SUMS.minisig not found on release $TAG. Run sign-release.py first."
+              exit 1
+            fi
+          fi
+
+      - name: Dry-run crates.io publish (garter --dry-run mode)
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Dry-run crates.io publish
+        if: ${{ inputs.dry-run && inputs.crates-publish }}
+        run: |
+          cargo publish --dry-run -p ${{ inputs.crates-name }}
+          echo "Dry-run complete; exiting without touching crates.io or the GitHub release."
+          exit 0
+
+      - name: Download verification files
+        if: ${{ inputs.verify-signature }}
+        run: gh release download "${{ steps.version.outputs.tag }}" --pattern "SHA256SUMS" --pattern "SHA256SUMS.minisig"
+
+      - name: Install minisign
+        if: ${{ inputs.verify-signature }}
+        run: |
+          curl -sL -o minisign.tar.gz https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          tar xzf minisign.tar.gz
+          install minisign-linux/x86_64/minisign /usr/local/bin/minisign
+          rm -rf minisign.tar.gz minisign-linux
+
+      - name: Verify signature
+        if: ${{ inputs.verify-signature }}
+        run: minisign -Vm SHA256SUMS -P 'RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z' -x SHA256SUMS.minisig
+
+      - name: Check crates.io for existing version
+        if: ${{ inputs.crates-publish && !inputs.dry-run }}
+        id: crates_check
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          CODE=$(curl -sL -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")
+          if [ "$CODE" = "200" ]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} already on crates.io; will skip publish."
+          elif [ "$CODE" = "404" ]; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unexpected HTTP $CODE from crates.io API"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        if: ${{ inputs.crates-publish && !inputs.dry-run && steps.crates_check.outputs.already_published == 'false' }}
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ inputs.crates-publish && !inputs.dry-run && steps.crates_check.outputs.already_published == 'false' }}
+
+      - name: Publish to crates.io
+        if: ${{ inputs.crates-publish && !inputs.dry-run && steps.crates_check.outputs.already_published == 'false' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p ${{ inputs.crates-name }}
+
+      - name: Wait for crates.io indexing
+        if: ${{ inputs.crates-publish && !inputs.dry-run }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Unbounded poll — `timeout-minutes: 30` on the job is the
+          # only ceiling. crates.io indexing is well-behaved; only
+          # reason to time out is a real outage.
+          until [ "$(curl -sL -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")" = "200" ]; do
+            echo "Still indexing..."
+            sleep 10
+          done
+          echo "Indexed."
+
+      - name: Publish release
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          # Belt-and-suspenders: --latest was pinned at draft creation;
+          # re-assert here so the published state matches even if the
+          # draft was edited externally. See #308.
+          gh release edit "$TAG" --draft=false --latest=${{ inputs.latest }}
+          echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"
