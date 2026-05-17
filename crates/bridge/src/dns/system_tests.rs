@@ -17,9 +17,9 @@ use std::net::Ipv6Addr;
 mod windows_timing_logs {
     use crate::dns::system::windows::flush_dns_cache;
     use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
     /// Phase-4 (#247): `flush_dns_cache` must return immediately. The
     /// flush itself runs on a detached `std::thread::spawn`'d thread so
@@ -61,7 +61,7 @@ mod windows_timing_logs {
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
         );
-        let _guard = subscriber.set_default();
+        let _guard = set_default_in_current_thread(subscriber);
 
         let _ = capture_adapters(&["hole-test-bogus-adapter-xyz".to_string()]);
 

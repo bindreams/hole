@@ -7,10 +7,11 @@
 //! tracing fields the tap emits on close: `bytes_to_plugin`,
 //! `bytes_from_plugin`, `ttfb_ms`, `close_kind`.
 //!
-//! Subscriber capture uses `tracing::subscriber::with_default` (thread-
-//! local) so each test sees only its own events. The tokio runtime is
-//! single-threaded for the same reason — `set_default` does not cross
-//! `tokio::spawn` on a multi-thread runtime per the project memory.
+//! Subscriber capture goes through
+//! [`crate::tracing_test::set_default_in_current_thread`], which enforces
+//! the current-thread tokio runtime invariant — see
+//! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
+//! `#[skuld::test] async fn` builds a current-thread runtime by default.
 
 use std::io;
 use std::net::SocketAddr;
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::tap::TapPlugin;
+use crate::tracing_test::set_default_in_current_thread;
 
 // Subscriber capture ==================================================================================================
 
@@ -164,7 +166,7 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let (subscriber, writer) = make_subscriber();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = set_default_in_current_thread(subscriber);
 
     let local = pick_local().await;
     let remote = unused_remote();
@@ -338,7 +340,7 @@ async fn rst_close_classified_as_rst_with_os_errno() {
 #[skuld::test]
 async fn shutdown_cancels_in_flight_connection_without_panic() {
     let (subscriber, _writer) = make_subscriber();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = set_default_in_current_thread(subscriber);
 
     let local = pick_local().await;
     let remote = unused_remote();

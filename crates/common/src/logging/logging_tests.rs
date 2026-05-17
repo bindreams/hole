@@ -266,7 +266,7 @@ fn panic_hook_emits_tracing_event() {
         inner: captured.clone(),
     };
     let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
 
     super::install_panic_hook_for_tests();
 
@@ -328,7 +328,7 @@ fn panic_hook_chains_previous() {
         inner: captured.clone(),
     };
     let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
 
     super::install_panic_hook_for_tests();
 

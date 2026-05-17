@@ -869,41 +869,47 @@ fn apply_dns_settings_emits_done_info_log() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
-    rt().block_on(async {
-        let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = subscriber.set_default();
+    // Current-thread runtime so `tokio::spawn` in `apply_dns_settings`
+    // (or anything downstream) stays on the test thread. The helper
+    // asserts this at install time. See bindreams/hole#302.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-        // Bind LocalDnsServer to an ephemeral loopback port so the test
-        // doesn't fight with anything else on :53.
-        let forwarder = Arc::new(DnsForwarder::new(
-            DnsConfig::default(),
-            Arc::new(DirectConnector),
-            false,
-        ));
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
+            // Bind LocalDnsServer to an ephemeral loopback port so the test
+            // doesn't fight with anything else on :53.
+            let forwarder = Arc::new(DnsForwarder::new(
+                DnsConfig::default(),
+                Arc::new(DirectConnector),
+                false,
+            ));
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
 
-        let _ = apply_dns_settings(&srv, "hole-test-nonexistent-iface-xyz", None).await;
+            let _ = apply_dns_settings(&srv, "hole-test-nonexistent-iface-xyz", None).await;
 
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains("apply_dns_settings done"),
-            "expected 'apply_dns_settings done' in INFO log; got:\n{output}"
-        );
-        assert!(
-            output.contains("elapsed_ms"),
-            "expected 'elapsed_ms' in INFO log; got:\n{output}"
-        );
-        assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
-    });
+            let output = writer.snapshot_string();
+            assert!(
+                output.contains("apply_dns_settings done"),
+                "expected 'apply_dns_settings done' in INFO log; got:\n{output}"
+            );
+            assert!(
+                output.contains("elapsed_ms"),
+                "expected 'elapsed_ms' in INFO log; got:\n{output}"
+            );
+            assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
+        });
 }
 
 // Phase 4 #247 — TUN skipped from capture, kept in apply ==============================================================
@@ -929,72 +935,78 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
-    rt().block_on(async {
-        let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-        );
-        let _guard = subscriber.set_default();
-
-        let forwarder = Arc::new(DnsForwarder::new(
-            DnsConfig::default(),
-            Arc::new(DirectConnector),
-            false,
-        ));
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
-
-        // Upstream alias uses a distinctive name so we can grep for it.
-        let _ = apply_dns_settings(&srv, "hole-p4-test-upstream-xyz", None).await;
-
-        let output = writer.snapshot_string();
-
-        // CAPTURE side: only the upstream alias appears. The TUN alias
-        // `hole-tun` must NOT appear in any `capture_one` / `show_dnsservers`
-        // line, because we no longer query its prior state.
-        let capture_lines: Vec<&str> = output
-            .lines()
-            .filter(|l| l.contains("show_dnsservers") || l.contains("capture_one"))
-            .collect();
-        assert!(
-            !capture_lines.is_empty(),
-            "expected at least one capture-side DEBUG line; got:\n{output}"
-        );
-        for line in &capture_lines {
-            assert!(
-                !line.contains("alias=hole-tun "),
-                "capture ran on TUN — expected to be skipped. line: {line}"
+    // Current-thread runtime — see `apply_dns_settings_emits_done_info_log`
+    // for why the multi-thread `rt()` is unsafe with `set_default`.
+    // bindreams/hole#302.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
             );
-        }
-        assert!(
-            capture_lines
-                .iter()
-                .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-            "capture should have run on upstream alias; got:\n{output}"
-        );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-        // APPLY side: the TUN alias DOES appear — we still set loopback DNS
-        // on the TUN so the OS's best-route-to-DNS lookup lands on 127.x.
-        let apply_lines: Vec<&str> = output
-            .lines()
-            .filter(|l| l.contains("set_dns_ipv4") || l.contains("set_dns_ipv6"))
-            .collect();
-        assert!(
-            apply_lines.iter().any(|l| l.contains("alias=hole-tun")),
-            "apply should have run on TUN alias; got:\n{output}"
-        );
-        assert!(
-            apply_lines
-                .iter()
-                .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-            "apply should have run on upstream alias; got:\n{output}"
-        );
-    });
+            let forwarder = Arc::new(DnsForwarder::new(
+                DnsConfig::default(),
+                Arc::new(DirectConnector),
+                false,
+            ));
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
+
+            // Upstream alias uses a distinctive name so we can grep for it.
+            let _ = apply_dns_settings(&srv, "hole-p4-test-upstream-xyz", None).await;
+
+            let output = writer.snapshot_string();
+
+            // CAPTURE side: only the upstream alias appears. The TUN alias
+            // `hole-tun` must NOT appear in any `capture_one` / `show_dnsservers`
+            // line, because we no longer query its prior state.
+            let capture_lines: Vec<&str> = output
+                .lines()
+                .filter(|l| l.contains("show_dnsservers") || l.contains("capture_one"))
+                .collect();
+            assert!(
+                !capture_lines.is_empty(),
+                "expected at least one capture-side DEBUG line; got:\n{output}"
+            );
+            for line in &capture_lines {
+                assert!(
+                    !line.contains("alias=hole-tun "),
+                    "capture ran on TUN — expected to be skipped. line: {line}"
+                );
+            }
+            assert!(
+                capture_lines
+                    .iter()
+                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
+                "capture should have run on upstream alias; got:\n{output}"
+            );
+
+            // APPLY side: the TUN alias DOES appear — we still set loopback DNS
+            // on the TUN so the OS's best-route-to-DNS lookup lands on 127.x.
+            let apply_lines: Vec<&str> = output
+                .lines()
+                .filter(|l| l.contains("set_dns_ipv4") || l.contains("set_dns_ipv6"))
+                .collect();
+            assert!(
+                apply_lines.iter().any(|l| l.contains("alias=hole-tun")),
+                "apply should have run on TUN alias; got:\n{output}"
+            );
+            assert!(
+                apply_lines
+                    .iter()
+                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
+                "apply should have run on upstream alias; got:\n{output}"
+            );
+        });
 }
 
 // Phase 1 #248 — forwarder self-test tests ============================================================================
@@ -1018,7 +1030,6 @@ mod self_test {
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
     /// A connector that immediately fails every connect. Drives the
     /// dead-upstream path in tests — the forwarder will fail every
@@ -1071,23 +1082,22 @@ mod self_test {
     #[skuld::test]
     fn self_test_empty_servers_logs_skipped() {
         let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = subscriber.set_default();
 
-        // Current-thread runtime so `tokio::spawn` in
-        // `spawn_forwarder_self_test` schedules on the test thread —
-        // `set_default` is thread-local; a multi-thread runtime would
-        // run the spawned task on a worker without the subscriber.
+        // Current-thread runtime — the helper asserts this. See
+        // bindreams/hole#302.
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
                 spawn_forwarder_self_test(forwarder, vec![]);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1106,13 +1116,6 @@ mod self_test {
     #[skuld::test]
     fn self_test_dead_upstream_logs_failed() {
         let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = subscriber.set_default();
 
         // Current-thread runtime — see `self_test_empty_servers_logs_skipped`
         // for why the shared multi-thread `rt()` doesn't work here.
@@ -1121,6 +1124,14 @@ mod self_test {
             .build()
             .unwrap()
             .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
                 spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
                 // Wait for the self-test to exhaust retries. 3 × 1500ms =

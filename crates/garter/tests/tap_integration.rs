@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+use garter::tracing_test::set_default_in_current_thread;
 use garter::{BinaryPlugin, ChainPlugin, TapPlugin};
 
 fn mock_plugin_path() -> PathBuf {
@@ -47,7 +48,7 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
         .with_test_writer()
         .with_max_level(tracing::Level::DEBUG)
         .finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = set_default_in_current_thread(subscriber);
 
     let mock_path = mock_plugin_path();
 
