@@ -65,6 +65,37 @@ Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) wo
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
 
+### Panic-dump dispatcher
+
+The `hole-test-observability` crate ships a workspace-shared panic-hook
+dispatcher at
+[`hole_test_observability::panic_dump`](crates/test-observability/src/panic_dump.rs).
+On any test panic the dispatcher iterates a registry of registered
+sources and calls `PanicDumpSource::dump(&mut stderr)` on each, then
+chains to the previous hook
+(`hole_common::logging::install_panic_hook`'s tracing-emit, then
+libtest's panic printer).
+
+**Contract.** Implementations of `PanicDumpSource::dump` MUST swallow
+all I/O errors silently — a double-panic from `unwrap()` or `?` would
+replace the original panic's message with an I/O error, destroying the
+diagnostic.
+
+**Registration is RAII**:
+`panic_dump::register(Arc<dyn PanicDumpSource>)` returns a
+`PanicDumpGuard`. Drop the guard to unregister; the same `Arc` can be
+registered multiple times (refcount semantics).
+
+**Test-support consumers do NOT call `install_panic_hook_once`** — the
+dispatcher is installed by `hole_test_observability::install()` at
+ctor time. New diagnostic sources just `register()` and store the
+guard.
+
+Current consumers:
+[`BridgeChildLogSource`](crates/bridge/src/test_support/dist_harness.rs)
+dumps the full subprocess `bridge.log` of every live `DistHarness`
+child. See bindreams/hole#303 for the extraction rationale.
+
 ### Spawn-retry architecture (file-contention diagnostics)
 
 Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:

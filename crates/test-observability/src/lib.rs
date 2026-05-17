@@ -49,6 +49,8 @@ use std::sync::Once;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 
+pub mod panic_dump;
+
 /// Re-exported attribute macro so consumer crates don't need to add
 /// `ctor` to their own dev-dependencies. Exposed as
 /// `hole_test_observability::ctor` (the attribute macro), invoked
@@ -163,6 +165,14 @@ pub fn install() {
         // is the fallback diagnostic.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         hole_common::logging::install_panic_hook();
+
+        // Workspace-shared panic-dump dispatcher. Chains over the
+        // hole_common tracing-emit hook (which chains over libtest's
+        // panic printer). Test-support consumers register sources
+        // via `panic_dump::register(Arc<dyn PanicDumpSource>)` —
+        // no per-consumer hook installation needed. See
+        // bindreams/hole#303.
+        panic_dump::install_panic_hook_once();
     });
 }
 

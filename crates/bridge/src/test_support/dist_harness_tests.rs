@@ -2,7 +2,8 @@
 //! covers the panic-hook log-dump path; the rest of the harness is
 //! exercised implicitly through the e2e tests that use it.
 
-use super::{dump_harness_log, ChildInfo};
+use super::BridgeChildLogSource;
+use hole_test_observability::panic_dump::PanicDumpSource;
 use std::path::PathBuf;
 
 /// Build a log body larger than the old 4 KiB tail cap. If the dump
@@ -33,14 +34,14 @@ fn dump_harness_log_emits_full_log_not_just_tail() {
         body.len()
     );
 
-    let info = ChildInfo {
+    let info = BridgeChildLogSource {
         pid: 12345,
         socket: PathBuf::from("fake-socket"),
         log_dir: log_dir.path().to_path_buf(),
     };
 
     let mut buf: Vec<u8> = Vec::new();
-    dump_harness_log(&mut buf, &info);
+    info.dump(&mut buf);
     let out = String::from_utf8(buf).expect("utf8");
 
     assert!(
@@ -71,7 +72,7 @@ fn dump_harness_log_emits_full_log_not_just_tail() {
     assert!(out.contains("---- end ----"), "dump must include the end marker");
     assert!(
         out.contains("pid=12345"),
-        "dump must include the ChildInfo pid; preview: {}",
+        "dump must include the BridgeChildLogSource pid; preview: {}",
         &out[..out.len().min(200)]
     );
 }
@@ -79,14 +80,14 @@ fn dump_harness_log_emits_full_log_not_just_tail() {
 #[skuld::test]
 fn dump_harness_log_handles_missing_file() {
     let log_dir = tempfile::tempdir().expect("tempdir");
-    let info = ChildInfo {
+    let info = BridgeChildLogSource {
         pid: 42,
         socket: PathBuf::from("fake-socket"),
         log_dir: log_dir.path().to_path_buf(),
     };
 
     let mut buf: Vec<u8> = Vec::new();
-    dump_harness_log(&mut buf, &info);
+    info.dump(&mut buf);
     let out = String::from_utf8(buf).expect("utf8");
 
     assert!(

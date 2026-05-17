@@ -17,6 +17,7 @@
 pub(crate) mod certs;
 pub(crate) mod dist_fixture;
 pub(crate) mod dist_harness;
+pub(crate) mod dist_harness_panic_hook_tests;
 pub(crate) mod http_connect_client;
 pub(crate) mod http_target;
 pub(crate) mod log_capture;

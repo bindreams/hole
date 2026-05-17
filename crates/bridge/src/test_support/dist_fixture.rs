@@ -45,17 +45,17 @@ use xtask::Profile;
 /// fixture cache can race; this enforces one-and-only-one staging.
 static STAGED_DIST_BIN: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-/// Stage the dist directory and return its absolute `bin/` path.
+/// Synchronous helper that performs the dist-directory staging.
 ///
-/// Process-scoped so the staging work happens at most once per test
-/// binary. The return value is reused by every `DistHarness::spawn`
-/// call — tests only borrow the path; they never mutate the directory.
-///
-/// `deref` lets tests request the fixture as `&Path` (via `Deref::Target`)
-/// instead of `&PathBuf`. `serial = DIST_BIN` makes tests using this
-/// fixture cross-process serial on that label.
-#[skuld::fixture(scope = process, deref, serial = DIST_BIN)]
-pub(crate) fn dist_dir() -> Result<PathBuf, String> {
+/// Called both by the [`dist_dir`] skuld fixture (which adds
+/// process-scope caching + the cross-process serial label) AND by the
+/// panic-hook regression test's child process in
+/// `dist_harness_panic_hook_tests::run_child` — a child can't go
+/// through skuld DI because skuld hasn't initialized at that point in
+/// `lib.rs::main`. Subsequent calls within a process short-circuit on
+/// the `OnceLock` cache. The cross-process serial guarantee is owned
+/// by the [`dist_dir`] fixture, not this helper.
+pub(crate) fn stage_dist_bin_dir() -> Result<PathBuf, String> {
     STAGED_DIST_BIN
         .get_or_init(|| {
             let repo_root = xtask::repo_root().map_err(|e| format!("locate workspace root: {e}"))?;
@@ -70,4 +70,18 @@ pub(crate) fn dist_dir() -> Result<PathBuf, String> {
             Ok(dist_bin)
         })
         .clone()
+}
+
+/// Stage the dist directory and return its absolute `bin/` path.
+///
+/// Process-scoped so the staging work happens at most once per test
+/// binary. The return value is reused by every `DistHarness::spawn`
+/// call — tests only borrow the path; they never mutate the directory.
+///
+/// `deref` lets tests request the fixture as `&Path` (via `Deref::Target`)
+/// instead of `&PathBuf`. `serial = DIST_BIN` makes tests using this
+/// fixture cross-process serial on that label.
+#[skuld::fixture(scope = process, deref, serial = DIST_BIN)]
+pub(crate) fn dist_dir() -> Result<PathBuf, String> {
+    stage_dist_bin_dir()
 }
