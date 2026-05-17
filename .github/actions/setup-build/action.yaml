@@ -28,7 +28,7 @@ runs:
         key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
 
-    - uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: mozilla-actions/sccache-action@v0.0.10
 
     - name: Fetch runtime deps (v2ray-plugin, wintun)
       shell: bash

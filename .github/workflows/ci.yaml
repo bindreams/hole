@@ -64,7 +64,7 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      - uses: cargo-bins/cargo-binstall@v1.18.1
+      - uses: cargo-bins/cargo-binstall@v1.19.1
 
       - name: Install nextest
         shell: bash
@@ -216,7 +216,7 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      - uses: cargo-bins/cargo-binstall@v1.18.1
+      - uses: cargo-bins/cargo-binstall@v1.19.1
 
       - name: Install nextest
         shell: bash
