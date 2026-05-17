@@ -32,7 +32,7 @@ fn cli_log_info_routes_to_tracing() {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let writer = VecWriter { inner: buf.clone() };
     let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
 
     crate::cli_log!(info, "cli-log-test-{}", "info");
 
@@ -48,7 +48,7 @@ fn cli_log_error_routes_to_tracing() {
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let writer = VecWriter { inner: buf.clone() };
     let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
 
     crate::cli_log!(error, "cli-log-test-{}", "err");
 

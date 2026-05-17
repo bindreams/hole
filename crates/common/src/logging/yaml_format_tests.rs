@@ -414,7 +414,7 @@ fn panic_hook_event_renders_multiline_backtrace() {
         .with_ansi(false)
         .event_format(YamlFormat)
         .finish();
-    let _g = tracing::subscriber::set_default(subscriber);
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
 
     super::super::install_panic_hook_for_tests();
     let _ = std::panic::catch_unwind(|| panic!("yaml-fmt-panic-payload"));
