@@ -29,6 +29,7 @@ harness = false
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 socket2 = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

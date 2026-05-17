@@ -90,6 +90,7 @@ ferrisetw = "1.2.0"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 tokio = { version = "1", features = ["test-util"] }
 # In-process log capture in tests — verifies diagnostic spans /
 # `elapsed_ms` debug logs (#247) and the forwarder's typed-error log

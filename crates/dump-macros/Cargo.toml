@@ -24,6 +24,7 @@ proc-macro2 = "1"
 [dev-dependencies]
 dump = { path = "../dump" }
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 
 [[test]]
 name = "derive_tests"

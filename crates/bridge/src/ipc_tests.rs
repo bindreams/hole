@@ -831,22 +831,27 @@ fn diagnostics_bridge_error_after_failed_start() {
 
 // The bridge's error-log emission on IPC handler failure is a single
 // `error!(error = %e, "proxy start failed")` call in `handle_start` (and
-// the analogous calls in `handle_stop`/`handle_reload`). We deliberately
-// do NOT write a log-capture test for these, because installing a custom
-// tracing subscriber in a workspace test binary has process-wide side
-// effects — `tracing_subscriber::fmt().init()` calls `LogTracer::init()`
-// which mutates the global `log::max_level` state and makes every
-// `log::debug!`/`trace!` call in every dependency (shadowsocks-service,
-// tokio, mio, etc.) start flowing through the tracing → log bridge.
-// That added per-event overhead causes the parallel `server_test_tests`
-// (which do real localhost TCP handshakes with 5 s timeouts) to tip over
-// into timing out on GH Actions Windows runners — see the #147 CI
-// investigation.
+// the analogous calls in `handle_stop`/`handle_reload`). A dedicated
+// log-capture test for these is currently NOT in this file; the same
+// error path is exercised end-to-end by `start_failure_returns_error`
+// (line ~363), which verifies the HTTP 500 response and error message.
 //
-// Keeping the coverage elsewhere: `start_failure_returns_error` (line
-// ~363) exercises the exact same error path and verifies the HTTP 500
-// response and error message. The `error!` call is trivially verifiable
-// by reading the three-line match arm in `ipc.rs`.
+// Historical note: pre-#301, the comment here documented the #147
+// constraint — `tracing_subscriber::fmt().init()` calls
+// `LogTracer::init()`, which sets `log::max_level=Trace` and routes
+// every `log::*!` from `shadowsocks-service`/`tokio`/`mio` through
+// `tracing-log`, allocating per event. That overhead tipped
+// `server_test_tests` (real localhost TCP + 5 s timeouts) into CI
+// timeout on Windows runners.
+//
+// Since #301, the workspace ships `hole-test-observability` (a
+// dev-dep installed via `hole_test_observability::register!()` in
+// every test-bearing crate's `lib.rs`). It installs a global
+// subscriber via `set_global_default` (not `try_init`) with an
+// EnvFilter that level-rejects noisy third-party log events before
+// `tracing-log` allocates. Adding a thread-local
+// `set_default`-based capture for the IPC error paths would now be
+// safe; doing so is a follow-up, not in scope for #301.
 
 // public_ip handler test is intentionally omitted — it makes an external HTTP call
 // to ipinfo.io which is not available in CI and cannot be easily mocked without

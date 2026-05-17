@@ -30,6 +30,7 @@ tempfile = "3"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 
 [build-dependencies]
 sha2 = "0.10"

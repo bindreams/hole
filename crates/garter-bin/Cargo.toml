@@ -29,6 +29,7 @@ yaml_serde = "0.10"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 
 [build-dependencies]
 xtask-lib = { path = "../../xtask-lib" }

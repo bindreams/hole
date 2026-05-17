@@ -1,0 +1,37 @@
+[package]
+name = "hole-test-observability"
+version = "0.1.0"
+edition.workspace = true
+license = "GPL-3.0-or-later"
+publish = false
+description = "Process-global tracing subscriber + panic hook for Hole workspace test binaries. Dev-dep-only."
+repository = "https://github.com/bindreams/hole"
+
+[package.metadata.hole-release]
+group = "hole"
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
+ctor = { workspace = true }
+
+# Direct dep on hole-common for `install_panic_hook` — Cargo allows
+# the cycle because hole-common only references this crate via
+# [dev-dependencies]. Gated to the platforms hole-common supports
+# (hole-common itself uses `compile_error!` on non-macOS/Windows
+# targets, so we can't pull it in on Linux/etc. without breaking
+# downstream Linux clippy jobs that hit this crate transitively via
+# garter/garter-bin/galoshes dev-deps).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+hole-common = { path = "../common" }
+
+[dev-dependencies]
+skuld = { workspace = true }
+log = "0.4"
+tracing-log = "0.2"

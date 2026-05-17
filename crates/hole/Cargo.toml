@@ -61,6 +61,7 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -61,10 +61,18 @@ pub(crate) async fn allocate_ephemeral_port(protocols: Protocols) -> u16 {
 /// attempts fit in a 10 s budget. The wrapper forces fast retries so the
 /// histogram reflects the actual attempt distribution.
 ///
-/// Diagnostics use `eprintln!` (not `tracing::*`) on purpose: installing a
-/// global tracing subscriber in the bridge test binary triggers the #147
-/// LogTracer regression that times out `server_test_tests` on Windows CI.
-/// See `crates/bridge/src/ipc_tests.rs:827-844`.
+/// Diagnostics use `eprintln!` on purpose. Pre-#301 the rationale was
+/// to avoid the #147 LogTracer regression — any global tracing
+/// subscriber install would set `log::max_level=Trace` and tip
+/// `server_test_tests` into Windows CI timeout. Since #301 the
+/// workspace ships `hole-test-observability` with an EnvFilter that
+/// level-rejects noisy log events before `tracing-log` allocates,
+/// so a `tracing::info!` here would actually be captured by
+/// Skuld/nextest on failure. `eprintln!` is retained because this
+/// diagnostic is intentionally always-on (not filterable) — it's a
+/// load-bearing histogram for understanding TCP-connect failure
+/// shapes on the runner, and we'd lose it if it went through the
+/// filter. See `crates/bridge/src/ipc_tests.rs` for the #301 follow-up.
 pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
     let start = Instant::now();
     let mut attempts: u32 = 0;

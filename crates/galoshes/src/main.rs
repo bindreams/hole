@@ -16,6 +16,9 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(v2ray_plugin_missing))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Sanctioned production caller of `fmt::SubscriberBuilder::init`;
+    // banned in tests via clippy.toml `disallowed_methods`. See #301.
+    #[allow(clippy::disallowed_methods)]
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();

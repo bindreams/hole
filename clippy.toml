@@ -58,6 +58,11 @@ reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bin
 # `#[allow(clippy::disallowed_methods)]` to call the real function;
 # `garter::tracing_test_tests::raw_set_default_on_multi_thread_loses_spawned_events`
 # uses it to deliberately demonstrate the bug the helper protects against.
+# `crates/test-observability/src/lib_tests.rs` also uses an inline
+# `#[allow]` for its own sync tests that exercise the global-default
+# dispatch — no tokio runtime is present so the helper's check is
+# vacuous, and the test-observability crate already sits beneath garter
+# in the workspace dep graph (cycle avoidance).
 
 [[disallowed-methods]]
 path = "tracing::subscriber::set_default"
@@ -70,3 +75,42 @@ reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asser
 [[disallowed-methods]]
 path = "tracing::dispatcher::set_default"
 reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing::subscriber::set_default` delegates to this lower-level function; disallowing the underlying form keeps the same thread-local-guard footgun out of reach for code that reaches under the abstraction. See bindreams/hole#302."
+
+# Test-time subscriber install — only hole-test-observability and the
+# production logging::init_multi site may install global tracing
+# subscribers via the `try_init` family. Direct callers in tests
+# trigger the #147 LogTracer perf regression that times out
+# `server_test_tests` on Windows CI. See bindreams/hole#301.
+#
+# Sanctioned suppressions:
+# 1. `crates/common/src/logging.rs::init_multi` — the production
+#    bridge logger; gated by a per-site `#[allow]` with a citation.
+# 2. `crates/test-observability/src/lib.rs` only ever uses the bare
+#    `tracing::subscriber::set_global_default` function, not
+#    `SubscriberInitExt::try_init`, so the rule does not bite it.
+# 3. `crates/galoshes/src/main.rs` and `crates/garter-bin/src/main.rs`
+#    are production binary mains that use `tracing_subscriber::fmt().init()`;
+#    sanctioned via per-site `#[allow]`.
+
+[[disallowed-methods]]
+path = "tracing_subscriber::util::SubscriberInitExt::init"
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. Direct .init() calls trigger the #147 LogTracer perf trap (sets log::max_level=Trace and allocates a tracing Event for every log::*! from shadowsocks-service/tokio/mio). See bindreams/hole#301."
+
+[[disallowed-methods]]
+path = "tracing_subscriber::util::SubscriberInitExt::try_init"
+reason = "Use hole_test_observability::register!() at lib.rs level for tests; the production caller in crates/common/src/logging.rs is sanctioned via #[allow]. See bindreams/hole#301."
+
+# `fmt::SubscriberBuilder::{init,try_init}` are the `tracing_subscriber::fmt().init()`
+# entry points; they forward to `SubscriberInitExt::try_init` internally, so the
+# rules above do NOT catch them — clippy `disallowed_methods` matches the literal
+# called path, not the transitive forwarder. Ban explicitly. The two production
+# callers in `crates/galoshes/src/main.rs` and `crates/garter-bin/src/main.rs`
+# carry per-site `#[allow]` suppressions citing this rule.
+
+[[disallowed-methods]]
+path = "tracing_subscriber::fmt::SubscriberBuilder::init"
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. Production main.rs callers in galoshes/garter-bin are sanctioned via #[allow]. See bindreams/hole#301."
+
+[[disallowed-methods]]
+path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
+reason = "Use hole_test_observability::register!() at lib.rs level for tests. See bindreams/hole#301."

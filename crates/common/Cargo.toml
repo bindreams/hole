@@ -50,6 +50,7 @@ yaml_serde = "0.10"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 log = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

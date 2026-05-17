@@ -335,8 +335,14 @@ pub(crate) fn install_panic_hook_for_tests() {
     install_panic_hook_inner();
 }
 
-fn install_panic_hook() {
-    // Idempotent: only install once per process. See PANIC_HOOK_INSTALLED.
+/// Install the tracing-emitting panic hook (chains before stdlib default).
+/// Idempotent — subsequent calls in the same process are no-ops.
+///
+/// Called from production `init_multi` and from
+/// `hole-test-observability`'s ctor; safe to invoke from both because
+/// the `PANIC_HOOK_INSTALLED` AtomicBool ensures only one hook is
+/// chained per process. See bindreams/hole#301.
+pub fn install_panic_hook() {
     if PANIC_HOOK_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -491,6 +497,11 @@ where
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
+    // Sanctioned by clippy.toml `disallowed_methods` (see #301).
+    // Production bridge logger — this is the ONE caller of
+    // `try_init` workspace-wide. Tests use
+    // `hole_test_observability::register!()` instead.
+    #[allow(clippy::disallowed_methods)]
     if let Err(e) = tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
