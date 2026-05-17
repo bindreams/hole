@@ -17,7 +17,7 @@
 //! one transport).
 //!
 //! Ephemeral-port callers of [`LocalDnsServer::bind`] (port 0, used by
-//! tests) delegate to [`hole_common::port_alloc::bind_with_retry`] to
+//! tests) delegate to [`hole_common::port_alloc::bind_ephemeral`] to
 //! absorb the Windows-specific bind race where the OS's independent
 //! TCP/UDP excluded-port-range tables disagree. Fixed-port callers
 //! ([`LocalDnsServer::bind_ladder`] with port 53) bypass the wrapper:
@@ -62,7 +62,7 @@ impl LocalDnsServer {
     /// need UDP and TCP on the same address.
     ///
     /// When `addr.port() == 0` the bind is delegated to
-    /// [`hole_common::port_alloc::bind_with_retry`], which absorbs the
+    /// [`hole_common::port_alloc::bind_ephemeral`], which absorbs the
     /// Windows `WSAEACCES` race where the OS's independent TCP/UDP
     /// excluded-port-range tables reject a freshly-allocated port on
     /// the paired transport. Fixed-port callers skip the wrapper —
@@ -71,15 +71,10 @@ impl LocalDnsServer {
     pub async fn bind(addr: SocketAddr, forwarder: Arc<DnsForwarder>) -> io::Result<Self> {
         if addr.port() == 0 {
             let ip = addr.ip();
-            let (_, server) = port_alloc::bind_with_retry(
-                ip,
-                Protocols::TCP | Protocols::UDP,
-                port_alloc::BIND_RETRY_ATTEMPTS,
-                |port| {
-                    let forwarder = Arc::clone(&forwarder);
-                    async move { Self::bind_once(SocketAddr::new(ip, port), forwarder).await }
-                },
-            )
+            let (_, server) = port_alloc::bind_ephemeral(ip, Protocols::TCP | Protocols::UDP, |port| {
+                let forwarder = Arc::clone(&forwarder);
+                async move { Self::bind_once(SocketAddr::new(ip, port), forwarder).await }
+            })
             .await?;
             Ok(server)
         } else {

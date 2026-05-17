@@ -3,14 +3,17 @@
 //! excluded-port-range tables, WSAEADDRINUSE from `SO_EXCLUSIVEADDRUSE`
 //! wildcard holders, WSAEADDRNOTAVAIL from the same reservation layer).
 //!
-//! [`bind_with_retry`] is the canonical entry point: it composes
-//! [`free_port`] (which probes once per transport with internal retry
-//! on probe-side races) with a caller-supplied bind closure, and retries
-//! the whole (allocate, bind) cycle on [`is_bind_race`] errors that
-//! surface from the closure. This absorbs the residual TOCTOU between
-//! `free_port`'s probe-drop and the real owner's bind.
+//! [`bind_ephemeral`] is the canonical entry point. It allocates an
+//! ephemeral port AND runs a caller-supplied bind closure against that
+//! port in the same loop iteration, retrying the whole (allocate, bind)
+//! cycle on [`is_bind_race`] errors. The retry is unbounded — the only
+//! terminations are success or a non-bind-race error. There is no
+//! "attempts budget"; the OS allocator covers ~28K ephemeral ports and
+//! a fixed retry cap would either mask real saturation (if too high) or
+//! flake on transient excluded-range pressure (if too low). See
+//! bindreams/hole#300.
 //!
-//! Three consumers in the bridge route through `bind_with_retry`:
+//! Three consumers in the bridge route through `bind_ephemeral`:
 //!
 //! * [`crate::dns::server::LocalDnsServer::bind`][0] (via hole-bridge) —
 //!   UDP+TCP on the same ephemeral loopback port.
@@ -19,8 +22,8 @@
 //! * `test_support::ssserver::start_real_ss_server*` — in-process
 //!   shadowsocks server fixtures.
 //!
-//! Direct `free_port` callers must explicitly justify why the
-//! `bind_with_retry` closure shape doesn't fit, suppressing the
+//! Direct [`free_port`] callers must explicitly justify why the
+//! `bind_ephemeral` closure shape doesn't fit, suppressing the
 //! `disallowed_methods` clippy lint (see workspace `clippy.toml`). The
 //! one current case is `test_support::port_alloc::allocate_ephemeral_port`,
 //! which hands the port across a process boundary via JSON config.
@@ -30,14 +33,14 @@
 //! The OS kernel has no "free for both TCP and UDP" primitive; we probe
 //! one transport via `bind(:0)`, then verify the remaining transports
 //! with `ensure_port_free`. Any bind race at either step triggers a
-//! retry with a freshly-allocated candidate port.
+//! fresh iteration with a freshly-allocated candidate port.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU32;
 
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, info, warn};
+use tokio::task::yield_now;
+use tracing::{debug, info};
 
 use crate::retry::is_bind_race;
 
@@ -74,24 +77,16 @@ impl std::fmt::Display for Protocols {
     }
 }
 
-/// Maximum attempts `free_port` will make before propagating the last
-/// transient-bind-race error. Five balances "cover the reasonable number
-/// of bad picks even on a heavily-reserved Windows machine" against
-/// "fail fast enough to not mask a real saturation bug." Galoshes#21
-/// uses 3; we pick 5 because our multi-protocol probe has two OS
-/// lookups per attempt (TCP + UDP) vs garter's single TCP probe.
-const MAX_BIND_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
-
 /// Find a port on `ip` that was free for every transport in `protocols`
-/// at the moment this function returned. Retries internally on transient
-/// bind races (see [`is_bind_race`]) up to [`MAX_BIND_ATTEMPTS`]. On
-/// exhaustion returns the last underlying `io::Error`.
+/// at the moment this function returned. Retries unboundedly on transient
+/// bind races (see [`is_bind_race`]); yields to the runtime between
+/// iterations. Terminates only on success or a non-bind-race error.
 ///
 /// The returned port number carries no reservation — callers must bind
 /// it immediately, and even then are subject to TOCTOU against other
-/// processes racing for the same ephemeral port. For cross-test
-/// serialization within the hole-bridge test suite, the `PORT_ALLOC`
-/// skuld label still applies.
+/// processes racing for the same ephemeral port. For in-process binders
+/// prefer [`bind_ephemeral`], which folds the caller's bind into the
+/// same retry loop and has no divorced-port-number TOCTOU window.
 ///
 /// Rejects `Protocols::empty()` with `ErrorKind::InvalidInput` — "find
 /// me a free port on no transports" has no meaning.
@@ -103,10 +98,6 @@ pub async fn free_port(ip: IpAddr, protocols: Protocols) -> io::Result<u16> {
         ));
     }
 
-    let n = MAX_BIND_ATTEMPTS.get();
-    let mut last_err: Option<io::Error> = None;
-    let mut last_port: Option<u16> = None;
-
     // TCP first when available — arbitrary ordering; if a caller needs
     // UDP-only the fallback picks UDP.
     let primary = if protocols.contains(Protocols::TCP) {
@@ -116,88 +107,39 @@ pub async fn free_port(ip: IpAddr, protocols: Protocols) -> io::Result<u16> {
     };
     let rest = protocols.difference(primary);
 
-    for attempt in 0..n {
-        if attempt > 0 {
-            info!(
-                target: "hole_common::port_alloc",
-                attempt = attempt,
-                max_attempts = n,
-                ip = %ip,
-                protocols = %protocols,
-                last_port = last_port.unwrap_or(0),
-                reason = "bind_race",
-                "free_port_retry"
-            );
-        }
-        let port = match probe_bind(SocketAddr::new(ip, 0), primary).await {
-            Ok(p) => p,
-            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
-                last_port = None;
-                last_err = Some(e);
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    target: "hole_common::port_alloc",
-                    ip = %ip,
-                    protocols = %protocols,
-                    attempts = attempt + 1,
-                    error = %e,
-                    "free_port exhausted"
-                );
-                return Err(e);
-            }
-        };
-        last_port = Some(port);
-        if rest.is_empty() {
-            debug!(
-                target: "hole_common::port_alloc",
-                ip = %ip,
-                port = port,
-                protocols = %protocols,
-                attempts = attempt + 1,
-                "free_port ok"
-            );
-            return Ok(port);
-        }
-        match ensure_port_free(SocketAddr::new(ip, port), rest).await {
-            Ok(()) => {
+    let mut attempt: u64 = 1;
+    loop {
+        match free_port_once(ip, primary, rest).await {
+            Ok(port) => {
                 debug!(
                     target: "hole_common::port_alloc",
                     ip = %ip,
                     port = port,
                     protocols = %protocols,
-                    attempts = attempt + 1,
+                    attempts = attempt,
                     "free_port ok"
                 );
                 return Ok(port);
             }
-            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
-                last_err = Some(e);
+            Err(e) if is_bind_race(&e) => {
+                emit_retry_log(attempt, ip, protocols, &e, "free_port retry");
+                attempt = attempt.saturating_add(1);
+                yield_now().await;
             }
-            Err(e) => {
-                warn!(
-                    target: "hole_common::port_alloc",
-                    ip = %ip,
-                    protocols = %protocols,
-                    attempts = attempt + 1,
-                    error = %e,
-                    "free_port exhausted"
-                );
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
-    let err = last_err.expect("NonZeroU32 guarantees at least one attempt recorded an error");
-    warn!(
-        target: "hole_common::port_alloc",
-        ip = %ip,
-        protocols = %protocols,
-        attempts = n,
-        error = %err,
-        "free_port exhausted"
-    );
-    Err(err)
+}
+
+/// Single iteration of [`free_port`]'s loop: probe the primary transport
+/// (gets a port from the OS), then verify the remaining transports.
+/// Returns the port on success or the first race/error encountered.
+async fn free_port_once(ip: IpAddr, primary: Protocols, rest: Protocols) -> io::Result<u16> {
+    let port = probe_bind(SocketAddr::new(ip, 0), primary).await?;
+    if !rest.is_empty() {
+        ensure_port_free(SocketAddr::new(ip, port), rest).await?;
+    }
+    Ok(port)
 }
 
 /// Probe whether `addr.port()` is free for every transport in
@@ -254,94 +196,130 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
     result.map(|a| a.port())
 }
 
-/// Default outer-retry budget for [`bind_with_retry`]. Five matches the
-/// inner [`MAX_BIND_ATTEMPTS`] budget — worst-case 25 attempts. Each
-/// attempt is fast for in-process binders (one OS bind + drop). Callers
-/// that pay per-attempt subprocess startup cost should pass a smaller
-/// budget explicitly.
-pub const BIND_RETRY_ATTEMPTS: NonZeroU32 = NonZeroU32::new(5).unwrap();
-
 /// Run `op(port)` against a freshly-allocated port on `ip` that is
 /// verified free for every transport in `protocols`. Retries the whole
-/// (allocate, bind) cycle on [`is_bind_race`] errors up to `attempts`.
-/// Returns the bound port and `op`'s value on success.
+/// (allocate, bind) cycle on [`is_bind_race`] errors. Unbounded — the
+/// only terminations are success or a non-bind-race error. Yields to
+/// the runtime between iterations.
 ///
-/// **Scope.** `bind_with_retry` only retries `is_bind_race` errors that
+/// **Scope.** `bind_ephemeral` only retries `is_bind_race` errors that
 /// surface from `op` as `io::Error`. Out-of-process binders (e.g. plugin
 /// subprocesses that bind the port themselves) report bind failures
 /// through other channels (oneshot timeout, exit code, stderr); those
-/// are not retried here. Use `bind_with_retry` for structural consistency
-/// at every ephemeral-bind site, but expect the retry to be load-bearing
-/// only for in-process binders.
+/// are not classified as bind races. The in-process probe step (running
+/// before `op` each iteration) is therefore the only `is_bind_race`
+/// signal at plugin-subprocess sites — it catches the Windows
+/// excluded-range disagreement class before the subprocess spawn. The
+/// residual TOCTOU between probe-drop and subprocess-bind is tracked in
+/// bindreams/hole#304.
 ///
 /// `op` is `Fn` rather than `FnMut`: each retry re-invokes it
 /// independently and per-call state should be created inside the
 /// closure rather than carried across attempts.
 ///
-/// Logging mirrors [`free_port`]: outer retries emit `info!`, exhaustion
-/// emits `warn!`, target `hole_common::port_alloc`.
-pub async fn bind_with_retry<T, F, Fut>(
-    ip: IpAddr,
-    protocols: Protocols,
-    attempts: NonZeroU32,
-    op: F,
-) -> io::Result<(u16, T)>
+/// Logging: per-iteration `debug!`; `info!` at adaptive milestones (10,
+/// 20, 50, 100, 200, 500, 1000, then every 1000 attempts). Total log
+/// volume is O(log n) regardless of how long the loop runs. No
+/// exhaustion warn — there is no exhaustion.
+pub async fn bind_ephemeral<T, F, Fut>(ip: IpAddr, protocols: Protocols, op: F) -> io::Result<(u16, T)>
 where
     F: Fn(u16) -> Fut,
     Fut: std::future::Future<Output = io::Result<T>>,
 {
-    let n = attempts.get();
-    let mut last_err: Option<io::Error> = None;
-    for attempt in 0..n {
-        if attempt > 0 {
-            info!(
-                target: "hole_common::port_alloc",
-                attempt = attempt,
-                max_attempts = n,
-                ip = %ip,
-                protocols = %protocols,
-                "bind_with_retry retry"
-            );
-        }
-        // bind_with_retry IS the canonical caller of free_port — the
-        // disallowed_methods lint rule applies to higher-level callers
-        // that should be using this wrapper. See workspace `clippy.toml`.
-        #[allow(clippy::disallowed_methods)]
-        let port = free_port(ip, protocols).await?;
-        match op(port).await {
-            Ok(value) => return Ok((port, value)),
-            Err(e) if is_bind_race(&e) && attempt + 1 < n => {
-                last_err = Some(e);
+    if protocols.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bind_ephemeral requires a non-empty Protocols set",
+        ));
+    }
+
+    let primary = if protocols.contains(Protocols::TCP) {
+        Protocols::TCP
+    } else {
+        Protocols::UDP
+    };
+    let rest = protocols.difference(primary);
+
+    let mut attempt: u64 = 1;
+    loop {
+        match bind_ephemeral_once(ip, primary, rest, &op).await {
+            Ok((port, value)) => {
+                debug!(
+                    target: "hole_common::port_alloc",
+                    ip = %ip,
+                    port = port,
+                    protocols = %protocols,
+                    attempts = attempt,
+                    "bind_ephemeral ok"
+                );
+                return Ok((port, value));
             }
-            Err(e) => {
-                // Two cases reach this arm: (a) the final retry's
-                // bind-race exhausted the budget, (b) any attempt
-                // returned a non-bind-race error. Only (a) is "retry
-                // exhausted"; (b) is immediate propagation.
-                if is_bind_race(&e) && attempt + 1 == n {
-                    warn!(
-                        target: "hole_common::port_alloc",
-                        attempts = n,
-                        ip = %ip,
-                        protocols = %protocols,
-                        error = %e,
-                        "bind_with_retry exhausted"
-                    );
-                }
-                return Err(e);
+            Err(e) if is_bind_race(&e) => {
+                emit_retry_log(attempt, ip, protocols, &e, "bind_ephemeral retry");
+                attempt = attempt.saturating_add(1);
+                yield_now().await;
             }
+            Err(e) => return Err(e),
         }
     }
-    let err = last_err.expect("NonZeroU32 guarantees at least one attempt recorded an error");
-    warn!(
+}
+
+/// Single iteration of [`bind_ephemeral`]'s loop: probe primary, verify
+/// rest, run `op`. Returns `(port, op_result)` on success or the first
+/// error from any step.
+async fn bind_ephemeral_once<T, F, Fut>(ip: IpAddr, primary: Protocols, rest: Protocols, op: &F) -> io::Result<(u16, T)>
+where
+    F: Fn(u16) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let port = probe_bind(SocketAddr::new(ip, 0), primary).await?;
+    if !rest.is_empty() {
+        ensure_port_free(SocketAddr::new(ip, port), rest).await?;
+    }
+    let value = op(port).await?;
+    Ok((port, value))
+}
+
+/// Adaptive retry logging: `debug!` per iteration, plus `info!` at
+/// milestones so a stuck loop is visible at the default `info` level
+/// without flooding logs on the common happy path.
+///
+/// `debug!` volume is O(n) (one per iteration) — operators debugging a
+/// stuck loop with `HOLE_BRIDGE_LOG=hole_common::port_alloc=debug`
+/// should expect proportional volume. `info!` volume is O(log n) by
+/// construction via [`is_log_milestone`], so default-log-level
+/// observability stays bounded regardless of loop length.
+///
+/// Milestones: 10, 20, 50, 100, 200, 500, 1000, then every 1000.
+fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Error, msg: &'static str) {
+    // The first attempt is the happy path entry; we only enter this
+    // function on retries (attempt >= 1 after a failure), so the
+    // smallest value we ever see is 1.
+    debug!(
         target: "hole_common::port_alloc",
-        attempts = n,
+        attempt = attempt,
         ip = %ip,
         protocols = %protocols,
         error = %err,
-        "bind_with_retry exhausted"
+        "{}", msg
     );
-    Err(err)
+    if is_log_milestone(attempt) {
+        info!(
+            target: "hole_common::port_alloc",
+            attempt = attempt,
+            ip = %ip,
+            protocols = %protocols,
+            error = %err,
+            "{} (milestone)", msg
+        );
+    }
+}
+
+/// True at attempt counts where the retry loop emits an `info!` so a
+/// stuck loop becomes visible at the default `hole_bridge=info` log
+/// level. Total `info!` volume is O(log n) regardless of loop length.
+fn is_log_milestone(attempt: u64) -> bool {
+    matches!(attempt, 10 | 20 | 50 | 100 | 200 | 500 | 1000) || (attempt > 1000 && attempt.is_multiple_of(1000))
 }
 
 #[cfg(test)]

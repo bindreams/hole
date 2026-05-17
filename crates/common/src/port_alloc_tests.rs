@@ -4,11 +4,10 @@
 // bindreams/hole#285.
 #![allow(clippy::disallowed_methods)]
 
-use super::{bind_with_retry, ensure_port_free, free_port, Protocols, BIND_RETRY_ATTEMPTS};
+use super::{bind_ephemeral, ensure_port_free, free_port, is_log_milestone, Protocols};
 use std::cell::Cell;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -141,34 +140,26 @@ async fn ensure_port_free_errors_on_busy_udp_port() {
     drop(hostage);
 }
 
-// bind_with_retry =====================================================================================================
-
-const FIVE: NonZeroU32 = NonZeroU32::new(5).expect("literal");
+// bind_ephemeral ======================================================================================================
 
 #[skuld::test]
-fn bind_retry_attempts_default_is_five() {
-    // Pin the public default — callers depend on it.
-    assert_eq!(BIND_RETRY_ATTEMPTS.get(), 5);
-}
-
-#[skuld::test]
-async fn bind_with_retry_returns_ok_on_first_attempt() {
+async fn bind_ephemeral_returns_ok_on_first_attempt() {
     let calls = Cell::new(0u32);
-    let result = bind_with_retry(LOCALHOST, Protocols::TCP, FIVE, |port| {
+    let result = bind_ephemeral(LOCALHOST, Protocols::TCP, |port| {
         calls.set(calls.get() + 1);
         async move { Ok::<_, io::Error>(port) }
     })
     .await
-    .expect("bind_with_retry happy path");
+    .expect("bind_ephemeral happy path");
     let (port, value) = result;
     assert_eq!(port, value, "returned port and op result must match");
     assert_eq!(calls.get(), 1, "Ok-on-first should not retry");
 }
 
 #[skuld::test]
-async fn bind_with_retry_propagates_non_bind_race_immediately() {
+async fn bind_ephemeral_propagates_non_bind_race_immediately() {
     let calls = Cell::new(0u32);
-    let result: io::Result<(u16, ())> = bind_with_retry(LOCALHOST, Protocols::TCP, FIVE, |_port| {
+    let result: io::Result<(u16, ())> = bind_ephemeral(LOCALHOST, Protocols::TCP, |_port| {
         calls.set(calls.get() + 1);
         async move { Err(io::Error::from(io::ErrorKind::NotFound)) }
     })
@@ -179,9 +170,9 @@ async fn bind_with_retry_propagates_non_bind_race_immediately() {
 }
 
 #[skuld::test]
-async fn bind_with_retry_retries_on_bind_race_until_success() {
+async fn bind_ephemeral_retries_on_bind_race_until_success() {
     let calls = Cell::new(0u32);
-    let result = bind_with_retry(LOCALHOST, Protocols::TCP, FIVE, |port| {
+    let result = bind_ephemeral(LOCALHOST, Protocols::TCP, |port| {
         let n = calls.get() + 1;
         calls.set(n);
         async move {
@@ -193,32 +184,18 @@ async fn bind_with_retry_retries_on_bind_race_until_success() {
         }
     })
     .await
-    .expect("bind_with_retry should retry through bind race");
+    .expect("bind_ephemeral should retry through bind race");
     let (port, value) = result;
     assert_eq!(port, value);
     assert_eq!(calls.get(), 3);
 }
 
 #[skuld::test]
-async fn bind_with_retry_exhausts_and_returns_last_bind_race_error() {
-    let calls = Cell::new(0u32);
-    let result: io::Result<(u16, ())> = bind_with_retry(LOCALHOST, Protocols::TCP, FIVE, |_port| {
-        calls.set(calls.get() + 1);
-        async move { Err(io::Error::from(io::ErrorKind::AddrInUse)) }
-    })
-    .await;
-    let err = result.expect_err("exhaustion must propagate the last error");
-    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
-    assert_eq!(calls.get(), 5, "must invoke exactly attempts times on terminal failure");
-}
-
-#[skuld::test]
-async fn bind_with_retry_propagates_non_bind_race_after_prior_bind_race() {
+async fn bind_ephemeral_propagates_non_bind_race_after_prior_bind_race() {
     // Interleave: AddrInUse twice (retried), then NotFound (immediate
-    // propagation). The non-bind-race wins; the prior `last_err` is
-    // discarded; total invocations = 3.
+    // propagation). The non-bind-race wins; total invocations = 3.
     let calls = Cell::new(0u32);
-    let result: io::Result<(u16, ())> = bind_with_retry(LOCALHOST, Protocols::TCP, FIVE, |_port| {
+    let result: io::Result<(u16, ())> = bind_ephemeral(LOCALHOST, Protocols::TCP, |_port| {
         let n = calls.get() + 1;
         calls.set(n);
         async move {
@@ -236,49 +213,116 @@ async fn bind_with_retry_propagates_non_bind_race_after_prior_bind_race() {
 }
 
 #[skuld::test]
-async fn bind_with_retry_invokes_closure_exactly_n_times_on_failure() {
-    // Distinct from the exhaustion test: this proves that retries don't
-    // silently skip the closure or invoke it more than once per attempt.
-    // Future readers auditing per-attempt cost (e.g. plugin subprocess
-    // spawns) rely on this invariant.
-    let attempts = NonZeroU32::new(4).expect("literal");
+async fn bind_ephemeral_retries_through_many_bind_races_until_success() {
+    // Pins the no-budget contract: the loop converges through arbitrary
+    // attempt counts. A future contributor who reintroduces a budget
+    // (e.g. caps retries at 5) breaks this test loudly.
+    const RACES: u32 = 20;
     let calls = Cell::new(0u32);
-    let result: io::Result<(u16, ())> = bind_with_retry(LOCALHOST, Protocols::TCP, attempts, |_port| {
-        calls.set(calls.get() + 1);
-        async move { Err(io::Error::from(io::ErrorKind::AddrInUse)) }
+    let result = bind_ephemeral(LOCALHOST, Protocols::TCP, |port| {
+        let n = calls.get() + 1;
+        calls.set(n);
+        async move {
+            if n <= RACES {
+                Err(io::Error::from(io::ErrorKind::AddrInUse))
+            } else {
+                Ok::<_, io::Error>(port)
+            }
+        }
     })
-    .await;
-    assert!(result.is_err());
-    assert_eq!(calls.get(), 4);
+    .await
+    .expect("bind_ephemeral must converge across many bind races");
+    let (port, value) = result;
+    assert_eq!(port, value);
+    assert_eq!(calls.get(), RACES + 1);
 }
 
 #[skuld::test]
-async fn bind_with_retry_returned_port_is_actually_bindable() {
+async fn bind_ephemeral_invokes_closure_once_per_iteration() {
+    // Auditability invariant: per-iteration closure cost (e.g. plugin
+    // subprocess spawns at `start_plugin_chain`) is exactly one
+    // invocation per loop turn — no double-fires, no skips.
+    const RACES: u32 = 20;
+    let calls = Cell::new(0u32);
+    let _ = bind_ephemeral(LOCALHOST, Protocols::TCP, |port| {
+        let n = calls.get() + 1;
+        calls.set(n);
+        async move {
+            if n <= RACES {
+                Err(io::Error::from(io::ErrorKind::AddrInUse))
+            } else {
+                Ok::<_, io::Error>(port)
+            }
+        }
+    })
+    .await
+    .expect("converged");
+    assert_eq!(
+        calls.get(),
+        RACES + 1,
+        "closure must run exactly once per loop iteration"
+    );
+}
+
+#[skuld::test]
+async fn bind_ephemeral_returned_port_is_actually_bindable() {
     // Integration: with a closure that successfully binds the port, the
     // (port, T) tuple's port is the same one the closure saw.
-    let result = bind_with_retry(LOCALHOST, Protocols::TCP | Protocols::UDP, FIVE, |port| async move {
+    let result = bind_ephemeral(LOCALHOST, Protocols::TCP | Protocols::UDP, |port| async move {
         let tcp = tokio::net::TcpListener::bind(SocketAddr::new(LOCALHOST, port)).await?;
         let udp = tokio::net::UdpSocket::bind(SocketAddr::new(LOCALHOST, port)).await?;
         Ok::<_, io::Error>((tcp.local_addr()?.port(), udp.local_addr()?.port()))
     })
     .await
-    .expect("real TCP+UDP bind on bind_with_retry'd port");
+    .expect("real TCP+UDP bind on bind_ephemeral'd port");
     let (alloc_port, (tcp_port, udp_port)) = result;
     assert_eq!(alloc_port, tcp_port);
     assert_eq!(alloc_port, udp_port);
 }
 
 #[skuld::test]
-async fn bind_with_retry_rejects_empty_protocols() {
-    // Inherits free_port's empty-protocols rejection at the first attempt;
-    // closure must not be invoked.
+async fn bind_ephemeral_udp_only_returned_port_is_actually_bindable() {
+    // Mirrors the TCP+UDP integration test for the UDP-only `primary`
+    // branch path (where `protocols.contains(TCP) == false` and `primary`
+    // becomes UDP).
+    let result = bind_ephemeral(LOCALHOST, Protocols::UDP, |port| async move {
+        let udp = tokio::net::UdpSocket::bind(SocketAddr::new(LOCALHOST, port)).await?;
+        Ok::<_, io::Error>(udp.local_addr()?.port())
+    })
+    .await
+    .expect("real UDP bind on bind_ephemeral'd port");
+    let (alloc_port, udp_port) = result;
+    assert_eq!(alloc_port, udp_port);
+}
+
+// is_log_milestone ====================================================================================================
+
+#[skuld::test]
+fn is_log_milestone_hits_documented_set() {
+    // Pin the milestone set. A future contributor who changes the matrix
+    // (e.g. flips the modulo, drops a milestone) breaks this loudly.
+    for n in [10u64, 20, 50, 100, 200, 500, 1000, 2000, 3000, 10_000, 100_000] {
+        assert!(is_log_milestone(n), "expected milestone at attempt={n}");
+    }
+}
+
+#[skuld::test]
+fn is_log_milestone_misses_non_milestones() {
+    for n in [0u64, 1, 2, 9, 11, 19, 21, 49, 51, 99, 101, 999, 1001, 1500, 100_001] {
+        assert!(!is_log_milestone(n), "unexpected milestone at attempt={n}");
+    }
+}
+
+#[skuld::test]
+async fn bind_ephemeral_rejects_empty_protocols() {
+    // Inherits the empty-protocols rejection without invoking the closure.
     let calls = Cell::new(0u32);
-    let result: io::Result<(u16, ())> = bind_with_retry(LOCALHOST, Protocols::empty(), FIVE, |_port| {
+    let result: io::Result<(u16, ())> = bind_ephemeral(LOCALHOST, Protocols::empty(), |_port| {
         calls.set(calls.get() + 1);
         async move { Ok(()) }
     })
     .await;
-    let err = result.expect_err("empty Protocols must be rejected by free_port");
+    let err = result.expect_err("empty Protocols must be rejected");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert_eq!(calls.get(), 0, "closure must not run when free_port rejects");
+    assert_eq!(calls.get(), 0, "closure must not run when protocols are empty");
 }

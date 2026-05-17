@@ -3,7 +3,7 @@
 //! Each helper spins up a real `shadowsocks_service::server::Server`
 //! bound to a loopback port the fixture allocates and binds in a single
 //! retry-wrapped operation via
-//! [`hole_common::port_alloc::bind_with_retry`], mirroring the
+//! [`hole_common::port_alloc::bind_ephemeral`], mirroring the
 //! [`crate::dns::server::LocalDnsServer::bind`] pattern. The returned
 //! [`JoinHandle`]s own the server loop and must be kept alive for the
 //! duration of the test that uses them.
@@ -49,7 +49,7 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
 /// the client asks for.
 ///
 /// The fixture owns port allocation and the bind, retrying both as a
-/// unit via [`port_alloc::bind_with_retry`]. This absorbs the residual
+/// unit via [`port_alloc::bind_ephemeral`]. This absorbs the residual
 /// probe-drop-to-bind TOCTOU on Windows, where independent TCP/UDP
 /// excluded-port-range tables can reject a freshly-allocated port on
 /// the paired transport. shadowsocks-rust's `ServerBuilder` clones
@@ -57,10 +57,9 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
 /// passing port 0 would hand the two sockets distinct kernel-allocated
 /// ports — the explicit allocation here keeps them on the same port.
 pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
-    let (port, server) = port_alloc::bind_with_retry(
+    let (port, server) = port_alloc::bind_ephemeral(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         Protocols::TCP | Protocols::UDP,
-        port_alloc::BIND_RETRY_ATTEMPTS,
         |port| {
             let password = password.to_string();
             async move {
@@ -71,7 +70,7 @@ pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> 
         },
     )
     .await
-    .expect("start_real_ss_server: bind/build failed after retries");
+    .expect("start_real_ss_server: bind/build failed");
 
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let handle = tokio::spawn(async move {
@@ -135,7 +134,7 @@ pub(crate) async fn start_real_ss_server_with_plugin_quic(
 /// transport, builds a server-side `ServerConfig` with `PluginConfig`,
 /// and spawns the server loop.
 ///
-/// **Retry-asymmetry note.** `bind_with_retry`'s outer retry catches
+/// **Retry-asymmetry note.** `bind_ephemeral`'s retry catches
 /// `is_bind_race` errors that surface as `io::Error` from
 /// [`SsServerBuilder::build`]. For the plugin variants the public_port
 /// bind happens inside the **plugin subprocess**, after `build()`
@@ -145,8 +144,9 @@ pub(crate) async fn start_real_ss_server_with_plugin_quic(
 /// that shadowsocks-rust's `Plugin::start` allocates synchronously
 /// (the long-standing #197 race class). Per-protocol correctness on
 /// the public port comes from the right `protocols` argument, not
-/// from the retry. See bindreams/hole#285 §"Where the fix actually
-/// lands".
+/// from the retry. The residual subprocess-bind TOCTOU is tracked in
+/// bindreams/hole#304. See bindreams/hole#285 §"Where the fix
+/// actually lands" for the rendezvous-port race class history.
 async fn spawn_ss_with_plugin(
     method: CipherKind,
     password: &str,
@@ -154,29 +154,24 @@ async fn spawn_ss_with_plugin(
     plugin_path: &str,
     plugin_opts: &str,
 ) -> (SocketAddr, JoinHandle<()>) {
-    let (port, server) = port_alloc::bind_with_retry(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        protocols,
-        port_alloc::BIND_RETRY_ATTEMPTS,
-        |port| {
-            let password = password.to_string();
-            let plugin_path = plugin_path.to_string();
-            let plugin_opts = plugin_opts.to_string();
-            async move {
-                let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
-                svr_cfg.set_mode(Mode::TcpAndUdp);
-                svr_cfg.set_plugin(PluginConfig {
-                    plugin: plugin_path,
-                    plugin_opts: Some(plugin_opts),
-                    plugin_args: vec![],
-                    plugin_mode: Mode::TcpAndUdp,
-                });
-                SsServerBuilder::new(svr_cfg).build().await
-            }
-        },
-    )
+    let (port, server) = port_alloc::bind_ephemeral(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols, |port| {
+        let password = password.to_string();
+        let plugin_path = plugin_path.to_string();
+        let plugin_opts = plugin_opts.to_string();
+        async move {
+            let mut svr_cfg = ServerConfig::new(("127.0.0.1", port), password, method).unwrap();
+            svr_cfg.set_mode(Mode::TcpAndUdp);
+            svr_cfg.set_plugin(PluginConfig {
+                plugin: plugin_path,
+                plugin_opts: Some(plugin_opts),
+                plugin_args: vec![],
+                plugin_mode: Mode::TcpAndUdp,
+            });
+            SsServerBuilder::new(svr_cfg).build().await
+        }
+    })
     .await
-    .expect("spawn_ss_with_plugin: bind/build failed after retries");
+    .expect("spawn_ss_with_plugin: bind/build failed");
 
     let public_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let handle = tokio::spawn(async move {
