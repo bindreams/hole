@@ -17,10 +17,11 @@ fn find_holders_missing_file_returns_empty() {
 /// Cross-platform ctor-linkage regression test for #301.
 ///
 /// The `hole_test_observability::register!()` invocation at the top
-/// of `lib.rs` expands to a `#[ctor::ctor]` static in THIS crate's
-/// object file. If a future MSVC link.exe / lld / ld / ld64 change
-/// (or a workspace refactor) DCE'd the static, our test subscriber
-/// would silently disappear from this binary.
+/// of `lib.rs` expands to a `ctor::declarative::ctor!` block emitting
+/// a `#[used]` static in THIS crate's object file. If a future MSVC
+/// link.exe / lld / ld / ld64 change (or a workspace refactor) DCE'd
+/// the static, our test subscriber would silently disappear from
+/// this binary.
 ///
 /// We detect this by asserting that AFTER our ctor has run, calling
 /// `set_global_default` again fails — proving a global default is

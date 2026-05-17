@@ -138,9 +138,9 @@ impl DistHarness {
         // Note: the workspace panic-dump dispatcher (see #303) is
         // installed at ctor time by `hole_test_observability::install`,
         // which runs strictly before any test code via the `register!`
-        // macro's `#[ctor::ctor]` function. The pre-#303 explicit
-        // `install_panic_hook_once()` here was load-bearing as a
-        // before-fallible-work guarantee; the ctor-time install
+        // macro's `ctor::declarative::ctor!` block. The pre-#303
+        // explicit `install_panic_hook_once()` here was load-bearing
+        // as a before-fallible-work guarantee; the ctor-time install
         // preserves that property.
 
         let hole_exe = dist_bin_dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
@@ -385,7 +385,7 @@ impl Drop for DistHarness {
 
 /// Generate a short random suffix for the socket path.
 fn rand_suffix() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let n: u32 = rand::rng().random();
     format!("{n:08x}")
 }

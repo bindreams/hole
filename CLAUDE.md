@@ -416,8 +416,8 @@ as a dev-dependency and invokes
 either at the top level of `src/lib.rs` (lib tests) or at the top of
 each `tests/*.rs` (integration tests). The macro expands (under
 `#[cfg(test)]`) to a `mod _hole_test_observability_init` containing
-a `#[ctor::ctor]` function. The ctor runs pre-main on every test
-binary and installs:
+a `ctor::declarative::ctor!` block. The ctor runs pre-main on every
+test binary and installs:
 
 - A process-global `tracing_subscriber` writing to stderr. Skuld's
   FD-level capture (under bare `cargo test`) and nextest's

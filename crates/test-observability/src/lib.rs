@@ -1,9 +1,9 @@
 //! Process-global test observability for the Hole workspace.
 //!
 //! Each test-bearing crate invokes [`register!`] from its `lib.rs`. The
-//! macro expands to a `#[cfg(test)]` `#[ctor::ctor]` block in the
-//! **consumer** crate (not this rlib) that calls [`install`] before
-//! `main` runs. [`install`] is idempotent.
+//! macro expands to a `#[cfg(test)]` `ctor::declarative::ctor!` block
+//! in the **consumer** crate (not this rlib) that calls [`install`]
+//! before `main` runs. [`install`] is idempotent.
 //!
 //! What gets installed:
 //!
@@ -51,12 +51,15 @@ use tracing_subscriber::EnvFilter;
 
 pub mod panic_dump;
 
-/// Re-exported attribute macro so consumer crates don't need to add
-/// `ctor` to their own dev-dependencies. Exposed as
-/// `hole_test_observability::ctor` (the attribute macro), invoked
-/// from the [`register!`] expansion as `#[$crate::ctor]`.
+/// Re-exported `ctor` crate so consumer crates don't need to add
+/// `ctor` to their own dev-dependencies. The [`register!`] macro
+/// invokes `ctor::declarative::ctor!` against this re-export — the
+/// declarative form is required because `default-features = false`
+/// in the workspace turns off the proc-macro `#[ctor]` attribute
+/// (which would otherwise emit absolute `::ctor::…` paths in
+/// consumer crates that don't depend on `ctor` directly).
 #[doc(hidden)]
-pub use ::ctor::ctor;
+pub use ::ctor;
 
 /// Default `EnvFilter` directives. Catch-all `info`; every Hole-side
 /// crate is pinned to `debug` for diagnostic depth. Third-party
@@ -82,7 +85,7 @@ const DEFAULT_FILTER: &str = "info,\
 /// Install the global subscriber, panic hook, and backtrace env var.
 ///
 /// Idempotent: subsequent calls are no-ops. Safe to invoke from any
-/// `#[ctor::ctor]` site or from a regular `fn`.
+/// `ctor::declarative::ctor!` site or from a regular `fn`.
 ///
 /// Short-circuits and does nothing when `HOLE_LOGGING_TEST_KIND` is
 /// set — the FD-redirect child-process branch in
@@ -100,7 +103,7 @@ pub fn install() {
     ONCE.call_once(|| {
         // SAFETY: ctor runs pre-main, single-threaded. The workspace
         // has no other ctor that reads env vars (grep-verified for
-        // `#[ctor]` / `ctor::ctor`).
+        // `ctor::declarative::ctor!` / `ctor::ctor`).
         if std::env::var_os("RUST_BACKTRACE").is_none() {
             unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
         }
@@ -184,10 +187,10 @@ pub fn install() {
 /// ```
 ///
 /// Expands to a `#[cfg(test)]` private module containing a
-/// `#[ctor::ctor]` function that calls [`install`]. The ctor's
-/// `#[used]` static is emitted in the **consumer** crate's object
-/// file — sidestepping rlib dead-code-elimination across linker
-/// variants (MSVC link.exe / lld / ld / ld64).
+/// `ctor::declarative::ctor!` block that calls [`install`]. The
+/// declarative form emits its `#[used]` static in the **consumer**
+/// crate's object file — sidestepping rlib dead-code-elimination
+/// across linker variants (MSVC link.exe / lld / ld / ld64).
 ///
 /// One invocation per crate root (including each `tests/foo.rs`
 /// integration-test target). The expanded module name is fixed, so
@@ -199,9 +202,11 @@ macro_rules! register {
         #[cfg(test)]
         #[doc(hidden)]
         mod _hole_test_observability_init {
-            #[$crate::ctor]
-            fn init() {
-                $crate::install();
+            $crate::ctor::declarative::ctor! {
+                #[ctor(unsafe)]
+                fn init() {
+                    $crate::install();
+                }
             }
         }
     };
