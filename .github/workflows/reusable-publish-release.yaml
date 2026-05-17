@@ -133,9 +133,13 @@ jobs:
       - name: Check crates.io for existing version
         if: ${{ !inputs.dry-run && inputs.crates-publish }}
         id: crates_check
+        env:
+          # crates.io API requires a User-Agent header; without it the
+          # API responds with HTTP 403. See #346.
+          CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          CODE=$(curl -sL -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")
+          CODE=$(curl -sL -A "$CRATES_UA" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")
           if [ "$CODE" = "200" ]; then
             echo "already_published=true" >> "$GITHUB_OUTPUT"
             echo "Version ${VERSION} already on crates.io; will skip publish."
@@ -162,12 +166,15 @@ jobs:
 
       - name: Wait for crates.io indexing
         if: ${{ !inputs.dry-run && inputs.crates-publish }}
+        env:
+          # crates.io API requires User-Agent; see #346.
+          CRATES_UA: "hole-release-pipeline (https://github.com/bindreams/hole)"
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           # Unbounded poll — `timeout-minutes: 30` on the job is the
           # only ceiling. crates.io indexing is well-behaved; only
           # reason to time out is a real outage.
-          until [ "$(curl -sL -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")" = "200" ]; do
+          until [ "$(curl -sL -A "$CRATES_UA" -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/${{ inputs.crates-name }}/${VERSION}")" = "200" ]; do
             echo "Still indexing..."
             sleep 10
           done
