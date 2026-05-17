@@ -6,6 +6,8 @@ pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
 pub mod tap;
+#[doc(hidden)]
+pub mod tracing_test;
 
 pub use binary::{BinaryPlugin, PidSink};
 pub use chain::ChainRunner;
@@ -32,6 +34,8 @@ mod shutdown_tests;
 mod sip003_tests;
 #[cfg(test)]
 mod tap_tests;
+#[cfg(test)]
+mod tracing_test_tests;
 
 #[cfg(test)]
 fn main() {
