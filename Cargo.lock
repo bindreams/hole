@@ -8998,7 +8998,7 @@ dependencies = [
  "semver",
  "skuld",
  "tempfile",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
