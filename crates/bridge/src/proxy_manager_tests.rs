@@ -1030,7 +1030,6 @@ mod self_test {
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
     /// A connector that immediately fails every connect. Drives the
     /// dead-upstream path in tests — the forwarder will fail every
@@ -1083,23 +1082,22 @@ mod self_test {
     #[skuld::test]
     fn self_test_empty_servers_logs_skipped() {
         let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = subscriber.set_default();
 
-        // Current-thread runtime so `tokio::spawn` in
-        // `spawn_forwarder_self_test` schedules on the test thread —
-        // `set_default` is thread-local; a multi-thread runtime would
-        // run the spawned task on a worker without the subscriber.
+        // Current-thread runtime — the helper asserts this. See
+        // bindreams/hole#302.
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
                 spawn_forwarder_self_test(forwarder, vec![]);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1118,13 +1116,6 @@ mod self_test {
     #[skuld::test]
     fn self_test_dead_upstream_logs_failed() {
         let writer = VecWriter::new();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        let _guard = subscriber.set_default();
 
         // Current-thread runtime — see `self_test_empty_servers_logs_skipped`
         // for why the shared multi-thread `rt()` doesn't work here.
@@ -1133,6 +1124,14 @@ mod self_test {
             .build()
             .unwrap()
             .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
                 spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
                 // Wait for the self-test to exhaust retries. 3 × 1500ms =
