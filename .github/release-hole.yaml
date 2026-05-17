@@ -13,8 +13,12 @@ initial_release: |
   versioning scheme.
 
 # A commit is included in this track's notes if it modified any file
-# matching one of these globs. Globs use fnmatch semantics
-# (`**` recursive, `*` non-slash wildcard).
+# matching one of these globs. Globs use gitignore semantics via the
+# `pathspec` library, with one local convention: a pattern WITHOUT `/`
+# (e.g. `Cargo.toml`) is anchored to the repo root, so it does NOT
+# match `crates/foo/Cargo.toml`. Patterns containing `/` use raw
+# gitignore: `**` recursive, trailing `/` directory-only, etc. See
+# `scripts/generate-release-notes.py::build_path_spec` for the rule.
 include_paths:
   - crates/hole/**
   - crates/common/**
