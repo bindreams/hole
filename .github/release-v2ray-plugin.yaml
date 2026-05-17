@@ -21,6 +21,15 @@ include_paths:
   - .github/workflows/draft-release-v2ray-plugin.yaml
   - .github/workflows/publish-release-v2ray-plugin.yaml
   - .github/release-v2ray-plugin.yaml
+  # Workspace-engineering files affect every release track. See #312.
+  - xtask/**
+  - xtask-lib/**
+  - scripts/generate-release-notes.py
+  - Cargo.toml
+  - Cargo.lock
+  - build.yaml
+  - prek.toml
+  - clippy.toml
 
 categories:
   - title: "🚀 Features"
