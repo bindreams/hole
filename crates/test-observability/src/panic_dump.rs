@@ -81,7 +81,7 @@ fn next_key() -> u64 {
 /// iterating), registration silently no-ops and the returned guard is
 /// a tombstone — its `Drop` is also a no-op. Mirrors the
 /// silent-on-poison property of the original DistHarness
-/// implementation at `dist_harness.rs:465`.
+/// `install_panic_hook_once`.
 ///
 /// `next_key()` uses `AtomicU64::fetch_add(1)`; overflow is structurally
 /// out of reach (at 1 register/μs that's 584,000 years).
@@ -111,13 +111,24 @@ pub(crate) fn install_panic_hook_once() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // Diagnostic marker so operators reading raw stderr can
-            // confirm the dispatcher actually fired before looking
-            // for source dumps. Inherited from the original
-            // DistHarness panic hook at `dist_harness.rs:464`.
+            // confirm the dispatcher actually fired before looking for
+            // source dumps. Inherited from the pre-#303 DistHarness
+            // panic hook.
             let _ = writeln!(std::io::stderr().lock(), "[panic_dump] dispatcher fired: {info}");
-            if let Ok(reg) = registry().lock() {
+            // Snapshot the registry under the lock, then release it
+            // before iterating. Calling `dump()` while holding the
+            // registry mutex would deadlock if a source's `dump`
+            // re-enters via `register()` / guard drop, and would
+            // serialize slow I/O across the lock-hold window. The
+            // `Arc` clones are cheap; the snapshot makes the dispatch
+            // pass lock-free.
+            let sources: Vec<Arc<dyn PanicDumpSource>> = match registry().lock() {
+                Ok(reg) => reg.values().cloned().collect(),
+                Err(_) => return, // poisoned — silently skip
+            };
+            if !sources.is_empty() {
                 let mut stderr = std::io::stderr().lock();
-                for source in reg.values() {
+                for source in &sources {
                     source.dump(&mut stderr);
                 }
             }

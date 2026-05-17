@@ -43,13 +43,13 @@ pub(crate) fn run_child() {
     };
 
     let runtime = rt();
-    // Hold `_harness` across both `block_on` calls so its
-    // `BridgeChildLogSource` is still in the registry when the panic
-    // hook iterates. Order at end of `run_child`: (1) panic unwinds →
-    // (2) hook fires reading registry → (3) unwind continues, dropping
-    // `_harness` → (4) `DistHarness::Drop` unregisters via
-    // `_panic_dump_guard.take()`. The hook reads at step 2, before
-    // step 4 — correct ordering.
+    // Hold `_harness` across the second `block_on` so its
+    // `BridgeChildLogSource` is still registered when the panic hook
+    // iterates. The panic hook fires from inside `panic_impl` BEFORE
+    // any local drop runs — `_harness` is live, the registry contains
+    // the source. Only AFTER the hook returns does unwind continue and
+    // drop `_harness`, which in turn runs `DistHarness::Drop`'s
+    // `_panic_dump_guard.take()` unregister. Hook reads before unregister.
     let _harness = runtime.block_on(async { DistHarness::spawn(&dist_bin_dir).await.expect("DistHarness::spawn") });
 
     // Deliberate panic INSIDE `rt().block_on(...)` — the exact
@@ -77,10 +77,18 @@ fn panic_hook_chain_dumps_bridge_log_and_libtest_message() {
     let exe = std::env::current_exe().expect("current_exe");
     let output = Command::new(&exe)
         .env("HOLE_DIST_HARNESS_PANIC_TEST", "1")
+        // Scrub env vars that other test-support code in the workspace
+        // interprets as "I am a child of a re-exec test", to avoid the
+        // child taking the wrong branch in `crates/common/src/lib.rs::main`
+        // or short-circuiting `hole_test_observability::install` (which
+        // would skip installing the dispatcher under test). Inheriting
+        // an accidentally-set value from the parent process would make
+        // this test silently pass under a broken chain.
+        .env_remove("HOLE_LOGGING_TEST_KIND")
         // `output()` captures both stdout and stderr. The child
-        // dispatches into `run_child` via the `lib.rs` branch
-        // BEFORE libtest's arg parsing, so we don't need any
-        // --nocapture / filter flags.
+        // dispatches into `run_child` via the `lib.rs` branch BEFORE
+        // libtest's arg parsing, so we don't need any --nocapture /
+        // filter flags.
         .output()
         .expect("spawn child");
 
@@ -125,12 +133,42 @@ fn panic_hook_chain_dumps_bridge_log_and_libtest_message() {
     );
 
     // Negative gate: the safety-net `eprintln!` MUST NOT appear — if
-    // it does, `block_on` swallowed the panic and the chain didn't
-    // get to fire at all (or fired without the panic value reaching
-    // the libtest printer).
+    // it does, `block_on` swallowed the panic and the chain didn't get
+    // to fire at all (or fired without the panic value reaching the
+    // libtest printer).
     assert!(
         !stderr.contains("panic did not propagate out of block_on"),
         "panic was swallowed by block_on or runtime — chain ordering \
          is broken. stderr:\n{stderr}"
+    );
+
+    // Ordering gate: the dispatcher must fire FIRST, then the
+    // hole_common tracing-emit hook, then libtest's panic printer.
+    // `contains`-based gates above would still pass if the chain
+    // silently reversed; this find-based check catches that regression.
+    //
+    // Note "panicked at" appears in BOTH the dispatcher's prologue
+    // (`writeln!(stderr, "[panic_dump] dispatcher fired: {info}")` —
+    // `PanicInfo`'s Display impl includes the "panicked at" line) AND
+    // libtest's panic printer. To identify libtest's line uniquely we
+    // search for the `thread '` prefix that libtest writes ahead of
+    // its `panicked at`; no other hook in the chain produces that
+    // prefix.
+    let pos_dispatcher = stderr
+        .find("[panic_dump] dispatcher fired:")
+        .expect("dispatcher marker");
+    let pos_tracing = stderr.find("hole::panic").expect("hole::panic tracing event");
+    let pos_libtest = stderr
+        .find("thread '")
+        .expect("libtest thread-prefixed panicked-at line");
+    assert!(
+        pos_dispatcher < pos_tracing,
+        "panic_dump dispatcher must run before the hole_common tracing-emit hook; \
+         dispatcher@{pos_dispatcher}, tracing@{pos_tracing}. stderr:\n{stderr}"
+    );
+    assert!(
+        pos_tracing < pos_libtest,
+        "hole_common tracing-emit hook must run before libtest's panic printer; \
+         tracing@{pos_tracing}, libtest@{pos_libtest}. stderr:\n{stderr}"
     );
 }

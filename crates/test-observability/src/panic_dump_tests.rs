@@ -92,10 +92,15 @@ fn double_register_uses_refcount() {
 }
 
 #[skuld::test]
-fn install_panic_hook_once_is_idempotent() {
+fn install_panic_hook_once_does_not_panic_on_multiple_calls() {
+    // Smoke-test for the `Once` guard. We cannot easily verify the
+    // hook count didn't grow without firing a real panic, which would
+    // interfere with the global hook the test runner relies on; this
+    // test only proves the function returns cleanly on subsequent
+    // calls. End-to-end chain ordering (which would catch a missing
+    // `Once`) is verified by the subprocess regression test at
+    // `crates/bridge/src/test_support/dist_harness_panic_hook_tests.rs`.
     install_panic_hook_once();
     install_panic_hook_once();
     install_panic_hook_once();
-    // The `Once` inside ensures only the first call installs;
-    // subsequent calls are no-ops. No panic, no double-chained hook.
 }

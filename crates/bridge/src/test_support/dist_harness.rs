@@ -210,22 +210,26 @@ impl DistHarness {
         // Register the live child with the workspace panic-dump
         // dispatcher (#303, originally #200 H3 evidence). The
         // returned guard's `Drop` removes the source on harness drop.
-        let panic_dump_guard =
-            hole_test_observability::panic_dump::register(std::sync::Arc::new(BridgeChildLogSource {
-                pid: child_pid,
-                socket: socket_path.clone(),
-                log_dir: log_dir.path().to_path_buf(),
-            }));
+        let log_source = std::sync::Arc::new(BridgeChildLogSource {
+            pid: child_pid,
+            socket: socket_path.clone(),
+            log_dir: log_dir.path().to_path_buf(),
+        });
+        let panic_dump_guard = hole_test_observability::panic_dump::register(log_source);
 
         // Wait for the socket to become connectable before returning.
         // If the subprocess has already exited, surface that instead of
         // waiting the full 10s timeout.
         if let Err(e) = wait_for_socket_or_exit(&socket_path, &mut child, Duration::from_secs(10)).await {
+            // Unregister BEFORE kill/wait — same ordering as the Drop
+            // impl. If `child.kill()` or `child.wait()` themselves
+            // panic, we don't want the dispatcher dumping a stale
+            // `BridgeChildLogSource` whose subprocess is mid-death.
+            drop(panic_dump_guard);
             // Try to reap the child so we don't leave a zombie if it's
             // still limping along.
             let _ = child.kill();
             let _ = child.wait();
-            drop(panic_dump_guard);
             return Err(HarnessError(format!(
                 "bridge subprocess never bound {socket_path:?}: {e}"
             )));
