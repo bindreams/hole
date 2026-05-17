@@ -15,14 +15,14 @@ edition = "2021"
 skuld = { version = "0.2", features = ["tokio"] }
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
-ctor = "0.2"
+ctor = "0.13"
 insta = { version = "1", features = ["yaml"] }
 trybuild = "1"
 # DNS forwarder deps — direct so a future shadowsocks-service bump cannot
 # silently change the forwarder's hickory/tokio-socks versions.
-hickory-proto = "0.25"
-hickory-resolver = "0.25"
-hickory-server = "0.25"
+hickory-proto = "0.26"
+hickory-resolver = "0.26"
+hickory-server = "0.26"
 tokio-socks = "0.5"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }

@@ -37,7 +37,7 @@ arc-swap = "1"
 # Pinned to the same versions shadowsocks-service 1.24 uses transitively
 # (via tun-0.8.6) so cargo deduplicates the crates.
 tun = { version = "0.8", features = ["async"] }
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
