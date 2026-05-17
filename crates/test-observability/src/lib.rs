@@ -155,6 +155,13 @@ pub fn install() {
         // Hole's tracing-emitting panic hook. Chains before the
         // stdlib default. Idempotent via its own AtomicBool, so
         // safe alongside any production caller of `init_logging`.
+        // Gated to Mac/Windows because `hole-common` only compiles
+        // on those platforms (see this crate's Cargo.toml); on
+        // Linux/etc. (where ex-Galoshes crates get clippy-checked
+        // and transitively pull in this crate via dev-deps) the
+        // stdlib default panic hook + `RUST_BACKTRACE=full` above
+        // is the fallback diagnostic.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         hole_common::logging::install_panic_hook();
     });
 }
