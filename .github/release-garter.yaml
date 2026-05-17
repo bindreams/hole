@@ -26,22 +26,4 @@ include_paths:
   - prek.toml
   - clippy.toml
 
-categories:
-  - title: "🚀 Features"
-    types: [feat]
-  - title: "🐛 Bug Fixes"
-    types: [fix]
-  - title: "⚡ Performance"
-    types: [perf]
-  - title: "♻️ Refactors"
-    types: [refactor]
-  - title: "📚 Documentation"
-    types: [docs]
-  - title: "🔧 Build & CI"
-    types: [build, ci]
-  - title: "🧪 Tests"
-    types: [test]
-  - title: "🧹 Chores"
-    types: [chore, style, revert]
-  - title: "Other"
-    types: []
+# Categories live in .github/release-categories.yaml (shared across all four tracks).

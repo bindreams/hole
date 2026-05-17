@@ -30,10 +30,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Allowed types match the CONTRIBUTING.md list and
-          # .github/release-*.yaml categorization buckets. If you add a
-          # new type here, also add a category for it in every
-          # per-track release config (or let it fall into "Other").
+          # Allowed types match the CONTRIBUTING.md list and the
+          # category buckets in .github/release-categories.yaml (shared
+          # across all four release tracks). New types here fall into
+          # the "Other" catch-all category by default; add to an explicit
+          # category in release-categories.yaml if a dedicated section is
+          # wanted. test_categories_cover_all_semantic_pr_types in
+          # scripts/generate-release-notes.py fails only if the catch-all
+          # is removed while uncovered types still exist.
           types: |
             feat
             fix
