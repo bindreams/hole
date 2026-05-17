@@ -20,10 +20,11 @@ include_paths:
   - xtask/**
   - xtask-lib/**
   - scripts/generate-release-notes.py
-  - scripts/sign-release.py
   - Cargo.toml
   - Cargo.lock
   - build.yaml
+  - prek.toml
+  - clippy.toml
 
 categories:
   - title: "🚀 Features"

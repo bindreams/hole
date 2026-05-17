@@ -9,22 +9,23 @@ initial_release: |
   decoupling rationale.
 
 include_paths:
+  # Note: crates/garter/** was removed from this list in #312. Garter
+  # changes belong in garter release notes; galoshes consumers wanting
+  # garter-library detail can read the garter release notes directly.
   - crates/galoshes/**
   - external/v2ray-plugin/**
   - .github/workflows/draft-release-galoshes.yaml
   - .github/workflows/publish-release-galoshes.yaml
   - .github/release-galoshes.yaml
   # Workspace-engineering files affect every release track. See #312.
-  # (crates/garter/** removed: garter changes belong in garter release
-  # notes; galoshes consumers wanting embedded-garter detail can read
-  # the garter release notes directly.)
   - xtask/**
   - xtask-lib/**
   - scripts/generate-release-notes.py
-  - scripts/sign-release.py
   - Cargo.toml
   - Cargo.lock
   - build.yaml
+  - prek.toml
+  - clippy.toml
 
 categories:
   - title: "🚀 Features"

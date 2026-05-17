@@ -39,6 +39,7 @@ include_paths:
   - Cargo.lock
   - build.yaml
   - prek.toml
+  - clippy.toml
 
 # Each commit is placed under the first category whose `types` list
 # contains the commit's Conventional Commit type. Commits without a
