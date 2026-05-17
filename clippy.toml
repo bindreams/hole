@@ -65,3 +65,7 @@ reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asser
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::set_default"
 reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks. See bindreams/hole#302."
+
+[[disallowed-methods]]
+path = "tracing::dispatcher::set_default"
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing::subscriber::set_default` delegates to this lower-level function; disallowing the underlying form keeps the same thread-local-guard footgun out of reach for code that reaches under the abstraction. See bindreams/hole#302."
