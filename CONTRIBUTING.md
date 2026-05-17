@@ -260,3 +260,7 @@ When Windows CI fails with a timeout in `server_test_tests` or loopback connects
 - Add `--test-threads=1` to the Windows CI invocation
 - Serialize tests via bare `#[skuld::test(serial)]` except for structural invariant checks. Resource-contention serialization belongs on the fixture that models the resource (`#[skuld::fixture(serial = LABEL)]`) or on the test carrying the resource's label: `#[skuld::test(labels = [LABEL], serial = LABEL)]`. Labels live in `crates/bridge/src/test_support/skuld_fixtures.rs` (`DIST_BIN`, `PORT_ALLOC`, `TUN`, `IPV6`). Label names are cross-crate reserved via skuld's SQLite coordinator — adding the same label name in another crate will unintentionally serialize tests across crates.
 - Add a per-test timeout. Job-level timeouts in `.github/workflows/ci.yaml` — `build` 30m, `test-hole` 20m, `test-garter`/`test-galoshes` 10m — are the sole global test timeouts. Developers wanting local per-test hang protection can set `NEXTEST_SLOW_TIMEOUT` in their shell.
+
+## Release operations
+
+See [docs/RELEASE-OPS.md](docs/RELEASE-OPS.md) for the rollback procedure, minisign key rotation, and the crates.io dry-run TOCTOU note.
