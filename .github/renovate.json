@@ -56,30 +56,6 @@
         "automerge": true,
         "schedule": ["before 9am on monday"]
       }
-    },
-    {
-      "description": "Pin ctor < 0.3 pending hole-test-observability migration to ctor 0.13 (see #336).",
-      "matchPackageNames": ["ctor"],
-      "matchManagers": ["cargo"],
-      "allowedVersions": "<0.3"
-    },
-    {
-      "description": "Pin schemars < 0.9 pending crates/common/build.rs migration to schemars 0.9 (see #336).",
-      "matchPackageNames": ["schemars"],
-      "matchManagers": ["cargo"],
-      "allowedVersions": "<0.9"
-    },
-    {
-      "description": "Pin rand < 0.10 pending hole-bridge test_support migration to rand 0.10 (see #336).",
-      "matchPackageNames": ["rand"],
-      "matchManagers": ["cargo"],
-      "allowedVersions": "<0.10"
-    },
-    {
-      "description": "Pin rcgen < 0.14 pending hole-bridge test_support migration to rcgen 0.14 (see #336).",
-      "matchPackageNames": ["rcgen"],
-      "matchManagers": ["cargo"],
-      "allowedVersions": "<0.14"
     }
   ]
 }

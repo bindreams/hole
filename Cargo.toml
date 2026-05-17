@@ -15,7 +15,16 @@ edition = "2021"
 skuld = { version = "0.2", features = ["tokio"] }
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
-ctor = "0.2"
+#
+# `default-features = false` disables the `proc_macro` default feature
+# (the `#[ctor]` attribute macro). Re-exporting wrappers must use the
+# declarative `ctor::declarative::ctor!` form instead — the proc-macro
+# emits absolute `::ctor::…` paths in consumer crates, which fails
+# because consumers (galoshes, hole, garter-bin, …) don't depend on
+# ctor directly. Upstream docs: "It is recommended that crates
+# re-exporting the `ctor` macro disable this feature and only use the
+# declarative form."
+ctor = { version = "0.13", default-features = false }
 insta = { version = "1", features = ["yaml"] }
 trybuild = "1"
 # DNS forwarder deps — direct so a future shadowsocks-service bump cannot

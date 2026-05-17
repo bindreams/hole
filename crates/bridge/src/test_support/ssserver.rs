@@ -32,7 +32,7 @@ pub(crate) const TEST_PASSWORD: &str = "test-password-1234";
 /// - For all other ciphers (stream, AEAD v1), the password is just an
 ///   arbitrary string and we hex-encode the random bytes for legibility.
 pub(crate) fn random_password_for(method: CipherKind) -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let key_len = method.key_len();
     let mut bytes = vec![0u8; key_len];
     rand::rng().fill_bytes(&mut bytes);
