@@ -526,9 +526,9 @@ fn question_end_rejects_truncated() {
 mod typed_error_logs {
     use super::*;
     use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-    use tracing_subscriber::util::SubscriberInitExt;
 
     /// Closed TCP upstream + PlainTcp protocol → the "upstream failed" log
     /// line must include `layer=connect` and `elapsed_ms=<n>`, so Phase 2
@@ -542,7 +542,7 @@ mod typed_error_logs {
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         );
-        let _guard = subscriber.set_default();
+        let _guard = set_default_in_current_thread(subscriber);
 
         let dead = unused_tcp_port().await;
         let fwd = DnsForwarder::new(
@@ -576,7 +576,7 @@ mod typed_error_logs {
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         );
-        let _guard = subscriber.set_default();
+        let _guard = set_default_in_current_thread(subscriber);
 
         let dead = unused_tcp_port().await;
         let fwd = DnsForwarder::new(
@@ -606,7 +606,7 @@ mod typed_error_logs {
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         );
-        let _guard = subscriber.set_default();
+        let _guard = set_default_in_current_thread(subscriber);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
