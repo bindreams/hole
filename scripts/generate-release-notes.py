@@ -75,13 +75,27 @@ class Commit:
 
 
 def load_config(repo_root: Path, track: str) -> TrackConfig:
-    path = repo_root / ".github" / f"release-{track}.yaml"
-    with open(path, encoding="utf-8") as f:
+    track_path = repo_root / ".github" / f"release-{track}.yaml"
+    with open(track_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+
+    # Per-track configs must NOT redeclare categories — the schema lives
+    # in the shared file. Reject loudly so a forgotten removal doesn't
+    # silently revert to per-track schemas.
+    if "categories" in raw:
+        raise RuntimeError(
+            f"{track_path} declares `categories:` but the shared schema "
+            f"lives in .github/release-categories.yaml. Remove the block."
+        )
+
+    shared_path = repo_root / ".github" / "release-categories.yaml"
+    with open(shared_path, encoding="utf-8") as f:
+        shared = yaml.safe_load(f)
+
     return TrackConfig(
         initial_release=raw.get("initial_release", "").strip(),
         include_paths=list(raw.get("include_paths", [])),
-        categories=[Category(title=c["title"], types=list(c.get("types", []))) for c in raw.get("categories", [])],
+        categories=[Category(title=c["title"], types=list(c.get("types", []))) for c in shared.get("categories", [])],
     )
 
 
@@ -518,47 +532,97 @@ def test_integration_filtering_against_real_history():
     assert "## " in out or "_No commits in this range" in out, f"Unexpected shape: {out[:200]}"
     assert "**Full Changelog**:" in out, f"Missing Full Changelog link: {out[-200:]}"
 
-    # Negative assertion: a commit touching ONLY crates/hole/ (no
-    # workspace-engineering path) within the same range must NOT appear
-    # in v2ray-plugin notes. Probe is range-constrained so it can't pass
-    # vacuously on an empty match.
-    hole_only = subprocess.run(
-        [
-            "git",
-            "log",
-            "--format=%H %s",
-            "-1",
-            f"{prev_tag}..HEAD",
-            "--",
-            "crates/hole/",
-            ":!external/",
-            ":!xtask/",
-            ":!xtask-lib/",
-            ":!scripts/",
-            ":!Cargo.toml",
-            ":!Cargo.lock",
-            ":!build.yaml",
-            ":!prek.toml",
-            ":!clippy.toml",
-            ":!.github/release-v2ray-plugin.yaml",
-            ":!.github/workflows/draft-release-v2ray-plugin.yaml",
-            ":!.github/workflows/publish-release-v2ray-plugin.yaml",
-        ],
+    # Negative assertion: a commit that touches ONLY hole-track paths
+    # within the same range must NOT appear in v2ray-plugin notes.
+    # Iterate recent commits in range, find one whose every file matches
+    # hole's include_paths but no v2ray-plugin include_paths.
+    hole_spec = build_path_spec(load_config(repo_root, "hole").include_paths)
+    v2ray_spec = build_path_spec(load_config(repo_root, "v2ray-plugin").include_paths)
+    all_commits = subprocess.run(
+        ["git", "log", "--format=%H", "--no-merges", f"{prev_tag}..HEAD"],
         cwd=repo_root,
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.strip()
-    if not hole_only:
-        # No hole-only commit in range — probe has nothing to assert.
-        # Common case for the v2ray-plugin track since releases there
-        # don't tend to be paired with hole-only PRs in the same window.
-        return
-    m = re.search(r"\(#(\d+)\)\s*$", hole_only)
-    if m:
+    ).stdout.splitlines()
+    for sha in all_commits:
+        files = subprocess.run(
+            ["git", "show", "--no-renames", "--name-only", "--format=", sha],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        files = [f for f in files if f.strip()]
+        if not files:
+            continue
+        hole_only = all(hole_spec.match_file(f) and not v2ray_spec.match_file(f) for f in files)
+        if not hole_only:
+            continue
+        subject = subprocess.run(
+            ["git", "log", "--format=%s", "-1", sha],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        m = re.search(r"\(#(\d+)\)\s*$", subject)
+        if not m:
+            continue
         pr_num = m.group(1)
-        # Word-boundary check to avoid `#3` matching `#307` etc.
         assert not re.search(rf"#{pr_num}\b", out), (
-            f"v2ray-plugin notes contain hole-only PR #{pr_num}; "
-            f"include-path filtering may be broken. Subject: {hole_only}"
+            f"v2ray-plugin notes contain hole-only PR #{pr_num} ({sha[:8]}); "
+            f"include-path filtering may be broken. Subject: {subject}"
         )
+        return
+    # No qualifying hole-only commit in range. Common; not a failure.
+
+
+def test_shared_categories_file_loaded():
+    """load_config returns categories from the shared file for every track."""
+    repo_root = Path(__file__).resolve().parent.parent
+    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text())
+    expected_titles = [c["title"] for c in shared["categories"]]
+    for track in ["hole", "galoshes", "garter", "v2ray-plugin"]:
+        config = load_config(repo_root, track)
+        assert [c.title
+                for c in config.categories] == expected_titles, (f"Track {track} categories don't match shared file")
+
+
+def test_per_track_configs_dont_duplicate_categories():
+    """Per-track files must not redeclare categories (single source of truth)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    for track in ["hole", "galoshes", "garter", "v2ray-plugin"]:
+        raw = yaml.safe_load((repo_root / ".github" / f"release-{track}.yaml").read_text())
+        assert "categories" not in raw, (
+            f"release-{track}.yaml must not declare `categories:`; "
+            f"shared schema lives in .github/release-categories.yaml"
+        )
+
+
+def test_categories_cover_all_semantic_pr_types():
+    """Every type in semantic-pr.yaml is reachable by the categorizer:
+    either in an explicit category, or via the "Other" catch-all
+    (category with empty types list).
+
+    Per S5 (b): catch-all is an acceptable runtime fallback. The test
+    enforces that if "Other" is ever removed, every type must have an
+    explicit category.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    semantic = yaml.safe_load((repo_root / ".github/workflows/semantic-pr.yaml").read_text())
+    types_block = semantic["jobs"]["validate"]["steps"][0]["with"]["types"]
+    declared_types = {t.strip() for t in types_block.splitlines() if t.strip()}
+
+    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text())
+    explicit_types = {t for cat in shared["categories"] for t in cat.get("types", [])}
+    has_catchall = any(not cat.get("types") for cat in shared["categories"])
+
+    if has_catchall:
+        return  # catch-all absorbs any uncovered type; invariant holds
+    missing = declared_types - explicit_types
+    assert not missing, (
+        f"No catch-all category exists and these types from semantic-pr.yaml "
+        f"have no explicit category: {sorted(missing)}. Either add them to "
+        f"an explicit category or re-add the 'Other' catch-all."
+    )
