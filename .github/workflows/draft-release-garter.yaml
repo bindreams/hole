@@ -141,6 +141,10 @@ jobs:
           cat release-notes.md
           echo "--- end ---"
 
+      # --latest=false at draft-create time pins GitHub's make_latest so
+      # the eventual publish doesn't promote this release to
+      # /releases/latest via the legacy semver+date heuristic. Hole is
+      # the only track that claims /latest. See #308.
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,6 +154,7 @@ jobs:
           TAG="releases/garter/v${VERSION}"
           gh release create "$TAG" \
             --draft \
+            --latest=false \
             --notes-file release-notes.md \
             --title "garter v${VERSION}" \
             --target "${{ github.sha }}" \
