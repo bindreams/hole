@@ -112,5 +112,8 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          # Belt-and-suspenders: --latest=false was pinned at draft
+          # creation; re-assert here so the published state matches even
+          # if the draft was edited externally. See #308.
           gh release edit "$TAG" --draft=false --latest=false
           echo "Release published: https://github.com/${{ github.repository }}/releases/tag/$TAG"

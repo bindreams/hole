@@ -152,6 +152,11 @@ jobs:
           cat release-notes.md
           echo "--- end ---"
 
+      # Hole is the user-facing product and is the canonical holder of
+      # /releases/latest. Pinning --latest=true at draft-create time
+      # means make_latest is set through the draft→publish lifecycle
+      # and doesn't depend on GitHub's legacy semver+date heuristic.
+      # The other three tracks pass --latest=false. See #308.
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -161,6 +166,7 @@ jobs:
           TAG="releases/hole/v${VERSION}"
           gh release create "$TAG" \
             --draft \
+            --latest=true \
             --notes-file release-notes.md \
             --title "hole v${VERSION}" \
             --target "${{ github.sha }}" \

@@ -489,6 +489,22 @@ public actions (tag creation, `cargo publish` for garter, latest-flip)
 sanity-check gate before irreversible work, not just for hole's signing
 step.
 
+### `/releases/latest` pinning policy
+
+Each draft workflow pins `--latest` at `gh release create` time:
+`hole=true`, `galoshes`/`garter`/`v2ray-plugin`=`false`. Each publish
+workflow re-asserts the same value on `gh release edit` as
+belt-and-suspenders. Without the create-time pin, GitHub re-evaluates
+`make_latest` via the legacy semver+date heuristic on first publish and
+can promote the wrong track to `/releases/latest` — this is what
+happened to `releases/v2ray-plugin/v1.3.3-hole.1` before #308.
+
+Pre-release semver versions (e.g. v2ray-plugin's `X.Y.Z-hole.N`) are
+NOT marked with `--prerelease=true`. The GitHub UI's "pre-release"
+label means "beta/RC quality" to users, which is wrong for vendor
+patches that are production-ready. `--latest=false` alone is
+sufficient to keep them out of `/releases/latest`.
+
 ### Per-product release workflows
 
 - **hole**: `draft-release-hole.yaml` → `scripts/sign-release.py <version>` → `publish-release-hole.yaml`. Tag created at publish.
