@@ -103,7 +103,7 @@ jobs:
       # The artifact is consumed by test-garter and test-galoshes only;
       # test-hole does its own build (#266 tracks unifying that).
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
           path: ci-artifacts/tests.tar.zst
@@ -137,7 +137,7 @@ jobs:
         with:
           tool: nextest
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
           path: ci-artifacts
@@ -178,7 +178,7 @@ jobs:
         with:
           tool: nextest
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: build-${{ matrix.os }}-${{ matrix.arch }}
           path: ci-artifacts
@@ -264,7 +264,7 @@ jobs:
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       - name: Upload bridge logs on test failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/**/bridge.log
