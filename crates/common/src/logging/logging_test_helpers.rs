@@ -197,11 +197,13 @@ fn scenario_log_bridge_to_file() {
     // need its diagnostics if the child fails. Disabled the same way the
     // pre-#301 in-process test did.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let _guard = super::init(log_dir, "test.log", "info");
+    let guard = super::init(log_dir, "test.log", "info");
     log::info!("from-log-crate-bridge-test");
-    // Sleep so the non-blocking file rotator flushes before we exit.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    drop(_guard);
+    // Drop the guard explicitly so the `tracing_appender::NonBlocking`
+    // worker thread flushes its in-flight events to disk before the
+    // child process exits. No sleep — the WorkerGuard's Drop joins
+    // the worker.
+    drop(guard);
 }
 
 /// Helper used by the redirect_grandchild_* scenarios. Writes a marker line

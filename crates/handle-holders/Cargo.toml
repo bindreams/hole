@@ -35,3 +35,5 @@ windows = { version = "0.62", features = [
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 tempfile = "3"
+# Used by the ctor-linkage regression test for #301.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

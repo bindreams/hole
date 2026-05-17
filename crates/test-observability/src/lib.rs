@@ -44,13 +44,17 @@
 //! See bindreams/hole#301 (motivation), #300 (trigger flake), #147
 //! (regression constraint).
 
+use std::io::Write;
 use std::sync::Once;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 
-/// Re-exported so consumer crates don't need to add `ctor` to their
-/// own dev-dependencies.
-pub use ctor;
+/// Re-exported attribute macro so consumer crates don't need to add
+/// `ctor` to their own dev-dependencies. Exposed as
+/// `hole_test_observability::ctor` (the attribute macro), invoked
+/// from the [`register!`] expansion as `#[$crate::ctor]`.
+#[doc(hidden)]
+pub use ::ctor::ctor;
 
 /// Default `EnvFilter` directives. Catch-all `info`; every Hole-side
 /// crate is pinned to `debug` for diagnostic depth. Third-party
@@ -99,7 +103,28 @@ pub fn install() {
             unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
         }
 
-        let env_filter = EnvFilter::try_from_env("HOLE_TEST_LOG").unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+        // Layer `HOLE_TEST_LOG` ON TOP of the default filter so users
+        // who pass e.g. `HOLE_TEST_LOG=hole_bridge=debug` get THAT
+        // directive in addition to the catch-all `info` and the
+        // per-crate `debug` pins — not in place of them.
+        let mut env_filter = EnvFilter::new(DEFAULT_FILTER);
+        if let Ok(extra) = std::env::var("HOLE_TEST_LOG") {
+            for directive in extra.split(',') {
+                let directive = directive.trim();
+                if directive.is_empty() {
+                    continue;
+                }
+                match directive.parse() {
+                    Ok(d) => env_filter = env_filter.add_directive(d),
+                    Err(e) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "hole-test-observability: ignoring invalid HOLE_TEST_LOG directive {directive:?}: {e}"
+                        );
+                    }
+                }
+            }
+        }
 
         let subscriber = tracing_subscriber::registry().with(env_filter).with(
             tracing_subscriber::fmt::layer()
@@ -114,7 +139,18 @@ pub fn install() {
         // LogTracer::init() ourselves. The EnvFilter handles noisy
         // third-party log events whether or not LogTracer ends up
         // installed by another code path. See #147.
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        //
+        // If a foreign global subscriber was installed before our ctor
+        // (linker-order race, unlikely but theoretically possible),
+        // fail loud to stderr rather than silently swallow — this
+        // crate's whole purpose is to NOT drop diagnostics silently.
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "hole-test-observability: set_global_default failed; \
+                 a foreign subscriber pre-empted ours: {e}"
+            );
+        }
 
         // Hole's tracing-emitting panic hook. Chains before the
         // stdlib default. Idempotent via its own AtomicBool, so
@@ -146,7 +182,7 @@ macro_rules! register {
         #[cfg(test)]
         #[doc(hidden)]
         mod _hole_test_observability_init {
-            #[$crate::ctor::ctor]
+            #[$crate::ctor]
             fn init() {
                 $crate::install();
             }
