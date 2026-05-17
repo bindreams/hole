@@ -8,12 +8,13 @@
 //! owner's bind) is identical to the kernel allocator's.
 //!
 //! For callers that bind in-process and can use a closure shape, prefer
-//! [`hole_common::port_alloc::bind_with_retry`] instead — it absorbs
-//! the residual probe-drop-to-bind TOCTOU by retrying on `is_bind_race`
-//! errors. This module's [`allocate_ephemeral_port`] is reserved for
-//! the case where the port is handed across a process boundary (e.g.
-//! to a `DistHarness` subprocess via JSON config) before the real bind
-//! happens; the closure shape can't fit there. See bindreams/hole#285.
+//! [`hole_common::port_alloc::bind_ephemeral`] instead — it folds the
+//! caller's bind into the same retry loop so there is no
+//! divorced-port-number TOCTOU window. This module's
+//! [`allocate_ephemeral_port`] is reserved for the case where the port
+//! is handed across a process boundary (e.g. to a `DistHarness`
+//! subprocess via JSON config) before the real bind happens; the
+//! closure shape can't fit there. See bindreams/hole#285 and #300.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,7 +42,7 @@ use hole_common::port_alloc::{self, Protocols};
 /// configuration before the bind happens.
 #[allow(
     clippy::disallowed_methods,
-    reason = "this helper is the canonical exception to the bind_with_retry rule: the port is handed across a process boundary via JSON config"
+    reason = "this helper is the canonical exception to the bind_ephemeral rule: the port is handed across a process boundary via JSON config"
 )]
 pub(crate) async fn allocate_ephemeral_port(protocols: Protocols) -> u16 {
     port_alloc::free_port(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols)

@@ -51,7 +51,7 @@ pub(crate) const DIST_BIN: skuld::Label;
 ///
 /// After bindreams/hole#285 the four `ssserver_*` fixtures own their
 /// own (allocate, bind) retry loop via
-/// [`hole_common::port_alloc::bind_with_retry`], so the
+/// [`hole_common::port_alloc::bind_ephemeral`], so the
 /// pre-allocate-then-bind TOCTOU window the label originally protected
 /// inside fixture init is gone. The label remains because per memory's
 /// "no feature regressions for test flakes" rule, the serialization

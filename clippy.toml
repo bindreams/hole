@@ -22,27 +22,28 @@ reason = "Route setup must go through `Routing::install`. Only `SystemRouting::i
 path = "tun_engine::routing::teardown_routes"
 reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."
 
-# Port allocation — enforce bind_with_retry over raw free_port (#285) ---
+# Port allocation — enforce bind_ephemeral over raw free_port (#285, #300) -
 #
-# Direct callers of `port_alloc::free_port` skip the residual
-# probe-drop-to-bind TOCTOU absorption that `port_alloc::bind_with_retry`
-# provides. On Windows the OS maintains independent TCP/UDP
-# excluded-port-range tables (Hyper-V / WSL / Docker dynamic
-# reservations); a port that passes a TCP probe can still fail UDP bind
-# with WSAEACCES. Three production sites (LocalDnsServer::bind,
+# Direct callers of `port_alloc::free_port` skip the
+# divorced-port-number TOCTOU absorption that
+# `port_alloc::bind_ephemeral` provides by folding the caller's bind
+# into the same retry loop. On Windows the OS maintains independent
+# TCP/UDP excluded-port-range tables (Hyper-V / WSL / Docker dynamic
+# reservations); a port that passes a TCP probe can still fail UDP
+# bind with WSAEACCES. Three production sites (LocalDnsServer::bind,
 # start_plugin_chain, test_support::ssserver::start_real_ss_server*)
-# go through `bind_with_retry`; new sites must too.
+# go through `bind_ephemeral`; new sites must too.
 #
 # The one sanctioned suppression is
 # `test_support::port_alloc::allocate_ephemeral_port` — it returns the
 # port to the caller for external configuration (JSON config to a
-# subprocess), which the closure shape of `bind_with_retry` cannot
+# subprocess), which the closure shape of `bind_ephemeral` cannot
 # accommodate. Suppress with `#[allow(clippy::disallowed_methods)]`
 # plus a comment citing why the wrapper shape doesn't fit.
 
 [[disallowed-methods]]
 path = "hole_common::port_alloc::free_port"
-reason = "Use `port_alloc::bind_with_retry` instead — it absorbs the residual probe-drop-to-bind TOCTOU on Windows. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285."
+reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285 and #300."
 
 # tracing subscriber test invariant (bindreams/hole#302) ---------------------------------------------------------------
 #

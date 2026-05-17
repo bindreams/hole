@@ -90,16 +90,21 @@ impl Drop for PluginChain {
 /// the Windows cross-protocol excluded-port race. See
 /// [`hole_common::plugin::plugin_protocols`].
 ///
-/// Goes through [`port_alloc::bind_with_retry`] for structural
+/// Goes through [`port_alloc::bind_ephemeral`] for structural
 /// consistency with the other ephemeral-bind sites in the workspace.
-/// The retry envelope is decorative for this site: the plugin
-/// subprocess binds `local_addr` itself, so a Windows excluded-range
-/// failure surfaces as a `ProxyError::Plugin` (oneshot timeout / exit
-/// before ready) rather than an `io::Error`, and `is_bind_race` cannot
-/// classify it. Plugin failures are converted to `io::Error::other`
-/// (non-bind-race), which `bind_with_retry` propagates immediately.
-/// `free_port`'s internal probe-side retry covers the practical
-/// exposure. See bindreams/hole#285 §"Where the fix actually lands".
+/// The retry on `op` is structurally decorative for this site: the
+/// plugin subprocess binds `local_addr` itself, so a Windows
+/// excluded-range failure surfaces as a `ProxyError::Plugin` (oneshot
+/// timeout / exit before ready) rather than an `io::Error`, and
+/// `is_bind_race` cannot classify it. Plugin failures are converted
+/// to `io::Error::other` (non-bind-race), which `bind_ephemeral`
+/// propagates immediately. The in-process probe step inside
+/// `bind_ephemeral` (run before each `op` call) catches the Windows
+/// excluded-range disagreement class before the subprocess spawn —
+/// that is the load-bearing race mitigation at this site. The
+/// residual probe-drop-to-subprocess-bind TOCTOU is tracked in
+/// bindreams/hole#304. See bindreams/hole#285 §"Where the fix
+/// actually lands" for the rendezvous-port race class history.
 pub async fn start_plugin_chain(
     plugin_name: &str,
     plugin_path: &str,
@@ -120,11 +125,8 @@ pub async fn start_plugin_chain(
     let merged_opts = inject_plugin_debug_logging(plugin_name, plugin_opts);
     let protocols = plugin_protocols(plugin_name);
 
-    let (_port, (handle, cancel, ready_addr)) = port_alloc::bind_with_retry(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        protocols,
-        port_alloc::BIND_RETRY_ATTEMPTS,
-        |port| {
+    let (_port, (handle, cancel, ready_addr)) =
+        port_alloc::bind_ephemeral(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols, |port| {
             // The Fn closure cannot move `merged_opts` (owned String) into
             // an `async move`; clone per attempt instead. `&str`/`&Path`
             // arguments are Copy and pass through unchanged.
@@ -143,10 +145,9 @@ pub async fn start_plugin_chain(
                 .await
                 .map_err(proxy_err_to_io_err)
             }
-        },
-    )
-    .await
-    .map_err(|e| ProxyError::Plugin(format!("plugin chain start failed: {e}")))?;
+        })
+        .await
+        .map_err(|e| ProxyError::Plugin(format!("plugin chain start failed: {e}")))?;
 
     Ok(PluginChain {
         handle,
@@ -161,7 +162,7 @@ pub async fn start_plugin_chain(
 /// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
 /// and awaits readiness with a 30-second timeout. On failure runs
 /// `cancel.cancel(); handle.abort()` so a retried attempt by
-/// `bind_with_retry` doesn't leak the previous attempt's task. On
+/// `bind_ephemeral` doesn't leak the previous attempt's task. On
 /// success returns `(handle, cancel, ready_addr)` — the caller wraps
 /// these in a [`PluginChain`].
 async fn spawn_plugin_runner_at(
@@ -255,11 +256,13 @@ async fn spawn_plugin_runner_at(
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into a
-/// non-bind-race [`io::Error`] so [`port_alloc::bind_with_retry`]
+/// non-bind-race [`io::Error`] so [`port_alloc::bind_ephemeral`]
 /// propagates it immediately. Plugin failures (subprocess exit before
-/// ready, readiness timeout) are not bind races we can deterministically
-/// retry through; only `free_port`'s own probe failures (already
-/// retried inside `bind_with_retry`) trigger the outer retry.
+/// ready, readiness timeout) are not bind races we can in-band
+/// classify; the in-process probe step inside `bind_ephemeral`
+/// already catches Windows excluded-range disagreements before the
+/// subprocess spawn. Stderr-based classification of subprocess bind
+/// failures is the follow-up tracked in bindreams/hole#304.
 ///
 /// `spawn_plugin_runner_at` only emits `ProxyError::Plugin`; the
 /// `unreachable!` arm is the contract guard. Future contributors who
