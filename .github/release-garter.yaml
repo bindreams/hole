@@ -16,6 +16,14 @@ include_paths:
   - .github/workflows/draft-release-garter.yaml
   - .github/workflows/publish-release-garter.yaml
   - .github/release-garter.yaml
+  # Workspace-engineering files affect every release track. See #312.
+  - xtask/**
+  - xtask-lib/**
+  - scripts/generate-release-notes.py
+  - scripts/sign-release.py
+  - Cargo.toml
+  - Cargo.lock
+  - build.yaml
 
 categories:
   - title: "🚀 Features"
