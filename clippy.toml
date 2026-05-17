@@ -43,3 +43,25 @@ reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `Syst
 [[disallowed-methods]]
 path = "hole_common::port_alloc::free_port"
 reason = "Use `port_alloc::bind_with_retry` instead — it absorbs the residual probe-drop-to-bind TOCTOU on Windows. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285."
+
+# tracing subscriber test invariant (bindreams/hole#302) ---------------------------------------------------------------
+#
+# `tracing::subscriber::set_default` returns a thread-local guard. On a
+# multi-thread tokio runtime, `tokio::spawn`'d tasks run on workers
+# without the subscriber and their events are dropped. Tests that
+# install a per-test subscriber as their assertion target must route
+# through `garter::tracing_test::set_default_in_current_thread`, which
+# checks the runtime flavor at install time and panics on multi-thread.
+#
+# Sanctioned suppressions: the helper itself uses an inline
+# `#[allow(clippy::disallowed_methods)]` to call the real function;
+# `garter::tracing_test_tests::raw_set_default_on_multi_thread_loses_spawned_events`
+# uses it to deliberately demonstrate the bug the helper protects against.
+
+[[disallowed-methods]]
+path = "tracing::subscriber::set_default"
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks. See bindreams/hole#302."
+
+[[disallowed-methods]]
+path = "tracing_subscriber::util::SubscriberInitExt::set_default"
+reason = "Use `garter::tracing_test::set_default_in_current_thread` — it asserts the current tokio runtime is current-thread, where `set_default`'s thread-local guard remains effective for `tokio::spawn`'d tasks. See bindreams/hole#302."

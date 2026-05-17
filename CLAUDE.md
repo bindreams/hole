@@ -369,6 +369,20 @@ npx tauri build                  # produces .dmg in target/release/bundle/
 Uses [skuld](https://github.com/bindreams/skuld) framework (`#[skuld::test]`), not `#[test]`.
 Unit test files are siblings: `foo.rs` → `foo_tests.rs`.
 
+### Tracing-subscriber test invariant
+
+Tests that install a per-test `tracing` subscriber as their assertion
+target must call [`garter::tracing_test::set_default_in_current_thread`](crates/garter/src/tracing_test.rs)
+instead of raw `tracing::subscriber::set_default`. The helper asserts
+that any current tokio runtime is `RuntimeFlavor::CurrentThread` —
+`set_default`'s guard is thread-local, so on a multi-thread runtime
+`tokio::spawn`'d tasks run on workers without the subscriber and their
+events are dropped. Workspace [`clippy.toml`](clippy.toml) disallows
+the raw form. `#[skuld::test] async fn` builds a current-thread runtime
+via `skuld::__private::build_async_runtime` and satisfies the invariant
+automatically. See bindreams/hole#302 for the incident and the helper's
+documented silent-passthrough limitation when called outside `block_on`.
+
 ### Windows installer
 
 ```sh
