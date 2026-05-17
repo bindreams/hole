@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["PyYAML>=6"]
+# dependencies = ["PyYAML>=6", "pathspec>=0.12"]
 # ///
 """Generate per-track release notes for Hole's four release tracks.
 
@@ -25,13 +25,13 @@ Run from the repo root or pass `--repo-root`.
 
 import argparse
 import dataclasses
-import fnmatch
 import re
 import subprocess
 import sys
 import typing as t
 from pathlib import Path
 
+import pathspec
 import yaml
 
 CONVENTIONAL_COMMIT_RE = re.compile(r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]+)\))?!?:\s*(?P<desc>.+)$")
@@ -174,34 +174,15 @@ def list_commits(repo_root: Path, range_spec: str) -> list[Commit]:
 # Filtering & categorization ===========================================================================================
 
 
-def matches_paths(commit_files: list[str], globs: list[str]) -> bool:
-    """True if any commit file matches any glob (fnmatch semantics).
-
-    Globs use `**` for recursive match. We expand `**/` and `/**` by
-    rewriting the pattern to fnmatch's equivalent.
-    """
-    for path in commit_files:
-        for g in globs:
-            if _fnmatch_recursive(path, g):
-                return True
-    return False
+def build_path_spec(globs: list[str]) -> pathspec.PathSpec:
+    """Compile a list of gitignore-style globs into a PathSpec for
+    repeated `match_file` calls."""
+    return pathspec.PathSpec.from_lines("gitignore", globs)
 
 
-def _fnmatch_recursive(path: str, glob: str) -> bool:
-    # fnmatch doesn't natively support `**`. We rewrite `**` to `*` and
-    # rely on fnmatch's `*` matching path separators in fnmatch (it
-    # doesn't actually distinguish `/` from other chars, unlike shell
-    # glob). So `crates/hole/**` matches `crates/hole/src/main.rs`
-    # because the trailing `*` from `**` matches the whole `src/main.rs`.
-    # Edge: a glob ending in `/**` should also match the directory
-    # itself. We approximate by also matching the trimmed form.
-    if glob.endswith("/**"):
-        prefix = glob[:-len("/**")]
-        return fnmatch.fnmatchcase(path, prefix) or fnmatch.fnmatchcase(path, prefix + "/*") or fnmatch.fnmatchcase(
-            path, glob.replace("**", "*")
-        )
-    normalized = glob.replace("**", "*")
-    return fnmatch.fnmatchcase(path, normalized)
+def matches_paths(commit_files: list[str], spec: pathspec.PathSpec) -> bool:
+    """True if any commit file matches the spec (gitignore semantics)."""
+    return any(spec.match_file(f) for f in commit_files)
 
 
 def categorize(commits: list[Commit], categories: list[Category]) -> dict[str, list[Commit]]:
@@ -316,7 +297,8 @@ def main() -> int:
 
     range_spec = f"{previous_tag}..{args.head}"
     commits = list_commits(repo_root, range_spec)
-    filtered = [c for c in commits if matches_paths(c.files, config.include_paths)]
+    path_spec = build_path_spec(config.include_paths)
+    filtered = [c for c in commits if matches_paths(c.files, path_spec)]
     grouped = categorize(filtered, config.categories)
     body = render_notes(grouped, new_tag=args.new_tag, previous_tag=previous_tag, repo_url=args.repo_url)
     sys.stdout.write(body)
@@ -375,12 +357,59 @@ def test_tag_version_re():
     assert m.groups() == ("1", "3", "3", "hole.1")
 
 
-def test_fnmatch_recursive_basic(tmp_path):
-    assert _fnmatch_recursive("crates/hole/src/main.rs", "crates/hole/**")
-    assert _fnmatch_recursive("crates/hole/Cargo.toml", "crates/hole/**")
-    assert not _fnmatch_recursive("crates/galoshes/src/main.rs", "crates/hole/**")
-    assert _fnmatch_recursive(".github/workflows/draft-release-hole.yaml", ".github/workflows/draft-release-hole.yaml")
-    assert _fnmatch_recursive("external/v2ray-plugin/main.go", "external/v2ray-plugin/**")
+def test_path_spec_basic():
+    spec = build_path_spec([
+        "crates/hole/**",
+        ".github/workflows/draft-release-hole.yaml",
+        "external/v2ray-plugin/**",
+    ])
+    assert spec.match_file("crates/hole/src/main.rs")
+    assert spec.match_file("crates/hole/Cargo.toml")
+    assert not spec.match_file("crates/galoshes/src/main.rs")
+    assert spec.match_file(".github/workflows/draft-release-hole.yaml")
+    assert spec.match_file("external/v2ray-plugin/main.go")
+
+
+def test_path_spec_workspace_engineering_patterns():
+    """The set of include-paths actually used by release-*.yaml configs
+    post-PR-#312. Locks in the post-fix glob behavior so the pathspec
+    migration is a pure refactor for these patterns.
+    """
+    spec = build_path_spec([
+        "crates/hole/**",
+        "crates/common/**",
+        "external/v2ray-plugin/**",
+        ".github/workflows/draft-release-hole.yaml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "xtask/**",
+        "xtask-lib/**",
+        "scripts/generate-release-notes.py",
+        "build.yaml",
+        "prek.toml",
+        "clippy.toml",
+    ])
+    cases = [
+        ("crates/hole/src/main.rs", True),
+        ("crates/hole/Cargo.toml", True),
+        ("crates/galoshes/src/main.rs", False),
+        ("external/v2ray-plugin/main.go", True),
+        ("external/v2ray-plugin/sub/dir/file.go", True),
+        (".github/workflows/draft-release-hole.yaml", True),
+        (".github/workflows/draft-release-galoshes.yaml", False),
+        ("Cargo.toml", True),
+        ("Cargo.lock", True),
+        ("xtask/src/lib.rs", True),
+        ("xtask-lib/src/version.rs", True),
+        ("scripts/generate-release-notes.py", True),
+        ("scripts/sign-release.py", False),
+        ("scripts/dev.py", False),
+        ("prek.toml", True),
+        ("clippy.toml", True),
+        ("README.md", False),
+    ]
+    for path, expected in cases:
+        assert spec.match_file(path) == expected, f"path={path!r} expected={expected}"
 
 
 def test_categorize_first_match_wins():
@@ -408,7 +437,72 @@ def test_categorize_no_catchall_drops_uncategorized():
 
 
 def test_matches_paths_globs():
-    assert matches_paths(["crates/hole/src/main.rs"], ["crates/hole/**"])
-    assert matches_paths(["a", "crates/hole/src/main.rs"], ["crates/hole/**"])
-    assert not matches_paths(["crates/galoshes/src/main.rs"], ["crates/hole/**"])
-    assert matches_paths(["external/v2ray-plugin/main.go"], ["external/v2ray-plugin/**"])
+    spec = build_path_spec(["crates/hole/**", "external/v2ray-plugin/**"])
+    assert matches_paths(["crates/hole/src/main.rs"], spec)
+    assert matches_paths(["a", "crates/hole/src/main.rs"], spec)
+    assert not matches_paths(["crates/galoshes/src/main.rs"], spec)
+    assert matches_paths(["external/v2ray-plugin/main.go"], spec)
+
+
+def test_integration_filtering_against_real_history():
+    """End-to-end: run the script as a subprocess against real repo
+    history and assert include-path filtering works.
+
+    Skipped if the repo has no `releases/v2ray-plugin/v*` tags
+    (bootstrap state) or if `uv` isn't on PATH. Per CLAUDE.md, tests
+    must fail loudly on missing CI-provisioned deps — so the uv check
+    fails rather than silently skips.
+    """
+    import shutil
+    import pytest
+    if shutil.which("uv") is None:
+        pytest.fail("uv not on PATH; CI must provision it (CLAUDE.md coding-style rule).")
+    repo_root = Path(__file__).resolve().parent.parent
+    tags = subprocess.run(
+        ["git", "tag", "--list", "releases/v2ray-plugin/v*"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if not tags:
+        pytest.skip("No releases/v2ray-plugin/v* tags yet (bootstrap state)")
+
+    script = repo_root / "scripts" / "generate-release-notes.py"
+    result = subprocess.run(
+        ["uv", "run",
+         str(script), "v2ray-plugin", "--new-tag", "releases/v2ray-plugin/v999.0.0", "--head", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = result.stdout
+    assert out.strip(), "Empty output"
+    assert "## " in out or "_No commits in this range" in out, f"Unexpected shape: {out[:200]}"
+    assert "**Full Changelog**:" in out, f"Missing Full Changelog link: {out[-200:]}"
+
+    # Filtering assertion: v2ray-plugin notes should NOT contain hole-only
+    # PRs (commits touching only crates/hole/, never workspace-engineering
+    # paths). Pick the most recent such commit and assert its PR# is absent.
+    hole_only = subprocess.run(
+        [
+            "git", "log", "--format=%s", "-1", "--", "crates/hole/", ":!crates/common/", ":!external/", ":!xtask/",
+            ":!xtask-lib/", ":!scripts/", ":!Cargo.toml", ":!Cargo.lock", ":!build.yaml", ":!prek.toml",
+            ":!clippy.toml", ":!.github/release-v2ray-plugin.yaml",
+            ":!.github/workflows/draft-release-v2ray-plugin.yaml",
+            ":!.github/workflows/publish-release-v2ray-plugin.yaml"
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if hole_only:
+        m = re.search(r"\(#(\d+)\)\s*$", hole_only)
+        if m:
+            pr_num = m.group(1)
+            assert f"#{pr_num}" not in out, (
+                f"v2ray-plugin notes contain hole-only PR #{pr_num}; "
+                f"include-path filtering may be broken. Subject: {hole_only}"
+            )
