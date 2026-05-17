@@ -116,34 +116,31 @@ def git(repo_root: Path, *args: str) -> str:
 
 
 def find_previous_tag(repo_root: Path, track: str, head: str) -> str | None:
-    """Highest-versioned `releases/<track>/v*` tag that's an ancestor of HEAD."""
-    listed = git(repo_root, "tag", "--list", f"releases/{track}/v*")
-    tags = [t.strip() for t in listed.splitlines() if t.strip()]
+    """Highest-versioned `releases/<track>/v*` tag that's an ancestor of head.
+
+    Uses a single `git for-each-ref --merged=<head>` to retrieve all
+    ancestor tags in one subprocess call. Previously walked all tags
+    matching the glob and ran `git merge-base --is-ancestor` per tag.
+    """
+    listed = git(
+        repo_root,
+        "for-each-ref",
+        f"--merged={head}",
+        "--format=%(refname:short)",
+        f"refs/tags/releases/{track}/v*",
+    )
+    tags = [t.strip().removeprefix("refs/tags/") for t in listed.splitlines() if t.strip()]
 
     # Sort key: (major, minor, patch, bare-discriminator, pre-release).
-    # The bare-discriminator is 1 for `X.Y.Z` and 0 for `X.Y.Z-pre`; this
-    # encodes the semver rule that bare > pre-release at the same M.M.P.
+    # Bare X.Y.Z sorts ABOVE X.Y.Z-hole.N per semver precedence; the
+    # discriminator (1 for bare, 0 for pre-release) ensures this.
     candidates: list[tuple[tuple[int, int, int, int, str], str]] = []
     for tag in tags:
         m = TAG_VERSION_RE.match(tag)
         if not m:
             continue
-        # Verify ancestor-of-head via merge-base --is-ancestor (exit code).
-        result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", tag, head],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            continue
         major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
         pre = m.group(4) or ""
-        # Sort key: (major, minor, patch, pre-or-empty). Bare X.Y.Z sorts
-        # ABOVE X.Y.Z-hole.N per semver precedence (no pre > with pre).
-        # We encode that as: bare → ("",), pre → (pre,). Tuple comparison
-        # treats "" as less than any non-empty string, so we invert:
-        # use a discriminator (1 for bare, 0 for pre-release).
         sort_key = (major, minor, patch, 1 if not pre else 0, pre)
         candidates.append((sort_key, tag))
 
@@ -626,3 +623,97 @@ def test_categories_cover_all_semantic_pr_types():
         f"have no explicit category: {sorted(missing)}. Either add them to "
         f"an explicit category or re-add the 'Other' catch-all."
     )
+
+
+def _init_test_repo(tmp_path):
+    """Create a minimal git repo with controlled tag/branch history for testing."""
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp_path, check=True)
+    return tmp_path
+
+
+def _commit(repo: Path, message: str) -> str:
+    (repo / "f").write_text(message)
+    subprocess.run(["git", "add", "f"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_find_previous_tag_no_tags(tmp_path):
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    assert find_previous_tag(repo, "hole", "HEAD") is None
+
+
+def test_find_previous_tag_one_tag(tmp_path):
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/hole/v1.0.0"], cwd=repo, check=True)
+    _commit(repo, "c2")
+    assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v1.0.0"
+
+
+def test_find_previous_tag_picks_highest_ancestor(tmp_path):
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/hole/v1.0.0"], cwd=repo, check=True)
+    _commit(repo, "c2")
+    subprocess.run(["git", "tag", "releases/hole/v1.1.0"], cwd=repo, check=True)
+    _commit(repo, "c3")
+    subprocess.run(["git", "tag", "releases/hole/v2.0.0"], cwd=repo, check=True)
+    _commit(repo, "c4")
+    assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v2.0.0"
+
+
+def test_find_previous_tag_ignores_non_ancestor(tmp_path):
+    repo = _init_test_repo(tmp_path)
+    c1 = _commit(repo, "c1")
+    subprocess.run(["git", "checkout", "-q", "-b", "side"], cwd=repo, check=True)
+    _commit(repo, "side1")
+    subprocess.run(["git", "tag", "releases/hole/v9.9.9"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/hole/v1.0.0", c1], cwd=repo, check=True)
+    _commit(repo, "c2")
+    # HEAD on main shouldn't see side branch's v9.9.9
+    assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v1.0.0"
+
+
+def test_find_previous_tag_bare_beats_prerelease(tmp_path):
+    """Per semver: 1.3.3 > 1.3.3-hole.1."""
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.1"], cwd=repo, check=True)
+    _commit(repo, "c2")
+    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3"], cwd=repo, check=True)
+    _commit(repo, "c3")
+    assert find_previous_tag(repo, "v2ray-plugin", "HEAD") == "releases/v2ray-plugin/v1.3.3"
+
+
+def test_find_previous_tag_higher_prerelease_iteration(tmp_path):
+    """Lexical sort puts hole.2 > hole.1 (and would put hole.10 < hole.2 — fragility noted)."""
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.1"], cwd=repo, check=True)
+    _commit(repo, "c2")
+    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.2"], cwd=repo, check=True)
+    _commit(repo, "c3")
+    assert find_previous_tag(repo, "v2ray-plugin", "HEAD") == "releases/v2ray-plugin/v1.3.3-hole.2"
+
+
+def test_find_previous_tag_skips_malformed_tags(tmp_path):
+    repo = _init_test_repo(tmp_path)
+    _commit(repo, "c1")
+    # Malformed tags matching the glob — should be silently skipped.
+    subprocess.run(["git", "tag", "releases/hole/v1"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/hole/vmalformed"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/hole/v1.0.0"], cwd=repo, check=True)
+    _commit(repo, "c2")
+    assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v1.0.0"
