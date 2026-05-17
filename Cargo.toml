@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/mock-plugin", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/mock-plugin", "crates/test-observability", "crates/tun-engine", "crates/tun-engine-macros", "xtask", "xtask-lib"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,9 @@ edition = "2021"
 
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
+# Pre-main init for the test-observability subscriber install. See
+# crates/test-observability and bindreams/hole#301.
+ctor = "0.2"
 insta = { version = "1", features = ["yaml"] }
 trybuild = "1"
 # DNS forwarder deps — direct so a future shadowsocks-service bump cannot

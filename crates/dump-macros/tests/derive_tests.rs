@@ -7,6 +7,10 @@
 use dump::{tag, Dump, DumpValue};
 use dump_macros::Dump as DeriveDump;
 
+// Install the workspace test subscriber + panic hook. See
+// `crates/test-observability/` and bindreams/hole#301.
+hole_test_observability::register!();
+
 fn main() {
     skuld::run_all();
 }

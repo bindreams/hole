@@ -13,8 +13,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::*;
-
 // Test result format ==================================================================================================
 
 /// Captured-event record written by the child to its result file.
@@ -477,28 +475,29 @@ fn cleanup_legacy_daily_logs_tolerates_missing_directory(#[fixture(temp_dir)] di
 
 // Tests: log crate bridge =============================================================================================
 
-#[skuld::test(serial)]
+#[skuld::test]
 fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
-    // Disable the FD redirect inside init() so libtest-mimic's per-test
-    // result lines (printed to FD 1) aren't eaten. Clean up the env var on
-    // every exit path to avoid leaking the override into other tests.
-    struct EnvGuard;
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("HOLE_LOGGING_DISABLE_REDIRECT");
-            }
-        }
-    }
-    unsafe {
-        std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1");
-    }
-    let _env_guard = EnvGuard;
+    // Runs as a subprocess: post-#301 the parent has the
+    // `hole-test-observability` global subscriber installed, so the
+    // production `init()`'s `set_global_default` would fail in-process
+    // and the file layer would never receive events. The child has a
+    // clean global slot (the ctor short-circuits on
+    // `HOLE_LOGGING_TEST_KIND`).
     let log_dir = dir.join("log-bridge-test");
-    let _guard = init(&log_dir, "test.log", "info");
-
-    log::info!("from-log-crate-bridge-test");
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "log_bridge_to_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+    assert!(
+        status.success(),
+        "log_bridge_to_file child failed with status {status:?}"
+    );
 
     let entries: Vec<_> = std::fs::read_dir(&log_dir)
         .expect("read log dir")

@@ -1427,6 +1427,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "dump-macros",
+ "hole-test-observability",
  "serde",
  "skuld",
 ]
@@ -1436,6 +1437,7 @@ name = "dump-macros"
 version = "0.1.0"
 dependencies = [
  "dump",
+ "hole-test-observability",
  "proc-macro2",
  "quote",
  "skuld",
@@ -1923,6 +1925,7 @@ dependencies = [
  "contracts",
  "futures",
  "garter",
+ "hole-test-observability",
  "sha2 0.10.9",
  "skuld",
  "tempfile",
@@ -1940,6 +1943,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "contracts",
+ "hole-test-observability",
  "libc",
  "skuld",
  "socket2",
@@ -1957,6 +1961,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "garter",
+ "hole-test-observability",
  "serde",
  "skuld",
  "tokio",
@@ -2313,6 +2318,7 @@ dependencies = [
 name = "handle-holders"
 version = "0.1.0"
 dependencies = [
+ "hole-test-observability",
  "skuld",
  "tempfile",
  "tracing",
@@ -2502,6 +2508,7 @@ dependencies = [
  "garter",
  "hole-bridge",
  "hole-common",
+ "hole-test-observability",
  "http",
  "http-body-util",
  "hyper",
@@ -2553,6 +2560,7 @@ dependencies = [
  "hickory-resolver",
  "hickory-server",
  "hole-common",
+ "hole-test-observability",
  "http",
  "http-body-util",
  "hyper",
@@ -2599,6 +2607,7 @@ dependencies = [
  "dirs 6.0.0",
  "file-rotate",
  "garter",
+ "hole-test-observability",
  "libc",
  "log",
  "nu-ansi-term",
@@ -2620,6 +2629,19 @@ dependencies = [
  "uuid",
  "windows 0.62.2",
  "yaml_serde",
+]
+
+[[package]]
+name = "hole-test-observability"
+version = "0.1.0"
+dependencies = [
+ "ctor",
+ "hole-common",
+ "log",
+ "skuld",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7098,6 +7120,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "default-net",
+ "hole-test-observability",
  "libc",
  "serde",
  "serde_json",
@@ -7120,6 +7143,7 @@ dependencies = [
 name = "tun-engine-macros"
 version = "0.1.0"
 dependencies = [
+ "hole-test-observability",
  "proc-macro2",
  "quote",
  "skuld",

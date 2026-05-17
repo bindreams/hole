@@ -19,6 +19,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Install the workspace test subscriber + panic hook. See
+// `crates/test-observability/` and bindreams/hole#301.
+hole_test_observability::register!();
+
 fn main() {
     skuld::run_all();
 }

@@ -23,6 +23,7 @@ proc-macro2 = "1"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
 trybuild = "1"
 
 [[test]]

@@ -176,8 +176,32 @@ pub(crate) fn run_child(kind: &str) {
         "lossy_backpressure" => scenario_lossy_backpressure(),
         "echo_stderr" => scenario_echo_stderr(),
         "echo_stdout" => scenario_echo_stdout(),
+        "log_bridge_to_file" => scenario_log_bridge_to_file(),
         other => panic!("unknown HOLE_LOGGING_TEST_KIND: {other}"),
     }
+}
+
+/// Verifies that `log::info!` (from the `log` crate) is bridged into
+/// tracing's file-rotator layer by the production `init` path. The
+/// parent test spawns this scenario, then reads the log file the
+/// child wrote and asserts the marker is present.
+///
+/// Runs in a subprocess so that the production `init()`'s
+/// `set_global_default` succeeds — the parent test binary already
+/// has the `hole-test-observability` global subscriber installed.
+/// See bindreams/hole#301.
+fn scenario_log_bridge_to_file() {
+    let log_dir_str = std::env::var("HOLE_LOGGING_TEST_LOG_DIR").expect("HOLE_LOGGING_TEST_LOG_DIR var");
+    let log_dir = std::path::Path::new(&log_dir_str);
+    // The redirect would eat the libtest-mimic per-test result lines; we
+    // need its diagnostics if the child fails. Disabled the same way the
+    // pre-#301 in-process test did.
+    unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
+    let _guard = super::init(log_dir, "test.log", "info");
+    log::info!("from-log-crate-bridge-test");
+    // Sleep so the non-blocking file rotator flushes before we exit.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(_guard);
 }
 
 /// Helper used by the redirect_grandchild_* scenarios. Writes a marker line

@@ -159,6 +159,10 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
+// Install the workspace test subscriber + panic hook. See
+// `crates/test-observability/` and bindreams/hole#301.
+hole_test_observability::register!();
+
 fn main() {
     skuld::run_all();
 }

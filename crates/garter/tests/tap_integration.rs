@@ -114,6 +114,10 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
     let _ = tokio::time::timeout(Duration::from_secs(5), plugin_handle).await;
 }
 
+// Install the workspace test subscriber + panic hook. See
+// `crates/test-observability/` and bindreams/hole#301.
+hole_test_observability::register!();
+
 fn main() {
     skuld::run_all();
 }

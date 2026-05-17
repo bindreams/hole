@@ -255,6 +255,12 @@ crates/dump-macros/       → dump-macros.  GPL-3.0, hole group, publish=false.
                             Proc-macro support for `dump` (#[derive(Dump)]).
 crates/handle-holders/    → handle-holders. GPL-3.0, hole group, publish=false.
                             File-handle introspection (Windows NtQuery / macOS lsof).
+crates/test-observability/ → hole-test-observability. GPL-3.0, hole group, publish=false.
+                            Dev-dep-only: pre-main ctor installs a process-global
+                            tracing subscriber + panic hook for every test binary.
+                            Wired into each test-bearing crate via
+                            `hole_test_observability::register!()` in lib.rs / tests/*.rs.
+                            See bindreams/hole#301.
 crates/garter/            → garter.       Apache-2.0, garter group, **published to crates.io**.
                             SIP003u plugin-chain runner library (ChainPlugin, ChainRunner).
 crates/garter-bin/        → garter-bin.   Apache-2.0, garter group, publish=false.
@@ -371,6 +377,52 @@ npx tauri build                  # produces .dmg in target/release/bundle/
 Uses [skuld](https://github.com/bindreams/skuld) framework (`#[skuld::test]`), not `#[test]`.
 Unit test files are siblings: `foo.rs` → `foo_tests.rs`.
 
+### Test observability invariant
+
+Every test-bearing workspace crate depends on `hole-test-observability`
+as a dev-dependency and invokes
+`hole_test_observability::register!()` once per test binary —
+either at the top level of `src/lib.rs` (lib tests) or at the top of
+each `tests/*.rs` (integration tests). The macro expands (under
+`#[cfg(test)]`) to a `mod _hole_test_observability_init` containing
+a `#[ctor::ctor]` function. The ctor runs pre-main on every test
+binary and installs:
+
+- A process-global `tracing_subscriber` writing to stderr. Skuld's
+  FD-level capture (under bare `cargo test`) and nextest's
+  per-subprocess capture (CI) both buffer it and dump on failure.
+- `RUST_BACKTRACE=full` (if unset) so the stdlib panic hook prints a
+  backtrace.
+- Hole's tracing-emitting panic hook from
+  [`hole_common::logging::install_panic_hook`](crates/common/src/logging.rs)
+  — chains before the stdlib hook, adds `target=hole::panic`
+  events with `force_capture` backtraces.
+
+Override the filter via `HOLE_TEST_LOG=hole_bridge=debug` (etc.).
+Default is catch-all `info` with every Hole-side crate pinned to
+`debug` — Hole's `debug!` lines are not high-volume; third-party
+`log::trace!` from `shadowsocks-service` / `tokio` / `mio` is
+level-rejected at `Dispatch::enabled()` before `tracing-log`
+allocates a tracing `Event` (the load-bearing safeguard against the
+#147 perf trap).
+
+**Do NOT** call `tracing_subscriber::fmt().init()` or any
+`SubscriberInitExt::try_init()` in test code — `clippy.toml`'s
+`disallowed-methods` denies it workspace-wide. The single
+production caller in
+[crates/common/src/logging.rs](crates/common/src/logging.rs) is
+`#[allow]`-suppressed.
+
+Special case: the FD-redirect child-process branch in
+[`crates/common/src/lib.rs::main`](crates/common/src/lib.rs)
+(`HOLE_LOGGING_TEST_KIND` set) installs its own
+`set_global_default` via `install_child_subscriber`. The ctor in
+`hole-test-observability::install` short-circuits when that env
+var is set so it doesn't preempt the child-side subscriber.
+
+See bindreams/hole#301 (motivation) and #147 (regression
+constraint).
+
 ### Tracing-subscriber test invariant
 
 Tests that install a per-test `tracing` subscriber as their assertion
@@ -384,6 +436,12 @@ the raw form. `#[skuld::test] async fn` builds a current-thread runtime
 via `skuld::__private::build_async_runtime` and satisfies the invariant
 automatically. See bindreams/hole#302 for the incident and the helper's
 documented silent-passthrough limitation when called outside `block_on`.
+
+Per-test thread-local subscribers via the helper shadow the
+test-observability global default on their thread without conflict —
+the 7 assertion-target tests (`proxy_manager_tests`,
+`forwarder_tests`, `system_tests`, `tap_tests`, `yaml_format_tests`,
+`logging_tests`, `cli_log_tests`) keep working as before.
 
 ### Windows installer
 
@@ -400,12 +458,12 @@ Version per group is declared in each crate's
 `xtask-lib::version` (publishable-but-ungrouped crates are rejected;
 within-group versions must match).
 
-| Product        | Group members                                                                                       | Artifacts                                                                | Signed         | crates.io     |
-| -------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
-| `hole`         | `hole, hole-common, hole-bridge, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders`  | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
-| `galoshes`     | `galoshes`                                                                                          | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
-| `garter`       | `garter, garter-bin`                                                                                | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
-| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`, lineage form `X.Y.Z[-hole.N]`) | 6-platform tar.gz set (upstream parity + windows-arm64) + `SHA256SUMS`   | No             | n/a           |
+| Product        | Group members                                                                                                               | Artifacts                                                                | Signed         | crates.io     |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
+| `hole`         | `hole, hole-common, hole-bridge, hole-test-observability, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders` | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
+| `galoshes`     | `galoshes`                                                                                                                  | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
+| `garter`       | `garter, garter-bin`                                                                                                        | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
+| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`, lineage form `X.Y.Z[-hole.N]`)                         | 6-platform tar.gz set (upstream parity + windows-arm64) + `SHA256SUMS`   | No             | n/a           |
 
 Asset naming:
 

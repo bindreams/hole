@@ -59,3 +59,4 @@ wintun-bindings = "0.7"
 
 [dev-dependencies]
 skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }

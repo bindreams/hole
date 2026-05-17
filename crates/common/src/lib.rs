@@ -8,6 +8,13 @@ pub mod protocol;
 pub mod retry;
 pub mod version;
 
+// Install the workspace test subscriber + panic hook. The dev-dep
+// is gated on cfg(test) because it isn't linked in non-test builds
+// (`dev-dependencies` are only available when building tests).
+// See `crates/test-observability/` and bindreams/hole#301.
+#[cfg(test)]
+hole_test_observability::register!();
+
 #[cfg(test)]
 fn main() {
     // FD-redirect tests in `logging_tests.rs` re-invoke the test binary as a
