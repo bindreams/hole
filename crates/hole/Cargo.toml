@@ -70,6 +70,6 @@ garter = { path = "../garter" }
 [build-dependencies]
 tauri-build = "2"
 xtask-lib = { path = "../../xtask-lib" }
-resvg = "0.45"
+resvg = "0.47"
 png = "0.18"
 ico = "0.5"

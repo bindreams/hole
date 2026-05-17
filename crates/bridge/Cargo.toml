@@ -47,11 +47,11 @@ idna = "1"
 ipnet = "2"
 regex = "1"
 # New crates not previously in the tree.
-lru = "0.16"
+lru = "0.18"
 tls-parser = "0.12"
 # Filter engine runtime deps — smoltcp types leak into HoleRouter for
 # CIDR parsing of the TUN's hard-coded v4/v6 subnets.
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
