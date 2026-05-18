@@ -24,6 +24,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "externalBin": [
       ".cache/v2ray-plugin/v2ray-plugin"
     ],
