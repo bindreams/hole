@@ -126,7 +126,21 @@ pub(crate) enum BridgeAction {
         state_dir: Option<std::path::PathBuf>,
     },
     /// Install and start the bridge service
-    Install,
+    Install {
+        /// Override the log directory. The GUI's elevated-install path
+        /// passes a per-invocation temp dir here so it can read this CLI's
+        /// `gui-cli.log` back after the elevation completes (and surface it
+        /// in the failure dialog).
+        #[arg(long)]
+        log_dir: Option<std::path::PathBuf>,
+        /// Repair ownership of a user data directory tree that an earlier
+        /// elevated install left root-owned (macOS only — a no-op
+        /// elsewhere). The walk is bounded to this exact path; symlinks
+        /// are never followed; hard-linked files are skipped. Best-effort:
+        /// failures are logged but do not abort the install.
+        #[arg(long)]
+        repair_user_data_dir: Option<std::path::PathBuf>,
+    },
     /// Stop and remove the bridge service
     Uninstall,
     /// Print bridge install/running status
@@ -224,20 +238,38 @@ pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
     )
 }
 
+/// Resolve the directory where `dispatch` should install the `gui-cli.log`
+/// guard for `command`. `None` means "don't install a guard" — see
+/// [`should_install_cli_log_guard`]. A `Some` result means "install in this
+/// directory".
+///
+/// `Bridge::Install { log_dir: Some(d), .. }` overrides the default — the
+/// GUI's elevated-install path uses this to redirect the subscriber into a
+/// per-invocation temp dir it can read back after the elevation completes
+/// (so the failure dialog can include the underlying error text).
+pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBuf> {
+    if !should_install_cli_log_guard(command) {
+        return None;
+    }
+    match command {
+        Command::Bridge {
+            action: BridgeAction::Install { log_dir: Some(d), .. },
+        } => Some(d.clone()),
+        _ => Some(hole_common::logging::default_log_dir()),
+    }
+}
+
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
 ///
 /// For write-action subcommands (Upgrade, Bridge::{Install, Uninstall, Status,
 /// GrantAccess, IpcSend}, and Path), install a CLI log guard so that
 /// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
 /// user-facing terminal output. See [`should_install_cli_log_guard`] for
-/// the exemption list.
+/// the exemption list and [`resolve_cli_log_dir`] for how the directory is
+/// chosen.
 pub(crate) fn dispatch(command: Command) -> ! {
-    let _cli_log_guard = if should_install_cli_log_guard(&command) {
-        let log_dir = hole_common::logging::default_log_dir();
-        Some(hole_common::logging::init(&log_dir, "gui-cli.log", "hole=info"))
-    } else {
-        None
-    };
+    let _cli_log_guard =
+        resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli.log", "hole=info"));
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
@@ -352,8 +384,20 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Install => {
-            if let Err(e) = crate::setup::install_bridge() {
+        BridgeAction::Install {
+            log_dir: _, // consumed by `resolve_cli_log_dir` already
+            repair_user_data_dir,
+        } => {
+            // Header line — guarantees the gui-cli.log identifies the build
+            // and host even if the rest of the install fails immediately.
+            cli_log!(
+                info,
+                "hole bridge install: hole={}, os={}, target={}",
+                hole::version::VERSION,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            );
+            if let Err(e) = crate::setup::install_bridge(repair_user_data_dir.as_deref()) {
                 cli_log!(error, "bridge install failed: {e}");
                 return 1;
             }

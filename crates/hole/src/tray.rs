@@ -213,6 +213,18 @@ fn revert_proxy_state(app: &AppHandle, enabled: bool) {
 pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
+    // Bridge install gate: if the user is trying to enable the proxy and
+    // the bridge isn't installed yet, prompt for installation BEFORE
+    // flipping any config state. Cancelling here leaves `config.enabled`
+    // untouched (no rollback needed). Replaces the prior launch-time
+    // install check at `setup::check_bridge_on_launch`.
+    if enabled
+        && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled
+        && !crate::setup::prompt_bridge_install(app.clone()).await
+    {
+        return Err("The Hole bridge must be installed to connect.".into());
+    }
+
     let proxy_config = {
         let mut config = state.config.lock().unwrap();
         if config.enabled == enabled {
@@ -480,7 +492,7 @@ async fn handle_uninstall_helper(app: AppHandle) {
     let result = tokio::task::spawn_blocking(move || crate::setup::run_elevated(&exe, &["bridge", "uninstall"])).await;
 
     match result {
-        Ok(Ok(status)) if status.success() => {
+        Ok(Ok(())) => {
             app.dialog()
                 .message("Bridge helper has been uninstalled.")
                 .title("Uninstall Helper")
@@ -495,10 +507,6 @@ async fn handle_uninstall_helper(app: AppHandle) {
                 .message(format!("Uninstall failed: {e}"))
                 .title("Error")
                 .blocking_show();
-        }
-        Ok(Ok(status)) => {
-            let code = status.code().unwrap_or(-1);
-            error!("uninstall exited with code {code}");
         }
         Err(e) => {
             error!("spawn_blocking failed: {e}");

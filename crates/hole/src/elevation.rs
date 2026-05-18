@@ -136,7 +136,7 @@ async fn run_grant_access_elevated(app: &AppHandle, request: &BridgeRequest) -> 
     .await;
 
     match result {
-        Ok(Ok(status)) if status.success() => {
+        Ok(Ok(())) => {
             info!("grant-access succeeded");
             true
         }
@@ -144,19 +144,10 @@ async fn run_grant_access_elevated(app: &AppHandle, request: &BridgeRequest) -> 
             info!("user cancelled elevation prompt");
             false
         }
-        Ok(Ok(status)) => {
-            let code = status.code().unwrap_or(-1);
-            error!("grant-access exited with code {code}");
-            app.dialog()
-                .message(format!("Failed to grant access (exit code {code})."))
-                .title("Elevation Error")
-                .blocking_show();
-            false
-        }
         Ok(Err(e)) => {
-            error!("elevation failed: {e}");
+            error!("grant-access elevation failed: {e}");
             app.dialog()
-                .message(format!("Elevation failed: {e}"))
+                .message(format!("Failed to grant access.\n\n{e}"))
                 .title("Elevation Error")
                 .blocking_show();
             false
@@ -194,7 +185,7 @@ async fn run_ipc_send_elevated(_app: &AppHandle, request: &BridgeRequest) -> boo
     .await;
 
     match result {
-        Ok(Ok(status)) if status.success() => {
+        Ok(Ok(())) => {
             info!("ipc-send succeeded");
             true
         }
@@ -202,13 +193,8 @@ async fn run_ipc_send_elevated(_app: &AppHandle, request: &BridgeRequest) -> boo
             info!("user cancelled elevation prompt");
             false
         }
-        Ok(Ok(status)) => {
-            let code = status.code().unwrap_or(-1);
-            error!("ipc-send exited with code {code}");
-            false
-        }
         Ok(Err(e)) => {
-            error!("elevation failed: {e}");
+            error!("ipc-send elevation failed: {e}");
             false
         }
         Err(e) => {

@@ -12,6 +12,7 @@ mod commands;
 mod elevation;
 mod log_collector;
 mod logging;
+mod orphan_sweep;
 mod path_management;
 mod platform;
 mod setup;
@@ -98,7 +99,12 @@ fn launch_gui(show_dashboard: bool) {
             if show_dashboard {
                 tray::open_settings_window(app.handle());
             }
-            setup::check_bridge_on_launch(app.handle().clone());
+            // Best-effort sweep of `hole-install-*` temp directories left
+            // behind by failed elevated installs (`run_elevated` detaches
+            // its TempDir on failure so the user can attach the log to
+            // support; this cleans those up after a few days). Non-
+            // blocking; failures are logged at `warn` only.
+            orphan_sweep::spawn_default();
             hole::update::start_update_checker(app.handle().clone(), |app, info| {
                 // Rebuild tray menu to include the "Install Update" item.
                 if let Some(tray_icon) = app.tray_by_id("main") {

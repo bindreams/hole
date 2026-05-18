@@ -94,7 +94,10 @@ fn dispatch_exempts_bridge_log_from_cli_log_guard() {
 fn dispatch_installs_cli_log_guard_for_write_actions() {
     assert!(should_install_cli_log_guard(&Command::Upgrade));
     assert!(should_install_cli_log_guard(&Command::Bridge {
-        action: BridgeAction::Install,
+        action: BridgeAction::Install {
+            log_dir: None,
+            repair_user_data_dir: None,
+        },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Uninstall,
@@ -316,4 +319,127 @@ fn read_server_entry_file_rejects_malformed_json(#[fixture(temp_dir)] dir: &Path
         err.contains("failed to parse"),
         "error should mention parse failure: {err}"
     );
+}
+
+// `bridge install` flag parsing =======================================================================================
+//
+// The GUI's elevated-install path passes `--log-dir` to redirect the CLI's
+// gui-cli.log into a per-invocation temp directory and
+// `--repair-user-data-dir` to reclaim a root-owned user data tree (macOS).
+
+#[skuld::test]
+fn bridge_install_parses_with_no_flags() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "install"]).expect("parse bridge install");
+    let Some(Command::Bridge {
+        action: BridgeAction::Install {
+            log_dir,
+            repair_user_data_dir,
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Install");
+    };
+    assert!(log_dir.is_none(), "default log_dir is None");
+    assert!(repair_user_data_dir.is_none(), "default repair_user_data_dir is None");
+}
+
+#[skuld::test]
+fn bridge_install_parses_log_dir_flag() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "install", "--log-dir", "/tmp/hole-install-XXXX"])
+        .expect("parse bridge install --log-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::Install { log_dir, .. },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Install");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/hole-install-XXXX")));
+}
+
+#[skuld::test]
+fn bridge_install_parses_repair_user_data_dir_flag() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "install",
+        "--repair-user-data-dir",
+        "/Users/test/Library/Application Support/hole",
+    ])
+    .expect("parse bridge install --repair-user-data-dir");
+    let Some(Command::Bridge {
+        action: BridgeAction::Install {
+            repair_user_data_dir, ..
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Install");
+    };
+    assert_eq!(
+        repair_user_data_dir,
+        Some(std::path::PathBuf::from("/Users/test/Library/Application Support/hole"))
+    );
+}
+
+#[skuld::test]
+fn bridge_install_parses_both_flags() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "install",
+        "--log-dir",
+        "/tmp/L",
+        "--repair-user-data-dir",
+        "/tmp/R",
+    ])
+    .expect("parse bridge install with both flags");
+    let Some(Command::Bridge {
+        action: BridgeAction::Install {
+            log_dir,
+            repair_user_data_dir,
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Install");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/L")));
+    assert_eq!(repair_user_data_dir, Some(std::path::PathBuf::from("/tmp/R")));
+}
+
+#[skuld::test]
+fn resolve_cli_log_dir_honors_install_log_dir_override() {
+    let custom = std::path::PathBuf::from("/tmp/hole-install-XYZ");
+    let cmd = Command::Bridge {
+        action: BridgeAction::Install {
+            log_dir: Some(custom.clone()),
+            repair_user_data_dir: None,
+        },
+    };
+    let resolved = resolve_cli_log_dir(&cmd);
+    assert_eq!(resolved, Some(custom));
+}
+
+#[skuld::test]
+fn resolve_cli_log_dir_falls_back_to_default_without_override() {
+    let cmd = Command::Bridge {
+        action: BridgeAction::Install {
+            log_dir: None,
+            repair_user_data_dir: None,
+        },
+    };
+    let resolved = resolve_cli_log_dir(&cmd);
+    assert_eq!(resolved, Some(hole_common::logging::default_log_dir()));
+}
+
+#[skuld::test]
+fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
+    assert!(resolve_cli_log_dir(&Command::Version).is_none());
+    assert!(resolve_cli_log_dir(&Command::Bridge {
+        action: BridgeAction::Run {
+            socket_path: None,
+            service: false,
+            log_dir: None,
+            state_dir: None,
+        },
+    })
+    .is_none());
 }
