@@ -5,6 +5,7 @@ table inspection. Windows-only, requires WiX toolchain.
 """
 
 import platform
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -23,10 +24,14 @@ pytestmark = [
 
 @pytest.fixture(scope="session")
 def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Create a staging directory with dummy (empty) binaries."""
+    """Create a staging directory with non-zero dummy binaries.
+
+    Non-zero so the embedded cabinet actually contains data and the
+    relocated-extract test (#357) has files to find post-extraction.
+    """
     d = tmp_path_factory.mktemp("stage")
     for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll"):
-        (d / name).write_bytes(b"")
+        (d / name).write_bytes(b"x" * 1024)
     return d
 
 
@@ -173,3 +178,78 @@ def test_components_are_64bit(decompiled_tree: ET.ElementTree) -> None:
             f"Component '{comp_id}' has Bitness='always32' (32-bit). "
             "Pass '-arch x64' to 'wix build' to build a 64-bit MSI."
         )
+
+
+# Cabinet embedding tests ==============================================================================================
+
+
+def test_decompiled_msi_cab_is_embedded(decompiled_tree: ET.ElementTree) -> None:
+    """The built MSI's Media table must declare embedded cabinets.
+
+    `wix msi decompile` translates the on-disk Cabinet='#name.cab' embedded
+    marker back to source form: it strips the '#' and emits EmbedCab='yes'
+    on each <Media>. Absence of EmbedCab='yes' on the decompiled XML means
+    the MSI ships external cabs and breaks for end users (#357 — v0.1.0).
+    """
+    pkg = decompiled_tree.getroot().find("wix:Package", NS)
+    assert pkg is not None
+    media_elements = list(pkg.iter(f"{{{NS['wix']}}}Media"))
+    assert media_elements, "Decompiled MSI has no <Media> element"
+    for media in media_elements:
+        embed = media.get("EmbedCab", "")
+        assert embed == "yes", (
+            f"<Media Id='{media.get('Id')}' Cabinet='{media.get('Cabinet')}' "
+            f"EmbedCab='{embed}'> declares an EXTERNAL cabinet. "
+            "Set <MediaTemplate EmbedCab='yes'> in hole.wxs."
+        )
+
+
+def test_built_msi_has_no_external_cab(built_msi: Path) -> None:
+    """No .cab file should sit next to the built .msi.
+
+    External cabs land in the same directory as the .msi with a name like
+    'cab1.cab'. End users who download only the .msi then get 'Source file
+    not found: cab1.cab' at install time (#357 — v0.1.0).
+    """
+    siblings = list(built_msi.parent.glob("*.cab"))
+    assert not siblings, (
+        f"Found external cabinet(s) next to the built MSI: {siblings}. "
+        "The MSI must be self-contained (<MediaTemplate EmbedCab='yes'>)."
+    )
+
+
+def test_msi_admin_extract_works_when_separated_from_build_dir(
+    built_msi: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Simulate the end-user 'download MSI alone and run it' flow.
+
+    Copy the .msi alone to a fresh directory (no cab siblings) and run
+    `msiexec /a` — administrative install, read-only extract, no admin
+    rights, no system mutation. External-cab MSIs fail here with the same
+    'cab1.cab not found' error that broke v0.1.0 (#357).
+    """
+    relocated_dir = tmp_path_factory.mktemp("relocated")
+    relocated = Path(shutil.copy(built_msi, relocated_dir / "hole.msi"))
+    extract_dir = tmp_path_factory.mktemp("extract")
+    abs_target = str(extract_dir.resolve())
+
+    # Trailing backslash on TARGETDIR is required by msiexec.
+    result = subprocess.run(
+        ["msiexec", "/a", str(relocated.resolve()), f"TARGETDIR={abs_target}\\", "/qn"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"msiexec /a failed (exit {result.returncode}) on a relocated MSI — "
+        f"the same code path that failed for v0.1.0 end users.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+    extracted = {
+        p.name
+        for p in extract_dir.rglob("*") if p.is_file() and p.name in {"hole.exe", "v2ray-plugin.exe", "wintun.dll"}
+    }
+    assert extracted == {"hole.exe", "v2ray-plugin.exe",
+                         "wintun.dll"}, (f"MSI extracted but expected payload missing: got {extracted}")
