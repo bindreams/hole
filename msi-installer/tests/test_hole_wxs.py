@@ -9,7 +9,10 @@ import xml.etree.ElementTree as ET
 from conftest import NS
 
 # Known bind path variables passed via `-bindpath` to `wix build`.
-KNOWN_BINDPATHS = {"BinDir"}
+KNOWN_BINDPATHS = {"BinDir", "LicenseDir"}
+
+# Namespace for the WixUI extension elements (<ui:WixUI ...>).
+UI_NS = "http://wixtoolset.org/schemas/v4/wxs/ui"
 
 # GUID tests ===========================================================================================================
 
@@ -109,6 +112,17 @@ def test_file_sources_use_known_bindpaths(package: ET.Element) -> None:
             assert var_name in KNOWN_BINDPATHS, (
                 f"File '{file_elem.get('Id')}' uses unknown bindpath variable '{var_name}'. "
                 f"Known: {KNOWN_BINDPATHS}"
+            )
+
+
+def test_wixvariable_values_use_known_bindpaths(package: ET.Element) -> None:
+    for var_elem in package.iter(f"{{{NS['wix']}}}WixVariable"):
+        value = var_elem.get("Value", "")
+        for match in BINDPATH_RE.finditer(value):
+            var_name = match.group(1)
+            assert var_name in KNOWN_BINDPATHS, (
+                f"WixVariable '{var_elem.get('Id')}' uses unknown bindpath variable "
+                f"'{var_name}'. Known: {KNOWN_BINDPATHS}"
             )
 
 
@@ -361,3 +375,249 @@ def test_every_component_has_key_path(package: ET.Element) -> None:
             f"Component '{comp_id}' must have exactly one child with KeyPath='yes', "
             f"found {len(key_path_children)}"
         )
+
+
+# UI property tests ====================================================================================================
+
+
+def _find_property(package: ET.Element, prop_id: str) -> ET.Element | None:
+    for prop in package.iter(f"{{{NS['wix']}}}Property"):
+        if prop.get("Id") == prop_id:
+            return prop
+    return None
+
+
+def _find_component(package: ET.Element, comp_id: str) -> ET.Element | None:
+    for comp in package.iter(f"{{{NS['wix']}}}Component"):
+        if comp.get("Id") == comp_id:
+            return comp
+    return None
+
+
+def test_install_start_menu_default_is_on(package: ET.Element) -> None:
+    """Silent auto-update path: defaulting to 1 preserves existing users' Start Menu shortcut."""
+    prop = _find_property(package, "INSTALL_START_MENU")
+    assert prop is not None, "Property INSTALL_START_MENU is required"
+    assert prop.get("Value") == "1", (
+        f"INSTALL_START_MENU must default to '1' for upgrade safety (auto-updater runs silent); "
+        f"got '{prop.get('Value')}'"
+    )
+    assert prop.get("Secure") == "yes", (
+        "Public properties driving Component conditions must be Secure='yes' to "
+        "propagate from UI sequence to deferred execute sequence"
+    )
+
+
+def test_install_desktop_icon_default_is_off(package: ET.Element) -> None:
+    """Silent auto-update path: defaulting to 0 prevents surprise desktop icons on upgrade."""
+    prop = _find_property(package, "INSTALL_DESKTOP_ICON")
+    assert prop is not None, "Property INSTALL_DESKTOP_ICON is required"
+    assert prop.get("Value") == "0", (
+        f"INSTALL_DESKTOP_ICON must default to '0' for upgrade safety; "
+        f"got '{prop.get('Value')}'"
+    )
+    assert prop.get("Secure") == "yes", (
+        "Public properties driving Component conditions must be Secure='yes' to "
+        "propagate from UI sequence to deferred execute sequence"
+    )
+
+
+def test_start_menu_shortcut_is_conditioned_on_property(package: ET.Element) -> None:
+    comp = _find_component(package, "StartMenuShortcut")
+    assert comp is not None
+    condition = comp.get("Condition", "")
+    assert 'INSTALL_START_MENU="1"' in condition, (
+        f"StartMenuShortcut must be conditioned on INSTALL_START_MENU; got Condition='{condition}'"
+    )
+
+
+def test_desktop_shortcut_is_conditioned_on_property(package: ET.Element) -> None:
+    comp = _find_component(package, "DesktopShortcut")
+    assert comp is not None
+    condition = comp.get("Condition", "")
+    assert 'INSTALL_DESKTOP_ICON="1"' in condition, (
+        f"DesktopShortcut must be conditioned on INSTALL_DESKTOP_ICON; got Condition='{condition}'"
+    )
+
+
+def test_shortcut_components_have_distinct_registry_names(package: ET.Element) -> None:
+    """Each shortcut component must own its own HKCU KeyPath.
+
+    Two components sharing Software\\Hole\\Installed would race during uninstall —
+    whichever runs last would no-op when the regkey is already gone, leaving its
+    shortcut orphaned.
+    """
+    names: dict[str, str] = {}  # registry name -> component id
+    for comp_id in ("StartMenuShortcut", "DesktopShortcut"):
+        comp = _find_component(package, comp_id)
+        assert comp is not None, f"Component '{comp_id}' missing"
+        reg = next(
+            (r for r in comp.iter(f"{{{NS['wix']}}}RegistryValue") if r.get("KeyPath") == "yes"),
+            None,
+        )
+        assert reg is not None, f"Component '{comp_id}' has no KeyPath RegistryValue"
+        name = reg.get("Name", "")
+        assert name not in names, (
+            f"Components '{comp_id}' and '{names[name]}' share HKCU registry Name='{name}' "
+            "as KeyPath. Each component must own a distinct registry value."
+        )
+        names[name] = comp_id
+
+
+def test_ui_extension_referenced(package: ET.Element) -> None:
+    """WixUI_InstallDir dialog set must be activated via <ui:WixUI>."""
+    wixui = package.find(f"{{{UI_NS}}}WixUI")
+    assert wixui is not None, "<ui:WixUI> element is required to activate the dialog set"
+    assert wixui.get("Id") == "WixUI_InstallDir", (f"Expected WixUI Id='WixUI_InstallDir'; got '{wixui.get('Id')}'")
+    assert wixui.get("InstallDirectory") == "INSTALLFOLDER", (
+        f"InstallDirectory must bind picker to INSTALLFOLDER; got '{wixui.get('InstallDirectory')}'"
+    )
+
+
+def test_wixui_license_rtf_bindpath(package: ET.Element) -> None:
+    """The License dialog reads license.rtf from the LicenseDir bindpath."""
+    for var in package.iter(f"{{{NS['wix']}}}WixVariable"):
+        if var.get("Id") == "WixUILicenseRtf":
+            value = var.get("Value", "")
+            assert "!(bindpath.LicenseDir)" in value, (
+                f"WixUILicenseRtf must reference !(bindpath.LicenseDir); got '{value}'"
+            )
+            assert value.endswith("license.rtf"), (f"WixUILicenseRtf must point to license.rtf; got '{value}'")
+            return
+    raise AssertionError("WixVariable Id='WixUILicenseRtf' is required for the License dialog")
+
+
+def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
+    """A single hidden Feature must group all components for the dialog set."""
+    feature = next(
+        (f for f in package.iter(f"{{{NS['wix']}}}Feature") if f.get("Id") == "Main"),
+        None,
+    )
+    assert feature is not None, "<Feature Id='Main'> is required"
+    refs = {ref.get("Id") for ref in feature.iter(f"{{{NS['wix']}}}ComponentGroupRef")}
+    expected = {"BinaryComponents", "ShortcutComponents", "DesktopShortcutComponents"}
+    assert refs == expected, (f"Feature 'Main' must reference exactly {expected}; got {refs}")
+
+
+# ShortcutsDlg structural tests ========================================================================================
+
+
+def _find_dialog(package: ET.Element, dialog_id: str) -> ET.Element | None:
+    for ui in package.iter(f"{{{NS['wix']}}}UI"):
+        for dlg in ui.iter(f"{{{NS['wix']}}}Dialog"):
+            if dlg.get("Id") == dialog_id:
+                return dlg
+    return None
+
+
+def test_shortcutsdlg_has_three_pushbuttons(package: ET.Element) -> None:
+    dlg = _find_dialog(package, "ShortcutsDlg")
+    assert dlg is not None, "<Dialog Id='ShortcutsDlg'> is required"
+    buttons = [c for c in dlg.iter(f"{{{NS['wix']}}}Control") if c.get("Type") == "PushButton"]
+    button_ids = sorted(b.get("Id", "") for b in buttons)
+    assert button_ids == [
+        "Back", "Cancel", "Next"
+    ], (f"ShortcutsDlg must have exactly three PushButtons (Back, Cancel, Next); got {button_ids}")
+
+
+def test_shortcutsdlg_cancel_spawns_canceldlg(package: ET.Element) -> None:
+    dlg = _find_dialog(package, "ShortcutsDlg")
+    assert dlg is not None
+    cancel = next(
+        (c for c in dlg.iter(f"{{{NS['wix']}}}Control") if c.get("Id") == "Cancel"),
+        None,
+    )
+    assert cancel is not None, "ShortcutsDlg must have a Control Id='Cancel'"
+    publishes = list(cancel.iter(f"{{{NS['wix']}}}Publish"))
+    spawn = [p for p in publishes if p.get("Event") == "SpawnDialog" and p.get("Value") == "CancelDlg"]
+    assert len(spawn) == 1, (
+        "ShortcutsDlg Cancel button must have child <Publish Event='SpawnDialog' Value='CancelDlg'> "
+        f"(matches upstream WixUI dialogs); got {len(spawn)} matching Publish elements"
+    )
+
+
+def test_shortcutsdlg_has_two_checkboxes(package: ET.Element) -> None:
+    dlg = _find_dialog(package, "ShortcutsDlg")
+    assert dlg is not None
+    checkboxes = {
+        c.get("Property"): c.get("CheckBoxValue")
+        for c in dlg.iter(f"{{{NS['wix']}}}Control") if c.get("Type") == "CheckBox"
+    }
+    assert checkboxes == {"INSTALL_START_MENU": "1", "INSTALL_DESKTOP_ICON": "1"}, (
+        "ShortcutsDlg must have two CheckBox controls bound to INSTALL_START_MENU "
+        f"and INSTALL_DESKTOP_ICON with CheckBoxValue='1'; got {checkboxes}"
+    )
+
+
+# UI Publish navigation tests ==========================================================================================
+
+
+def _ui_publishes(package: ET.Element) -> list[ET.Element]:
+    """Publishes at top-level of <UI> (not nested under Controls)."""
+    result: list[ET.Element] = []
+    for ui in package.iter(f"{{{NS['wix']}}}UI"):
+        for child in ui:
+            if child.tag == f"{{{NS['wix']}}}Publish":
+                result.append(child)
+    return result
+
+
+def _find_publish(publishes: list[ET.Element], dialog: str, control: str, event: str, value: str) -> ET.Element | None:
+    for p in publishes:
+        if (
+            p.get("Dialog") == dialog and p.get("Control") == control and p.get("Event") == event
+            and p.get("Value") == value
+        ):
+            return p
+    return None
+
+
+def test_installdirdlg_next_publishes_to_shortcutsdlg(package: ET.Element) -> None:
+    """Override of upstream WixUI_InstallDir's Order=4 NewDialog→VerifyReadyDlg.
+
+    Our Order must be strictly greater than 4 (upstream's value, verified from
+    WiX v6.0.2 source) so MSI processes our row after, making our NewDialog win.
+    """
+    pub = _find_publish(_ui_publishes(package), "InstallDirDlg", "Next", "NewDialog", "ShortcutsDlg")
+    assert pub is not None, (
+        "Missing <Publish Dialog='InstallDirDlg' Control='Next' Event='NewDialog' "
+        "Value='ShortcutsDlg'> — required to inject ShortcutsDlg into the wizard"
+    )
+    order = int(pub.get("Order", "0"))
+    assert order > 4, (
+        f"InstallDirDlg.Next→ShortcutsDlg must use Order > 4 to beat upstream's "
+        f"Order=4 NewDialog→VerifyReadyDlg; got Order={order}"
+    )
+
+
+def test_shortcutsdlg_back_publishes_to_installdirdlg(package: ET.Element) -> None:
+    pub = _find_publish(_ui_publishes(package), "ShortcutsDlg", "Back", "NewDialog", "InstallDirDlg")
+    assert pub is not None, "ShortcutsDlg Back must publish NewDialog→InstallDirDlg"
+
+
+def test_shortcutsdlg_next_publishes_to_verifyreadydlg(package: ET.Element) -> None:
+    pub = _find_publish(_ui_publishes(package), "ShortcutsDlg", "Next", "NewDialog", "VerifyReadyDlg")
+    assert pub is not None, "ShortcutsDlg Next must publish NewDialog→VerifyReadyDlg"
+
+
+def test_verifyreadydlg_back_publishes_to_shortcutsdlg(package: ET.Element) -> None:
+    """Override of upstream WixUI_InstallDir's Order=1 NewDialog→InstallDirDlg (Condition='NOT Installed').
+
+    Our Order must be strictly greater than 1 to win. The condition must match
+    upstream so we only override the install path, not maintenance/patch flows.
+    """
+    pub = _find_publish(_ui_publishes(package), "VerifyReadyDlg", "Back", "NewDialog", "ShortcutsDlg")
+    assert pub is not None, (
+        "Missing <Publish Dialog='VerifyReadyDlg' Control='Back' Event='NewDialog' "
+        "Value='ShortcutsDlg'> — needed for Back-button regression"
+    )
+    order = int(pub.get("Order", "0"))
+    assert order > 1, (
+        f"VerifyReadyDlg.Back→ShortcutsDlg must use Order > 1 to beat upstream's "
+        f"Order=1 NewDialog→InstallDirDlg; got Order={order}"
+    )
+    condition = pub.get("Condition", "")
+    assert "NOT Installed" in condition, (
+        f"VerifyReadyDlg.Back→ShortcutsDlg must condition on 'NOT Installed' to avoid "
+        f"intercepting maintenance/patch flows; got Condition='{condition}'"
+    )
