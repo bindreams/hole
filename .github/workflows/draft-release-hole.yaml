@@ -119,9 +119,14 @@ jobs:
       - name: Sanity-check artifact sizes
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          files=( hole-*.msi hole-*.dmg )
+          if (( ${#files[@]} != 3 )); then
+            echo "::error::expected 3 release artifacts (1 MSI + 2 DMGs), found ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
           fail=0
-          for f in hole-*.msi hole-*.dmg; do
-            [ -f "$f" ] || continue
+          for f in "${files[@]}"; do
             size=$(stat -c%s "$f")
             if [ "$size" -lt 5000000 ]; then
               echo "::error::$f is only $size bytes (expected >= 5 MB) -- likely external-cab MSI or truncated artifact (#357)"
