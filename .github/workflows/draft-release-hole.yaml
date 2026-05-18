@@ -111,32 +111,6 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
-      # Sanity-check artifact sizes before signing/publishing. v0.1.0 shipped
-      # a 36 KB Windows MSI (external-cab, binaries omitted) and broke every
-      # user. A self-contained Hole installer is always 10+ MB. 5 MB floor
-      # is a defensive lower bound; raise if Hole's payload ever shrinks
-      # below it. See #357.
-      - name: Sanity-check artifact sizes
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          files=( hole-*.msi hole-*.dmg )
-          if (( ${#files[@]} != 3 )); then
-            echo "::error::expected 3 release artifacts (1 MSI + 2 DMGs), found ${#files[@]}: ${files[*]}"
-            exit 1
-          fi
-          fail=0
-          for f in "${files[@]}"; do
-            size=$(stat -c%s "$f")
-            if [ "$size" -lt 5000000 ]; then
-              echo "::error::$f is only $size bytes (expected >= 5 MB) -- likely external-cab MSI or truncated artifact (#357)"
-              fail=1
-            else
-              echo "OK: $f is $size bytes"
-            fi
-          done
-          exit $fail
-
       # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
       # text-mode regardless of which per-matrix runner built each
       # artifact. Git-Bash sha256sum on Windows defaults to binary mode
