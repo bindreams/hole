@@ -75,6 +75,14 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
         files.push(BindirFile::new(wintun_src, "wintun.dll".to_string()));
     }
 
+    // 5. NOTICES.md — Apache-2.0 attribution for galoshes/garter components
+    //    that the GPL-3.0 binary distribution bundles. Apache-2.0 §4(d)
+    //    requires the NOTICE file to be preserved in derivative works; since
+    //    the installer's license dialog only shows GPL-3.0 text, the file
+    //    must accompany the binaries on disk. See bindreams/hole#363 review.
+    let notices_src = repo_root.join("NOTICES.md");
+    files.push(BindirFile::new(notices_src, "NOTICES.md".to_string()));
+
     Ok(files)
 }
 

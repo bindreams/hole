@@ -31,7 +31,7 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     relocated-extract test (#357) has files to find post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
-    for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll"):
+    for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"):
         (d / name).write_bytes(b"x" * 1024)
     return d
 
@@ -265,12 +265,9 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
-    extracted = {
-        p.name
-        for p in extract_dir.rglob("*") if p.is_file() and p.name in {"hole.exe", "v2ray-plugin.exe", "wintun.dll"}
-    }
-    assert extracted == {"hole.exe", "v2ray-plugin.exe",
-                         "wintun.dll"}, (f"MSI extracted but expected payload missing: got {extracted}")
+    payload_files = {"hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"}
+    extracted = {p.name for p in extract_dir.rglob("*") if p.is_file() and p.name in payload_files}
+    assert extracted == payload_files, (f"MSI extracted but expected payload missing: got {extracted}")
 
 
 # UI property + dialog tests ===========================================================================================

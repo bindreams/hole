@@ -50,11 +50,40 @@
     <!-- UI properties driving the two shortcut checkboxes.
          Secure="yes" lets the public properties flow from the UI sequence to
          the deferred execute sequence where component conditions are evaluated.
-         Defaults preserve current behavior on silent auto-update (#363):
-           INSTALL_START_MENU=1   → existing v0.1.x users keep their shortcut.
-           INSTALL_DESKTOP_ICON=0 → no surprise desktop icon on upgrade. -->
+         Defaults are picked for fresh installs:
+           INSTALL_START_MENU=1   → typical consumer-app default.
+           INSTALL_DESKTOP_ICON=0 → no desktop icon unless the user opts in. -->
     <Property Id="INSTALL_START_MENU" Value="1" Secure="yes" />
     <Property Id="INSTALL_DESKTOP_ICON" Value="0" Secure="yes" />
+
+    <!-- Sticky preferences across silent auto-update (#363).
+         The auto-updater runs `msiexec /quiet` with no property overrides, so
+         without preserving the prior choice the upgrade would silently undo
+         whatever the user picked. Each shortcut component writes "1" to its
+         HKCU KeyPath regkey iff installed; RegistrySearch returns that value
+         (or leaves the property unset). SetProperty then overrides the public
+         default to match the prior choice — only on upgrades, so fresh
+         installs keep the defaults above.
+         AppSearch (where RegistrySearch fires) runs in the immediate sequence
+         BEFORE RemoveExistingProducts removes the old install, so the prior
+         regkeys are still readable. -->
+    <Property Id="HOLE_START_MENU_INSTALLED">
+      <RegistrySearch Id="StartMenuPresent" Root="HKCU" Key="Software\Hole"
+                      Name="Installed" Type="raw" />
+    </Property>
+    <Property Id="HOLE_DESKTOP_INSTALLED">
+      <RegistrySearch Id="DesktopPresent" Root="HKCU" Key="Software\Hole"
+                      Name="DesktopShortcutInstalled" Type="raw" />
+    </Property>
+
+    <!-- Start Menu: default 1; if prior upgrade-detected install LACKED the
+         regkey, the user unchecked it last time → override to 0. -->
+    <SetProperty Id="INSTALL_START_MENU" Value="0" After="AppSearch"
+                 Condition="WIX_UPGRADE_DETECTED AND NOT HOLE_START_MENU_INSTALLED" />
+    <!-- Desktop: default 0; if prior upgrade-detected install HAD the regkey,
+         the user checked it last time → override to 1. -->
+    <SetProperty Id="INSTALL_DESKTOP_ICON" Value="1" After="AppSearch"
+                 Condition="WIX_UPGRADE_DETECTED AND HOLE_DESKTOP_INSTALLED" />
 
     <!-- License RTF resolved from the build-time LicenseDir bindpath.
          Source: https://www.gnu.org/licenses/gpl-3.0.rtf
@@ -79,6 +108,12 @@
       </Component>
       <Component Id="WintunDll" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
         <File Id="wintun.dll" Source="!(bindpath.BinDir)\wintun.dll" KeyPath="yes" />
+      </Component>
+      <!-- NOTICES.md preserves Apache-2.0 §4(d) attribution for the bundled
+           galoshes/garter components. The License dialog only displays GPL-3.0
+           text; the NOTICE file must accompany the binaries on disk. -->
+      <Component Id="NoticesMd" Guid="F6A7B8C9-D0E1-2345-F012-456789012345">
+        <File Id="NOTICES.md" Source="!(bindpath.BinDir)\NOTICES.md" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

@@ -216,14 +216,18 @@ def find_wix_exe(base_dir: Path) -> Path | None:
 def ui_extension_path(wix_exe: Path) -> Path:
     """Resolve the WixToolset.UI.wixext.dll bundled with the WiX toolchain.
 
-    The UI extension ships inside wix-cli-x64.msi and is admin-extracted alongside
-    wix.exe by ensure_wix(). Layout (deterministic, set by the extraction logic):
+    The UI extension ships inside wix-cli-x64.msi and is admin-extracted by
+    ensure_wix() into a deterministic layout. The four .parent traversals walk
+    bin -> "WiX Toolset v6.0" -> PFiles64 -> wix-v<ver>, landing on cache_root:
 
-        wix_exe:       <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin/wix.exe
-        UI extension:  <cache>/wix-v<ver>/CFiles64/WixToolset/extensions/
-                           WixToolset.UI.wixext/<ver>/wixext6/WixToolset.UI.wixext.dll
+        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin/wix.exe
+        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin
+        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0
+        .parent x 3     = <cache>/wix-v<ver>/PFiles64
+        .parent x 4     = <cache>/wix-v<ver>                    <- cache_root
+        UI extension    = cache_root/CFiles64/WixToolset/extensions/
+                              WixToolset.UI.wixext/<ver>/wixext6/WixToolset.UI.wixext.dll
     """
-    # 4 parents: bin → "WiX Toolset v6.0" → PFiles64 → wix-v<ver>.
     cache_root = wix_exe.parent.parent.parent.parent
     version = cache_root.name.removeprefix("wix-v")
     dll = (

@@ -499,6 +499,111 @@ def test_main_feature_wraps_all_component_groups(package: ET.Element) -> None:
     assert refs == expected, (f"Feature 'Main' must reference exactly {expected}; got {refs}")
 
 
+# Attribution file tests ===============================================================================================
+
+
+def test_notices_md_component_exists(package: ET.Element) -> None:
+    """NOTICES.md must ship alongside binaries (Apache-2.0 §4(d) attribution).
+
+    The License dialog displays only GPL-3.0 text; the NOTICE file preserving
+    Apache-2.0 attribution for galoshes/garter must be installed on disk.
+    """
+    comp = _find_component(package, "NoticesMd")
+    assert comp is not None, "Component 'NoticesMd' is required for Apache-2.0 attribution"
+    file_elem = next(
+        (f for f in comp.iter(f"{{{NS['wix']}}}File") if f.get("Id") == "NOTICES.md"),
+        None,
+    )
+    assert file_elem is not None, "NoticesMd component must contain <File Id='NOTICES.md'>"
+    source = file_elem.get("Source", "")
+    assert "!(bindpath.BinDir)" in source, (f"NOTICES.md File Source must resolve via BinDir bindpath; got '{source}'")
+
+
+# Sticky-preference tests ==============================================================================================
+
+
+def _find_registry_search_property(package: ET.Element, prop_id: str) -> ET.Element | None:
+    """Return the <Property> if it contains a <RegistrySearch> child, else None."""
+    for prop in package.iter(f"{{{NS['wix']}}}Property"):
+        if prop.get("Id") != prop_id:
+            continue
+        if next(prop.iter(f"{{{NS['wix']}}}RegistrySearch"), None) is not None:
+            return prop
+    return None
+
+
+def test_start_menu_registry_search_exists(package: ET.Element) -> None:
+    """RegistrySearch reads the prior install's HKCU regkey to keep choices sticky."""
+    prop = _find_registry_search_property(package, "HOLE_START_MENU_INSTALLED")
+    assert prop is not None, "Property 'HOLE_START_MENU_INSTALLED' with <RegistrySearch> is required"
+    search = next(prop.iter(f"{{{NS['wix']}}}RegistrySearch"))
+    assert search.get("Root") == "HKCU", "Sticky-preference search must be HKCU (matches shortcut KeyPath)"
+    assert search.get("Key") == "Software\\Hole"
+    assert search.get("Name"
+                      ) == "Installed", ("Must search for the same regkey Name written by StartMenuShortcut's KeyPath")
+
+
+def test_desktop_registry_search_exists(package: ET.Element) -> None:
+    prop = _find_registry_search_property(package, "HOLE_DESKTOP_INSTALLED")
+    assert prop is not None, "Property 'HOLE_DESKTOP_INSTALLED' with <RegistrySearch> is required"
+    search = next(prop.iter(f"{{{NS['wix']}}}RegistrySearch"))
+    assert search.get("Root") == "HKCU"
+    assert search.get("Key") == "Software\\Hole"
+    assert search.get("Name") == "DesktopShortcutInstalled", (
+        "Must search for the same regkey Name written by DesktopShortcut's KeyPath"
+    )
+
+
+def _find_set_property(package: ET.Element, prop_id: str) -> ET.Element | None:
+    for sp in package.iter(f"{{{NS['wix']}}}SetProperty"):
+        if sp.get("Id") == prop_id:
+            return sp
+    return None
+
+
+def test_sticky_start_menu_setproperty(package: ET.Element) -> None:
+    """On upgrade, if prior install LACKED Start Menu regkey, override default 1 to 0.
+
+    Without this, an interactive install where the user unchecked Start Menu
+    would silently re-enable it on the next auto-update (defaults apply).
+    """
+    sp = _find_set_property(package, "INSTALL_START_MENU")
+    assert sp is not None, ("<SetProperty Id='INSTALL_START_MENU'> is required to make the choice sticky on upgrade")
+    assert sp.get("Value"
+                  ) == "0", (f"Sticky override must set value to '0' (preserve un-checked); got '{sp.get('Value')}'")
+    assert sp.get("After") == "AppSearch", (
+        f"SetProperty must run After='AppSearch' so RegistrySearch results are populated; "
+        f"got After='{sp.get('After')}'"
+    )
+    condition = sp.get("Condition", "")
+    assert "WIX_UPGRADE_DETECTED" in condition, (
+        f"Condition must gate on WIX_UPGRADE_DETECTED so fresh installs keep defaults; "
+        f"got Condition='{condition}'"
+    )
+    assert "NOT HOLE_START_MENU_INSTALLED" in condition, (
+        f"Condition must fire only when prior install lacked the regkey; got '{condition}'"
+    )
+
+
+def test_sticky_desktop_setproperty(package: ET.Element) -> None:
+    """On upgrade, if prior install HAD Desktop regkey, override default 0 to 1.
+
+    Without this, an interactive install where the user checked Desktop would
+    silently lose its icon on the next auto-update (defaults apply, 0=off).
+    """
+    sp = _find_set_property(package, "INSTALL_DESKTOP_ICON")
+    assert sp is not None, ("<SetProperty Id='INSTALL_DESKTOP_ICON'> is required to make the choice sticky on upgrade")
+    assert sp.get("Value"
+                  ) == "1", (f"Sticky override must set value to '1' (preserve checked); got '{sp.get('Value')}'")
+    assert sp.get("After") == "AppSearch"
+    condition = sp.get("Condition", "")
+    assert "WIX_UPGRADE_DETECTED" in condition
+    assert "HOLE_DESKTOP_INSTALLED" in condition and "NOT HOLE_DESKTOP_INSTALLED" not in condition, (
+        f"Condition must fire only when prior install HAD the regkey (positive check); "
+        f"got '{condition}'"
+    )
+
+
 # ShortcutsDlg structural tests ========================================================================================
 
 
