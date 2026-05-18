@@ -113,7 +113,10 @@ jobs:
           tar -czf "$ARCHIVE" -C "$STAGE_DIR" "$INNER"
           rm -r "$STAGE_DIR"
 
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256line"
+          # Git-Bash sha256sum defaults to binary mode (asterisk marker,
+          # single space); strip it so output matches the macOS text-mode
+          # format (two spaces). Hashing itself is still binary-correct.
+          sha256sum "$ARCHIVE" | sed 's/ \*/  /' > "${ARCHIVE}.sha256line"
           echo "Artifact: $ARCHIVE"
           cat "${ARCHIVE}.sha256line"
 

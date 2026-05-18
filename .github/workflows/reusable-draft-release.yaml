@@ -126,7 +126,10 @@ jobs:
           if [ "$OS" = "windows" ]; then EXT=".exe"; fi
           ASSET="${TRACK}-${VERSION}-${OS}-${ARCH}${EXT}"
           mv "target/release/${CRATE}${EXT}" "$ASSET"
-          sha256sum "$ASSET" > "${ASSET}.sha256line"
+          # Git-Bash sha256sum defaults to binary mode (asterisk marker,
+          # single space); strip it so output matches the macOS text-mode
+          # format (two spaces). Hashing itself is still binary-correct.
+          sha256sum "$ASSET" | sed 's/ \*/  /' > "${ASSET}.sha256line"
           echo "Artifact: $ASSET"
           cat "${ASSET}.sha256line"
 
