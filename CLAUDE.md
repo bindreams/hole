@@ -12,6 +12,14 @@ Single-binary design:
 
 GUI and bridge communicate over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON), defined by an OpenAPI spec at `crates/common/api/openapi.yaml`.
 
+### Single-instance enforcement
+
+GUI mode (no subcommand) is single-instance via [`tauri-plugin-single-instance`](crates/hole/src/main.rs), keyed on Tauri's `com.hole.app` identifier. A second `hole` invocation forwards its `argv` + `cwd` to the running instance (which opens the dashboard — same UX as a tray left-click) and exits. The lock is per-session on Windows (`CreateMutexW` without `Global\` prefix, so concurrent Fast User Switching / RDP users each get their own GUI) and machine-wide on macOS (AF_UNIX listener under `/tmp` — Tauri/Electron app default).
+
+The plugin is registered *inside* [`launch_gui`](crates/hole/src/main.rs), so every CLI subcommand path (`hole bridge run`, `hole proxy start`, `hole version`, …) bypasses the lock — multiple concurrent CLI invocations are unaffected. The callback fires on a plugin-owned thread; UI work is dispatched to the main thread via `AppHandle::run_on_main_thread` for Cocoa compatibility.
+
+**Upgrade-while-running caveat.** `hole upgrade`'s `/quiet` MSI does not relaunch the GUI on in-place upgrade (`LaunchApp` is gated on `NOT WIX_UPGRADE_DETECTED`). The old GUI keeps running on the old binary and holds the lock; a manual launch of the freshly-installed `hole.exe` will silently forward args to the old instance and exit. This is the same rough edge as the existing upgrade flow — the symptom shifts from "two tray icons after relaunch" (pre-#360) to "no visible change after relaunch" (post-#360). Fixing the upgrade flow properly (force-restart on upgrade, or version-mismatch toast) is tracked separately.
+
 ### UDP policy
 
 Hole is a VPN. UDP flows whose filter decision resolves to `Proxy` are **dropped**, not bypassed, when the configured plugin cannot carry UDP (e.g. plain v2ray-plugin is TCP-only). Falling back to the clear-text upstream interface would leak the flow outside the encrypted tunnel, violating the user's VPN expectation.
