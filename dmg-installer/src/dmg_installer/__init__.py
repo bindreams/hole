@@ -31,9 +31,7 @@ def find_built_dmg(repo_root: Path) -> Path:
     bundle_dir = repo_root / "target" / "release" / "bundle" / "dmg"
     matches = sorted(bundle_dir.glob("*.dmg"))
     if not matches:
-        raise DmgTestError(
-            f"no .dmg found in {bundle_dir}; run `cargo xtask build hole-dmg` first"
-        )
+        raise DmgTestError(f"no .dmg found in {bundle_dir}; run `cargo xtask build hole-dmg` first")
     if len(matches) > 1:
         raise DmgTestError(
             f"multiple .dmg files in {bundle_dir}: {[p.name for p in matches]}; "

@@ -27,7 +27,8 @@ def test_code_signature_directory_exists(installed_app: Path) -> None:
 
 def test_codesign_verify_strict_passes(installed_app: Path) -> None:
     result = subprocess.run(
-        ["codesign", "--verify", "--strict", "--verbose=4", str(installed_app)],
+        ["codesign", "--verify", "--strict", "--verbose=4",
+         str(installed_app)],
         capture_output=True,
         text=True,
     )
@@ -36,23 +37,18 @@ def test_codesign_verify_strict_passes(installed_app: Path) -> None:
 
 def test_codesign_verify_deep_strict_passes(installed_app: Path) -> None:
     result = subprocess.run(
-        ["codesign", "--verify", "--deep", "--strict", "--verbose=4", str(installed_app)],
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=4",
+         str(installed_app)],
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, (
-        f"codesign --verify --deep --strict failed:\n{result.stderr}"
-    )
+    assert result.returncode == 0, (f"codesign --verify --deep --strict failed:\n{result.stderr}")
 
 
 def test_bundle_has_sealed_resources(installed_app: Path) -> None:
     output = _codesign_dv(installed_app)
-    assert "Sealed Resources=none" not in output, (
-        f"bundle has no sealed resource envelope:\n{output}"
-    )
-    assert "Sealed Resources version=" in output, (
-        f"bundle is missing Sealed Resources block:\n{output}"
-    )
+    assert "Sealed Resources=none" not in output, (f"bundle has no sealed resource envelope:\n{output}")
+    assert "Sealed Resources version=" in output, (f"bundle is missing Sealed Resources block:\n{output}")
 
 
 def test_main_binary_is_not_linker_signed(installed_app: Path) -> None:

@@ -40,9 +40,14 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 
     subprocess.run(
         [
-            "hdiutil", "attach",
-            "-nobrowse", "-readonly", "-noverify", "-quiet",
-            "-mountpoint", str(mount_dir),
+            "hdiutil",
+            "attach",
+            "-nobrowse",
+            "-readonly",
+            "-noverify",
+            "-quiet",
+            "-mountpoint",
+            str(mount_dir),
             str(dmg),
         ],
         check=True,
@@ -50,15 +55,14 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     try:
         src_app = mount_dir / "Hole.app"
         if not src_app.is_dir():
-            raise dmg_installer.DmgTestError(
-                f"Hole.app not found in DMG (looked in {mount_dir})"
-            )
+            raise dmg_installer.DmgTestError(f"Hole.app not found in DMG (looked in {mount_dir})")
 
         dst_app = install_dir / "Hole.app"
         shutil.copytree(src_app, dst_app, symlinks=True)
 
         subprocess.run(
-            ["xattr", "-w", "com.apple.quarantine", QUARANTINE_VALUE, str(dst_app)],
+            ["xattr", "-w", "com.apple.quarantine", QUARANTINE_VALUE,
+             str(dst_app)],
             check=True,
         )
 
