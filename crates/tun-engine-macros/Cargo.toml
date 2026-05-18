@@ -1,6 +1,6 @@
 [package]
 name = "tun-engine-macros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "Proc-macro support for the tun-engine crate (provides #[freeze])."

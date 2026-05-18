@@ -263,6 +263,24 @@ def test_major_upgrade_allows_same_version(package: ET.Element) -> None:
     )
 
 
+def test_media_template_embeds_cab(package: ET.Element) -> None:
+    """<Package> must declare <MediaTemplate EmbedCab='yes'>.
+
+    Without it, WiX v4+ defaults to external cabinets, which makes the
+    .msi unusable when downloaded alone (#357 — v0.1.0).
+    """
+    template = package.find("wix:MediaTemplate", NS)
+    assert template is not None, (
+        "<Package> must declare <MediaTemplate EmbedCab='yes'>. Without it "
+        "WiX defaults to external cabs and the MSI fails to install when "
+        "downloaded alone."
+    )
+    assert template.get("EmbedCab") == "yes", (
+        f"<MediaTemplate> must set EmbedCab='yes', got "
+        f"EmbedCab='{template.get('EmbedCab')}'."
+    )
+
+
 # Custom action attribute tests ========================================================================================
 
 
