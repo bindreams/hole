@@ -342,11 +342,11 @@ def main() -> None:
         stage_dir = root / "target" / "release" / "installer-stage"
         stage_files(root, stage_dir, console)
 
-        # `cargo build` runs crates/hole/build.rs::generate_icons, which
-        # writes .cache/icons/icon.ico unconditionally on every build (see
-        # the unconditional contract in build.rs lines 90-95). Fail loud
-        # here if the contract is broken — a missing ICO would otherwise
-        # surface as a less obvious WiX bindpath error.
+        # `generate_icons` in crates/hole/build.rs writes
+        # .cache/icons/icon.ico whenever build.rs runs, and the file
+        # persists across cargo invocations. Fail loud here if it's
+        # absent — a missing ICO would otherwise surface as a less
+        # obvious WiX bindpath-resolution error.
         icon_dir = root / ".cache" / "icons"
         if not (icon_dir / "icon.ico").exists():
             raise BuildError(
