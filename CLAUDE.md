@@ -322,6 +322,9 @@ external/                 → Third-party source (git-subrepos via ingydotnet/gi
                             release-group version lives at
                             external/v2ray-plugin/version.toml.
 msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
+dmg-installer/            → macOS DMG signature checks (Python project: pytest harness
+                            asserting `Hole.app`'s codesign seal is internally consistent
+                            so quarantined downloads don't launch "damaged" — see #364)
 scripts/                  → Utility scripts (dev.py, network-reset.py, sign-release.py, ...)
 ui/                       → Frontend HTML/CSS/TypeScript (Vite)
 ```
@@ -478,6 +481,13 @@ the 7 assertion-target tests (`proxy_manager_tests`,
 
 ```sh
 cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build validation
+```
+
+### macOS installer
+
+```sh
+cargo xtask build hole-dmg            # build the .dmg (npx tauri build under the hood)
+cargo xtask run hole-dmg-tests        # mount + assert .app code signature is intact
 ```
 
 ## Releases

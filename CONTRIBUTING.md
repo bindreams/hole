@@ -25,6 +25,8 @@ At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebK
 | `xtask/`         | workspace task runner (`cargo xtask <build\|run\|list\|stage\|...>`) — see `build.yaml` |
 | `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                            |
 | `external/`      | Third-party source (git subrepos)                                                       |
+| `msi-installer/` | Windows MSI installer (Python project: thin wrapper around xtask + WiX)                 |
+| `dmg-installer/` | macOS DMG signature checks (Python project: pytest harness over the built `Hole.app`)   |
 | `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                     |
 
 ### Logging

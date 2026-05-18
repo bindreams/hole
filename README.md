@@ -23,6 +23,15 @@ Single-binary design — `hole` serves as both the Tauri GUI and the privileged 
 
 Communication happens over IPC (Unix socket on macOS, named pipe on Windows) using HTTP/1.1 REST (JSON).
 
+## Install
+
+**macOS first launch:** Hole is ad-hoc-signed but not yet notarized by Apple.
+On first launch after installing from the DMG, macOS will say "Hole cannot be
+opened because the developer cannot be verified." Right-click the app →
+**Open** → **Open** in the confirmation dialog. This is a one-time step per
+machine; subsequent launches work normally. Tracked for removal once Developer
+ID + notarization is in place (#365).
+
 ## Build
 
 Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E tests).
