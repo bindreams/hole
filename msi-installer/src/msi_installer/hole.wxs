@@ -32,6 +32,15 @@
          element is omitted; that made v0.1.0 unusable (#357). -->
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- ARP entry icon. Reads from .cache/icons/icon.ico (built by
+         crates/hole/build.rs) via the IconDir bindpath passed by the
+         Python builder. Id must end in .ico per Windows Installer
+         convention; the stored stream is named after the Id, so the
+         cached file under C:\Windows\Installer\{ProductCode}\ is named
+         hole.ico (not icon.ico). -->
+    <Icon Id="hole.ico" SourceFile="!(bindpath.IconDir)\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="hole.ico" />
+
     <!-- Installation directory structure -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="hole">

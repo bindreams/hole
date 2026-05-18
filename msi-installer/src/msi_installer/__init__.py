@@ -246,6 +246,7 @@ def wix_build(
     wix_exe: Path,
     wxs: Path,
     stage_dir: Path,
+    icon_dir: Path,
     license_dir: Path,
     version: str,
     output: Path,
@@ -262,6 +263,8 @@ def wix_build(
         str(ui_extension_path(wix_exe)),
         "-bindpath",
         f"BinDir={stage_dir}",
+        "-bindpath",
+        f"IconDir={icon_dir}",
         "-bindpath",
         f"LicenseDir={license_dir}",
         "-d",
@@ -339,11 +342,23 @@ def main() -> None:
         stage_dir = root / "target" / "release" / "installer-stage"
         stage_files(root, stage_dir, console)
 
+        # `cargo build` runs crates/hole/build.rs::generate_icons, which
+        # writes .cache/icons/icon.ico unconditionally on every build (see
+        # the unconditional contract in build.rs lines 90-95). Fail loud
+        # here if the contract is broken — a missing ICO would otherwise
+        # surface as a less obvious WiX bindpath error.
+        icon_dir = root / ".cache" / "icons"
+        if not (icon_dir / "icon.ico").exists():
+            raise BuildError(
+                f"missing {icon_dir / 'icon.ico'}; expected `cargo build` to have generated it. "
+                "Re-run `cargo build --release --workspace`."
+            )
+
         version = get_version(root)
         wix_exe = ensure_wix(root, console)
 
         output = root / "target" / "release" / "hole.msi"
-        wix_build(wix_exe, WXS_PATH, stage_dir, _PKG_DIR, version, output, console)
+        wix_build(wix_exe, WXS_PATH, stage_dir, icon_dir, _PKG_DIR, version, output, console)
 
         console.print(f"[bold green]Installer built:[/] {output}")
     except BuildError as e:
