@@ -345,6 +345,41 @@ jobs:
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
 
+  # Darwin-only counterpart to `test-installer`: build the DMG and run the
+  # signature-consistency tests in `dmg-installer/`. Catches issue #364 —
+  # an unsigned .app bundle that launches "damaged" under Gatekeeper
+  # quarantine. Always runs (no path filter) so this stays a stable
+  # required check on every PR.
+  test-dmg-signing:
+    name: Test DMG signing (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: darwin, arch: amd64, runner: macos-15-intel }
+          - { os: darwin, arch: arm64, runner: macos-latest }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: ./.github/actions/setup-build
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build DMG
+        run: cargo xtask build hole-dmg
+
+      - name: Test DMG signing
+        run: cargo xtask run hole-dmg-tests
+
   # Renovate npm safety gate: builds the Vite bundle (via `cargo xtask build
   # frontend-build`) and type-checks (via `cargo xtask run frontend-check`,
   # which does its own `npm ci` + `npm run check` — tsc reads source directly

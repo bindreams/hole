@@ -100,6 +100,14 @@ targets:
     platforms: [darwin/amd64, darwin/arm64]
     build: npx tauri build
 
+  hole-dmg-tests:
+    # Pytest harness that asserts the produced .app's code signature is
+    # internally consistent (sealed resources, no linker-signed-only Mach-Os,
+    # sidecar identifier rewritten). Guards against issue #364 regressing.
+    depends: hole-dmg
+    platforms: [darwin/amd64, darwin/arm64]
+    run: uv run --directory dmg-installer pytest -v
+
   frontend-build:
     # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-independent
     # output, so we run on the cheapest CI host (linux/amd64) only. The
