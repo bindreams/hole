@@ -112,17 +112,12 @@ jobs:
           ARCHIVE="v2ray-plugin-${OS}-${ARCH}-v${VERSION}.tar.gz"
           tar -czf "$ARCHIVE" -C "$STAGE_DIR" "$INNER"
           rm -r "$STAGE_DIR"
-
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256line"
           echo "Artifact: $ARCHIVE"
-          cat "${ARCHIVE}.sha256line"
 
       - uses: actions/upload-artifact@v7
         with:
           name: v2ray-plugin-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            v2ray-plugin-*.tar.gz
-            v2ray-plugin-*.tar.gz.sha256line
+          path: v2ray-plugin-*.tar.gz
 
   release:
     name: Create draft release
@@ -134,10 +129,14 @@ jobs:
           pattern: v2ray-plugin-*
           merge-multiple: true
 
-      - name: Assemble SHA256SUMS
+      # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
+      # text-mode regardless of which per-matrix runner built each
+      # artifact. Git-Bash sha256sum on Windows defaults to binary mode
+      # (asterisk marker), macOS defaults to text mode; hashing here
+      # avoids that divergence entirely. See #355.
+      - name: Compute SHA256SUMS
         run: |
-          cat *.sha256line > SHA256SUMS
-          rm *.sha256line
+          sha256sum v2ray-plugin-*.tar.gz > SHA256SUMS
 
           lines=$(wc -l < SHA256SUMS)
           if [ "$lines" -ne 6 ]; then

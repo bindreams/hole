@@ -112,7 +112,7 @@ jobs:
         shell: bash
         run: cargo xtask build ${{ inputs.build-target }}
 
-      - name: Rename artifact and compute SHA-256
+      - name: Rename artifact
         shell: bash
         env:
           OS: ${{ matrix.os }}
@@ -126,16 +126,12 @@ jobs:
           if [ "$OS" = "windows" ]; then EXT=".exe"; fi
           ASSET="${TRACK}-${VERSION}-${OS}-${ARCH}${EXT}"
           mv "target/release/${CRATE}${EXT}" "$ASSET"
-          sha256sum "$ASSET" > "${ASSET}.sha256line"
           echo "Artifact: $ASSET"
-          cat "${ASSET}.sha256line"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.track }}-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            ${{ inputs.track }}-*
-            ${{ inputs.track }}-*.sha256line
+          path: ${{ inputs.track }}-*
 
   release:
     name: Create draft release
@@ -147,10 +143,14 @@ jobs:
           pattern: ${{ inputs.track }}-*
           merge-multiple: true
 
-      - name: Assemble SHA256SUMS
+      # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
+      # text-mode regardless of which per-matrix runner built each
+      # artifact. Git-Bash sha256sum on Windows defaults to binary mode
+      # (asterisk marker), macOS defaults to text mode; hashing here
+      # avoids that divergence entirely. See #355.
+      - name: Compute SHA256SUMS
         run: |
-          cat *.sha256line > SHA256SUMS
-          rm *.sha256line
+          sha256sum ${{ inputs.track }}-* > SHA256SUMS
 
           lines=$(wc -l < SHA256SUMS)
           if [ "$lines" -ne ${{ inputs.expected-sha256sums-count }} ]; then
