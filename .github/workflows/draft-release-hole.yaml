@@ -83,8 +83,7 @@ jobs:
         shell: bash
         run: cargo xtask build "hole-${{ matrix.ext }}"
 
-      # Rename and hash
-      - name: Rename artifact and compute SHA-256
+      - name: Rename artifact
         shell: bash
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
@@ -95,20 +94,12 @@ jobs:
           else
             mv target/release/bundle/dmg/*.dmg "$ASSET"
           fi
-
-          # Git-Bash sha256sum defaults to binary mode (asterisk marker,
-          # single space); strip it so output matches the macOS text-mode
-          # format (two spaces). Hashing itself is still binary-correct.
-          sha256sum "$ASSET" | sed 's/ \*/  /' > "${ASSET}.sha256line"
           echo "Artifact: $ASSET"
-          cat "${ASSET}.sha256line"
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            hole-*.${{ matrix.ext }}
-            hole-*.${{ matrix.ext }}.sha256line
+          path: hole-*.${{ matrix.ext }}
 
   release:
     name: Create draft release
@@ -120,10 +111,14 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
-      - name: Assemble SHA256SUMS
+      # Hash on ubuntu (single platform) so SHA256SUMS is uniformly
+      # text-mode regardless of which per-matrix runner built each
+      # artifact. Git-Bash sha256sum on Windows defaults to binary mode
+      # (asterisk marker), macOS defaults to text mode; hashing here
+      # avoids that divergence entirely. See #355.
+      - name: Compute SHA256SUMS
         run: |
-          cat *.sha256line > SHA256SUMS
-          rm *.sha256line
+          sha256sum hole-* > SHA256SUMS
 
           lines=$(wc -l < SHA256SUMS)
           if [ "$lines" -ne 3 ]; then
