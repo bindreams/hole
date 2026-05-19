@@ -603,3 +603,5 @@ Source icons under `crates/hole/icons/` are split per platform:
 `TrayState::Disabled` currently aliases to `Enabled` — both resolve to the same bytes in [crates/hole/src/tray_icons.rs](crates/hole/src/tray_icons.rs). The enum is preserved so a designer-supplied disabled variant can drop in without API churn at call sites.
 
 The build script (`build.rs`) converts them automatically. Do not commit generated raster icons.
+
+`.cache/icons/icon.ico` is also bound by the MSI as `ARPPRODUCTICON` in [msi-installer/src/msi_installer/hole.wxs](msi-installer/src/msi_installer/hole.wxs) so the Add/Remove Programs entry matches the app icon (#359).

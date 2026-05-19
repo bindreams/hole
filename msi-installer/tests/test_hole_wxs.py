@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from conftest import NS
 
 # Known bind path variables passed via `-bindpath` to `wix build`.
-KNOWN_BINDPATHS = {"BinDir", "LicenseDir"}
+KNOWN_BINDPATHS = {"BinDir", "IconDir", "LicenseDir"}
 
 # Namespace for the WixUI extension elements (<ui:WixUI ...>).
 UI_NS = "http://wixtoolset.org/schemas/v4/wxs/ui"
@@ -103,16 +103,25 @@ def test_install_dir_is_64bit(package: ET.Element) -> None:
 
 BINDPATH_RE = re.compile(r"!\(bindpath\.(\w+)\)")
 
+# Elements that can bind a source path, mapped to the attribute they use.
+# <File> uses Source; <Icon> uses SourceFile. Add new entries here when
+# adding new source-bearing elements.
+_SOURCE_BEARING_ELEMENTS = {
+    "File": "Source",
+    "Icon": "SourceFile",
+}
+
 
 def test_file_sources_use_known_bindpaths(package: ET.Element) -> None:
-    for file_elem in package.iter(f"{{{NS['wix']}}}File"):
-        source = file_elem.get("Source", "")
-        for match in BINDPATH_RE.finditer(source):
-            var_name = match.group(1)
-            assert var_name in KNOWN_BINDPATHS, (
-                f"File '{file_elem.get('Id')}' uses unknown bindpath variable '{var_name}'. "
-                f"Known: {KNOWN_BINDPATHS}"
-            )
+    for tag, attr in _SOURCE_BEARING_ELEMENTS.items():
+        for elem in package.iter(f"{{{NS['wix']}}}{tag}"):
+            source = elem.get(attr, "")
+            for match in BINDPATH_RE.finditer(source):
+                var_name = match.group(1)
+                assert var_name in KNOWN_BINDPATHS, (
+                    f"<{tag} Id='{elem.get('Id')}'> uses unknown bindpath variable '{var_name}'. "
+                    f"Known: {KNOWN_BINDPATHS}"
+                )
 
 
 def test_wixvariable_values_use_known_bindpaths(package: ET.Element) -> None:
@@ -274,6 +283,29 @@ def test_major_upgrade_allows_same_version(package: ET.Element) -> None:
     assert mu.get("AllowSameVersionUpgrades") == "yes", (
         "MajorUpgrade must have AllowSameVersionUpgrades='yes' to handle "
         "reinstalls of the same version without creating duplicate entries"
+    )
+
+
+def test_arp_product_icon_defined(package: ET.Element) -> None:
+    """ARPPRODUCTICON must reference a declared <Icon> Id.
+
+    Without this property, Windows's Add/Remove Programs UI falls back
+    to a generic gray installer-box icon for the Hole entry (#359).
+    """
+    icon_ids = {icon.get("Id") for icon in package.iter(f"{{{NS['wix']}}}Icon")}
+    arp_property = None
+    for prop in package.iter(f"{{{NS['wix']}}}Property"):
+        if prop.get("Id") == "ARPPRODUCTICON":
+            arp_property = prop
+            break
+    assert arp_property is not None, (
+        "Missing <Property Id='ARPPRODUCTICON'>. Without it, the Add/Remove "
+        "Programs entry shows a generic installer icon (#359)."
+    )
+    value = arp_property.get("Value", "")
+    assert value in icon_ids, (
+        f"ARPPRODUCTICON value '{value}' does not match any declared <Icon Id=...>. "
+        f"Declared Icon Ids: {sorted(icon_ids)}"
     )
 
 
