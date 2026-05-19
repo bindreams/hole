@@ -111,7 +111,15 @@ targets:
   hole-dmg:
     # Same logic as hole-msi: tauri does its own `cargo build --release`. No
     # wintun dep on darwin (it doesn't apply to that platform).
-    depends: galoshes
+    #
+    # `frontend-build` is a dep so `node_modules/` (with `@tauri-apps/cli`)
+    # exists before `npx tauri build` runs — otherwise npx fails with "could
+    # not determine executable to run". Tauri then runs
+    # `beforeBuildCommand: "npm run build"` again (vite build executes
+    # twice — ~10-15s waste), but the redundancy keeps `npx tauri build`
+    # self-sufficient for ad-hoc developer use outside the orchestrator.
+    # See bindreams/hole#372.
+    depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build: npx tauri build
 
@@ -129,21 +137,24 @@ targets:
     # is a separate target — tsc reads source directly and produces no
     # artifact.
     #
-    # Listed on `hole-msi.depends` because msi-installer's
-    # `cargo build --release` does NOT honor Tauri's `beforeBuildCommand`
-    # (only `npx tauri build` does), so the frontend has to be built
-    # ahead of the Rust build. `hole-dmg` does NOT depend on us — it runs
-    # `npx tauri build`, which runs `npm run build` itself; double-running
-    # would waste ~10-15s per release build.
+    # Listed on `hole-msi.depends` AND `hole-dmg.depends`. For `hole-msi`:
+    # msi-installer's `cargo build --release` does NOT honor Tauri's
+    # `beforeBuildCommand` (only `npx tauri build` does), so the frontend
+    # has to be built ahead of the Rust build. For `hole-dmg`: `npx tauri
+    # build` needs `node_modules/` populated (with `@tauri-apps/cli`)
+    # before it can even start; the `npm ci` step here provides that.
+    # Tauri's own `beforeBuildCommand: "npm run build"` re-runs vite —
+    # ~10-15s waste — but we accept the redundancy to keep `npx tauri
+    # build` self-sufficient for ad-hoc dev use outside the orchestrator.
     #
     # `hole-msi` doesn't switch to `npx tauri build` because the WiX MSI
     # layout (custom-action install/uninstall, PATH munging, embedded
     # cabinets) doesn't fit Tauri's bundler output shape.
     #
-    # Platforms include `windows/amd64` so `cargo xtask build hole-msi`
-    # can satisfy the dependency locally and in release CI; linux/amd64
-    # stays because `frontend-check` runs there too.
-    platforms: [linux/amd64, windows/amd64]
+    # Platforms cover every host that builds hole: linux/amd64 keeps the
+    # Renovate `frontend-check` standalone path working, windows/amd64
+    # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
+    platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
     build:
       - npm ci --no-audit --no-fund
       - npm run build

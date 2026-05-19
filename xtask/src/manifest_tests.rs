@@ -696,7 +696,9 @@ fn frontend_build_target_shape() {
         t.platforms,
         vec![
             Platform::new(Os::Linux, Arch::Amd64),
-            Platform::new(Os::Windows, Arch::Amd64)
+            Platform::new(Os::Windows, Arch::Amd64),
+            Platform::new(Os::Darwin, Arch::Amd64),
+            Platform::new(Os::Darwin, Arch::Arm64),
         ]
     );
     assert_eq!(
