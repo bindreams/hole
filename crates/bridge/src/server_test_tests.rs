@@ -396,7 +396,7 @@ fn run_test_with_v2ray_plugin_happy_path() {
     if !plugin_path.is_file() {
         panic!(
             "v2ray-plugin not built at {plugin_path:?} — \
-             run 'cargo build --workspace' before 'cargo test'"
+             run 'cargo build --workspace --no-default-features' before 'cargo test'"
         );
     }
 

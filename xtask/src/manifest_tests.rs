@@ -627,7 +627,7 @@ fn clippy_hole_target_shape() {
     assert_eq!(
         t.run,
         vec![Step::Bash {
-            command: "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
+            command: "cargo clippy --workspace --all-targets --no-default-features -- -D warnings".to_string(),
             environment: HashMap::new(),
         }]
     );
@@ -692,7 +692,13 @@ fn frontend_build_target_shape() {
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
     let t = m.get("frontend-build").expect("frontend-build target missing");
 
-    assert_eq!(t.platforms, vec![Platform::new(Os::Linux, Arch::Amd64)]);
+    assert_eq!(
+        t.platforms,
+        vec![
+            Platform::new(Os::Linux, Arch::Amd64),
+            Platform::new(Os::Windows, Arch::Amd64)
+        ]
+    );
     assert_eq!(
         t.build,
         vec![

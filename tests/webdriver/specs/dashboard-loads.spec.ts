@@ -17,9 +17,10 @@ describe("Dashboard window", () => {
 
   it("renders the server-list container from the bundled DOM", async () => {
     // #server-list lives at ui/index.html:22 — present iff index.html was
-    // actually served from embedded assets.
+    // actually served from embedded assets. `waitForExist` throws on
+    // timeout, which is the actual assertion; the test name documents
+    // intent.
     const list = await $("#server-list");
     await list.waitForExist({ timeout: 5000 });
-    expect(await list.isExisting()).toBe(true);
   });
 });

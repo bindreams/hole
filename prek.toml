@@ -24,7 +24,12 @@ pass_filenames = false
 [[repos.hooks]]
 id = "cargo-clippy"
 name = "cargo clippy"
-entry = "cargo clippy --all-targets -- -D warnings"
+# `--no-default-features` is required to keep Tauri in dev mode for the
+# `hole` crate — production mode panics at compile time on missing
+# `ui/dist/` because `tauri/custom-protocol` triggers `tauri-codegen`'s
+# embed step. Production lint coverage runs under `clippy-hole` in CI
+# (which uses the same flag). See bindreams/hole#372.
+entry = "cargo clippy --all-targets --no-default-features -- -D warnings"
 language = "system"
 types = ["rust"]
 pass_filenames = false

@@ -234,13 +234,18 @@ jobs:
         shell: bash
         run: cargo xtask build hole-tests
 
+      # `--no-default-features` mirrors the `hole-tests` xtask target. Without
+      # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
+      # feature set → different fingerprint → fresh build), which expands
+      # `tauri::generate_context!()` in production mode and panics on
+      # missing `ui/dist/`. See bindreams/hole#372.
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
         env:
           SKULD_LABELS: "!tun"
         run: >
-          cargo nextest run
+          cargo nextest run --no-default-features
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
@@ -253,7 +258,7 @@ jobs:
         env:
           SKULD_LABELS: "tun"
         run: >
-          cargo nextest run
+          cargo nextest run --no-default-features
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
@@ -338,14 +343,15 @@ jobs:
       # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
       # after a fresh install. Tauri's single-instance plugin would route
       # tauri-driver's new launch into that already-running instance, so we
-      # need a clean slate. `Stop-Process -Force` is fire-and-forget; the
-      # `Start-Sleep` lets the OS release the handles before the E2E test
-      # spawns a fresh `hole.exe`.
+      # need a clean slate. `Stop-Process -Force` calls `TerminateProcess`
+      # synchronously; the subsequent `Wait-Process -ErrorAction Ignore`
+      # waits for the process object to be reaped without depending on a
+      # wall-clock delay.
       - name: Kill any running hole.exe (post-install LaunchApp)
         shell: pwsh
         run: |
           Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
-          Start-Sleep -Seconds 2
+          Wait-Process -Name hole -ErrorAction SilentlyContinue
 
       # Reuse the `node_modules/` left by `frontend-build` during
       # `cargo xtask build hole-msi`. WDIO is in devDependencies; the
@@ -414,12 +420,9 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - uses: ./.github/actions/setup-build
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version-file: package.json
-      - name: Install npm dependencies
-        run: npm install
-
+      # `npx tauri build` (under `hole-dmg`) runs `npm install` itself via
+      # `beforeBuildCommand` in tauri.conf.json. Node.js is provided by
+      # `setup-build` above. See bindreams/hole#372.
       - name: Build DMG
         run: cargo xtask build hole-dmg
 

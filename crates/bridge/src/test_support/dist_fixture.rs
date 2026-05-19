@@ -64,7 +64,7 @@ pub(crate) fn stage_dist_bin_dir() -> Result<PathBuf, String> {
             xtask::run_stage(Profile::Debug, &dist_bin).map_err(|e| {
                 format!(
                     "xtask::run_stage into {dist_bin:?} failed: {e}\n\
-                     (did you forget `cargo xtask deps && cargo build --workspace`?)"
+                     (did you forget `cargo xtask deps && cargo build --workspace --no-default-features`?)"
                 )
             })?;
             Ok(dist_bin)

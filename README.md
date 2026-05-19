@@ -41,14 +41,15 @@ Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E test
 # downloads + verifies wintun.dll on Windows). Cached after the first run.
 cargo xtask deps
 
-# Build all crates
-cargo build --workspace
+# Build all crates (Tauri dev mode — for production use `cargo xtask build hole-msi`
+# or `cargo xtask build hole-dmg`; see CLAUDE.md → Tauri dev/prod feature toggle).
+cargo build --workspace --no-default-features
 
 # Run GUI in dev mode
 npx tauri dev
 
 # Run all tests
-cargo test --workspace
+cargo test --workspace --no-default-features
 ```
 
 ## Project layout
@@ -96,8 +97,8 @@ Four independent release tracks, each tagged as
 Unit tests use the [skuld](https://github.com/bindreams/skuld) framework. Test files are siblings to their source files (`foo.rs` → `foo_tests.rs`).
 
 ```sh
-cargo test --workspace           # all unit tests
-npm run test:e2e                 # E2E tests (requires release build)
+cargo test --workspace --no-default-features   # all unit tests
+npm run test:e2e                                # E2E tests (requires release build)
 ```
 
 ## Emergency network reset

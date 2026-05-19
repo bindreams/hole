@@ -29,9 +29,12 @@ export const config: Options.Testrunner = {
   reporters: ["spec"],
 
   onPrepare() {
-    tauriDriver = spawn("tauri-driver", [], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Discard tauri-driver's stdio — keeping the pipes open would block
+    // tauri-driver if it ever writes more than the pipe buffer (~64 KB
+    // on Windows) without anyone reading. The WDIO/Mocha output already
+    // covers the test side; tauri-driver itself is rarely the failing
+    // piece.
+    tauriDriver = spawn("tauri-driver", [], { stdio: "ignore" });
   },
 
   onComplete() {

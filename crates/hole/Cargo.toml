@@ -34,7 +34,7 @@ harness = false
 [dependencies]
 hole-common = { path = "../common" }
 hole-bridge = { path = "../bridge" }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"

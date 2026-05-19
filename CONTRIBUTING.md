@@ -176,7 +176,7 @@ cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # per-
 
 `cargo xtask build hole` walks the `build.yaml` DAG: it builds v2ray-plugin
 (Go), galoshes (workspace member), downloads wintun on Windows, then runs
-`cargo build --workspace` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
+`cargo build --workspace --no-default-features` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
 table; `cargo xtask build --all` builds every target applicable to the host
 platform; `cargo xtask run <name>` builds and then performs the named
 target's `run:` action — running tests (`hole-tests`), linters
@@ -219,7 +219,7 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ## Testing
 
 ```sh
-cargo test --workspace
+cargo test --workspace --no-default-features
 ```
 
 ### Avoiding Windows Firewall prompts on every rebuild
@@ -249,7 +249,7 @@ When Windows CI fails with a timeout in `server_test_tests` or loopback connects
 
 1. **Grep the failing test output for `routing subprocesses` or `netsh|route add|route delete`.** The #165 fix added a regression test (`proxy_manager_tests_never_spawn_routing_subprocess`) that prints `"proxy_manager start/stop cycles spawned N routing subprocesses"` and asserts `N == 0`. If that assertion fires, a new code path has bypassed the `Routing` trait — find the new `Drop` impl or helper that calls the free `routing::setup_routes`/`teardown_routes` functions and route it through the trait. Clippy's `disallowed_methods` lint should have caught this at build time; if it didn't, the lint needs tightening.
 
-1. **Run `cargo clippy --workspace` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
+1. **Run `cargo clippy --workspace --no-default-features` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
 
 1. **Check for new `std::process::Command::new` calls in recent diffs to `crates/bridge/src/`.** Not covered by the clippy lint (too broad a ban would break platform/group.rs). Each new usage is a potential test-time subprocess leak.
 
