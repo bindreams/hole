@@ -42,6 +42,9 @@ fn fake_repo() -> tempfile::TempDir {
         fs::write(wintun.join("wintun.dll"), b"fake wintun").unwrap();
     }
 
+    // NOTICES.md — Apache-2.0 attribution shipped alongside the binary.
+    fs::write(root.join("NOTICES.md"), b"fake notices").unwrap();
+
     dir
 }
 
@@ -58,14 +61,20 @@ fn bindir_contains_expected_files() {
     #[cfg(target_os = "windows")]
     assert_eq!(
         names,
-        vec!["hole.exe", "v2ray-plugin.exe", "galoshes.exe", "wintun.dll"]
+        vec![
+            "hole.exe",
+            "v2ray-plugin.exe",
+            "galoshes.exe",
+            "wintun.dll",
+            "NOTICES.md"
+        ]
     );
 
     #[cfg(target_os = "macos")]
-    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes"]);
+    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes", "NOTICES.md"]);
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes"]);
+    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes", "NOTICES.md"]);
 }
 
 #[skuld::test]

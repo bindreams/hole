@@ -2,15 +2,21 @@
 
 <!--
   WiX installer for Hole.
-  Installs to [ProgramFiles64Folder]\hole\bin\, registers the bridge service,
-  and adds hole to the system PATH.
+  Installs to [ProgramFiles64Folder]\hole\bin\ (or user-chosen path),
+  registers the bridge service, and adds hole to the system PATH.
+
+  Interactive flow (WixUI_InstallDir + custom ShortcutsDlg):
+    Welcome → License (GPL-3.0) → InstallDir picker → Shortcuts → VerifyReady
+  Silent (/quiet) skips the UI; defaults preserve current behavior:
+    INSTALL_START_MENU=1, INSTALL_DESKTOP_ICON=0.
 
   Build:   cd msi-installer && uv run build
   Install: msiexec /i hole.msi
   Silent:  msiexec /i hole.msi /quiet
 -->
 
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
     Name="Hole"
     Manufacturer="Hole Project"
@@ -38,6 +44,60 @@
       <Directory Id="HoleMenuFolder" Name="Hole" />
     </StandardDirectory>
 
+    <!-- Desktop shortcut directory (system folder, not removed on uninstall). -->
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- UI properties driving the two shortcut checkboxes.
+         Secure="yes" lets the public properties flow from the UI sequence to
+         the deferred execute sequence where component conditions are evaluated.
+         Defaults are picked for fresh installs:
+           INSTALL_START_MENU=1   → typical consumer-app default.
+           INSTALL_DESKTOP_ICON=0 → no desktop icon unless the user opts in. -->
+    <Property Id="INSTALL_START_MENU" Value="1" Secure="yes" />
+    <Property Id="INSTALL_DESKTOP_ICON" Value="0" Secure="yes" />
+
+    <!-- Sticky preferences across silent auto-update (#363).
+         The auto-updater runs `msiexec /quiet` with no property overrides, so
+         without preserving the prior choice the upgrade would silently undo
+         whatever the user picked. Each shortcut component writes "1" to its
+         HKCU KeyPath regkey iff installed; RegistrySearch returns that value
+         (or leaves the property unset). SetProperty then overrides the public
+         default to match the prior choice — only on upgrades, so fresh
+         installs keep the defaults above.
+         AppSearch (where RegistrySearch fires) runs in the immediate sequence
+         BEFORE RemoveExistingProducts removes the old install, so the prior
+         regkeys are still readable. -->
+    <Property Id="HOLE_START_MENU_INSTALLED">
+      <RegistrySearch Id="StartMenuPresent" Root="HKCU" Key="Software\Hole"
+                      Name="Installed" Type="raw" />
+    </Property>
+    <Property Id="HOLE_DESKTOP_INSTALLED">
+      <RegistrySearch Id="DesktopPresent" Root="HKCU" Key="Software\Hole"
+                      Name="DesktopShortcutInstalled" Type="raw" />
+    </Property>
+
+    <!-- Start Menu: default 1; if prior upgrade-detected install LACKED the
+         regkey, the user unchecked it last time → override to 0. -->
+    <SetProperty Id="INSTALL_START_MENU" Value="0" After="AppSearch"
+                 Condition="WIX_UPGRADE_DETECTED AND NOT HOLE_START_MENU_INSTALLED" />
+    <!-- Desktop: default 0; if prior upgrade-detected install HAD the regkey,
+         the user checked it last time → override to 1. -->
+    <SetProperty Id="INSTALL_DESKTOP_ICON" Value="1" After="AppSearch"
+                 Condition="WIX_UPGRADE_DETECTED AND HOLE_DESKTOP_INSTALLED" />
+
+    <!-- License RTF resolved from the build-time LicenseDir bindpath.
+         Source: https://www.gnu.org/licenses/gpl-3.0.rtf
+         SHA256: a348e35edada9240ed21b1249e79be20ddac0184714773c7d0b02b7156fc642c
+         The file is committed byte-for-byte identical to upstream so the SHA256
+         remains verifiable. To refresh, re-download and update this hash. -->
+    <WixVariable Id="WixUILicenseRtf" Value="!(bindpath.LicenseDir)\license.rtf" />
+
+    <!-- Activate the WixUI_InstallDir dialog set (Welcome → License → InstallDir
+         → VerifyReady → Progress → Exit). InstallDirectory= binds the picker
+         to INSTALLFOLDER. ShortcutsDlg is injected between InstallDirDlg and
+         VerifyReadyDlg by the <UI> fragment at the bottom of this file. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
     <!-- Main component: binaries -->
     <ComponentGroup Id="BinaryComponents" Directory="BINDIR">
       <Component Id="HoleExe" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
@@ -49,11 +109,19 @@
       <Component Id="WintunDll" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
         <File Id="wintun.dll" Source="!(bindpath.BinDir)\wintun.dll" KeyPath="yes" />
       </Component>
+      <!-- NOTICES.md preserves Apache-2.0 §4(d) attribution for the bundled
+           galoshes/garter components. The License dialog only displays GPL-3.0
+           text; the NOTICE file must accompany the binaries on disk. -->
+      <Component Id="NoticesMd" Guid="F6A7B8C9-D0E1-2345-F012-456789012345">
+        <File Id="NOTICES.md" Source="!(bindpath.BinDir)\NOTICES.md" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
-    <!-- Start Menu shortcut -->
+    <!-- Start Menu shortcut. Conditioned on INSTALL_START_MENU; component GUID
+         unchanged across versions so MajorUpgrade refcounts the regkey cleanly. -->
     <ComponentGroup Id="ShortcutComponents" Directory="HoleMenuFolder">
-      <Component Id="StartMenuShortcut" Guid="D4E5F6A7-B8C9-0123-DEF0-234567890123">
+      <Component Id="StartMenuShortcut" Guid="D4E5F6A7-B8C9-0123-DEF0-234567890123"
+                 Condition="INSTALL_START_MENU=&quot;1&quot;">
         <Shortcut
           Id="HoleShortcut"
           Name="Hole"
@@ -69,6 +137,38 @@
           KeyPath="yes" />
       </Component>
     </ComponentGroup>
+
+    <!-- Desktop shortcut. Conditioned on INSTALL_DESKTOP_ICON. Distinct registry
+         Name from StartMenuShortcut so each component owns its own HKCU KeyPath
+         (otherwise both components share Software\Hole\Installed and only one
+         can be uninstalled cleanly). No RemoveFolder — DesktopFolder is a system
+         directory we do not own. -->
+    <ComponentGroup Id="DesktopShortcutComponents" Directory="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="E5F6A7B8-C9D0-1234-EF01-345678901234"
+                 Condition="INSTALL_DESKTOP_ICON=&quot;1&quot;">
+        <Shortcut
+          Id="HoleDesktopShortcut"
+          Name="Hole"
+          Target="[BINDIR]hole.exe"
+          WorkingDirectory="BINDIR" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Hole"
+          Name="DesktopShortcutInstalled"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Single hidden feature wrapping all component groups. WixUI_InstallDir
+         expects a Feature to bind to; without one some dialog branches in the
+         set (e.g. CustomizeDlg if ever activated) fail at runtime. -->
+    <Feature Id="Main" Title="Hole" Level="1" AllowAbsent="no" Display="hidden">
+      <ComponentGroupRef Id="BinaryComponents" />
+      <ComponentGroupRef Id="ShortcutComponents" />
+      <ComponentGroupRef Id="DesktopShortcutComponents" />
+    </Feature>
 
     <!-- Custom actions: bridge install/uninstall + PATH add/remove.
          Uses FileRef (Type 18) to reference hole.exe by its File ID,
@@ -136,6 +236,60 @@
       <Custom Action="LaunchApp" After="InstallFinalize"
         Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE AND NOT SUPPRESS_LAUNCH" />
     </InstallExecuteSequence>
+
+    <!-- ShortcutsDlg: custom dialog inserted between InstallDirDlg and
+         VerifyReadyDlg via Publish-event overrides. Layout mirrors upstream
+         InstallDirDlg (banner, title, description, three buttons).
+
+         Override-Order rationale (verified against WiX v6.0.2 source):
+           InstallDirDlg.Next: upstream Order=4 NewDialog→VerifyReadyDlg, no
+             condition. Our Order=5 NewDialog→ShortcutsDlg fires later and wins.
+           VerifyReadyDlg.Back: upstream Order=1 NewDialog→InstallDirDlg with
+             Condition="NOT Installed". Our Order=3 NewDialog→ShortcutsDlg with
+             same condition fires later and wins. -->
+    <UI>
+      <Dialog Id="ShortcutsDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17"
+                 Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17"
+                 Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15"
+                 Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15"
+                 Transparent="yes" NoPrefix="yes" Text="Choose which shortcuts to create." />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="373" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="373" Height="0" />
+
+        <Control Id="StartMenuCheckBox" Type="CheckBox" X="20" Y="70" Width="290" Height="17"
+                 Property="INSTALL_START_MENU" CheckBoxValue="1"
+                 Text="Create &amp;Start Menu shortcut" />
+        <Control Id="DesktopCheckBox" Type="CheckBox" X="20" Y="95" Width="290" Height="17"
+                 Property="INSTALL_DESKTOP_ICON" CheckBoxValue="1"
+                 Text="Create &amp;Desktop icon" />
+      </Dialog>
+
+      <!-- Inject ShortcutsDlg between InstallDirDlg and VerifyReadyDlg.
+           Order=5 beats upstream's Order=4 NewDialog→VerifyReadyDlg. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog"
+               Value="ShortcutsDlg" Order="5" />
+
+      <!-- ShortcutsDlg navigation (no upstream rows to override). -->
+      <Publish Dialog="ShortcutsDlg" Control="Back" Event="NewDialog"
+               Value="InstallDirDlg" Order="1" />
+      <Publish Dialog="ShortcutsDlg" Control="Next" Event="NewDialog"
+               Value="VerifyReadyDlg" Order="1" />
+
+      <!-- Order=3 beats upstream's Order=1 (NOT Installed → InstallDirDlg). -->
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog"
+               Value="ShortcutsDlg" Order="3" Condition="NOT Installed" />
+    </UI>
 
   </Package>
 </Wix>

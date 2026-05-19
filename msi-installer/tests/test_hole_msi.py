@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import msi_installer
 from conftest import NS, WXS_PATH
 
 pytestmark = [
@@ -30,14 +31,27 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     relocated-extract test (#357) has files to find post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
-    for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll"):
+    for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"):
         (d / name).write_bytes(b"x" * 1024)
     return d
 
 
 @pytest.fixture(scope="session")
-def built_msi(wix_exe: Path, staged_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build an MSI from hole.wxs with dummy binaries."""
+def stub_license_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Minimal RTF for the WixUI License dialog. The real license.rtf is not under test."""
+    d = tmp_path_factory.mktemp("license")
+    (d / "license.rtf").write_bytes(b"{\\rtf1\\ansi Test license\\par}")
+    return d
+
+
+@pytest.fixture(scope="session")
+def built_msi(
+    wix_exe: Path,
+    staged_dir: Path,
+    stub_license_dir: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Build an MSI from hole.wxs with dummy binaries and a stub license."""
     out_dir = tmp_path_factory.mktemp("msi")
     msi_path = out_dir / "hole.msi"
     result = subprocess.run(
@@ -47,8 +61,12 @@ def built_msi(wix_exe: Path, staged_dir: Path, tmp_path_factory: pytest.TempPath
             str(WXS_PATH),
             "-arch",
             "x64",
+            "-ext",
+            str(msi_installer.ui_extension_path(wix_exe)),
             "-bindpath",
             f"BinDir={staged_dir}",
+            "-bindpath",
+            f"LicenseDir={stub_license_dir}",
             "-d",
             "ProductVersion=1.0.0",
             "-o",
@@ -247,9 +265,118 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
-    extracted = {
-        p.name
-        for p in extract_dir.rglob("*") if p.is_file() and p.name in {"hole.exe", "v2ray-plugin.exe", "wintun.dll"}
-    }
-    assert extracted == {"hole.exe", "v2ray-plugin.exe",
-                         "wintun.dll"}, (f"MSI extracted but expected payload missing: got {extracted}")
+    payload_files = {"hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"}
+    extracted = {p.name for p in extract_dir.rglob("*") if p.is_file() and p.name in payload_files}
+    assert extracted == payload_files, (f"MSI extracted but expected payload missing: got {extracted}")
+
+
+# UI property + dialog tests ===========================================================================================
+
+
+def _decompiled_package(tree: ET.ElementTree) -> ET.Element:
+    pkg = tree.getroot().find("wix:Package", NS)
+    assert pkg is not None
+    return pkg
+
+
+def _find_property(pkg: ET.Element, prop_id: str) -> ET.Element | None:
+    for prop in pkg.iter(f"{{{NS['wix']}}}Property"):
+        if prop.get("Id") == prop_id:
+            return prop
+    return None
+
+
+def test_decompiled_has_install_start_menu_default(decompiled_tree: ET.ElementTree) -> None:
+    pkg = _decompiled_package(decompiled_tree)
+    prop = _find_property(pkg, "INSTALL_START_MENU")
+    assert prop is not None, "INSTALL_START_MENU property missing from built MSI"
+    assert prop.get("Value") == "1", (
+        f"INSTALL_START_MENU default must be '1' (silent-upgrade safety); "
+        f"got '{prop.get('Value')}'"
+    )
+
+
+def test_decompiled_has_install_desktop_icon_default(decompiled_tree: ET.ElementTree) -> None:
+    pkg = _decompiled_package(decompiled_tree)
+    prop = _find_property(pkg, "INSTALL_DESKTOP_ICON")
+    assert prop is not None, "INSTALL_DESKTOP_ICON property missing from built MSI"
+    assert prop.get("Value") == "0", (
+        f"INSTALL_DESKTOP_ICON default must be '0' (silent-upgrade safety); "
+        f"got '{prop.get('Value')}'"
+    )
+
+
+def test_decompiled_has_shortcutsdlg(decompiled_tree: ET.ElementTree) -> None:
+    pkg = _decompiled_package(decompiled_tree)
+    for dlg in pkg.iter(f"{{{NS['wix']}}}Dialog"):
+        if dlg.get("Id") == "ShortcutsDlg":
+            return
+    raise AssertionError("Dialog 'ShortcutsDlg' missing from built MSI")
+
+
+# UI override-wins tests ===============================================================================================
+#
+# `wix msi decompile` lowers MSI ControlEvent rows to nested <Publish>
+# children under each Control. The order in which rows fire — the MSI Order
+# column ascending — is preserved as XML document order. For NewDialog, the
+# LAST row with a true condition wins (each fired Publish sets the new
+# dialog, last writer wins). So "our override beats upstream" is structurally
+# equivalent to "the last NewDialog <Publish> under (Dialog/Control) has our
+# target as Value".
+
+
+def _new_dialog_targets(pkg: ET.Element, dialog_id: str, control_id: str, condition: str | None = None) -> list[str]:
+    """Return Value of every NewDialog <Publish> under (dialog_id/control_id), in document order.
+
+    If `condition` is set, only rows whose Condition matches are returned.
+    """
+    targets: list[str] = []
+    for dlg in pkg.iter(f"{{{NS['wix']}}}Dialog"):
+        if dlg.get("Id") != dialog_id:
+            continue
+        for ctrl in dlg.iter(f"{{{NS['wix']}}}Control"):
+            if ctrl.get("Id") != control_id:
+                continue
+            for pub in ctrl.iter(f"{{{NS['wix']}}}Publish"):
+                if pub.get("Event") != "NewDialog":
+                    continue
+                if condition is not None and pub.get("Condition") != condition:
+                    continue
+                targets.append(pub.get("Value", ""))
+    return targets
+
+
+def test_installdirdlg_next_override_wins(decompiled_tree: ET.ElementTree) -> None:
+    """The last NewDialog row for (InstallDirDlg, Next) must target ShortcutsDlg.
+
+    Load-bearing: if upstream's row to VerifyReadyDlg fires last, the user
+    skips ShortcutsDlg entirely. This is the structural check that our
+    Order=5 override actually wins at MSI runtime.
+    """
+    pkg = _decompiled_package(decompiled_tree)
+    targets = _new_dialog_targets(pkg, "InstallDirDlg", "Next")
+    assert targets, "No NewDialog Publish rows for (InstallDirDlg, Next) in built MSI"
+    assert targets[-1] == "ShortcutsDlg", (
+        f"Last NewDialog row for (InstallDirDlg, Next) is '{targets[-1]}', not 'ShortcutsDlg'. "
+        f"Full sequence (document order = MSI Order asc): {targets}. "
+        "MSI runtime fires rows in Order asc and the last true condition wins; "
+        "if our override doesn't appear last, ShortcutsDlg will be skipped."
+    )
+
+
+def test_verifyreadydlg_back_override_wins(decompiled_tree: ET.ElementTree) -> None:
+    """The last (NOT Installed) NewDialog row for (VerifyReadyDlg, Back) must target ShortcutsDlg.
+
+    Load-bearing: this is what makes the Back button on VerifyReadyDlg lead
+    back to ShortcutsDlg instead of skipping it.
+    """
+    pkg = _decompiled_package(decompiled_tree)
+    targets = _new_dialog_targets(pkg, "VerifyReadyDlg", "Back", condition="NOT Installed")
+    assert targets, (
+        "No NewDialog Publish rows with Condition='NOT Installed' for "
+        "(VerifyReadyDlg, Back) in built MSI"
+    )
+    assert targets[-1] == "ShortcutsDlg", (
+        f"Last NewDialog row (Condition='NOT Installed') for (VerifyReadyDlg, Back) is "
+        f"'{targets[-1]}', not 'ShortcutsDlg'. Full sequence: {targets}."
+    )

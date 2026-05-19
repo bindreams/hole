@@ -213,10 +213,44 @@ def find_wix_exe(base_dir: Path) -> Path | None:
     return next(base_dir.rglob("wix.exe"), None)
 
 
+def ui_extension_path(wix_exe: Path) -> Path:
+    """Resolve the WixToolset.UI.wixext.dll bundled with the WiX toolchain.
+
+    The UI extension ships inside wix-cli-x64.msi and is admin-extracted by
+    ensure_wix() into a deterministic layout. The four .parent traversals walk
+    bin -> "WiX Toolset v6.0" -> PFiles64 -> wix-v<ver>, landing on cache_root:
+
+        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin/wix.exe
+        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin
+        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0
+        .parent x 3     = <cache>/wix-v<ver>/PFiles64
+        .parent x 4     = <cache>/wix-v<ver>                    <- cache_root
+        UI extension    = cache_root/CFiles64/WixToolset/extensions/
+                              WixToolset.UI.wixext/<ver>/wixext6/WixToolset.UI.wixext.dll
+    """
+    cache_root = wix_exe.parent.parent.parent.parent
+    version = cache_root.name.removeprefix("wix-v")
+    dll = (
+        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / "wixext6" /
+        "WixToolset.UI.wixext.dll"
+    )
+    if not dll.exists():
+        raise BuildError(f"WiX UI extension DLL not found at {dll}")
+    return dll
+
+
 # WiX build ============================================================================================================
 
 
-def wix_build(wix_exe: Path, wxs: Path, stage_dir: Path, version: str, output: Path, console: Console) -> None:
+def wix_build(
+    wix_exe: Path,
+    wxs: Path,
+    stage_dir: Path,
+    license_dir: Path,
+    version: str,
+    output: Path,
+    console: Console,
+) -> None:
     console.print(f"[bold]Building MSI installer[/] (version {version})")
     result = subprocess.run([
         str(wix_exe),
@@ -224,8 +258,12 @@ def wix_build(wix_exe: Path, wxs: Path, stage_dir: Path, version: str, output: P
         str(wxs),
         "-arch",
         "x64",
+        "-ext",
+        str(ui_extension_path(wix_exe)),
         "-bindpath",
         f"BinDir={stage_dir}",
+        "-bindpath",
+        f"LicenseDir={license_dir}",
         "-d",
         f"ProductVersion={version}",
         "-o",
@@ -305,7 +343,7 @@ def main() -> None:
         wix_exe = ensure_wix(root, console)
 
         output = root / "target" / "release" / "hole.msi"
-        wix_build(wix_exe, WXS_PATH, stage_dir, version, output, console)
+        wix_build(wix_exe, WXS_PATH, stage_dir, _PKG_DIR, version, output, console)
 
         console.print(f"[bold green]Installer built:[/] {output}")
     except BuildError as e:
