@@ -60,6 +60,26 @@ fn launch_gui(show_dashboard: bool) {
     let _log_guard = logging::init(&log_dir);
 
     tauri::Builder::default()
+        // `tauri-plugin-single-instance` must be registered first per
+        // upstream guidance: the duplicate-instance process exits during
+        // this plugin's init, so any plugin registered earlier would do
+        // startup work in vain (and `tauri-plugin-autostart::init` touches
+        // the Windows registry / macOS LaunchAgent plist, which would race
+        // against the live first instance). The callback fires on a
+        // plugin-owned thread; `WebviewWindowBuilder::build` and Cocoa UI
+        // work require the main thread, so dispatch via
+        // `run_on_main_thread`. `argv` and `cwd` are intentionally ignored
+        // — whether the user typed `hole`, `hole --show-dashboard`, or
+        // double-clicked the desktop shortcut, the only useful response
+        // is to reveal the existing UI (same as a tray click). See #360.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let handle = app.clone();
+            if let Err(e) = app.run_on_main_thread(move || {
+                tray::open_settings_window(&handle);
+            }) {
+                tracing::warn!(error = %e, "single-instance: failed to dispatch to main thread");
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
