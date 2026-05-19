@@ -316,6 +316,52 @@ jobs:
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
 
+      # WebDriverIO smoke test against the INSTALLED binary, gating
+      # bindreams/hole#372 (dashboard loads bundled frontend, not the
+      # WebView2 "localhost refused" error page).
+      #
+      # tauri-driver is installed via `cargo install`; the cargo registry
+      # cache + sccache from setup-build keep this fast across runs.
+      # `--locked` and a pinned version guard against flakes from
+      # unrelated bumps in the tauri-driver crate.
+      - name: Install tauri-driver
+        run: cargo install --locked --version 2.0.6 tauri-driver
+
+      # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver.
+      # The windows-latest runner image documents msedgedriver's location
+      # via the `EDGEWEBDRIVER` env var; prepend it so tauri-driver finds
+      # it without hard-coded paths.
+      - name: Prepend EDGEWEBDRIVER to PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value $env:EDGEWEBDRIVER
+
+      # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
+      # after a fresh install. Tauri's single-instance plugin would route
+      # tauri-driver's new launch into that already-running instance, so we
+      # need a clean slate. `Stop-Process -Force` is fire-and-forget; the
+      # `Start-Sleep` lets the OS release the handles before the E2E test
+      # spawns a fresh `hole.exe`.
+      - name: Kill any running hole.exe (post-install LaunchApp)
+        shell: pwsh
+        run: |
+          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+
+      # Reuse the `node_modules/` left by `frontend-build` during
+      # `cargo xtask build hole-msi`. WDIO is in devDependencies; the
+      # configured `tauri:options.application` is overridden via env var
+      # to point at the installed binary, not the workspace's release.
+      - name: E2E dashboard test
+        env:
+          HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
+        run: npm run test:e2e
+
+      - name: Kill hole.exe after E2E
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
+
       - name: Dump install log on failure
         if: failure()
         shell: pwsh

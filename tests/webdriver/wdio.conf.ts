@@ -16,7 +16,8 @@ export const config: Options.Testrunner = {
   capabilities: [
     {
       "tauri:options": {
-        application: path.resolve(__dirname, "../../target/release/hole.exe"),
+        application: process.env.HOLE_TEST_APP_PATH ?? path.resolve(__dirname, "../../target/release/hole.exe"),
+        args: ["--show-dashboard"],
       },
     } as any,
   ],

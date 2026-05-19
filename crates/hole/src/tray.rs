@@ -712,7 +712,14 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
         .min_inner_size(800.0, 200.0)
         .max_inner_size(800.0, 4096.0)
         .resizable(true)
-        .maximizable(false);
+        .maximizable(false)
+        // F12 → open WebView2 devtools, via Wry's `browser_accelerator_keys`
+        // (default = true). Enabled unconditionally — including in release
+        // MSI — so end users can self-diagnose webview issues (#372 had to
+        // be reproduced blind because devtools were off). Side effect:
+        // WebView2's default right-click context menu (Inspect / Reload /
+        // View Source) becomes accessible.
+        .devtools(true);
 
     // Menu bar (all platforms) ----------------------------------------------------------------------------------------
     {
