@@ -6,6 +6,12 @@ let tauriDriver: ChildProcess;
 
 export const config: Options.Testrunner = {
   runner: "local",
+  // tauri-driver listens on 127.0.0.1:4444 (its default). wdio MUST know
+  // this — without `hostname`+`port`, it tries to spawn a real browser
+  // session and fails with "No browserName defined in capabilities". See
+  // bindreams/hole#372.
+  hostname: "127.0.0.1",
+  port: 4444,
   autoCompileOpts: {
     tsNodeOpts: {
       project: path.join(__dirname, "tsconfig.json"),
