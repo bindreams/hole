@@ -18,6 +18,11 @@
   ],
   "packageRules": [
     {
+      "description": "Don't update vendored upstream CI under external/*/.circleci/. We don't run it; subrepo pulls overwrite any edits.",
+      "matchFileNames": ["external/*/.circleci/**"],
+      "enabled": false
+    },
+    {
       "description": "Group GitHub Actions updates",
       "matchManagers": ["github-actions"],
       "groupName": "github-actions",
