@@ -1,7 +1,6 @@
 // Bridge installation status detection and privilege elevation.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
 use thiserror::Error;
 
 // Status detection ====================================================================================================
@@ -35,14 +34,70 @@ pub fn bridge_install_status() -> BridgeInstallStatus {
 pub enum SetupError {
     #[error("user cancelled the elevation prompt")]
     Cancelled,
-    #[error("elevated process failed with exit code {0}")]
-    #[allow(dead_code)] // Used on macOS
-    ExitCode(i32),
+    #[error("{}", format_exit_code_error(*code, output, log_path.as_deref()))]
+    ExitCode {
+        code: i32,
+        output: String,
+        log_path: Option<PathBuf>,
+    },
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[cfg(target_os = "windows")]
     #[error("windows error: {0}")]
     Windows(#[from] windows::core::Error),
+}
+
+fn format_exit_code_error(code: i32, output: &str, log_path: Option<&Path>) -> String {
+    let mut s = format!("elevated process exited with code {code}");
+    if !output.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(output);
+    }
+    if let Some(p) = log_path {
+        if output.is_empty() {
+            s.push_str("\n\n");
+        } else if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("Full log: ");
+        s.push_str(&p.display().to_string());
+    }
+    s
+}
+
+/// Maximum number of bytes from the elevated child's log to embed in a
+/// `SetupError::ExitCode` dialog. The full file is still detached on disk
+/// (its path goes into the dialog as `Full log: <path>`), so support can
+/// pull the rest if needed.
+const DIALOG_OUTPUT_BUDGET: usize = 3 * 1024;
+const ELLIPSIS_PREFIX: &str = "...\n";
+
+/// Trim `s` to roughly `DIALOG_OUTPUT_BUDGET` bytes for inclusion in a
+/// message dialog. Cuts on a line boundary when possible (so the truncated
+/// view doesn't start mid-line), falls back to a char-boundary byte cut
+/// when no newline is available within the budget, and prefixes `...\n` on
+/// any truncation. Returns the input unchanged when already within budget.
+pub(crate) fn truncate_for_dialog(s: &str) -> String {
+    if s.len() <= DIALOG_OUTPUT_BUDGET {
+        return s.to_string();
+    }
+    // Take last DIALOG_OUTPUT_BUDGET bytes, then advance to next char
+    // boundary so we never split a UTF-8 sequence.
+    let mut start = s.len() - DIALOG_OUTPUT_BUDGET;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &s[start..];
+    // Skip the (likely partial) first line if a newline exists in the
+    // tail — gives the user complete lines only.
+    let body = match tail.find('\n') {
+        Some(nl) => &tail[nl + 1..],
+        None => tail,
+    };
+    let mut out = String::with_capacity(ELLIPSIS_PREFIX.len() + body.len());
+    out.push_str(ELLIPSIS_PREFIX);
+    out.push_str(body);
+    out
 }
 
 /// Resolve the path to the bridge binary (which is ourselves).
@@ -54,11 +109,20 @@ pub fn bridge_binary_path() -> std::io::Result<PathBuf> {
 
 /// Run a command with elevated privileges.
 ///
+/// On non-success, returns `Err(SetupError::ExitCode { code, output, log_path })`.
+/// `output` carries whatever diagnostic stdio the platform allows
+/// capturing without a co-operating child (osascript stderr on macOS;
+/// empty on Windows because UAC strips inheritable stdio handles). The
+/// elevated-install path layered above this in
+/// [`prompt_bridge_install`] augments the result with the temp-log it
+/// passes via `--log-dir`.
+///
 /// On Windows, uses `ShellExecuteExW` with the "runas" verb (UAC prompt).
 /// On macOS, uses `osascript` with `with administrator privileges`.
 #[cfg(target_os = "windows")]
-pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupError> {
+pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     use std::os::windows::process::ExitStatusExt;
+    use std::process::ExitStatus;
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
@@ -105,7 +169,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
     // process handle. WaitForSingleObject blocks until the process exits.
     // GetExitCodeProcess reads the exit code into a stack-local u32.
     // CloseHandle is called exactly once on all paths, releasing the handle.
-    unsafe {
+    let exit_status: ExitStatus = unsafe {
         let wait_result = WaitForSingleObject(handle, INFINITE);
         if wait_result != WAIT_OBJECT_0 {
             let _ = CloseHandle(handle);
@@ -116,8 +180,23 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
         GetExitCodeProcess(handle, &mut exit_code)?;
         let _ = CloseHandle(handle);
 
-        Ok(ExitStatus::from_raw(exit_code))
+        ExitStatus::from_raw(exit_code)
+    };
+
+    if exit_status.success() {
+        return Ok(());
     }
+
+    let code = exit_status.code().unwrap_or(1);
+    // ShellExecuteExW cannot redirect child stdio under UAC; no captured
+    // output available here. Callers that need diagnostics pass a path
+    // via a co-operating CLI flag (e.g. `bridge install --log-dir`) and
+    // read it back themselves — see `prompt_bridge_install`.
+    Err(SetupError::ExitCode {
+        code,
+        output: String::new(),
+        log_path: None,
+    })
 }
 
 /// Quote a single argument per the MSDN `CommandLineToArgvW` specification.
@@ -201,9 +280,13 @@ fn cmdline_roundtrips(cmdline: &str, expected: &[&str]) -> bool {
 
 /// Run a command with elevated privileges.
 ///
-/// On macOS, uses `osascript` with `with administrator privileges`.
+/// On macOS, uses `osascript` with `with administrator privileges`. On
+/// non-success, captures osascript's stderr (truncated for dialog
+/// display) — that's the only diagnostic channel guaranteed available
+/// without a co-operating child. For richer diagnostics
+/// see [`prompt_bridge_install`], which layers a temp-log capture on top.
 #[cfg(target_os = "macos")]
-pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupError> {
+pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     // Build the shell command with proper escaping
     let mut cmd_parts = vec![shell_escape(program.to_string_lossy().as_ref())];
     for arg in args {
@@ -218,15 +301,26 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<ExitStatus, SetupEr
 
     let output = std::process::Command::new("osascript").args(["-e", &script]).output()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") {
-            return Err(SetupError::Cancelled);
-        }
-        return Err(SetupError::ExitCode(output.status.code().unwrap_or(1)));
+    if output.status.success() {
+        return Ok(());
     }
 
-    Ok(output.status)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("User canceled") {
+        return Err(SetupError::Cancelled);
+    }
+
+    let code = output.status.code().unwrap_or(1);
+    let captured = if stderr.trim().is_empty() {
+        String::new()
+    } else {
+        truncate_for_dialog(stderr.trim())
+    };
+    Err(SetupError::ExitCode {
+        code,
+        output: captured,
+        log_path: None,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -238,8 +332,26 @@ fn shell_escape(s: &str) -> String {
 // Install/uninstall orchestration =====================================================================================
 
 /// Run `bridge install` — idempotent, handles upgrades.
-pub fn install_bridge() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `repair_user_data_dir` is the path to a (possibly root-owned-by-mistake)
+/// user data directory that the GUI wants the elevated install to reclaim
+/// for the invoking user before doing anything else. Best-effort on macOS;
+/// no-op everywhere else.
+pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let binary_path = bridge_binary_path()?;
+
+    // Reclaim ownership of an existing user data dir if the GUI asked us to.
+    // Runs before everything else so the rest of the install can write into
+    // user-home subdirs as needed (and so that even a crash mid-install
+    // leaves the user with a healthy data dir for the next attempt).
+    if let Some(path) = repair_user_data_dir {
+        #[cfg(target_os = "macos")]
+        repair::run(path);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path; // suppress unused on non-macOS
+        }
+    }
 
     // Create access group, add installing user, and (on Windows) write the
     // installer SID file so the bridge includes it in the socket DACL on
@@ -285,40 +397,12 @@ pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// GUI launch check ====================================================================================================
+// GUI install prompt ==================================================================================================
 
-/// Check bridge status at GUI launch and prompt for installation if needed.
-///
-/// This runs asynchronously to avoid blocking the Tauri event loop.
-pub fn check_bridge_on_launch(app: tauri::AppHandle) {
-    // In dev mode (HOLE_BRIDGE_SOCKET set), the bridge runs in foreground
-    // rather than as an installed service. Skip the install check.
-    if std::env::var("HOLE_BRIDGE_SOCKET").is_ok() {
-        tracing::info!("HOLE_BRIDGE_SOCKET set, skipping bridge install check");
-        return;
-    }
-
-    let status = bridge_install_status();
-
-    match status {
-        BridgeInstallStatus::Running => {
-            tracing::info!("bridge is running");
-        }
-        BridgeInstallStatus::Installed => {
-            tracing::warn!("bridge is installed but not running");
-            // The service has auto-start; it should start on its own.
-            // Just log and continue.
-        }
-        BridgeInstallStatus::NotInstalled => {
-            tracing::info!("bridge not installed, prompting user");
-            tauri::async_runtime::spawn(async move {
-                prompt_bridge_install(app).await;
-            });
-        }
-    }
-}
-
-async fn prompt_bridge_install(app: tauri::AppHandle) {
+/// Prompt the user to install the bridge, run the elevated install, and
+/// return whether the bridge is now reachable. Returns `false` on cancel,
+/// elevation failure, or post-install IPC unreachability.
+pub async fn prompt_bridge_install(app: tauri::AppHandle) -> bool {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let confirmed = app
@@ -330,7 +414,7 @@ async fn prompt_bridge_install(app: tauri::AppHandle) {
 
     if !confirmed {
         tracing::info!("user declined bridge install");
-        return;
+        return false;
     }
 
     let exe = match bridge_binary_path() {
@@ -341,43 +425,103 @@ async fn prompt_bridge_install(app: tauri::AppHandle) {
                 .message(format!("Failed to determine binary path: {e}"))
                 .title("Setup Error")
                 .blocking_show();
-            return;
+            return false;
         }
     };
 
-    // Run elevated install on a blocking thread
-    let result = tokio::task::spawn_blocking(move || run_elevated(&exe, &["bridge", "install"])).await;
+    // `--repair-user-data-dir` lets the elevated install reclaim ownership
+    // of the unprivileged user data dir if a previous install ran as root
+    // via osascript and left it root-owned.
+    let user_data_dir_arg = dirs::config_dir().map(|d| d.join("hole").to_string_lossy().into_owned());
+
+    let result = tokio::task::spawn_blocking({
+        let exe = exe.clone();
+        let user_data_dir_arg = user_data_dir_arg.clone();
+        move || run_elevated_install(&exe, user_data_dir_arg.as_deref())
+    })
+    .await;
 
     match result {
-        Ok(Ok(status)) if status.success() => {
+        Ok(Ok(())) => {
             tracing::info!("bridge installed successfully via elevation");
             // Poll IPC to verify bridge is reachable
             let reachable = poll_bridge_ipc().await;
             if !reachable {
                 tracing::warn!("bridge installed but not yet reachable via IPC");
+                app.dialog()
+                    .message("The bridge installed, but is not yet reachable. Try again in a moment.")
+                    .title("Setup Error")
+                    .blocking_show();
+                return false;
             }
-        }
-        Ok(Ok(status)) => {
-            let code = status.code().unwrap_or(-1);
-            tracing::error!("bridge install exited with code {code}");
-            app.dialog()
-                .message(format!("Bridge installation failed (exit code {code})."))
-                .title("Setup Error")
-                .blocking_show();
+            true
         }
         Ok(Err(SetupError::Cancelled)) => {
             tracing::info!("user cancelled elevation prompt");
+            false
         }
         Ok(Err(e)) => {
             tracing::error!("elevation failed: {e}");
             app.dialog()
-                .message(format!("Failed to run installer: {e}"))
+                .message(format!("Failed to install the Hole bridge.\n\n{e}"))
                 .title("Setup Error")
                 .blocking_show();
+            false
         }
         Err(e) => {
             tracing::error!("spawn_blocking failed: {e}");
+            false
         }
+    }
+}
+
+/// Run an elevated `hole bridge install`, capturing the elevated child's
+/// `gui-cli.log` into a per-invocation temp directory so a failed install
+/// can surface the underlying cause (`dseditgroup` errors, missing
+/// permissions, etc.) instead of just an exit code.
+///
+/// On success: the temp dir is dropped (auto-deleted).
+/// On failure: the temp dir is detached from auto-cleanup and its path
+/// becomes the `log_path` of `SetupError::ExitCode`, so the user can
+/// attach the full file to support if the truncated copy in the dialog
+/// isn't sufficient.
+fn run_elevated_install(exe: &Path, repair_user_data_dir: Option<&str>) -> Result<(), SetupError> {
+    let tempdir = tempfile::TempDir::with_prefix("hole-install-")?;
+    let log_dir_arg = tempdir.path().to_string_lossy().into_owned();
+
+    let mut args: Vec<&str> = vec!["bridge", "install", "--log-dir", &log_dir_arg];
+    if let Some(d) = repair_user_data_dir {
+        args.push("--repair-user-data-dir");
+        args.push(d);
+    }
+
+    match run_elevated(exe, &args) {
+        Ok(()) => Ok(()),
+        Err(SetupError::ExitCode {
+            code,
+            output: native_output,
+            log_path: _,
+        }) => {
+            let log_path = tempdir.path().join("gui-cli.log");
+            let raw_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let display_output = if !raw_log.is_empty() {
+                truncate_for_dialog(&raw_log)
+            } else if !native_output.is_empty() {
+                // Elevated child exited before tracing init — fall back to
+                // whatever stderr the OS gave us at the elevation layer.
+                native_output
+            } else {
+                "(no further detail available — elevated process exited before logging began)".to_string()
+            };
+            // Detach the tempdir so the user can attach the full file.
+            let kept = tempdir.keep();
+            Err(SetupError::ExitCode {
+                code,
+                output: display_output,
+                log_path: Some(kept.join("gui-cli.log")),
+            })
+        }
+        Err(other) => Err(other),
     }
 }
 
@@ -397,6 +541,129 @@ async fn poll_bridge_ipc() -> bool {
         }
     }
     false
+}
+
+// Ownership repair (macOS) ============================================================================================
+
+/// Reclaim ownership of a directory tree that was created root-owned by an
+/// earlier elevated install (the osascript admin-privileges context
+/// preserves `HOME` from the unprivileged parent, so root-mode CLI helpers
+/// happily wrote `~/Library/Application Support/hole/` and friends as
+/// root). This module walks the tree and `lchown`s every entry back to the
+/// owner of the path's parent.
+///
+/// Safety-critical: runs as root, so any symlink confusion is a privilege
+/// escalation primitive. Constraints:
+///
+/// - `walkdir` with `.follow_links(false)` (the default; set explicitly).
+/// - `lchown` (not `chown`) on every entry, so symlink ENTRIES get
+///   re-owned, not their TARGETS.
+/// - Regular files with `nlink > 1` are skipped — a hard link planted in a
+///   writable subdir could otherwise re-own a file outside the tree.
+/// - The top-level `path` itself, if a symlink, is refused (warning
+///   logged, install continues).
+///
+/// Best-effort. Failures are logged at `warn` level (with a summary line)
+/// but do not abort the install.
+#[cfg(target_os = "macos")]
+mod repair {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    pub(super) fn run(path: &Path) {
+        // Path may not exist (first install on a clean machine) — nothing to do.
+        let Ok(top_meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if top_meta.file_type().is_symlink() {
+            cli_log!(warn, "refusing to repair ownership of symlink: {}", path.display());
+            return;
+        }
+
+        // Resolve parent owner — the user who owns ~/Library/Application Support
+        // by definition.
+        let parent = match path.parent() {
+            Some(p) => p,
+            None => {
+                cli_log!(warn, "cannot determine parent of {}", path.display());
+                return;
+            }
+        };
+        let parent_meta = match std::fs::metadata(parent) {
+            Ok(m) => m,
+            Err(e) => {
+                cli_log!(warn, "cannot stat parent {}: {e}", parent.display());
+                return;
+            }
+        };
+        let target_uid = parent_meta.uid();
+        let target_gid = parent_meta.gid();
+
+        // Skip the walk entirely when the tree is already healthy.
+        if top_meta.uid() == target_uid && top_meta.gid() == target_gid {
+            return;
+        }
+
+        let mut repaired = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+
+        for entry in walkdir::WalkDir::new(path).follow_links(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    cli_log!(warn, "walkdir error under {}: {e}", path.display());
+                    failed += 1;
+                    continue;
+                }
+            };
+            let entry_path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    cli_log!(warn, "stat failed for {}: {e}", entry_path.display());
+                    failed += 1;
+                    continue;
+                }
+            };
+
+            // Already correctly owned — skip the chown call.
+            if meta.uid() == target_uid && meta.gid() == target_gid {
+                continue;
+            }
+
+            // Refuse to chown a regular file with extra hard links: an
+            // attacker with prior write access in the tree could plant a
+            // hard link to a file outside the tree, and changing the
+            // ownership of one hard link silently re-owns the other.
+            if meta.file_type().is_file() && meta.nlink() > 1 {
+                cli_log!(
+                    warn,
+                    "skipping {} (nlink={}): refusing to chown hard-linked file",
+                    entry_path.display(),
+                    meta.nlink(),
+                );
+                skipped += 1;
+                continue;
+            }
+
+            // lchown: do not follow symlinks (the entry returned by
+            // walkdir with follow_links(false) is the symlink itself; we
+            // re-own the link, never its target).
+            if let Err(e) = std::os::unix::fs::lchown(entry_path, Some(target_uid), Some(target_gid)) {
+                cli_log!(warn, "lchown failed for {}: {e}", entry_path.display());
+                failed += 1;
+                continue;
+            }
+            repaired += 1;
+        }
+
+        cli_log!(
+            info,
+            "repaired ownership: {repaired} entries chowned, {skipped} skipped, {failed} failed (path={})",
+            path.display(),
+        );
+    }
 }
 
 #[cfg(test)]

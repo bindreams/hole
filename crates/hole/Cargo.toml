@@ -59,6 +59,13 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Used by `setup::repair` to walk the user data dir on a one-shot
+# ownership repair triggered by the elevated `bridge install`. macOS-only
+# because the bug it fixes (osascript-admin elevation creating user-home
+# files as root) doesn't occur on Windows (UAC same-user elevation).
+walkdir = "2"
+
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
@@ -66,6 +73,7 @@ axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 garter = { path = "../garter" }
+filetime = "0.2"
 
 [build-dependencies]
 tauri-build = "2"

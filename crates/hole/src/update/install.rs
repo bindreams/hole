@@ -13,10 +13,12 @@ pub fn run_installer(path: &Path, quiet: bool) -> Result<(), UpdateError> {
 
     if quiet {
         // Quiet mode skips UAC, so we must elevate explicitly.
-        let status = crate::setup::run_elevated(Path::new("msiexec"), &args_ref)
-            .map_err(|e| UpdateError::Io(std::io::Error::other(e.to_string())))?;
-        if !status.success() {
-            return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
+        match crate::setup::run_elevated(Path::new("msiexec"), &args_ref) {
+            Ok(()) => {}
+            Err(crate::setup::SetupError::ExitCode { code, .. }) => {
+                return Err(UpdateError::InstallerFailed(code));
+            }
+            Err(e) => return Err(UpdateError::Io(std::io::Error::other(e.to_string()))),
         }
     } else {
         // Interactive mode: msiexec shows its own UAC prompt.
@@ -113,13 +115,11 @@ fn install_from_mount(mount_dir: &Path) -> Result<(), UpdateError> {
     let cp_path = Path::new("/bin/cp");
     let src_str = app_src.to_string_lossy().to_string();
     let cp_args = ["-R", &src_str, &app_dest];
-    let status = crate::setup::run_elevated(cp_path, &cp_args)
-        .map_err(|e| UpdateError::Io(std::io::Error::other(e.to_string())))?;
-    if !status.success() {
-        return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
+    match crate::setup::run_elevated(cp_path, &cp_args) {
+        Ok(()) => Ok(()),
+        Err(crate::setup::SetupError::ExitCode { code, .. }) => Err(UpdateError::InstallerFailed(code)),
+        Err(e) => Err(UpdateError::Io(std::io::Error::other(e.to_string()))),
     }
-
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
