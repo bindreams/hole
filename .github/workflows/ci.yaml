@@ -333,12 +333,25 @@ jobs:
         run: cargo install --locked --version 2.0.6 tauri-driver
 
       # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver.
-      # The windows-latest runner image documents msedgedriver's location
-      # via the `EDGEWEBDRIVER` env var; prepend it so tauri-driver finds
-      # it without hard-coded paths.
-      - name: Prepend EDGEWEBDRIVER to PATH
+      # The runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the
+      # Edge BROWSER version on the image, but WebView2 RUNTIME (which
+      # hole.exe actually loads) auto-updates independently and is
+      # typically a higher version — msedgedriver then rejects the
+      # session with "only supports Microsoft Edge version N". Detect
+      # the installed WebView2 runtime version and download the matching
+      # msedgedriver from Microsoft's CDN. See bindreams/hole#372.
+      - name: Install msedgedriver matching WebView2 runtime
         shell: pwsh
-        run: Add-Content -Path $env:GITHUB_PATH -Value $env:EDGEWEBDRIVER
+        run: |
+          $key = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          $webview2 = (Get-ItemProperty -Path $key -Name pv).pv
+          Write-Host "WebView2 runtime version: $webview2"
+          $url = "https://msedgedriver.microsoft.com/$webview2/edgedriver_win64.zip"
+          $zip = "$env:RUNNER_TEMP\edgedriver.zip"
+          $out = "$env:RUNNER_TEMP\edgedriver"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $out
 
       # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
       # after a fresh install. Tauri's single-instance plugin would route
