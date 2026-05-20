@@ -1253,9 +1253,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.13.1"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3429e8f8e3ce0ffe475c411850f70468c70d7a87d2ac3d15dd44703fb885aede"
+checksum = "6d765eb1c0bda10d31e0ea185f5ee15da532d60b0912d2bd1441783439e749c5"
 
 [[package]]
 name = "ctor-proc-macro"
@@ -2979,7 +2979,7 @@ dependencies = [
 name = "hole-test-observability"
 version = "0.1.1"
 dependencies = [
- "ctor 0.13.1",
+ "ctor 1.0.6",
  "hole-common",
  "log",
  "skuld",
