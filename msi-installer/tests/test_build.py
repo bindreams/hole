@@ -1,10 +1,13 @@
 """Unit tests for msi_installer build helpers."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import msi_installer
 from msi_installer import BuildError, find_wix_exe, get_version, ui_extension_path
+from msi_installer import _accept_wix_eula
 
 # Note: hardlink/copy logic moved to `xtask::stage` (Rust). See xtask/src/stage.rs
 # and xtask/src/stage_tests.rs. The msi-installer Python project no longer
@@ -90,3 +93,67 @@ def test_ui_extension_path_missing_dll_raises(tmp_path: Path) -> None:
 
     with pytest.raises(BuildError):
         ui_extension_path(wix_exe)
+
+
+# _accept_wix_eula tests ===============================================================================================
+
+
+def test_accept_wix_eula_fast_path_skips_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the marker file exists, no subprocess is spawned."""
+    monkeypatch.setattr(msi_installer, "_WIX_EULA_MARKER_DIR", tmp_path)
+    (tmp_path / "wix7-osmf-eula.txt").write_text("accepted")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _accept_wix_eula(Path("/fake/wix.exe"), "7.0.0")
+    assert calls == [], "subprocess should be skipped when marker exists"
+
+
+def test_accept_wix_eula_spawns_when_marker_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If no marker file, spawn `wix eula accept wix<major>`."""
+    monkeypatch.setattr(msi_installer, "_WIX_EULA_MARKER_DIR", tmp_path)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _accept_wix_eula(Path("/fake/wix.exe"), "7.0.0")
+    assert calls == [[str(Path("/fake/wix.exe")), "eula", "accept", "wix7"]]
+
+
+def test_accept_wix_eula_derives_eulaid_from_major(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forward-looking: eulaId is `wix{major}`, derived from the version."""
+    monkeypatch.setattr(msi_installer, "_WIX_EULA_MARKER_DIR", tmp_path)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _accept_wix_eula(Path("/fake/wix.exe"), "8.1.2")
+    assert calls[0][-1] == "wix8"
+
+
+def test_accept_wix_eula_raises_on_nonzero_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(msi_installer, "_WIX_EULA_MARKER_DIR", tmp_path)
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(BuildError, match="failed to accept WiX EULA 'wix7'"):
+        _accept_wix_eula(Path("/fake/wix.exe"), "7.0.0")

@@ -157,17 +157,28 @@ def ensure_wix(root: Path, console: Console) -> Path:
     return wix_exe
 
 
+_WIX_EULA_MARKER_DIR = Path.home() / ".wix"
+
+
 def _accept_wix_eula(wix_exe: Path, version: str) -> None:
-    """Accept the OSMF EULA persistently for this WiX major version.
+    """Ask `wix.exe` to persist OSMF EULA acceptance for this major version.
 
     Required since WiX v7 (error WIX7015 from any wix subcommand otherwise).
-    Writes the marker file at ``~/.wix/wix<major>-osmf-eula.txt``. Idempotent:
-    re-running is a silent no-op once the marker exists. The eulaId mirrors
-    `wix eula accept wix<major>` and matches WixToolset.Sdk's
-    WixToolsetExtensionPackageFolder convention (one per major release).
+    `wix eula accept wix<major>` writes a marker file at
+    ``~/.wix/wix<major>-osmf-eula.txt``; subsequent wix invocations consult
+    that file. Fast-pathed here: if the marker exists, skip the subprocess
+    entirely. Otherwise spawn `wix eula accept` and fail loudly on nonzero
+    exit (corrupt extract, missing write permission, upstream rename of
+    the eulaId — any of these should surface, not be tolerated).
+
+    The eulaId mirrors WixToolset.Sdk's WixToolsetExtensionPackageFolder
+    convention (one per major release: wix5, wix6, wix7, ...).
     """
     major = version.split(".", 1)[0]
     eula_id = f"wix{major}"
+    marker = _WIX_EULA_MARKER_DIR / f"{eula_id}-osmf-eula.txt"
+    if marker.exists():
+        return
     result = subprocess.run(
         [str(wix_exe), "eula", "accept", eula_id],
         capture_output=True,
