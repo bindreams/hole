@@ -23,44 +23,50 @@
       "enabled": false
     },
     {
-      "description": "Group GitHub Actions updates",
+      "description": "Group non-major GitHub Actions updates",
       "matchManagers": ["github-actions"],
-      "groupName": "github-actions",
-      "automerge": true,
-      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"]
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "GitHub Actions",
+      "automerge": true
     },
     {
-      "description": "Group Cargo updates",
+      "description": "Group non-major Rust crate updates",
       "matchManagers": ["cargo"],
-      "groupName": "cargo",
-      "automerge": true,
-      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"]
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "Rust crates",
+      "automerge": true
     },
     {
-      "description": "Group Go module updates",
+      "description": "Group non-major Go module updates",
       "matchManagers": ["gomod"],
-      "groupName": "gomod",
-      "automerge": true,
-      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"]
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "Go modules",
+      "automerge": true
     },
     {
-      "description": "Group Python (PEP 621) updates",
+      "description": "Group non-major Python (PEP 621) updates",
       "matchManagers": ["pep621"],
-      "groupName": "python",
-      "automerge": true,
-      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"]
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "Python packages",
+      "automerge": true
     },
     {
-      "description": "Group npm updates",
+      "description": "Group non-major npm updates; weekly lockfile maintenance runs out-of-band",
       "matchManagers": ["npm"],
-      "groupName": "npm",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "npm packages",
       "automerge": true,
-      "matchUpdateTypes": ["major", "minor", "patch", "pin", "digest"],
       "lockFileMaintenance": {
         "enabled": true,
         "automerge": true,
         "schedule": ["before 9am on monday"]
       }
+    },
+    {
+      "description": "Major updates: one PR per package (API breaks reviewed individually). groupName: null overrides any inherited monorepo group from config:recommended's group:monorepos / group:recommended presets. Applies to customManagers (WiX) as well — by design; the customManagers block has no groupName, so this just reasserts the default.",
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "automerge": true
     }
   ]
 }
