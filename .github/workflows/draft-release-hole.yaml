@@ -64,21 +64,14 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      # Frontend deps + Node toolchain — needed by the macOS DMG path
-      # (`npx tauri build`). Cheap on Windows runners; unconditional to
-      # keep the workflow flat.
-      - uses: actions/setup-node@v6
-        if: matrix.os == 'darwin'
-        with:
-          node-version-file: package.json
-      - name: Install npm dependencies
-        if: matrix.os == 'darwin'
-        run: npm install
-
       # Single matrix-driven build call: `hole-msi` on Windows, `hole-dmg`
       # on Darwin. The orchestrator (build.yaml) owns the per-platform
       # recipe — this step has no per-os `if:` because the target name
-      # carries the platform information.
+      # carries the platform information. Node.js is installed by the
+      # `setup-build` composite action above; `hole-msi` cascades through
+      # the `frontend-build` xtask target (which runs `npm ci` + `npm run
+      # build`), and `hole-dmg`'s `npx tauri build` runs the
+      # `beforeBuildCommand` itself. See bindreams/hole#372.
       - name: Build artifact
         shell: bash
         run: cargo xtask build "hole-${{ matrix.ext }}"

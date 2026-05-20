@@ -400,6 +400,25 @@ cargo xtask run hole-tests       # canonical local nextest invocation for hole c
 `build.yaml` at the repo root is the single source of truth for the build
 graph. `cargo xtask list` prints the full target table.
 
+### Tauri dev/prod feature toggle
+
+The `hole` crate declares
+`[features] default = ["tauri/custom-protocol"]`. With the feature **on**,
+Tauri is in production mode: `cfg(dev) = false`, the webview loads from
+the bundled `tauri.localhost` custom protocol, and `tauri-codegen` embeds
+`ui/dist/` into the binary at compile time (panics if `ui/dist/` is
+missing). With the feature **off** (`--no-default-features`), Tauri is in
+dev mode: webview loads `devUrl` (`http://localhost:1420`, served by
+Vite), and codegen embeds empty assets so `ui/dist/` is not required.
+
+The `hole` and `hole-tests` build.yaml targets pass
+`--no-default-features` because they're dev/test workflows. `hole-msi`
+and `hole-dmg` (production paths) use the default features and depend on
+`frontend-build` (which produces `ui/dist/`). Manual `cargo build -p hole` invocations follow the same split: pass `--no-default-features`
+for dev, or run `cargo xtask build frontend-build` first for a
+production build. See bindreams/hole#372 for the incident that produced
+this split.
+
 ### Windows installer
 
 ```sh

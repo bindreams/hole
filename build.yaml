@@ -76,10 +76,16 @@ targets:
     # above will have just executed it, so dev.py's own invocation no-ops via
     # cargo's incremental cache. Cheap, no special handling needed. Requires
     # elevation (sudo / Run As Administrator) — same precondition as today.
+    #
+    # `--no-default-features` keeps Tauri's `cfg(dev) = true` so the webview
+    # loads from the Vite dev server (`http://localhost:1420`) instead of
+    # demanding pre-built embedded assets at `ui/dist/`. The hole crate's
+    # default = ["tauri/custom-protocol"] is meant for production builds
+    # (hole-msi / hole-dmg). See bindreams/hole#372.
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - cargo build --workspace
+      - cargo build --workspace --no-default-features
       - cargo xtask stage --profile debug --out-dir target/debug/dist
     run: uv run scripts/dev.py
 
@@ -89,14 +95,31 @@ targets:
     # depending on `hole` (debug) would force a redundant debug compile that
     # nothing consumes. We depend instead on the same sidecars `hole` does, so
     # the MSI build still has v2ray-plugin, galoshes, and wintun.dll on disk.
-    depends: [galoshes, wintun]
+    #
+    # `frontend-build` is on the depends list because msi-installer runs
+    # plain `cargo build --release` (not `npx tauri build`), so Tauri's
+    # `beforeBuildCommand: "npm run build"` is **never executed** — the only
+    # thing that triggers it is the Tauri CLI. With the hole crate's
+    # default-on `tauri/custom-protocol` feature, tauri-codegen panics at
+    # compile time if `ui/dist/` is missing (it short-circuits and embeds
+    # empty assets only when `cfg(dev) = true`). frontend-build produces
+    # `ui/dist/` ahead of the cargo invocation. See bindreams/hole#372.
+    depends: [galoshes, wintun, frontend-build]
     platforms: [windows/amd64]
     build: uv run --directory msi-installer build
 
   hole-dmg:
     # Same logic as hole-msi: tauri does its own `cargo build --release`. No
     # wintun dep on darwin (it doesn't apply to that platform).
-    depends: galoshes
+    #
+    # `frontend-build` is a dep so `node_modules/` (with `@tauri-apps/cli`)
+    # exists before `npx tauri build` runs — otherwise npx fails with "could
+    # not determine executable to run". Tauri then runs
+    # `beforeBuildCommand: "npm run build"` again (vite build executes
+    # twice — ~10-15s waste), but the redundancy keeps `npx tauri build`
+    # self-sufficient for ad-hoc developer use outside the orchestrator.
+    # See bindreams/hole#372.
+    depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build: npx tauri build
 
@@ -109,13 +132,29 @@ targets:
     run: uv run --directory dmg-installer pytest -v
 
   frontend-build:
-    # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-independent
-    # output, so we run on the cheapest CI host (linux/amd64) only. The
-    # type-check (`cargo xtask run frontend-check`) is a separate target —
-    # tsc reads source directly and produces no artifact. Not depended on by
-    # hole-msi / hole-dmg: Tauri's beforeBuildCommand runs `npm run build`
-    # itself at packaging time.
-    platforms: linux/amd64
+    # Vite bundle of ui/ → ui/dist/. Pure JS/TS toolchain, platform-
+    # independent output. The type-check (`cargo xtask run frontend-check`)
+    # is a separate target — tsc reads source directly and produces no
+    # artifact.
+    #
+    # Listed on `hole-msi.depends` AND `hole-dmg.depends`. For `hole-msi`:
+    # msi-installer's `cargo build --release` does NOT honor Tauri's
+    # `beforeBuildCommand` (only `npx tauri build` does), so the frontend
+    # has to be built ahead of the Rust build. For `hole-dmg`: `npx tauri
+    # build` needs `node_modules/` populated (with `@tauri-apps/cli`)
+    # before it can even start; the `npm ci` step here provides that.
+    # Tauri's own `beforeBuildCommand: "npm run build"` re-runs vite —
+    # ~10-15s waste — but we accept the redundancy to keep `npx tauri
+    # build` self-sufficient for ad-hoc dev use outside the orchestrator.
+    #
+    # `hole-msi` doesn't switch to `npx tauri build` because the WiX MSI
+    # layout (custom-action install/uninstall, PATH munging, embedded
+    # cabinets) doesn't fit Tauri's bundler output shape.
+    #
+    # Platforms cover every host that builds hole: linux/amd64 keeps the
+    # Renovate `frontend-check` standalone path working, windows/amd64
+    # satisfies `hole-msi`, darwin/{amd64,arm64} satisfies `hole-dmg`.
+    platforms: [linux/amd64, windows/amd64, darwin/amd64, darwin/arm64]
     build:
       - npm ci --no-audit --no-fund
       - npm run build
@@ -126,16 +165,21 @@ targets:
   # and the archive-based test-garter / test-galoshes jobs.
 
   hole-tests:
+    # `--no-default-features` matches the `hole` target's debug build: tests
+    # compile main.rs (which expands `tauri::generate_context!()`), and
+    # production-mode generate_context panics at compile time on missing
+    # `ui/dist/`. Tests don't need bundled frontend assets — they exercise
+    # CLI / IPC / bridge paths, not the webview. See bindreams/hole#372.
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build: >
-      cargo nextest run --no-run
+      cargo nextest run --no-run --no-default-features
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
           + package(handle-holders)'
     run: >
-      cargo nextest run
+      cargo nextest run --no-default-features
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
@@ -177,8 +221,14 @@ targets:
   clippy-hole:
     # Hole platforms only. On the Hole platforms the entire workspace
     # compiles, so `--workspace` is correct.
+    #
+    # `--no-default-features` matches the `hole` / `hole-tests` targets:
+    # clippy expands `tauri::generate_context!()` like a regular compile,
+    # which would panic on missing `ui/dist/` in production mode. Linting
+    # the dev-mode codepaths is sufficient — the cfg(dev) gate only affects
+    # Tauri-internal URL resolution, not Hole-side code. See #372.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
-    run: cargo clippy --workspace --all-targets -- -D warnings
+    run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
   clippy-ex-galoshes:
     # Hole crates use windows/macos cfg-gates that don't compile on linux or

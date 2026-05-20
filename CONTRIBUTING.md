@@ -130,6 +130,8 @@ sudo cargo xtask run hole
 
 `cargo xtask run hole` builds the `hole` target and then launches `scripts/dev.py`, which builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
 
+**`--no-default-features` for direct cargo invocations.** The `hole` crate defaults to enabling `tauri/custom-protocol`, which puts Tauri in production mode (`cfg(dev) = false`, webview loads bundled assets from `tauri.localhost`). The dev/test build.yaml targets (`hole`, `hole-tests`, `clippy-hole`) pass `--no-default-features` to flip back to dev mode, where the webview loads from Vite's `http://localhost:1420` and `ui/dist/` is not required. If you run cargo directly for hole — e.g. `cargo build -p hole`, `cargo clippy -p hole`, `cargo test -p hole` — add `--no-default-features` or you'll panic at compile time on missing `ui/dist/`. The orchestrator (`cargo xtask build hole`, `cargo xtask run hole-tests`, etc.) handles this automatically. See bindreams/hole#372 for the incident that produced this split.
+
 **Lock collision with an installed GUI.** The dev binary uses the same Tauri identifier (`com.hole.app`) as the released MSI/DMG build, so the [single-instance lock](CLAUDE.md#single-instance-enforcement) treats them as the same app. If an MSI-installed `hole.exe` is already running (e.g. via autostart), `cargo xtask run hole` will silently forward its args to that instance and the dev GUI won't appear. Quit the installed Hole (tray → Exit) before starting dev mode.
 
 **Why the explicit `cargo xtask build hole` on macOS.** `cargo xtask run` always invokes the build cascade for the target before its `run:` steps; under `sudo` that cascade runs as root and would leave `target/` and `target/debug/dist/` files owned by root. `dev.py` already drops privileges around its own internal `cargo xtask build hole` (see lines 130-134 / 336-340 in [scripts/dev.py](scripts/dev.py)), but the orchestrator's pre-cascade fires *before* dev.py gets control. Running `cargo xtask build hole` unprivileged first warms the cargo cache so the elevated `run` cascade is a no-op, sidestepping the ownership issue. Windows is unaffected — UAC elevation is token-based and all subprocesses naturally share the same user identity.
@@ -174,7 +176,7 @@ cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # per-
 
 `cargo xtask build hole` walks the `build.yaml` DAG: it builds v2ray-plugin
 (Go), galoshes (workspace member), downloads wintun on Windows, then runs
-`cargo build --workspace` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
+`cargo build --workspace --no-default-features` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
 table; `cargo xtask build --all` builds every target applicable to the host
 platform; `cargo xtask run <name>` builds and then performs the named
 target's `run:` action — running tests (`hole-tests`), linters
@@ -217,7 +219,7 @@ HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ## Testing
 
 ```sh
-cargo test --workspace
+cargo test --workspace --no-default-features
 ```
 
 ### Avoiding Windows Firewall prompts on every rebuild
@@ -247,7 +249,7 @@ When Windows CI fails with a timeout in `server_test_tests` or loopback connects
 
 1. **Grep the failing test output for `routing subprocesses` or `netsh|route add|route delete`.** The #165 fix added a regression test (`proxy_manager_tests_never_spawn_routing_subprocess`) that prints `"proxy_manager start/stop cycles spawned N routing subprocesses"` and asserts `N == 0`. If that assertion fires, a new code path has bypassed the `Routing` trait — find the new `Drop` impl or helper that calls the free `routing::setup_routes`/`teardown_routes` functions and route it through the trait. Clippy's `disallowed_methods` lint should have caught this at build time; if it didn't, the lint needs tightening.
 
-1. **Run `cargo clippy --workspace` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
+1. **Run `cargo clippy --workspace --no-default-features` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
 
 1. **Check for new `std::process::Command::new` calls in recent diffs to `crates/bridge/src/`.** Not covered by the clippy lint (too broad a ban would break platform/group.rs). Each new usage is a potential test-time subprocess leak.
 

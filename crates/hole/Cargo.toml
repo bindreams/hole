@@ -10,6 +10,18 @@ group = "hole"
 [lints]
 workspace = true
 
+[features]
+# `tauri/custom-protocol` flips the Tauri build from dev mode
+# (`cfg(dev) = true`, webview loads `devUrl`) to production mode
+# (`cfg(dev) = false`, webview loads the bundled `tauri.localhost` custom
+# protocol). The Tauri CLI sets this flag automatically for
+# `npx tauri build`; plain `cargo build --release` does not. Default-on so
+# production builds (msi-installer / release CI) just work. Dev paths
+# (build.yaml's `hole` and `hole-tests` targets, scripts/dev.py) pass
+# `--no-default-features` to keep `cfg(dev) = true` for the Vite-served
+# workflow. See bindreams/hole#372 for the incident.
+default = ["tauri/custom-protocol"]
+
 [lib]
 name = "hole"
 harness = false
@@ -22,7 +34,7 @@ harness = false
 [dependencies]
 hole-common = { path = "../common" }
 hole-bridge = { path = "../bridge" }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"

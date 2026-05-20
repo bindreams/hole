@@ -712,7 +712,20 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
         .min_inner_size(800.0, 200.0)
         .max_inner_size(800.0, 4096.0)
         .resizable(true)
-        .maximizable(false);
+        .maximizable(false)
+        // `.devtools(true)` calls `SetAreDevToolsEnabled(true)` on Windows
+        // (unconditional in Wry) and `setInspectable(true)` on macOS (gated
+        // by `tauri/devtools` Cargo feature, which Cargo.toml enables above).
+        // Enabled unconditionally — including in release builds — so end
+        // users can self-diagnose webview issues (#372 had to be reproduced
+        // blind because devtools were off).
+        //
+        // F12 → "open devtools" is bound natively by WebView2 once devtools
+        // are enabled. macOS users access the inspector via Safari → Develop.
+        // Side effect: an "Inspect" item appears in WebView2's right-click
+        // context menu (which is shown unconditionally regardless of this
+        // setting).
+        .devtools(true);
 
     // Menu bar (all platforms) ----------------------------------------------------------------------------------------
     {
