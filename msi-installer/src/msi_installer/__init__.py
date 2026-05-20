@@ -120,6 +120,7 @@ def ensure_wix(root: Path, console: Console) -> Path:
         wix_exe = find_wix_exe(extract_dir)
         if wix_exe is not None:
             console.print(f"[bold]Using cached WiX v{version}[/]")
+            _accept_wix_eula(wix_exe, version)
             return wix_exe
 
     # Download phase
@@ -152,7 +153,42 @@ def ensure_wix(root: Path, console: Console) -> Path:
     wix_exe = find_wix_exe(extract_dir)
     if wix_exe is None:
         raise BuildError(f"wix.exe not found in extracted directory {extract_dir}")
+    _accept_wix_eula(wix_exe, version)
     return wix_exe
+
+
+_WIX_EULA_MARKER_DIR = Path.home() / ".wix"
+
+
+def _accept_wix_eula(wix_exe: Path, version: str) -> None:
+    """Ask `wix.exe` to persist OSMF EULA acceptance for this major version.
+
+    Required since WiX v7 (error WIX7015 from any wix subcommand otherwise).
+    `wix eula accept wix<major>` writes a marker file at
+    ``~/.wix/wix<major>-osmf-eula.txt``; subsequent wix invocations consult
+    that file. Fast-pathed here: if the marker exists, skip the subprocess
+    entirely. Otherwise spawn `wix eula accept` and fail loudly on nonzero
+    exit (corrupt extract, missing write permission, upstream rename of
+    the eulaId — any of these should surface, not be tolerated).
+
+    The eulaId mirrors WixToolset.Sdk's WixToolsetExtensionPackageFolder
+    convention (one per major release: wix5, wix6, wix7, ...).
+    """
+    major = version.split(".", 1)[0]
+    eula_id = f"wix{major}"
+    marker = _WIX_EULA_MARKER_DIR / f"{eula_id}-osmf-eula.txt"
+    if marker.exists():
+        return
+    result = subprocess.run(
+        [str(wix_exe), "eula", "accept", eula_id],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BuildError(
+            f"failed to accept WiX EULA '{eula_id}' (exit {result.returncode}): "
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
 
 
 def _download_and_hash(url: str, dest: Path, console: Console) -> str:
@@ -218,20 +254,26 @@ def ui_extension_path(wix_exe: Path) -> Path:
 
     The UI extension ships inside wix-cli-x64.msi and is admin-extracted by
     ensure_wix() into a deterministic layout. The four .parent traversals walk
-    bin -> "WiX Toolset v6.0" -> PFiles64 -> wix-v<ver>, landing on cache_root:
+    bin -> "WiX Toolset v<major>.<minor>" -> PFiles64 -> wix-v<ver>, landing
+    on cache_root:
 
-        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin/wix.exe
-        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin
-        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0
+        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>/bin/wix.exe
+        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>/bin
+        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>
         .parent x 3     = <cache>/wix-v<ver>/PFiles64
         .parent x 4     = <cache>/wix-v<ver>                    <- cache_root
         UI extension    = cache_root/CFiles64/WixToolset/extensions/
-                              WixToolset.UI.wixext/<ver>/wixext6/WixToolset.UI.wixext.dll
+                              WixToolset.UI.wixext/<ver>/wixext<major>/WixToolset.UI.wixext.dll
+
+    The `wixext<major>` segment matches WixToolset.Sdk's
+    `WixToolsetExtensionPackageFolder` (renamed in lockstep with each WiX
+    major release: v5→wixext5, v6→wixext6, v7→wixext7, ...).
     """
     cache_root = wix_exe.parent.parent.parent.parent
     version = cache_root.name.removeprefix("wix-v")
+    major = version.split(".", 1)[0]
     dll = (
-        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / "wixext6" /
+        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / f"wixext{major}" /
         "WixToolset.UI.wixext.dll"
     )
     if not dll.exists():
