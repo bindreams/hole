@@ -218,20 +218,26 @@ def ui_extension_path(wix_exe: Path) -> Path:
 
     The UI extension ships inside wix-cli-x64.msi and is admin-extracted by
     ensure_wix() into a deterministic layout. The four .parent traversals walk
-    bin -> "WiX Toolset v6.0" -> PFiles64 -> wix-v<ver>, landing on cache_root:
+    bin -> "WiX Toolset v<major>.<minor>" -> PFiles64 -> wix-v<ver>, landing
+    on cache_root:
 
-        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin/wix.exe
-        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0/bin
-        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v6.0
+        wix_exe         = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>/bin/wix.exe
+        wix_exe.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>/bin
+        .parent.parent  = <cache>/wix-v<ver>/PFiles64/WiX Toolset v<x.y>
         .parent x 3     = <cache>/wix-v<ver>/PFiles64
         .parent x 4     = <cache>/wix-v<ver>                    <- cache_root
         UI extension    = cache_root/CFiles64/WixToolset/extensions/
-                              WixToolset.UI.wixext/<ver>/wixext6/WixToolset.UI.wixext.dll
+                              WixToolset.UI.wixext/<ver>/wixext<major>/WixToolset.UI.wixext.dll
+
+    The `wixext<major>` segment matches WixToolset.Sdk's
+    `WixToolsetExtensionPackageFolder` (renamed in lockstep with each WiX
+    major release: v5→wixext5, v6→wixext6, v7→wixext7, ...).
     """
     cache_root = wix_exe.parent.parent.parent.parent
     version = cache_root.name.removeprefix("wix-v")
+    major = version.split(".", 1)[0]
     dll = (
-        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / "wixext6" /
+        cache_root / "CFiles64" / "WixToolset" / "extensions" / "WixToolset.UI.wixext" / version / f"wixext{major}" /
         "WixToolset.UI.wixext.dll"
     )
     if not dll.exists():
