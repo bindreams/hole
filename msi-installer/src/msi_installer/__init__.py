@@ -120,6 +120,7 @@ def ensure_wix(root: Path, console: Console) -> Path:
         wix_exe = find_wix_exe(extract_dir)
         if wix_exe is not None:
             console.print(f"[bold]Using cached WiX v{version}[/]")
+            _accept_wix_eula(wix_exe, version)
             return wix_exe
 
     # Download phase
@@ -152,7 +153,31 @@ def ensure_wix(root: Path, console: Console) -> Path:
     wix_exe = find_wix_exe(extract_dir)
     if wix_exe is None:
         raise BuildError(f"wix.exe not found in extracted directory {extract_dir}")
+    _accept_wix_eula(wix_exe, version)
     return wix_exe
+
+
+def _accept_wix_eula(wix_exe: Path, version: str) -> None:
+    """Accept the OSMF EULA persistently for this WiX major version.
+
+    Required since WiX v7 (error WIX7015 from any wix subcommand otherwise).
+    Writes the marker file at ``~/.wix/wix<major>-osmf-eula.txt``. Idempotent:
+    re-running is a silent no-op once the marker exists. The eulaId mirrors
+    `wix eula accept wix<major>` and matches WixToolset.Sdk's
+    WixToolsetExtensionPackageFolder convention (one per major release).
+    """
+    major = version.split(".", 1)[0]
+    eula_id = f"wix{major}"
+    result = subprocess.run(
+        [str(wix_exe), "eula", "accept", eula_id],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BuildError(
+            f"failed to accept WiX EULA '{eula_id}' (exit {result.returncode}): "
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
 
 
 def _download_and_hash(url: str, dest: Path, console: Console) -> str:
