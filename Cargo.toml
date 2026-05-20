@@ -24,7 +24,7 @@ skuld = { version = "0.2", features = ["tokio"] }
 # ctor directly. Upstream docs: "It is recommended that crates
 # re-exporting the `ctor` macro disable this feature and only use the
 # declarative form."
-ctor = { version = "0.13", default-features = false }
+ctor = { version = "1.0", default-features = false }
 insta = { version = "1", features = ["yaml"] }
 trybuild = "1"
 # DNS forwarder deps — direct so a future shadowsocks-service bump cannot
