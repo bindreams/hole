@@ -1,6 +1,6 @@
 [package]
 name = "tun-engine"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "Cross-platform TUN device, OS routing, gateway discovery, and a smoltcp-backed packet-loop engine for building split-tunnel VPN/proxy daemons."
