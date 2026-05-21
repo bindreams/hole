@@ -49,15 +49,31 @@ export const config: Options.Testrunner = {
       ok: boolean;
       error: string | null;
     }>((done) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ready = (window as any).__holeUiReady as undefined | (() => Promise<{ ok: boolean; error: string | null }>);
-      if (typeof ready !== "function") {
-        done({ ok: false, error: "__holeUiReady not exposed by ui/main.ts" });
-        return;
+      // The webdriver session can establish before ui/main.ts has
+      // executed its module-level `window.__holeUiReady = ...`
+      // assignment. If `document.readyState !== "complete"` we wait
+      // for the `load` event — all scripts have run by then — and
+      // then call the bridge. Event-driven (no polling).
+      type ReadyFn = () => Promise<{ ok: boolean; error: string | null }>;
+      const go = () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ready = (window as any).__holeUiReady as ReadyFn | undefined;
+        if (typeof ready !== "function") {
+          done({
+            ok: false,
+            error: "__holeUiReady not exposed by ui/main.ts after page load",
+          });
+          return;
+        }
+        ready()
+          .then(done)
+          .catch((e: unknown) => done({ ok: false, error: String(e) }));
+      };
+      if (document.readyState === "complete") {
+        go();
+      } else {
+        window.addEventListener("load", go, { once: true });
       }
-      ready()
-        .then(done)
-        .catch((e: unknown) => done({ ok: false, error: String(e) }));
     });
     if (!result.ok) {
       throw new Error(`UI init failed: ${result.error}`);

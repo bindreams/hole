@@ -521,7 +521,7 @@ the class:
 1. **Test-of-timing.** The delay IS the behavior under test
    ([`SlowWriter` in logging_test_helpers.rs:379](crates/common/src/logging/logging_test_helpers.rs#L379)
    verifying backpressure-induced drops, or
-   [`SilentAfterRead { delay }` in tap_tests.rs](crates/garter/src/tap_tests.rs)
+   [`SilentAfterRead { delay }` in tap_tests.rs:139](crates/garter/src/tap_tests.rs#L139)
    exercising idle-close semantics).
 1. **External event with graceful failure bound.** The retry budget
    for a *remote/out-of-process* operation that might genuinely never

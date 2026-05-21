@@ -21,7 +21,6 @@ mod tray;
 mod ui_ready;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use state::AppState;
 use tauri::Manager;
@@ -61,15 +60,13 @@ fn launch_gui(show_dashboard: bool) {
 
     let _log_guard = logging::init(&log_dir);
 
-    let ui_ready = Arc::new(ui_ready::UiReady::default());
-
     tauri::Builder::default()
         // `UiReady` is registered on the builder (not in `.setup`) so
         // it is available to command handlers at first dispatch — the
         // dashboard webview begins navigation during `.build()`, and
         // `ui/main.ts::init()` may fire `signal_ui_ready` before the
         // setup hook runs.
-        .manage(Arc::clone(&ui_ready))
+        .manage(ui_ready::UiReady::default())
         // `tauri-plugin-single-instance` must be registered first per
         // upstream guidance: the duplicate-instance process exits during
         // this plugin's init, so any plugin registered earlier would do

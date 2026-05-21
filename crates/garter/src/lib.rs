@@ -6,6 +6,7 @@ pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
 pub mod tap;
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub mod test_utils;
 #[doc(hidden)]

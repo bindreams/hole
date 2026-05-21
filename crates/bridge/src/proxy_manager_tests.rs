@@ -792,12 +792,13 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
 #[skuld::test]
 fn start_cancellable_dropped_future_runs_guards() {
     // Drop-safety: even without CancellationToken, dropping the start
-    // future at an await point must clean up. Uses `tokio::time::timeout`
-    // with a very short deadline to force the drop while `proxy.start`
-    // is parked on the gate.
+    // future at an await point must clean up. Uses the `entered` signal
+    // to know when proxy.start is parked on the gate, then drops the
+    // future via a `select!` race — deterministic, no time-based wait.
     rt().block_on(async {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let proxy = MockProxy::with_start_gate(gate.clone());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
@@ -806,10 +807,18 @@ fn start_cancellable_dropped_future_runs_guards() {
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         let token = CancellationToken::new();
 
-        // Short deadline — the future will be dropped before proxy.start
-        // ever returns (the gate is never released).
-        let result = tokio::time::timeout(Duration::from_millis(50), pm.start_cancellable(&test_config(), token)).await;
-        assert!(result.is_err(), "expected elapsed timeout");
+        // Race the start future against the entered signal. When the
+        // entered arm wins, `select!` drops the `&mut f` arm and the
+        // surrounding scope drops `f`, running the drop-safety guards.
+        {
+            let cfg = test_config();
+            let f = pm.start_cancellable(&cfg, token);
+            tokio::pin!(f);
+            tokio::select! {
+                _ = &mut f => panic!("start should not complete while gate is unfired"),
+                res = entered_rx => res.expect("MockProxy::start never entered"),
+            }
+        }
 
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(

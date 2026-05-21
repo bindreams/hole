@@ -59,7 +59,10 @@ def run_and_terminate(cmd: list[str], *, stdin_devnull: bool) -> None:
     """Launch a subprocess, wait until it signals it has finished startup
     (via the Vite "ready in" line on stdout), then terminate it. Reading
     a deterministic marker replaces a sleep-based "wait briefly" — see
-    bindreams/hole#383.
+    bindreams/hole#383. If the subprocess exits before emitting the
+    marker (Vite changed its output format, npm failed, etc.), we
+    panic loudly: the corruption check is only meaningful against a
+    subprocess that actually set up its console handlers.
     """
     stdin_arg = subprocess.DEVNULL if stdin_devnull else None
     proc = subprocess.Popen(
@@ -68,15 +71,20 @@ def run_and_terminate(cmd: list[str], *, stdin_devnull: bool) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    # Read until Vite emits its "ready in" startup marker. If the
-    # subprocess dies before emitting it, readline returns "" and the
-    # loop exits cleanly. The terminate-and-wait below then verifies
-    # the corruption check ran against a subprocess that had actually
-    # set up its console handlers.
     assert proc.stdout is not None
+    marker_seen = False
     for raw in proc.stdout:
         if b"ready in" in raw.lower() or b"local:" in raw.lower():
+            marker_seen = True
             break
+    if not marker_seen:
+        # Drain any remaining output, then fail loud.
+        proc.terminate()
+        proc.wait(timeout=10)
+        raise RuntimeError(
+            "subprocess exited before emitting 'ready in' / 'local:' marker — "
+            "console corruption check is meaningless without Vite startup."
+        )
     proc.terminate()
     proc.wait(timeout=10)
 

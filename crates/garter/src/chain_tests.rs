@@ -269,11 +269,8 @@ async fn on_ready_fires_with_local_addr() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // rx should fire with the local address once the plugin is listening.
-    let ready_addr = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .expect("timed out waiting for readiness")
-        .expect("ready_tx was dropped without sending");
+    // rx fires with the local address once the plugin is listening.
+    let ready_addr = rx.await.expect("ready_tx was dropped without sending");
 
     assert_eq!(ready_addr.port(), addr.port());
 
@@ -293,10 +290,7 @@ async fn on_ready_dropped_on_plugin_failure() {
     let handle = tokio::spawn(runner.run(env));
 
     // The plugin fails immediately, so ready_tx is dropped → rx gets RecvError.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .expect("timed out waiting for readiness result");
-
+    let result = rx.await;
     assert!(
         result.is_err(),
         "rx should get RecvError when plugin fails before ready"
@@ -333,12 +327,9 @@ async fn cancel_token_triggers_graceful_shutdown() {
     // Cancel externally.
     cancel.cancel();
 
-    // The chain should exit cleanly.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-        .await
-        .expect("timed out waiting for chain to exit")
-        .unwrap();
-
+    // The chain exits cleanly. If cancellation regresses, handle.await
+    // hangs and the test framework's timeout surfaces it.
+    let result = handle.await.unwrap();
     assert!(result.is_ok(), "chain should exit Ok on external cancellation");
 }
 
@@ -416,10 +407,7 @@ async fn first_error_preserved_across_drain() {
     env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
 
     let handle = tokio::spawn(runner.run(env));
-    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
-        .await
-        .expect("chain should exit within drain_timeout of plugin failure")
-        .expect("no JoinError");
+    let result = handle.await.expect("no JoinError");
 
     match result {
         Err(crate::Error::PluginExit { code: 1, .. }) => {}
@@ -484,10 +472,7 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     let handle = tokio::spawn(runner.run(env));
     cancel.cancel();
 
-    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
-        .await
-        .expect("chain should exit within drain_timeout")
-        .expect("no JoinError");
+    let result = handle.await.expect("no JoinError");
 
     match result {
         Err(crate::Error::PluginExit { code: 1, .. }) => {}

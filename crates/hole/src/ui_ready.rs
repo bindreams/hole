@@ -13,8 +13,6 @@
 //!
 //! See bindreams/hole#383.
 
-use std::sync::Arc;
-
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -59,13 +57,13 @@ impl UiReady {
 }
 
 #[tauri::command]
-pub async fn signal_ui_ready(state: tauri::State<'_, Arc<UiReady>>, result: UiReadyResult) -> Result<(), String> {
+pub async fn signal_ui_ready(state: tauri::State<'_, UiReady>, result: UiReadyResult) -> Result<(), String> {
     state.signal(result);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn wait_ui_ready(state: tauri::State<'_, Arc<UiReady>>) -> Result<UiReadyResult, String> {
+pub async fn wait_ui_ready(state: tauri::State<'_, UiReady>) -> Result<UiReadyResult, String> {
     Ok(state.wait().await)
 }
 

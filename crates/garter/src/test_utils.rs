@@ -31,11 +31,23 @@ impl WaitableWriter {
     }
 
     /// Register a one-shot wait — fires the returned receiver the first
-    /// time a future write contains `substring`. Subsequent matches are
-    /// no-ops (the pattern is removed after firing).
+    /// time the accumulated buffer contains `substring`. If the buffer
+    /// already contains it at the time of this call, the receiver fires
+    /// immediately so the caller does not race against past writes.
+    /// Subsequent matches are no-ops (the pattern is removed after
+    /// firing).
     pub fn wait_for(&self, substring: &str) -> std::sync::mpsc::Receiver<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        self.patterns.lock().unwrap().insert(substring.to_string(), tx);
+        // Hold both locks while we check-and-register to avoid losing a
+        // write that lands between the check and the insert.
+        let inner = self.inner.lock().unwrap();
+        let mut patterns = self.patterns.lock().unwrap();
+        let text = String::from_utf8_lossy(&inner);
+        if text.contains(substring) {
+            let _ = tx.send(());
+        } else {
+            patterns.insert(substring.to_string(), tx);
+        }
         rx
     }
 
@@ -47,11 +59,21 @@ impl WaitableWriter {
 
 impl io::Write for WaitableWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.lock().unwrap().extend_from_slice(buf);
-        let text = String::from_utf8_lossy(buf);
+        let mut inner = self.inner.lock().unwrap();
+        inner.extend_from_slice(buf);
         let mut patterns = self.patterns.lock().unwrap();
+        if patterns.is_empty() {
+            return Ok(buf.len());
+        }
+        // Scan the ENTIRE accumulated buffer (not just this write's
+        // `buf`) so a pattern that spans two `write()` calls — e.g.,
+        // tracing-subscriber buffering the header in one call and the
+        // body in the next — still matches. Patterns are removed after
+        // firing, so the work is bounded by the number of *active*
+        // patterns × buffer size.
+        let all_text = String::from_utf8_lossy(&inner);
         patterns.retain(|pattern, tx| {
-            if text.contains(pattern.as_str()) {
+            if all_text.contains(pattern.as_str()) {
                 let _ = tx.send(());
                 false
             } else {

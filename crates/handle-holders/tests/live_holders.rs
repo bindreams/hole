@@ -44,6 +44,15 @@ fn spawn_holder_ready(path: &Path) -> (Child, BufReader<ChildStdout>) {
     (child, reader)
 }
 
+/// Shut down the holder by closing its stdin pipe — `hold_file` exits
+/// on EOF. This exercises the stdin-EOF exit path (the production
+/// contract) rather than forcefully terminating, so a regression in
+/// `hold_file`'s EOF handling shows up here.
+fn shutdown_holder(mut child: Child) {
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 fn collect_holders(path: &Path) -> Vec<FileHolder> {
     find_holders(path).expect("find_holders")
 }
@@ -57,11 +66,10 @@ fn find_holders_finds_foreign_process_holding_file_windows() {
         .and_then(|mut f| f.write_all(b"content"))
         .expect("write file");
 
-    let (mut child, _stdout) = spawn_holder_ready(&path);
+    let (child, _stdout) = spawn_holder_ready(&path);
     let child_pid = child.id();
     let holders = collect_holders(&path);
-    let _ = child.kill();
-    let _ = child.wait();
+    shutdown_holder(child);
 
     let me = std::process::id();
     assert!(
@@ -97,10 +105,9 @@ fn find_holders_detects_child_holding_file() {
         .and_then(|mut f| f.write_all(b"content"))
         .expect("write file");
 
-    let (mut child, _stdout) = spawn_holder_ready(&path);
+    let (child, _stdout) = spawn_holder_ready(&path);
     let holders = collect_holders(&path);
-    let _ = child.kill();
-    let _ = child.wait();
+    shutdown_holder(child);
 
     let me = std::process::id();
     assert!(

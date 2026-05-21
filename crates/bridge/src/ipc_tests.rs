@@ -349,6 +349,7 @@ fn server_accepts_connection() {
         });
         let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -377,6 +378,7 @@ fn status_when_not_running_returns_false() {
             }
         );
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -398,6 +400,7 @@ fn multiple_requests_on_same_connection() {
         assert!(!s2.running);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -425,6 +428,7 @@ fn invalid_request_returns_error_response() {
         assert!(resp.status().is_client_error());
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -468,6 +472,7 @@ fn start_request_starts_proxy() {
         assert_eq!(consume(post_stop(&mut client).await).await, 200);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -495,6 +500,7 @@ fn stop_request_stops_proxy() {
         assert!(!status.running, "expected running=false after Stop");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -522,6 +528,7 @@ fn start_failure_returns_error() {
         );
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -552,6 +559,7 @@ fn reload_request_reloads_proxy() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -575,14 +583,17 @@ fn run_cancellation_aborts_connection_handlers() {
         let _ = handle.await;
 
         // The connection handler should have been aborted by JoinSet::drop.
-        // A subsequent request should fail — not block forever.
-        // Allow up to 3 seconds for the non-blocking accept poll loop to yield.
+        // A subsequent request must fail — the hyper client observes the
+        // FIN/RST on the closed connection and errors. If a regression
+        // makes send_request hang on a dead connection, the test
+        // framework's overall timeout surfaces the hang.
         //
         // ready() is intentionally omitted: the server is already dead, so we're
-        // testing that send_request on a broken connection fails promptly.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), {
-            #[allow(clippy::disallowed_methods)]
-            client.sender.send_request(
+        // testing that send_request on a broken connection fails.
+        #[allow(clippy::disallowed_methods)]
+        let result = client
+            .sender
+            .send_request(
                 http::Request::builder()
                     .method("GET")
                     .uri(ROUTE_STATUS)
@@ -590,13 +601,8 @@ fn run_cancellation_aborts_connection_handlers() {
                     .body(Full::new(Bytes::new()))
                     .unwrap(),
             )
-        })
-        .await;
-        assert!(result.is_ok(), "request should not block — handler must be aborted");
-        assert!(
-            result.unwrap().is_err(),
-            "request should fail after server cancellation"
-        );
+            .await;
+        assert!(result.is_err(), "request should fail after server cancellation");
     });
 }
 
@@ -620,6 +626,7 @@ fn unknown_route_returns_404() {
         assert_eq!(resp.status(), 404);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -644,6 +651,7 @@ fn wrong_method_returns_405() {
         assert_eq!(resp.status(), 405);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -697,6 +705,7 @@ fn metrics_returns_zeros_when_stopped() {
         assert_eq!(metrics.uptime_secs, 0);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -727,6 +736,7 @@ fn metrics_returns_uptime_when_running() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -760,6 +770,7 @@ fn diagnostics_bridge_running() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -787,6 +798,7 @@ fn diagnostics_network_error_when_gateway_unavailable() {
         assert_eq!(diag.internet, "unknown");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -818,6 +830,7 @@ fn diagnostics_proxy_stopped() {
         assert_eq!(diag.internet, "unknown");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -847,6 +860,7 @@ fn diagnostics_bridge_error_after_failed_start() {
         assert_eq!(diag.bridge, "error");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -928,13 +942,12 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             "cancel must succeed even while start is in flight"
         );
 
-        // Wait for A's Start to return, bounded. With cancellation working
-        // correctly the select! branch fires, drop-safety unwinds the
-        // partial state, and Cancelled is returned promptly.
-        let (_client_a, resp_a) = tokio::time::timeout(std::time::Duration::from_secs(5), start_future)
-            .await
-            .expect("start did not return within 5s of cancel")
-            .expect("start task panicked");
+        // Wait for A's Start to return. With cancellation working correctly
+        // the select! branch fires, drop-safety unwinds the partial state,
+        // and Cancelled is returned promptly. If cancellation regresses,
+        // start_future hangs forever and the test framework's overall
+        // timeout surfaces the failure.
+        let (_client_a, resp_a) = start_future.await.expect("start task panicked");
         assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
 
         // Release the gate so the mock's start_ss future can settle if it
@@ -942,7 +955,8 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         gate.notify_one();
         // run_n(2) returns naturally once both connections are handled, so
         // no abort is needed — but use a bounded await to surface any leak.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -976,7 +990,8 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -995,7 +1010,8 @@ fn cancel_with_no_start_is_ack_idempotent() {
         assert_eq!(consume(post_cancel(&mut client).await).await, 200);
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1046,15 +1062,14 @@ fn concurrent_start_is_rejected_with_conflict() {
         let mut client_c = TestClient::connect(&path).await;
         assert_eq!(consume(post_cancel(&mut client_c).await).await, 200);
 
-        // A's start must eventually return Cancelled.
-        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
-            .await
-            .expect("A's start did not return")
-            .expect("A task panicked");
+        // A's start must return Cancelled. If cancellation regresses,
+        // a_future hangs and the test framework's timeout surfaces it.
+        let (_client_a, a_resp) = a_future.await.expect("A task panicked");
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1091,7 +1106,8 @@ fn sequential_start_cancel_start_consumes_pre_arm_once() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1136,15 +1152,14 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         assert_eq!(b_resp.status(), 200);
         assert_eq!(c_resp.status(), 200);
 
-        // A's start returns Cancelled.
-        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
-            .await
-            .expect("A's start did not return")
-            .expect("A task panicked");
+        // A's start returns Cancelled. If cancellation regresses,
+        // a_future hangs and the test framework's timeout surfaces it.
+        let (_client_a, a_resp) = a_future.await.expect("A task panicked");
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1235,6 +1250,7 @@ fn bind_accepts_connection() {
         });
         let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -1254,6 +1270,7 @@ fn bind_status_query() {
         assert_eq!(status.uptime_secs, 0);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }

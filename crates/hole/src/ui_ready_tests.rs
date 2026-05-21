@@ -17,7 +17,13 @@ fn signal_before_wait_returns_immediately() {
 }
 
 #[skuld::test]
-fn signal_after_wait_wakes_waiter() {
+fn signal_and_wait_compose_regardless_of_order() {
+    // Tokio's task scheduling determines whether `ui2.wait().await`
+    // parks before `ui.signal(...)` fires or after. Either ordering
+    // must yield the correct value; this test only asserts the
+    // behavior on a successful interleave, not the ordering itself.
+    // The `signal_before_wait_returns_immediately` test exercises the
+    // signal-first path explicitly.
     rt().block_on(async {
         let ui = Arc::new(UiReady::default());
         let ui2 = Arc::clone(&ui);
