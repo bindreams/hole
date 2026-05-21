@@ -7,12 +7,12 @@
 //! Apache-2.0-process-boundary behavior.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 use garter::{BinaryPlugin, ChainPlugin, TapPlugin};
 
@@ -39,14 +39,14 @@ fn mock_plugin_path() -> PathBuf {
 
 #[skuld::test]
 async fn tap_relays_data_through_binary_plugin_to_echo_server() {
-    // Install a subscriber that prints to test stderr so mock-plugin's
-    // own stderr (captured by BinaryPlugin and re-emitted as
-    // tracing::warn) and the tap's info events are visible when this
-    // test is debugged.
+    // Install a subscriber backed by `WaitableWriter` so the test can
+    // park on the tap's "plugin tap: ready" event without polling.
+    let writer = WaitableWriter::new();
+    let ready_rx = writer.wait_for("plugin tap: ready");
     let subscriber = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_test_writer()
+        .with_writer(writer.clone())
         .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
         .finish();
     let _g = set_default_in_current_thread(subscriber);
 
@@ -86,32 +86,27 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
     let plugin_shutdown = shutdown.clone();
     let plugin_handle = tokio::spawn(async move { tap.run(chain_local, echo_addr, plugin_shutdown).await });
 
-    // Wait for tap public listener to come up.
-    let mut client = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            match TcpStream::connect(chain_local).await {
-                Ok(s) => break s,
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => panic!("tap did not start accepting within 10s: {e}"),
-            }
-        }
-    };
+    // Park until tap signals ready via the tracing event the
+    // `WaitableWriter` is watching for. Deterministic, no polling.
+    // See bindreams/hole#383.
+    tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(chain_local)
+        .await
+        .expect("connect to tap public listener");
 
     client.write_all(b"hello through tap+mock").await.unwrap();
     let mut buf = [0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
-        .await
-        .expect("read timed out")
-        .unwrap();
+    let n = client.read(&mut buf).await.expect("read from tap returned error");
     assert_eq!(&buf[..n], b"hello through tap+mock");
 
     drop(client);
     echo_task.abort();
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), plugin_handle).await;
+    // Await the plugin task; if it hangs, the test framework's timeout
+    // surfaces a clear "test took too long" failure.
+    let _ = plugin_handle.await;
 }
 
 // Install the workspace test subscriber + panic hook. See

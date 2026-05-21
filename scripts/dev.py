@@ -183,6 +183,10 @@ def wait_for_port(port: int, timeout: float, proc: subprocess.Popen) -> bool:
                     return True
             except OSError:
                 continue
+        # External-event-with-graceful-failure exception (CLAUDE.md
+        # §Synchronization invariant): the subprocess is out-of-process,
+        # OS doesn't expose an "Nth process bound port P" event, so we
+        # poll. Failure is relayed cleanly via the False return.
         time.sleep(0.2)
     return False
 
@@ -195,6 +199,9 @@ def wait_for_socket(path: Path, proc: subprocess.Popen, timeout: float) -> bool:
             return False
         if path.exists():
             return True
+        # External-event-with-graceful-failure exception (CLAUDE.md
+        # §Synchronization invariant): subprocess file creation is not
+        # synchronously observable cross-process. Failure returns False.
         time.sleep(0.1)
     return False
 

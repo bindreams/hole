@@ -36,14 +36,26 @@ fn mock_plugin_path() -> PathBuf {
 async fn two_plugin_chain_relays_data() {
     let mock_path = mock_plugin_path();
 
-    // Start an echo server as the final destination
+    // Multi-connection echo server. `on_ready`'s TCP-connect probe is
+    // forwarded through the chain to the echo server, consuming an
+    // accept slot before the real client connection arrives — so echo
+    // must loop. (The previous poll-based readiness check connected
+    // directly to the outermost listener before traffic flowed through
+    // the chain, masking this.) See bindreams/hole#383.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
 
     let echo_task = tokio::spawn(async move {
-        if let Ok((stream, _)) = echo_listener.accept().await {
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                    });
+                }
+                Err(_) => return,
+            }
         }
     });
 
@@ -52,10 +64,16 @@ async fn two_plugin_chain_relays_data() {
     let chain_local = chain_listener.local_addr().unwrap();
     drop(chain_listener);
 
-    // Build chain: mock-plugin-1 -> mock-plugin-2
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    // Build chain: mock-plugin-1 -> mock-plugin-2. `on_ready` fires
+    // when the outermost plugin has bound `chain_local` — see
+    // bindreams/hole#383 for why the previous poll-connect was a flake
+    // hazard.
     let runner = ChainRunner::new()
         .add(Box::new(BinaryPlugin::new(&mock_path, None)))
         .add(Box::new(BinaryPlugin::new(&mock_path, None)))
+        .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
 
     let env = PluginEnv {
@@ -68,26 +86,13 @@ async fn two_plugin_chain_relays_data() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    // Wait for the chain to start accepting connections
-    let mut client = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match TcpStream::connect(chain_local).await {
-                Ok(stream) => break stream,
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => panic!("chain did not start accepting within 5s: {e}"),
-            }
-        }
-    };
+    // Park until the chain signals ready. Deterministic, no poll-retry.
+    ready_rx.await.expect("chain never signaled ready");
+    let mut client = TcpStream::connect(chain_local).await.expect("connect to chain local");
     client.write_all(b"hello through chain").await.unwrap();
 
     let mut buf = [0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
-        .await
-        .expect("read timed out")
-        .unwrap();
+    let n = client.read(&mut buf).await.expect("read from chain returned error");
 
     assert_eq!(&buf[..n], b"hello through chain");
 
@@ -95,10 +100,12 @@ async fn two_plugin_chain_relays_data() {
     drop(client);
     echo_task.abort();
 
-    // Chain plugins loop on accept() indefinitely. When the skuld test
-    // harness drops the tokio runtime at the end of the test, tasks are
-    // cancelled and kill_on_drop terminates the child processes.
-    let _ = tokio::time::timeout(Duration::from_secs(10), chain_task).await;
+    // Chain plugins loop on accept() indefinitely. The skuld test
+    // harness drops the tokio runtime at the end of the test; tasks
+    // are cancelled and kill_on_drop terminates the child processes.
+    // No explicit wait needed.
+    chain_task.abort();
+    let _ = chain_task.await;
 }
 
 /// Verify that pid_sink fires once per binary plugin with a valid PID.
@@ -156,7 +163,7 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     }
 
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    let _ = handle.await;
 }
 
 // Install the workspace test subscriber + panic hook. See

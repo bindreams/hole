@@ -12,6 +12,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{state as route_state, Routing};
@@ -25,6 +26,13 @@ struct MockProxy {
     /// simulate a slow start so tests can race `POST /v1/cancel` against
     /// an in-flight `POST /v1/start`.
     start_gate: Option<Arc<tokio::sync::Notify>>,
+    /// If Some, `start` fires this sender on entry — before awaiting
+    /// `start_gate`. Lets tests park until the proxy is *known* to be
+    /// inside `start()` instead of sleeping a guess-duration. One-shot
+    /// per MockProxy (subsequent entries do nothing); the test pattern
+    /// is "spawn task A; await entered; act on the parked state."
+    /// See bindreams/hole#383.
+    start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl MockProxy {
@@ -32,6 +40,7 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(false),
             start_gate: None,
+            start_entered: std::sync::Mutex::new(None),
         }
     }
 
@@ -39,6 +48,7 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(true),
             start_gate: None,
+            start_entered: std::sync::Mutex::new(None),
         }
     }
 
@@ -46,7 +56,13 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(false),
             start_gate: Some(gate),
+            start_entered: std::sync::Mutex::new(None),
         }
+    }
+
+    fn with_entered_signal(mut self, tx: oneshot::Sender<()>) -> Self {
+        self.start_entered = std::sync::Mutex::new(Some(tx));
+        self
     }
 }
 
@@ -54,6 +70,11 @@ impl Proxy for MockProxy {
     type Running = MockRunning;
 
     async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+        // Fire the entered signal BEFORE awaiting the gate so the test
+        // can sequence subsequent operations on the parked state.
+        if let Some(tx) = self.start_entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
         }
@@ -190,10 +211,14 @@ fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
-fn gated_proxy(gate: Arc<tokio::sync::Notify>) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+fn gated_proxy(
+    gate: Arc<tokio::sync::Notify>,
+    entered: oneshot::Sender<()>,
+) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::new(state_dir);
-    Arc::new(Mutex::new(ProxyManager::new(MockProxy::gated(gate), routing)))
+    let mock = MockProxy::gated(gate).with_entered_signal(entered);
+    Arc::new(Mutex::new(ProxyManager::new(mock, routing)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -691,9 +716,6 @@ fn metrics_returns_uptime_when_running() {
         // Start proxy
         assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
 
-        // Small delay to accumulate uptime
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
         let metrics = get_metrics(&mut client).await;
         // Traffic fields are still zero (not yet integrated)
         assert_eq!(metrics.bytes_in, 0);
@@ -876,7 +898,8 @@ fn cancel_while_start_in_flight_returns_cancelled() {
     rt().block_on(async {
         let path = test_socket_path("cancel-in-flight");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // Bound the accept loop to exactly the two connections this test
         // uses, instead of running indefinitely. See `run_n` docstring.
         let handle = tokio::spawn(async move { server.run_n(2).await });
@@ -890,8 +913,9 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             (client_a, resp)
         });
 
-        // Give A a moment to acquire the proxy mutex and park in start_ss.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Park until A is *known* to be inside MockProxy::start (before
+        // it awaits the gate). Deterministic — no sleep.
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Connection B: cancel the in-flight start. Must succeed without
         // waiting for the in-flight Start (which never completes since the
@@ -985,7 +1009,8 @@ fn concurrent_start_is_rejected_with_conflict() {
     rt().block_on(async {
         let path = test_socket_path("concurrent-start");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // 3 connections: A start, B start, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -997,8 +1022,8 @@ fn concurrent_start_is_rejected_with_conflict() {
             (client_a, resp)
         });
 
-        // Give A a moment to register its token.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Park until A is inside MockProxy::start (token registered).
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Client B sends a concurrent Start and must be rejected.
         let mut client_b = TestClient::connect(&path).await;
@@ -1080,7 +1105,8 @@ fn concurrent_double_cancel_during_start_both_succeed() {
     rt().block_on(async {
         let path = test_socket_path("double-cancel");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // 3 connections: A start, B cancel, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -1091,7 +1117,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
             let resp = post_start(&mut client_a, &sample_config()).await;
             (client_a, resp)
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Two concurrent cancels on separate connections.
         let path_b = path.clone();

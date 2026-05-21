@@ -30,6 +30,77 @@ use std::thread::JoinHandle;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 
+// Test-only flush mechanism ===========================================================================================
+//
+// Production never flushes the relay (the relay reader threads run
+// until process exit; their Drop is a no-op by design). Tests need a
+// deterministic "all bytes written so far have been consumed by the
+// reader and emitted as tracing events" hook so they don't sleep-
+// for-sync. The mechanism: `StdioRelayHandles::flush` writes a unique
+// in-band sentinel line through stderr/stdout, then blocks on a
+// `std::sync::mpsc::sync_channel` ack that the relay reader fires
+// when it consumes the sentinel. The sentinel is intercepted before
+// the tee/emit path so it does not pollute either log surface.
+// Event-driven, no polling.
+//
+// Synchronous (mpsc, not tokio::oneshot) so test scenarios that run
+// outside a tokio runtime — like the FD-redirect child-process
+// scenarios in `logging_test_helpers.rs` — can use it directly.
+//
+// See bindreams/hole#383.
+
+#[cfg(test)]
+pub(crate) const RELAY_FLUSH_SENTINEL_PREFIX: &str = "__hole_relay_flush__";
+
+#[cfg(test)]
+static PENDING_FLUSH_ACKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::SyncSender<()>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pending_flush_acks() -> &'static std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::SyncSender<()>>> {
+    PENDING_FLUSH_ACKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+static NEXT_FLUSH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+impl StdioRelayHandles {
+    /// Block until every byte written to stderr/stdout *before this
+    /// call* has been consumed by the relay reader thread and emitted
+    /// as a tracing event.
+    ///
+    /// Mechanism: writes a unique sentinel line through each stream;
+    /// the relay reader, when it consumes the sentinel, fires an
+    /// `mpsc` ack. The sentinel is not teed/emitted as a tracing
+    /// event. Event-driven, no polling.
+    ///
+    /// Test-only and synchronous so it works in non-tokio scenarios.
+    /// Production relays run until process exit; flushing is
+    /// meaningless there.
+    pub fn flush(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let stderr_id = NEXT_FLUSH_ID.fetch_add(1, Ordering::SeqCst);
+        let stdout_id = NEXT_FLUSH_ID.fetch_add(1, Ordering::SeqCst);
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        {
+            let mut acks = pending_flush_acks().lock().unwrap();
+            acks.insert(stderr_id, stderr_tx);
+            acks.insert(stdout_id, stdout_tx);
+        }
+        // Write sentinels through the real stderr/stdout. The FD-level
+        // redirect routes them into our pipe; the relay reader will
+        // see them next.
+        writeln!(std::io::stderr(), "{RELAY_FLUSH_SENTINEL_PREFIX}{stderr_id}")?;
+        writeln!(std::io::stdout(), "{RELAY_FLUSH_SENTINEL_PREFIX}{stdout_id}")?;
+        stderr_rx.recv().map_err(io::Error::other)?;
+        stdout_rx.recv().map_err(io::Error::other)?;
+        Ok(())
+    }
+}
+
 // LogGuard ============================================================================================================
 
 /// Guards for the non-blocking writers and the stdio relay reader threads.
@@ -203,13 +274,25 @@ fn relay_loop(reader: os_pipe::PipeReader, mut tee: tracing_appender::non_blocki
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break,
             Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                // Test-only: intercept the flush sentinel before the tee/
+                // emit path so it does not pollute either log surface.
+                #[cfg(test)]
+                if let Some(id_str) = trimmed.strip_prefix(RELAY_FLUSH_SENTINEL_PREFIX) {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        let tx = pending_flush_acks().lock().unwrap().remove(&id);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(());
+                            continue;
+                        }
+                    }
+                }
                 // Tee raw bytes to the saved-original first so script-visible
                 // output ordering is preserved.
                 let _ = tee.write_all(&buf);
                 let _ = tee.flush();
                 // Emit a tracing event with the trimmed text for the file log.
-                let line = String::from_utf8_lossy(&buf);
-                let trimmed = line.trim_end_matches(['\r', '\n']);
                 if !trimmed.is_empty() {
                     match stream {
                         Stream::Stderr => emit_stderr_relay(trimmed),

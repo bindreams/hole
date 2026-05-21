@@ -34,6 +34,36 @@ export const config: Options.Testrunner = {
   },
   reporters: ["spec"],
 
+  // Wait for the UI to signal it has finished `init()` (success or
+  // failure). Synchronizes the test run with the UI's initialization
+  // state via an explicit Tauri-command bridge in
+  // crates/hole/src/ui_ready.rs. `executeAsync` parks the driver
+  // until `done()` is called from the page-side script. The Mocha
+  // 30s `timeout` above is the framework-level failure bound (it
+  // covers WebView2-itself-broken — an external-event-might-never-
+  // happen scenario; not the synchronization).
+  //
+  // See bindreams/hole#383 for the flake that motivated this.
+  async before() {
+    const result = await browser.executeAsync<{
+      ok: boolean;
+      error: string | null;
+    }>((done) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ready = (window as any).__holeUiReady as undefined | (() => Promise<{ ok: boolean; error: string | null }>);
+      if (typeof ready !== "function") {
+        done({ ok: false, error: "__holeUiReady not exposed by ui/main.ts" });
+        return;
+      }
+      ready()
+        .then(done)
+        .catch((e: unknown) => done({ ok: false, error: String(e) }));
+    });
+    if (!result.ok) {
+      throw new Error(`UI init failed: ${result.error}`);
+    }
+  },
+
   onPrepare() {
     // Discard tauri-driver's stdio — keeping the pipes open would block
     // tauri-driver if it ever writes more than the pipe buffer (~64 KB

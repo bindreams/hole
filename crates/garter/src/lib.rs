@@ -7,6 +7,8 @@ pub mod shutdown;
 pub mod sip003;
 pub mod tap;
 #[doc(hidden)]
+pub mod test_utils;
+#[doc(hidden)]
 pub mod tracing_test;
 
 pub use binary::{BinaryPlugin, PidSink};

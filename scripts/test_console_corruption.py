@@ -21,7 +21,6 @@ import ctypes.wintypes
 import shutil
 import subprocess
 import sys
-import time
 
 if sys.platform != "win32":
     print("SKIP: this test only runs on Windows")
@@ -57,7 +56,11 @@ def mode_flags(mode: int) -> str:
 
 
 def run_and_terminate(cmd: list[str], *, stdin_devnull: bool) -> None:
-    """Launch a subprocess, wait briefly, then terminate it."""
+    """Launch a subprocess, wait until it signals it has finished startup
+    (via the Vite "ready in" line on stdout), then terminate it. Reading
+    a deterministic marker replaces a sleep-based "wait briefly" — see
+    bindreams/hole#383.
+    """
     stdin_arg = subprocess.DEVNULL if stdin_devnull else None
     proc = subprocess.Popen(
         cmd,
@@ -65,7 +68,15 @@ def run_and_terminate(cmd: list[str], *, stdin_devnull: bool) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    time.sleep(2)
+    # Read until Vite emits its "ready in" startup marker. If the
+    # subprocess dies before emitting it, readline returns "" and the
+    # loop exits cleanly. The terminate-and-wait below then verifies
+    # the corruption check ran against a subprocess that had actually
+    # set up its console handlers.
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        if b"ready in" in raw.lower() or b"local:" in raw.lower():
+            break
     proc.terminate()
     proc.wait(timeout=10)
 

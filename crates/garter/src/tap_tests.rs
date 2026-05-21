@@ -13,9 +13,7 @@
 //! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 
-use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,42 +23,19 @@ use tokio_util::sync::CancellationToken;
 use crate::counting::CountingStream;
 use crate::plugin::ChainPlugin;
 use crate::tap::TapPlugin;
+use crate::test_utils::WaitableWriter;
 use crate::tracing_test::set_default_in_current_thread;
 
 // Subscriber capture ==================================================================================================
 
-#[derive(Clone, Default)]
-struct VecWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for VecWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
-    type Writer = VecWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn make_subscriber() -> (impl tracing::Subscriber + Send + Sync, VecWriter) {
-    let writer = VecWriter::default();
+fn make_subscriber() -> (impl tracing::Subscriber + Send + Sync, WaitableWriter) {
+    let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
         .with_ansi(false)
         .with_target(true)
         .finish();
     (subscriber, writer)
-}
-
-fn captured_text(writer: &VecWriter) -> String {
-    String::from_utf8_lossy(&writer.0.lock().unwrap().clone()).into_owned()
 }
 
 // Stubs ===============================================================================================================
@@ -174,34 +149,35 @@ where
     let inner = Box::new(StubPlugin { behavior }) as Box<dyn ChainPlugin>;
     let tap = Box::new(TapPlugin::wrap(inner));
 
+    // Register event waits BEFORE spawning the plugin so an unusually
+    // fast emit can't race past us.
+    let ready_rx = writer.wait_for("plugin tap: ready");
+    let closed_rx = writer.wait_for("plugin tap: closed");
+
     let plugin_shutdown = shutdown.clone();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown).await });
 
-    // Wait for tap to be ready by polling its public listener.
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if TcpStream::connect(local).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    ready.expect("tap public listener never became ready");
+    // Park until tap signals ready via tracing event. No timeout — the
+    // test framework bounds wall time; if tap is broken the failure is
+    // clear ("test took too long" vs "tap never bound"). Deterministic.
+    tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
+        .await
+        .unwrap();
 
     // Run the user-supplied client interaction.
     client_body(local).await;
 
-    // Give the tap's spawn_tap a moment to log the close line (it runs
-    // off the same runtime; the close log fires after copy_bidirectional
-    // returns, which can be up to one tokio scheduling tick after the
-    // OS-side close). 200ms is plenty in practice for these stubs.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Park until tap logs "closed" for the connection — the event-driven
+    // replacement for the previous 200ms sleep that hoped close had
+    // landed in the writer.
+    tokio::task::spawn_blocking(move || closed_rx.recv().expect("tap never signaled close"))
+        .await
+        .unwrap();
 
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(3), plugin_handle).await;
+    let _ = plugin_handle.await;
 
-    captured_text(&writer)
+    writer.snapshot()
 }
 
 // Tests ===============================================================================================================
@@ -339,7 +315,7 @@ async fn rst_close_classified_as_rst_with_os_errno() {
 
 #[skuld::test]
 async fn shutdown_cancels_in_flight_connection_without_panic() {
-    let (subscriber, _writer) = make_subscriber();
+    let (subscriber, writer) = make_subscriber();
     let _g = set_default_in_current_thread(subscriber);
 
     let local = pick_local().await;
@@ -352,29 +328,28 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     }) as Box<dyn ChainPlugin>;
     let tap = Box::new(TapPlugin::wrap(inner));
 
+    let ready_rx = writer.wait_for("plugin tap: ready");
+
     let plugin_shutdown = shutdown.clone();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown).await });
 
-    // Wait for tap ready.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if TcpStream::connect(local).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("tap ready");
+    // Park until tap signals ready via tracing event. Deterministic.
+    tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
+        .await
+        .unwrap();
 
     // Open a connection that the echo plugin will hold (waiting on
     // read_exact for 4096 bytes — we send only 1).
     let _client = TcpStream::connect(local).await.unwrap();
 
-    // Cancel shutdown and assert the plugin exits within budget.
+    // Cancel shutdown and await the plugin exit. The plugin's own
+    // shutdown bookkeeping bounds time; if it hangs the test
+    // framework's timeout surfaces a clear failure.
     shutdown.cancel();
-    let result = tokio::time::timeout(Duration::from_secs(3), plugin_handle).await;
-    assert!(result.is_ok(), "tap plugin did not exit within 3s of shutdown");
+    plugin_handle
+        .await
+        .expect("plugin task panicked")
+        .expect("plugin returned error");
 }
 
 #[skuld::test]

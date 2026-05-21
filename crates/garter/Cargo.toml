@@ -20,6 +20,10 @@ workspace = true
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
+# `fmt` is needed for the `MakeWriter` trait impl in `test_utils`.
+# Other features (env-filter, ansi) remain in dev-deps to keep the
+# production footprint minimal. Cargo unions features across deps.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 thiserror = "2"
 contracts = { workspace = true }
 async-trait = { workspace = true }
@@ -32,6 +36,10 @@ skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 socket2 = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Enable `tokio::time::pause` / `advance` / `resume` for tests that need
+# virtual-clock control. Cargo unions this with the main deps `full`
+# feature set; production builds do NOT get test-util.
+tokio = { version = "1", features = ["test-util"] }
 
 [[test]]
 name = "chain_integration"

@@ -13,6 +13,10 @@ workspace = true
 [lib]
 harness = false
 
+[[bin]]
+name = "hold_file"
+path = "src/bin/hold_file.rs"
+
 [[test]]
 name = "live_holders"
 path = "tests/live_holders.rs"
