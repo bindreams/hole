@@ -10,7 +10,13 @@ import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
 import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
-import { importFromDialog, initServers, renderServers, showImportFailureDialog } from "./servers";
+import {
+  clearImportZoneHighlight,
+  importFromDialog,
+  initServers,
+  renderServers,
+  showImportFailureDialog,
+} from "./servers";
 import { initSettings, renderSettings } from "./settings";
 import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
 import { showToast } from "./toast";
@@ -152,12 +158,26 @@ function setupEventListeners() {
   // File > Import menu action (tray emits () as payload — open dialog).
   listen("import-requested", () => importFromDialog());
 
+  // WebView2 (Windows) shows the OS "forbidden" cursor on file drags
+  // unless JS calls `preventDefault()` on the `dragover` event — even
+  // though Tauri's native drop handler is what actually delivers the
+  // file paths via `tauri://drag-drop`. Without these two lines, the
+  // user gets a red-crossed-circle cursor and the drop is rejected at
+  // the OS layer before Tauri sees it. The handlers are window-scoped
+  // because Tauri's drop handler is also window-scoped. See #385.
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
+
   // Drag-and-drop file import. The user may drop one or many files;
   // iterate, showing a BLOCKING error dialog per failure (sequential —
   // the user must acknowledge each), and aggregate any successes into
   // a single end-of-loop toast. See bindreams/hole#385: errors used to
   // be toasts that auto-dismiss in 10s, which is easy to miss.
   listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
+    // A successful drop may not fire `dragleave` on the import zone —
+    // remove the visual highlight unconditionally before processing
+    // (the no-op case where the zone wasn't highlighted is harmless).
+    clearImportZoneHighlight();
     const paths = event.payload?.paths ?? [];
     if (paths.length === 0) return;
 

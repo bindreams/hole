@@ -748,6 +748,18 @@ order. (0,2,0) > (0,1,0). */
   border-color: var(--text-muted);
 }
 
+/* Drag-over highlight: stronger than hover, signals "drop will be
+ * accepted here." Triggered by HTML5 `dragenter`/`dragleave` wired in
+ * `initServers` (the actual drop is handled by Tauri's native
+ * `tauri://drag-drop` event).
+ */
+.add-zone.drag-over {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  border-style: solid;
+  background: var(--accent-bg);
+}
+
 /* Filters table =====  */
 .filters-tbl {
   width: 100%;

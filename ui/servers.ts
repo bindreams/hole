@@ -253,9 +253,25 @@ export async function importFromDialog() {
   );
 }
 
+/**
+ * Clear the drag-over highlight on the import zone. Called by the
+ * `tauri://drag-drop` listener in main.ts because the OS does not
+ * always fire a final `dragleave` after a successful drop, so relying
+ * on `dragleave` alone leaves the zone stuck highlighted.
+ */
+export function clearImportZoneHighlight(): void {
+  importZone.classList.remove("drag-over");
+}
+
 // Initialization ======================================================================================================
 
 /** Set up event listeners for the servers section. Called once from main.ts. */
 export function initServers() {
   importZone.addEventListener("click", importFromDialog);
+
+  // Visual feedback during a file drag. The actual drop is delivered by
+  // Tauri's native handler via `tauri://drag-drop` (wired in main.ts);
+  // these HTML5 events run in parallel and only drive the styling.
+  importZone.addEventListener("dragenter", () => importZone.classList.add("drag-over"));
+  importZone.addEventListener("dragleave", () => importZone.classList.remove("drag-over"));
 }
