@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
+import { showToast } from "./toast";
 import { LATENCY_VALIDATED_ON_CONNECT, type ServerTestOutcome, type ValidationState } from "./types";
 
 // DOM references ======================================================================================================
@@ -192,22 +193,41 @@ async function deleteServer(id: string) {
 
 /** Open a file dialog and import servers from the selected JSON file. */
 export async function importFromDialog() {
+  let path: string | null;
   try {
-    const path = await open({
+    path = await open({
       filters: [{ name: "JSON", extensions: ["json"] }],
       multiple: false,
     });
-    if (!path) return;
-    const newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
-    await loadConfig();
-    // Auto-test imported servers in parallel (bounded). Fire and forget.
-    runTestsBounded(
-      newServers.map((s) => s.id),
-      TEST_CONCURRENCY,
-    );
+  } catch (err) {
+    console.error("file dialog failed:", err);
+    showToast(`Could not open file dialog: ${err}`, "error");
+    return;
+  }
+  if (!path) return; // user cancelled
+
+  let newServers: { id: string }[];
+  try {
+    newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
   } catch (err) {
     console.error("import from dialog failed:", err);
+    showToast(`Import failed: ${err}`, "error");
+    return;
   }
+
+  await loadConfig();
+
+  if (newServers.length === 0) {
+    showToast("No new servers — already in the list.", "info");
+    return;
+  }
+  showToast(`Imported ${newServers.length} server(s).`, "success");
+
+  // Auto-test imported servers in parallel (bounded). Fire and forget.
+  runTestsBounded(
+    newServers.map((s) => s.id),
+    TEST_CONCURRENCY,
+  );
 }
 
 // Initialization ======================================================================================================

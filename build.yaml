@@ -254,7 +254,8 @@ targets:
           environment: { SKIP: cargo-clippy }
 
   frontend-check:
-    # tsc --noEmit. Platform-independent (tsc doesn't care about host OS).
+    # tsc --noEmit + Vitest unit tests. Platform-independent (tsc and
+    # Vitest both read source files directly; no Vite bundle dependency).
     # No `depends: frontend-build` — tsc reads source files directly; the
     # Vite bundle is an artifact, not an input to the type-check.
     platforms:
@@ -262,3 +263,4 @@ targets:
     run:
       - npm ci --no-audit --no-fund
       - npm run check
+      - npm test

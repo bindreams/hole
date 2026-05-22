@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::Path;
 use tauri::{Emitter, State};
 use time::OffsetDateTime;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -62,6 +62,55 @@ fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, String> {
     import::import_servers(&json).map_err(|e| sanitize_import_error(&e))
 }
 
+/// Append `parsed` server entries into `config`, deduplicating by
+/// (server, port, method, password). Returns the actually-appended entries
+/// and the count of dropped duplicates. Emits a single `info!` summary so
+/// every import attempt leaves a trace in `gui.log`.
+///
+/// Pure helper — no Tauri `State`, no `AppHandle`, no `Mutex` — so it is
+/// unit-testable without standing up a real Tauri app. The `#[tauri::command]`
+/// wrapper [`import_servers_from_file`] holds the lock and persists the
+/// resulting config; this helper does NOT save.
+fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<ServerEntry>, usize) {
+    let parsed_count = parsed.len();
+    let existing_count = config.servers.len();
+
+    let mut appended = Vec::new();
+    for server in parsed {
+        let already_exists = config.servers.iter().any(|s| {
+            s.server == server.server
+                && s.server_port == server.server_port
+                && s.method == server.method
+                && s.password == server.password
+        });
+        if !already_exists {
+            config.servers.push(server.clone());
+            appended.push(server);
+        }
+    }
+    let appended_count = appended.len();
+    let deduped_count = parsed_count - appended_count;
+
+    let selected_before = config.selected_server.clone();
+    auto_select_first_server(config);
+    let selected_after = config.selected_server.clone();
+    let selection_initialized_from_none = selected_before.is_none() && selected_after.is_some();
+    let selection_healed = selected_before.is_some() && selected_before != selected_after;
+
+    info!(
+        parsed = parsed_count,
+        appended = appended_count,
+        deduped = deduped_count,
+        existing_before = existing_count,
+        total_after = existing_count + appended_count,
+        selection_initialized_from_none,
+        selection_healed,
+        "import_servers_from_file: apply summary"
+    );
+
+    (appended, deduped_count)
+}
+
 /// Convert an ImportError to a user-facing message without leaking file content.
 fn sanitize_import_error(err: &import::ImportError) -> String {
     match err {
@@ -96,26 +145,28 @@ fn auto_select_first_server(config: &mut AppConfig) {
 /// the returned IDs to auto-test *new* entries; returning phantom IDs for
 /// deduped entries would produce silent "no server with id …" errors in
 /// the auto-test loop.
+///
+/// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
+/// emits `warn!` on validate/parse failure and on config-save failure. The
+/// save-failure path returns a generic user-facing message because the
+/// underlying error includes a filesystem path (PII on Windows).
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
-    let parsed = validate_and_read_import(Path::new(&path))?;
+    info!(path = %path, "import_servers_from_file: start");
+    let parsed = validate_and_read_import(Path::new(&path)).inspect_err(|e| {
+        warn!(path = %path, error = %e, "import_servers_from_file: validate/parse failed");
+    })?;
 
     let mut config = state.config.lock().unwrap();
-    let mut appended = Vec::new();
-    for server in parsed {
-        let already_exists = config.servers.iter().any(|s| {
-            s.server == server.server
-                && s.server_port == server.server_port
-                && s.method == server.method
-                && s.password == server.password
-        });
-        if !already_exists {
-            config.servers.push(server.clone());
-            appended.push(server);
-        }
-    }
-    auto_select_first_server(&mut config);
-    config.save(&state.config_path).map_err(|e| e.to_string())?;
+    let (appended, _deduped) = apply_import(&mut config, parsed);
+
+    config.save(&state.config_path).map_err(|e| {
+        warn!(error = %e, "import_servers_from_file: config save failed");
+        // The raw error contains the config-file path (PII on Windows).
+        // The detail goes to gui.log via the warn! above; the user sees
+        // only a generic message.
+        "failed to save config — see gui.log".to_string()
+    })?;
 
     Ok(appended)
 }

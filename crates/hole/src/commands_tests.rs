@@ -364,3 +364,224 @@ fn import_error_sanitizes_invalid_value(#[fixture(temp_dir)] dir: &Path) {
     let err = result.unwrap_err();
     assert!(!err.contains("99999"), "error message leaked raw value: {err}");
 }
+
+// apply_import tests ==================================================================================================
+
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone)]
+struct VecWriter {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for VecWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for VecWriter {
+    type Writer = VecWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Build a `ServerEntry` from individual fields. The default `test_entry`
+/// fixture at the top of this file always uses 1.2.3.4:8388 which makes
+/// dedup tests harder to read.
+fn entry(id: &str, server: &str, port: u16) -> ServerEntry {
+    ServerEntry {
+        id: id.to_string(),
+        name: format!("Server {id}"),
+        server: server.to_string(),
+        server_port: port,
+        method: "aes-256-gcm".to_string(),
+        password: "pw".to_string(),
+        plugin: None,
+        plugin_opts: None,
+        validation: None,
+    }
+}
+
+#[skuld::test]
+fn apply_import_empty_parsed_appends_nothing() {
+    let mut config = AppConfig::default();
+    let (appended, deduped) = apply_import(&mut config, vec![]);
+    assert!(appended.is_empty());
+    assert_eq!(deduped, 0);
+    assert!(config.servers.is_empty());
+    assert!(config.selected_server.is_none());
+}
+
+/// Stronger non-mutation property: an empty parsed list must not touch
+/// the existing servers list, the selection, or any other field of
+/// `AppConfig`. Compares the whole config before and after.
+#[skuld::test]
+fn apply_import_empty_parsed_does_not_mutate_populated_config() {
+    let before = AppConfig {
+        servers: vec![entry("a", "10.0.0.1", 8388), entry("b", "10.0.0.2", 8388)],
+        selected_server: Some("b".to_string()),
+        local_port: 4073,
+        enabled: true,
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    let (appended, deduped) = apply_import(&mut after, vec![]);
+    assert!(appended.is_empty());
+    assert_eq!(deduped, 0);
+    // Compare relevant fields explicitly (PartialEq on AppConfig may not
+    // exist; field-by-field is robust either way).
+    assert_eq!(after.servers, before.servers);
+    assert_eq!(after.selected_server, before.selected_server);
+    assert_eq!(after.local_port, before.local_port);
+    assert_eq!(after.enabled, before.enabled);
+}
+
+#[skuld::test]
+fn apply_import_appends_all_unique_entries() {
+    let mut config = AppConfig::default();
+    let parsed = vec![
+        entry("new-1", "10.0.0.1", 8388),
+        entry("new-2", "10.0.0.2", 8388),
+        entry("new-3", "10.0.0.3", 8388),
+    ];
+    let (appended, deduped) = apply_import(&mut config, parsed);
+    assert_eq!(appended.len(), 3);
+    assert_eq!(deduped, 0);
+    assert_eq!(config.servers.len(), 3);
+}
+
+#[skuld::test]
+fn apply_import_deduplicates_against_existing() {
+    let mut config = AppConfig {
+        servers: vec![entry("existing", "10.0.0.1", 8388)],
+        ..Default::default()
+    };
+    let parsed = vec![
+        entry("dup", "10.0.0.1", 8388), // same as existing — should be skipped
+        entry("fresh", "10.0.0.2", 8388),
+    ];
+    let (appended, deduped) = apply_import(&mut config, parsed);
+    assert_eq!(appended.len(), 1);
+    assert_eq!(appended[0].server, "10.0.0.2");
+    assert_eq!(deduped, 1);
+    assert_eq!(config.servers.len(), 2);
+}
+
+#[skuld::test]
+fn apply_import_auto_selects_first_when_previously_none() {
+    let mut config = AppConfig {
+        selected_server: None,
+        ..Default::default()
+    };
+    let parsed = vec![entry("a", "10.0.0.1", 8388), entry("b", "10.0.0.2", 8388)];
+    let (appended, _) = apply_import(&mut config, parsed);
+    assert_eq!(appended.len(), 2);
+    assert_eq!(
+        config.selected_server.as_deref(),
+        Some("a"),
+        "selected_server should auto-set to the first appended entry"
+    );
+}
+
+#[skuld::test]
+fn apply_import_preserves_existing_selection() {
+    let mut config = AppConfig {
+        servers: vec![entry("first", "10.0.0.0", 8388)],
+        selected_server: Some("first".to_string()),
+        ..Default::default()
+    };
+    let parsed = vec![entry("new", "10.0.0.1", 8388)];
+    let (appended, _) = apply_import(&mut config, parsed);
+    assert_eq!(appended.len(), 1);
+    assert_eq!(
+        config.selected_server.as_deref(),
+        Some("first"),
+        "existing selection must not be clobbered by an import"
+    );
+}
+
+/// All entries already exist — appended is empty but the call is still a
+/// "success." The frontend uses this to show a "no new servers" info toast
+/// instead of leaving the user with silent no-op.
+#[skuld::test]
+fn apply_import_all_duplicates_returns_empty_with_dedup_count() {
+    let mut config = AppConfig {
+        servers: vec![entry("a", "10.0.0.1", 8388), entry("b", "10.0.0.2", 8388)],
+        ..Default::default()
+    };
+    let parsed = vec![entry("dup1", "10.0.0.1", 8388), entry("dup2", "10.0.0.2", 8388)];
+    let (appended, deduped) = apply_import(&mut config, parsed);
+    assert!(appended.is_empty());
+    assert_eq!(deduped, 2);
+    assert_eq!(config.servers.len(), 2);
+}
+
+#[skuld::test]
+fn apply_import_emits_summary_event() {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = VecWriter { inner: buf.clone() };
+    let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let mut config = AppConfig::default();
+    let parsed = vec![entry("a", "10.0.0.1", 8388), entry("b", "10.0.0.2", 8388)];
+    apply_import(&mut config, parsed);
+
+    let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        captured.contains("import_servers_from_file: apply summary"),
+        "expected apply summary event in captured output:\n{captured}"
+    );
+    assert!(
+        captured.contains("parsed=2"),
+        "expected parsed=2 field in summary:\n{captured}"
+    );
+    assert!(
+        captured.contains("appended=2"),
+        "expected appended=2 field in summary:\n{captured}"
+    );
+    assert!(
+        captured.contains("deduped=0"),
+        "expected deduped=0 field in summary:\n{captured}"
+    );
+}
+
+#[skuld::test]
+fn apply_import_summary_records_dedup_counts() {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = VecWriter { inner: buf.clone() };
+    let subscriber = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
+    let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let mut config = AppConfig {
+        servers: vec![entry("existing", "10.0.0.1", 8388)],
+        ..Default::default()
+    };
+    let parsed = vec![
+        entry("dup", "10.0.0.1", 8388),
+        entry("dup2", "10.0.0.1", 8388),
+        entry("new", "10.0.0.2", 8388),
+    ];
+    apply_import(&mut config, parsed);
+
+    let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        captured.contains("parsed=3"),
+        "expected parsed=3 in summary:\n{captured}"
+    );
+    assert!(
+        captured.contains("appended=1"),
+        "expected appended=1 in summary:\n{captured}"
+    );
+    assert!(
+        captured.contains("deduped=2"),
+        "expected deduped=2 in summary:\n{captured}"
+    );
+}
