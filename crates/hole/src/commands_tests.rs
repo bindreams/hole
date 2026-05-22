@@ -276,39 +276,48 @@ const VALID_SERVER_JSON: &str = r#"{"server":"1.2.3.4","server_port":8388,"passw
 fn import_rejects_non_json_extension(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("data.txt");
     std::fs::write(&file, VALID_SERVER_JSON).unwrap();
-    let result = validate_and_read_import(&file);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("only .json"));
+    let err = validate_and_read_import(&file).unwrap_err();
+    match err {
+        ImportFailure::FileError { detail } => assert!(detail.contains("only .json"), "{detail}"),
+        other => panic!("expected FileError, got {other:?}"),
+    }
 }
 
 #[skuld::test]
 fn import_rejects_no_extension(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("shadow");
     std::fs::write(&file, "root:x:0:0:root").unwrap();
-    let result = validate_and_read_import(&file);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("only .json"));
+    let err = validate_and_read_import(&file).unwrap_err();
+    match err {
+        ImportFailure::FileError { detail } => assert!(detail.contains("only .json"), "{detail}"),
+        other => panic!("expected FileError, got {other:?}"),
+    }
 }
 
 #[skuld::test]
 fn import_rejects_directory(#[fixture(temp_dir)] dir: &Path) {
     let subdir = dir.join("not-a-file.json");
     std::fs::create_dir(&subdir).unwrap();
-    let result = validate_and_read_import(&subdir);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    // On Windows, File::open on a directory fails before the is_file() check.
-    assert!(
-        err.contains("not a regular file") || err.contains("not found or not accessible"),
-        "unexpected error: {err}"
-    );
+    let err = validate_and_read_import(&subdir).unwrap_err();
+    match err {
+        ImportFailure::FileError { detail } => {
+            // On Windows, File::open on a directory fails before the is_file() check.
+            assert!(
+                detail.contains("not a regular file") || detail.contains("not found or not accessible"),
+                "unexpected detail: {detail}"
+            );
+        }
+        other => panic!("expected FileError, got {other:?}"),
+    }
 }
 
 #[skuld::test]
 fn import_rejects_nonexistent_path() {
-    let result = validate_and_read_import(Path::new("/nonexistent/path.json"));
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not found"));
+    let err = validate_and_read_import(Path::new("/nonexistent/path.json")).unwrap_err();
+    match err {
+        ImportFailure::FileError { detail } => assert!(detail.contains("not found"), "{detail}"),
+        other => panic!("expected FileError, got {other:?}"),
+    }
 }
 
 #[skuld::test]
@@ -316,9 +325,11 @@ fn import_rejects_oversized_file(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("huge.json");
     let data = vec![b' '; 11 * 1024 * 1024]; // 11 MB
     std::fs::write(&file, &data).unwrap();
-    let result = validate_and_read_import(&file);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("too large"));
+    let err = validate_and_read_import(&file).unwrap_err();
+    match err {
+        ImportFailure::FileError { detail } => assert!(detail.contains("too large"), "{detail}"),
+        other => panic!("expected FileError, got {other:?}"),
+    }
 }
 
 #[skuld::test]
@@ -338,31 +349,43 @@ fn import_accepts_uppercase_json_extension(#[fixture(temp_dir)] dir: &Path) {
     assert!(result.is_ok());
 }
 
+/// Corrupted JSON must produce `ImportFailure::CorruptedJson` with NO
+/// detail field — `serde_json::Error`'s Display includes a fragment of
+/// the input near the parse error, which can include credentials.
 #[skuld::test]
-fn import_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
+fn corrupted_json_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("bad.json");
     std::fs::write(&file, "SUPER_SECRET_CONTENT_HERE").unwrap();
-    let result = validate_and_read_import(&file);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        !err.contains("SUPER_SECRET"),
-        "error message leaked file content: {err}"
-    );
+    let err = validate_and_read_import(&file).unwrap_err();
+    match err {
+        ImportFailure::CorruptedJson => {} // good — no detail to leak
+        other => panic!("expected CorruptedJson, got {other:?}"),
+    }
+    let json = serde_json::to_string(&err).unwrap();
+    assert!(!json.contains("SUPER_SECRET"), "wire form leaked file content: {json}");
 }
 
+/// `InvalidValue` is allowed to surface a port number — it's
+/// information the user needs to fix their config and not PII. Sensitive
+/// fragments (raw passwords, server hostnames) are NOT in the
+/// `InvalidValue` detail because they don't trigger this variant.
 #[skuld::test]
-fn import_error_sanitizes_invalid_value(#[fixture(temp_dir)] dir: &Path) {
+fn invalid_value_keeps_port_for_diagnosis(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("bad-port.json");
     std::fs::write(
         &file,
         r#"{"server":"1.2.3.4","server_port":99999,"password":"pw","method":"aes-256-gcm"}"#,
     )
     .unwrap();
-    let result = validate_and_read_import(&file);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(!err.contains("99999"), "error message leaked raw value: {err}");
+    let err = validate_and_read_import(&file).unwrap_err();
+    match err {
+        ImportFailure::InvalidValue { detail } => {
+            assert!(detail.contains("99999"), "user needs to see which value: {detail}");
+            assert!(!detail.contains("pw"), "must not leak password: {detail}");
+            assert!(!detail.contains("1.2.3.4"), "must not leak server: {detail}");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
 }
 
 // apply_import tests ==================================================================================================
@@ -551,6 +574,103 @@ fn apply_import_emits_summary_event() {
         captured.contains("deduped=0"),
         "expected deduped=0 field in summary:\n{captured}"
     );
+}
+
+// ImportFailure sanitization (bindreams/hole#385 Phase 2) =============================================================
+// `to_import_failure` converts the file-I/O + parse error surface into
+// the tagged enum the frontend deserializes. The conversion is the only
+// place where (a) `serde_json::Error`'s parse-error message (which echoes
+// file content) is scrubbed and (b) the per-variant categorization is
+// made — so the frontend can show the right blocking dialog without any
+// string parsing.
+
+#[skuld::test]
+fn to_import_failure_parse_error_becomes_corrupted_json() {
+    let err =
+        hole_common::import::ImportError::Parse(serde_json::from_str::<serde_json::Value>("not-json").unwrap_err());
+    let failure = to_import_failure(err);
+    assert!(matches!(failure, ImportFailure::CorruptedJson), "got {failure:?}");
+}
+
+#[skuld::test]
+fn to_import_failure_missing_field_becomes_unrecognized_format() {
+    let err = hole_common::import::ImportError::MissingField("server (or 'address')");
+    let failure = to_import_failure(err);
+    match failure {
+        ImportFailure::UnrecognizedFormat { missing_field } => {
+            assert_eq!(missing_field, "server (or 'address')");
+        }
+        other => panic!("expected UnrecognizedFormat, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn to_import_failure_unsupported_plugin_carries_name_and_list() {
+    let err = hole_common::import::ImportError::UnsupportedPlugin {
+        name: "kcptun".to_string(),
+    };
+    let failure = to_import_failure(err);
+    match failure {
+        ImportFailure::UnsupportedPlugin { plugin, supported } => {
+            assert_eq!(plugin, "kcptun");
+            // `supported` is derived from the single source of truth
+            // (`KNOWN_PLUGINS`), so this assertion stays correct
+            // automatically when new plugins are added.
+            assert!(supported.contains(&"v2ray-plugin".to_string()), "got {supported:?}");
+            assert!(supported.contains(&"galoshes".to_string()), "got {supported:?}");
+        }
+        other => panic!("expected UnsupportedPlugin, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn to_import_failure_invalid_value_keeps_safe_detail() {
+    let err = hole_common::import::ImportError::InvalidValue("server_port 99999 out of range".to_string());
+    let failure = to_import_failure(err);
+    match failure {
+        ImportFailure::InvalidValue { detail } => {
+            // Port detail is safe to show (numeric, not file content).
+            assert!(detail.contains("99999"), "port detail should survive: {detail}");
+        }
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+/// `ImportFailure` must serialize as a `serde`-tagged enum so the JS
+/// `{ kind }` discriminator works.
+#[skuld::test]
+fn import_failure_serializes_with_kind_tag() {
+    let f = ImportFailure::CorruptedJson;
+    let json = serde_json::to_string(&f).unwrap();
+    assert_eq!(json, r#"{"kind":"corrupted_json"}"#);
+
+    let f = ImportFailure::UnrecognizedFormat {
+        missing_field: "method".to_string(),
+    };
+    let json = serde_json::to_string(&f).unwrap();
+    assert_eq!(json, r#"{"kind":"unrecognized_format","missing_field":"method"}"#);
+
+    let f = ImportFailure::UnsupportedPlugin {
+        plugin: "kcptun".to_string(),
+        supported: vec!["v2ray-plugin".to_string(), "galoshes".to_string()],
+    };
+    let json = serde_json::to_string(&f).unwrap();
+    assert!(json.contains(r#""kind":"unsupported_plugin""#));
+    assert!(json.contains(r#""plugin":"kcptun""#));
+    assert!(json.contains(r#""supported":["v2ray-plugin","galoshes"]"#));
+
+    let f = ImportFailure::FileError {
+        detail: "file not found or not accessible".to_string(),
+    };
+    let json = serde_json::to_string(&f).unwrap();
+    assert_eq!(
+        json,
+        r#"{"kind":"file_error","detail":"file not found or not accessible"}"#
+    );
+
+    let f = ImportFailure::SaveFailed;
+    let json = serde_json::to_string(&f).unwrap();
+    assert_eq!(json, r#"{"kind":"save_failed"}"#);
 }
 
 #[skuld::test]

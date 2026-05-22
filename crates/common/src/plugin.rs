@@ -32,6 +32,20 @@ pub fn is_known(name: &str) -> bool {
     lookup(name).is_some()
 }
 
+/// Iterator over the names of every shipped plugin, in declaration
+/// order from [`KNOWN_PLUGINS`]. The single source of truth — error
+/// messages and wire-form lists derive from this rather than
+/// hardcoding the list separately. See bindreams/hole#385.
+pub fn known_plugin_names() -> impl Iterator<Item = &'static str> {
+    KNOWN_PLUGINS.iter().map(|p| p.name)
+}
+
+/// Same set as [`known_plugin_names`], pre-joined with `", "` for use
+/// in `tracing`-style error messages.
+pub fn known_plugin_names_joined() -> String {
+    known_plugin_names().collect::<Vec<_>>().join(", ")
+}
+
 /// IP transport set the named plugin will bind on its local address at
 /// the SIP003 handoff. Used by the proxy manager when allocating the
 /// port to pass to the plugin via `SS_LOCAL_PORT`: a TCP-only plugin

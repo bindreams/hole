@@ -1,7 +1,8 @@
 // Servers section: rendering server cards, selection, deletion, file import.
 
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { message, open } from "@tauri-apps/plugin-dialog";
+import { describeUnknownImportError } from "./import-failure";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
 import { showToast } from "./toast";
@@ -191,6 +192,22 @@ async function deleteServer(id: string) {
 
 // File import =========================================================================================================
 
+/**
+ * Show a blocking error dialog for an import failure. The dialog
+ * pauses the JS event loop until the user clicks OK — chosen
+ * deliberately so import errors can't be missed (a toast that
+ * auto-dismisses in 10s is easy to overlook). See bindreams/hole#385.
+ *
+ * Accepts `unknown` because the Tauri invoke rejection type is unknown:
+ * the structured `ImportFailure` is the happy path, but a transport-
+ * layer failure (channel closed mid-call) delivers a string/Error.
+ * `describeUnknownImportError` handles both shapes uniformly.
+ */
+export async function showImportFailureDialog(failure: unknown): Promise<void> {
+  const { title, body } = describeUnknownImportError(failure);
+  await message(body, { title, kind: "error" });
+}
+
 /** Open a file dialog and import servers from the selected JSON file. */
 export async function importFromDialog() {
   let path: string | null;
@@ -210,8 +227,14 @@ export async function importFromDialog() {
   try {
     newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
   } catch (err) {
+    // Tauri serializes the Rust-side `ImportFailure` enum to JSON; the
+    // `invoke` rejection delivers the deserialized object verbatim
+    // (happy path). A transport-layer failure (e.g. channel closed) can
+    // also surface as a string/Error here — `showImportFailureDialog`
+    // accepts `unknown` and routes both shapes through
+    // `describeUnknownImportError`.
     console.error("import from dialog failed:", err);
-    showToast(`Import failed: ${err}`, "error");
+    await showImportFailureDialog(err);
     return;
   }
 

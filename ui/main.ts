@@ -8,9 +8,9 @@ import { attachConsole, error as logError, warn as logWarn } from "@tauri-apps/p
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
-import { summarizeMultiImport } from "./import-summary";
+import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
-import { importFromDialog, initServers, renderServers } from "./servers";
+import { importFromDialog, initServers, renderServers, showImportFailureDialog } from "./servers";
 import { initSettings, renderSettings } from "./settings";
 import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
 import { showToast } from "./toast";
@@ -153,8 +153,10 @@ function setupEventListeners() {
   listen("import-requested", () => importFromDialog());
 
   // Drag-and-drop file import. The user may drop one or many files;
-  // iterate and aggregate results into one toast so a multi-file drop
-  // can't silently lose servers.
+  // iterate, showing a BLOCKING error dialog per failure (sequential —
+  // the user must acknowledge each), and aggregate any successes into
+  // a single end-of-loop toast. See bindreams/hole#385: errors used to
+  // be toasts that auto-dismiss in 10s, which is easy to miss.
   listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
     const paths = event.payload?.paths ?? [];
     if (paths.length === 0) return;
@@ -170,17 +172,16 @@ function setupEventListeners() {
       } catch (err) {
         totalFailed++;
         console.error(`import failed for ${path}:`, err);
-        if (paths.length === 1) {
-          // Single-file drop: surface the specific error verbatim.
-          showToast(`Import failed: ${err}`, "error");
-        }
+        // Sequential, modal — `await` here parks the loop until the
+        // user dismisses the dialog before moving on to the next file.
+        await showImportFailureDialog(err);
       }
     }
 
     // Skip the config reload when nothing was appended — the config
     // didn't change, and a reload of an unchanged config would only
-    // risk a spurious "Failed to load config" toast on top of the
-    // per-file error toast(s) we already showed.
+    // risk a spurious "Failed to load config" dialog on top of the
+    // per-file error dialog(s) we already showed.
     if (totalAppended > 0) {
       await loadConfig();
       // Auto-test the newly imported servers in parallel (bounded).
@@ -188,7 +189,11 @@ function setupEventListeners() {
       runTestsBounded(newIds, TEST_CONCURRENCY);
     }
 
-    const summary = summarizeMultiImport(paths.length, totalAppended, totalFailed);
+    // Errors were already delivered via blocking dialogs inside the
+    // per-file `catch`. The post-loop summary covers only success/info
+    // outcomes — and explicitly names any failure count in the partial
+    // case so the toast doesn't lie.
+    const summary = postImportSummary(totalAppended, totalFailed);
     if (summary !== null) showToast(summary.message, summary.kind);
   });
 
