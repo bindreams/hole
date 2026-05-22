@@ -68,18 +68,28 @@ static NEXT_FLUSH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 #[cfg(test)]
 impl StdioRelayHandles {
     /// Block until every byte written to stderr/stdout *before this
-    /// call* has been consumed by the relay reader thread and emitted
-    /// as a tracing event.
+    /// call* has been consumed by the relay reader thread, emitted as
+    /// a tracing event, AND written through the lossy `NonBlocking`
+    /// tee writers to the underlying tee targets.
     ///
-    /// Mechanism: writes a unique sentinel line through each stream;
-    /// the relay reader, when it consumes the sentinel, fires an
-    /// `mpsc` ack. The sentinel is not teed/emitted as a tracing
-    /// event. Event-driven, no polling.
+    /// Mechanism, in two phases:
+    /// 1. **Reader drain.** Write a unique sentinel line through each
+    ///    stream; the relay reader, when it consumes the sentinel,
+    ///    fires an `mpsc` ack. The sentinel is not teed/emitted. This
+    ///    guarantees the reader has processed (and either emitted or
+    ///    forwarded to `NonBlocking`) every pre-sentinel byte.
+    /// 2. **Tee drain.** Take ownership of the `WorkerGuard`s for the
+    ///    `NonBlocking` tee writers and drop them. `WorkerGuard::drop`
+    ///    joins the worker, which flushes any buffered bytes to the
+    ///    underlying tee target. After this, subsequent writes through
+    ///    the tee path are lossy no-ops (the workers are gone) — which
+    ///    is fine because callers call `flush()` at the end of a
+    ///    scenario, never before further writes are expected.
     ///
     /// Test-only and synchronous so it works in non-tokio scenarios.
     /// Production relays run until process exit; flushing is
     /// meaningless there.
-    pub fn flush(&self) -> io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         let stderr_id = NEXT_FLUSH_ID.fetch_add(1, Ordering::SeqCst);
         let stdout_id = NEXT_FLUSH_ID.fetch_add(1, Ordering::SeqCst);
@@ -97,6 +107,13 @@ impl StdioRelayHandles {
         writeln!(std::io::stdout(), "{RELAY_FLUSH_SENTINEL_PREFIX}{stdout_id}")?;
         stderr_rx.recv().map_err(io::Error::other)?;
         stdout_rx.recv().map_err(io::Error::other)?;
+        // Phase 2: drain the NonBlocking tee writers by dropping their
+        // WorkerGuards. The relay reader's `tee.write_all(buf)` calls
+        // go through these guards; without dropping them, buffered
+        // bytes may not have reached the tee target by the time the
+        // caller reads from it.
+        drop(self._stderr_tee_guard.take());
+        drop(self._stdout_tee_guard.take());
         Ok(())
     }
 }

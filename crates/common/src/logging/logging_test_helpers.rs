@@ -155,12 +155,12 @@ fn write_result(result: &ChildResult) {
     std::fs::write(output_path(), bytes).expect("write result");
 }
 
-fn finish(harness: &ChildHarness) -> ChildResult {
+fn finish(harness: &mut ChildHarness) -> ChildResult {
     // Flush the stdio relay deterministically: write a sentinel through
-    // stderr/stdout and block on the reader's ack. The sentinel is
-    // intercepted before tee/emit so it doesn't pollute either log
-    // surface. No sleep. See bindreams/hole#383.
-    if let Some(relays) = harness.relays.as_ref() {
+    // stderr/stdout, block on the reader's ack, then drain the
+    // NonBlocking tee writers' WorkerGuards. No sleep.
+    // See bindreams/hole#383.
+    if let Some(relays) = harness.relays.as_mut() {
         relays.flush().expect("relay flush");
     }
     let mut events = parse_lines("file", &harness.file_writer.snapshot());
@@ -235,7 +235,7 @@ fn scenario_basic_stderr() {
     harness.relays = Some(relays);
     let _ = writeln!(std::io::stderr(), "hello-from-stderr");
     let _ = std::io::stderr().flush();
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -245,7 +245,7 @@ fn scenario_basic_stdout() {
     harness.relays = Some(relays);
     let _ = writeln!(std::io::stdout(), "hello-from-stdout");
     let _ = std::io::stdout().flush();
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -278,7 +278,7 @@ fn scenario_grandchild_stderr() {
             .status();
     }
 
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -309,7 +309,7 @@ fn scenario_grandchild_stdout() {
             .status();
     }
 
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -350,7 +350,7 @@ fn scenario_tee() {
     let _ = writeln!(std::io::stdout(), "tee-stdout-line");
     let _ = std::io::stdout().flush();
 
-    let mut result = finish(&harness);
+    let mut result = finish(&mut harness);
     result.tee_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     result.tee_stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     write_result(&result);
@@ -362,7 +362,7 @@ fn scenario_multiline() {
     harness.relays = Some(relays);
     let _ = std::io::stderr().write_all(b"multiline-a\nmultiline-b\nmultiline-c\n");
     let _ = std::io::stderr().flush();
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -371,7 +371,7 @@ fn scenario_no_loop() {
     let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
     harness.relays = Some(relays);
     tracing::info!("normal event");
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
