@@ -269,11 +269,8 @@ async fn on_ready_fires_with_local_addr() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // rx should fire with the local address once the plugin is listening.
-    let ready_addr = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .expect("timed out waiting for readiness")
-        .expect("ready_tx was dropped without sending");
+    // rx fires with the local address once the plugin is listening.
+    let ready_addr = rx.await.expect("ready_tx was dropped without sending");
 
     assert_eq!(ready_addr.port(), addr.port());
 
@@ -293,10 +290,7 @@ async fn on_ready_dropped_on_plugin_failure() {
     let handle = tokio::spawn(runner.run(env));
 
     // The plugin fails immediately, so ready_tx is dropped → rx gets RecvError.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await
-        .expect("timed out waiting for readiness result");
-
+    let result = rx.await;
     assert!(
         result.is_err(),
         "rx should get RecvError when plugin fails before ready"
@@ -333,12 +327,9 @@ async fn cancel_token_triggers_graceful_shutdown() {
     // Cancel externally.
     cancel.cancel();
 
-    // The chain should exit cleanly.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-        .await
-        .expect("timed out waiting for chain to exit")
-        .unwrap();
-
+    // The chain exits cleanly. If cancellation regresses, handle.await
+    // hangs and the test framework's timeout surfaces it.
+    let result = handle.await.unwrap();
     assert!(result.is_ok(), "chain should exit Ok on external cancellation");
 }
 
@@ -349,8 +340,15 @@ async fn cancel_token_triggers_graceful_shutdown() {
 /// primary regression gate for the drain-timeout scope fix: pre-fix,
 /// `drain_timeout` was applied to the whole chain lifetime, so
 /// `StubbornPlugin` was aborted after ≈ drain_timeout.
+///
+/// Uses `tokio::time::pause` + `advance` to simulate "drain_timeout * 3
+/// has elapsed in virtual time" without real wall-clock sleep. Any
+/// internal timer that would have bounded the chain at drain_timeout
+/// fires under virtual time; we then assert the chain is still alive.
+/// See bindreams/hole#383.
 #[skuld::test]
 async fn long_running_plugin_survives_past_drain_timeout() {
+    tokio::time::pause();
     let cancel = CancellationToken::new();
     let drain_timeout = std::time::Duration::from_millis(200);
 
@@ -364,24 +362,25 @@ async fn long_running_plugin_survives_past_drain_timeout() {
     let mut env = test_env();
     env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
 
-    let mut handle = tokio::spawn(runner.run(env));
+    let handle = tokio::spawn(runner.run(env));
 
-    // Wait past drain_timeout and confirm the plugin is still running.
-    tokio::time::sleep(drain_timeout * 3).await;
+    // Advance virtual time past drain_timeout. Pre-fix this would have
+    // fired the lifetime-bounding timer and the chain would exit. Post-
+    // fix, no timer bounds the lifetime — chain stays running.
+    tokio::time::advance(drain_timeout * 3).await;
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), &mut handle)
-            .await
-            .is_err(),
+        !handle.is_finished(),
         "chain must still be running — drain_timeout must not bound the full lifetime"
     );
 
     // Cancel; chain should abort the stubborn plugin within drain_timeout
-    // (+ scheduler slack) and return the drain-timeout error.
+    // (+ scheduler slack, advanced under virtual time) and return the
+    // drain-timeout error.
     cancel.cancel();
-    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
-        .await
-        .expect("chain should exit within drain_timeout after cancel")
-        .expect("no JoinError");
+    tokio::time::advance(drain_timeout + std::time::Duration::from_millis(500)).await;
+    // Resume real time for the join so any non-tokio work can complete.
+    tokio::time::resume();
+    let result = handle.await.expect("no JoinError");
 
     match result {
         Err(crate::Error::Chain(msg)) if msg.contains("drain timeout expired") => {}
@@ -408,10 +407,7 @@ async fn first_error_preserved_across_drain() {
     env.local_port = allocate_ports(1).unwrap().pop().unwrap().port();
 
     let handle = tokio::spawn(runner.run(env));
-    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
-        .await
-        .expect("chain should exit within drain_timeout of plugin failure")
-        .expect("no JoinError");
+    let result = handle.await.expect("no JoinError");
 
     match result {
         Err(crate::Error::PluginExit { code: 1, .. }) => {}
@@ -476,10 +472,7 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     let handle = tokio::spawn(runner.run(env));
     cancel.cancel();
 
-    let result = tokio::time::timeout(drain_timeout + std::time::Duration::from_millis(500), handle)
-        .await
-        .expect("chain should exit within drain_timeout")
-        .expect("no JoinError");
+    let result = handle.await.expect("no JoinError");
 
     match result {
         Err(crate::Error::PluginExit { code: 1, .. }) => {}

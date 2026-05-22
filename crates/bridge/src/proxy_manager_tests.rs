@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::GatewayInfo;
@@ -34,6 +35,11 @@ struct MockProxy {
     /// start mid-flight so cancellation tests can fire the cancel token
     /// while the future is suspended in `proxy.start(...)`.
     start_gate: Option<Arc<tokio::sync::Notify>>,
+    /// If Some, `start` fires this sender on entry — before awaiting
+    /// `start_gate`. Lets tests park until `start` is *known* to be in
+    /// flight, instead of sleeping. One-shot per MockProxy. See
+    /// bindreams/hole#383.
+    start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl MockProxy {
@@ -41,6 +47,7 @@ impl MockProxy {
         Self {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
+            start_entered: std::sync::Mutex::new(None),
         }
     }
 
@@ -56,6 +63,11 @@ impl MockProxy {
         m
     }
 
+    fn with_entered_signal(mut self, tx: oneshot::Sender<()>) -> Self {
+        self.start_entered = std::sync::Mutex::new(Some(tx));
+        self
+    }
+
     fn start_calls_handle(&self) -> Arc<MockProxyState> {
         Arc::clone(&self.state)
     }
@@ -65,6 +77,10 @@ impl Proxy for MockProxy {
     type Running = MockRunning;
 
     async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+        // Fire entered signal BEFORE awaiting the gate.
+        if let Some(tx) = self.start_entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
         }
@@ -499,7 +515,9 @@ fn uptime_increases_while_running() {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         pm.start(&test_config()).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Simulate "1.1s has elapsed since start" by rewinding the
+        // started_at marker. Deterministic — no sleep.
+        pm.shift_started_at_for_test(Duration::from_millis(1100));
         assert!(pm.uptime_secs() >= 1);
 
         pm.stop().await.unwrap();
@@ -697,7 +715,8 @@ fn start_cancellable_succeeds_when_not_cancelled() {
 fn start_cancellable_cancelled_during_ss_start_rolls_back() {
     rt().block_on(async {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let proxy = MockProxy::with_start_gate(gate.clone());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
@@ -706,11 +725,11 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         let token = CancellationToken::new();
 
-        // Fire off the cancel after a short delay so the start is already
-        // parked in `proxy.start(...)`.
+        // Fire the cancel once `proxy.start(...)` is *known* to be parked
+        // on the gate. Deterministic — no sleep.
         let cancel_clone = token.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            entered_rx.await.expect("MockProxy::start never entered");
             cancel_clone.cancel();
         });
 
@@ -773,12 +792,13 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
 #[skuld::test]
 fn start_cancellable_dropped_future_runs_guards() {
     // Drop-safety: even without CancellationToken, dropping the start
-    // future at an await point must clean up. Uses `tokio::time::timeout`
-    // with a very short deadline to force the drop while `proxy.start`
-    // is parked on the gate.
+    // future at an await point must clean up. Uses the `entered` signal
+    // to know when proxy.start is parked on the gate, then drops the
+    // future via a `select!` race — deterministic, no time-based wait.
     rt().block_on(async {
         let gate = Arc::new(tokio::sync::Notify::new());
-        let proxy = MockProxy::with_start_gate(gate.clone());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let routing_state = routing.state();
@@ -787,10 +807,18 @@ fn start_cancellable_dropped_future_runs_guards() {
         let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         let token = CancellationToken::new();
 
-        // Short deadline — the future will be dropped before proxy.start
-        // ever returns (the gate is never released).
-        let result = tokio::time::timeout(Duration::from_millis(50), pm.start_cancellable(&test_config(), token)).await;
-        assert!(result.is_err(), "expected elapsed timeout");
+        // Race the start future against the entered signal. When the
+        // entered arm wins, `select!` drops the `&mut f` arm and the
+        // surrounding scope drops `f`, running the drop-safety guards.
+        {
+            let cfg = test_config();
+            let f = pm.start_cancellable(&cfg, token);
+            tokio::pin!(f);
+            tokio::select! {
+                _ = &mut f => panic!("start should not complete while gate is unfired"),
+                res = entered_rx => res.expect("MockProxy::start never entered"),
+            }
+        }
 
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(
@@ -1067,13 +1095,17 @@ mod self_test {
             .block_on(async {
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
                 let start = std::time::Instant::now();
-                spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
+                let handle = spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
                 let elapsed = start.elapsed();
                 assert!(
                     elapsed < std::time::Duration::from_millis(100),
                     "spawn_forwarder_self_test must return immediately (tokio::spawn is \
                      non-blocking); returned after {elapsed:?}"
                 );
+                // Abort the spawned task so the test doesn't have to wait
+                // out the 3×1500ms retry budget. The handle is None when
+                // servers is empty; here it is Some.
+                handle.expect("Some(handle) when servers is non-empty").abort();
             });
     }
 
@@ -1099,8 +1131,11 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                spawn_forwarder_self_test(forwarder, vec![]);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Empty servers — the skipped-log fires synchronously
+                // inside the function and `spawn_forwarder_self_test`
+                // returns None (no task spawned). No wait needed.
+                let handle = spawn_forwarder_self_test(forwarder, vec![]);
+                assert!(handle.is_none(), "no task should be spawned when servers is empty");
             });
 
         let output = writer.snapshot_string();
@@ -1133,10 +1168,12 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
-                // Wait for the self-test to exhaust retries. 3 × 1500ms =
-                // 4.5s worst case; give it a little extra for CI jitter.
-                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                let handle = spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()])
+                    .expect("Some(handle) when servers is non-empty");
+                // Park until the self-test task exits — deterministic,
+                // no sleep. The retry budget (3 × 1500ms with 5s outer
+                // timeout) is internal to the spawned future.
+                handle.await.expect("self-test task panicked");
             });
 
         let output = writer.snapshot_string();

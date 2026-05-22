@@ -12,6 +12,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{state as route_state, Routing};
@@ -25,6 +26,13 @@ struct MockProxy {
     /// simulate a slow start so tests can race `POST /v1/cancel` against
     /// an in-flight `POST /v1/start`.
     start_gate: Option<Arc<tokio::sync::Notify>>,
+    /// If Some, `start` fires this sender on entry — before awaiting
+    /// `start_gate`. Lets tests park until the proxy is *known* to be
+    /// inside `start()` instead of sleeping a guess-duration. One-shot
+    /// per MockProxy (subsequent entries do nothing); the test pattern
+    /// is "spawn task A; await entered; act on the parked state."
+    /// See bindreams/hole#383.
+    start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl MockProxy {
@@ -32,6 +40,7 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(false),
             start_gate: None,
+            start_entered: std::sync::Mutex::new(None),
         }
     }
 
@@ -39,6 +48,7 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(true),
             start_gate: None,
+            start_entered: std::sync::Mutex::new(None),
         }
     }
 
@@ -46,7 +56,13 @@ impl MockProxy {
         Self {
             fail_start: AtomicBool::new(false),
             start_gate: Some(gate),
+            start_entered: std::sync::Mutex::new(None),
         }
+    }
+
+    fn with_entered_signal(mut self, tx: oneshot::Sender<()>) -> Self {
+        self.start_entered = std::sync::Mutex::new(Some(tx));
+        self
     }
 }
 
@@ -54,6 +70,11 @@ impl Proxy for MockProxy {
     type Running = MockRunning;
 
     async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+        // Fire the entered signal BEFORE awaiting the gate so the test
+        // can sequence subsequent operations on the parked state.
+        if let Some(tx) = self.start_entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
         }
@@ -190,10 +211,14 @@ fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
-fn gated_proxy(gate: Arc<tokio::sync::Notify>) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+fn gated_proxy(
+    gate: Arc<tokio::sync::Notify>,
+    entered: oneshot::Sender<()>,
+) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::new(state_dir);
-    Arc::new(Mutex::new(ProxyManager::new(MockProxy::gated(gate), routing)))
+    let mock = MockProxy::gated(gate).with_entered_signal(entered);
+    Arc::new(Mutex::new(ProxyManager::new(mock, routing)))
 }
 
 fn sample_config() -> ProxyConfig {
@@ -324,6 +349,7 @@ fn server_accepts_connection() {
         });
         let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -352,6 +378,7 @@ fn status_when_not_running_returns_false() {
             }
         );
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -373,6 +400,7 @@ fn multiple_requests_on_same_connection() {
         assert!(!s2.running);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -400,6 +428,7 @@ fn invalid_request_returns_error_response() {
         assert!(resp.status().is_client_error());
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -443,6 +472,7 @@ fn start_request_starts_proxy() {
         assert_eq!(consume(post_stop(&mut client).await).await, 200);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -470,6 +500,7 @@ fn stop_request_stops_proxy() {
         assert!(!status.running, "expected running=false after Stop");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -497,6 +528,7 @@ fn start_failure_returns_error() {
         );
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -527,6 +559,7 @@ fn reload_request_reloads_proxy() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -550,14 +583,17 @@ fn run_cancellation_aborts_connection_handlers() {
         let _ = handle.await;
 
         // The connection handler should have been aborted by JoinSet::drop.
-        // A subsequent request should fail — not block forever.
-        // Allow up to 3 seconds for the non-blocking accept poll loop to yield.
+        // A subsequent request must fail — the hyper client observes the
+        // FIN/RST on the closed connection and errors. If a regression
+        // makes send_request hang on a dead connection, the test
+        // framework's overall timeout surfaces the hang.
         //
         // ready() is intentionally omitted: the server is already dead, so we're
-        // testing that send_request on a broken connection fails promptly.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), {
-            #[allow(clippy::disallowed_methods)]
-            client.sender.send_request(
+        // testing that send_request on a broken connection fails.
+        #[allow(clippy::disallowed_methods)]
+        let result = client
+            .sender
+            .send_request(
                 http::Request::builder()
                     .method("GET")
                     .uri(ROUTE_STATUS)
@@ -565,13 +601,8 @@ fn run_cancellation_aborts_connection_handlers() {
                     .body(Full::new(Bytes::new()))
                     .unwrap(),
             )
-        })
-        .await;
-        assert!(result.is_ok(), "request should not block — handler must be aborted");
-        assert!(
-            result.unwrap().is_err(),
-            "request should fail after server cancellation"
-        );
+            .await;
+        assert!(result.is_err(), "request should fail after server cancellation");
     });
 }
 
@@ -595,6 +626,7 @@ fn unknown_route_returns_404() {
         assert_eq!(resp.status(), 404);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -619,6 +651,7 @@ fn wrong_method_returns_405() {
         assert_eq!(resp.status(), 405);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -672,6 +705,7 @@ fn metrics_returns_zeros_when_stopped() {
         assert_eq!(metrics.uptime_secs, 0);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -691,9 +725,6 @@ fn metrics_returns_uptime_when_running() {
         // Start proxy
         assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
 
-        // Small delay to accumulate uptime
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
         let metrics = get_metrics(&mut client).await;
         // Traffic fields are still zero (not yet integrated)
         assert_eq!(metrics.bytes_in, 0);
@@ -705,6 +736,7 @@ fn metrics_returns_uptime_when_running() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -738,6 +770,7 @@ fn diagnostics_bridge_running() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -765,6 +798,7 @@ fn diagnostics_network_error_when_gateway_unavailable() {
         assert_eq!(diag.internet, "unknown");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -796,6 +830,7 @@ fn diagnostics_proxy_stopped() {
         assert_eq!(diag.internet, "unknown");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -825,6 +860,7 @@ fn diagnostics_bridge_error_after_failed_start() {
         assert_eq!(diag.bridge, "error");
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -876,7 +912,8 @@ fn cancel_while_start_in_flight_returns_cancelled() {
     rt().block_on(async {
         let path = test_socket_path("cancel-in-flight");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // Bound the accept loop to exactly the two connections this test
         // uses, instead of running indefinitely. See `run_n` docstring.
         let handle = tokio::spawn(async move { server.run_n(2).await });
@@ -890,8 +927,9 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             (client_a, resp)
         });
 
-        // Give A a moment to acquire the proxy mutex and park in start_ss.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Park until A is *known* to be inside MockProxy::start (before
+        // it awaits the gate). Deterministic — no sleep.
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Connection B: cancel the in-flight start. Must succeed without
         // waiting for the in-flight Start (which never completes since the
@@ -904,13 +942,12 @@ fn cancel_while_start_in_flight_returns_cancelled() {
             "cancel must succeed even while start is in flight"
         );
 
-        // Wait for A's Start to return, bounded. With cancellation working
-        // correctly the select! branch fires, drop-safety unwinds the
-        // partial state, and Cancelled is returned promptly.
-        let (_client_a, resp_a) = tokio::time::timeout(std::time::Duration::from_secs(5), start_future)
-            .await
-            .expect("start did not return within 5s of cancel")
-            .expect("start task panicked");
+        // Wait for A's Start to return. With cancellation working correctly
+        // the select! branch fires, drop-safety unwinds the partial state,
+        // and Cancelled is returned promptly. If cancellation regresses,
+        // start_future hangs forever and the test framework's overall
+        // timeout surfaces the failure.
+        let (_client_a, resp_a) = start_future.await.expect("start task panicked");
         assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
 
         // Release the gate so the mock's start_ss future can settle if it
@@ -918,7 +955,8 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         gate.notify_one();
         // run_n(2) returns naturally once both connections are handled, so
         // no abort is needed — but use a bounded await to surface any leak.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -952,7 +990,8 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -971,7 +1010,8 @@ fn cancel_with_no_start_is_ack_idempotent() {
         assert_eq!(consume(post_cancel(&mut client).await).await, 200);
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -985,7 +1025,8 @@ fn concurrent_start_is_rejected_with_conflict() {
     rt().block_on(async {
         let path = test_socket_path("concurrent-start");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // 3 connections: A start, B start, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -997,8 +1038,8 @@ fn concurrent_start_is_rejected_with_conflict() {
             (client_a, resp)
         });
 
-        // Give A a moment to register its token.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Park until A is inside MockProxy::start (token registered).
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Client B sends a concurrent Start and must be rejected.
         let mut client_b = TestClient::connect(&path).await;
@@ -1021,15 +1062,14 @@ fn concurrent_start_is_rejected_with_conflict() {
         let mut client_c = TestClient::connect(&path).await;
         assert_eq!(consume(post_cancel(&mut client_c).await).await, 200);
 
-        // A's start must eventually return Cancelled.
-        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
-            .await
-            .expect("A's start did not return")
-            .expect("A task panicked");
+        // A's start must return Cancelled. If cancellation regresses,
+        // a_future hangs and the test framework's timeout surfaces it.
+        let (_client_a, a_resp) = a_future.await.expect("A task panicked");
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1066,7 +1106,8 @@ fn sequential_start_cancel_start_consumes_pre_arm_once() {
         consume(post_stop(&mut client).await).await;
 
         drop(client);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1080,7 +1121,8 @@ fn concurrent_double_cancel_during_start_both_succeed() {
     rt().block_on(async {
         let path = test_socket_path("double-cancel");
         let gate = Arc::new(tokio::sync::Notify::new());
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone())).unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
         // 3 connections: A start, B cancel, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -1091,7 +1133,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
             let resp = post_start(&mut client_a, &sample_config()).await;
             (client_a, resp)
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        entered_rx.await.expect("MockProxy::start never entered");
 
         // Two concurrent cancels on separate connections.
         let path_b = path.clone();
@@ -1110,15 +1152,14 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         assert_eq!(b_resp.status(), 200);
         assert_eq!(c_resp.status(), 200);
 
-        // A's start returns Cancelled.
-        let (_client_a, a_resp) = tokio::time::timeout(std::time::Duration::from_secs(5), a_future)
-            .await
-            .expect("A's start did not return")
-            .expect("A task panicked");
+        // A's start returns Cancelled. If cancellation regresses,
+        // a_future hangs and the test framework's timeout surfaces it.
+        let (_client_a, a_resp) = a_future.await.expect("A task panicked");
         assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
 
         gate.notify_one();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        handle.abort();
+        let _ = handle.await;
     });
 }
 
@@ -1209,6 +1250,7 @@ fn bind_accepts_connection() {
         });
         let stream = LocalStream::connect(&path).await.unwrap();
         drop(stream);
+        handle.abort();
         let _ = handle.await;
     });
 }
@@ -1228,6 +1270,7 @@ fn bind_status_query() {
         assert_eq!(status.uptime_secs, 0);
 
         drop(client);
+        handle.abort();
         let _ = handle.await;
     });
 }

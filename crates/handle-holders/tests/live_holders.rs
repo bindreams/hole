@@ -1,23 +1,20 @@
 //! Live-API tests that need a real foreign process holding the target file.
 //!
 //! Integration-test target, not a unit test module, because
-//! `CARGO_BIN_EXE_hold_file` is only set for `tests/*.rs`.
-//! The tiny `hold_file` bin (see `src/bin/hold_file.rs`) opens the
-//! path passed via the `HOLD_FILE` env var and sleeps, so we can
-//! observe it as a file holder without re-invoking a full test
-//! binary (which re-initializes skuld/tokio/tracing and tripped a
-//! Rust runtime abort in earlier attempts).
+//! `CARGO_BIN_EXE_hold_file` is only set for `tests/*.rs`. The tiny
+//! `hold_file` bin (see `src/bin/hold_file.rs`) opens the path passed
+//! via the `HOLD_FILE` env var and waits for stdin EOF, so we can
+//! observe it as a file holder.
 //!
-//! Read `CARGO_BIN_EXE_hold_file` at runtime (via `env::var`) instead of
-//! compile-time (`env!`) so the test works when nextest runs the binary
-//! from a downloaded archive on a different machine — nextest extracts
-//! bin targets to a fresh temp dir and sets the env var to that path.
+//! Path resolution: prefer the runtime `CARGO_BIN_EXE_hold_file` env
+//! var (set by nextest's archive workflow when the binary is extracted
+//! to a temp dir on the runner). Fall back to the compile-time value
+//! via `env!()` for plain `cargo test` invocations on the build host.
 
 use handle_holders::{find_holders, FileHolder};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 // Install the workspace test subscriber + panic hook. See
 // `crates/test-observability/` and bindreams/hole#301.
@@ -27,27 +24,37 @@ fn main() {
     skuld::run_all();
 }
 
-fn spawn_holder(path: &Path) -> Child {
-    let exe = std::env::var("CARGO_BIN_EXE_hold_file")
-        .expect("CARGO_BIN_EXE_hold_file should be set by cargo test / nextest");
-    Command::new(exe)
+/// Spawn `hold_file` and park until its stdout emits "ready", meaning
+/// the child has the file handle open. Deterministic — no sleep-based
+/// poll over `find_holders`. See bindreams/hole#383.
+fn spawn_holder_ready(path: &Path) -> (Child, BufReader<ChildStdout>) {
+    let exe = std::env::var("CARGO_BIN_EXE_hold_file").unwrap_or_else(|_| env!("CARGO_BIN_EXE_hold_file").to_string());
+    let mut child = Command::new(exe)
         .env("HOLD_FILE", path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn hold_file child")
+        .expect("spawn hold_file child");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read ready line from hold_file");
+    assert_eq!(line.trim(), "ready", "unexpected ready line: {line:?}");
+    (child, reader)
 }
 
-fn wait_for_holder(path: &Path, deadline: Duration) -> Vec<FileHolder> {
-    let started = Instant::now();
-    loop {
-        let holders = find_holders(path).expect("find_holders");
-        if !holders.is_empty() || started.elapsed() >= deadline {
-            return holders;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+/// Shut down the holder by closing its stdin pipe — `hold_file` exits
+/// on EOF. This exercises the stdin-EOF exit path (the production
+/// contract) rather than forcefully terminating, so a regression in
+/// `hold_file`'s EOF handling shows up here.
+fn shutdown_holder(mut child: Child) {
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+fn collect_holders(path: &Path) -> Vec<FileHolder> {
+    find_holders(path).expect("find_holders")
 }
 
 #[cfg(target_os = "windows")]
@@ -59,11 +66,10 @@ fn find_holders_finds_foreign_process_holding_file_windows() {
         .and_then(|mut f| f.write_all(b"content"))
         .expect("write file");
 
-    let mut child = spawn_holder(&path);
+    let (child, _stdout) = spawn_holder_ready(&path);
     let child_pid = child.id();
-    let holders = wait_for_holder(&path, Duration::from_secs(10));
-    let _ = child.kill();
-    let _ = child.wait();
+    let holders = collect_holders(&path);
+    shutdown_holder(child);
 
     let me = std::process::id();
     assert!(
@@ -99,10 +105,9 @@ fn find_holders_detects_child_holding_file() {
         .and_then(|mut f| f.write_all(b"content"))
         .expect("write file");
 
-    let mut child = spawn_holder(&path);
-    let holders = wait_for_holder(&path, Duration::from_secs(3));
-    let _ = child.kill();
-    let _ = child.wait();
+    let (child, _stdout) = spawn_holder_ready(&path);
+    let holders = collect_holders(&path);
+    shutdown_holder(child);
 
     let me = std::process::id();
     assert!(

@@ -8,6 +8,7 @@ pub mod path_management;
 pub mod setup;
 pub mod state;
 pub mod tray_icons;
+pub mod ui_ready;
 pub mod update;
 pub mod version;
 

@@ -194,6 +194,20 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             .unwrap_or(0)
     }
 
+    /// Test seam: shift `started_at` backwards by `by`. Lets uptime
+    /// tests assert "after N seconds elapsed" without sleeping or
+    /// injecting a clock abstraction. No-op if not currently running.
+    /// See bindreams/hole#383.
+    #[cfg(test)]
+    pub fn shift_started_at_for_test(&mut self, by: std::time::Duration) {
+        if let Some(r) = self.running.as_mut() {
+            r.started_at = r
+                .started_at
+                .checked_sub(by)
+                .expect("shift_started_at_for_test: arithmetic underflow");
+        }
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -746,7 +760,7 @@ async fn build_local_dns(
     // `tokio::spawn` so a dead upstream cannot stall `start_inner` by the
     // retry budget — the contract is that `build_local_dns` returns
     // regardless of self-test outcome.
-    spawn_forwarder_self_test(Arc::clone(&forwarder), dns_cfg.servers.clone());
+    let _ = spawn_forwarder_self_test(Arc::clone(&forwarder), dns_cfg.servers.clone());
 
     let endpoint = if dns_cfg.intercept_udp53 {
         Some(crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder)))
@@ -769,17 +783,17 @@ async fn build_local_dns(
 fn spawn_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
     const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     const ATTEMPTS: u32 = 3;
 
     let Some(&first_server) = servers.first() else {
         info!("forwarder self-test skipped: no servers configured");
-        return;
+        return None;
     };
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let query = sample_self_test_query();
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(OUTER_BUDGET, async {
@@ -830,7 +844,7 @@ fn spawn_forwarder_self_test(
                 );
             }
         }
-    });
+    }))
 }
 
 enum SelfTestOutcome {

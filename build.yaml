@@ -196,8 +196,11 @@ targets:
     depends: garter
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run --no-run -p garter
-    run: cargo nextest run -p garter
+    # `--features test-utils` makes `garter::test_utils::WaitableWriter`
+    # visible to the integration tests (`tests/*.rs`). See garter's
+    # Cargo.toml `[features]` and bindreams/hole#383.
+    build: cargo nextest run --no-run -p garter --features test-utils
+    run: cargo nextest run -p garter --features test-utils
 
   garter-bin-tests:
     depends: garter-bin

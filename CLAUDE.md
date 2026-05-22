@@ -504,6 +504,86 @@ the 7 assertion-target tests (`proxy_manager_tests`,
 `forwarder_tests`, `system_tests`, `tap_tests`, `yaml_format_tests`,
 `logging_tests`, `cli_log_tests`) keep working as before.
 
+### Synchronization invariant (no sleeps for sync)
+
+`tokio::time::sleep`, `std::thread::sleep`, `setTimeout`-as-wait,
+`browser.pause()`, and any timeout-bounded poll
+(`waitUntil({ timeout })`, `waitForExist({ timeout })`,
+`tokio::time::timeout(d, wait_for_x)`) are **forbidden for
+synchronization**. Enforced by code review (`review` agent and human
+review). Every PR that introduces or keeps a sleep must justify the
+site (which exception class) or replace it with a deterministic
+primitive. See bindreams/hole#383 for the audit that established this.
+
+Two narrow exceptions, each with a one-line comment at the site naming
+the class:
+
+1. **Test-of-timing.** The delay IS the behavior under test
+   ([`SlowWriter` in logging_test_helpers.rs:379](crates/common/src/logging/logging_test_helpers.rs#L379)
+   verifying backpressure-induced drops, or
+   [`SilentAfterRead { delay }` in tap_tests.rs:139](crates/garter/src/tap_tests.rs#L139)
+   exercising idle-close semantics).
+1. **External event with graceful failure bound.** The retry budget
+   for a *remote/out-of-process* operation that might genuinely never
+   succeed — port-bind races against the OS allocator, subprocess
+   startup observed only through file existence or port-open polling,
+   external HTTP. The framework timeout (Mocha, nextest) or job
+   timeout (GHA) is the *failure-to-human* signal, never the sync.
+   Not applicable to intra-process synchronization where both sides
+   are our code.
+
+For intra-process sync, use the codebase's primitives:
+
+- **Task rendezvous "wait until A is parked at Y"**:
+  [`oneshot::channel`](crates/bridge/src/ipc_tests.rs) in
+  `MockProxy::start_entered`. The inner task fires
+  `tx.send(())` before the await point; the test code calls
+  `entered_rx.await`. *Do NOT use `Notify::notify_waiters` for
+  rendezvous* — it has no latch; the signal is lost if the receiver
+  hasn't called `notified()` yet.
+- **UI-window readiness from webdriver**:
+  [`wait_ui_ready` Tauri command + `__holeUiReady` global](crates/hole/src/ui_ready.rs).
+  The test parks in Rust on a `watch` channel until `init()` calls
+  `signal_ui_ready` (success or failure). See
+  [tests/webdriver/wdio.conf.ts](tests/webdriver/wdio.conf.ts).
+  `withGlobalTauri: false` means injected JS cannot see `window.__TAURI__`,
+  so the bundled UI entry exposes a typed `window.__holeUiReady` bridge.
+- **Server-bind readiness**: return a separate `oneshot::Receiver<()>`
+  from `bind` (or have the spawned-task signal one after a synchronous
+  bind). The test awaits the receiver before connecting. See
+  [foreground_tests.rs](crates/bridge/src/foreground_tests.rs) (IpcServer)
+  and the `on_ready` builder method on [ChainRunner](crates/garter/src/chain.rs).
+- **Stdio-relay flush in tests**:
+  [`StdioRelayHandles::flush()`](crates/common/src/logging.rs) writes
+  a unique in-band sentinel through stderr/stdout and blocks on an
+  `mpsc::sync_channel` ack from the relay reader. The sentinel is
+  intercepted before tee/emit so it does not pollute either log
+  surface.
+- **Elapsed-time assertions**: prefer `tokio::time::pause()` +
+  `tokio::time::advance(d)` if the system-under-test uses
+  `tokio::time::Instant` or `tokio::time::sleep`. Requires the
+  `test-util` feature in dev-deps (`tokio = { features = ["test-util"] }`).
+  If production code uses `std::time::Instant` (not controlled by
+  tokio's virtual clock), inject a test seam — see
+  [`ProxyManager::shift_started_at_for_test`](crates/bridge/src/proxy_manager.rs).
+- **Log-event sequencing**: subscribe a `WaitableWriter` to the
+  tracing subscriber; register `wait_for(substring)` patterns; park
+  on the returned `mpsc::Receiver`. See
+  [`garter::test_utils::WaitableWriter`](crates/garter/src/test_utils.rs)
+  and the tap_tests "plugin tap: ready" / "plugin tap: closed"
+  patterns.
+- **Holding a resource open until test signals release**:
+  `CancellationToken::new()` + `token.cancelled().await` in the
+  holding task; test calls `token.cancel()` when done. Or, for a
+  child-process helper, read from stdin and exit on EOF — parent
+  closes stdin (via `kill`) when ready. See
+  [`hold_file.rs`](crates/handle-holders/src/bin/hold_file.rs).
+- **"Wait for spawned work to complete"**: return the `JoinHandle`
+  from the spawning function and `.await` it. Don't fire-and-forget
+  if you might need to wait. See
+  [`spawn_forwarder_self_test`](crates/bridge/src/proxy_manager.rs) for
+  the pattern (returns `Option<JoinHandle<()>>`).
+
 ### Windows installer
 
 ```sh

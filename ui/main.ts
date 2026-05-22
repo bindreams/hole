@@ -19,6 +19,18 @@ import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./ty
 /// RAM and looks like a port scan from one IP to commercial SS providers.
 export const TEST_CONCURRENCY = 5;
 
+// Test seam: webdriver's `before` hook calls this to park until
+// `init()` has completed (success or failure). `withGlobalTauri: false`
+// strips `window.__TAURI__` from injected scripts, so this typed
+// global is the documented entry point. See
+// `crates/hole/src/ui_ready.rs` and bindreams/hole#383.
+declare global {
+  interface Window {
+    __holeUiReady?: () => Promise<{ ok: boolean; error: string | null }>;
+  }
+}
+window.__holeUiReady = () => invoke<{ ok: boolean; error: string | null }>("wait_ui_ready");
+
 // State ===============================================================================================================
 
 /** The current application config, loaded from the backend. */
@@ -172,55 +184,76 @@ function setupEventListeners() {
 // Initialization ======================================================================================================
 
 async function init() {
-  // Wire the webview into the Rust log pipeline BEFORE anything else so the
-  // subsequent console.error/warn calls are captured, and `window.onerror` /
-  // `window.onunhandledrejection` route through tracing too. The plugin is
-  // registered on the Rust side in main.rs with `.skip_logger()` so JS log
-  // events flow through `log` → `tracing-log::LogTracer` → `gui.log`.
-  await attachConsole();
+  let result: { ok: boolean; error: string | null };
+  try {
+    // Wire the webview into the Rust log pipeline BEFORE anything else so the
+    // subsequent console.error/warn calls are captured, and `window.onerror` /
+    // `window.onunhandledrejection` route through tracing too. The plugin is
+    // registered on the Rust side in main.rs with `.skip_logger()` so JS log
+    // events flow through `log` → `tracing-log::LogTracer` → `gui.log`.
+    await attachConsole();
 
-  window.addEventListener("error", (e) => {
-    logError(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
-  });
-  window.addEventListener("unhandledrejection", (e) => {
-    const reason = e.reason instanceof Error ? `${e.reason.message}\n${e.reason.stack ?? ""}` : String(e.reason);
-    logError(`unhandledrejection: ${reason}`);
-  });
-
-  // Initialize UI modules.
-  initSections();
-  initServers();
-  initFilters();
-  initSettings();
-  initSidebar();
-
-  // Replace native scrollbars with fade-in/out overlay scrollbars.
-  const main = document.querySelector<HTMLElement>(".main");
-  if (main) {
-    OverlayScrollbars(main, {
-      scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+    window.addEventListener("error", (e) => {
+      logError(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
     });
-  }
-  const sbContent = document.querySelector<HTMLElement>(".sb-content");
-  if (sbContent) {
-    OverlayScrollbars(sbContent, {
-      scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+    window.addEventListener("unhandledrejection", (e) => {
+      const reason = e.reason instanceof Error ? `${e.reason.message}\n${e.reason.stack ?? ""}` : String(e.reason);
+      logError(`unhandledrejection: ${reason}`);
     });
+
+    // Initialize UI modules.
+    initSections();
+    initServers();
+    initFilters();
+    initSettings();
+    initSidebar();
+
+    // Replace native scrollbars with fade-in/out overlay scrollbars.
+    const main = document.querySelector<HTMLElement>(".main");
+    if (main) {
+      OverlayScrollbars(main, {
+        scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+      });
+    }
+    const sbContent = document.querySelector<HTMLElement>(".sb-content");
+    if (sbContent) {
+      OverlayScrollbars(sbContent, {
+        scrollbars: { theme: "os-theme-hole", autoHide: "scroll", autoHideDelay: 800 },
+      });
+    }
+
+    // Load config from backend.
+    await loadConfig();
+
+    // Initial data fetches (all in parallel).
+    await Promise.allSettled([pollProxyStatus(), pollMetrics(), pollDiagnostics(), updatePublicIp()]);
+
+    // Start polling intervals.
+    setInterval(pollProxyStatus, 5000);
+    setInterval(pollMetrics, 1000);
+    setInterval(pollDiagnostics, 5000);
+
+    // Wire up event listeners.
+    setupEventListeners();
+
+    result = { ok: true, error: null };
+  } catch (err) {
+    const msg = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
+    logError(`init failed: ${msg}`);
+    result = { ok: false, error: msg };
   }
 
-  // Load config from backend.
-  await loadConfig();
-
-  // Initial data fetches (all in parallel).
-  await Promise.allSettled([pollProxyStatus(), pollMetrics(), pollDiagnostics(), updatePublicIp()]);
-
-  // Start polling intervals.
-  setInterval(pollProxyStatus, 5000);
-  setInterval(pollMetrics, 1000);
-  setInterval(pollDiagnostics, 5000);
-
-  // Wire up event listeners.
-  setupEventListeners();
+  // Always signal — even on init failure — so the webdriver test
+  // surfaces a real error instead of hanging on the watch channel.
+  try {
+    await invoke("signal_ui_ready", { result });
+  } catch (signalErr) {
+    // If the invoke itself fails the Tauri runtime is broken, which
+    // is an external-event-might-never-happen scenario. The webdriver
+    // test surfaces this via its framework timeout — there is no
+    // intra-process recovery available here.
+    logError(`signal_ui_ready failed: ${signalErr}`);
+  }
 }
 
 init();

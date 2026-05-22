@@ -34,6 +34,52 @@ export const config: Options.Testrunner = {
   },
   reporters: ["spec"],
 
+  // Wait for the UI to signal it has finished `init()` (success or
+  // failure). Synchronizes the test run with the UI's initialization
+  // state via an explicit Tauri-command bridge in
+  // crates/hole/src/ui_ready.rs. `executeAsync` parks the driver
+  // until `done()` is called from the page-side script. The Mocha
+  // 30s `timeout` above is the framework-level failure bound (it
+  // covers WebView2-itself-broken — an external-event-might-never-
+  // happen scenario; not the synchronization).
+  //
+  // See bindreams/hole#383 for the flake that motivated this.
+  async before() {
+    const result = await browser.executeAsync<{
+      ok: boolean;
+      error: string | null;
+    }>((done) => {
+      // The webdriver session can establish before ui/main.ts has
+      // executed its module-level `window.__holeUiReady = ...`
+      // assignment. If `document.readyState !== "complete"` we wait
+      // for the `load` event — all scripts have run by then — and
+      // then call the bridge. Event-driven (no polling).
+      type ReadyFn = () => Promise<{ ok: boolean; error: string | null }>;
+      const go = () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ready = (window as any).__holeUiReady as ReadyFn | undefined;
+        if (typeof ready !== "function") {
+          done({
+            ok: false,
+            error: "__holeUiReady not exposed by ui/main.ts after page load",
+          });
+          return;
+        }
+        ready()
+          .then(done)
+          .catch((e: unknown) => done({ ok: false, error: String(e) }));
+      };
+      if (document.readyState === "complete") {
+        go();
+      } else {
+        window.addEventListener("load", go, { once: true });
+      }
+    });
+    if (!result.ok) {
+      throw new Error(`UI init failed: ${result.error}`);
+    }
+  },
+
   onPrepare() {
     // Discard tauri-driver's stdio — keeping the pipes open would block
     // tauri-driver if it ever writes more than the pipe buffer (~64 KB

@@ -9,7 +9,7 @@
 // and the parent reads + asserts on it.
 
 use crate::logging::logging_tests::{CapturedEvent, ChildResult};
-use crate::logging::redirect_stdio_to_tracing_for_tests;
+use crate::logging::{redirect_stdio_to_tracing_for_tests, StdioRelayHandles};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -109,6 +109,10 @@ fn parse_lines(layer: &str, raw: &[u8]) -> Vec<CapturedEvent> {
 struct ChildHarness {
     file_writer: VecWriter,
     stderr_writer: VecWriter,
+    /// If Some, `finish` flushes through this relay (in-band sentinel +
+    /// mpsc ack) before snapshotting the writers. Scenarios that don't
+    /// redirect (none currently) would leave it as None.
+    relays: Option<StdioRelayHandles>,
 }
 
 fn install_child_subscriber() -> ChildHarness {
@@ -136,6 +140,7 @@ fn install_child_subscriber() -> ChildHarness {
     ChildHarness {
         file_writer,
         stderr_writer,
+        relays: None,
     }
 }
 
@@ -150,9 +155,14 @@ fn write_result(result: &ChildResult) {
     std::fs::write(output_path(), bytes).expect("write result");
 }
 
-fn finish(harness: &ChildHarness) -> ChildResult {
-    // Give the in-memory tracing layers a chance to flush.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+fn finish(harness: &mut ChildHarness) -> ChildResult {
+    // Flush the stdio relay deterministically: write a sentinel through
+    // stderr/stdout, block on the reader's ack, then drain the
+    // NonBlocking tee writers' WorkerGuards. No sleep.
+    // See bindreams/hole#383.
+    if let Some(relays) = harness.relays.as_mut() {
+        relays.flush().expect("relay flush");
+    }
     let mut events = parse_lines("file", &harness.file_writer.snapshot());
     events.extend(parse_lines("stderr", &harness.stderr_writer.snapshot()));
     ChildResult {
@@ -220,26 +230,29 @@ fn scenario_echo_stdout() {
 }
 
 fn scenario_basic_stderr() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
     let _ = writeln!(std::io::stderr(), "hello-from-stderr");
     let _ = std::io::stderr().flush();
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
 fn scenario_basic_stdout() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
     let _ = writeln!(std::io::stdout(), "hello-from-stdout");
     let _ = std::io::stdout().flush();
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
 fn scenario_grandchild_stderr() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
 
     // Pass A: Rust grandchild via current_exe.
     let exe = std::env::current_exe().expect("current_exe");
@@ -265,15 +278,14 @@ fn scenario_grandchild_stderr() {
             .status();
     }
 
-    // Allow relay to drain.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
 fn scenario_grandchild_stdout() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
 
     let exe = std::env::current_exe().expect("current_exe");
     let _ = std::process::Command::new(&exe)
@@ -297,8 +309,7 @@ fn scenario_grandchild_stdout() {
             .status();
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
@@ -326,42 +337,41 @@ fn scenario_tee() {
         .open(&stdout_path)
         .expect("open stdout tee file");
 
-    let harness = install_child_subscriber();
-    let _relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+    let mut harness = install_child_subscriber();
+    let relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
         Box::new(stderr_file.try_clone().unwrap()),
         Box::new(stdout_file.try_clone().unwrap()),
     )
     .expect("redirect with custom writers");
+    harness.relays = Some(relays);
 
     let _ = writeln!(std::io::stderr(), "tee-stderr-line");
     let _ = std::io::stderr().flush();
     let _ = writeln!(std::io::stdout(), "tee-stdout-line");
     let _ = std::io::stdout().flush();
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    let mut result = finish(&harness);
+    let mut result = finish(&mut harness);
     result.tee_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     result.tee_stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     write_result(&result);
 }
 
 fn scenario_multiline() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
     let _ = std::io::stderr().write_all(b"multiline-a\nmultiline-b\nmultiline-c\n");
     let _ = std::io::stderr().flush();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
 fn scenario_no_loop() {
-    let harness = install_child_subscriber();
-    let (_relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    let mut harness = install_child_subscriber();
+    let (relays, _layer_writer) = redirect_stdio_to_tracing_for_tests().expect("redirect");
+    harness.relays = Some(relays);
     tracing::info!("normal event");
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let result = finish(&harness);
+    let result = finish(&mut harness);
     write_result(&result);
 }
 
