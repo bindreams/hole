@@ -138,6 +138,17 @@ fn redirect_captures_subprocess_stdout_via_inheritance(#[fixture(temp_dir)] dir:
     );
 }
 
+/// Load-bearing test for the **tee-drain phase** of
+/// [`StdioRelayHandles::flush`](crate::logging::StdioRelayHandles).
+/// The relay's `tee.write_all(buf)` goes through a
+/// `tracing_appender::NonBlocking` worker whose drain is asynchronous;
+/// without `flush` dropping the `WorkerGuard`s, the tee target can be
+/// empty when the test reads it. Historically the child scenario
+/// relied on a wall-clock `sleep(150ms)` to mask this; the sleep was
+/// removed in #383 and the test caught the regression on darwin/amd64
+/// (slowest CI runner) before merge. Do not weaken the
+/// `tee_stderr`/`tee_stdout` assertions — they are the canonical
+/// regression gate for the flush contract.
 #[skuld::test]
 fn redirect_tees_to_saved_original(#[fixture(temp_dir)] dir: &Path) {
     let result = run_child("redirect_tee", dir);
