@@ -4,14 +4,22 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
+import { attachConsole, error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
+import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
-import { importFromDialog, initServers, renderServers } from "./servers";
+import {
+  clearImportZoneHighlight,
+  importFromDialog,
+  initServers,
+  renderServers,
+  showImportFailureDialog,
+} from "./servers";
 import { initSettings, renderSettings } from "./settings";
 import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
+import { showToast } from "./toast";
 import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./types";
 
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
@@ -55,6 +63,7 @@ export async function loadConfig() {
     updateDiagnostics();
   } catch (err) {
     console.error("loadConfig failed:", err);
+    showToast(`Failed to load config: ${err}`, "error");
   }
 }
 
@@ -66,6 +75,7 @@ export async function saveConfig() {
     dirty = false;
   } catch (err) {
     console.error("saveConfig failed:", err);
+    showToast(`Failed to save config: ${err}`, "error");
   }
 }
 
@@ -144,34 +154,67 @@ export async function runTestsBounded(ids: string[], maxInFlight: number) {
 
 // Event listeners =====================================================================================================
 
-/** Handle file import (from menu or drag-and-drop). */
-async function importFile(path: string) {
-  try {
-    const newServers = await invoke<Server[]>("import_servers_from_file", { path });
-    // Reload config so the UI picks up the new servers.
-    await loadConfig();
-    // Auto-test the newly imported servers in parallel (bounded). Fire
-    // and forget — the validation-changed listener handles repaint.
-    runTestsBounded(
-      newServers.map((s) => s.id),
-      TEST_CONCURRENCY,
-    );
-  } catch (err) {
-    console.error("import failed:", err);
-  }
-}
-
 function setupEventListeners() {
   // File > Import menu action (tray emits () as payload — open dialog).
   listen("import-requested", () => importFromDialog());
 
-  // Drag-and-drop file import.
+  // WebView2 (Windows) shows the OS "forbidden" cursor on file drags
+  // unless JS calls `preventDefault()` on the `dragover` event — even
+  // though Tauri's native drop handler is what actually delivers the
+  // file paths via `tauri://drag-drop`. Without these two lines, the
+  // user gets a red-crossed-circle cursor and the drop is rejected at
+  // the OS layer before Tauri sees it. The handlers are window-scoped
+  // because Tauri's drop handler is also window-scoped. See #385.
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
+
+  // Drag-and-drop file import. The user may drop one or many files;
+  // iterate, showing a BLOCKING error dialog per failure (sequential —
+  // the user must acknowledge each), and aggregate any successes into
+  // a single end-of-loop toast. See bindreams/hole#385: errors used to
+  // be toasts that auto-dismiss in 10s, which is easy to miss.
   listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
-    const paths = event.payload?.paths;
-    if (paths && paths.length > 0) {
-      // Import the first dropped file.
-      await importFile(paths[0]);
+    // A successful drop may not fire `dragleave` on the import zone —
+    // remove the visual highlight unconditionally before processing
+    // (the no-op case where the zone wasn't highlighted is harmless).
+    clearImportZoneHighlight();
+    const paths = event.payload?.paths ?? [];
+    if (paths.length === 0) return;
+
+    let totalAppended = 0;
+    let totalFailed = 0;
+    const newIds: string[] = [];
+    for (const path of paths) {
+      try {
+        const newServers = await invoke<Server[]>("import_servers_from_file", { path });
+        totalAppended += newServers.length;
+        for (const s of newServers) newIds.push(s.id);
+      } catch (err) {
+        totalFailed++;
+        console.error(`import failed for ${path}:`, err);
+        // Sequential, modal — `await` here parks the loop until the
+        // user dismisses the dialog before moving on to the next file.
+        await showImportFailureDialog(err);
+      }
     }
+
+    // Skip the config reload when nothing was appended — the config
+    // didn't change, and a reload of an unchanged config would only
+    // risk a spurious "Failed to load config" dialog on top of the
+    // per-file error dialog(s) we already showed.
+    if (totalAppended > 0) {
+      await loadConfig();
+      // Auto-test the newly imported servers in parallel (bounded).
+      // Fire and forget — the validation-changed listener handles repaint.
+      runTestsBounded(newIds, TEST_CONCURRENCY);
+    }
+
+    // Errors were already delivered via blocking dialogs inside the
+    // per-file `catch`. The post-loop summary covers only success/info
+    // outcomes — and explicitly names any failure count in the partial
+    // case so the toast doesn't lie.
+    const summary = postImportSummary(totalAppended, totalFailed);
+    if (summary !== null) showToast(summary.message, summary.kind);
   });
 
   // Persisted validation changed (from `test_server` or
@@ -183,22 +226,83 @@ function setupEventListeners() {
 
 // Initialization ======================================================================================================
 
+/// Format a single console-argument for the relay: include the stack on
+/// Errors so `gui.log` keeps the diagnostic; plain `String(a)` for everything
+/// else (matches console's own toString behavior for non-Error args).
+function formatRelayArg(a: unknown): string {
+  return a instanceof Error ? `${a.message}\n${a.stack ?? ""}` : String(a);
+}
+
+/// Forward JS `console.error` / `console.warn` calls through
+/// `@tauri-apps/plugin-log` so they land in `gui.log`. Toast presentation is
+/// per-call-site (deliberate, contextual messages); this relay is log-only.
+///
+/// Reentrancy guard: if `logError` / `logWarn` themselves throw (e.g. a
+/// future capability mishap), the resulting promise rejection would re-enter
+/// the relay and recurse. The `inRelay` flag short-circuits the recursive
+/// call; the `.catch(origError, ...)` surfaces relay-side failures to the
+/// ORIGINAL (unpatched) `console.error` so a misconfigured plugin-log
+/// capability is loud rather than silent. `origError` bypasses the patched
+/// `console.error` so it can't re-enter the relay.
+function installConsoleRelay() {
+  let inRelay = false;
+  const origError = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    origError(...args);
+    if (inRelay) return;
+    inRelay = true;
+    try {
+      void logError(args.map(formatRelayArg).join(" ")).catch((e) => {
+        origError("console.error relay failed:", e);
+      });
+    } finally {
+      inRelay = false;
+    }
+  };
+  const origWarn = console.warn.bind(console);
+  console.warn = (...args: unknown[]) => {
+    origWarn(...args);
+    if (inRelay) return;
+    inRelay = true;
+    try {
+      void logWarn(args.map(formatRelayArg).join(" ")).catch((e) => {
+        // Use origError, not origWarn — a relay failure is an Error.
+        origError("console.warn relay failed:", e);
+      });
+    } finally {
+      inRelay = false;
+    }
+  };
+}
+
 async function init() {
+  // Install the JS→Rust console relay BEFORE anything else so the
+  // subsequent `console.error` / `console.warn` calls in this `init`
+  // (and the window-level error / unhandledrejection handlers) end up in
+  // `gui.log`. The relay only logs; it does NOT toast. Toast presentation
+  // is per-call-site so blanket capture doesn't flood the UI.
+  installConsoleRelay();
+
   let result: { ok: boolean; error: string | null };
   try {
-    // Wire the webview into the Rust log pipeline BEFORE anything else so the
-    // subsequent console.error/warn calls are captured, and `window.onerror` /
-    // `window.onunhandledrejection` route through tracing too. The plugin is
-    // registered on the Rust side in main.rs with `.skip_logger()` so JS log
-    // events flow through `log` → `tracing-log::LogTracer` → `gui.log`.
-    await attachConsole();
+    // Mirror Rust log events into the JS console (the OPPOSITE direction
+    // from the relay above). Wrapped in try/catch so a future capability
+    // misconfiguration on `tauri-plugin-log` doesn't silently break the
+    // whole dashboard. The plugin is registered on the Rust side in
+    // main.rs with `.skip_logger()` so JS log events flow through
+    // `log` → `tracing-log::LogTracer` → `gui.log`.
+    try {
+      await attachConsole();
+    } catch (e) {
+      console.warn("attachConsole failed:", e);
+    }
 
     window.addEventListener("error", (e) => {
-      logError(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
+      console.error(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
     });
     window.addEventListener("unhandledrejection", (e) => {
       const reason = e.reason instanceof Error ? `${e.reason.message}\n${e.reason.stack ?? ""}` : String(e.reason);
-      logError(`unhandledrejection: ${reason}`);
+      console.error(`unhandledrejection: ${reason}`);
     });
 
     // Initialize UI modules.
@@ -239,12 +343,29 @@ async function init() {
     result = { ok: true, error: null };
   } catch (err) {
     const msg = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
-    logError(`init failed: ${msg}`);
+    // `console.error` routes to gui.log via the relay installed above.
+    console.error(`init failed: ${msg}`);
     result = { ok: false, error: msg };
+    // Toast may not be ready if init failed in its first two lines (before
+    // the OverlayScrollbars/load steps). Show the toast; on failure, fall
+    // back to a synchronous `alert()`. Both happen AFTER `signal_ui_ready`
+    // below — `alert()` is modal-blocking on Windows WebView2, and parking
+    // the JS event loop here would prevent the webdriver-side
+    // `wait_ui_ready` from observing the result.
+    queueMicrotask(() => {
+      try {
+        showToast(`Dashboard failed to initialize: ${msg}`, "error", 30_000);
+      } catch {
+        alert(`Hole dashboard failed to initialize: ${msg}`);
+      }
+    });
   }
 
   // Always signal — even on init failure — so the webdriver test
   // surfaces a real error instead of hanging on the watch channel.
+  // This MUST run before any modal UI (toast/alert) in the failure
+  // path; otherwise an alert dialog would park the JS event loop and
+  // wedge the webdriver session indefinitely.
   try {
     await invoke("signal_ui_ready", { result });
   } catch (signalErr) {

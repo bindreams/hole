@@ -7,13 +7,81 @@ use hole_common::import;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, ProxyConfig, ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT,
 };
+use serde::Serialize;
 use std::io::Read;
 use std::path::Path;
 use tauri::{Emitter, State};
 use time::OffsetDateTime;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
+// ImportFailure =======================================================================================================
+//
+// Structured failure type for `import_servers_from_file`. The frontend
+// matches on the `kind` discriminator to pick a user-friendly blocking
+// dialog title + body (e.g. "This file is corrupted or in a wrong
+// format", "Unsupported plugin"). Avoids the string-parsing-hack of
+// guessing failure mode from a free-form error string at the JS
+// boundary. See bindreams/hole#385 and the JS-side `friendlyDialog`
+// helper at `ui/import-failure.ts`.
+
+/// Structured import failure surfaced to the frontend. Tagged enum
+/// (serde `tag = "kind"`) so the JS side branches on the discriminator
+/// without parsing free-form strings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportFailure {
+    /// File-system layer: not found / not accessible / not a regular
+    /// file / wrong extension / too large to import. The `detail` is
+    /// pre-scrubbed of paths and safe to show verbatim.
+    FileError { detail: String },
+    /// JSON syntax error. No detail — `serde_json` parse errors echo
+    /// fragments of file content, which we never surface to the user
+    /// (the file might contain credentials). The full underlying error
+    /// is logged via `warn!` for diagnosis.
+    CorruptedJson,
+    /// JSON parsed but required Shadowsocks fields are missing.
+    /// `missing_field` names the first missing one (e.g.
+    /// `"server (or 'address')"`) so the user sees which field shape
+    /// Hole was looking for.
+    UnrecognizedFormat { missing_field: String },
+    /// The file specifies a plugin Hole doesn't bundle. `plugin` is the
+    /// offending name; `supported` is the canonical list of bundled
+    /// plugin names from `hole_common::plugin::KNOWN_PLUGINS`.
+    UnsupportedPlugin { plugin: String, supported: Vec<String> },
+    /// A field value was out-of-range (e.g. port > 65535) or malformed
+    /// (e.g. plugin name with path separators). `detail` is safe to
+    /// show — it never echoes file content (covered by tests in
+    /// `import_tests.rs` and `commands_tests.rs`).
+    InvalidValue { detail: String },
+    /// Config save to disk failed. No detail — the underlying
+    /// `io::Error` Display includes the config-file path (PII on
+    /// Windows). The full detail lands in `gui.log` via `warn!`.
+    SaveFailed,
+}
+
+/// Convert an `ImportError` from the parser into the user-facing
+/// `ImportFailure`. The categorization is the only thing this function
+/// does — it's not a one-to-one map; for example,
+/// `ImportError::Parse(_)` collapses to `CorruptedJson` (no detail) to
+/// avoid leaking JSON parse-error messages (which can include fragments
+/// of file content). The `supported` plugin list is fetched directly
+/// from the single source of truth at
+/// [`hole_common::plugin::KNOWN_PLUGINS`] — no comma-string round-trip.
+fn to_import_failure(err: import::ImportError) -> ImportFailure {
+    match err {
+        import::ImportError::Parse(_) => ImportFailure::CorruptedJson,
+        import::ImportError::MissingField(name) => ImportFailure::UnrecognizedFormat {
+            missing_field: name.to_string(),
+        },
+        import::ImportError::UnsupportedPlugin { name } => ImportFailure::UnsupportedPlugin {
+            plugin: name,
+            supported: hole_common::plugin::known_plugin_names().map(String::from).collect(),
+        },
+        import::ImportError::InvalidValue(detail) => ImportFailure::InvalidValue { detail },
+    }
+}
 
 #[tauri::command]
 pub fn get_config(state: State<AppState>) -> AppConfig {
@@ -31,48 +99,93 @@ pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), 
     Ok(())
 }
 
+/// Helper: wrap a static user-facing string in `ImportFailure::FileError`.
+fn file_error(detail: impl Into<String>) -> ImportFailure {
+    ImportFailure::FileError { detail: detail.into() }
+}
+
 /// Validate a file path, read it, and parse server entries from it.
-fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, String> {
+///
+/// Returns an `ImportFailure` — the file-system layer maps to
+/// `FileError { detail }` (with already-scrubbed detail), and parser
+/// errors flow through `to_import_failure`.
+fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, ImportFailure> {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("json") => {}
-        _ => return Err("only .json files can be imported".to_string()),
+        _ => return Err(file_error("only .json files can be imported")),
     }
 
     // Open once, then fstat the fd to avoid TOCTOU races.
     let mut file = std::fs::File::open(path).map_err(|e| {
         debug!("failed to open import file: {e}");
-        "file not found or not accessible".to_string()
+        file_error("file not found or not accessible")
     })?;
     let metadata = file.metadata().map_err(|e| {
         debug!("failed to read file metadata: {e}");
-        "file not found or not accessible".to_string()
+        file_error("file not found or not accessible")
     })?;
     if !metadata.is_file() {
-        return Err("path is not a regular file".to_string());
+        return Err(file_error("path is not a regular file"));
     }
     if metadata.len() > MAX_IMPORT_FILE_SIZE {
-        return Err("file is too large to import".to_string());
+        return Err(file_error("file is too large to import (max 10 MB)"));
     }
 
     let mut json = String::new();
     file.read_to_string(&mut json).map_err(|e| {
         debug!("failed to read import file: {e}");
-        "failed to read file".to_string()
+        file_error("failed to read file")
     })?;
-    import::import_servers(&json).map_err(|e| sanitize_import_error(&e))
+    import::import_servers(&json).map_err(to_import_failure)
 }
 
-/// Convert an ImportError to a user-facing message without leaking file content.
-fn sanitize_import_error(err: &import::ImportError) -> String {
-    match err {
-        import::ImportError::MissingField(field) => {
-            format!("missing required field: {field}")
-        }
-        // Parse and InvalidValue can contain fragments of file content.
-        import::ImportError::Parse(_) | import::ImportError::InvalidValue(_) => {
-            "file does not contain valid server configuration".to_string()
+/// Append `parsed` server entries into `config`, deduplicating by
+/// (server, port, method, password). Returns the actually-appended entries
+/// and the count of dropped duplicates. Emits a single `info!` summary so
+/// every import attempt leaves a trace in `gui.log`.
+///
+/// Pure helper — no Tauri `State`, no `AppHandle`, no `Mutex` — so it is
+/// unit-testable without standing up a real Tauri app. The `#[tauri::command]`
+/// wrapper [`import_servers_from_file`] holds the lock and persists the
+/// resulting config; this helper does NOT save.
+fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<ServerEntry>, usize) {
+    let parsed_count = parsed.len();
+    let existing_count = config.servers.len();
+
+    let mut appended = Vec::new();
+    for server in parsed {
+        let already_exists = config.servers.iter().any(|s| {
+            s.server == server.server
+                && s.server_port == server.server_port
+                && s.method == server.method
+                && s.password == server.password
+        });
+        if !already_exists {
+            config.servers.push(server.clone());
+            appended.push(server);
         }
     }
+    let appended_count = appended.len();
+    let deduped_count = parsed_count - appended_count;
+
+    let selected_before = config.selected_server.clone();
+    auto_select_first_server(config);
+    let selected_after = config.selected_server.clone();
+    let selection_initialized_from_none = selected_before.is_none() && selected_after.is_some();
+    let selection_healed = selected_before.is_some() && selected_before != selected_after;
+
+    info!(
+        parsed = parsed_count,
+        appended = appended_count,
+        deduped = deduped_count,
+        existing_before = existing_count,
+        total_after = existing_count + appended_count,
+        selection_initialized_from_none,
+        selection_healed,
+        "import_servers_from_file: apply summary"
+    );
+
+    (appended, deduped_count)
 }
 
 /// Select the first server if no valid server is currently selected.
@@ -96,26 +209,27 @@ fn auto_select_first_server(config: &mut AppConfig) {
 /// the returned IDs to auto-test *new* entries; returning phantom IDs for
 /// deduped entries would produce silent "no server with id …" errors in
 /// the auto-test loop.
+///
+/// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
+/// emits `warn!` on validate/parse failure and on config-save failure. The
+/// save-failure path returns `ImportFailure::SaveFailed` (no detail in
+/// the wire form) because the underlying `io::Error` includes the
+/// config-file path (PII on Windows); the full detail still lands in
+/// `gui.log` via `warn!`.
 #[tauri::command]
-pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, String> {
-    let parsed = validate_and_read_import(Path::new(&path))?;
+pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, ImportFailure> {
+    info!(path = %path, "import_servers_from_file: start");
+    let parsed = validate_and_read_import(Path::new(&path)).inspect_err(|e| {
+        warn!(path = %path, error = ?e, "import_servers_from_file: validate/parse failed");
+    })?;
 
     let mut config = state.config.lock().unwrap();
-    let mut appended = Vec::new();
-    for server in parsed {
-        let already_exists = config.servers.iter().any(|s| {
-            s.server == server.server
-                && s.server_port == server.server_port
-                && s.method == server.method
-                && s.password == server.password
-        });
-        if !already_exists {
-            config.servers.push(server.clone());
-            appended.push(server);
-        }
-    }
-    auto_select_first_server(&mut config);
-    config.save(&state.config_path).map_err(|e| e.to_string())?;
+    let (appended, _deduped) = apply_import(&mut config, parsed);
+
+    config.save(&state.config_path).map_err(|e| {
+        warn!(error = %e, "import_servers_from_file: config save failed");
+        ImportFailure::SaveFailed
+    })?;
 
     Ok(appended)
 }

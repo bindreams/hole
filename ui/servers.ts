@@ -1,9 +1,11 @@
 // Servers section: rendering server cards, selection, deletion, file import.
 
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { message, open } from "@tauri-apps/plugin-dialog";
+import { describeUnknownImportError } from "./import-failure";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
+import { showToast } from "./toast";
 import { LATENCY_VALIDATED_ON_CONNECT, type ServerTestOutcome, type ValidationState } from "./types";
 
 // DOM references ======================================================================================================
@@ -190,24 +192,75 @@ async function deleteServer(id: string) {
 
 // File import =========================================================================================================
 
+/**
+ * Show a blocking error dialog for an import failure. The dialog
+ * pauses the JS event loop until the user clicks OK — chosen
+ * deliberately so import errors can't be missed (a toast that
+ * auto-dismisses in 10s is easy to overlook). See bindreams/hole#385.
+ *
+ * Accepts `unknown` because the Tauri invoke rejection type is unknown:
+ * the structured `ImportFailure` is the happy path, but a transport-
+ * layer failure (channel closed mid-call) delivers a string/Error.
+ * `describeUnknownImportError` handles both shapes uniformly.
+ */
+export async function showImportFailureDialog(failure: unknown): Promise<void> {
+  const { title, body } = describeUnknownImportError(failure);
+  await message(body, { title, kind: "error" });
+}
+
 /** Open a file dialog and import servers from the selected JSON file. */
 export async function importFromDialog() {
+  let path: string | null;
   try {
-    const path = await open({
+    path = await open({
       filters: [{ name: "JSON", extensions: ["json"] }],
       multiple: false,
     });
-    if (!path) return;
-    const newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
-    await loadConfig();
-    // Auto-test imported servers in parallel (bounded). Fire and forget.
-    runTestsBounded(
-      newServers.map((s) => s.id),
-      TEST_CONCURRENCY,
-    );
   } catch (err) {
-    console.error("import from dialog failed:", err);
+    console.error("file dialog failed:", err);
+    showToast(`Could not open file dialog: ${err}`, "error");
+    return;
   }
+  if (!path) return; // user cancelled
+
+  let newServers: { id: string }[];
+  try {
+    newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
+  } catch (err) {
+    // Tauri serializes the Rust-side `ImportFailure` enum to JSON; the
+    // `invoke` rejection delivers the deserialized object verbatim
+    // (happy path). A transport-layer failure (e.g. channel closed) can
+    // also surface as a string/Error here — `showImportFailureDialog`
+    // accepts `unknown` and routes both shapes through
+    // `describeUnknownImportError`.
+    console.error("import from dialog failed:", err);
+    await showImportFailureDialog(err);
+    return;
+  }
+
+  await loadConfig();
+
+  if (newServers.length === 0) {
+    showToast("No new servers — already in the list.", "info");
+    return;
+  }
+  showToast(`Imported ${newServers.length} server(s).`, "success");
+
+  // Auto-test imported servers in parallel (bounded). Fire and forget.
+  runTestsBounded(
+    newServers.map((s) => s.id),
+    TEST_CONCURRENCY,
+  );
+}
+
+/**
+ * Clear the drag-over highlight on the import zone. Called by the
+ * `tauri://drag-drop` listener in main.ts because the OS does not
+ * always fire a final `dragleave` after a successful drop, so relying
+ * on `dragleave` alone leaves the zone stuck highlighted.
+ */
+export function clearImportZoneHighlight(): void {
+  importZone.classList.remove("drag-over");
 }
 
 // Initialization ======================================================================================================
@@ -215,4 +268,10 @@ export async function importFromDialog() {
 /** Set up event listeners for the servers section. Called once from main.ts. */
 export function initServers() {
   importZone.addEventListener("click", importFromDialog);
+
+  // Visual feedback during a file drag. The actual drop is delivered by
+  // Tauri's native handler via `tauri://drag-drop` (wired in main.ts);
+  // these HTML5 events run in parallel and only drive the styling.
+  importZone.addEventListener("dragenter", () => importZone.classList.add("drag-over"));
+  importZone.addEventListener("dragleave", () => importZone.classList.remove("drag-over"));
 }
