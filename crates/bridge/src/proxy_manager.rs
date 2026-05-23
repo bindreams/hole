@@ -458,14 +458,18 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
 
         // CRITICAL ORDERING (bindreams/hole#388):
         //
+        //   0. (above) plugin_chain spawn  — plugin subprocess is alive
+        //      from this point. NOT a system-state mutation (the chain
+        //      Drop SIGTERMs it on unwind) but the user sees the
+        //      v2ray-plugin process briefly.
         //   1. proxy.start  — binds local SS listener
         //   2. build_local_dns  — binds loopback DNS server (Err on no
         //      listen capacity, or on degenerate dns.enabled + empty
         //      servers config)
         //   3. GATE: run_forwarder_self_test  — Err here means the plugin
         //      chain cannot reach upstream. RAII unwind drops
-        //      running_proxy + plugin_chain locally. NO state outside
-        //      this fn is mutated.
+        //      running_proxy + plugin_chain locally. NO system state
+        //      (routes / system DNS / TUN adapter) is mutated.
         //   4. Dispatcher::new  — only NOW does LocalDnsEndpoint become
         //      reachable through the cascade
         //   5. routing.install  — TUN routes go live, intercept_udp53
@@ -637,7 +641,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             && active.dns == config.dns
             && active.proxy_socks5 == config.proxy_socks5
             && active.proxy_http == config.proxy_http
-            && active.local_port_http == config.local_port_http;
+            && active.local_port_http == config.local_port_http
+            // #388: toggling diagnostic_plugin_tap wraps/unwraps the
+            // plugin chain in TapPlugin, which is fixed at chain
+            // construction. Hot-swap can't rebuild the chain — force
+            // full stop + start so the new tap state takes effect.
+            && active.diagnostic_plugin_tap == config.diagnostic_plugin_tap;
 
         if structural_same {
             // Fast path: hot-swap filter rules without restart.
@@ -868,7 +877,7 @@ async fn run_forwarder_self_test(
         for attempt in 1..=ATTEMPTS {
             match tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)).await {
                 Ok(reply) => {
-                    if reply.len() >= 12 && (reply[3] & 0x0F) != 2 {
+                    if is_dns_reply_ok(&reply) {
                         return SelfTestOutcome::Ok { attempts: attempt };
                     }
                     last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
@@ -932,8 +941,16 @@ impl SelfTestOutcome {
     }
 }
 
+/// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.
+/// The reply header is 12 bytes; RCODE lives in the low nibble of byte 3
+/// (RFC 1035 §4.1.1). RCODE 2 = SERVFAIL (upstream failed explicitly);
+/// all other RCODEs (NoError, NXDOMAIN, REFUSED) mean the path works.
+fn is_dns_reply_ok(reply: &[u8]) -> bool {
+    reply.len() >= 12 && (reply[3] & 0x0F) != 2
+}
+
 /// Build a minimal wire-format DNS query: `example.com A`. Used by
-/// [`spawn_forwarder_self_test`] — hardcoded hostname is acceptable
+/// [`run_forwarder_self_test`] — hardcoded hostname is acceptable
 /// because the forwarder self-test is an internal probe, never a user-
 /// visible config. NXDOMAIN on this name still proves the path works.
 fn sample_self_test_query() -> Vec<u8> {

@@ -615,8 +615,9 @@ For intra-process sync, use the codebase's primitives:
 - **"Wait for spawned work to complete"**: return the `JoinHandle`
   from the spawning function and `.await` it. Don't fire-and-forget
   if you might need to wait. See
-  [`spawn_forwarder_self_test`](crates/bridge/src/proxy_manager.rs) for
-  the pattern (returns `Option<JoinHandle<()>>`).
+  [`Dispatcher::shutdown`](crates/bridge/src/dispatcher.rs) for the
+  pattern (`tokio::time::timeout(2s, handle).await` with abort
+  fallback for the wedge case).
 
 ### Windows installer
 

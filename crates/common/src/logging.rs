@@ -20,9 +20,15 @@
 //    target `hole::panic`, then chains the previous hook so the default printer
 //    still runs in dev mode.
 //
-// Every non-blocking writer uses `.lossy(true)` so a slow/blocked file
-// appender drops events instead of wedging the producing thread (including
-// the panic hook itself, which would hang a panicking thread otherwise).
+// Non-blocking writers split into two categories (#388):
+// - **Stderr + stdio-relay tees** keep `.lossy(true)` — a wedged terminal
+//   (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic
+//   hook.
+// - **File appender** is `.lossy(false)` — the teardown burst MUST land
+//   on disk for #388 diagnostics. Hang risk is bounded by the
+//   `buffered_lines_limit` default (128k events) and by the fact that
+//   real disk wedges are user-visible (a stop that takes >2s is reported
+//   to the IPC caller).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

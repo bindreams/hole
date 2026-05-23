@@ -22,6 +22,19 @@ pub fn remove_adapter(tun_name: &str) {
     use std::process::Command;
     use tracing::{debug, warn};
 
+    // Guard against PowerShell injection. The only production caller
+    // passes the const `TUN_DEVICE_NAME = "hole-tun"`, so this assert
+    // never fires in practice — it's a structural guarantee against a
+    // future caller that interpolates user input. PowerShell uses
+    // single-quote strings (no expansion) but a literal `'` would
+    // terminate the string and the rest would be evaluated as PowerShell.
+    debug_assert!(
+        tun_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "tun_name must be alphanumeric/-/_; got {tun_name:?}"
+    );
+
     // `-ErrorAction SilentlyContinue` on Get-NetAdapter swallows the
     // "no MSFT_NetAdapter objects found" error so the pipe's overall
     // exit code is 0 when nothing matches (the dominant case after a

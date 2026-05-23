@@ -1280,6 +1280,57 @@ mod self_test {
             });
     }
 
+    /// **#388**: `is_dns_reply_ok` reply-decode contract — direct unit
+    /// tests of the RCODE check. Without these, a regression in the
+    /// mask (`0x0F` → `0xF0`) or the length check would only surface
+    /// once the gate runs against real upstream DNS in production.
+    #[skuld::test]
+    fn is_dns_reply_ok_treats_noerror_as_success() {
+        let mut reply = vec![0u8; 12];
+        reply[3] = 0x00; // RCODE = 0 (NoError)
+        assert!(super::is_dns_reply_ok(&reply));
+    }
+
+    #[skuld::test]
+    fn is_dns_reply_ok_treats_nxdomain_as_success() {
+        let mut reply = vec![0u8; 12];
+        reply[3] = 0x03; // RCODE = 3 (NXDOMAIN). Path probe semantic.
+        assert!(super::is_dns_reply_ok(&reply));
+    }
+
+    #[skuld::test]
+    fn is_dns_reply_ok_treats_refused_as_success() {
+        let mut reply = vec![0u8; 12];
+        reply[3] = 0x05; // RCODE = 5 (REFUSED). Resolver declined, path works.
+        assert!(super::is_dns_reply_ok(&reply));
+    }
+
+    #[skuld::test]
+    fn is_dns_reply_ok_rejects_servfail() {
+        let mut reply = vec![0u8; 12];
+        reply[3] = 0x02; // RCODE = 2 (SERVFAIL). Upstream explicitly failed.
+        assert!(!super::is_dns_reply_ok(&reply));
+    }
+
+    #[skuld::test]
+    fn is_dns_reply_ok_ignores_high_nibble_of_byte_3() {
+        // RFC 1035: low nibble = RCODE; high nibble = Z (reserved) + RA
+        // (recursion available). High-nibble bits set MUST NOT mask the
+        // RCODE check.
+        let mut reply = vec![0u8; 12];
+        reply[3] = 0xF2; // high nibble set + RCODE=2
+        assert!(!super::is_dns_reply_ok(&reply));
+        reply[3] = 0xF0; // high nibble set + RCODE=0
+        assert!(super::is_dns_reply_ok(&reply));
+    }
+
+    #[skuld::test]
+    fn is_dns_reply_ok_rejects_truncated_reply() {
+        // Fewer than 12 bytes is not a well-formed DNS header.
+        assert!(!super::is_dns_reply_ok(&[]));
+        assert!(!super::is_dns_reply_ok(&[0u8; 11]));
+    }
+
     /// `dns.enabled = false` → `build_local_dns` returns
     /// `(None, None, None)` → gate is skipped entirely in `start_inner`.
     #[skuld::test]
@@ -1317,7 +1368,17 @@ mod self_test {
     /// fast on each refused connect, well under the 5s outer budget).
     /// `bind_ladder` succeeds because the test process can bind one of the
     /// `127.53.0.X:53` loopback alternates.
+    ///
+    /// **Windows-only**: macOS / Linux require root to bind port 53, so
+    /// `bind_ladder` returns Err on every candidate → `build_local_dns`
+    /// returns `ProxyError::Runtime(io::Error)`, not the
+    /// `ForwarderSelfTestFailed` variant under test. The gate IS still
+    /// exercised on those platforms via the DistHarness e2e tests
+    /// (bridge runs elevated). Lifting this gate to non-Windows
+    /// requires a port-injection seam in `bind_ladder` —
+    /// follow-up tracked separately.
     #[skuld::test]
+    #[cfg(target_os = "windows")]
     fn start_blocks_on_forwarder_self_test_failure() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
