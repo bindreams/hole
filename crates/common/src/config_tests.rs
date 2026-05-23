@@ -344,6 +344,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         proxy_socks5: false,
         proxy_http: true,
         local_port_http: 5555,
+        diagnostic_plugin_tap: false,
         ..Default::default()
     };
     config.save(&path).unwrap();

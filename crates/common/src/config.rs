@@ -143,6 +143,19 @@ pub struct AppConfig {
     /// toggles are on (enforced at bridge start by
     /// `hole_bridge::proxy::config::build_ss_config`).
     pub local_port_http: u16,
+    /// When true, the bridge wraps the plugin chain in
+    /// [`garter::TapPlugin`] so per-TCP-connection
+    /// `bytes_to_plugin` / `bytes_from_plugin` / `ttfb_ms` / `close_kind`
+    /// land in `bridge.log`. Off by default — adds a loopback round-trip
+    /// per byte, inappropriate at browser-traffic scale. Enable when
+    /// reproducing a #248-class "tunnel returns nothing" failure (e.g.
+    /// bindreams/hole#388, where the v2ray-plugin outbound WebSocket
+    /// silently hung). See CLAUDE.md "Plugin tap" section.
+    ///
+    /// **Reaches service mode**: this flag travels via [`ProxyConfig`]
+    /// in the IPC `BridgeRequest::Start` payload, unlike the
+    /// `HOLE_BRIDGE_PLUGIN_TAP` env var which is dev-shell-only.
+    pub diagnostic_plugin_tap: bool,
 }
 
 impl Default for AppConfig {
@@ -162,6 +175,7 @@ impl Default for AppConfig {
             proxy_http: false,
             dns: DnsConfig::default(),
             local_port_http: 4074,
+            diagnostic_plugin_tap: false,
         }
     }
 }

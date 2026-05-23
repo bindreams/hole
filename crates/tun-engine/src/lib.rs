@@ -35,6 +35,7 @@ fn main() {
     skuld::run_all();
 }
 
+pub mod adapter_cleanup;
 pub mod device;
 pub mod engine;
 pub mod error;

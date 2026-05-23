@@ -65,6 +65,17 @@ pub enum ProxyError {
     /// A listener is enabled but its port is 0.
     #[error("{field} must be non-zero when the corresponding listener is enabled")]
     InvalidListenerPort { field: &'static str },
+    /// The DNS forwarder self-test failed before TUN routes were installed.
+    /// `routes` / `system DNS` were never touched on this path — the user's
+    /// system DNS is untouched. Used by the start-time gate added in #388
+    /// to prevent the GUI from reporting "Running" while a dead plugin
+    /// chain hijacks all DNS into the tunnel.
+    #[error("forwarder self-test failed after {attempts} attempts in {elapsed_ms}ms: {reason}")]
+    ForwarderSelfTestFailed {
+        reason: String,
+        attempts: u32,
+        elapsed_ms: u64,
+    },
 }
 
 // Error conversions from tun-engine ===================================================================================

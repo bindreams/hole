@@ -257,10 +257,24 @@ fn recover_phases_are_classified_as_expected_failures() {
     assert!(is_recovery_phase(PHASE_RECOVER_BYPASS));
 }
 
+/// **#388**: `PHASE_TEARDOWN` is also a best-effort phase. Empirically
+/// `netsh interface ip delete route 0.0.0.0/1 <adapter>` and the bare
+/// `route delete <ip>` both exit non-zero when the route is absent,
+/// and `setup_routes` is NOT transactional — a failed mid-install
+/// leaves an arbitrary subset of routes present, so teardown must
+/// tolerate missing routes silently. Real teardown failures surface
+/// elsewhere (post-teardown `Remove-NetAdapter` reporting, state-file
+/// persistence errors).
 #[skuld::test]
-fn setup_and_teardown_phases_are_not_recovery() {
+fn teardown_phase_is_classified_as_expected_failures() {
+    assert!(is_recovery_phase(PHASE_TEARDOWN));
+}
+
+#[skuld::test]
+fn setup_phase_is_not_recovery() {
+    // PHASE_SETUP is the only path that should warn on non-zero exit:
+    // initial route install IS expected to succeed.
     assert!(!is_recovery_phase(PHASE_SETUP));
-    assert!(!is_recovery_phase(PHASE_TEARDOWN));
 }
 
 // recover_routes_with tests ===========================================================================================

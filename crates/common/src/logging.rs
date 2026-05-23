@@ -553,11 +553,25 @@ where
         file_rotate::compression::Compression::None,
         None,
     );
-    // Lossy mode on every non-blocking writer: when the channel is full
-    // (backpressure from a slow disk), drop events instead of blocking the
-    // producer. Discarding logs is strictly better than wedging the bridge or
-    // the panic hook.
-    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(true).finish(file_appender);
+    // **#388**: the FILE appender is `lossy(false)` so the proxy-stop
+    // teardown burst (SystemRoutes::drop entered / route command
+    // succeeded ×5 / state-file clear / Remove-NetAdapter / SystemRoutes::drop
+    // completed — emitted in tens of ms) is never silently truncated.
+    // Pre-#388 the lossy(true) channel dropped these events under burst
+    // pressure, leaving `bridge.log` missing the diagnostic for a
+    // teardown that broke the user's network.
+    //
+    // Hang risk acknowledgment: a wedged disk (full filesystem, OneDrive
+    // sync stall, AV scan) now back-pressures the tracing producer.
+    // Acceptable trade-off — the panic hook routes through the same
+    // subscriber, so a hang here means a hang in panic handling, which
+    // is more visible than silent log loss. The `buffered_lines_limit`
+    // (default 128k events) caps the queue, so the back-pressure window
+    // is bounded.
+    //
+    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
+    // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
+    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(file_appender);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
     // Global default is INFO so third-party crates (shadowsocks-service,

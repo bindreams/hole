@@ -296,10 +296,19 @@ fn test_config() -> ProxyConfig {
         local_port: 1080,
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: Vec::new(),
-        dns: hole_common::config::DnsConfig::default(),
+        // dns.enabled = false avoids the #388 forwarder self-test gate in
+        // happy-path tests — MockProxy doesn't bind a real TCP listener,
+        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would
+        // time out after 4.5s on every test. Tests that exercise the
+        // gate enable DNS explicitly (see the self_test mod).
+        dns: hole_common::config::DnsConfig {
+            enabled: false,
+            ..hole_common::config::DnsConfig::default()
+        },
         proxy_socks5: true,
         proxy_http: false,
         local_port_http: 4074,
+        diagnostic_plugin_tap: false,
     }
 }
 
@@ -1037,14 +1046,14 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
         });
 }
 
-// Phase 1 #248 — forwarder self-test tests ============================================================================
+// #388 — forwarder self-test gate tests ===============================================================================
 //
-// `build_local_dns` fires a detached post-bind self-test (via
-// `spawn_forwarder_self_test`) so Phase 2 observation can tell
-// "forwarder works at bind time" from "forwarder is fundamentally
-// broken". These tests assert log output + the detach contract
-// (spawn_forwarder_self_test must return immediately; the spawned task
-// runs in the background).
+// `start_inner` runs `run_forwarder_self_test` synchronously BEFORE
+// installing TUN routes / applying system DNS. A failed gate returns
+// `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned RAII
+// guards unwind without ever hijacking the user's system DNS into a
+// dead tunnel. Pre-#388 the self-test was fire-and-forget; the proxy
+// committed Running before the test even completed.
 
 #[cfg(test)]
 mod self_test {
@@ -1061,7 +1070,7 @@ mod self_test {
 
     /// A connector that immediately fails every connect. Drives the
     /// dead-upstream path in tests — the forwarder will fail every
-    /// attempt, but the spawned self-test must not stall the caller.
+    /// attempt, surfacing as `SelfTestOutcome::Failed`.
     struct DeadConnector;
     #[async_trait]
     impl UpstreamConnector for DeadConnector {
@@ -1082,41 +1091,15 @@ mod self_test {
         }
     }
 
-    /// Core contract: `spawn_forwarder_self_test` must return to its caller
-    /// immediately regardless of how slow the self-test itself is. The
-    /// 3×1500ms + 5s budget runs on a detached tokio task; the caller is
-    /// never blocked.
+    /// Empty servers → `run_forwarder_self_test` logs `skipped` and
+    /// returns `Ok(0)`. Empty-servers in production is rejected at
+    /// `build_local_dns` *before* `run_forwarder_self_test` is even
+    /// called (test below: `gate_returns_err_for_empty_servers_via_build_local_dns`);
+    /// this test pins the helper's contract in isolation.
     #[skuld::test]
-    fn spawn_forwarder_self_test_returns_immediately() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let start = std::time::Instant::now();
-                let handle = spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()]);
-                let elapsed = start.elapsed();
-                assert!(
-                    elapsed < std::time::Duration::from_millis(100),
-                    "spawn_forwarder_self_test must return immediately (tokio::spawn is \
-                     non-blocking); returned after {elapsed:?}"
-                );
-                // Abort the spawned task so the test doesn't have to wait
-                // out the 3×1500ms retry budget. The handle is None when
-                // servers is empty; here it is Some.
-                handle.expect("Some(handle) when servers is non-empty").abort();
-            });
-    }
-
-    /// When `dns_cfg.servers` is empty, the self-test must log a `skipped`
-    /// line and never call into the forwarder.
-    #[skuld::test]
-    fn self_test_empty_servers_logs_skipped() {
+    fn self_test_empty_servers_returns_ok_zero() {
         let writer = VecWriter::new();
 
-        // Current-thread runtime — the helper asserts this. See
-        // bindreams/hole#302.
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1131,11 +1114,8 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                // Empty servers — the skipped-log fires synchronously
-                // inside the function and `spawn_forwarder_self_test`
-                // returns None (no task spawned). No wait needed.
-                let handle = spawn_forwarder_self_test(forwarder, vec![]);
-                assert!(handle.is_none(), "no task should be spawned when servers is empty");
+                let outcome = run_forwarder_self_test(forwarder, vec![], false).await;
+                assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
             });
 
         let output = writer.snapshot_string();
@@ -1145,15 +1125,14 @@ mod self_test {
         );
     }
 
-    /// Dead upstream → self-test must log `forwarder self-test failed` at
-    /// INFO with `attempts=3`. This is the signal Phase 2 uses to know the
-    /// tunnel itself is broken, not a transient later issue.
+    /// Dead upstream → `run_forwarder_self_test` returns
+    /// `SelfTestOutcome::Failed { attempts: 3, .. }` and logs `forwarder
+    /// self-test failed` at INFO. `into_result` then maps that to
+    /// `ProxyError::ForwarderSelfTestFailed`.
     #[skuld::test]
-    fn self_test_dead_upstream_logs_failed() {
+    fn self_test_dead_upstream_returns_failed() {
         let writer = VecWriter::new();
 
-        // Current-thread runtime — see `self_test_empty_servers_logs_skipped`
-        // for why the shared multi-thread `rt()` doesn't work here.
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1168,12 +1147,30 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let handle = spawn_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()])
-                    .expect("Some(handle) when servers is non-empty");
-                // Park until the self-test task exits — deterministic,
-                // no sleep. The retry budget (3 × 1500ms with 5s outer
-                // timeout) is internal to the spawned future.
-                handle.await.expect("self-test task panicked");
+                let outcome = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+                let SelfTestOutcome::Failed { attempts, reason } = outcome else {
+                    panic!("expected Failed");
+                };
+                assert_eq!(attempts, 3);
+                assert!(
+                    !reason.is_empty(),
+                    "Failed reason must be non-empty for diagnostic value"
+                );
+                // into_result maps to the canonical error variant.
+                let err = SelfTestOutcome::Failed {
+                    attempts: 3,
+                    reason: reason.clone(),
+                }
+                .into_result(4500)
+                .unwrap_err();
+                assert!(matches!(
+                    err,
+                    ProxyError::ForwarderSelfTestFailed {
+                        attempts: 3,
+                        elapsed_ms: 4500,
+                        ..
+                    }
+                ));
             });
 
         let output = writer.snapshot_string();
@@ -1182,5 +1179,197 @@ mod self_test {
             "expected 'forwarder self-test failed' in log; got:\n{output}"
         );
         assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
+    }
+
+    /// **#388**: when self-test fails AND `diagnostic_plugin_tap=true`,
+    /// emit a `warn!` breadcrumb pointing the reader to the tap output
+    /// above. Const-anchored so a text change breaks only the const.
+    #[skuld::test]
+    fn self_test_failure_with_tap_enabled_emits_correlation_hint() {
+        let writer = VecWriter::new();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], true).await;
+            });
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains(super::TAP_ENABLED_HINT),
+            "expected TAP_ENABLED_HINT in log; got:\n{output}"
+        );
+        assert!(
+            !output.contains(super::TAP_DISABLED_HINT),
+            "tap=true must NOT emit the disabled hint; got:\n{output}"
+        );
+    }
+
+    /// **#388**: when self-test fails AND tap is OFF, emit a `warn!`
+    /// remediation hint pointing the reader to the config flag.
+    #[skuld::test]
+    fn self_test_failure_without_tap_emits_remediation_hint() {
+        let writer = VecWriter::new();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+            });
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains(super::TAP_DISABLED_HINT),
+            "expected TAP_DISABLED_HINT in log; got:\n{output}"
+        );
+        assert!(
+            !output.contains(super::TAP_ENABLED_HINT),
+            "tap=false must NOT emit the enabled hint; got:\n{output}"
+        );
+    }
+
+    /// `build_local_dns` rejects the degenerate `enabled=true, servers=[]`
+    /// config combination as `ForwarderSelfTestFailed`. Pre-#388 this
+    /// silently returned `(None, None)` and left TUN routes live with
+    /// `intercept_udp53` hijacking UDP/53 into a forwarder with no
+    /// upstream.
+    #[skuld::test]
+    fn build_local_dns_returns_err_for_empty_servers() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cfg = DnsConfig {
+                    enabled: true,
+                    servers: vec![], // degenerate
+                    protocol: DnsProtocol::PlainTcp,
+                    intercept_udp53: true,
+                };
+                match build_local_dns(&cfg, 1080, false).await {
+                    Err(ProxyError::ForwarderSelfTestFailed {
+                        attempts: 0,
+                        elapsed_ms: 0,
+                        ..
+                    }) => {}
+                    Err(other) => panic!("unexpected error variant: {other:?}"),
+                    Ok(_) => panic!("expected ForwarderSelfTestFailed for empty servers"),
+                }
+            });
+    }
+
+    /// `dns.enabled = false` → `build_local_dns` returns
+    /// `(None, None, None)` → gate is skipped entirely in `start_inner`.
+    #[skuld::test]
+    fn build_local_dns_returns_none_when_disabled() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cfg = DnsConfig {
+                    enabled: false,
+                    servers: vec![],
+                    protocol: DnsProtocol::PlainTcp,
+                    intercept_udp53: true,
+                };
+                let res = build_local_dns(&cfg, 1080, false).await;
+                let (srv, ep, fwd) = match res {
+                    Ok(t) => t,
+                    Err(e) => panic!("expected Ok((None, None, None)) for disabled DNS, got {e:?}"),
+                };
+                assert!(srv.is_none());
+                assert!(ep.is_none());
+                assert!(fwd.is_none());
+            });
+    }
+
+    /// **Load-bearing**: when the forwarder self-test fails, `start_cancellable`
+    /// returns `Err(ForwarderSelfTestFailed)` AND `routing.install` is NEVER
+    /// called. Catches any future regression that re-orders the gate
+    /// AFTER route install — re-introducing the #388 dead-tunnel DNS hijack.
+    ///
+    /// Test plumbing: `MockProxy::new()` does not bind a real TCP listener
+    /// on `127.0.0.1:1080`, so the forwarder's `Socks5Connector` connection
+    /// fails with ECONNREFUSED on every attempt (the 3×1500ms loop closes
+    /// fast on each refused connect, well under the 5s outer budget).
+    /// `bind_ladder` succeeds because the test process can bind one of the
+    /// `127.53.0.X:53` loopback alternates.
+    #[skuld::test]
+    fn start_blocks_on_forwarder_self_test_failure() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let routing_state = routing.state();
+            let state_path = dir.path().join(route_state::STATE_FILE_NAME);
+
+            let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
+
+            // Enable the DNS gate. The forwarder will fail because nothing
+            // listens on `127.0.0.1:<local_port>` (MockProxy.start returns
+            // Ok without binding).
+            let mut cfg = test_config();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+
+            assert!(
+                matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
+                "expected ForwarderSelfTestFailed, got {err:?}"
+            );
+            assert_eq!(pm.state(), ProxyState::Stopped);
+            assert_eq!(
+                routing_state.install_calls.load(Ordering::SeqCst),
+                0,
+                "routing.install MUST NOT be called when self-test fails (#388 regression guard)"
+            );
+            assert_eq!(routing_state.teardown_calls.load(Ordering::SeqCst), 0);
+            assert!(!state_path.exists(), "no state file when install never ran");
+            assert!(
+                pm.last_error()
+                    .map(|s| s.contains("forwarder self-test failed"))
+                    .unwrap_or(false),
+                "last_error should mention the self-test failure; got {:?}",
+                pm.last_error()
+            );
+        });
+    }
+
+    /// `dns.enabled = false` → start happy path is unchanged. Gate is
+    /// skipped; routes install; proxy transitions to Running.
+    #[skuld::test]
+    fn start_succeeds_when_dns_disabled() {
+        rt().block_on(async {
+            let (mut pm, _dir) = new_manager(MockProxy::new());
+            // test_config() already has dns.enabled = false.
+            pm.start_cancellable(&test_config(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(pm.state(), ProxyState::Running);
+            pm.stop().await.unwrap();
+        });
     }
 }

@@ -370,6 +370,7 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 &config.server.server,
                 config.server.server_port,
                 state_dir,
+                config.diagnostic_plugin_tap,
             )
             .await?;
             Some(chain)
@@ -455,19 +456,57 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
 
-        // Start the SS SOCKS5 proxy.
+        // CRITICAL ORDERING (bindreams/hole#388):
+        //
+        //   1. proxy.start  — binds local SS listener
+        //   2. build_local_dns  — binds loopback DNS server (Err on no
+        //      listen capacity, or on degenerate dns.enabled + empty
+        //      servers config)
+        //   3. GATE: run_forwarder_self_test  — Err here means the plugin
+        //      chain cannot reach upstream. RAII unwind drops
+        //      running_proxy + plugin_chain locally. NO state outside
+        //      this fn is mutated.
+        //   4. Dispatcher::new  — only NOW does LocalDnsEndpoint become
+        //      reachable through the cascade
+        //   5. routing.install  — TUN routes go live, intercept_udp53
+        //      activates
+        //   6. apply_dns_settings  — system DNS pointed at our loopback
+        //
+        // Reordering steps 3..=6 re-introduces the #388 symptom (dead-
+        // tunnel DNS hijack with the GUI reporting "Running"). The
+        // start_blocks_on_forwarder_self_test_failure test catches the
+        // most likely regression (asserting routing.install was NOT
+        // called when the gate fails).
+
+        // (1) Start the SS SOCKS5 proxy.
         let running_proxy = proxy.start(ss_config).await?;
 
-        // DNS forwarder wiring. Must happen BEFORE Dispatcher::new so the
-        // LocalDnsEndpoint can be passed in as a constructor argument —
-        // HoleRouter has no mutable registration API. We wire the
-        // forwarder's upstream through the just-started SS SOCKS5
-        // listener (Socks5Connector) so user filter rules that Block the
-        // resolver IP cannot strand our own queries. See `dns/mod.rs`.
-        let (local_dns_server, local_dns_endpoint) =
-            build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available).await;
+        // (2) Build local DNS forwarder + server. Now Err on bind failure
+        // (was silent-degrade pre-#388). Returns the forwarder Arc so
+        // the gate can drive it without re-plumbing.
+        let (local_dns_server, local_dns_endpoint, forwarder) =
+            build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available).await?;
 
-        // Start the dispatcher (owns TUN device + smoltcp). Skipped
+        // (3) Blocking forwarder self-test gate. Runs synchronously
+        // BEFORE Dispatcher::new / routing.install / apply_dns_settings.
+        // On Err, the locally-owned `running_proxy` Drop aborts the SS
+        // task and `plugin_chain` (further up the stack) Drop SIGTERMs
+        // the chain. System state is untouched. The gate is
+        // cancellation-safe via the outer `tokio::select!` in
+        // start_cancellable — dropping the future cleanly releases all
+        // in-flight forwarder connections.
+        if let Some(fwd) = forwarder.as_ref() {
+            let started = std::time::Instant::now();
+            let outcome = run_forwarder_self_test(
+                std::sync::Arc::clone(fwd),
+                config.dns.servers.clone(),
+                config.diagnostic_plugin_tap,
+            )
+            .await;
+            outcome.into_result(started.elapsed().as_millis() as u64)?;
+        }
+
+        // (4) Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
         let dispatcher = {
@@ -489,10 +528,10 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             None
         };
 
-        // Install the routes — NOW traffic starts flowing to the TUN.
+        // (5) Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
-        // Apply system DNS AFTER routes install so the OS "best-route to
+        // (6) Apply system DNS AFTER routes install so the OS "best-route to
         // DNS server" lookup resolves through the TUN (its DNS setting is
         // our loopback IP). Persist the prior state to `bridge-dns.json`
         // BEFORE mutating so a mid-apply crash leaves a recoverable file.
@@ -717,20 +756,46 @@ mod proxy_manager_listener_e2e_tests;
 
 // DNS wiring helpers ==================================================================================================
 
-/// Build the local DNS server + endpoint, if the config enables it. The
-/// forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
+/// Build the local DNS server + endpoint + forwarder, if the config enables
+/// it. The forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
 /// targeting the just-started SS SOCKS5 listener, so user filter rules
 /// cannot strand our own queries.
+///
+/// Returns the `forwarder` Arc alongside the server + endpoint so the
+/// blocking self-test gate in `start_inner` can call `forwarder.forward(...)`
+/// without re-plumbing.
+///
+/// **#388 change**: previously returned `(None, None)` silently when
+/// `bind_ladder` failed; now returns `Err(ProxyError::Runtime(io::Error))`.
+/// Also rejects the `dns.enabled && servers.is_empty()` config combination
+/// with `ForwarderSelfTestFailed { reason: "no DNS servers configured" }`
+/// because that combination would otherwise produce a degenerate runtime
+/// (TUN routes go live but forwarder has nothing to forward to).
 async fn build_local_dns(
     dns_cfg: &hole_common::config::DnsConfig,
     local_ss_port: u16,
     ipv6_bypass_available: bool,
-) -> (
-    Option<crate::dns::server::LocalDnsServer>,
-    Option<crate::endpoint::LocalDnsEndpoint>,
-) {
+) -> Result<
+    (
+        Option<crate::dns::server::LocalDnsServer>,
+        Option<crate::endpoint::LocalDnsEndpoint>,
+        Option<std::sync::Arc<crate::dns::forwarder::DnsForwarder>>,
+    ),
+    ProxyError,
+> {
     if !dns_cfg.enabled {
-        return (None, None);
+        return Ok((None, None, None));
+    }
+    if dns_cfg.servers.is_empty() {
+        // Hard error: the only sensible recovery is to disable the forwarder.
+        // Pre-#388 this silently returned (None, None) which left TUN routes
+        // live with intercept_udp53 hijacking UDP/53 into a forwarder that
+        // had no upstream — a worse failure mode than failing loud here.
+        return Err(ProxyError::ForwarderSelfTestFailed {
+            reason: "no DNS servers configured".into(),
+            attempts: 0,
+            elapsed_ms: 0,
+        });
     }
 
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -745,22 +810,8 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    let server = match crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder)).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "LocalDnsServer::bind_ladder failed; DNS forwarder disabled for this session");
-            return (None, None);
-        }
-    };
+    let server = crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder)).await?;
     info!(addr = %server.addr(), "LocalDnsServer bound");
-
-    // Fire a detached self-test so Phase-2 observation of #248 can tell
-    // "forwarder works at bind time; later query failures are downstream"
-    // from "forwarder is fundamentally broken right now". Spawned via
-    // `tokio::spawn` so a dead upstream cannot stall `start_inner` by the
-    // retry budget — the contract is that `build_local_dns` returns
-    // regardless of self-test outcome.
-    let _ = spawn_forwarder_self_test(Arc::clone(&forwarder), dns_cfg.servers.clone());
 
     let endpoint = if dns_cfg.intercept_udp53 {
         Some(crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder)))
@@ -768,88 +819,117 @@ async fn build_local_dns(
         None
     };
 
-    (Some(server), endpoint)
+    Ok((Some(server), endpoint, Some(forwarder)))
 }
 
-/// Spawn a detached task that exercises the forwarder against its first
-/// configured server. Log-only — never propagates, never blocks
-/// [`build_local_dns`]. Runs 3 attempts with a 1500ms per-attempt
-/// timeout, wrapped in a 5s outer budget (3 × 1500 = 4.5s < 5s with
-/// slack). No back-off: the retry is to absorb plugin-handshake settle
-/// at cold start, which completes or doesn't within ~2s.
+/// Hint logged on self-test failure when the plugin tap IS enabled.
+/// Tells the reader where the per-connection diagnostic lines are.
+pub(crate) const TAP_ENABLED_HINT: &str =
+    "DNS self-test failed with plugin tap enabled; check 'plugin tap: closed' lines above for per-connection bytes_to_plugin / bytes_from_plugin / ttfb_ms / close_kind";
+
+/// Hint logged on self-test failure when the plugin tap is NOT enabled.
+/// Tells the reader how to capture richer diagnostics next time.
+pub(crate) const TAP_DISABLED_HINT: &str =
+    "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
+
+/// Run the forwarder self-test inline against its first configured server.
+/// Returns `SelfTestOutcome::Ok` when any well-formed non-SERVFAIL reply
+/// comes back within the 3×1500ms / 5s budget, else `Failed`. Also writes
+/// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
+/// log line at `info!`. On failure, additionally emits a `warn!`
+/// correlation breadcrumb pointing the reader to the plugin tap
+/// (depending on whether it was enabled this run — see
+/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
 ///
-/// Target name: `example.com A`. NXDOMAIN counts as success — the
-/// self-test is a path probe, not a correctness probe.
-fn spawn_forwarder_self_test(
+/// **#388 change**: replaces the pre-#388 `spawn_forwarder_self_test`
+/// (fire-and-forget). Called from `start_inner` BEFORE
+/// `Dispatcher::new` / `routing.install` / `apply_dns_settings`. A
+/// failure short-circuits the start; the locally-owned `running_proxy` +
+/// `plugin_chain` RAII guards unwind without ever hijacking system DNS
+/// into a dead tunnel.
+async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,
-) -> Option<tokio::task::JoinHandle<()>> {
+    diagnostic_tap_enabled: bool,
+) -> SelfTestOutcome {
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
     const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     const ATTEMPTS: u32 = 3;
 
     let Some(&first_server) = servers.first() else {
         info!("forwarder self-test skipped: no servers configured");
-        return None;
+        return SelfTestOutcome::Ok { attempts: 0 };
     };
 
-    Some(tokio::spawn(async move {
-        let query = sample_self_test_query();
-        let started = std::time::Instant::now();
-        let outcome = tokio::time::timeout(OUTER_BUDGET, async {
-            let mut last_err: Option<String> = None;
-            for attempt in 1..=ATTEMPTS {
-                match tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)).await {
-                    Ok(reply) => {
-                        // Treat "any well-formed DNS reply" as success. SERVFAIL
-                        // means upstream explicitly failed (bad), but NXDOMAIN /
-                        // NoError+empty means the path works (good). Distinguish
-                        // via the RCODE nibble.
-                        if reply.len() >= 12 && (reply[3] & 0x0F) != 2 {
-                            return SelfTestOutcome::Ok { attempts: attempt };
-                        }
-                        last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+    let query = sample_self_test_query();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(OUTER_BUDGET, async {
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=ATTEMPTS {
+            match tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)).await {
+                Ok(reply) => {
+                    if reply.len() >= 12 && (reply[3] & 0x0F) != 2 {
+                        return SelfTestOutcome::Ok { attempts: attempt };
                     }
-                    Err(_) => last_err = Some(format!("attempt {attempt} timed out after {PER_ATTEMPT:?}")),
+                    last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
                 }
-            }
-            SelfTestOutcome::Failed {
-                attempts: ATTEMPTS,
-                reason: last_err.unwrap_or_else(|| "unknown".into()),
-            }
-        })
-        .await
-        .unwrap_or(SelfTestOutcome::Failed {
-            attempts: ATTEMPTS,
-            reason: format!("outer timeout after {OUTER_BUDGET:?}"),
-        });
-
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        match outcome {
-            SelfTestOutcome::Ok { attempts } => {
-                info!(
-                    %first_server,
-                    attempts,
-                    elapsed_ms,
-                    "forwarder self-test ok"
-                );
-            }
-            SelfTestOutcome::Failed { attempts, reason } => {
-                info!(
-                    %first_server,
-                    attempts,
-                    elapsed_ms,
-                    reason,
-                    "forwarder self-test failed"
-                );
+                Err(_) => last_err = Some(format!("attempt {attempt} timed out after {PER_ATTEMPT:?}")),
             }
         }
-    }))
+        SelfTestOutcome::Failed {
+            attempts: ATTEMPTS,
+            reason: last_err.unwrap_or_else(|| "unknown".into()),
+        }
+    })
+    .await
+    .unwrap_or(SelfTestOutcome::Failed {
+        attempts: ATTEMPTS,
+        reason: format!("outer timeout after {OUTER_BUDGET:?}"),
+    });
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &outcome {
+        SelfTestOutcome::Ok { attempts } => {
+            info!(%first_server, attempts, elapsed_ms, "forwarder self-test ok");
+        }
+        SelfTestOutcome::Failed { attempts, reason } => {
+            info!(%first_server, attempts, elapsed_ms, reason, "forwarder self-test failed");
+            // #388 correlation breadcrumb: tells the reader either
+            // where the tap data lives, or how to enable it for next
+            // reproduction. The actual error surfaces through
+            // ProxyError::ForwarderSelfTestFailed → IPC response →
+            // GUI; no error! log needed.
+            if diagnostic_tap_enabled {
+                warn!("{TAP_ENABLED_HINT}");
+            } else {
+                warn!("{TAP_DISABLED_HINT}");
+            }
+        }
+    }
+    outcome
 }
 
+#[derive(Debug)]
 enum SelfTestOutcome {
     Ok { attempts: u32 },
     Failed { attempts: u32, reason: String },
+}
+
+impl SelfTestOutcome {
+    /// Convert outcome to a Result for use as a start-time gate.
+    /// `Ok(attempts)` carries the attempt count taken to succeed (0 when
+    /// skipped because no servers configured — only reachable via the
+    /// `dns.enabled = false` branch in `build_local_dns`).
+    fn into_result(self, elapsed_ms: u64) -> Result<u32, ProxyError> {
+        match self {
+            Self::Ok { attempts } => Ok(attempts),
+            Self::Failed { attempts, reason } => Err(ProxyError::ForwarderSelfTestFailed {
+                reason,
+                attempts,
+                elapsed_ms,
+            }),
+        }
+    }
 }
 
 /// Build a minimal wire-format DNS query: `example.com A`. Used by
