@@ -393,6 +393,19 @@ components:
           description: |
             Port for the HTTP CONNECT listener. Must differ from
             local_port when both listeners are enabled.
+        diagnostic_plugin_tap:
+          type: boolean
+          default: false
+          description: |
+            Wrap the plugin chain in a counting tap so per-TCP-connection
+            byte flow + close-kind become visible in bridge.log. Off by
+            default; the extra loopback hop is cheap on debug-mode
+            reproduction but inappropriate at browser-traffic scale.
+            Sourced from AppConfig.diagnostic_plugin_tap; the bridge can
+            also be opted in via the HOLE_BRIDGE_PLUGIN_TAP=1 env var
+            (dev-shell only — env vars don't survive into SCM/launchd
+            contexts). Added in bindreams/hole#388 to give service-mode
+            reproductions a knob the env var can't reach.
 
     TunnelMode:
       type: string

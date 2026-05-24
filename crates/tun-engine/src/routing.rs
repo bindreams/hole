@@ -82,13 +82,25 @@ pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<Str
 /// Returns true if route command failures during this phase are *expected*
 /// idempotent-cleanup behavior and should be logged at debug, not warn.
 ///
-/// Recovery is best-effort: every clean startup tries to delete the four
+/// **Recovery** is best-effort: every clean startup tries to delete the four
 /// fixed split routes, and on a healthy system all four of those calls fail
-/// because nothing leaked. Treating those failures as warnings would drown
-/// every dev/prod startup in red. Adding a new `PHASE_RECOVER_*` constant
-/// requires updating this matcher.
+/// because nothing leaked.
+///
+/// **Teardown** (added 2026-05 for bindreams/hole#388) is *also* best-effort
+/// because [`setup_routes`] is NOT transactional — when a setup command fails
+/// midway, the defensive [`teardown_routes`] call deletes routes that were
+/// never installed (empirically `netsh interface ip delete route 0.0.0.0/1
+/// <adapter>` exits non-zero when the route is absent, and the bare `route
+/// delete <ip>` does the same). The pre-#388 framing of "any warn here is a
+/// real production teardown failure" assumed transactional install, which we
+/// don't have. Real teardown failures (e.g. "adapter unavailable") surface
+/// via the bridge's post-teardown `Remove-NetAdapter` reporting and via
+/// state-file persistence failures.
+///
+/// Adding a new `PHASE_*` constant that should silently tolerate non-zero
+/// exit codes MUST be paired with a matching arm here.
 fn is_recovery_phase(phase: &str) -> bool {
-    phase == PHASE_RECOVER_SPLIT || phase == PHASE_RECOVER_BYPASS
+    matches!(phase, PHASE_RECOVER_SPLIT | PHASE_RECOVER_BYPASS | PHASE_TEARDOWN)
 }
 
 fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
@@ -112,17 +124,18 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
                    stdout = %stdout.trim(), stderr = %stderr.trim(),
                    "route command succeeded");
         } else if recovery {
+            // Recovery and teardown phases (post-#388) — see is_recovery_phase
+            // doc-comment. Non-zero exits here are the unavoidable consequence
+            // of non-transactional install + best-effort cleanup; warning would
+            // drown legitimate signal.
             debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-                   "recovery command failed (expected if no leaked routes)");
+                   "best-effort command failed (expected if route absent)");
         } else {
-            // Post-#165: unit tests no longer invoke this path, so any
-            // `warn!` fired here is a real production teardown failure —
-            // not a benign test-time artifact. Framing matters: the old
-            // message trained investigators to dismiss it. See the
-            // #165 incident report.
+            // PHASE_SETUP only. A non-zero exit during initial route install
+            // IS a real anomaly — investigate.
             warn!(phase, cmd = cmd.join(" "), exit_code,
                   stdout = %stdout.trim(), stderr = %stderr.trim(),
-                  "route command failed — investigate if this is not a no-op idempotent teardown");
+                  "route command failed — investigate (setup phase only)");
         }
     }
     Ok(())
@@ -354,6 +367,13 @@ impl Drop for SystemRoutes {
         if let Err(e) = state::clear(&self.state_dir) {
             warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
         }
+        // **#388**: belt-and-suspenders post-teardown wintun adapter cleanup.
+        // The architectural fix in `bridge::Dispatcher::drop` synchronously
+        // drains the engine task so wintun's own Drop runs — this is the
+        // safety net for paths that bypass it (panic, current-thread runtime
+        // tests, Drop 2s-timeout fallback). PowerShell `Remove-NetAdapter`
+        // is idempotent on missing adapters. See adapter_cleanup docs.
+        crate::adapter_cleanup::remove_adapter(&self.tun_name);
         // Note: WFP/NDIS post-teardown snapshots live in bridge's Stop
         // path, not here — tun-engine can't depend on the bridge's
         // diagnostics module.

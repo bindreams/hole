@@ -215,6 +215,9 @@ async fn maybe_start_plugin(
 
     // `None` for state_dir: test-server probes are one-shot and die with
     // the bridge; no crash recovery tracking needed.
+    // `diagnostic_tap = false`: one-shot probe; the user is connecting
+    // for a quick test, not a debugging session. Per-conn tap metrics
+    // would add noise without value here.
     let chain = crate::proxy::plugin::start_plugin_chain(
         plugin_name,
         &plugin_path,
@@ -222,6 +225,7 @@ async fn maybe_start_plugin(
         &server_host,
         server_port,
         None,
+        false,
     )
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;

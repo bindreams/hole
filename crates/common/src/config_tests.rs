@@ -344,6 +344,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         proxy_socks5: false,
         proxy_http: true,
         local_port_http: 5555,
+        diagnostic_plugin_tap: true, // #388: set to non-default to anchor the roundtrip
         ..Default::default()
     };
     config.save(&path).unwrap();
@@ -356,6 +357,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
     assert_eq!(config.proxy_socks5, loaded.proxy_socks5);
     assert_eq!(config.proxy_http, loaded.proxy_http);
     assert_eq!(config.local_port_http, loaded.local_port_http);
+    assert_eq!(config.diagnostic_plugin_tap, loaded.diagnostic_plugin_tap);
 }
 
 #[skuld::test]

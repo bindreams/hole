@@ -142,13 +142,57 @@ impl Dispatcher {
     }
 }
 
-/// Cancel the driver and abort it on drop. This ensures implicit drops
-/// (e.g., from `check_health` or a cancelled `start_cancellable`) do not
-/// leak the driver task. `shutdown()` is preferred for graceful teardown,
-/// but the `Drop` provides a safety net.
+/// Cancel the driver and synchronously drain the spawned task so the
+/// wintun adapter handle (owned by the future) is dropped before this
+/// method returns. `shutdown()` is preferred for graceful teardown; the
+/// `Drop` provides a safety net for non-graceful paths (panic, cancel
+/// mid-`start_inner`, `start_inner` Err that drops the local dispatcher).
+///
+/// **#388 rationale**: pre-#388 this only called `cancel + abort`. The
+/// spawned task that owns the `tun::AsyncDevice` (and therefore the
+/// kernel wintun adapter handle) was abort-flagged but not joined, so
+/// runtime shutdown could happen before the task was polled to its end —
+/// leaving the kernel adapter alive until reboot or
+/// `scripts/network-reset.py`. `block_on` inside Drop works on the
+/// multi-thread runtime the bridge uses in production. Current-thread
+/// runtimes (skuld tests) take the abort-only fallback path, with the
+/// PowerShell `Remove-NetAdapter` shell-out in `SystemRoutes::drop` as
+/// the belt-and-suspenders second layer.
+///
+/// **Graceful path interaction**: `ProxyManager::stop` →
+/// `Dispatcher::shutdown` already calls
+/// `tokio::time::timeout(2s, handle).await`, so the handle is `None`
+/// here on the normal stop path and only the abort fallback runs
+/// (a no-op).
 impl Drop for Dispatcher {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.driver_abort.abort();
+
+        let Some(handle) = self.driver_handle.take() else {
+            // shutdown() already awaited; nothing to drain.
+            self.driver_abort.abort();
+            return;
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) if matches!(rt.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
+                // CRITICAL: use `rt.block_on`, NOT `futures::executor::block_on`.
+                // The `timeout` future needs the tokio reactor; an external
+                // executor would panic with "no reactor running."
+                // `block_in_place` keeps the worker thread available for
+                // other tasks. It panics on a current-thread runtime —
+                // that's why we gated on `MultiThread` above.
+                tokio::task::block_in_place(|| {
+                    let _ = rt.block_on(tokio::time::timeout(std::time::Duration::from_secs(2), handle));
+                });
+            }
+            _ => {
+                // Current-thread runtime (skuld tests) or no runtime —
+                // `block_in_place` would panic. Abort and rely on the
+                // defensive `adapter_cleanup` in `SystemRoutes::drop` to
+                // sweep any leaked wintun adapter.
+                self.driver_abort.abort();
+            }
+        }
     }
 }

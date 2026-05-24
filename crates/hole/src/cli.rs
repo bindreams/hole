@@ -759,6 +759,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     proxy_socks5: !no_socks5,
                     proxy_http: http,
                     local_port_http,
+                    diagnostic_plugin_tap: false,
                 },
             };
             match send_bridge_request_inner(request) {

@@ -25,6 +25,7 @@ fn sample_config() -> ProxyConfig {
         proxy_socks5: true,
         proxy_http: false,
         local_port_http: 4074,
+        diagnostic_plugin_tap: false,
     }
 }
 
@@ -394,6 +395,7 @@ fn proxy_config_tunnel_mode_full_roundtrips() {
         proxy_socks5: true,
         proxy_http: true,
         local_port_http: 4074,
+        diagnostic_plugin_tap: false,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
@@ -411,10 +413,57 @@ fn proxy_config_tunnel_mode_socks_only_roundtrips() {
         proxy_socks5: false,
         proxy_http: true,
         local_port_http: 5555,
+        diagnostic_plugin_tap: false,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, cfg);
+}
+
+/// **#388**: `diagnostic_plugin_tap` survives the JSON roundtrip.
+/// Anchors the IPC contract for the field so a future rename breaks
+/// this test rather than silently dropping the field at the bridge.
+#[skuld::test]
+fn proxy_config_diagnostic_plugin_tap_field_roundtrips() {
+    let cfg = ProxyConfig {
+        server: sample_server(),
+        local_port: 4073,
+        tunnel_mode: TunnelMode::Full,
+        filters: Vec::new(),
+        dns: crate::config::DnsConfig::default(),
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
+        diagnostic_plugin_tap: true,
+    };
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: ProxyConfig = serde_json::from_str(&json).unwrap();
+    assert!(decoded.diagnostic_plugin_tap);
+    assert_eq!(decoded, cfg);
+}
+
+/// **#388**: a legacy client (pre-#388 GUI) that omits the
+/// `diagnostic_plugin_tap` field must deserialize with the field
+/// defaulting to `false` — backward-compat contract.
+#[skuld::test]
+fn proxy_config_diagnostic_plugin_tap_defaults_on_legacy_payload() {
+    let json = r#"{
+        "server": {
+            "id": "x",
+            "name": "x",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "p"
+        },
+        "local_port": 4073,
+        "tunnel_mode": "full"
+    }"#;
+    let cfg: ProxyConfig = serde_json::from_str(json).expect("legacy payload must parse");
+    assert!(
+        !cfg.diagnostic_plugin_tap,
+        "diagnostic_plugin_tap must default to false for backward compat"
+    );
 }
 
 #[skuld::test]

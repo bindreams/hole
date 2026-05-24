@@ -157,6 +157,18 @@ pub struct ProxyConfig {
     /// listeners are enabled (enforced at bridge start).
     #[serde(default = "proxy_config_defaults::local_port_http")]
     pub local_port_http: u16,
+    /// Enable per-TCP-connection plugin tap diagnostics in `bridge.log`.
+    /// Defaults to `false`. When `true`, the bridge wraps the plugin
+    /// chain in [`garter::TapPlugin`] so per-connection
+    /// `bytes_to_plugin` / `bytes_from_plugin` / `ttfb_ms` / `close_kind`
+    /// land in the log. Sourced from
+    /// [`crate::config::AppConfig::diagnostic_plugin_tap`]; the bridge
+    /// can also be opted in via the `HOLE_BRIDGE_PLUGIN_TAP=1` env var
+    /// (dev-shell only — env vars don't survive into SCM/launchd
+    /// contexts). Added in bindreams/hole#388 to give service-mode
+    /// reproductions a knob the env var can't reach.
+    #[serde(default)]
+    pub diagnostic_plugin_tap: bool,
 }
 
 mod proxy_config_defaults {
@@ -179,6 +191,7 @@ impl Default for ProxyConfig {
             proxy_socks5: true,
             proxy_http: false,
             local_port_http: 4074,
+            diagnostic_plugin_tap: false,
         }
     }
 }

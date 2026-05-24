@@ -21,10 +21,14 @@ fn encode_request_roundtrips() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
-            dns: hole_common::config::DnsConfig::default(),
+            dns: hole_common::config::DnsConfig {
+                enabled: false,
+                ..hole_common::config::DnsConfig::default()
+            },
             proxy_socks5: true,
             proxy_http: false,
             local_port_http: 4074,
+            diagnostic_plugin_tap: false,
         },
     };
 
@@ -72,10 +76,14 @@ fn write_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
-            dns: hole_common::config::DnsConfig::default(),
+            dns: hole_common::config::DnsConfig {
+                enabled: false,
+                ..hole_common::config::DnsConfig::default()
+            },
             proxy_socks5: true,
             proxy_http: false,
             local_port_http: 4074,
+            diagnostic_plugin_tap: false,
         },
     };
 
@@ -111,10 +119,14 @@ fn read_request_file_roundtrip() {
             local_port: 4073,
             tunnel_mode: TunnelMode::Full,
             filters: Vec::new(),
-            dns: hole_common::config::DnsConfig::default(),
+            dns: hole_common::config::DnsConfig {
+                enabled: false,
+                ..hole_common::config::DnsConfig::default()
+            },
             proxy_socks5: true,
             proxy_http: false,
             local_port_http: 4074,
+            diagnostic_plugin_tap: false,
         },
     };
 

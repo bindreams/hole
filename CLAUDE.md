@@ -69,6 +69,14 @@ Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) wo
 
 **Upgrade migration**: `AppConfig` already carries `#[serde(default)]`, so existing configs without a `dns` key deserialize with `DnsConfig::default()` — which has `enabled: true`, `protocol: Https`, `servers: [1.1.1.1, 1.0.0.1]`, `intercept_udp53: true`. This enables the forwarder silently on upgrade (per user spec: "enabled on upgrade, no notification").
 
+**Load-bearing start-time gate (#388)**: the bridge runs an inline forwarder self-test inside [`start_inner`](crates/bridge/src/proxy_manager.rs) **before** `Dispatcher::new` / `routing.install` / `apply_dns_settings`. On failure (3×1500ms / 5s budget exhausted, or no DNS servers configured, or `bind_ladder` exhausted) `start_cancellable` returns `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind. Routes, system DNS, and the wintun adapter are never touched on this path. Pre-#388 the test was fire-and-forget at `info!` and the proxy committed `Running` while `intercept_udp53` hijacked user DNS into a dead tunnel — see bindreams/hole#388. The `start_blocks_on_forwarder_self_test_failure` test is the ordering invariant guard.
+
+**Behavior changes from #388**:
+
+- `dns.enabled = true` with `servers = []` is now a hard config error (was: silent skip + degenerate runtime).
+- `bind_ladder` exhaustion (all 255 loopback candidates blocked) is now a hard start error (was: silent-degrade to no forwarder). Single conflicting service (pi-hole on `127.0.0.1:53`) still succeeds via the `127.53.0.X:53` ladder.
+- A plugin chain that binds locally but can't reach upstream is now caught at start time; the GUI receives a clear error message instead of a dead tunnel.
+
 ### Bridge test-isolation contract
 
 All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
@@ -164,18 +172,33 @@ TRACE line per TCP connection (≥100/sec under Chrome). Use for
 debugging sessions only; `bridge.log` rotates via
 `MAX_LOG_BYTES`/`MAX_ROTATED_LOGS` so the cap is bounded.
 
-### Plugin tap (HOLE_BRIDGE_PLUGIN_TAP)
+### Plugin tap (AppConfig.diagnostic_plugin_tap / HOLE_BRIDGE_PLUGIN_TAP)
 
 When the bridge's local SOCKS5 listener relays a connection to the
 plugin chain, the boundary in between is normally invisible — the
 plugin process (`v2ray-plugin`, `galoshes`) runs out-of-process and
-its network I/O is not captured by the bridge's ETW consumer. Setting
-`HOLE_BRIDGE_PLUGIN_TAP=1` interposes
-[`garter::TapPlugin`](crates/garter/src/tap.rs) between
-shadowsocks-service and the inner plugin. Per-TCP-connection it logs:
+its network I/O is not captured by the bridge's ETW consumer. Two
+independent gates enable [`garter::TapPlugin`](crates/garter/src/tap.rs)
+to interpose between shadowsocks-service and the inner plugin:
+
+- **`AppConfig.diagnostic_plugin_tap`** — persistent in user settings;
+  travels through `ProxyConfig` IPC, so reaches service-mode bridges
+  (Windows SCM / launchd). Added in bindreams/hole#388 to give
+  service-mode reproductions a knob the env var can't reach.
+- **`HOLE_BRIDGE_PLUGIN_TAP=1`** — dev shell only; env vars don't
+  survive into SCM/launchd. Use for `scripts/dev.py` and hand-run
+  `hole bridge run`.
+
+Either gate enables the tap; the config flag is preferred for
+user-facing reproductions.
+
+Per-TCP-connection the tap logs at `info!`:
 
 - `bytes_to_plugin` / `bytes_from_plugin` — raw byte counts in each
   direction, observed by [`garter::CountingStream`](crates/garter/src/counting.rs).
+  `bytes_to_plugin > 0 && bytes_from_plugin == 0` is the fingerprint
+  of an upstream-dial hang — the #388 reproduction case (v2ray-plugin
+  WebSocket dial silently hung).
 - `ttfb_ms` — milliseconds from `accept` to the first non-zero
   upstream read. `None` means the connection closed without ever
   receiving a byte from the plugin chain — the load-bearing diagnostic
@@ -185,11 +208,22 @@ shadowsocks-service and the inner plugin. Per-TCP-connection it logs:
   cross-platform via Win32+POSIX errno mapping.
 - `close_dir` is implicit in the byte-count asymmetry: if
   `bytes_inbound_read != bytes_inbound_written` an inflight cancel hit.
+- `tap_conn_id` — process-wide monotonic; correlates `accepted` and
+  `closed` lines for one connection.
 
-**Dev-mode only.** Service-mode bridges (Windows SCM / launchd) do not
-inherit user shell env, so the gate is meant for `scripts/dev.py` and
-hand-run `hole bridge run`. Cost: an extra loopback round-trip per
-byte, fine for a debugging session, inappropriate as default.
+**Auto-correlation on self-test failure (#388)**: when the DNS
+forwarder self-test fails AND the tap is enabled, the bridge emits a
+`warn!` breadcrumb directing readers to the preceding `plugin tap: closed`
+lines (text: `TAP_ENABLED_HINT` const in
+[`proxy_manager.rs`](crates/bridge/src/proxy_manager.rs)). When the tap
+is disabled, the failure emits a `warn!` remediation hint telling the
+user to set `diagnostic_plugin_tap=true` for next reproduction
+(`TAP_DISABLED_HINT`).
+
+**Cost.** Extra loopback round-trip per byte; one structured log line
+per TCP connection close. Acceptable for a debugging session, NOT for
+default operation under browser-traffic load (Chrome easily hits >100
+connections/sec).
 
 ### Plugin debug logging (always-on)
 
@@ -581,8 +615,9 @@ For intra-process sync, use the codebase's primitives:
 - **"Wait for spawned work to complete"**: return the `JoinHandle`
   from the spawning function and `.await` it. Don't fire-and-forget
   if you might need to wait. See
-  [`spawn_forwarder_self_test`](crates/bridge/src/proxy_manager.rs) for
-  the pattern (returns `Option<JoinHandle<()>>`).
+  [`Dispatcher::shutdown`](crates/bridge/src/dispatcher.rs) for the
+  pattern (`tokio::time::timeout(2s, handle).await` with abort
+  fallback for the wedge case).
 
 ### Windows installer
 

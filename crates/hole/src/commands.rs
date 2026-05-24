@@ -507,6 +507,7 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         proxy_socks5: config.proxy_socks5,
         proxy_http: config.proxy_http,
         local_port_http: config.local_port_http,
+        diagnostic_plugin_tap: config.diagnostic_plugin_tap,
     })
 }
 

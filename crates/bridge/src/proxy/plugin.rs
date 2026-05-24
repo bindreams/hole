@@ -112,6 +112,7 @@ pub async fn start_plugin_chain(
     server_host: &str,
     server_port: u16,
     state_dir: Option<&Path>,
+    diagnostic_tap: bool,
 ) -> Result<PluginChain, ProxyError> {
     // Inject a debug-level log directive into the plugin's
     // SS_PLUGIN_OPTIONS unconditionally — Hole owns plugin stderr (it's
@@ -141,6 +142,7 @@ pub async fn start_plugin_chain(
                     server_host,
                     server_port,
                     state_dir,
+                    diagnostic_tap,
                 )
                 .await
                 .map_err(proxy_err_to_io_err)
@@ -157,6 +159,36 @@ pub async fn start_plugin_chain(
     })
 }
 
+/// Sourced gate for the plugin tap. The IPC config flag is the primary
+/// knob (reaches service mode); the env var stays as the dev-shell
+/// fallback for `scripts/dev.py` / hand-run `hole bridge run`.
+#[derive(Debug, Clone, Copy)]
+enum TapSource {
+    Config,
+    EnvVar,
+    None,
+}
+
+impl std::fmt::Display for TapSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Config => "AppConfig.diagnostic_plugin_tap",
+            Self::EnvVar => "HOLE_BRIDGE_PLUGIN_TAP env",
+            Self::None => "off",
+        })
+    }
+}
+
+fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
+    if diagnostic_tap {
+        TapSource::Config
+    } else if std::env::var_os("HOLE_BRIDGE_PLUGIN_TAP").is_some() {
+        TapSource::EnvVar
+    } else {
+        TapSource::None
+    }
+}
+
 /// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
 /// (with optional `pid_sink`), wraps in `TapPlugin` when
 /// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
@@ -165,6 +197,7 @@ pub async fn start_plugin_chain(
 /// `bind_ephemeral` doesn't leak the previous attempt's task. On
 /// success returns `(handle, cancel, ready_addr)` — the caller wraps
 /// these in a [`PluginChain`].
+#[allow(clippy::too_many_arguments)] // 8 args — already at the limit before #388 added diagnostic_tap; bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
     plugin_path: &str,
@@ -173,6 +206,7 @@ async fn spawn_plugin_runner_at(
     server_host: &str,
     server_port: u16,
     state_dir: Option<&Path>,
+    diagnostic_tap: bool,
 ) -> Result<
     (
         tokio::task::JoinHandle<garter::Result<()>>,
@@ -214,21 +248,21 @@ async fn spawn_plugin_runner_at(
         plugin_options: merged_opts.map(String::from),
     };
 
-    // #267: when `HOLE_BRIDGE_PLUGIN_TAP=1` is set, wrap the plugin in a
-    // counting tap so per-connection byte flow becomes visible in
-    // `bridge.log` (`bytes_to_plugin`, `bytes_from_plugin`, `ttfb_ms`,
-    // `close_kind`). Dev-mode only — env vars do not survive into
-    // SCM/launchd service contexts. Off by default; the extra loopback
-    // hop is cheap on debug-mode reproduction but inappropriate at
-    // browser-traffic scale.
-    let plugin: Box<dyn garter::ChainPlugin> = if std::env::var_os("HOLE_BRIDGE_PLUGIN_TAP").is_some() {
-        tracing::info!(
-            plugin = plugin_name,
-            "HOLE_BRIDGE_PLUGIN_TAP=1: wrapping plugin in TapPlugin"
-        );
-        Box::new(garter::TapPlugin::wrap(Box::new(plugin)))
-    } else {
+    // #267 + #388: wrap plugin in counting `TapPlugin` so per-TCP
+    // connection byte flow + close-kind become visible in `bridge.log`.
+    // Two gates compose:
+    //   - `AppConfig.diagnostic_plugin_tap` via `ProxyConfig` IPC field
+    //     (reaches service mode — #388).
+    //   - `HOLE_BRIDGE_PLUGIN_TAP=1` env var (dev shell only — env vars
+    //     don't survive into SCM/launchd contexts — #267).
+    // Off by default; the extra loopback hop is cheap on debug-mode
+    // reproduction but inappropriate at browser-traffic scale.
+    let tap_source = resolve_tap_source(diagnostic_tap);
+    let plugin: Box<dyn garter::ChainPlugin> = if matches!(tap_source, TapSource::None) {
         Box::new(plugin)
+    } else {
+        tracing::info!(plugin = plugin_name, %tap_source, "wrapping plugin in TapPlugin");
+        Box::new(garter::TapPlugin::wrap(Box::new(plugin)))
     };
 
     let runner = garter::ChainRunner::new()
