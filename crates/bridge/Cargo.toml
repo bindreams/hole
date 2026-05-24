@@ -29,6 +29,13 @@ serde_json = "1"
 tracing = "0.1"
 thiserror = "2"
 tokio-util = "0.7"
+# Runtime-checked async-cleanup discipline: SystemDnsApplied and other async-
+# cleanup guards own a `DebugDropBomb` defused by `shutdown().await`. Drop
+# panics in debug builds if the bomb is armed, catching missed-shutdown bugs
+# at first test run. Release builds use the no-op DebugDropBomb variant and
+# fall through to a best-effort sync fallback with a `warn!` log. See #397
+# and the "Bridge cancellation contract" section in CLAUDE.md.
+drop_bomb = "0.1"
 socket2 = "0.6"
 axum = { version = "0.8", default-features = false, features = ["json"] }
 hyper = { version = "1", features = ["http1", "server"] }
