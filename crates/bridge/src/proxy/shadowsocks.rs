@@ -57,13 +57,35 @@ impl Proxy for ShadowsocksProxy {
 
 /// RAII handle on a running shadowsocks tunnel.
 ///
-/// Drop aborts the spawned task best-effort; the supported shutdown path is
-/// [`RunningProxy::stop`], which also awaits the task so errors can be
-/// reported. Reaching `Drop` with a live handle indicates the caller forgot
-/// `stop().await` — a debug_assert fires in dev/test builds to surface such
-/// misuse per the CLAUDE.md "debug asserts are encouraged" rule.
+/// Two cleanup paths, both safe:
+///
+/// - [`RunningProxy::stop`] — graceful shutdown. Aborts the task and
+///   `await`s the handle, surfacing task-internal panics as
+///   `ProxyError::Runtime`. Preferred when the caller has an `.await`
+///   point (the normal Stop request flow).
+/// - `Drop` — cancel-unwind cleanup. Aborts the task best-effort and
+///   returns immediately. Used when the value goes out of scope under
+///   an error-path `?` (e.g. the #388 forwarder self-test gate inside
+///   `start_inner`) or when the surrounding future is cancelled (e.g.
+///   the `tokio::select!` in `start_cancellable`), where there is no
+///   `.await` point to host a graceful stop.
+///
+/// Both paths abort the task; the only thing `Drop` loses vs `stop()`
+/// is the ability to observe task-internal panics. See bindreams/hole#393
+/// for the incident that motivated documenting the dual contract.
 pub struct ShadowsocksRunning {
     handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+#[cfg(test)]
+impl ShadowsocksRunning {
+    /// Test-only constructor: wrap a freshly-spawned task so the Drop
+    /// contract can be exercised without binding real shadowsocks
+    /// listeners. Production code never reaches `ShadowsocksRunning`
+    /// except through [`ShadowsocksProxy::start`].
+    pub(crate) fn from_handle(handle: JoinHandle<io::Result<()>>) -> Self {
+        Self { handle: Some(handle) }
+    }
 }
 
 impl RunningProxy for ShadowsocksRunning {
@@ -93,17 +115,17 @@ impl RunningProxy for ShadowsocksRunning {
 
 impl Drop for ShadowsocksRunning {
     fn drop(&mut self) {
-        // Last-resort cleanup for the panic-unwinding path. Errors are
-        // discarded because Rust does not allow `Drop::drop` to be async or
-        // fallible. Reaching here with a live task means the caller forgot
-        // to call `stop().await` — which loses the graceful-shutdown error
-        // reporting but at least aborts the task so it doesn't leak.
-        debug_assert!(
-            self.handle.as_ref().is_none_or(|h| h.is_finished()),
-            "ShadowsocksRunning dropped with a live task — caller forgot stop().await"
-        );
+        // Cancel-unwind cleanup. `h.abort()` is fire-and-forget — the
+        // runtime delivers cancellation to the task on the next poll.
+        // No `await` is possible here (Drop is sync), so task-internal
+        // panics are not observed; callers who need that signal use
+        // `stop().await`. See the type doc and bindreams/hole#393.
         if let Some(h) = self.handle.take() {
             h.abort();
         }
     }
 }
+
+#[cfg(test)]
+#[path = "shadowsocks_tests.rs"]
+mod shadowsocks_tests;
