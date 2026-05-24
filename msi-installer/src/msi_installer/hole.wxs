@@ -116,7 +116,7 @@
            Staged by xtask::bindir alongside hole.exe, with the workspace
            `[profile.release].debug = "limited"` guaranteeing the PDB
            carries line tables + names. See bindreams/hole#393. -->
-      <Component Id="HolePdb" Guid="E5F6A7B8-C9D0-1234-EF01-345678901234">
+      <Component Id="HolePdb" Guid="1A2B3C4D-5E6F-7A8B-9C0D-1E2F3A4B5C6D">
         <File Id="hole.pdb" Source="!(bindpath.BinDir)\hole.pdb" KeyPath="yes" />
       </Component>
       <Component Id="V2rayPlugin" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
