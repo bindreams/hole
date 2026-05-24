@@ -1114,7 +1114,7 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let outcome = run_forwarder_self_test(forwarder, vec![], false).await;
+                let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
                 assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
             });
 
@@ -1147,7 +1147,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let outcome = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+                let outcome = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await;
                 let SelfTestOutcome::Failed { attempts, reason } = outcome else {
                     panic!("expected Failed");
                 };
@@ -1202,7 +1208,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], true).await;
+                let _ = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    true,
+                    CancellationToken::new(),
+                )
+                .await;
             });
 
         let output = writer.snapshot_string();
@@ -1236,7 +1248,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+                let _ = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await;
             });
 
         let output = writer.snapshot_string();
@@ -1268,7 +1286,7 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     intercept_udp53: true,
                 };
-                match build_local_dns(&cfg, 1080, false).await {
+                match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
                         attempts: 0,
                         elapsed_ms: 0,
@@ -1346,7 +1364,7 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     intercept_udp53: true,
                 };
-                let res = build_local_dns(&cfg, 1080, false).await;
+                let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (srv, ep, fwd) = match res {
                     Ok(t) => t,
                     Err(e) => panic!("expected Ok((None, None, None)) for disabled DNS, got {e:?}"),

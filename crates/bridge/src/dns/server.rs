@@ -42,6 +42,7 @@ use hole_common::retry::is_bind_race;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::dns::forwarder::DnsForwarder;
 
@@ -140,11 +141,40 @@ impl LocalDnsServer {
     /// then `127.53.0.1..=127.53.0.254`, returning the first IP where BOTH
     /// UDP and TCP bind succeeds. Returns an explicit error when the whole
     /// ladder is exhausted.
-    pub async fn bind_ladder(forwarder: Arc<DnsForwarder>) -> io::Result<Self> {
+    ///
+    /// **Cooperative cancel (#397).** Checks `cancel.is_cancelled()` at
+    /// each candidate boundary; on cancel returns an `io::Error::other`
+    /// whose message names the attempt count. The caller's outer
+    /// `tokio::select!` against the same token sees the cancel first
+    /// (biased ordering) and re-emits `ProxyError::Cancelled` canonically;
+    /// the internal early-exit is the safety net for callers that drive
+    /// `bind_ladder` without an outer select. Mid-attempt cancel
+    /// granularity (cancel-during-`socket::bind`) is impractical on
+    /// Windows where the bind syscall is uninterruptible; the worst-case
+    /// cancel response is the duration of one bind attempt — typically
+    /// ms — see the "Bind-ladder worst-case cancel latency" follow-up.
+    ///
+    /// Logs adaptive `info!` checkpoints at attempts 10, 20, 30 … so a
+    /// stuck ladder stays visible at the default log level without
+    /// flooding the happy-path log volume (mirrors `bind_ephemeral`'s
+    /// adaptive logging, see CLAUDE.md §"No budget — by design").
+    pub async fn bind_ladder(forwarder: Arc<DnsForwarder>, cancel: CancellationToken) -> io::Result<Self> {
         let candidates = ladder_candidates();
         let preferred = candidates[0];
         let mut last_err: Option<io::Error> = None;
-        for addr in candidates {
+        for (idx, addr) in candidates.into_iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(io::Error::other(format!(
+                    "LocalDnsServer bind_ladder cancelled after {idx} attempts"
+                )));
+            }
+            let attempt_num = idx + 1;
+            if attempt_num > 1 && attempt_num % 10 == 0 {
+                tracing::info!(
+                    attempts = attempt_num,
+                    "LocalDnsServer bind_ladder still trying loopback candidates"
+                );
+            }
             match Self::bind(addr, Arc::clone(&forwarder)).await {
                 Ok(srv) => return Ok(srv),
                 Err(e) => {

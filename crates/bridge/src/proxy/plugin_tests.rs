@@ -1,7 +1,10 @@
+use tokio_util::sync::CancellationToken;
+
 use super::start_plugin_chain;
 
 #[skuld::test]
 async fn start_with_nonexistent_binary_returns_plugin_error() {
+    let cancel = CancellationToken::new();
     let result = start_plugin_chain(
         "v2ray-plugin",
         "/nonexistent/binary",
@@ -10,6 +13,7 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
         12345,
         None,
         false,
+        &cancel,
     )
     .await;
 

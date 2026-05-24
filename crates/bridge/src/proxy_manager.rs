@@ -1,6 +1,6 @@
 // Proxy lifecycle manager — start/stop/reload orchestration.
 //
-// # Design notes (post-#165)
+// # Design notes (post-#165, post-#397)
 //
 // `ProxyManager` is parameterized over two traits:
 // - `P: Proxy`     — the proxy backend (production: `ShadowsocksProxy`).
@@ -8,18 +8,27 @@
 //
 // Both traits return RAII associated types on success (`P::Running` /
 // `R::Installed`) whose Drop impls clean up their respective side effects.
-// This is what makes `start_inner` cancel-safe: if the start future is
-// dropped mid-flight (for example because a `tokio::select!` cancel branch
-// fired), the locally-owned `Running` / `Installed` values are dropped in
-// reverse-declaration order — aborting the shadowsocks task and tearing
-// down routes without the ProxyManager fields ever being mutated.
+// RAII unwind covers the Err-return path of `start_inner` — if any phase
+// returns Err, locally-owned guards drop in reverse-declaration order,
+// aborting the shadowsocks task and tearing down routes without the
+// ProxyManager fields ever being mutated.
+//
+// **Cancellation is cooperative (#397).** The pre-#397 design wrapped
+// `start_inner` in an outer `tokio::select!` and relied on future-drop
+// for cancel propagation; that approach is fundamentally incompatible
+// with phases that need async cleanup (DNS apply, see #395) — once a
+// sync FFI is on a tokio worker the future can't be preempted. The
+// current design threads a `CancellationToken` *into* `start_inner` and
+// has every long-running phase observe it cooperatively. RAII Drop is
+// retained as the catastrophic / panic teardown safety net only.
 //
 // A cycle's transient state lives in `Option<RunningState<P, R>>`. When
 // `stop()` takes the state, the proxy handle is explicitly
 // `stop().await`ed (so errors are reported), then the routes guard drops
 // (tearing down). On a successful `start`, the full `RunningState` is
-// committed to `self.running` from the synchronous match arm, after the
-// `tokio::select!` that races the cancel token has already resolved.
+// committed to `self.running` strictly after `start_inner` returns
+// `Ok(state)`; the cooperative-cancel path returns `Err(Cancelled)`
+// before reaching the commit.
 //
 // There are deliberately no getters for `proxy` or `routing` — test access
 // to mock state happens via `Arc` clones captured before the mock is
@@ -255,22 +264,27 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     /// `Err(ProxyError::Cancelled)` and rolls back partial state (via
     /// the RAII guards inside `start_inner`) without mutating `self`.
     ///
+    /// **Cooperative cancellation (#397).** The pre-#397 implementation
+    /// wrapped `start_inner` in an outer `tokio::select! { cancel.cancelled() => …, r = start_inner => r }`
+    /// and relied on future-drop to unwind locally-owned RAII guards.
+    /// That approach is sound for sync-cleanable resources but cannot
+    /// preempt phases whose inner future never yields (sync FFI on a
+    /// tokio worker, the #395 symptom). The current design instead
+    /// threads the token *into* `start_inner` and has every long-running
+    /// phase observe it cooperatively — see the `start_inner` doc and
+    /// the per-phase cancel-aware wrappers.
+    ///
     /// Three race scenarios are handled correctly:
     ///
-    /// 1. **Cancel before any `start_inner` await.** `tokio::select!`
-    ///    with `biased;` polls the cancel branch first, so an
-    ///    already-cancelled token returns `Cancelled` without invoking
-    ///    `start_inner` at all.
-    /// 2. **Cancel mid-flight.** `select!` drops the `start_inner`
-    ///    future, which runs every live RAII guard's `Drop` in
-    ///    reverse-declaration order — the proxy task is aborted (by
-    ///    `P::Running::drop`), routes are torn down (by
-    ///    `R::Installed::drop`), and the state file is cleared (by the
-    ///    same `R::Installed::drop`).
+    /// 1. **Cancel before `start_inner` starts.** The first phase's
+    ///    `cancel.is_cancelled()` check fires immediately and returns
+    ///    `Cancelled` without doing any work.
+    /// 2. **Cancel mid-flight.** Each phase's cancel-aware wrapper
+    ///    returns `Cancelled` cooperatively; locally-owned RAII guards
+    ///    drop in reverse-declaration order as the function unwinds.
     /// 3. **Cancel right after `start_inner` returns `Ok(started)`.**
-    ///    Commit to `self` happens in this outer function AFTER
-    ///    `select!` has already yielded `Ok(started)`, so the late
-    ///    cancel cannot race the commit. The started proxy is left
+    ///    Commit to `self` happens after `start_inner` yields, so the
+    ///    late cancel cannot race the commit. The started proxy is left
     ///    running; the client sees `Ok(())`. A caller that wanted to
     ///    cancel that late can follow up with an explicit stop.
     pub async fn start_cancellable(
@@ -290,21 +304,21 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        // Run start_inner in a select! against the cancel token.
         // `start_inner` is a free associated function — it does NOT
-        // touch `self`, so dropping the future leaves `self` untouched.
-        // All partial state is owned by the locally-constructed RAII
-        // types inside start_inner and cleans up on drop.
+        // touch `self`, so any cancel-driven unwind leaves `self`
+        // untouched. All partial state is owned by the locally-
+        // constructed RAII types inside start_inner and cleans up on
+        // drop. The cancel token is threaded *into* start_inner instead
+        // of being raced against it (#397); this prevents the
+        // "uncancellable sync phase" foot-gun where a future that
+        // doesn't yield blocks the outer select! from observing cancel.
         debug!("awaiting start_inner");
-        let result: Result<RunningState<P, R>, ProxyError> = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(ProxyError::Cancelled),
-            r = Self::start_inner(&self.proxy, &self.routing, config, self.state_dir.as_deref()) => r,
-        };
+        let result: Result<RunningState<P, R>, ProxyError> =
+            Self::start_inner(&self.proxy, &self.routing, config, self.state_dir.as_deref(), cancel).await;
 
         // Commit (or record the error) in the outer function, so the
         // only path that mutates `self.running = Some(..)` is strictly
-        // after the select! has completed successfully.
+        // after start_inner has completed successfully.
         match result {
             Ok(state) => {
                 let server_ip = state.server_ip;
@@ -339,13 +353,44 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         }
     }
 
-    /// Produce a [`RunningState`] without touching `self`. All partial
-    /// state is owned by local RAII values so that dropping this future
-    /// at any `.await` point unwinds cleanly:
+    /// Produce a [`RunningState`] without touching `self`.
     ///
-    /// 1. `P::Running` — on drop, aborts the spawned proxy task.
-    /// 2. `R::Installed` — on drop, tears down routes and clears the
+    /// **Cooperative cancellation (#397).** Each long-running phase
+    /// observes the supplied `cancel` token and returns
+    /// `Err(ProxyError::Cancelled)` cooperatively. Earlier RAII guards
+    /// drop in reverse-declaration order when the function returns Err,
+    /// tearing down anything that was constructed before the cancel
+    /// observation:
+    ///
+    /// 1. `PluginChain` — on drop, cancels its garter token and clears
+    ///    the plugin state file.
+    /// 2. `P::Running` — on drop, aborts the spawned proxy task.
+    /// 3. `R::Installed` — on drop, tears down routes and clears the
     ///    crash-recovery state file.
+    ///
+    /// Per-phase cancellation strategy:
+    /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
+    ///   `start_plugin_chain`, which derives child tokens for each
+    ///   attempt and races readiness against cancel.
+    /// - **Phase 2 (proxy.start)**: `tokio::select!` around
+    ///   `proxy.start(ss_config)`. Drop-on-cancel is sound — Proxy
+    ///   implementations own no async cleanup obligations on an
+    ///   in-flight start.
+    /// - **Phase 3 (build_local_dns / bind_ladder)**: cancel is passed
+    ///   to `bind_ladder` for per-candidate observation. Outer
+    ///   `tokio::select!` against cancel re-emits Cancelled canonically.
+    /// - **Phase 4 (forwarder self-test)**: cooperative — the token is
+    ///   threaded into `run_forwarder_self_test` which checks it
+    ///   between retry attempts and races the per-attempt forward.
+    /// - **Phases 5–6 (Dispatcher::new, routing.install)**: sync; cancel
+    ///   observed at phase boundary only (`if cancel.is_cancelled()`).
+    ///   These calls are millisecond-scale; mid-call preemption isn't
+    ///   needed.
+    /// - **Phase 7 (apply_dns_settings)**: chunk-1 NOT yet
+    ///   cancel-aware (still routes through pre-#397 netsh sync path
+    ///   that the #395 reproduction caught taking 22 s). Cancel-aware
+    ///   apply lands in chunks 2–3 alongside the Win32-native DNS
+    ///   refactor.
     ///
     /// CRITICAL ORDERING: the routing provider is responsible for
     /// persisting the recovery state BEFORE mutating routes. A panic
@@ -358,9 +403,16 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         routing: &R,
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
+        cancel: CancellationToken,
     ) -> Result<RunningState<P, R>, ProxyError> {
         debug!("start_inner entered");
-        // Start plugin chain via Garter if a plugin is configured.
+        // Pre-flight: short-circuit a pre-cancelled token before any work.
+        if cancel.is_cancelled() {
+            return Err(ProxyError::Cancelled);
+        }
+        // Phase 1: start plugin chain via Garter if a plugin is configured.
+        // `start_plugin_chain` threads `cancel` through to its readiness
+        // wait + bind_ephemeral retries.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
             let chain = crate::proxy::plugin::start_plugin_chain(
@@ -371,12 +423,21 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
                 config.server.server_port,
                 state_dir,
                 config.diagnostic_plugin_tap,
+                &cancel,
             )
             .await?;
             Some(chain)
         } else {
             None
         };
+
+        // Cancel observed between phases — required because a
+        // pre-cancelled token can slip past `start_plugin_chain` when
+        // there is no plugin configured (the `if let` branch above is
+        // skipped entirely).
+        if cancel.is_cancelled() {
+            return Err(ProxyError::Cancelled);
+        }
 
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
@@ -390,7 +451,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // only bind the SOCKS5 listener.
         if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
             debug!(local_count = ss_config.local.len(), "calling proxy.start");
-            let running_proxy = proxy.start(ss_config).await?;
+            // Phase 2 (SocksOnly): race proxy.start against cancel.
+            let running_proxy = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
+                r = proxy.start(ss_config) => r?,
+            };
             debug!("proxy.start returned Ok");
 
             // In-bridge SOCKS5 loopback self-test (#200 H2 vs H3 disambiguation).
@@ -482,35 +548,51 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // most likely regression (asserting routing.install was NOT
         // called when the gate fails).
 
-        // (1) Start the SS SOCKS5 proxy.
-        let running_proxy = proxy.start(ss_config).await?;
+        // Phase 2 (Full mode): start the SS SOCKS5 proxy, racing the
+        // start future against cancel. Drop on Running aborts the SS
+        // task on cancel via P::Running::drop.
+        let running_proxy = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
+            r = proxy.start(ss_config) => r?,
+        };
 
-        // (2) Build local DNS forwarder + server. Now Err on bind failure
+        // Phase 3: build local DNS forwarder + server. Now Err on bind failure
         // (was silent-degrade pre-#388). Returns the forwarder Arc so
-        // the gate can drive it without re-plumbing.
-        let (local_dns_server, local_dns_endpoint, forwarder) =
-            build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available).await?;
+        // the gate can drive it without re-plumbing. `bind_ladder`
+        // observes the cancel token between candidates; the outer
+        // `tokio::select!` here catches cancel even mid-attempt.
+        let (local_dns_server, local_dns_endpoint, forwarder) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
+            r = build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available, cancel.clone()) => r?,
+        };
 
-        // (3) Blocking forwarder self-test gate. Runs synchronously
+        // Phase 4: blocking forwarder self-test gate. Runs synchronously
         // BEFORE Dispatcher::new / routing.install / apply_dns_settings.
         // On Err, the locally-owned `running_proxy` Drop aborts the SS
         // task and `plugin_chain` (further up the stack) Drop SIGTERMs
-        // the chain. System state is untouched. The gate is
-        // cancellation-safe via the outer `tokio::select!` in
-        // start_cancellable — dropping the future cleanly releases all
-        // in-flight forwarder connections.
+        // the chain. System state is untouched. `run_forwarder_self_test`
+        // observes cancel cooperatively between retry attempts and races
+        // each per-attempt forward against it (#397).
         if let Some(fwd) = forwarder.as_ref() {
             let started = std::time::Instant::now();
             let outcome = run_forwarder_self_test(
                 std::sync::Arc::clone(fwd),
                 config.dns.servers.clone(),
                 config.diagnostic_plugin_tap,
+                cancel.clone(),
             )
             .await;
             outcome.into_result(started.elapsed().as_millis() as u64)?;
         }
 
-        // (4) Start the dispatcher (owns TUN device + smoltcp). Skipped
+        // Phase 5: cancel checkpoint before Dispatcher::new (sync, cannot
+        // be preempted mid-call once entered).
+        if cancel.is_cancelled() {
+            return Err(ProxyError::Cancelled);
+        }
+        // Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
         let dispatcher = {
@@ -532,7 +614,13 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
             None
         };
 
-        // (5) Install the routes — NOW traffic starts flowing to the TUN.
+        // Phase 6: cancel checkpoint before routing.install (sync; mid-
+        // call preemption isn't structurally possible — netsh/route
+        // shell-outs are uninterruptible from our process).
+        if cancel.is_cancelled() {
+            return Err(ProxyError::Cancelled);
+        }
+        // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
         // (6) Apply system DNS AFTER routes install so the OS "best-route to
@@ -784,6 +872,7 @@ async fn build_local_dns(
     dns_cfg: &hole_common::config::DnsConfig,
     local_ss_port: u16,
     ipv6_bypass_available: bool,
+    cancel: CancellationToken,
 ) -> Result<
     (
         Option<crate::dns::server::LocalDnsServer>,
@@ -819,7 +908,7 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    let server = crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder)).await?;
+    let server = crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder), cancel).await?;
     info!(addr = %server.addr(), "LocalDnsServer bound");
 
     let endpoint = if dns_cfg.intercept_udp53 {
@@ -860,6 +949,7 @@ async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,
     diagnostic_tap_enabled: bool,
+    cancel: CancellationToken,
 ) -> SelfTestOutcome {
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
     const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -875,7 +965,21 @@ async fn run_forwarder_self_test(
     let outcome = tokio::time::timeout(OUTER_BUDGET, async {
         let mut last_err: Option<String> = None;
         for attempt in 1..=ATTEMPTS {
-            match tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)).await {
+            // Cooperative cancel check between retry attempts (#397).
+            if cancel.is_cancelled() {
+                return SelfTestOutcome::Cancelled;
+            }
+            // Future-drop on `forwarder.forward(&query)` IS acceptable
+            // here — the single exception to the cooperative cancellation
+            // contract in this module (#397). The `DnsForwarder`'s only
+            // in-flight resource is a TCP/UDP socket that closes on Drop
+            // (sync, trivial); there is no async cleanup to await.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
+                r = tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)) => r,
+            };
+            match result {
                 Ok(reply) => {
                     if is_dns_reply_ok(&reply) {
                         return SelfTestOutcome::Ok { attempts: attempt };
@@ -914,14 +1018,26 @@ async fn run_forwarder_self_test(
                 warn!("{TAP_DISABLED_HINT}");
             }
         }
+        SelfTestOutcome::Cancelled => {
+            info!(%first_server, elapsed_ms, "forwarder self-test cancelled");
+        }
     }
     outcome
 }
 
 #[derive(Debug)]
 enum SelfTestOutcome {
-    Ok { attempts: u32 },
-    Failed { attempts: u32, reason: String },
+    Ok {
+        attempts: u32,
+    },
+    Failed {
+        attempts: u32,
+        reason: String,
+    },
+    /// The bridge cancel token fired before the self-test could complete
+    /// or fail definitively (#397). Maps to `ProxyError::Cancelled` via
+    /// `into_result`; not a diagnostic failure (the user asked for it).
+    Cancelled,
 }
 
 impl SelfTestOutcome {
@@ -937,6 +1053,7 @@ impl SelfTestOutcome {
                 attempts,
                 elapsed_ms,
             }),
+            Self::Cancelled => Err(ProxyError::Cancelled),
         }
     }
 }

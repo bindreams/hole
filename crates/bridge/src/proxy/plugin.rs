@@ -105,6 +105,7 @@ impl Drop for PluginChain {
 /// residual probe-drop-to-subprocess-bind TOCTOU is tracked in
 /// bindreams/hole#304. See bindreams/hole#285 §"Where the fix
 /// actually lands" for the rendezvous-port race class history.
+#[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin_name: &str,
     plugin_path: &str,
@@ -113,6 +114,7 @@ pub async fn start_plugin_chain(
     server_port: u16,
     state_dir: Option<&Path>,
     diagnostic_tap: bool,
+    cancel: &CancellationToken,
 ) -> Result<PluginChain, ProxyError> {
     // Inject a debug-level log directive into the plugin's
     // SS_PLUGIN_OPTIONS unconditionally — Hole owns plugin stderr (it's
@@ -132,6 +134,11 @@ pub async fn start_plugin_chain(
             // an `async move`; clone per attempt instead. `&str`/`&Path`
             // arguments are Copy and pass through unchanged.
             let merged_opts = merged_opts.clone();
+            // Each attempt gets its own child token derived from the
+            // bridge cancel: cancelling the bridge cancels every attempt;
+            // a failed attempt that drops its child does not signal the
+            // bridge or sibling retries.
+            let attempt_cancel = cancel.child_token();
             async move {
                 let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
                 spawn_plugin_runner_at(
@@ -143,13 +150,24 @@ pub async fn start_plugin_chain(
                     server_port,
                     state_dir,
                     diagnostic_tap,
+                    attempt_cancel,
                 )
                 .await
                 .map_err(proxy_err_to_io_err)
             }
         })
         .await
-        .map_err(|e| ProxyError::Plugin(format!("plugin chain start failed: {e}")))?;
+        .map_err(|e| {
+            // A cancel-attributed io::Error (from spawn_plugin_runner_at
+            // observing the child token) re-surfaces as Cancelled so the
+            // caller short-circuits cleanly instead of seeing
+            // ProxyError::Plugin("...cancelled").
+            if cancel.is_cancelled() {
+                ProxyError::Cancelled
+            } else {
+                ProxyError::Plugin(format!("plugin chain start failed: {e}"))
+            }
+        })?;
 
     Ok(PluginChain {
         handle,
@@ -197,7 +215,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// `bind_ephemeral` doesn't leak the previous attempt's task. On
 /// success returns `(handle, cancel, ready_addr)` — the caller wraps
 /// these in a [`PluginChain`].
-#[allow(clippy::too_many_arguments)] // 8 args — already at the limit before #388 added diagnostic_tap; bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 9 args — already at the limit before #397 added cancel; bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
     plugin_path: &str,
@@ -207,6 +225,7 @@ async fn spawn_plugin_runner_at(
     server_port: u16,
     state_dir: Option<&Path>,
     diagnostic_tap: bool,
+    cancel: CancellationToken,
 ) -> Result<
     (
         tokio::task::JoinHandle<garter::Result<()>>,
@@ -234,7 +253,10 @@ async fn spawn_plugin_runner_at(
         plugin = plugin.pid_sink(sink);
     }
 
-    let cancel = CancellationToken::new();
+    // `cancel` is the externally-supplied child token from
+    // `start_plugin_chain`. Cancelling the bridge's start cancel cancels
+    // this token via the child link; PluginChain::Drop also cancels it
+    // (subtree-only) so the chain's RAII teardown stays self-contained.
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let env = garter::PluginEnv {
@@ -272,18 +294,29 @@ async fn spawn_plugin_runner_at(
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    let ready_addr = match tokio::time::timeout(READINESS_TIMEOUT, ready_rx).await {
-        Ok(Ok(addr)) => addr,
-        Ok(Err(_)) => {
-            cancel.cancel();
+    // Race readiness against the bridge cancel: if the user cancels the
+    // start mid-spawn, abort the partially-spawned chain and return
+    // ProxyError::Cancelled so the caller short-circuits cleanly instead
+    // of waiting up to READINESS_TIMEOUT for a chain it no longer wants.
+    let ready_addr = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
             handle.abort();
-            return Err(ProxyError::Plugin("plugin exited before becoming ready".into()));
+            return Err(ProxyError::Cancelled);
         }
-        Err(_) => {
-            cancel.cancel();
-            handle.abort();
-            return Err(ProxyError::Plugin("plugin did not become ready within 30s".into()));
-        }
+        r = tokio::time::timeout(READINESS_TIMEOUT, ready_rx) => match r {
+            Ok(Ok(addr)) => addr,
+            Ok(Err(_)) => {
+                cancel.cancel();
+                handle.abort();
+                return Err(ProxyError::Plugin("plugin exited before becoming ready".into()));
+            }
+            Err(_) => {
+                cancel.cancel();
+                handle.abort();
+                return Err(ProxyError::Plugin("plugin did not become ready within 30s".into()));
+            }
+        },
     };
 
     Ok((handle, cancel, ready_addr))
@@ -298,13 +331,20 @@ async fn spawn_plugin_runner_at(
 /// subprocess spawn. Stderr-based classification of subprocess bind
 /// failures is the follow-up tracked in bindreams/hole#304.
 ///
-/// `spawn_plugin_runner_at` only emits `ProxyError::Plugin`; the
-/// `unreachable!` arm is the contract guard. Future contributors who
-/// add new variants must update this site to map them appropriately.
+/// `spawn_plugin_runner_at` emits `ProxyError::Plugin` (subprocess
+/// failure paths) or `ProxyError::Cancelled` (bridge cancel observed
+/// mid-spawn, #397). Both surface as non-bind-race `io::Error::other`
+/// so `bind_ephemeral` propagates them immediately; the outer
+/// `start_plugin_chain` then distinguishes Cancelled via
+/// `cancel.is_cancelled()` to re-emit the canonical variant. The
+/// `unreachable!` arm is the contract guard for future variants.
 fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
     match e {
         ProxyError::Plugin(msg) => std::io::Error::other(msg),
-        other => unreachable!("spawn_plugin_runner_at only emits ProxyError::Plugin, got: {other}"),
+        ProxyError::Cancelled => std::io::Error::other("plugin spawn cancelled"),
+        other => {
+            unreachable!("spawn_plugin_runner_at only emits ProxyError::Plugin or ProxyError::Cancelled, got: {other}")
+        }
     }
 }
 
