@@ -93,6 +93,16 @@
 //! [`TCPIP_KEYWORDS`] — earlier versions of this module filtered at
 //! the kernel level and silently dropped events 1004 and 1077, both
 //! of which are critical to the #200 narrative.
+//!
+//! # AFD/WFP severity (bindreams/hole#393)
+//!
+//! Only TCPIP events get rich event-id-aware severity routing.
+//! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]
+//! until either provider grows a rich handler. The cross-provider
+//! event-id collisions (AFD `1002` and `1004` overlap TCPIP
+//! `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND`) made the original
+//! event-id-only match misclassify AFD background traffic as
+//! INFO-level TCPIP events — see [`dispatch`] for the provider gate.
 
 use dump::{dump, DeriveDump};
 use ferrisetw::parser::Parser;
@@ -565,12 +575,22 @@ pub(crate) fn dispatch(
         return None;
     }
 
-    if is_tcpip_provider(provider) && HIGH_VOLUME_TCPIP_EVENTS.contains(&event_id) {
+    // **Provider gate (bindreams/hole#393).** TCPIP, AFD, and WFP all
+    // recycle small event-id integers (1002, 1004, 1017, …), so a
+    // bare `match event_id` matches AFD events as if they were TCPIP
+    // `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND` / etc. and emits them
+    // at INFO. That was the source of the ~2000-line bridge-log
+    // flood in #393. AFD and WFP have no rich handlers yet, so they
+    // surface at DEBUG via `Emission::Unknown` until one exists.
+    if !is_tcpip_provider(provider) {
+        return Some(Emission::Unknown);
+    }
+
+    if HIGH_VOLUME_TCPIP_EVENTS.contains(&event_id) {
         return None;
     }
 
-    // TCPIP-specific severity rules. WFP + AFD currently use the generic
-    // info-with-event-id path; their rich decoding is a future iteration.
+    // TCPIP-specific severity rules.
     match event_id {
         tcpip_events::TCB_CONNECT_REQUESTED | tcpip_events::SEND_RETRANSMIT_ROUND
             if fields.rexmit_count.is_some_and(|n| n >= RETRANSMIT_WARN_THRESHOLD) =>
