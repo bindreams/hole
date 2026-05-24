@@ -15,6 +15,8 @@ import {
 } from "./connection-state";
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
+import { showToast } from "./toast";
+import { toggleFailureToast } from "./toggle-failure";
 import {
   type DiagnosticsData,
   LATENCY_VALIDATED_ON_CONNECT,
@@ -193,12 +195,16 @@ async function toggleFromIdle(goingToConnect: boolean) {
     // Best-effort cancel so the bridge doesn't finish the connect in
     // the background behind our back. Ignore the result.
     invoke("cancel_proxy").catch(() => {});
+    const spec = toggleFailureToast(raced, goingToConnect);
+    showToast(spec.message, spec.kind);
     setState(goingToConnect ? "connection-failed" : "disconnection-failed");
     return;
   }
 
   if (raced.kind === "err") {
     console.error("toggle_proxy failed:", raced.error);
+    const spec = toggleFailureToast(raced, goingToConnect);
+    showToast(spec.message, spec.kind);
     setState(goingToConnect ? "connection-failed" : "disconnection-failed");
     return;
   }
@@ -219,6 +225,8 @@ async function toggleFromIdle(goingToConnect: boolean) {
       setState(stateForToggleOutcome(stopOutcome));
     } catch (err) {
       console.error("follow-up stop failed:", err);
+      const spec = toggleFailureToast({ kind: "err", error: err }, /*goingToConnect=*/ false);
+      showToast(spec.message, spec.kind);
       setState("disconnection-failed");
     }
     updatePublicIp();
