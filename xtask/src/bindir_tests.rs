@@ -8,12 +8,23 @@ fn fake_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
-    // target/{debug,release}/hole{.exe}
+    // target/{debug,release}/hole{.exe} (+ debug symbols per platform).
+    // The PDB / dSYM is staged so panic backtraces resolve. See
+    // bindreams/hole#393.
     for profile in ["debug", "release"] {
         let target = root.join("target").join(profile);
         fs::create_dir_all(&target).unwrap();
         let name = if cfg!(windows) { "hole.exe" } else { "hole" };
         fs::write(target.join(name), b"fake hole binary").unwrap();
+
+        #[cfg(target_os = "windows")]
+        fs::write(target.join("hole.pdb"), b"fake pdb").unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let dsym = target.join("hole.dSYM").join("Contents");
+            fs::create_dir_all(&dsym).unwrap();
+            fs::write(dsym.join("Info.plist"), b"<plist/>").unwrap();
+        }
     }
 
     // .cache/v2ray-plugin/v2ray-plugin-<triple>{.exe} — exactly one match
@@ -63,6 +74,7 @@ fn bindir_contains_expected_files() {
         names,
         vec![
             "hole.exe",
+            "hole.pdb",
             "v2ray-plugin.exe",
             "galoshes.exe",
             "wintun.dll",
@@ -71,7 +83,10 @@ fn bindir_contains_expected_files() {
     );
 
     #[cfg(target_os = "macos")]
-    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes", "NOTICES.md"]);
+    assert_eq!(
+        names,
+        vec!["hole", "hole.dSYM", "v2ray-plugin", "galoshes", "NOTICES.md"]
+    );
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes", "NOTICES.md"]);
@@ -87,19 +102,27 @@ fn bindir_uses_correct_profile_dir() {
     let debug_hole = &debug_files[0];
     let release_hole = &release_files[0];
     assert!(
-        debug_hole.source.to_string_lossy().contains("debug"),
+        debug_hole.source.path().to_string_lossy().contains("debug"),
         "expected debug profile path, got {}",
-        debug_hole.source.display()
+        debug_hole.source.path().display()
     );
     assert!(
-        release_hole.source.to_string_lossy().contains("release"),
+        release_hole.source.path().to_string_lossy().contains("release"),
         "expected release profile path, got {}",
-        release_hole.source.display()
+        release_hole.source.path().display()
     );
 
-    // Sidecar paths are profile-independent (they live in .cache/, not target/)
-    let debug_sidecar = &debug_files[1];
-    let release_sidecar = &release_files[1];
+    // Sidecar paths are profile-independent (they live in .cache/, not target/).
+    // Look up by name rather than index because debug symbols (added in #393)
+    // shift the v2ray-plugin slot off index 1 on Windows/macOS.
+    let debug_sidecar = debug_files
+        .iter()
+        .find(|f| f.dest_name.starts_with("v2ray-plugin"))
+        .unwrap();
+    let release_sidecar = release_files
+        .iter()
+        .find(|f| f.dest_name.starts_with("v2ray-plugin"))
+        .unwrap();
     assert_eq!(debug_sidecar.source, release_sidecar.source);
 }
 

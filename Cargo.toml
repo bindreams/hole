@@ -44,3 +44,12 @@ contracts = "0.6"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
+
+# Release profile carries enough debug info for symbolicated panic
+# backtraces. Without this, `backtrace::Backtrace::force_capture()` in
+# `hole_common::logging::install_panic_hook` produces `<unknown>` frames
+# (the bridge.log panic in bindreams/hole#393). `"limited"` emits line
+# tables + function names, no types/locals — the right trade-off for
+# end-user crash reports vs PDB size.
+[profile.release]
+debug = "limited"

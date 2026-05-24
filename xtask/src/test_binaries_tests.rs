@@ -118,7 +118,7 @@ fn bindir_files_exe_only_when_no_pdb() {
     let files = bindir_files_for_artifact("hole_bridge.test.exe", &a);
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].dest_name, "hole_bridge.test.exe");
-    assert_eq!(files[0].source, exe);
+    assert_eq!(files[0].source.path(), exe.as_path());
 }
 
 #[cfg(windows)]
