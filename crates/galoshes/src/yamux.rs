@@ -436,11 +436,6 @@ impl YamuxPlugin {
             is_server,
         }
     }
-
-    pub fn from_plugin_options(options: Option<&str>) -> Self {
-        let is_server = options.map(|opts| opts.contains("server")).unwrap_or(false);
-        Self::new(is_server)
-    }
 }
 
 #[async_trait::async_trait]
