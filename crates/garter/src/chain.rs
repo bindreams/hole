@@ -11,6 +11,48 @@ use crate::shutdown;
 
 const MAX_PORT_RETRIES: usize = 3;
 
+/// Direction of the SIP003 chain.
+///
+/// In `Client` mode, the chain forwards data from `SS_LOCAL_*` (the SS
+/// client's listener) to `SS_REMOTE_*` (the SS server's public endpoint).
+/// Plugin position 0 listens on `SS_LOCAL`, position N-1 forwards to
+/// `SS_REMOTE`. This is what the SIP003 spec calls "client mode."
+///
+/// In `Server` mode, the chain forwards data from `SS_REMOTE_*` (the
+/// public-facing endpoint that external clients connect to) to
+/// `SS_LOCAL_*` (the local `ssserver` instance). The plugin chain is
+/// supplied in the SAME order in both modes (data-source-side first),
+/// but garter inverts the address walk and the `on_ready` probe target
+/// so position 0 forwards to `SS_LOCAL` and position N-1 listens on
+/// `SS_REMOTE`. This is what the SIP003 spec calls "server mode" and
+/// what `ssserver --plugin <chain-runner>` requires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Client,
+    Server,
+}
+
+impl Mode {
+    /// Derive the SIP003 chain mode from the `SS_PLUGIN_OPTIONS` string.
+    /// Returns [`Mode::Server`] if a `server` key is present in the
+    /// options (with or without a value), [`Mode::Client`] otherwise.
+    /// Uses the spec-correct key parser ([`crate::parse_plugin_options`]),
+    /// so options like `servername=cdn.example.com` correctly resolve to
+    /// client mode.
+    pub fn from_plugin_options(opts: Option<&str>) -> Self {
+        let Some(opts) = opts else { return Mode::Client };
+        if crate::sip003::parse_plugin_options(opts)
+            .iter()
+            .any(|(k, _)| k == "server")
+        {
+            Mode::Server
+        } else {
+            Mode::Client
+        }
+    }
+}
+
 /// Allocate `count` unique ephemeral ports on localhost.
 pub fn allocate_ports(count: usize) -> crate::Result<Vec<SocketAddr>> {
     let mut ports = Vec::with_capacity(count);
@@ -82,6 +124,7 @@ pub struct ChainRunner {
     drain_timeout: Duration,
     ready_tx: Option<oneshot::Sender<SocketAddr>>,
     external_cancel: Option<CancellationToken>,
+    mode: Mode,
 }
 
 impl Default for ChainRunner {
@@ -97,6 +140,7 @@ impl ChainRunner {
             drain_timeout: Duration::from_secs(5),
             ready_tx: None,
             external_cancel: None,
+            mode: Mode::default(),
         }
     }
 
@@ -149,6 +193,14 @@ impl ChainRunner {
         self
     }
 
+    /// Set the chain direction. See [`Mode`] for semantics.
+    ///
+    /// Default: [`Mode::Client`].
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// Run the full chain. Blocks until all plugins exit or shutdown is requested.
     #[debug_requires(!self.plugins.is_empty(), "chain must have at least one plugin")]
     pub async fn run(self, env: crate::sip003::PluginEnv) -> crate::Result<()> {
@@ -184,27 +236,44 @@ impl ChainRunner {
             });
         }
 
-        // Spawn all plugins
+        // Capture `Copy` field before the partial move below.
+        let mode = self.mode;
+
+        // Spawn all plugins. In Client mode, plugin i listens on addrs[i] and
+        // forwards to addrs[i+1]. In Server mode, the direction is inverted:
+        // plugin i listens on addrs[i+1] and forwards to addrs[i]. See `Mode`.
         let mut set = tokio::task::JoinSet::new();
         for (i, plugin) in self.plugins.into_iter().enumerate() {
-            let local = addrs[i];
-            let remote = addrs[i + 1];
+            let (local, remote) = match mode {
+                Mode::Client => (addrs[i], addrs[i + 1]),
+                Mode::Server => (addrs[i + 1], addrs[i]),
+            };
             let token = shutdown.child_token();
             let plugin_name = plugin.name().to_string();
 
-            let span = tracing::info_span!("plugin", name = %plugin_name, position = i);
+            let span = tracing::info_span!(
+                "plugin",
+                name = %plugin_name,
+                position = i,
+                chain_mode = ?mode,
+            );
             set.spawn(async move {
                 let result = plugin.run(local, remote, token).instrument(span).await;
                 (plugin_name, result)
             });
         }
 
-        // Readiness polling: probe the outermost local address until it accepts.
+        // Readiness polling: probe the public-facing local address. In Client
+        // mode that is the position-0 plugin (addrs[0] = SS_LOCAL); in Server
+        // mode it is the position-(N-1) plugin (addrs[n] = SS_REMOTE).
         if let Some(ready_tx) = self.ready_tx {
-            let local_addr = addrs[0];
+            let probe_addr = match mode {
+                Mode::Client => addrs[0],
+                Mode::Server => addrs[n],
+            };
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                if let Some(addr) = poll_ready(local_addr, shutdown).await {
+                if let Some(addr) = poll_ready(probe_addr, shutdown).await {
                     let _ = ready_tx.send(addr);
                 }
                 // If poll_ready returns None (shutdown before ready), ready_tx

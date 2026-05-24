@@ -1,5 +1,5 @@
 use garter::sip003::parse_plugin_options;
-use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = garter_bin::config::load_config(std::path::Path::new(&config_path))?;
     anyhow::ensure!(!cfg.chain.is_empty(), "chain config must have at least one plugin");
 
-    let mut runner = ChainRunner::new();
+    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
+    let mut runner = ChainRunner::new().mode(mode);
     for entry in cfg.chain {
         runner = runner.add(Box::new(BinaryPlugin::new(entry.plugin, entry.options.as_deref())));
     }

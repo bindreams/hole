@@ -24,25 +24,43 @@ byte-level diagnostics.
   for any `tokio::io::AsyncRead + AsyncWrite` stream.
 - **`parse_plugin_options`** — parses the SIP003 `;`-separated options
   string into a typed `HashMap`.
+- **`Mode`** — selects chain direction (`Client` / `Server`); see below.
+
+### Modes
+
+`ChainRunner` supports two SIP003 chain directions selected via
+`.mode(...)`:
+
+- `Mode::Client` (default) — data flows from the SS client's listener
+  (`SS_LOCAL_*`) through the chain to the SS server's public endpoint
+  (`SS_REMOTE_*`).
+- `Mode::Server` — data flows from the public-facing endpoint
+  (`SS_REMOTE_*`) through the chain back to a local `ssserver`
+  (`SS_LOCAL_*`). The plugin add-order stays the same in both modes
+  (data-source-side first); garter inverts the address wiring and the
+  `on_ready` probe target accordingly.
+
+Use `Mode::from_plugin_options(env.plugin_options.as_deref())` to derive
+the mode automatically from the SIP003 `server` keyword in
+`SS_PLUGIN_OPTIONS`.
 
 ## Example
 
 ```rust,no_run
-use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[tokio::main]
 async fn main() -> garter::Result<()> {
-    let env = PluginEnv {
-        remote_host: "203.0.113.1".into(),
-        remote_port: 8388,
-        local_host: "127.0.0.1".into(),
-        local_port: 0, // shadowsocks picks
-        options: String::new(),
-    };
+    let env = PluginEnv::from_env()?;
+    // Detect SIP003 chain mode from SS_PLUGIN_OPTIONS (`server` keyword
+    // = Server; default = Client). Same parse used by v2ray-plugin and
+    // other SIP003 plugins.
+    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
 
     let chain = ChainRunner::new()
-        .push(BinaryPlugin::new("v2ray-plugin", "host=example.com;tls"))
-        .push(BinaryPlugin::new("obfs-local", "obfs=tls"));
+        .mode(mode)
+        .add(Box::new(BinaryPlugin::new("v2ray-plugin", Some("host=example.com;tls"))))
+        .add(Box::new(BinaryPlugin::new("obfs-local", Some("obfs=tls"))));
 
     chain.run(env).await
 }

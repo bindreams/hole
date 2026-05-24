@@ -1,6 +1,6 @@
 #![cfg_attr(v2ray_plugin_missing, allow(dead_code, unused_imports))]
 
-use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[cfg(not(v2ray_plugin_missing))]
 const V2RAY_BYTES: &[u8] = include_bytes!(env!("V2RAY_PLUGIN_PATH"));
@@ -43,11 +43,12 @@ async fn main() -> anyhow::Result<()> {
 
     let verified = v2ray_binary.prepare()?;
 
-    let yamux_plugin = galoshes::yamux::YamuxPlugin::from_plugin_options(env.plugin_options.as_deref());
-
+    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
+    let yamux_plugin = galoshes::yamux::YamuxPlugin::new(mode == Mode::Server);
     let v2ray_plugin = BinaryPlugin::new(verified.exec_path(), env.plugin_options.as_deref());
 
     let runner = ChainRunner::new()
+        .mode(mode)
         .add(Box::new(yamux_plugin))
         .add(Box::new(v2ray_plugin));
 

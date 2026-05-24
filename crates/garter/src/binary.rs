@@ -7,8 +7,24 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::chain::Mode;
 use crate::plugin::ChainPlugin;
 use crate::shutdown;
+
+/// Resolved SIP003 environment-variable mapping for a `BinaryPlugin`'s
+/// child process. The plugin's `(local, remote)` from
+/// [`ChainPlugin::run`] is mapped here per the SIP003 spec: in client
+/// mode `local → SS_LOCAL_*` and `remote → SS_REMOTE_*`; in server mode
+/// the pair is swapped so the binary's own server-mode address swap
+/// (v2ray-plugin `parseEnv`, etc.) restores the chain's intended
+/// direction. See bindreams/hole#396 for the incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Sip003Env {
+    pub ss_local_host: String,
+    pub ss_local_port: u16,
+    pub ss_remote_host: String,
+    pub ss_remote_port: u16,
+}
 
 /// Callback invoked synchronously when a binary plugin process is spawned.
 /// Receives the child PID immediately after `Command::spawn()` returns,
@@ -41,6 +57,27 @@ impl BinaryPlugin {
         self.pid_sink = Some(sink);
         self
     }
+
+    /// Compute the SIP003 env-var mapping for `(local, remote)`. Public
+    /// to `crate` for testability; production callers use [`Self::run`]
+    /// which feeds this into `Command::env`. See [`Sip003Env`] for the
+    /// client/server semantics.
+    pub(crate) fn sip003_env(&self, local: SocketAddr, remote: SocketAddr) -> Sip003Env {
+        // In server mode the binary itself swaps SS_LOCAL/SS_REMOTE
+        // semantics (SS_REMOTE = inbound listener, SS_LOCAL = outbound
+        // dial). We swap here first so the binary's swap restores the
+        // direction we wanted.
+        let (ss_local, ss_remote) = match Mode::from_plugin_options(self.options.as_deref()) {
+            Mode::Client => (local, remote),
+            Mode::Server => (remote, local),
+        };
+        Sip003Env {
+            ss_local_host: ss_local.ip().to_string(),
+            ss_local_port: ss_local.port(),
+            ss_remote_host: ss_remote.ip().to_string(),
+            ss_remote_port: ss_remote.port(),
+        }
+    }
 }
 
 fn extract_name(path: &Path) -> String {
@@ -62,11 +99,12 @@ impl ChainPlugin for BinaryPlugin {
         remote: SocketAddr,
         shutdown: CancellationToken,
     ) -> crate::Result<()> {
+        let env = self.sip003_env(local, remote);
         let mut cmd = Command::new(&self.path);
-        cmd.env("SS_LOCAL_HOST", local.ip().to_string());
-        cmd.env("SS_LOCAL_PORT", local.port().to_string());
-        cmd.env("SS_REMOTE_HOST", remote.ip().to_string());
-        cmd.env("SS_REMOTE_PORT", remote.port().to_string());
+        cmd.env("SS_LOCAL_HOST", env.ss_local_host);
+        cmd.env("SS_LOCAL_PORT", env.ss_local_port.to_string());
+        cmd.env("SS_REMOTE_HOST", env.ss_remote_host);
+        cmd.env("SS_REMOTE_PORT", env.ss_remote_port.to_string());
         if let Some(ref opts) = self.options {
             cmd.env("SS_PLUGIN_OPTIONS", opts);
         }

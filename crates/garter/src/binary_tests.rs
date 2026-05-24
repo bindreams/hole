@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use crate::binary::BinaryPlugin;
 use crate::plugin::ChainPlugin;
 
@@ -18,4 +20,57 @@ fn binary_plugin_name_from_windows_path() {
 fn binary_plugin_with_options() {
     let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("tls;host=example.com"));
     assert_eq!(plugin.name(), "v2ray-plugin");
+}
+
+// SIP003 env-var direction tests ======================================================================================
+
+/// In Client mode (no `server` key in options) `BinaryPlugin` maps
+/// `local → SS_LOCAL_*` and `remote → SS_REMOTE_*`. This matches v2ray-plugin's
+/// client-mode interpretation: bind on SS_LOCAL, dial SS_REMOTE.
+#[skuld::test]
+fn sip003_env_client_mode_straight_through() {
+    let listen: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let dial: SocketAddr = "203.0.113.1:8388".parse().unwrap();
+    let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("tls;host=example.com"));
+    let env = plugin.sip003_env(listen, dial);
+    assert_eq!(env.ss_local_host, "127.0.0.1");
+    assert_eq!(env.ss_local_port, 9001);
+    assert_eq!(env.ss_remote_host, "203.0.113.1");
+    assert_eq!(env.ss_remote_port, 8388);
+}
+
+/// In Server mode (bare `server` key in options) `BinaryPlugin` must SWAP
+/// the env vars: `local → SS_REMOTE_*` and `remote → SS_LOCAL_*`. Reason:
+/// v2ray-plugin's server-mode `parseEnv` swaps SS_LOCAL/SS_REMOTE
+/// semantics again (SS_REMOTE = inbound listener, SS_LOCAL = outbound
+/// dial), so a double-swap restores the chain's intended direction.
+/// Without this swap the binary listens on `remote` and forwards to
+/// `local`, colliding with the previous chain link. See bindreams/hole#396.
+#[skuld::test]
+fn sip003_env_server_mode_swaps_addresses() {
+    let listen: SocketAddr = "[::]:80".parse().unwrap();
+    let dial: SocketAddr = "127.0.0.1:45589".parse().unwrap();
+    let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("server;host=example.com"));
+    let env = plugin.sip003_env(listen, dial);
+    // Swap: BinaryPlugin's `local` (where the chain wants the binary to
+    // bind, [::]:80) must reach v2ray-plugin as SS_REMOTE so its
+    // server-mode swap interprets it as the listen address.
+    assert_eq!(env.ss_remote_host, "::");
+    assert_eq!(env.ss_remote_port, 80);
+    assert_eq!(env.ss_local_host, "127.0.0.1");
+    assert_eq!(env.ss_local_port, 45589);
+}
+
+/// `server` keyword is detected by SIP003 key parser, not substring match.
+/// `servername=...` is NOT server mode.
+#[skuld::test]
+fn sip003_env_client_mode_when_options_only_have_servername() {
+    let listen: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let dial: SocketAddr = "203.0.113.1:8388".parse().unwrap();
+    let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("servername=cdn.example.com"));
+    let env = plugin.sip003_env(listen, dial);
+    assert_eq!(env.ss_local_host, "127.0.0.1");
+    assert_eq!(env.ss_local_port, 9001);
+    assert_eq!(env.ss_remote_host, "203.0.113.1");
+    assert_eq!(env.ss_remote_port, 8388);
 }

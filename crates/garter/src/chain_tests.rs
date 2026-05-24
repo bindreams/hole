@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -331,6 +332,262 @@ async fn cancel_token_triggers_graceful_shutdown() {
     // hangs and the test framework's timeout surfaces it.
     let result = handle.await.unwrap();
     assert!(result.is_ok(), "chain should exit Ok on external cancellation");
+}
+
+// Mode tests ==========================================================================================================
+
+/// Plugin that records its `(local, remote)` args and exits cleanly. Used
+/// to assert address wiring without doing real I/O. Backing storage is
+/// `Mutex<Option<(SocketAddr, SocketAddr)>>` initialized to `None` so a
+/// plugin that was never invoked is distinguishable from one whose
+/// recorded value happens to equal a sentinel; the assertion sites
+/// `.expect("...")` the `Option` before asserting the values.
+struct RecordingPlugin {
+    name: String,
+    record: Arc<Mutex<Option<(SocketAddr, SocketAddr)>>>,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for RecordingPlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        _shutdown: CancellationToken,
+    ) -> crate::Result<()> {
+        *self.record.lock().unwrap() = Some((local, remote));
+        Ok(())
+    }
+}
+
+#[skuld::test]
+async fn mode_default_is_client() {
+    // Pin behavioral default. If someone removes the `#[default]` on
+    // `Mode::Client`, this fails before any wiring-dependent test does.
+    assert_eq!(crate::chain::Mode::default(), crate::chain::Mode::Client);
+}
+
+#[skuld::test]
+async fn chain_runner_server_mode_inverts_address_wiring() {
+    let ss_local: SocketAddr = "127.0.0.1:11111".parse().unwrap();
+    let ss_remote_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let ss_remote: SocketAddr = format!("127.0.0.1:{ss_remote_port}").parse().unwrap();
+
+    let rec0 = Arc::new(Mutex::new(None));
+    let rec1 = Arc::new(Mutex::new(None));
+
+    let runner = ChainRunner::new()
+        .mode(crate::chain::Mode::Server)
+        .add(Box::new(RecordingPlugin {
+            name: "inner".into(),
+            record: rec0.clone(),
+        }))
+        .add(Box::new(RecordingPlugin {
+            name: "outer".into(),
+            record: rec1.clone(),
+        }));
+
+    let env = crate::sip003::PluginEnv {
+        local_host: ss_local.ip(),
+        local_port: ss_local.port(),
+        remote_host: "127.0.0.1".into(),
+        remote_port: ss_remote_port,
+        plugin_options: None,
+    };
+
+    runner.run(env).await.unwrap();
+
+    let (l0, r0) = rec0.lock().unwrap().expect("inner plugin must have been invoked");
+    let (l1, r1) = rec1.lock().unwrap().expect("outer plugin must have been invoked");
+
+    // Inner plugin (position 0) faces the ssserver side: forwards to SS_LOCAL.
+    assert_eq!(r0, ss_local, "inner plugin must forward to SS_LOCAL in Server mode");
+    // Outer plugin (position N-1) faces the public side: listens on SS_REMOTE.
+    assert_eq!(l1, ss_remote, "outer plugin must listen on SS_REMOTE in Server mode");
+    // Inner listens on the intermediate; outer forwards to the same intermediate.
+    assert_eq!(
+        l0, r1,
+        "shared intermediate must match between inner.local and outer.remote"
+    );
+    // Concretely: the intermediate is neither SS_LOCAL nor SS_REMOTE.
+    assert_ne!(l0, ss_local);
+    assert_ne!(l0, ss_remote);
+}
+
+#[skuld::test]
+async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
+    let (tx, rx) = oneshot::channel();
+    let listen_addr = allocate_ports(1).unwrap()[0];
+
+    // `ListeningPlugin` binds whatever `local` it is given. In Server mode
+    // the OUTER (position 1) plugin gets `local = SS_REMOTE`, so on_ready
+    // must probe THAT address. The probe's TCP-connect either succeeds
+    // (correct probe target) or never fires (wrong probe target — the
+    // test then hangs and skuld's runtime drop bounds it).
+    let runner = ChainRunner::new()
+        .mode(crate::chain::Mode::Server)
+        .add(Box::new(ListeningPlugin {
+            name: "inner-listener".into(),
+        }))
+        .add(Box::new(ListeningPlugin {
+            name: "outer-listener".into(),
+        }))
+        .on_ready(tx);
+
+    let ss_local_port = allocate_ports(1).unwrap()[0].port();
+    let env = crate::sip003::PluginEnv {
+        local_host: "127.0.0.1".parse().unwrap(),
+        local_port: ss_local_port,
+        remote_host: "127.0.0.1".into(),
+        remote_port: listen_addr.port(),
+        plugin_options: None,
+    };
+
+    let handle = tokio::spawn(runner.run(env));
+    let ready_addr = rx.await.expect("ready_tx dropped");
+    assert_eq!(
+        ready_addr.port(),
+        listen_addr.port(),
+        "on_ready in Server mode must probe SS_REMOTE (outer's local), not SS_LOCAL (inner's remote)"
+    );
+    handle.abort();
+}
+
+#[skuld::test]
+async fn chain_runner_default_matches_explicit_client_mode() {
+    let ss_local: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+    let ss_remote_port = allocate_ports(1).unwrap().pop().unwrap().port();
+    let ss_remote: SocketAddr = format!("127.0.0.1:{ss_remote_port}").parse().unwrap();
+
+    let rec_default = Arc::new(Mutex::new(None));
+    let rec_explicit = Arc::new(Mutex::new(None));
+
+    // Default: no .mode() call
+    let runner = ChainRunner::new().add(Box::new(RecordingPlugin {
+        name: "p".into(),
+        record: rec_default.clone(),
+    }));
+    let env = crate::sip003::PluginEnv {
+        local_host: ss_local.ip(),
+        local_port: ss_local.port(),
+        remote_host: "127.0.0.1".into(),
+        remote_port: ss_remote_port,
+        plugin_options: None,
+    };
+    runner.run(env).await.unwrap();
+
+    // Explicit Client
+    let runner = ChainRunner::new()
+        .mode(crate::chain::Mode::Client)
+        .add(Box::new(RecordingPlugin {
+            name: "p".into(),
+            record: rec_explicit.clone(),
+        }));
+    let env = crate::sip003::PluginEnv {
+        local_host: ss_local.ip(),
+        local_port: ss_local.port(),
+        remote_host: "127.0.0.1".into(),
+        remote_port: ss_remote_port,
+        plugin_options: None,
+    };
+    runner.run(env).await.unwrap();
+
+    let default_rec = rec_default
+        .lock()
+        .unwrap()
+        .expect("default plugin must have been invoked");
+    let explicit_rec = rec_explicit
+        .lock()
+        .unwrap()
+        .expect("explicit-Client plugin must have been invoked");
+
+    assert_eq!(
+        default_rec, explicit_rec,
+        "no .mode() call must behave identically to .mode(Mode::Client)"
+    );
+    // Pin the actual wiring values too, so a future bug where both modes
+    // accidentally got the same (inverted) wiring would be caught.
+    assert_eq!(
+        default_rec,
+        (ss_local, ss_remote),
+        "Client mode (default): position-0 plugin must listen on SS_LOCAL, forward to SS_REMOTE"
+    );
+}
+
+// Mode::from_plugin_options tests -------------------------------------------------------------------------------------
+
+#[skuld::test]
+async fn mode_from_plugin_options_detects_bare_server_keyword() {
+    use crate::chain::Mode;
+    assert_eq!(Mode::from_plugin_options(Some("server")), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server;path=/")), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("path=/;server;host=h")), Mode::Server);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_false_when_server_only_appears_as_substring() {
+    use crate::chain::Mode;
+    assert_eq!(
+        Mode::from_plugin_options(Some("servername=cdn.example.com")),
+        Mode::Client
+    );
+    assert_eq!(Mode::from_plugin_options(Some("path=/serverlist")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("path=/server")), Mode::Client);
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/serverlist;servername=foo")),
+        Mode::Client
+    );
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_false_when_options_missing() {
+    use crate::chain::Mode;
+    assert_eq!(Mode::from_plugin_options(None), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("")), Mode::Client);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_handles_mixed_options() {
+    use crate::chain::Mode;
+    // Realistic postern server-side `plugin_opts`:
+    // `server;fast-open;path=/t/<token>;host=<fqdn>`. See voyager2's
+    // postern/portal/src/postern/ss_config.py.
+    let opts = "server;fast-open;path=/t/abc123;host=hole-stgn.binarydreams.me";
+    assert_eq!(Mode::from_plugin_options(Some(opts)), Mode::Server);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_false_for_capitalized_keyword() {
+    use crate::chain::Mode;
+    // SIP003 keys are lowercase per v2ray-plugin convention; pin the
+    // case-sensitive behavior so a future "be lenient about case" patch
+    // is a conscious decision rather than drift.
+    assert_eq!(Mode::from_plugin_options(Some("Server")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("SERVER;path=/")), Mode::Client);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_true_when_key_has_value() {
+    use crate::chain::Mode;
+    // SIP003 convention treats `server` as a bare key, but v2ray-plugin's
+    // own parser uses `opts.Get("server")` which matches `server=value`
+    // (value ignored). Mirror that semantics: presence of the key triggers
+    // server mode regardless of value.
+    assert_eq!(Mode::from_plugin_options(Some("server=1;path=/")), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server=true")), Mode::Server);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_false_for_escaped_server() {
+    use crate::chain::Mode;
+    // `\s` is not a SIP003-recognized escape (only \;, \\, \= per
+    // parse_plugin_options). So `\server` parses as the literal
+    // string `\server` -- which is NOT the bare key `server`.
+    assert_eq!(Mode::from_plugin_options(Some(r"\server")), Mode::Client);
 }
 
 // Drain-timeout semantics tests =======================================================================================
