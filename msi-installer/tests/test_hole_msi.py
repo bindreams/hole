@@ -32,7 +32,10 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     relocated-extract test (#357) has files to find post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
-    for name in ("hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"):
+    # hole.pdb shipped alongside hole.exe for symbolicated panic
+    # backtraces — see bindreams/hole#393. Mirrors the bindir layout
+    # produced by `cargo xtask stage`.
+    for name in ("hole.exe", "hole.pdb", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"):
         (d / name).write_bytes(b"x" * 1024)
     return d
 
@@ -338,7 +341,7 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
-    payload_files = {"hole.exe", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"}
+    payload_files = {"hole.exe", "hole.pdb", "v2ray-plugin.exe", "wintun.dll", "NOTICES.md"}
     extracted = {p.name for p in extract_dir.rglob("*") if p.is_file() and p.name in payload_files}
     assert extracted == payload_files, (f"MSI extracted but expected payload missing: got {extracted}")
 

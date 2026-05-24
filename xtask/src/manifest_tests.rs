@@ -676,6 +676,10 @@ fn frontend_check_target_shape() {
                 command: "npm run check".to_string(),
                 environment: HashMap::new(),
             },
+            Step::Bash {
+                command: "npm test".to_string(),
+                environment: HashMap::new(),
+            },
         ]
     );
     // No `depends: frontend-build`. tsc reads source files directly; the

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -139,15 +140,84 @@ def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> No
 
 # Process management ===================================================================================================
 
+_ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 
-def prefix_stream(stream, label: str, color: str) -> None:
-    """Read lines from a stream and print them with a colored prefix."""
+
+def prefix_stream(
+    stream,
+    label: str,
+    color: str,
+    lock: threading.Lock,
+    *,
+    buffer_entries: bool,
+) -> None:
+    """Read lines from a stream and print them with a colored prefix.
+
+    Two modes:
+
+    - ``buffer_entries=True``: assume the stream emits structured
+      tracing entries that start with an ISO 8601 timestamp; any
+      continuation line (indented YAML body, stdlib panic frames, etc.)
+      is part of the previous entry. The whole entry is buffered and
+      flushed as a single atomic write under ``lock`` once the next
+      entry-start arrives — or on EOF — so other streams cannot
+      interleave their lines into the middle of a multi-line entry.
+      The panic backtrace in bindreams/hole#393 was the motivating
+      case: ``[client]`` log lines split the bridge's ``backtrace: |2``
+      block into pieces.
+
+    - ``buffer_entries=False``: each line is printed directly under
+      ``lock``. Used for streams that have no timestamp anchor (Vite),
+      where buffering would never see an entry-start and the stream's
+      output would never flush.
+
+    Tradeoff for the buffered mode: a quiet stream's last entry sits
+    in the buffer until the next entry-start arrives or EOF. In dev
+    the bridge has constant heartbeat traffic so latency is bounded;
+    the worst case (panic-then-exit) is bounded by subprocess EOF,
+    which triggers the final flush.
+    """
     prefix = f"{color}{BOLD}[{label}]{RESET} "
+
+    if not buffer_entries:
+        try:
+            for line in iter(stream.readline, ""):
+                with lock:
+                    print(f"{prefix}{line}", end="", flush=True)
+        except ValueError:
+            pass  # stream closed
+        return
+
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if not buffer:
+            return
+        joined = "".join(f"{prefix}{ln}" for ln in buffer)
+        with lock:
+            sys.stdout.write(joined)
+            sys.stdout.flush()
+        buffer.clear()
+
     try:
         for line in iter(stream.readline, ""):
-            print(f"{prefix}{line}", end="", flush=True)
+            if _ISO_TIMESTAMP_RE.match(line):
+                # New entry-start. Emit any previous entry, begin a new buffer.
+                flush()
+                buffer.append(line)
+            elif buffer:
+                # Continuation of the in-progress entry.
+                buffer.append(line)
+            else:
+                # Standalone line with no preceding entry — e.g. the
+                # raw stdlib panic message `thread '...' panicked at ...`
+                # printed by the default panic hook AFTER the tracing
+                # entry was already flushed. Emit immediately.
+                with lock:
+                    print(f"{prefix}{line}", end="", flush=True)
+        flush()
     except ValueError:
-        pass  # stream closed
+        flush()  # stream closed
 
 
 def wait_for_port(port: int, timeout: float, proc: subprocess.Popen) -> bool:
@@ -249,7 +319,10 @@ def terminate_tree(proc: subprocess.Popen) -> None:
             proc.terminate()
 
 
-def shutdown(procs: list[subprocess.Popen]) -> None:
+def shutdown(
+    procs: list[subprocess.Popen],
+    prefix_threads: list[threading.Thread] | None = None,
+) -> None:
     print(f"\n{BOLD}Shutting down...{RESET}")
     for proc in procs:
         terminate_tree(proc)
@@ -260,6 +333,17 @@ def shutdown(procs: list[subprocess.Popen]) -> None:
             # Tree-kill already used SIGKILL on Windows; on POSIX fall
             # back to per-process SIGKILL for any stragglers.
             proc.kill()
+
+    # Drain the prefix_stream readers so any entry buffered in-flight
+    # (the bridge's panic before exit, in particular — see bindreams/hole#393)
+    # gets flushed to the console. Each thread's natural exit happens
+    # quickly after its subprocess's stdout closes; the 5 s budget is
+    # the graceful-failure bound for the external readline returning
+    # (CLAUDE.md "external event with graceful failure bound" — the
+    # exception class for sync against an out-of-process I/O event).
+    if prefix_threads is not None:
+        for t in prefix_threads:
+            t.join(timeout=5)
 
 
 # Privilege drop =======================================================================================================
@@ -385,6 +469,8 @@ def main() -> None:
     print()
 
     procs: list[subprocess.Popen] = []
+    prefix_threads: list[threading.Thread] = []
+    print_lock = threading.Lock()
     done = threading.Event()
 
     try:
@@ -404,7 +490,16 @@ def main() -> None:
             **new_process_group_kwargs(),
         )
         procs.append(vite_proc)
-        threading.Thread(target=prefix_stream, args=(vite_proc.stdout, "  vite", YELLOW), daemon=True).start()
+        # Vite's output has no ISO timestamps; per-line emit avoids the
+        # buffer-never-flushes failure mode (see prefix_stream docstring).
+        t_vite = threading.Thread(
+            target=prefix_stream,
+            args=(vite_proc.stdout, "  vite", YELLOW, print_lock),
+            kwargs={"buffer_entries": False},
+            daemon=True,
+        )
+        t_vite.start()
+        prefix_threads.append(t_vite)
         threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
 
         if not wait_for_port(VITE_PORT, VITE_READY_TIMEOUT, vite_proc):
@@ -433,7 +528,16 @@ def main() -> None:
             **new_process_group_kwargs(),
         )
         procs.append(bridge_proc)
-        threading.Thread(target=prefix_stream, args=(bridge_proc.stdout, "bridge", CYAN), daemon=True).start()
+        # Bridge emits ISO-timestamped tracing entries; buffer multi-line
+        # entries so panic backtraces don't get split by [client] lines.
+        t_bridge = threading.Thread(
+            target=prefix_stream,
+            args=(bridge_proc.stdout, "bridge", CYAN, print_lock),
+            kwargs={"buffer_entries": True},
+            daemon=True,
+        )
+        t_bridge.start()
+        prefix_threads.append(t_bridge)
         threading.Thread(target=wait_for_exit, args=(bridge_proc, done), daemon=True).start()
 
         # Wait for the bridge to bind the socket before starting the GUI.
@@ -480,7 +584,15 @@ def main() -> None:
             **new_process_group_kwargs(),
         )
         procs.append(gui_proc)
-        threading.Thread(target=prefix_stream, args=(gui_proc.stdout, "client", MAGENTA), daemon=True).start()
+        # GUI also emits ISO-timestamped tracing entries.
+        t_client = threading.Thread(
+            target=prefix_stream,
+            args=(gui_proc.stdout, "client", MAGENTA, print_lock),
+            kwargs={"buffer_entries": True},
+            daemon=True,
+        )
+        t_client.start()
+        prefix_threads.append(t_client)
         threading.Thread(target=wait_for_exit, args=(gui_proc, done), daemon=True).start()
 
         # Block until any process exits or Ctrl+C.
@@ -503,7 +615,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        shutdown(procs)
+        shutdown(procs, prefix_threads)
 
 
 if __name__ == "__main__":

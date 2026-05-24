@@ -6,16 +6,31 @@
 use super::*;
 use dump::dump;
 
-// Zeroed GUID — matches no subscribed provider, used where the test is
-// about PID filtering or severity rules and not provider-scoped filters.
+// Zeroed GUID — matches no subscribed provider. Useful only for
+// "non-TCPIP" tests since the dispatch provider gate (#393) routes
+// anything not-TCPIP to `Emission::Unknown` regardless of event-id.
 fn any_guid() -> GUID {
     GUID::from_u128(0)
 }
 
-/// TCPIP provider GUID, used by tests that check the
-/// [`HIGH_VOLUME_TCPIP_EVENTS`] drop list (which only fires for TCPIP).
+/// TCPIP provider GUID, used by tests that exercise TCPIP-specific
+/// severity routing (which is the only path that distinguishes
+/// event-ids — see [`dispatch`]).
 fn tcpip_guid() -> GUID {
     GUID::from(TCPIP_PROVIDER)
+}
+
+/// Winsock-AFD provider GUID. Used by tests that verify AFD events
+/// with TCPIP-colliding IDs (1002, 1004, …) are not misclassified as
+/// TCPIP per the provider gate added in bindreams/hole#393.
+fn afd_guid() -> GUID {
+    GUID::from(AFD_PROVIDER)
+}
+
+/// Microsoft-Windows-WFP provider GUID. Symmetric with `afd_guid()`
+/// for WFP coverage.
+fn wfp_guid() -> GUID {
+    GUID::from(WFP_PROVIDER)
 }
 
 const BRIDGE_PID: u32 = 12345;
@@ -38,7 +53,7 @@ fn dispatch_ignores_non_bridge_pid() {
 #[skuld::test]
 fn dispatch_emits_for_matching_pid() {
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::CONNECT_COMPLETED,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -52,7 +67,7 @@ fn dispatch_emits_for_matching_pid() {
 #[skuld::test]
 fn dispatch_tcp_connect_completed_is_info() {
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::CONNECT_COMPLETED,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -64,7 +79,7 @@ fn dispatch_tcp_connect_completed_is_info() {
 #[skuld::test]
 fn dispatch_tcp_connect_request_timeout_is_warn() {
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::CONNECT_REQUEST_TIMEOUT,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -76,7 +91,7 @@ fn dispatch_tcp_connect_request_timeout_is_warn() {
 #[skuld::test]
 fn dispatch_tcp_retransmit_timeout_is_warn() {
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::RETRANSMIT_TIMEOUT,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -88,7 +103,7 @@ fn dispatch_tcp_retransmit_timeout_is_warn() {
 #[skuld::test]
 fn dispatch_tcp_abort_issued_is_warn() {
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::ABORT_ISSUED,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -106,7 +121,7 @@ fn dispatch_retransmit_count_lt_threshold_is_info() {
         ..Default::default()
     };
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::SEND_RETRANSMIT_ROUND,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -126,7 +141,7 @@ fn dispatch_retransmit_count_at_threshold_is_warn() {
         ..Default::default()
     };
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::SEND_RETRANSMIT_ROUND,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -146,7 +161,7 @@ fn dispatch_retransmit_count_gt_threshold_is_warn() {
         ..Default::default()
     };
     let got = dispatch(
-        any_guid(),
+        tcpip_guid(),
         tcpip_events::TCB_CONNECT_REQUESTED,
         BRIDGE_PID,
         BRIDGE_PID,
@@ -158,10 +173,57 @@ fn dispatch_retransmit_count_gt_threshold_is_warn() {
 // Unknown events ======================================================================================================
 
 #[skuld::test]
-fn dispatch_unknown_event_id_returns_unknown() {
+fn dispatch_unknown_event_id_from_tcpip_returns_unknown() {
+    // TCPIP event with an ID outside the rich-handler table falls through
+    // the match arm to Emission::Unknown.
+    let got = dispatch(
+        tcpip_guid(),
+        /*event_id=*/ 65500, // deliberately outside the known-IDs block
+        BRIDGE_PID,
+        BRIDGE_PID,
+        &ParsedFields::default(),
+    );
+    assert_eq!(got, Some(Emission::Unknown));
+}
+
+// Provider gate (bindreams/hole#393) ==================================================================================
+
+#[skuld::test]
+fn dispatch_afd_with_tcpip_colliding_id_returns_unknown() {
+    // AFD event-id 1004 is TCB_SYN_SEND under TCPIP. Without the
+    // provider gate, AFD would emit at INFO under "tcp event". With the
+    // gate, AFD short-circuits to DEBUG-level Unknown.
+    let got = dispatch(
+        afd_guid(),
+        tcpip_events::TCB_SYN_SEND,
+        BRIDGE_PID,
+        BRIDGE_PID,
+        &ParsedFields::default(),
+    );
+    assert_eq!(got, Some(Emission::Unknown));
+}
+
+#[skuld::test]
+fn dispatch_wfp_with_tcpip_colliding_id_returns_unknown() {
+    // Symmetric coverage for WFP. WFP event-id 1002 (whatever it means
+    // semantically) must not be misclassified as TCPIP
+    // TCB_CONNECT_REQUESTED.
+    let got = dispatch(
+        wfp_guid(),
+        tcpip_events::TCB_CONNECT_REQUESTED,
+        BRIDGE_PID,
+        BRIDGE_PID,
+        &ParsedFields::default(),
+    );
+    assert_eq!(got, Some(Emission::Unknown));
+}
+
+#[skuld::test]
+fn dispatch_unknown_provider_returns_unknown() {
+    // Zero GUID is not subscribed; same short-circuit as AFD/WFP.
     let got = dispatch(
         any_guid(),
-        /*event_id=*/ 65500, // deliberately outside the known-IDs block
+        tcpip_events::CONNECT_COMPLETED,
         BRIDGE_PID,
         BRIDGE_PID,
         &ParsedFields::default(),
@@ -184,15 +246,17 @@ fn dispatch_drops_high_volume_tcpip_events() {
 }
 
 #[skuld::test]
-fn dispatch_keeps_high_volume_event_ids_on_non_tcpip_providers() {
-    // Event IDs collide across providers; a high-volume TCPIP event ID
-    // from AFD or WFP must not be dropped.
+fn dispatch_non_tcpip_provider_with_high_volume_id_short_circuits_to_unknown() {
+    // Event IDs collide across providers, but with the #393 provider
+    // gate the AFD/WFP short-circuit fires BEFORE the drop list is
+    // consulted. Either way the user-visible effect is the same: no
+    // INFO spam from non-TCPIP background traffic.
     for &id in HIGH_VOLUME_TCPIP_EVENTS {
-        let got = dispatch(any_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        let got = dispatch(afd_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
         assert_eq!(
             got,
             Some(Emission::Unknown),
-            "event_id={id} from non-TCPIP provider should fall through to Unknown, got {got:?}"
+            "AFD event_id={id} should short-circuit to Unknown, got {got:?}"
         );
     }
 }

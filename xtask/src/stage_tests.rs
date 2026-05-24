@@ -1,4 +1,4 @@
-use crate::bindir::BindirFile;
+use crate::bindir::{BindirFile, BindirSource};
 use crate::stage::stage;
 use std::fs;
 
@@ -60,6 +60,76 @@ fn stage_errors_when_source_missing() {
     assert!(
         msg.contains("does not exist") && msg.contains("hole.exe"),
         "expected missing-source error, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn stage_recursively_copies_directory_bundle() {
+    // Directory-bundle support was added for macOS `.dSYM` in
+    // bindreams/hole#393. Verify the recursion preserves nested
+    // structure.
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let bundle = src_dir.path().join("hole.dSYM");
+    fs::create_dir_all(bundle.join("Contents").join("Resources").join("DWARF")).unwrap();
+    fs::write(bundle.join("Contents").join("Info.plist"), b"<plist/>").unwrap();
+    fs::write(
+        bundle.join("Contents").join("Resources").join("DWARF").join("hole"),
+        b"dwarf",
+    )
+    .unwrap();
+
+    let files = vec![BindirFile::directory(bundle, "hole.dSYM")];
+    stage(dst_dir.path(), &files).unwrap();
+
+    let staged = dst_dir.path().join("hole.dSYM");
+    assert!(staged.is_dir());
+    assert_eq!(
+        fs::read(staged.join("Contents").join("Info.plist")).unwrap(),
+        b"<plist/>"
+    );
+    assert_eq!(
+        fs::read(staged.join("Contents").join("Resources").join("DWARF").join("hole")).unwrap(),
+        b"dwarf"
+    );
+}
+
+#[skuld::test]
+fn stage_directory_replaces_existing_bundle() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+
+    let bundle = src_dir.path().join("hole.dSYM");
+    fs::create_dir(&bundle).unwrap();
+    fs::write(bundle.join("new.txt"), b"new").unwrap();
+
+    // Pre-existing destination bundle with stale file — must be wiped
+    // before the new tree is copied in.
+    let stale = dst_dir.path().join("hole.dSYM");
+    fs::create_dir(&stale).unwrap();
+    fs::write(stale.join("stale.txt"), b"stale").unwrap();
+
+    let files = vec![BindirFile::directory(bundle, "hole.dSYM")];
+    stage(dst_dir.path(), &files).unwrap();
+
+    // Stale file is gone, new file is present.
+    assert!(!stale.join("stale.txt").exists(), "stale file should have been removed");
+    assert_eq!(fs::read(stale.join("new.txt")).unwrap(), b"new");
+}
+
+#[skuld::test]
+fn stage_errors_when_directory_source_missing() {
+    let dst_dir = tempfile::tempdir().unwrap();
+    let files = vec![BindirFile {
+        source: BindirSource::Directory(std::path::PathBuf::from("/no/such/bundle.dSYM")),
+        dest_name: "bundle.dSYM".to_string(),
+    }];
+    let err = stage(dst_dir.path(), &files).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does not exist") && msg.contains("bundle.dSYM"),
+        "expected missing-directory error, got: {msg}"
     );
 }
 

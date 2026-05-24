@@ -13,19 +13,53 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::Profile;
 
-/// One file that must end up in BINDIR alongside the bridge binary.
+/// Source kind for a BINDIR entry. Files use hard-link-then-copy;
+/// directory bundles (macOS `.dSYM`) recurse a copy. Introduced for
+/// bindreams/hole#393 so panic-backtrace symbols ship on both
+/// platforms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindirSource {
+    /// Single regular file. Staged via hard-link with copy fallback.
+    File(PathBuf),
+    /// Directory bundle. Staged via recursive copy. Used for macOS
+    /// `.dSYM` bundles; hard-link doesn't apply at the directory
+    /// level, and even if it did, Finder/Spotlight expect a real
+    /// directory tree.
+    Directory(PathBuf),
+}
+
+impl BindirSource {
+    pub fn path(&self) -> &Path {
+        match self {
+            BindirSource::File(p) | BindirSource::Directory(p) => p,
+        }
+    }
+}
+
+/// One file or bundle that must end up in BINDIR alongside the bridge
+/// binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindirFile {
-    /// Absolute source path on disk.
-    pub source: PathBuf,
+    /// Absolute source path on disk and its kind.
+    pub source: BindirSource,
     /// Filename to use in the destination directory (no path components).
     pub dest_name: String,
 }
 
 impl BindirFile {
+    /// Construct a file entry — the common case. Equivalent to
+    /// `BindirSource::File(source)`.
     pub fn new(source: PathBuf, dest_name: impl Into<String>) -> Self {
         Self {
-            source,
+            source: BindirSource::File(source),
+            dest_name: dest_name.into(),
+        }
+    }
+
+    /// Construct a directory-bundle entry (macOS `.dSYM`, etc.).
+    pub fn directory(source: PathBuf, dest_name: impl Into<String>) -> Self {
+        Self {
+            source: BindirSource::Directory(source),
             dest_name: dest_name.into(),
         }
     }
@@ -45,6 +79,29 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     let hole_name = format!("hole{exe_suffix}");
     let hole_src = repo_root.join("target").join(profile.dir_name()).join(&hole_name);
     files.push(BindirFile::new(hole_src, hole_name));
+
+    // 1a. Debug symbols for `hole` — staged alongside the binary so panic
+    //     backtraces in dev (`scripts/dev.py`) and production (the MSI)
+    //     resolve frame names and line numbers. Without these, the panic
+    //     hook at `crates/common/src/logging.rs::install_panic_hook` renders
+    //     every frame as `<unknown>`. See bindreams/hole#393.
+    //
+    //     The workspace `[profile.release].debug = "limited"` guarantees the
+    //     PDB/dSYM exists for release builds (cargo's default is `false`).
+    //     Debug builds already emit full debug info.
+    #[cfg(target_os = "windows")]
+    {
+        // MSVC emits the binary's PDB next to the .exe.
+        let pdb_src = repo_root.join("target").join(profile.dir_name()).join("hole.pdb");
+        files.push(BindirFile::new(pdb_src, "hole.pdb".to_string()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Cargo's macOS `split-debuginfo = "unpacked"` (release default)
+        // emits a `.dSYM` bundle at the same level as the binary.
+        let dsym_src = repo_root.join("target").join(profile.dir_name()).join("hole.dSYM");
+        files.push(BindirFile::directory(dsym_src, "hole.dSYM".to_string()));
+    }
 
     // 2. v2ray-plugin sidecar. Built by `cargo xtask v2ray-plugin` into
     //    `.cache/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}`. The

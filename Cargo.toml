@@ -44,3 +44,25 @@ contracts = "0.6"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
+
+# Symbolicated panic backtraces. Without these settings,
+# `backtrace::Backtrace::force_capture()` in
+# `hole_common::logging::install_panic_hook` produces `<unknown>` frames
+# (the bridge.log panic in bindreams/hole#393).
+#
+# - `debug = "limited"` (release only) — emits line tables + function
+#   names without types/locals. Cargo's release default is `false` which
+#   strips everything.
+# - `split-debuginfo = "packed"` — bundles debug info into a separate
+#   `.pdb` (MSVC, already the platform default) or `.dSYM` (macOS, the
+#   non-default). The cargo macOS dev default is `"unpacked"`, which
+#   leaves debug info in per-crate `.o` files referenced by the binary
+#   — so a binary copied out of `target/<profile>/` to a staging dir
+#   has no resolvable debug info. `"packed"` produces a self-contained
+#   `hole.dSYM` bundle that travels with the binary via `bindir_files`.
+[profile.dev]
+split-debuginfo = "packed"
+
+[profile.release]
+debug = "limited"
+split-debuginfo = "packed"

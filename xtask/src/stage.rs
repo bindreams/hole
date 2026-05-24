@@ -14,24 +14,13 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::bindir::BindirFile;
+use crate::bindir::{BindirFile, BindirSource};
 
 /// Stage `files` into `out_dir`. Creates `out_dir` if missing.
 pub fn stage(out_dir: &Path, files: &[BindirFile]) -> Result<()> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("failed to create out_dir {}", out_dir.display()))?;
 
     for f in files {
-        // Validate the source exists with a clear error message — much more
-        // useful than the cryptic "No such file or directory" you'd get
-        // from std::fs::hard_link.
-        if !f.source.is_file() {
-            return Err(anyhow!(
-                "BINDIR source file does not exist: {}\n\
-                 Run `cargo build` (and, post-Commit-4, `cargo xtask deps`) first.",
-                f.source.display()
-            ));
-        }
-
         // Reject any dest_name with path separators — defense against future
         // edits to bindir_files() introducing nested layouts that the consumers
         // wouldn't handle.
@@ -44,25 +33,103 @@ pub fn stage(out_dir: &Path, files: &[BindirFile]) -> Result<()> {
 
         let dest = out_dir.join(&f.dest_name);
 
-        // Remove any pre-existing file at the destination so hard_link can
-        // succeed (it errors if the destination exists). This matches what
-        // shutil.copy2 and the existing link_or_copy helper do implicitly.
-        if dest.exists() {
-            std::fs::remove_file(&dest)
-                .with_context(|| format!("failed to remove pre-existing dest {}", dest.display()))?;
-        }
-
-        match std::fs::hard_link(&f.source, &dest) {
-            Ok(()) => {}
-            Err(_) => {
-                // Hardlink failed (cross-device, permissions, etc.). Fall back
-                // to a copy. We deliberately do not log the hardlink error —
-                // it's expected on a fresh dev temp dir on a different volume.
-                std::fs::copy(&f.source, &dest)
-                    .with_context(|| format!("failed to copy {} to {}", f.source.display(), dest.display()))?;
-            }
+        match &f.source {
+            BindirSource::File(src) => stage_file(src, &dest)?,
+            BindirSource::Directory(src) => stage_directory(src, &dest)?,
         }
     }
 
+    Ok(())
+}
+
+fn stage_file(src: &Path, dest: &Path) -> Result<()> {
+    // Validate the source exists with a clear error message — much more
+    // useful than the cryptic "No such file or directory" you'd get
+    // from std::fs::hard_link.
+    if !src.is_file() {
+        return Err(anyhow!(
+            "BINDIR source file does not exist: {}\n\
+             Run `cargo build` (and `cargo xtask deps`) first.",
+            src.display()
+        ));
+    }
+
+    // Remove any pre-existing file at the destination so hard_link can
+    // succeed (it errors if the destination exists). This matches what
+    // shutil.copy2 and the existing link_or_copy helper do implicitly.
+    if dest.exists() {
+        std::fs::remove_file(dest).with_context(|| format!("failed to remove pre-existing dest {}", dest.display()))?;
+    }
+
+    match std::fs::hard_link(src, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Hardlink failed (cross-device, permissions, etc.). Fall back
+            // to a copy. We deliberately do not log the hardlink error —
+            // it's expected on a fresh dev temp dir on a different volume.
+            std::fs::copy(src, dest)
+                .map(|_| ())
+                .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))
+        }
+    }
+}
+
+/// Recursively copy `src` directory into `dest`. Used for macOS `.dSYM`
+/// bundles. Hard-link is not attempted — these bundles are needed as
+/// real directory trees for Spotlight/Finder/lldb.
+///
+/// The recursion is depth-first, idempotent (pre-existing `dest` is
+/// removed first), and propagates the first I/O error encountered.
+fn stage_directory(src: &Path, dest: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Err(anyhow!(
+            "BINDIR source directory does not exist: {}\n\
+             Run `cargo build` (and `cargo xtask deps`) first.",
+            src.display()
+        ));
+    }
+
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)
+            .with_context(|| format!("failed to remove pre-existing dest {}", dest.display()))?;
+    }
+
+    copy_dir_recursive(src, dest)
+        .with_context(|| format!("failed to copy directory {} to {}", src.display(), dest.display()))
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_symlink() {
+            // Preserve symlinks within the bundle (rare but possible
+            // inside dSYM/Versions/). On Windows symlinks may fail
+            // without elevation; fall back to a regular copy of the
+            // target so we still produce a usable bundle.
+            let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Resolve the symlink and copy its target as a regular file.
+                let resolved = if target.is_absolute() {
+                    target
+                } else {
+                    from.parent().unwrap_or(src).join(&target)
+                };
+                std::fs::copy(&resolved, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
     Ok(())
 }
