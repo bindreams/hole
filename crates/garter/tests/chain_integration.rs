@@ -172,6 +172,81 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     let _ = handle.await;
 }
 
+/// Server-mode counterpart to `two_plugin_chain_relays_data`. In server
+/// mode, the chain runs in reverse: an external client connects to the
+/// "public" port (SS_REMOTE), data flows through the chain in the
+/// opposite direction to the "ssserver-stand-in" echo at SS_LOCAL.
+/// Uses the existing `mock-plugin` binary because it is direction-symmetric
+/// — bind `local`, connect to `remote` — and works for both modes once
+/// `ChainRunner` wires the addresses correctly.
+#[skuld::test]
+async fn two_plugin_chain_server_mode_relays_data() {
+    let mock_path = mock_plugin_path();
+
+    // Echo plays the ssserver role -- runs at SS_LOCAL.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    // Public-facing port (SS_REMOTE): in server mode the chain LISTENS here.
+    let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_addr = public_listener.local_addr().unwrap();
+    drop(public_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .mode(garter::Mode::Server)
+        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
+        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: echo_addr.ip(), // SS_LOCAL = ssserver-stand-in
+        local_port: echo_addr.port(),
+        remote_host: public_addr.ip().to_string(), // SS_REMOTE = public port
+        remote_port: public_addr.port(),
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    // on_ready fires when the OUTER plugin has bound the public port.
+    let ready_addr = ready_rx.await.expect("chain never signaled ready");
+    assert_eq!(
+        ready_addr.port(),
+        public_addr.port(),
+        "on_ready in Server mode must report SS_REMOTE (the public port)"
+    );
+
+    // External client connects to the public port; data round-trips
+    // through the chain to the echo and back.
+    let mut client = TcpStream::connect(public_addr).await.expect("connect to public");
+    client.write_all(b"hello server-mode chain").await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"hello server-mode chain");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
 // Install the workspace test subscriber + panic hook. See
 // `crates/test-observability/` and bindreams/hole#301.
 hole_test_observability::register!();
