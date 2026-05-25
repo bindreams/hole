@@ -221,6 +221,8 @@ async fn maybe_start_plugin(
     // would add noise without value here.
     // server_test is a one-shot probe with no caller-side cancel; pass a
     // never-signalled token so the chain runs to its natural conclusion.
+    #[allow(clippy::disallowed_methods)]
+    // One-shot CLI probe: no caller-side cancel exists. See clippy.toml CancellationToken::new rule.
     let chain_cancel = CancellationToken::new();
     let chain = crate::proxy::plugin::start_plugin_chain(
         plugin_name,

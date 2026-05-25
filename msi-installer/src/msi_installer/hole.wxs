@@ -27,6 +27,32 @@
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
+    <!-- Windows-version floor: Hole's DNS bridge uses
+         `SetInterfaceDnsSettings` (added in Windows 10 build 19041 /
+         version 2004, May 2020) instead of the netsh subprocess chain.
+         The Win32 FFI is ~10× faster than netsh and unlike netsh is
+         cooperatively cancellable mid-apply, which is what fixes the
+         "3-click misery" symptom on Defender-active machines.
+         `SetInterfaceDnsSettings` is missing on Windows 10 LTSC 2019,
+         Server 2019, and any pre-2004 build — the launch condition
+         refuses cleanly rather than failing at first proxy-start.
+
+         `CurrentBuildNumber` is `REG_SZ`; WiX/MSI's expression
+         evaluator coerces numeric strings to integers when both sides
+         look numeric. `WIN10BUILD >= 19041` (no quotes around 19041)
+         is therefore an integer comparison. See bindreams/hole#397. -->
+    <Property Id="WIN10BUILD">
+      <RegistrySearch
+        Id="Win10BuildSearch"
+        Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        Name="CurrentBuildNumber"
+        Type="raw" />
+    </Property>
+    <Launch
+      Condition="Installed OR WIN10BUILD &gt;= 19041"
+      Message="Hole requires Windows 10 version 2004 (May 2020) or later. SetInterfaceDnsSettings is unavailable on older builds." />
+
     <!-- Embed cabinets inside the .msi so the installer is one self-contained
          file. WiX v4+ defaults to EmbedCab="no" (external cabs) when this
          element is omitted; that made v0.1.0 unusable (#357). -->

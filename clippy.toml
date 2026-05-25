@@ -141,3 +141,42 @@ allow-invalid = true  # only `hole-bridge` has the `Win32_NetworkManagement_IpHe
 path = "windows::Win32::NetworkManagement::IpHelper::GetInterfaceDnsSettings"
 reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
 allow-invalid = true
+
+# Bridge cancellation contract (bindreams/hole#397) --------------------------------------------------------------------
+#
+# Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
+# the cooperative-cancellation propagation that the #397 refactor put
+# in place: a bridge cancel signal from the user's "Cancel" button
+# travels from `ipc.rs::handle_start`'s root token down through every
+# phase of `proxy_manager::start_inner` via `child_token()`. Any fresh
+# token rooted elsewhere is unreachable from that root, and any
+# in-flight work observing only that fresh token cannot be preempted.
+# The historical regression at `plugin.rs:237` (a fresh token shadowing
+# the bridge cancel during plugin-chain spawn) is the case this rule
+# guards against.
+#
+# Sanctioned suppressions, each with a per-call-site
+# `#[allow(clippy::disallowed_methods)]` plus comment citing this rule:
+#
+# 1. `crates/bridge/src/ipc.rs::handle_start` — the IPC root. Every
+#    bridge cancel scope descends from this one token.
+# 2. `crates/bridge/src/dispatcher.rs::Dispatcher::new` — the
+#    Dispatcher owns its own subsystem cancel scope tied to its
+#    lifecycle (started in `new`, cancelled in `shutdown`); it is not
+#    a child of the start-cancel.
+# 3. `crates/bridge/src/proxy_manager.rs::ProxyManager::start` — the
+#    non-cancellable convenience shim that explicitly creates a fresh
+#    never-signalled token because the caller (tests, `reload`) does
+#    not want cancel semantics.
+# 4. `crates/bridge/src/server_test.rs` — the one-shot `test-server`
+#    CLI probe, no caller-side cancel; never-signalled token by design.
+#
+# Test files use module-level `#![allow(clippy::disallowed_methods)]`
+# because `CancellationToken::new` is pervasive there as the test
+# harness's root signal and per-call suppressions would dominate the
+# file. The module-level shape is `#![allow(...)]` near the top with a
+# comment citing this rule.
+
+[[disallowed-methods]]
+path = "tokio_util::sync::CancellationToken::new"
+reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy_manager.rs::ProxyManager::start`, `server_test.rs`. Test files use module-level `#![allow]`. See bindreams/hole#397."

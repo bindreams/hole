@@ -6,6 +6,11 @@
 //! Rust `StubPlugin`s, which is faster but doesn't verify
 //! Apache-2.0-process-boundary behavior.
 
+// `CancellationToken::new` is the cancel-test harness root; module-level
+// allow per the hole workspace clippy.toml's "Bridge cancellation contract"
+// sanctioned-test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

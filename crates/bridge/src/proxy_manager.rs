@@ -241,7 +241,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// existing callers (tests, `reload`) that don't need cancel
     /// semantics.
     pub async fn start(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
-        self.start_cancellable(config, CancellationToken::new()).await
+        #[allow(clippy::disallowed_methods)]
+        // Non-cancellable shim: callers explicitly opt out of cancel semantics. See clippy.toml CancellationToken::new rule.
+        let token = CancellationToken::new();
+        self.start_cancellable(config, token).await
     }
 
     /// Start the proxy with a caller-supplied `CancellationToken`.

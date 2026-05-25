@@ -1,3 +1,8 @@
+// `CancellationToken::new` is the cancel-test harness root; module-level
+// allow per clippy.toml's "Bridge cancellation contract" sanctioned-
+// test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use tokio_util::sync::CancellationToken;
 
 use super::start_plugin_chain;

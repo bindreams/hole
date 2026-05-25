@@ -232,6 +232,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // without even attempting the start. If a concurrent start is already
     // in flight, reject this one — the slot is single-occupancy because a
     // Cancel targets exactly one in-flight start.
+    #[allow(clippy::disallowed_methods)]
+    // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");

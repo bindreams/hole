@@ -13,6 +13,11 @@
 //! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
 
+// `CancellationToken::new` is the cancel-test harness root; module-level
+// allow per the hole workspace clippy.toml's "Bridge cancellation contract"
+// sanctioned-test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

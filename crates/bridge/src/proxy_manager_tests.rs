@@ -1,3 +1,8 @@
+// `CancellationToken::new` is pervasive across these tests as the test
+// harness's root signal; module-level allow per clippy.toml's
+// "Bridge cancellation contract" sanctioned-test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use hole_common::config::ServerEntry;

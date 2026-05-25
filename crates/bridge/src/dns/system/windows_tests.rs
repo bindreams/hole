@@ -5,6 +5,11 @@
 //! [`MockBackend`] to verify cancel-aware behavior in
 //! [`crate::dns::system::SystemDns::apply`] without touching the OS.
 
+// `CancellationToken::new` is the cancel-test harness root; module-level
+// allow per clippy.toml's "Bridge cancellation contract" sanctioned-
+// test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};

@@ -1,3 +1,8 @@
+// `CancellationToken::new` is the cancel-test harness root; module-level
+// allow per the hole workspace clippy.toml's "Bridge cancellation contract"
+// sanctioned-test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 

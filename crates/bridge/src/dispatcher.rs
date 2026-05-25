@@ -92,6 +92,8 @@ impl Dispatcher {
             .map_err(|e| std::io::Error::other(format!("failed to build engine: {e}")))?;
 
         // Cancellation token drives shutdown.
+        #[allow(clippy::disallowed_methods)]
+        // Dispatcher owns its own subsystem cancel scope (tied to its lifecycle, not the start-cancel). See clippy.toml CancellationToken::new rule.
         let cancel = CancellationToken::new();
         let cancel_for_driver = cancel.clone();
         let driver_handle = tokio::spawn(async move {
