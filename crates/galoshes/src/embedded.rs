@@ -44,6 +44,8 @@ impl EmbeddedBinary {
         #[cfg(unix)]
         set_dir_permissions(dir)?;
 
+        check_dir_executable(dir)?;
+
         let target = dir.join(self.name);
 
         // Warm start: try to verify the existing file first.
@@ -135,36 +137,70 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 // Platform: runtime_dir ===============================================================================================
 
-#[cfg(target_os = "linux")]
 fn runtime_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        Ok(PathBuf::from(dir).join("galoshes"))
-    } else {
-        Ok(std::env::temp_dir().join("galoshes"))
-    }
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    let default_root = platform_default_env().ok();
+    resolve(xdg.as_deref(), default_root.as_deref())
 }
 
-#[cfg(target_os = "macos")]
-fn runtime_dir() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        Ok(PathBuf::from(home).join("Library").join("Caches").join("galoshes"))
-    } else {
-        Ok(std::env::temp_dir().join("galoshes"))
-    }
+#[cfg(unix)]
+fn platform_default_env() -> Result<String, std::env::VarError> {
+    std::env::var("HOME")
 }
 
 #[cfg(target_os = "windows")]
-fn runtime_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-        Ok(PathBuf::from(dir).join("galoshes"))
-    } else {
-        Ok(std::env::temp_dir().join("galoshes"))
+fn platform_default_env() -> Result<String, std::env::VarError> {
+    std::env::var("LOCALAPPDATA")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+    if let Some(dir) = xdg {
+        return Ok(PathBuf::from(dir).join("galoshes"));
     }
+    if let Some(home) = default_root {
+        return Ok(PathBuf::from(home).join(".cache").join("galoshes"));
+    }
+    bail!(
+        "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor HOME is set. \
+         Set XDG_RUNTIME_DIR to a directory on an exec-capable mount."
+    );
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+    if let Some(dir) = xdg {
+        return Ok(PathBuf::from(dir).join("galoshes"));
+    }
+    if let Some(home) = default_root {
+        return Ok(PathBuf::from(home).join("Library").join("Caches").join("galoshes"));
+    }
+    bail!(
+        "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor HOME is set. \
+         Set XDG_RUNTIME_DIR to a directory on an exec-capable mount."
+    );
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn resolve(xdg: Option<&str>, default_root: Option<&str>) -> Result<PathBuf> {
+    if let Some(dir) = xdg {
+        return Ok(PathBuf::from(dir).join("galoshes"));
+    }
+    if let Some(local) = default_root {
+        return Ok(PathBuf::from(local).join("galoshes"));
+    }
+    bail!(
+        "cannot resolve galoshes runtime directory: neither XDG_RUNTIME_DIR nor LOCALAPPDATA is set. \
+         Set XDG_RUNTIME_DIR to a directory on an exec-capable mount."
+    );
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn runtime_dir() -> Result<PathBuf> {
-    Ok(std::env::temp_dir().join("galoshes"))
+pub(crate) fn resolve(xdg: Option<&str>, _default_root: Option<&str>) -> Result<PathBuf> {
+    if let Some(dir) = xdg {
+        return Ok(PathBuf::from(dir).join("galoshes"));
+    }
+    bail!("cannot resolve galoshes runtime directory: XDG_RUNTIME_DIR is not set");
 }
 
 // Platform: permissions ===============================================================================================
@@ -181,6 +217,69 @@ fn set_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o500))
         .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
+
+// Platform: check_dir_executable ======================================================================================
+
+fn check_dir_executable(dir: &Path) -> Result<()> {
+    if is_noexec_mount(dir)? {
+        bail!(
+            "runtime directory {} is mounted noexec; galoshes cannot exec the embedded \
+             v2ray-plugin from this location. Set XDG_RUNTIME_DIR to a directory on an \
+             exec-capable mount, or remount this filesystem with the exec option.",
+            dir.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_noexec_mount(dir: &Path) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .with_context(|| format!("path {} contains a NUL byte", dir.display()))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow::Error::from(err)).with_context(|| format!("statvfs({}) failed", dir.display()));
+    }
+    Ok(check_noexec_linux(stat.f_flag))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn check_noexec_linux(flag: libc::c_ulong) -> bool {
+    flag & libc::ST_NOEXEC == libc::ST_NOEXEC
+}
+
+#[cfg(target_os = "macos")]
+fn is_noexec_mount(dir: &Path) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .with_context(|| format!("path {} contains a NUL byte", dir.display()))?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow::Error::from(err)).with_context(|| format!("statfs({}) failed", dir.display()));
+    }
+    Ok(check_noexec_macos(stat.f_flags))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn check_noexec_macos(flags: u32) -> bool {
+    let mask = libc::MNT_NOEXEC as u32;
+    flags & mask == mask
+}
+
+// Windows has no noexec filesystem flag. Read-only attributes, AppLocker, and
+// Defender quarantine fail at runtime — those paths surface through anyhow
+// context on the existing fs / persist / spawn calls. Other Unixes (FreeBSD,
+// OpenBSD, …) fall through to the same noop; their MNT_NOEXEC semantics differ
+// per kernel and galoshes is not currently shipped there.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_noexec_mount(_dir: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 // Platform: open_verified =============================================================================================

@@ -2183,6 +2183,7 @@ dependencies = [
  "futures",
  "garter",
  "hole-test-observability",
+ "libc",
  "sha2 0.11.0",
  "skuld",
  "tempfile",

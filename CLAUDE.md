@@ -402,6 +402,25 @@ executable at compile time:
    triples in the CI matrix (Hole's Windows/macOS set plus ex-Galoshes
    Linux x64/arm64 and Windows-arm64).
 
+**Runtime extraction directory.** At startup galoshes writes the
+embedded v2ray-plugin to a per-user runtime dir resolved by
+[`embedded::runtime_dir`](crates/galoshes/src/embedded.rs):
+`$XDG_RUNTIME_DIR/galoshes` if set (honored cross-platform), else the
+platform default — `$HOME/.cache/galoshes` on Linux,
+`$HOME/Library/Caches/galoshes` on macOS, `%LOCALAPPDATA%/galoshes` on
+Windows. If neither env var is set, startup bails with a message naming
+both. The Linux `/tmp` fallback was removed because tmpfs mounts are
+commonly `noexec` (Docker `--tmpfs`, systemd `PrivateTmp=yes`, hardened
+distros) and silently became unable to exec the embedded plugin.
+
+After resolving the dir, galoshes statvfs's it (Linux `ST_NOEXEC`) /
+statfs's it (macOS `MNT_NOEXEC`) and bails with a clear remediation
+hint if the mount is noexec. Windows has no noexec filesystem flag
+and skips the probe — Windows-side execution failures (AppLocker,
+Defender) surface from the eventual spawn with anyhow context. See
+bindreams/hole#401 for the postern-container incident that motivated
+the strict resolution + probe.
+
 Build orchestration is owned by `xtask/`. The canonical list of files that
 go into the runnable BINDIR (next to `hole.exe`) lives in
 [xtask/src/bindir.rs](xtask/src/bindir.rs); both `scripts/dev.py` and
