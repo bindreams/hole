@@ -1004,11 +1004,13 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
             let output = writer.snapshot_string();
 
             // CAPTURE side: only the upstream alias appears. The TUN alias
-            // `hole-tun` must NOT appear in any `capture_one` / `show_dnsservers`
-            // line, because we no longer query its prior state.
+            // `hole-tun` must NOT appear in any `Win32Real::get_settings`
+            // line, because we no longer query its prior state. (Post-#397
+            // the Win32 backend replaced the `capture_one` / `show_dnsservers`
+            // netsh helpers; the debug tag is now `Win32Real::get_settings`.)
             let capture_lines: Vec<&str> = output
                 .lines()
-                .filter(|l| l.contains("show_dnsservers") || l.contains("capture_one"))
+                .filter(|l| l.contains("Win32Real::get_settings"))
                 .collect();
             assert!(
                 !capture_lines.is_empty(),
@@ -1029,9 +1031,10 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
 
             // APPLY side: the TUN alias DOES appear — we still set loopback DNS
             // on the TUN so the OS's best-route-to-DNS lookup lands on 127.x.
+            // Post-#397 the per-FFI tag is `Win32Real::set_loopback`.
             let apply_lines: Vec<&str> = output
                 .lines()
-                .filter(|l| l.contains("set_dns_ipv4") || l.contains("set_dns_ipv6"))
+                .filter(|l| l.contains("Win32Real::set_loopback"))
                 .collect();
             assert!(
                 apply_lines.iter().any(|l| l.contains("alias=hole-tun")),
