@@ -114,3 +114,30 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Pr
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
 reason = "Use hole_test_observability::register!() at lib.rs level for tests. See bindreams/hole#301."
+
+# Bridge Dns trait — Win32 native DNS FFI (bindreams/hole#397) ---------------------------------------------------------
+#
+# The Win32 DNS settings FFIs (`SetInterfaceDnsSettings` /
+# `GetInterfaceDnsSettings`) must only be called from inside the
+# `WinDnsBackend::Win32Real` impl. Direct callers bypass the
+# `MockBackend` test seam exactly the same way the #165 `setup_routes`
+# bypass did. The free-function shims `capture_adapters` /
+# `apply_loopback` / `platform_restore_adapter` in
+# `crates/bridge/src/dns/system/windows.rs` already route through
+# `Win32Real::default()`; the bans below cover anything reaching the
+# raw `windows` crate paths directly.
+#
+# Sanctioned suppressions: only the two `Win32Real::{get_settings,
+# set_loopback, restore}` call sites in `dns/system/windows.rs`. Each
+# uses `#[allow(clippy::disallowed_methods)]` with a comment citing
+# this rule.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::IpHelper::SetInterfaceDnsSettings"
+reason = "Must go through `WinDnsBackend::set_loopback` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true  # only `hole-bridge` has the `Win32_NetworkManagement_IpHelper` feature wired in; other workspace crates can't resolve the path.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::IpHelper::GetInterfaceDnsSettings"
+reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true

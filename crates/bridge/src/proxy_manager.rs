@@ -45,6 +45,7 @@ use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{Routing, SystemRouting};
 
+use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
@@ -74,20 +75,26 @@ pub enum ProxyState {
 
 /// Per-cycle state owned only while a proxy is running.
 ///
-/// **Field declaration order is load-bearing.** DNS drops first (restores
-/// the user's OS DNS while routes + dispatcher + SS are still live so any
-/// in-flight OS DNS queries egress the restored path), then dispatcher
-/// (closes TUN, cancels handlers), then plugin chain (graceful stop via
-/// SIGTERM/CTRL_BREAK), then routes (teardown commands), then proxy
-/// (releases SS). `None` fields for SocksOnly mode where
-/// routing/dispatcher/DNS are skipped, or when no plugin is configured.
-struct RunningState<P: Proxy, R: Routing> {
-    /// DNS interception: system-DNS apply + LocalDnsServer. Drops FIRST
-    /// so the user's prior resolvers are restored before anything else
-    /// tears down. `None` when DNS forwarder is disabled or in SocksOnly
-    /// mode.
+/// **Tear-down order is load-bearing.** `ProxyManager::stop` runs the
+/// shutdown sequence in this order:
+/// 1. `dns_applied.shutdown().await` — restores OS DNS while routes +
+///    dispatcher + SS are still live so any in-flight OS DNS queries
+///    egress the restored path.
+/// 2. `dispatcher.shutdown().await` — closes TUN, cancels handlers.
+/// 3. `plugin_chain` drop — graceful stop via SIGTERM/CTRL_BREAK.
+/// 4. `proxy.stop().await` — releases SS task.
+/// 5. `routes` drop — RAII teardown.
+///
+/// `None` fields for SocksOnly mode where routing / dispatcher / DNS are
+/// skipped, or when no plugin is configured.
+struct RunningState<P: Proxy, R: Routing, D: Dns> {
+    /// DNS interception guard: holds the captured prior DNS state and
+    /// the `LocalDnsServer`. `stop()` awaits
+    /// [`DnsApplied::shutdown`] on this BEFORE dropping anything else so
+    /// the OS sees its restored resolvers while routes are still live.
+    /// `None` when DNS forwarder is disabled or in SocksOnly mode.
     #[allow(dead_code)]
-    dns: Option<RunningDns>,
+    dns: Option<D::Applied>,
     /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
     /// handler tasks. Drops SECOND. `None` in SocksOnly mode and under
     /// `#[cfg(test)]`.
@@ -112,47 +119,13 @@ struct RunningState<P: Proxy, R: Routing> {
     ipv6_bypass_available: bool,
 }
 
-/// DNS interception state held for the proxy's lifetime. Drop restores
-/// system DNS (via `system::restore_all`) and clears `bridge-dns.json`,
-/// then drops `local_dns_server` (aborts its tasks, releasing the
-/// loopback port). Drop is synchronous because all underlying OS
-/// commands block; this matches the existing `SystemRoutes::drop`
-/// convention.
-struct RunningDns {
-    applied_prior: Vec<crate::dns_state::DnsPriorAdapter>,
-    /// State directory for the `bridge-dns.json` persisted file. `None`
-    /// when the caller didn't configure one (dev harness without a
-    /// state dir — a case the existing plugin / routes paths also
-    /// tolerate).
-    state_dir: Option<std::path::PathBuf>,
-    /// Held to keep the loopback `<ip>:53` bound and to keep the
-    /// forwarder tasks running. Dropped after system DNS is restored.
-    _local_dns_server: crate::dns::server::LocalDnsServer,
-}
-
-impl Drop for RunningDns {
-    fn drop(&mut self) {
-        let errors = crate::dns::system::restore_all(&self.applied_prior);
-        if !errors.is_empty() {
-            warn!(
-                count = errors.len(),
-                "RunningDns::drop: some adapters failed to restore"
-            );
-        }
-        if let Some(dir) = &self.state_dir {
-            if let Err(e) = crate::dns_state::clear(dir) {
-                warn!(error = %e, "RunningDns::drop: failed to clear bridge-dns.json");
-            }
-        }
-    }
-}
-
 // ProxyManager ========================================================================================================
 
-pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting> {
+pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting, D: Dns = SystemDns> {
     proxy: P,
     routing: R,
-    running: Option<RunningState<P, R>>,
+    dns: D,
+    running: Option<RunningState<P, R, D>>,
     last_error: Option<String>,
     /// Last successfully-started config. Used by `reload` to detect
     /// filter-only changes (hot-swap path vs full restart).
@@ -166,11 +139,23 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting>
     state_dir: Option<std::path::PathBuf>,
 }
 
-impl<P: Proxy, R: Routing> ProxyManager<P, R> {
+impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
+        Self::new_with_dns(proxy, routing, SystemDns::default())
+    }
+}
+
+impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
+    /// Construct a [`ProxyManager`] with an explicit [`Dns`] provider.
+    /// Used by Layer-1 unit tests to substitute `MockDns` so cancel /
+    /// shutdown propagation through `start_inner` can be observed
+    /// without touching the OS resolver. Production code uses
+    /// [`Self::new`].
+    pub fn new_with_dns(proxy: P, routing: R, dns: D) -> Self {
         Self {
             proxy,
             routing,
+            dns,
             running: None,
             last_error: None,
             active_config: None,
@@ -313,8 +298,15 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // "uncancellable sync phase" foot-gun where a future that
         // doesn't yield blocks the outer select! from observing cancel.
         debug!("awaiting start_inner");
-        let result: Result<RunningState<P, R>, ProxyError> =
-            Self::start_inner(&self.proxy, &self.routing, config, self.state_dir.as_deref(), cancel).await;
+        let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
+            &self.proxy,
+            &self.routing,
+            &self.dns,
+            config,
+            self.state_dir.as_deref(),
+            cancel,
+        )
+        .await;
 
         // Commit (or record the error) in the outer function, so the
         // only path that mutates `self.running = Some(..)` is strictly
@@ -386,11 +378,14 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     ///   observed at phase boundary only (`if cancel.is_cancelled()`).
     ///   These calls are millisecond-scale; mid-call preemption isn't
     ///   needed.
-    /// - **Phase 7 (apply_dns_settings)**: chunk-1 NOT yet
-    ///   cancel-aware (still routes through pre-#397 netsh sync path
-    ///   that the #395 reproduction caught taking 22 s). Cancel-aware
-    ///   apply lands in chunks 2–3 alongside the Win32-native DNS
-    ///   refactor.
+    /// - **Phase 7 (dns.apply)**: cooperative — the token is threaded
+    ///   into [`Dns::apply`], which observes cancel between per-adapter
+    ///   FFIs. A cancel arriving mid-apply triggers an inline-restore
+    ///   of any partially-applied adapters before `DnsError::Cancelled`
+    ///   propagates back as `ProxyError::Cancelled`. The
+    ///   `SystemDnsApplied` guard is returned only on the `Ok` path,
+    ///   so the `DebugDropBomb` is never armed during an Err unwind
+    ///   (`#397` plan-review #8).
     ///
     /// CRITICAL ORDERING: the routing provider is responsible for
     /// persisting the recovery state BEFORE mutating routes. A panic
@@ -401,10 +396,11 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
     async fn start_inner(
         proxy: &P,
         routing: &R,
+        dns: &D,
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
         cancel: CancellationToken,
-    ) -> Result<RunningState<P, R>, ProxyError> {
+    ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
         // Pre-flight: short-circuit a pre-cancelled token before any work.
         if cancel.is_cancelled() {
@@ -623,24 +619,48 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
-        // (6) Apply system DNS AFTER routes install so the OS "best-route to
-        // DNS server" lookup resolves through the TUN (its DNS setting is
-        // our loopback IP). Persist the prior state to `bridge-dns.json`
-        // BEFORE mutating so a mid-apply crash leaves a recoverable file.
-        let dns_state = if let Some(srv) = local_dns_server.as_ref() {
-            apply_dns_settings(srv, &gw_info.interface_name, state_dir).await
+        // Phase 7: apply system DNS AFTER routes install so the OS
+        // "best-route to DNS server" lookup resolves through the TUN
+        // (its DNS setting is our loopback IP). Persist + apply are
+        // cancel-aware inside `Dns::apply`; cancel observed between
+        // FFIs runs the inline-restore on partially-applied adapters
+        // and returns `DnsError::Cancelled`, which we map back to
+        // `ProxyError::Cancelled`. Non-cancel failures (Io) downgrade
+        // to a `warn!` + `None`, preserving the pre-#397
+        // "best-effort apply" semantics so a single adapter failure
+        // doesn't tank an otherwise-working start.
+        let dns_applied = if let Some(srv) = local_dns_server {
+            // Capture runs on upstream only; the TUN was created by
+            // `routing.install` above so its prior is definitionally
+            // "defaults" (Phase 4 #247 — fast-path nonsensical capture).
+            // Apply runs on both: TUN needs loopback DNS so the OS's
+            // best-route-to-DNS lookup lands on our forwarder when the
+            // TUN becomes the primary interface.
+            let capture_aliases = vec![gw_info.interface_name.clone()];
+            let apply_aliases = vec![TUN_DEVICE_NAME.into(), gw_info.interface_name.clone()];
+            match dns
+                .apply(
+                    srv,
+                    capture_aliases,
+                    apply_aliases,
+                    state_dir.map(std::path::Path::to_path_buf),
+                    cancel.clone(),
+                )
+                .await
+            {
+                Ok(a) => Some(a),
+                Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
+                Err(DnsError::Io(e)) => {
+                    warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
+                    None
+                }
+            }
         } else {
             None
         };
 
-        let dns = local_dns_server.zip(dns_state).map(|(srv, applied)| RunningDns {
-            applied_prior: applied,
-            state_dir: state_dir.map(std::path::Path::to_path_buf),
-            _local_dns_server: srv,
-        });
-
         Ok(RunningState {
-            dns,
+            dns: dns_applied,
             dispatcher,
             plugin_chain,
             routes: Some(routes),
@@ -670,7 +690,12 @@ impl<P: Proxy, R: Routing> ProxyManager<P, R> {
 
         // 0. Restore system DNS FIRST (while routes + SS are still live
         // so any in-flight OS queries egress via the restored resolver).
-        drop(dns);
+        // Async shutdown — defuses the `DebugDropBomb` in `SystemDnsApplied`
+        // before the field drops. Skipping the await would panic in debug
+        // builds (catching missed-shutdown bugs at first test run).
+        if let Some(mut d) = dns {
+            d.shutdown().await;
+        }
 
         // 1. Shut down dispatcher (closes TUN, cancels all handlers).
         if let Some(mut d) = dispatcher {
@@ -1084,105 +1109,4 @@ fn sample_self_test_query() -> Vec<u8> {
     q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
     q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
     q
-}
-
-/// Capture prior system DNS for the adapters we're about to override,
-/// persist the `bridge-dns.json` recovery file, then apply the loopback
-/// IP. Returns the captured prior state on success, which
-/// [`RunningDns::drop`] will later replay.
-///
-/// Async because the underlying platform functions shell out to
-/// `netsh` / `networksetup` via `std::process::Command`. Keeping the
-/// body sync today (see `dns::system::windows`) blocks a tokio worker
-/// thread for the full duration, which #247 observed stalling the
-/// `start_inner` path by ~10s. The `async fn` signature is a
-/// Phase-1 no-behavior-change prerequisite for a Phase-4 swap to
-/// `tokio::process::Command`.
-///
-/// Instrumented with an `info_span!("apply_dns_settings")` entered via
-/// `.instrument()`. The happy-path exit logs
-/// `info!(elapsed_ms = ..., "apply_dns_settings done")` so Phase-2
-/// observation of #247 sees the total at INFO without needing to raise
-/// the log level — per-sub-call `elapsed_ms` lines live at DEBUG inside
-/// `dns::system::windows`.
-async fn apply_dns_settings(
-    server: &crate::dns::server::LocalDnsServer,
-    upstream_iface: &str,
-    state_dir: Option<&std::path::Path>,
-) -> Option<Vec<crate::dns_state::DnsPriorAdapter>> {
-    use tracing::Instrument;
-    let span = tracing::info_span!("apply_dns_settings", upstream_iface = %upstream_iface);
-    async { apply_dns_settings_body(server, upstream_iface, state_dir) }
-        .instrument(span)
-        .await
-}
-
-fn apply_dns_settings_body(
-    server: &crate::dns::server::LocalDnsServer,
-    upstream_iface: &str,
-    state_dir: Option<&std::path::Path>,
-) -> Option<Vec<crate::dns_state::DnsPriorAdapter>> {
-    let started = Instant::now();
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let result = {
-        use crate::dns::system;
-        use crate::dns_state::{self, DnsState, SCHEMA_VERSION};
-        use crate::proxy::TUN_DEVICE_NAME;
-
-        // Capture runs on the upstream adapter only. The TUN adapter is
-        // fresh (just created by `routing.install`); its prior DNS state
-        // is definitionally "whatever Windows defaults a brand-new adapter
-        // to" — unknowable and uninteresting, and Phase-2 observation of
-        // #247 identified `netsh show dnsservers` against a newly-created
-        // TUN as one of the slowest sub-calls in the 11.3s stall.
-        //
-        // Apply runs on both adapters: the TUN still needs its DNS set to
-        // the loopback IP so the OS's "best-route to DNS server" lookup
-        // picks our forwarder when the TUN becomes the primary interface.
-        // On teardown, the TUN is destroyed with the routes so there is
-        // nothing to restore there — `RunningDns::drop` only replays the
-        // captured prior (upstream-only).
-        let capture_aliases: Vec<String> = vec![upstream_iface.to_string()];
-        let apply_aliases: Vec<String> = vec![TUN_DEVICE_NAME.into(), upstream_iface.to_string()];
-
-        let prior = match system::capture_adapters(&capture_aliases) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "system DNS capture failed; skipping apply");
-                return None;
-            }
-        };
-
-        // Persist BEFORE mutating so a mid-apply crash has a recoverable
-        // file. Matches the `tun_engine::routing::SystemRouting::install`
-        // precondition.
-        if let Some(dir) = state_dir {
-            let state = DnsState {
-                version: SCHEMA_VERSION,
-                chosen_loopback: server.addr(),
-                adapters: prior.clone(),
-            };
-            if let Err(e) = dns_state::save(dir, &state) {
-                warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
-            }
-        }
-
-        if let Err(e) = system::apply_loopback(&apply_aliases, server.addr().ip()) {
-            warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
-            return None;
-        }
-
-        Some(prior)
-    };
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let result: Option<Vec<crate::dns_state::DnsPriorAdapter>> = {
-        let _ = (server, upstream_iface, state_dir);
-        None
-    };
-
-    info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "apply_dns_settings done"
-    );
-    result
 }

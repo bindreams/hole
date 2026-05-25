@@ -21,17 +21,18 @@
 //!
 //! - The free-function shims [`capture_adapters`] / [`apply_loopback`] /
 //!   [`platform_restore_adapter`] / [`flush_dns_cache`] keep the
-//!   pre-#397 call-site contract intact until chunk 3 rewires
-//!   [`crate::proxy_manager::apply_dns_settings`] to call into
-//!   `SystemDns::apply` directly. Each shim instantiates [`Win32Real`]
-//!   and delegates.
+//!   crash-recovery call sites (see [`crate::dns::recovery`]) intact.
+//!   Each shim instantiates [`Win32Real`] and delegates. The
+//!   `Dns`-trait apply path inside `SystemDns::apply` goes through
+//!   `Arc<dyn WinDnsBackend>` directly.
 //!
 //! ## Windows version floor
 //!
 //! `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` were added in
 //! Windows 10 build 19041 (version 2004, May 2020). Pre-19041 systems
-//! will fail to link at runtime. The MSI installer gate
-//! (`WIN10BUILD >= 19041` launch condition) lands in a later chunk.
+//! will fail to link at runtime. The MSI installer `WIN10BUILD >=
+//! 19041` launch condition gate is tracked separately (see #397 plan
+//! step 12).
 //!
 //! ## v4 vs v6
 //!
@@ -283,6 +284,11 @@ fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
     // SAFETY: `settings` is an owned `DNS_INTERFACE_SETTINGS` whose
     // address is valid for the call. The OS writes a fresh `NameServer`
     // string we must free via `FreeInterfaceDnsSettings`.
+    // The `disallowed_methods` ban on `GetInterfaceDnsSettings` exists
+    // so that nothing outside `Win32Real` reaches around the
+    // `WinDnsBackend` test seam (bindreams/hole#397). This module IS
+    // the sanctioned caller.
+    #[allow(clippy::disallowed_methods)]
     let rc: WIN32_ERROR = unsafe { GetInterfaceDnsSettings(guid, &mut settings) };
     if rc != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(rc.0 as i32));
@@ -338,6 +344,9 @@ fn set_one(guid: GUID, ipv6: bool, prior: &DnsPrior) -> io::Result<()> {
     // SAFETY: `settings` and `wide` outlive the FFI call. The OS reads
     // `Version` first to interpret the struct; we always pass
     // `DNS_INTERFACE_SETTINGS_VERSION3`.
+    // Sanctioned `disallowed_methods` site — see `get_one` for the
+    // rationale; the rule exists to keep the FFI inside `Win32Real`.
+    #[allow(clippy::disallowed_methods)]
     let rc: WIN32_ERROR = unsafe { SetInterfaceDnsSettings(guid, &settings) };
     if rc != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(rc.0 as i32));
@@ -365,13 +374,11 @@ fn parse_servers(s: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-// Free-function shims (pre-#397 call-site compat) =====================================================================
+// Free-function shims (crash-recovery + non-Dns-trait call sites) =====================================================
 //
-// `crate::proxy_manager::apply_dns_settings` and `super::restore_all`
-// still call these free functions; chunk 3 rewires them to call
-// `SystemDns::apply` directly. Until then, the shims delegate to
-// `Win32Real::default()` so the call sites get the Win32-native fast
-// path immediately without rewriting the call structure.
+// `crate::dns::recovery` and `super::restore_all` call these shims; the
+// new `Dns`-trait path inside `SystemDns::apply` goes through
+// `Arc<dyn WinDnsBackend>` directly.
 
 /// Capture the v4+v6 DNS state of every adapter in `aliases`. Adapters
 /// that don't exist are silently skipped. See [`Win32Real::get_settings`].

@@ -46,13 +46,13 @@ use crate::dns_state::{AdapterId, DnsPriorAdapter};
 /// `Dns` and [`DnsApplied`] are the test-isolation seam for system-DNS
 /// I/O, mirroring [`crate::proxy::Proxy`] and [`tun_engine::routing::Routing`].
 /// Production goes through [`SystemDns`] (platform-specific); tests
-/// substitute `MockDns` via `ProxyManager::new_with_dns` (chunk 3).
+/// substitute a mock via [`crate::proxy_manager::ProxyManager::new_with_dns`].
 ///
 /// **Why a trait, not free functions.** Direct callers of the
 /// platform-free-function surface (`apply_loopback`, `capture_adapters`,
 /// `restore_all`) outside the `SystemDns` impl are rejected by workspace
-/// `clippy.toml` `disallowed_methods` (added in chunk 3), mirroring the
-/// `setup_routes` / `teardown_routes` enforcement at
+/// `clippy.toml` `disallowed_methods`, mirroring the `setup_routes` /
+/// `teardown_routes` enforcement at
 /// [tun_engine::routing](../../../tun_engine/routing.rs). The motivation
 /// is identical to #165: a helper that bypasses the trait cannot be
 /// intercepted by the mock and will exercise real production code from
@@ -66,7 +66,7 @@ pub trait Dns: Send + Sync + 'static {
     /// **Two teardown paths**:
     ///
     /// - Preferred: call [`DnsApplied::shutdown`] (async) before drop.
-    ///   This is what `ProxyManager::stop` does (chunk 3).
+    ///   This is what `ProxyManager::stop` does.
     /// - Fallback: Drop. Synchronous, used only on crash / panic
     ///   unwind. The `DebugDropBomb` safeguard inside the production
     ///   guard panics in debug builds if shutdown wasn't awaited, so
@@ -122,14 +122,15 @@ pub enum DnsError {
 
 // SystemDns ===========================================================================================================
 //
-// On Windows, `SystemDns` carries an `Arc<dyn WinDnsBackend>` so tests can
-// substitute `MockBackend`. The default constructor uses `Win32Real` which
-// calls `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` /
-// `DnsFlushResolverCache` directly (~ms-scale FFI).
+// `SystemDns` carries a platform-specific backend trait object so tests
+// can substitute a mock without touching the OS resolver. Mirrors
+// [`tun_engine::routing::SystemRouting`].
 //
-// On macOS, `SystemDns` is currently stateless and delegates to the
-// `networksetup`-based free-function surface; the parity `MacDnsBackend`
-// refactor lands in chunk 3.
+// - Windows: `Arc<dyn WinDnsBackend>`. Production: `Win32Real`
+//   (`SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` /
+//   `DnsFlushResolverCache`, ~ms-scale FFI).
+// - macOS: `Arc<dyn MacDnsBackend>`. Production: `Networksetup`
+//   (`networksetup -getdnsservers` / `-setdnsservers` subprocess).
 
 /// Production [`Dns`] implementation.
 #[derive(Clone)]
@@ -138,6 +139,11 @@ pub struct SystemDns {
     /// substitute via [`Self::new_with_backend`].
     #[cfg(target_os = "windows")]
     backend: Arc<dyn windows::WinDnsBackend>,
+    /// macOS `networksetup` backend. Production:
+    /// [`macos::Networksetup`]; tests: substitute via
+    /// [`Self::new_with_mac_backend`].
+    #[cfg(target_os = "macos")]
+    backend: Arc<dyn macos::MacDnsBackend>,
 }
 
 impl Default for SystemDns {
@@ -151,6 +157,8 @@ impl SystemDns {
         Self {
             #[cfg(target_os = "windows")]
             backend: Arc::new(windows::Win32Real),
+            #[cfg(target_os = "macos")]
+            backend: Arc::new(macos::Networksetup),
         }
     }
 
@@ -159,6 +167,14 @@ impl SystemDns {
     /// substitute a mock. Production code uses [`Self::new`].
     #[cfg(target_os = "windows")]
     pub fn new_with_backend(backend: Arc<dyn windows::WinDnsBackend>) -> Self {
+        Self { backend }
+    }
+
+    /// Construct a [`SystemDns`] with a specific [`macos::MacDnsBackend`]
+    /// implementation. Used by Layer-2 unit tests to substitute a mock.
+    /// Production code uses [`Self::new`].
+    #[cfg(target_os = "macos")]
+    pub fn new_with_mac_backend(backend: Arc<dyn macos::MacDnsBackend>) -> Self {
         Self { backend }
     }
 }
@@ -195,47 +211,15 @@ impl Dns for SystemDns {
         state_dir: Option<PathBuf>,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        // macOS path keeps the chunk-1 stub-delegation. The cancel-aware
-        // `MacDnsBackend` refactor lands in chunk 3.
-        let _ = cancel;
-        let started = std::time::Instant::now();
-        let chosen_loopback = local_dns_server.addr();
-        let loopback_ip = chosen_loopback.ip();
-
-        let captured = {
-            let capture_aliases = capture_aliases.clone();
-            let apply_aliases = apply_aliases.clone();
-            let state_dir_for_blocking = state_dir.clone();
-            tokio::task::spawn_blocking(move || -> Result<Vec<DnsPriorAdapter>, io::Error> {
-                let prior = capture_adapters(&capture_aliases)?;
-                if let Some(dir) = state_dir_for_blocking.as_deref() {
-                    let state = crate::dns_state::DnsState {
-                        version: crate::dns_state::SCHEMA_VERSION,
-                        chosen_loopback,
-                        adapters: prior.clone(),
-                    };
-                    if let Err(e) = crate::dns_state::save(dir, &state) {
-                        tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
-                    }
-                }
-                apply_loopback(&apply_aliases, loopback_ip)?;
-                Ok(prior)
-            })
-            .await
-            .map_err(|join_err| io::Error::other(format!("dns apply join error: {join_err}")))??
-        };
-
-        tracing::info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "apply_dns_settings done"
-        );
-
-        Ok(SystemDnsApplied {
-            applied_prior: captured,
+        apply_macos(
+            &self.backend,
+            local_dns_server,
+            capture_aliases,
+            apply_aliases,
             state_dir,
-            local_dns_server: Some(local_dns_server),
-            bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
-        })
+            cancel,
+        )
+        .await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -378,6 +362,114 @@ async fn inline_restore(backend: &Arc<dyn windows::WinDnsBackend>, prior: &[DnsP
     .await;
 }
 
+// macOS apply loop ====================================================================================================
+
+#[cfg(target_os = "macos")]
+async fn apply_macos(
+    backend: &Arc<dyn macos::MacDnsBackend>,
+    local_dns_server: crate::dns::server::LocalDnsServer,
+    capture_aliases: Vec<String>,
+    apply_aliases: Vec<String>,
+    state_dir: Option<PathBuf>,
+    cancel: CancellationToken,
+) -> Result<SystemDnsApplied, DnsError> {
+    let started = std::time::Instant::now();
+    let chosen_loopback = local_dns_server.addr();
+    let loopback_ip = chosen_loopback.ip();
+    let mut captured: Vec<DnsPriorAdapter> = Vec::new();
+
+    // Capture phase. Cancel checked between subprocesses; capture is
+    // read-only, so an early Err here mutates no state.
+    for service in &capture_aliases {
+        if cancel.is_cancelled() {
+            return Err(DnsError::Cancelled);
+        }
+        let b = Arc::clone(backend);
+        let svc_owned = service.clone();
+        let res = tokio::task::spawn_blocking(move || b.get_settings(&svc_owned))
+            .await
+            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
+        match res {
+            Ok(Some(prior)) => captured.push(prior),
+            Ok(None) => tracing::debug!(%service, "DNS capture: service not found; skipping"),
+            Err(e) => tracing::warn!(%service, error = %e, "DNS capture failed for service"),
+        }
+    }
+
+    if cancel.is_cancelled() {
+        return Err(DnsError::Cancelled);
+    }
+
+    // Persist BEFORE apply so a mid-apply crash leaves a recoverable
+    // file (matches `tun_engine::routing::SystemRouting::install`).
+    if let Some(dir) = state_dir.as_deref() {
+        let state = crate::dns_state::DnsState {
+            version: crate::dns_state::SCHEMA_VERSION,
+            chosen_loopback,
+            adapters: captured.clone(),
+        };
+        if let Err(e) = crate::dns_state::save(dir, &state) {
+            tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
+        }
+    }
+
+    // Apply phase. Cancel between subprocesses, mirroring the Windows
+    // path's TOCTOU rationale: abandoning an in-flight `spawn_blocking`
+    // leaves `networksetup` running on the blocking pool and would race
+    // the subsequent inline-restore.
+    for service in &apply_aliases {
+        if cancel.is_cancelled() {
+            inline_restore_macos(backend, &captured).await;
+            return Err(DnsError::Cancelled);
+        }
+        let b = Arc::clone(backend);
+        let svc_owned = service.clone();
+        let res = tokio::task::spawn_blocking(move || b.set_loopback(&svc_owned, loopback_ip))
+            .await
+            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
+        if let Err(e) = res {
+            tracing::warn!(%service, error = %e, "DNS apply failed; continuing");
+        }
+    }
+
+    // Flush. Best-effort — through the backend so mock backends can
+    // count it for the perf-regression test.
+    let b = Arc::clone(backend);
+    let _ = tokio::task::spawn_blocking(move || b.flush()).await;
+
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "apply_dns_settings done"
+    );
+
+    Ok(SystemDnsApplied {
+        backend: Arc::clone(backend),
+        applied_prior: captured,
+        state_dir,
+        local_dns_server: Some(local_dns_server),
+        bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn inline_restore_macos(backend: &Arc<dyn macos::MacDnsBackend>, prior: &[DnsPriorAdapter]) {
+    let backend = Arc::clone(backend);
+    let prior = prior.to_vec();
+    let _ = tokio::task::spawn_blocking(move || {
+        for adapter in &prior {
+            if let Err(e) = backend.restore(adapter) {
+                tracing::warn!(
+                    id = ?adapter.id,
+                    error = %e,
+                    "inline-restore: adapter failed; continuing"
+                );
+            }
+        }
+        let _ = backend.flush();
+    })
+    .await;
+}
+
 // SystemDnsApplied ====================================================================================================
 
 /// RAII guard returned by [`SystemDns::apply`]. The preferred teardown
@@ -387,10 +479,14 @@ async fn inline_restore(backend: &Arc<dyn windows::WinDnsBackend>, prior: &[DnsP
 /// test run. Release builds fall through to a best-effort sync restore.
 #[must_use = "SystemDnsApplied owns async cleanup; call .shutdown().await before drop"]
 pub struct SystemDnsApplied {
-    /// Win32 backend used for restore. None on macOS / unsupported
-    /// targets — those use the free-function path (chunk 3 unifies).
+    /// Win32 backend used for restore on Windows. Mirrors the macOS
+    /// `backend` field below; both go through `Arc<dyn …Backend>` so
+    /// `SystemDnsApplied` is platform-agnostic.
     #[cfg(target_os = "windows")]
     backend: Arc<dyn windows::WinDnsBackend>,
+    /// `networksetup` backend used for restore on macOS.
+    #[cfg(target_os = "macos")]
+    backend: Arc<dyn macos::MacDnsBackend>,
     applied_prior: Vec<DnsPriorAdapter>,
     state_dir: Option<PathBuf>,
     /// Held to keep the loopback `<ip>:53` bound and to keep the
@@ -407,11 +503,11 @@ impl DnsApplied for SystemDnsApplied {
         self.bomb.defuse();
         let prior = std::mem::take(&mut self.applied_prior);
         let state_dir = self.state_dir.clone();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let backend = Arc::clone(&self.backend);
 
         let _ = tokio::task::spawn_blocking(move || {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 for adapter in &prior {
                     if let Err(e) = backend.restore(adapter) {
@@ -424,15 +520,9 @@ impl DnsApplied for SystemDnsApplied {
                 }
                 let _ = backend.flush();
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
-                let errors = restore_all(&prior);
-                if !errors.is_empty() {
-                    tracing::warn!(
-                        count = errors.len(),
-                        "SystemDnsApplied::shutdown: some adapters failed to restore"
-                    );
-                }
+                let _ = prior;
             }
             if let Some(dir) = state_dir {
                 if let Err(e) = crate::dns_state::clear(&dir) {
@@ -465,7 +555,7 @@ impl Drop for SystemDnsApplied {
         // best-effort sync restore so the user's DNS isn't left
         // hijacked.
         tracing::warn!("SystemDnsApplied dropped without shutdown() — sync fallback");
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             for adapter in &self.applied_prior {
                 if let Err(e) = self.backend.restore(adapter) {
@@ -477,16 +567,6 @@ impl Drop for SystemDnsApplied {
                 }
             }
             let _ = self.backend.flush();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let errors = restore_all(&self.applied_prior);
-            if !errors.is_empty() {
-                tracing::warn!(
-                    count = errors.len(),
-                    "SystemDnsApplied::drop: some adapters failed to restore (sync fallback)"
-                );
-            }
         }
         if let Some(dir) = &self.state_dir {
             if let Err(e) = crate::dns_state::clear(dir) {
