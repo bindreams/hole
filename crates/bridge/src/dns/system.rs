@@ -311,7 +311,11 @@ async fn apply_windows(
             // Cooperative inline-restore — runs serially through the
             // same backend (cancel-disregarded inside restore). FFI
             // budget for restore: 2 adapters × 2 families = ~40 ms.
-            inline_restore(backend, &captured).await;
+            // Also clears `bridge-dns.json` so the next start's
+            // `recover_dns_config` doesn't replay an already-restored
+            // prior over any user-side DNS changes made between this
+            // cancel and that next start.
+            inline_restore(backend, &captured, state_dir.as_deref()).await;
             return Err(DnsError::Cancelled);
         }
         let b = Arc::clone(backend);
@@ -340,13 +344,19 @@ async fn apply_windows(
         state_dir,
         local_dns_server: Some(local_dns_server),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
+        shutdown_completed: false,
     })
 }
 
 #[cfg(target_os = "windows")]
-async fn inline_restore(backend: &Arc<dyn windows::WinDnsBackend>, prior: &[DnsPriorAdapter]) {
+async fn inline_restore(
+    backend: &Arc<dyn windows::WinDnsBackend>,
+    prior: &[DnsPriorAdapter],
+    state_dir: Option<&std::path::Path>,
+) {
     let backend = Arc::clone(backend);
     let prior = prior.to_vec();
+    let state_dir = state_dir.map(std::path::Path::to_path_buf);
     let _ = tokio::task::spawn_blocking(move || {
         for adapter in &prior {
             if let Err(e) = backend.restore(adapter) {
@@ -358,6 +368,14 @@ async fn inline_restore(backend: &Arc<dyn windows::WinDnsBackend>, prior: &[DnsP
             }
         }
         let _ = backend.flush();
+        if let Some(dir) = state_dir {
+            if let Err(e) = crate::dns_state::clear(&dir) {
+                tracing::warn!(
+                    error = %e,
+                    "inline-restore: failed to clear bridge-dns.json"
+                );
+            }
+        }
     })
     .await;
 }
@@ -419,7 +437,9 @@ async fn apply_macos(
     // the subsequent inline-restore.
     for service in &apply_aliases {
         if cancel.is_cancelled() {
-            inline_restore_macos(backend, &captured).await;
+            // Clears `bridge-dns.json` alongside the per-adapter restore —
+            // same rationale as the Windows path above.
+            inline_restore_macos(backend, &captured, state_dir.as_deref()).await;
             return Err(DnsError::Cancelled);
         }
         let b = Arc::clone(backend);
@@ -448,13 +468,19 @@ async fn apply_macos(
         state_dir,
         local_dns_server: Some(local_dns_server),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
+        shutdown_completed: false,
     })
 }
 
 #[cfg(target_os = "macos")]
-async fn inline_restore_macos(backend: &Arc<dyn macos::MacDnsBackend>, prior: &[DnsPriorAdapter]) {
+async fn inline_restore_macos(
+    backend: &Arc<dyn macos::MacDnsBackend>,
+    prior: &[DnsPriorAdapter],
+    state_dir: Option<&std::path::Path>,
+) {
     let backend = Arc::clone(backend);
     let prior = prior.to_vec();
+    let state_dir = state_dir.map(std::path::Path::to_path_buf);
     let _ = tokio::task::spawn_blocking(move || {
         for adapter in &prior {
             if let Err(e) = backend.restore(adapter) {
@@ -466,6 +492,14 @@ async fn inline_restore_macos(backend: &Arc<dyn macos::MacDnsBackend>, prior: &[
             }
         }
         let _ = backend.flush();
+        if let Some(dir) = state_dir {
+            if let Err(e) = crate::dns_state::clear(&dir) {
+                tracing::warn!(
+                    error = %e,
+                    "inline-restore: failed to clear bridge-dns.json"
+                );
+            }
+        }
     })
     .await;
 }
@@ -493,14 +527,25 @@ pub struct SystemDnsApplied {
     /// forwarder tasks running. Released AFTER system DNS is restored.
     local_dns_server: Option<crate::dns::server::LocalDnsServer>,
     /// Runtime safeguard: panics in debug builds on drop if `shutdown`
-    /// wasn't awaited. No-op in release; the sync-fallback `Drop` impl
-    /// below covers the release-build crash-unwind path.
+    /// wasn't awaited. No-op in release.
+    ///
+    /// **DO NOT** gate the sync-fallback `Drop` path on `bomb.is_defused()`:
+    /// `drop_bomb::DebugDropBomb::is_defused()` returns `true`
+    /// unconditionally in release builds (`FakeBomb`), which would make
+    /// the fallback dead code in release. The `shutdown_completed` flag
+    /// below is the load-bearing release-mode signal.
     bomb: drop_bomb::DebugDropBomb,
+    /// `true` after `DnsApplied::shutdown` has completed its restore +
+    /// cleanup. Set in `shutdown` regardless of build profile. `Drop`
+    /// checks this (not `bomb.is_defused()`) to decide whether to run
+    /// the sync-fallback restore. See bindreams/hole#397.
+    shutdown_completed: bool,
 }
 
 impl DnsApplied for SystemDnsApplied {
     async fn shutdown(&mut self) {
         self.bomb.defuse();
+        self.shutdown_completed = true;
         let prior = std::mem::take(&mut self.applied_prior);
         let state_dir = self.state_dir.clone();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -547,8 +592,13 @@ impl Drop for SystemDnsApplied {
     /// Drop panics in debug builds if not defused (catching
     /// missed-shutdown bugs); release builds suppress the panic and we
     /// run the best-effort sync restore below.
+    ///
+    /// The release-mode signal is `shutdown_completed`, NOT
+    /// `bomb.is_defused()` — the latter is `true` unconditionally in
+    /// release (`drop_bomb::FakeBomb`), which would make this path
+    /// dead code in release. See the `shutdown_completed` field doc.
     fn drop(&mut self) {
-        if self.bomb.is_defused() {
+        if self.shutdown_completed {
             return;
         }
         // Released paths: missed-shutdown bug in release. Log and run

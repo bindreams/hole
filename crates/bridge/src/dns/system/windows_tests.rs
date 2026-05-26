@@ -188,6 +188,49 @@ async fn system_dns_apply_aborts_between_calls_on_cancel() {
     );
 }
 
+/// Regression: cancel mid-apply must clear `bridge-dns.json` alongside
+/// the inline-restore, so the next bridge start's `recover_dns_config`
+/// doesn't replay an already-restored prior over any user-side DNS
+/// changes made between the cancelled start and the next start.
+#[skuld::test]
+async fn inline_restore_clears_state_file_on_cancel() {
+    let backend = MockBackend::new();
+    let (entered_rx, release_tx) = backend.arm_set_rendezvous();
+
+    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().to_path_buf();
+
+    tokio::spawn(async move {
+        entered_rx.await.expect("first set_loopback never entered");
+        cancel_clone.cancel();
+        let _ = release_tx.send(());
+    });
+
+    let srv = fake_local_dns_server().await;
+    let result = dns
+        .apply(
+            srv,
+            vec!["upstream-alias".into()],
+            vec!["wintun".into(), "upstream-alias".into()],
+            Some(state_dir.clone()),
+            cancel,
+        )
+        .await;
+    assert!(matches!(result, Err(DnsError::Cancelled)), "apply should cancel");
+
+    // `apply` writes the state file BEFORE the apply loop (the `save`
+    // call after capture). On cancel, inline_restore must clear it so
+    // the next start's recovery doesn't replay over user DNS changes.
+    assert!(
+        crate::dns_state::load(&state_dir).is_none(),
+        "inline_restore must clear bridge-dns.json on cancel; presence would replay restore on next start"
+    );
+}
+
 /// One `set_loopback` per `apply_aliases` entry — guards against accidental
 /// double-application or reordering.
 #[skuld::test]
@@ -226,8 +269,8 @@ async fn system_dns_apply_one_set_per_apply_alias() {
 /// The `DebugDropBomb` safeguard panics in debug builds when `shutdown`
 /// is not awaited before drop, catching missed-shutdown bugs at the
 /// first test run. Release builds use the no-op variant and fall through
-/// to the sync-fallback restore; that path is not tested here (it's a
-/// `warn!` log only).
+/// to the sync-fallback restore — exercised by
+/// [`drop_invokes_sync_fallback_when_shutdown_skipped`] below.
 #[skuld::test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "SystemDnsApplied dropped without awaiting shutdown()")]
@@ -244,4 +287,53 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
 
     // No .shutdown().await — bomb panics on drop.
     drop(applied);
+}
+
+/// Regression for the release-mode dead-code bug in `SystemDnsApplied::Drop`:
+/// the previous gate `if !self.bomb.is_defused()` was always `false` in
+/// release (`drop_bomb::FakeBomb::is_defused()` returns `true`
+/// unconditionally), so the sync-fallback restore never ran on a missed
+/// `shutdown().await` in release — the user's DNS would stay pointed at
+/// the loopback forwarder forever.
+///
+/// The fix tracks a separate `shutdown_completed: bool` field; this test
+/// asserts the manual `Drop` impl invokes the backend's `restore` for
+/// each captured prior in **both** build profiles. In debug, the bomb's
+/// own Drop still panics afterward (manual Drop runs first, then field
+/// drops trigger the bomb) — `std::panic::catch_unwind` absorbs that.
+#[skuld::test]
+async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
+    let backend = MockBackend::new();
+    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
+    let cancel = CancellationToken::new();
+
+    let srv = fake_local_dns_server().await;
+    let applied = dns
+        .apply(
+            srv,
+            vec!["upstream-alias".into()],
+            vec!["wintun".into(), "upstream-alias".into()],
+            None,
+            cancel,
+        )
+        .await
+        .expect("apply should succeed");
+
+    let restore_before = backend.restore_calls.load(SeqCst);
+    let flush_before = backend.flush_calls.load(SeqCst);
+
+    // Drop without shutdown. In debug, the bomb (a field of `applied`)
+    // panics on its own Drop AFTER our `impl Drop` has run the sync
+    // fallback — catch_unwind absorbs the panic so the test can assert
+    // on the backend's call counts in either build profile.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(applied)));
+
+    assert!(
+        backend.restore_calls.load(SeqCst) > restore_before,
+        "Drop must invoke sync-fallback restore when shutdown_completed=false (release dead-code regression)"
+    );
+    assert!(
+        backend.flush_calls.load(SeqCst) > flush_before,
+        "Drop must invoke flush after sync-fallback restore"
+    );
 }

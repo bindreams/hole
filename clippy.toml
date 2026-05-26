@@ -142,6 +142,18 @@ path = "windows::Win32::NetworkManagement::IpHelper::GetInterfaceDnsSettings"
 reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
 allow-invalid = true
 
+# `DnsFlushResolverCache` is currently called via a local `#[link]`
+# declaration in `dns/system/windows.rs` (no `windows` crate path), but
+# we ban the canonical path for symmetry: any future binding via the
+# `windows` crate or a helper crate must still go through
+# `WinDnsBackend::flush`. The local `#[link]` site is sanctioned with an
+# `#[allow(clippy::disallowed_methods)]` plus comment citing this rule.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::Dns::DnsFlushResolverCache"
+reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true
+
 # Bridge cancellation contract (bindreams/hole#397) --------------------------------------------------------------------
 #
 # Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
@@ -155,7 +167,19 @@ allow-invalid = true
 # the bridge cancel during plugin-chain spawn) is the case this rule
 # guards against.
 #
-# Sanctioned suppressions, each with a per-call-site
+# **Scope is workspace-wide, not bridge-only.** Cargo's `clippy.toml`
+# resolution is workspace-rooted; there is no per-crate override
+# without splitting workspaces. As a consequence, ex-Galoshes crates
+# (`garter`, `galoshes`, `garter-bin`, `mock-plugin`) that legitimately
+# spawn their own root tokens — for test harnesses, signal handlers,
+# and subsystem owners outside the bridge's IPC cancel chain — carry a
+# module-level `#![allow(clippy::disallowed_methods)]` in the affected
+# test / lib files. This is accepted noise; the alternative
+# (cargo-supported per-crate clippy.toml) does not exist as of cargo
+# 1.93. If a future cargo gains per-crate overrides, narrow the rule's
+# scope and remove the ex-Galoshes module-level allows.
+#
+# Sanctioned bridge-side suppressions, each with a per-call-site
 # `#[allow(clippy::disallowed_methods)]` plus comment citing this rule:
 #
 # 1. `crates/bridge/src/ipc.rs::handle_start` — the IPC root. Every
@@ -171,7 +195,7 @@ allow-invalid = true
 # 4. `crates/bridge/src/server_test.rs` — the one-shot `test-server`
 #    CLI probe, no caller-side cancel; never-signalled token by design.
 #
-# Test files use module-level `#![allow(clippy::disallowed_methods)]`
+# Bridge test files use module-level `#![allow(clippy::disallowed_methods)]`
 # because `CancellationToken::new` is pervasive there as the test
 # harness's root signal and per-call suppressions would dominate the
 # file. The module-level shape is `#![allow(...)]` near the top with a
