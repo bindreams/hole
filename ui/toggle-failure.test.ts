@@ -1,43 +1,46 @@
 // Unit tests for the pure failure-message helper. See
-// bindreams/hole#393 — the original incident was a real bridge error
-// being invisible to the user; these tests pin the format the user
-// sees in the toast.
+// bindreams/hole#393 for the original incident (silent failure → user
+// saw no toast) and #397 sub-bug C for the timeout-arm removal: the
+// discriminated union collapsed to a single interface once the
+// client-side timer was deleted.
 
 import { describe, expect, it } from "vitest";
-import { TOGGLE_TIMEOUT_MS, toggleFailureToast } from "./toggle-failure";
+import { type ToggleFailure, toggleFailureToast } from "./toggle-failure";
 
 describe("toggleFailureToast", () => {
-  it("timeout going-to-connect yields a 'start' message in seconds", () => {
-    expect(toggleFailureToast({ kind: "timeout" }, true)).toEqual({
-      message: `Proxy start timed out after ${Math.round(TOGGLE_TIMEOUT_MS / 1000)} s.`,
-      kind: "error",
-    });
-  });
-
-  it("timeout going-to-disconnect yields a 'stop' message", () => {
-    expect(toggleFailureToast({ kind: "timeout" }, false)).toEqual({
-      message: `Proxy stop timed out after ${Math.round(TOGGLE_TIMEOUT_MS / 1000)} s.`,
-      kind: "error",
-    });
-  });
-
   it("string rejection surfaces the bridge error verbatim", () => {
     // Production wire format: ProxyError::ForwarderSelfTestFailed.Display.
     const msg = "forwarder self-test failed after 3 attempts in 4520ms: attempt 3 timed out after 1.5s";
-    expect(toggleFailureToast({ kind: "err", error: msg }, true)).toEqual({
+    expect(toggleFailureToast({ error: msg })).toEqual({
       message: msg,
       kind: "error",
     });
   });
 
   it("non-string rejection is stringified defensively (no [object Object])", () => {
-    expect(toggleFailureToast({ kind: "err", error: new Error("boom") }, true)).toEqual({
+    expect(toggleFailureToast({ error: new Error("boom") })).toEqual({
       message: "Error: boom",
       kind: "error",
     });
   });
 
   it("undefined rejection still produces a non-empty message", () => {
-    expect(toggleFailureToast({ kind: "err", error: undefined }, true).message).toBe("undefined");
+    expect(toggleFailureToast({ error: undefined }).message).toBe("undefined");
+  });
+});
+
+describe("ToggleFailure shape (regression for #397 sub-bug C)", () => {
+  it("no longer accepts a `kind: 'timeout'` variant at the type level", () => {
+    // @ts-expect-error — { kind: "timeout" } was a member of the
+    // ToggleFailure union pre-#397 sub-bug C. The union collapsed to
+    // a plain { error: unknown } interface after the 15 s client-side
+    // timer was removed. Re-adding a discriminated variant requires
+    // intentional restructuring; this assertion catches accidental
+    // reintroduction.
+    const _typeProbe: ToggleFailure = { kind: "timeout" };
+    // `_typeProbe` is intentionally unused — the @ts-expect-error
+    // above is the load-bearing assertion. We expect the line to
+    // produce a TS error, hence the directive.
+    expect(_typeProbe).toBeDefined();
   });
 });

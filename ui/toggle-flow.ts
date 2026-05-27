@@ -65,7 +65,7 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
     outcome = await deps.invoke<ToggleOutcome>("toggle_proxy");
   } catch (error) {
     console.error("toggle_proxy failed:", error);
-    const spec = toggleFailureToast({ kind: "err", error }, goingToConnect);
+    const spec = toggleFailureToast({ error });
     deps.showToast(spec.message, spec.kind);
     deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
     return;
@@ -84,7 +84,7 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
       deps.setState(stateForToggleOutcome(stopOutcome));
     } catch (err) {
       console.error("follow-up stop failed:", err);
-      const spec = toggleFailureToast({ kind: "err", error: err }, /*goingToConnect=*/ false);
+      const spec = toggleFailureToast({ error: err });
       deps.showToast(spec.message, spec.kind);
       deps.setState("disconnection-failed");
     }

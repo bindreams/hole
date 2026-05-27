@@ -1,19 +1,22 @@
-// Pure helper: format the toast message for a `toggle_proxy` failure
-// (timeout, rejection, or follow-up-stop rejection). Extracted so the
-// message shape is unit-testable without DOM/Tauri-mock plumbing in
-// sidebar.ts.
+// Pure helper: format the toast message for a `toggle_proxy` failure.
+// Extracted so the message shape is unit-testable without DOM/Tauri-
+// mock plumbing.
 //
 // See bindreams/hole#393 for the original incident — a real bridge
-// failure was silently invisible to the user because `toggleFromIdle`
-// only logged to console.
+// failure was silently invisible to the user because the toggle flow
+// only logged to console. See #397 sub-bug C for the timeout-arm
+// removal: the union collapsed from a discriminated union to a
+// single interface once the 15 s client-side timer was deleted.
 
 import type { ToastKind } from "./toast";
 
-/// Client-side timeout for `toggle_proxy`, mirrored from sidebar.ts so
-/// the helper has no upward import. Keep in sync.
-export const TOGGLE_TIMEOUT_MS = 15_000;
-
-export type ToggleFailure = { kind: "timeout" } | { kind: "err"; error: unknown };
+/// A toggle_proxy IPC failure. The bridge's wire format is
+/// `Result<_, String>`; `error` is typed `unknown` for the defensive
+/// `String()` conversion below — a future shape change shouldn't
+/// silently fall back to "[object Object]" in the user's face.
+export interface ToggleFailure {
+  error: unknown;
+}
 
 export interface ToastSpec {
   message: string;
@@ -21,18 +24,8 @@ export interface ToastSpec {
 }
 
 /// Compute the toast message for a `toggle_proxy` failure. Stringifies
-/// non-string rejections defensively (current bridge wire format is
-/// `Result<_, String>`, but a future shape change shouldn't silently
-/// fall back to "[object Object]" in the user's face).
-export function toggleFailureToast(failure: ToggleFailure, goingToConnect: boolean): ToastSpec {
-  if (failure.kind === "timeout") {
-    const action = goingToConnect ? "start" : "stop";
-    const seconds = Math.round(TOGGLE_TIMEOUT_MS / 1000);
-    return {
-      message: `Proxy ${action} timed out after ${seconds} s.`,
-      kind: "error",
-    };
-  }
+/// non-string rejections defensively.
+export function toggleFailureToast(failure: ToggleFailure): ToastSpec {
   return {
     message: String(failure.error),
     kind: "error",
