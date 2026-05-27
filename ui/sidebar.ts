@@ -14,6 +14,7 @@ import {
 } from "./connection-state";
 import { setCountryFlag } from "./country-flag";
 import { formatBytes, formatSpeed, formatUptime } from "./formatting";
+import { initGraph, pushGraphData, renderGraph } from "./graph";
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
 import { showToast } from "./toast";
@@ -34,8 +35,6 @@ const statusWord = document.getElementById("status-word")!;
 const ipText = document.getElementById("ip-text")!;
 const countryFlag = document.getElementById("country-flag")!;
 const copyIpBtn = document.getElementById("copy-ip-btn")!;
-const graphSvg = document.getElementById("graph-svg")!;
-const graphScaleLabel = document.getElementById("graph-scale-label")!;
 const statDownloaded = document.getElementById("stat-downloaded")!;
 const statUploaded = document.getElementById("stat-uploaded")!;
 const statDownloadSpeed = document.getElementById("stat-download-speed")!;
@@ -47,45 +46,6 @@ const versionFooter = document.getElementById("version-footer")!;
 
 let currentState: ConnectionState = "disconnected";
 let currentIp = "";
-
-// Throughput graph data — circular buffer of 60 data points.
-const GRAPH_POINTS = 60;
-const graphData: { speedIn: number; speedOut: number }[] = [];
-for (let i = 0; i < GRAPH_POINTS; i++) {
-  graphData.push({ speedIn: 0, speedOut: 0 });
-}
-
-// SVG constants (viewBox: 0 0 220 80).
-const SVG_W = 220;
-const SVG_H = 80;
-
-// Pre-create SVG elements so we only update `d` attributes each tick.
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-const rxFill = document.createElementNS(SVG_NS, "path");
-rxFill.setAttribute("fill", "var(--graph-fill-rx)");
-rxFill.setAttribute("stroke", "none");
-
-const rxLine = document.createElementNS(SVG_NS, "polyline");
-rxLine.setAttribute("fill", "none");
-rxLine.setAttribute("stroke", "var(--green)");
-rxLine.setAttribute("stroke-width", "1.5");
-rxLine.setAttribute("stroke-linejoin", "round");
-
-const txFill = document.createElementNS(SVG_NS, "path");
-txFill.setAttribute("fill", "var(--graph-fill-tx)");
-txFill.setAttribute("stroke", "none");
-
-const txLine = document.createElementNS(SVG_NS, "polyline");
-txLine.setAttribute("fill", "none");
-txLine.setAttribute("stroke", "var(--amber)");
-txLine.setAttribute("stroke-width", "1.5");
-txLine.setAttribute("stroke-linejoin", "round");
-
-graphSvg.appendChild(rxFill);
-graphSvg.appendChild(txFill);
-graphSvg.appendChild(rxLine);
-graphSvg.appendChild(txLine);
 
 // Power button ========================================================================================================
 
@@ -156,52 +116,6 @@ function handleCopyIp() {
   navigator.clipboard.writeText(currentIp).catch((err) => {
     console.error("clipboard write failed:", err);
   });
-}
-
-// Throughput graph ====================================================================================================
-
-function pushGraphData(speedIn: number, speedOut: number) {
-  graphData.shift();
-  graphData.push({ speedIn, speedOut });
-}
-
-function renderGraph() {
-  // Determine Y-axis max from the data in the window.
-  let maxSpeed = 0;
-  for (const pt of graphData) {
-    if (pt.speedIn > maxSpeed) maxSpeed = pt.speedIn;
-    if (pt.speedOut > maxSpeed) maxSpeed = pt.speedOut;
-  }
-  // Ensure a minimum scale so the graph doesn't collapse to nothing.
-  if (maxSpeed < 1000) maxSpeed = 1000;
-
-  graphScaleLabel.textContent = formatSpeed(maxSpeed);
-
-  // Build polyline points and filled area paths.
-  const stepX = SVG_W / (GRAPH_POINTS - 1);
-
-  let rxPts = "";
-  let txPts = "";
-  let rxFillD = `M0,${SVG_H}`;
-  let txFillD = `M0,${SVG_H}`;
-
-  for (let i = 0; i < GRAPH_POINTS; i++) {
-    const x = (i * stepX).toFixed(1);
-    const yRx = (SVG_H - (graphData[i].speedIn / maxSpeed) * SVG_H).toFixed(1);
-    const yTx = (SVG_H - (graphData[i].speedOut / maxSpeed) * SVG_H).toFixed(1);
-    rxPts += `${x},${yRx} `;
-    txPts += `${x},${yTx} `;
-    rxFillD += ` L${x},${yRx}`;
-    txFillD += ` L${x},${yTx}`;
-  }
-
-  rxFillD += ` L${SVG_W},${SVG_H} Z`;
-  txFillD += ` L${SVG_W},${SVG_H} Z`;
-
-  rxLine.setAttribute("points", rxPts.trim());
-  txLine.setAttribute("points", txPts.trim());
-  rxFill.setAttribute("d", rxFillD);
-  txFill.setAttribute("d", txFillD);
 }
 
 // Stats table =========================================================================================================
@@ -363,6 +277,5 @@ export function initSidebar() {
   powerBtn.addEventListener("click", handlePowerClick);
   copyIpBtn.addEventListener("click", handleCopyIp);
   initVersion();
-  // Initial graph render (all zeros).
-  renderGraph();
+  initGraph();
 }
