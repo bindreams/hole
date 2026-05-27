@@ -1,7 +1,6 @@
 // Sidebar functionality: power button, IP display, throughput graph,
 // stats table, diagnostics chain, version footer.
 
-import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import {
   type ConnectionState,
@@ -22,12 +21,12 @@ import { initStats, updateStats } from "./stats";
 import { showToast } from "./toast";
 import { toggleFromIdle } from "./toggle-flow";
 import type { Metrics, ProxyStatus } from "./types";
+import { initVersion } from "./version";
 
 // DOM references ======================================================================================================
 
 const powerBtn = document.getElementById("power-btn")!;
 const statusWord = document.getElementById("status-word")!;
-const versionFooter = document.getElementById("version-footer")!;
 
 // State ===============================================================================================================
 
@@ -78,17 +77,6 @@ async function handlePowerClick() {
     getConfig: () => config,
     loadConfig,
   });
-}
-
-// Version footer ======================================================================================================
-
-async function initVersion() {
-  try {
-    const version = await getVersion();
-    versionFooter.textContent = `Hole v${version}`;
-  } catch {
-    versionFooter.textContent = "Hole";
-  }
 }
 
 // Public update functions =============================================================================================
