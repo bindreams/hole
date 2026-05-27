@@ -12,8 +12,10 @@ import {
   statusTextFor,
   statusWordClassFor,
 } from "./connection-state";
-import { setCountryFlag } from "./country-flag";
 import { initGraph, pushGraphData, renderGraph } from "./graph";
+import { initIpDisplay, updatePublicIp } from "./ip-display";
+export { updatePublicIp };
+
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
 import { initStats, updateStats } from "./stats";
@@ -24,7 +26,6 @@ import {
   LATENCY_VALIDATED_ON_CONNECT,
   type Metrics,
   type ProxyStatus,
-  type PublicIpData,
   type ValidationState,
 } from "./types";
 
@@ -32,15 +33,11 @@ import {
 
 const powerBtn = document.getElementById("power-btn")!;
 const statusWord = document.getElementById("status-word")!;
-const ipText = document.getElementById("ip-text")!;
-const countryFlag = document.getElementById("country-flag")!;
-const copyIpBtn = document.getElementById("copy-ip-btn")!;
 const versionFooter = document.getElementById("version-footer")!;
 
 // State ===============================================================================================================
 
 let currentState: ConnectionState = "disconnected";
-let currentIp = "";
 
 // Power button ========================================================================================================
 
@@ -86,30 +83,6 @@ async function handlePowerClick() {
     showToast,
     getConfig: () => config,
     loadConfig,
-  });
-}
-
-// IP display ==========================================================================================================
-
-export async function updatePublicIp() {
-  try {
-    const data = await invoke<PublicIpData>("get_public_ip");
-    const ip = data.ip || "unknown";
-    currentIp = ip;
-    setCountryFlag(countryFlag, data.country_code);
-    // Structure: <span class="country-flag fi fis fi-XX" id="country-flag" title="XX"></span> ip.addr
-    ipText.replaceChildren(countryFlag, document.createTextNode(` ${ip}`));
-  } catch (err) {
-    console.error("get_public_ip failed:", err);
-  }
-}
-
-// Copy to clipboard ===================================================================================================
-
-function handleCopyIp() {
-  if (!currentIp) return;
-  navigator.clipboard.writeText(currentIp).catch((err) => {
-    console.error("clipboard write failed:", err);
   });
 }
 
@@ -260,8 +233,8 @@ export function getConnectionState(): ConnectionState {
 
 export function initSidebar() {
   powerBtn.addEventListener("click", handlePowerClick);
-  copyIpBtn.addEventListener("click", handleCopyIp);
   initVersion();
+  initIpDisplay();
   initGraph();
   initStats();
 }
