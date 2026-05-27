@@ -6,8 +6,9 @@
 // type, the text/CSS mapping, and the small set of predicates that the
 // DOM-wiring layer (`sidebar.ts`) uses to decide what to render.
 //
-// See `docs/superpowers/specs/` design notes for the full transition
-// graph and rationale (backend cancellation, 15 s client timeout, etc.).
+// The transition graph and rationale (idle states, transitions,
+// backend-cooperative cancellation) is documented in this file's
+// exported predicates and in `toggle-flow.ts`.
 
 export type ConnectionState =
   | "disconnected" //       red,       "Disconnected",       click → start
