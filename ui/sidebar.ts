@@ -13,10 +13,10 @@ import {
   statusWordClassFor,
 } from "./connection-state";
 import { setCountryFlag } from "./country-flag";
-import { formatBytes, formatSpeed, formatUptime } from "./formatting";
 import { initGraph, pushGraphData, renderGraph } from "./graph";
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
+import { initStats, updateStats } from "./stats";
 import { showToast } from "./toast";
 import { toggleFromIdle } from "./toggle-flow";
 import {
@@ -35,11 +35,6 @@ const statusWord = document.getElementById("status-word")!;
 const ipText = document.getElementById("ip-text")!;
 const countryFlag = document.getElementById("country-flag")!;
 const copyIpBtn = document.getElementById("copy-ip-btn")!;
-const statDownloaded = document.getElementById("stat-downloaded")!;
-const statUploaded = document.getElementById("stat-uploaded")!;
-const statDownloadSpeed = document.getElementById("stat-download-speed")!;
-const statUploadSpeed = document.getElementById("stat-upload-speed")!;
-const statUptime = document.getElementById("stat-uptime")!;
 const versionFooter = document.getElementById("version-footer")!;
 
 // State ===============================================================================================================
@@ -116,16 +111,6 @@ function handleCopyIp() {
   navigator.clipboard.writeText(currentIp).catch((err) => {
     console.error("clipboard write failed:", err);
   });
-}
-
-// Stats table =========================================================================================================
-
-function updateStats(metrics: Metrics) {
-  statDownloaded.textContent = formatBytes(metrics.bytes_in);
-  statUploaded.textContent = formatBytes(metrics.bytes_out);
-  statDownloadSpeed.textContent = formatSpeed(metrics.speed_in_bps);
-  statUploadSpeed.textContent = formatSpeed(metrics.speed_out_bps);
-  statUptime.textContent = formatUptime(metrics.uptime_secs);
 }
 
 // Diagnostics chain ===================================================================================================
@@ -278,4 +263,5 @@ export function initSidebar() {
   copyIpBtn.addEventListener("click", handleCopyIp);
   initVersion();
   initGraph();
+  initStats();
 }
