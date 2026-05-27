@@ -11,12 +11,6 @@ import type { ToastKind } from "./toast";
 import { toggleFailureToast } from "./toggle-failure";
 import type { Config } from "./types";
 
-/// Client-side timeout for `toggle_proxy`. Will be removed in the
-/// follow-up task (sub-bug C of #397); kept here verbatim from
-/// sidebar.ts so this extraction commit is a pure refactor with no
-/// behavior change.
-const TOGGLE_TIMEOUT_MS = 15_000;
-
 /// All side-effects `toggleFromIdle` performs flow through this object.
 /// The module reads no ambient state — pass everything explicitly so
 /// tests can substitute mocks for each surface (IPC, state updates,
@@ -52,53 +46,30 @@ export interface ToggleDeps {
   loadConfig(): Promise<void>;
 }
 
-/// Issue `toggle_proxy` with a 15 s client-side timeout. On success,
-/// the state transitions per `ToggleOutcome`; on explicit failure, to
-/// the matching `-failed` idle state; on timeout, to the matching
-/// `-failed` state AND a best-effort `cancel_proxy` is fired to stop
-/// the bridge from completing the operation in the background.
+/// Issue `toggle_proxy` and apply the resulting state transition.
 ///
-/// NOTE: the timeout will be deleted in a follow-up task (sub-bug C
-/// of #397). This file's first commit preserves the current behavior
-/// so the extraction itself is a pure refactor.
+/// The UI stays in `connecting`/`disconnecting` until the bridge IPC
+/// returns. There is no client-side timeout — the user's `Cancel`
+/// button (which fires `cancel_proxy` on a fresh bridge connection)
+/// is the escape hatch for a genuinely-hung bridge. The 15 s
+/// `Promise.race` that existed pre-#397 sub-bug C was load-bearing
+/// only while the bridge could ignore `Cancel` mid-`apply_dns_settings`;
+/// PR #406 fixed that with cooperative cancellation, making the
+/// client-side timer redundant and user-hostile on slow machines
+/// (false-failure toast while the bridge was still making progress).
 export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps): Promise<void> {
   deps.setState(goingToConnect ? "connecting" : "disconnecting");
 
-  const togglePromise = deps.invoke<ToggleOutcome>("toggle_proxy");
-  // Prevent unhandled-rejection warnings if the promise settles after
-  // we've already moved on due to timeout.
-  togglePromise.catch(() => {});
-
-  const raced = await Promise.race<
-    { kind: "ok"; outcome: ToggleOutcome } | { kind: "err"; error: unknown } | { kind: "timeout" }
-  >([
-    togglePromise
-      .then((outcome) => ({ kind: "ok" as const, outcome }))
-      .catch((error) => ({ kind: "err" as const, error })),
-    new Promise((resolve) => setTimeout(() => resolve({ kind: "timeout" as const }), TOGGLE_TIMEOUT_MS)),
-  ]);
-
-  if (raced.kind === "timeout") {
-    console.error(`toggle_proxy timed out after ${TOGGLE_TIMEOUT_MS}ms — firing cancel`);
-    // Best-effort cancel so the bridge doesn't finish the connect in
-    // the background behind our back. Ignore the result.
-    deps.invoke("cancel_proxy").catch(() => {});
-    const spec = toggleFailureToast(raced, goingToConnect);
+  let outcome: ToggleOutcome;
+  try {
+    outcome = await deps.invoke<ToggleOutcome>("toggle_proxy");
+  } catch (error) {
+    console.error("toggle_proxy failed:", error);
+    const spec = toggleFailureToast({ kind: "err", error }, goingToConnect);
     deps.showToast(spec.message, spec.kind);
     deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
     return;
   }
-
-  if (raced.kind === "err") {
-    console.error("toggle_proxy failed:", raced.error);
-    const spec = toggleFailureToast(raced, goingToConnect);
-    deps.showToast(spec.message, spec.kind);
-    deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
-    return;
-  }
-
-  // raced.kind === "ok"
-  const outcome = raced.outcome;
 
   // Race: the user clicked Cancel during connecting, but the Start had
   // already succeeded at the bridge before the cancel reached it. The
