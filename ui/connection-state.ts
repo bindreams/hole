@@ -33,6 +33,10 @@ export const IDLE_STATES = new Set<ConnectionState>([
 /// state where a click fires `cancel_proxy`.
 export const TRANSITION_STATES = new Set<ConnectionState>(["connecting", "disconnecting", "cancelling"]);
 
+/// Backend `ToggleOutcome` (Rust enum, lowercase-serialized).
+/// Must match `crates/hole/src/tray.rs::ToggleOutcome`.
+export type ToggleOutcome = "running" | "stopped" | "cancelled";
+
 /// True if the UI represents the proxy as "running" for the user — i.e.
 /// clicking the button should initiate a disconnect. Includes the
 /// optimistic Running state and the DisconnectionFailed state (where the
@@ -100,7 +104,7 @@ export function powerBtnClassFor(state: ConnectionState): string {
 
 /// Map the backend-side `ToggleOutcome` variants (serialized lowercase)
 /// to the frontend state that should result when a toggle succeeds.
-export function stateForToggleOutcome(outcome: "running" | "stopped" | "cancelled"): ConnectionState {
+export function stateForToggleOutcome(outcome: ToggleOutcome): ConnectionState {
   switch (outcome) {
     case "running":
       return "connected";

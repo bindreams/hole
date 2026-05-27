@@ -12,6 +12,7 @@ import {
   stateForToggleOutcome,
   statusTextFor,
   statusWordClassFor,
+  type ToggleOutcome,
 } from "./connection-state";
 import { setCountryFlag } from "./country-flag";
 import { config, loadConfig } from "./main";
@@ -26,10 +27,6 @@ import {
   type PublicIpData,
   type ValidationState,
 } from "./types";
-
-/// Backend returns `ToggleOutcome` serialized as lowercase strings. Must
-/// match `crates/hole/src/tray.rs::ToggleOutcome`.
-type ToggleOutcome = "running" | "stopped" | "cancelled";
 
 /// Client-side timeout for `toggle_proxy`. If the IPC call doesn't
 /// resolve within this window we fire `cancel_proxy` and move the UI to
