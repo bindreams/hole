@@ -9,16 +9,14 @@ import {
   isEffectivelyOn,
   powerBtnClassFor,
   stateForPolledRunning,
-  stateForToggleOutcome,
   statusTextFor,
   statusWordClassFor,
-  type ToggleOutcome,
 } from "./connection-state";
 import { setCountryFlag } from "./country-flag";
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
 import { showToast } from "./toast";
-import { toggleFailureToast } from "./toggle-failure";
+import { toggleFromIdle } from "./toggle-flow";
 import {
   type DiagnosticsData,
   LATENCY_VALIDATED_ON_CONNECT,
@@ -27,13 +25,6 @@ import {
   type PublicIpData,
   type ValidationState,
 } from "./types";
-
-/// Client-side timeout for `toggle_proxy`. If the IPC call doesn't
-/// resolve within this window we fire `cancel_proxy` and move the UI to
-/// a "failed" state. Chosen to comfortably exceed a real connect (DNS +
-/// handshake + route setup usually <5 s) while still surfacing a hung
-/// bridge promptly.
-const TOGGLE_TIMEOUT_MS = 15_000;
 
 // Formatting helpers ==================================================================================================
 
@@ -163,92 +154,15 @@ async function handlePowerClick() {
   // effectively on. Retry paths (connection-failed, disconnection-failed)
   // are treated as their base idle states for the purpose of this dispatch.
   const goingToConnect = !isEffectivelyOn(currentState);
-  await toggleFromIdle(goingToConnect);
-}
-
-/// Issue `toggle_proxy` with a 15 s client-side timeout. On success,
-/// the state transitions per `ToggleOutcome`; on explicit failure, to
-/// the matching `-failed` idle state; on timeout, to the matching
-/// `-failed` state AND a best-effort `cancel_proxy` is fired to stop
-/// the bridge from completing the operation in the background.
-async function toggleFromIdle(goingToConnect: boolean) {
-  setState(goingToConnect ? "connecting" : "disconnecting");
-
-  const togglePromise = invoke<ToggleOutcome>("toggle_proxy");
-  // Prevent unhandled-rejection warnings if the promise settles after
-  // we've already moved on due to timeout.
-  togglePromise.catch(() => {});
-
-  const raced = await Promise.race<
-    { kind: "ok"; outcome: ToggleOutcome } | { kind: "err"; error: unknown } | { kind: "timeout" }
-  >([
-    togglePromise
-      .then((outcome) => ({ kind: "ok" as const, outcome }))
-      .catch((error) => ({ kind: "err" as const, error })),
-    new Promise((resolve) => setTimeout(() => resolve({ kind: "timeout" as const }), TOGGLE_TIMEOUT_MS)),
-  ]);
-
-  if (raced.kind === "timeout") {
-    console.error(`toggle_proxy timed out after ${TOGGLE_TIMEOUT_MS}ms — firing cancel`);
-    // Best-effort cancel so the bridge doesn't finish the connect in
-    // the background behind our back. Ignore the result.
-    invoke("cancel_proxy").catch(() => {});
-    const spec = toggleFailureToast(raced, goingToConnect);
-    showToast(spec.message, spec.kind);
-    setState(goingToConnect ? "connection-failed" : "disconnection-failed");
-    return;
-  }
-
-  if (raced.kind === "err") {
-    console.error("toggle_proxy failed:", raced.error);
-    const spec = toggleFailureToast(raced, goingToConnect);
-    showToast(spec.message, spec.kind);
-    setState(goingToConnect ? "connection-failed" : "disconnection-failed");
-    return;
-  }
-
-  // raced.kind === "ok"
-  const outcome = raced.outcome;
-
-  // Race: the user clicked Cancel during connecting, but the Start had
-  // already succeeded at the bridge before the cancel reached it. The
-  // outcome is Running despite the user's intent to cancel. Honor the
-  // user's intent by firing a follow-up Stop. This preserves the plan's
-  // "cancelling --raced-- disconnecting" transition.
-  if (currentState === "cancelling" && outcome === "running") {
-    console.info("cancel raced with successful start — firing follow-up stop");
-    setState("disconnecting");
-    try {
-      const stopOutcome = await invoke<ToggleOutcome>("toggle_proxy");
-      setState(stateForToggleOutcome(stopOutcome));
-    } catch (err) {
-      console.error("follow-up stop failed:", err);
-      const spec = toggleFailureToast({ kind: "err", error: err }, /*goingToConnect=*/ false);
-      showToast(spec.message, spec.kind);
-      setState("disconnection-failed");
-    }
-    updatePublicIp();
-    return;
-  }
-
-  setState(stateForToggleOutcome(outcome));
-  // Refresh IP on any successful transition.
-  updatePublicIp();
-
-  // User-initiated connect succeeded — mark the selected server as
-  // validated so the UI gets a green dot without a separate test run.
-  // Fired from the click handler (not polling) because `connecting →
-  // connected` is a click-local transition that polling never observes.
-  // Sequence the persist BEFORE the reload so loadConfig() sees the
-  // new validation state.
-  if (goingToConnect && outcome === "running" && config?.selected_server) {
-    try {
-      await invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
-      await loadConfig();
-    } catch (err) {
-      console.error("mark_validated_by_proxy_start failed:", err);
-    }
-  }
+  await toggleFromIdle(goingToConnect, {
+    invoke,
+    getState: () => currentState,
+    setState,
+    updatePublicIp,
+    showToast,
+    getConfig: () => config,
+    loadConfig,
+  });
 }
 
 // IP display ==========================================================================================================
