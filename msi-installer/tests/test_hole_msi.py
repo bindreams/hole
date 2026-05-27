@@ -440,6 +440,68 @@ def test_installdirdlg_next_override_wins(decompiled_tree: ET.ElementTree) -> No
     )
 
 
+# Launch-condition tests ===============================================================================================
+#
+# Source-side mirror lives in test_hole_wxs.py::test_launch_condition_requires_build_19041.
+# This test guards against the gate being silently dropped during the
+# WiX compile → MSI → decompile round-trip (e.g. a WiX schema migration
+# that changes how LaunchCondition is encoded).
+
+
+def test_decompiled_has_win10_launch_condition(decompiled_tree: ET.ElementTree) -> None:
+    """The built MSI must carry a LaunchCondition gating install on build >= 19041.
+
+    `wix msi decompile` lowers a MSI LaunchCondition table row to either
+    a `<Launch>` element (WiX v4+ schema) or a legacy
+    `<Condition Message="...">CONDITION_TEXT</Condition>` form. Accept
+    either shape; assert the condition text mentions WIN10BUILD and
+    19041. See bindreams/hole#397.
+    """
+    pkg = _decompiled_package(decompiled_tree)
+
+    found_conditions: list[str] = []
+    for el in pkg.iter(f"{{{NS['wix']}}}Launch"):
+        cond = el.get("Condition") or ""
+        if "WIN10BUILD" in cond:
+            found_conditions.append(cond)
+    for el in pkg.iter(f"{{{NS['wix']}}}Condition"):
+        # Legacy form: condition text is the element's .text, not a
+        # Condition= attribute. Only Conditions carrying a Message= are
+        # LaunchConditions (others gate components/features).
+        if el.get("Message") and el.text and "WIN10BUILD" in el.text:
+            found_conditions.append(el.text)
+
+    assert found_conditions, (
+        "Decompiled MSI has no LaunchCondition referencing WIN10BUILD. The "
+        "#397 Windows-version gate is missing from the built MSI."
+    )
+    assert any(
+        "19041" in c for c in found_conditions
+    ), (f"LaunchCondition(s) found referencing WIN10BUILD but none gate on 19041. "
+        f"Conditions: {found_conditions}")
+
+
+def test_decompiled_has_win10build_property(decompiled_tree: ET.ElementTree) -> None:
+    """The built MSI must declare a WIN10BUILD property backed by a RegistrySearch.
+
+    Without the property, the launch condition's WIN10BUILD reference
+    evaluates to empty and the gate becomes vacuous.
+    """
+    pkg = _decompiled_package(decompiled_tree)
+    prop = _find_property(pkg, "WIN10BUILD")
+    assert prop is not None, "WIN10BUILD property missing from built MSI"
+
+    search = prop.find(f"{{{NS['wix']}}}RegistrySearch")
+    assert search is not None, (
+        "WIN10BUILD property has no <RegistrySearch> child in the built MSI — "
+        "the gate has no value to evaluate against."
+    )
+    assert search.get("Name") == "CurrentBuildNumber", (
+        f"WIN10BUILD RegistrySearch must read CurrentBuildNumber, "
+        f"got Name='{search.get('Name')}'."
+    )
+
+
 def test_verifyreadydlg_back_override_wins(decompiled_tree: ET.ElementTree) -> None:
     """The last (NOT Installed) NewDialog row for (VerifyReadyDlg, Back) must target ShortcutsDlg.
 

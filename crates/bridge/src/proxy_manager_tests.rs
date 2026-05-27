@@ -1,3 +1,8 @@
+// `CancellationToken::new` is pervasive across these tests as the test
+// harness's root signal; module-level allow per clippy.toml's
+// "Bridge cancellation contract" sanctioned-test-file exception.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use hole_common::config::ServerEntry;
@@ -897,17 +902,19 @@ fn reload_when_not_running_starts() {
 /// `networksetup` calls fail fast (adapter not found), but the wrapping
 /// instrumentation still emits the diagnostic.
 #[skuld::test]
-fn apply_dns_settings_emits_done_info_log() {
+fn dns_apply_emits_done_info_log() {
     use crate::dns::connector::DirectConnector;
     use crate::dns::forwarder::DnsForwarder;
     use crate::dns::server::LocalDnsServer;
+    use crate::dns::system::{Dns, SystemDns};
     use crate::test_support::log_capture::VecWriter;
     use hole_common::config::DnsConfig;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    // Current-thread runtime so `tokio::spawn` in `apply_dns_settings`
+    // Current-thread runtime so `tokio::spawn` in `SystemDns::apply`
     // (or anything downstream) stays on the test thread. The helper
     // asserts this at install time. See bindreams/hole#302.
     tokio::runtime::Builder::new_current_thread()
@@ -934,7 +941,21 @@ fn apply_dns_settings_emits_done_info_log() {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
             let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
 
-            let _ = apply_dns_settings(&srv, "hole-test-nonexistent-iface-xyz", None).await;
+            let dns = SystemDns::default();
+            // Adapter doesn't exist — `Win32Real::get_settings` returns
+            // `Ok(None)` so nothing is captured and apply also no-ops, but
+            // the surrounding `apply_dns_settings done` INFO log still fires.
+            let mut applied = dns
+                .apply(
+                    srv,
+                    vec!["hole-test-nonexistent-iface-xyz".into()],
+                    vec![],
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("apply ok with missing adapter");
+            applied.shutdown().await;
 
             let output = writer.snapshot_string();
             assert!(
@@ -963,17 +984,20 @@ fn apply_dns_settings_emits_done_info_log() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
+fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
     use crate::dns::connector::DirectConnector;
     use crate::dns::forwarder::DnsForwarder;
     use crate::dns::server::LocalDnsServer;
+    use crate::dns::system::{Dns, SystemDns};
+    use crate::proxy::TUN_DEVICE_NAME;
     use crate::test_support::log_capture::VecWriter;
     use hole_common::config::DnsConfig;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    // Current-thread runtime — see `apply_dns_settings_emits_done_info_log`
+    // Current-thread runtime — see `dns_apply_emits_done_info_log`
     // for why the multi-thread `rt()` is unsafe with `set_default`.
     // bindreams/hole#302.
     tokio::runtime::Builder::new_current_thread()
@@ -999,16 +1023,41 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
             let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
 
             // Upstream alias uses a distinctive name so we can grep for it.
-            let _ = apply_dns_settings(&srv, "hole-p4-test-upstream-xyz", None).await;
+            // Mirrors `start_inner`'s phase 7 wiring: capture_aliases=
+            // [upstream] (TUN skipped per Phase 4 #247), apply_aliases=
+            // [TUN, upstream].
+            let dns = SystemDns::default();
+            let mut applied = dns
+                .apply(
+                    srv,
+                    vec!["hole-p4-test-upstream-xyz".into()],
+                    vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("apply ok");
+            applied.shutdown().await;
 
             let output = writer.snapshot_string();
 
-            // CAPTURE side: only the upstream alias appears. The TUN alias
-            // `hole-tun` must NOT appear in any `capture_one` / `show_dnsservers`
-            // line, because we no longer query its prior state.
+            // The per-FFI lines from `Win32Real` are emitted on the
+            // blocking pool thread (the `apply_windows` loop dispatches
+            // each backend call via `spawn_blocking`) so the test's
+            // thread-local subscriber never sees them. We assert on the
+            // wrapper lines from `apply_windows` instead — those run on
+            // the test thread.
+            //
+            // Both fake aliases are missing from the system: capture
+            // surfaces `"DNS capture: adapter not found; skipping
+            // alias=..."` (debug); apply surfaces `"DNS apply failed;
+            // continuing alias=..."` (warn). Capture must NEVER carry
+            // the TUN alias (Phase 4 #247); apply MUST carry both.
+
+            // CAPTURE side: only the upstream alias appears.
             let capture_lines: Vec<&str> = output
                 .lines()
-                .filter(|l| l.contains("show_dnsservers") || l.contains("capture_one"))
+                .filter(|l| l.contains("DNS capture: adapter not found"))
                 .collect();
             assert!(
                 !capture_lines.is_empty(),
@@ -1016,7 +1065,7 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
             );
             for line in &capture_lines {
                 assert!(
-                    !line.contains("alias=hole-tun "),
+                    !line.contains(&format!("alias={TUN_DEVICE_NAME}")),
                     "capture ran on TUN — expected to be skipped. line: {line}"
                 );
             }
@@ -1027,14 +1076,17 @@ fn apply_dns_settings_skips_tun_from_capture_keeps_in_apply() {
                 "capture should have run on upstream alias; got:\n{output}"
             );
 
-            // APPLY side: the TUN alias DOES appear — we still set loopback DNS
-            // on the TUN so the OS's best-route-to-DNS lookup lands on 127.x.
+            // APPLY side: the TUN alias DOES appear — we still set
+            // loopback DNS on the TUN so the OS's best-route-to-DNS
+            // lookup lands on 127.x.
             let apply_lines: Vec<&str> = output
                 .lines()
-                .filter(|l| l.contains("set_dns_ipv4") || l.contains("set_dns_ipv6"))
+                .filter(|l| l.contains("DNS apply failed; continuing"))
                 .collect();
             assert!(
-                apply_lines.iter().any(|l| l.contains("alias=hole-tun")),
+                apply_lines
+                    .iter()
+                    .any(|l| l.contains(&format!("alias={TUN_DEVICE_NAME}"))),
                 "apply should have run on TUN alias; got:\n{output}"
             );
             assert!(
@@ -1114,7 +1166,7 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let outcome = run_forwarder_self_test(forwarder, vec![], false).await;
+                let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
                 assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
             });
 
@@ -1147,7 +1199,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let outcome = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+                let outcome = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await;
                 let SelfTestOutcome::Failed { attempts, reason } = outcome else {
                     panic!("expected Failed");
                 };
@@ -1202,7 +1260,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], true).await;
+                let _ = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    true,
+                    CancellationToken::new(),
+                )
+                .await;
             });
 
         let output = writer.snapshot_string();
@@ -1236,7 +1300,13 @@ mod self_test {
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
                 let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
-                let _ = run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false).await;
+                let _ = run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await;
             });
 
         let output = writer.snapshot_string();
@@ -1268,7 +1338,7 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     intercept_udp53: true,
                 };
-                match build_local_dns(&cfg, 1080, false).await {
+                match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
                         attempts: 0,
                         elapsed_ms: 0,
@@ -1346,7 +1416,7 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     intercept_udp53: true,
                 };
-                let res = build_local_dns(&cfg, 1080, false).await;
+                let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (srv, ep, fwd) = match res {
                     Ok(t) => t,
                     Err(e) => panic!("expected Ok((None, None, None)) for disabled DNS, got {e:?}"),

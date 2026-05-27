@@ -114,3 +114,93 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Pr
 [[disallowed-methods]]
 path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
 reason = "Use hole_test_observability::register!() at lib.rs level for tests. See bindreams/hole#301."
+
+# Bridge Dns trait — Win32 native DNS FFI (bindreams/hole#397) ---------------------------------------------------------
+#
+# The Win32 DNS settings FFIs (`SetInterfaceDnsSettings` /
+# `GetInterfaceDnsSettings`) must only be called from inside the
+# `WinDnsBackend::Win32Real` impl. Direct callers bypass the
+# `MockBackend` test seam exactly the same way the #165 `setup_routes`
+# bypass did. The free-function shims `capture_adapters` /
+# `apply_loopback` / `platform_restore_adapter` in
+# `crates/bridge/src/dns/system/windows.rs` already route through
+# `Win32Real::default()`; the bans below cover anything reaching the
+# raw `windows` crate paths directly.
+#
+# Sanctioned suppressions: only the two `Win32Real::{get_settings,
+# set_loopback, restore}` call sites in `dns/system/windows.rs`. Each
+# uses `#[allow(clippy::disallowed_methods)]` with a comment citing
+# this rule.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::IpHelper::SetInterfaceDnsSettings"
+reason = "Must go through `WinDnsBackend::set_loopback` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true  # only `hole-bridge` has the `Win32_NetworkManagement_IpHelper` feature wired in; other workspace crates can't resolve the path.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::IpHelper::GetInterfaceDnsSettings"
+reason = "Must go through `WinDnsBackend::get_settings` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true
+
+# `DnsFlushResolverCache` is currently called via a local `#[link]`
+# declaration in `dns/system/windows.rs` (no `windows` crate path), but
+# we ban the canonical path for symmetry: any future binding via the
+# `windows` crate or a helper crate must still go through
+# `WinDnsBackend::flush`. The local `#[link]` site is sanctioned with an
+# `#[allow(clippy::disallowed_methods)]` plus comment citing this rule.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::Dns::DnsFlushResolverCache"
+reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+allow-invalid = true
+
+# Bridge cancellation contract (bindreams/hole#397) --------------------------------------------------------------------
+#
+# Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
+# the cooperative-cancellation propagation that the #397 refactor put
+# in place: a bridge cancel signal from the user's "Cancel" button
+# travels from `ipc.rs::handle_start`'s root token down through every
+# phase of `proxy_manager::start_inner` via `child_token()`. Any fresh
+# token rooted elsewhere is unreachable from that root, and any
+# in-flight work observing only that fresh token cannot be preempted.
+# The historical regression at `plugin.rs:237` (a fresh token shadowing
+# the bridge cancel during plugin-chain spawn) is the case this rule
+# guards against.
+#
+# **Scope is workspace-wide, not bridge-only.** Cargo's `clippy.toml`
+# resolution is workspace-rooted; there is no per-crate override
+# without splitting workspaces. As a consequence, ex-Galoshes crates
+# (`garter`, `galoshes`, `garter-bin`, `mock-plugin`) that legitimately
+# spawn their own root tokens — for test harnesses, signal handlers,
+# and subsystem owners outside the bridge's IPC cancel chain — carry a
+# module-level `#![allow(clippy::disallowed_methods)]` in the affected
+# test / lib files. This is accepted noise; the alternative
+# (cargo-supported per-crate clippy.toml) does not exist as of cargo
+# 1.93. If a future cargo gains per-crate overrides, narrow the rule's
+# scope and remove the ex-Galoshes module-level allows.
+#
+# Sanctioned bridge-side suppressions, each with a per-call-site
+# `#[allow(clippy::disallowed_methods)]` plus comment citing this rule:
+#
+# 1. `crates/bridge/src/ipc.rs::handle_start` — the IPC root. Every
+#    bridge cancel scope descends from this one token.
+# 2. `crates/bridge/src/dispatcher.rs::Dispatcher::new` — the
+#    Dispatcher owns its own subsystem cancel scope tied to its
+#    lifecycle (started in `new`, cancelled in `shutdown`); it is not
+#    a child of the start-cancel.
+# 3. `crates/bridge/src/proxy_manager.rs::ProxyManager::start` — the
+#    non-cancellable convenience shim that explicitly creates a fresh
+#    never-signalled token because the caller (tests, `reload`) does
+#    not want cancel semantics.
+# 4. `crates/bridge/src/server_test.rs` — the one-shot `test-server`
+#    CLI probe, no caller-side cancel; never-signalled token by design.
+#
+# Bridge test files use module-level `#![allow(clippy::disallowed_methods)]`
+# because `CancellationToken::new` is pervasive there as the test
+# harness's root signal and per-call suppressions would dominate the
+# file. The module-level shape is `#![allow(...)]` near the top with a
+# comment citing this rule.
+
+[[disallowed-methods]]
+path = "tokio_util::sync::CancellationToken::new"
+reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy_manager.rs::ProxyManager::start`, `server_test.rs`. Test files use module-level `#![allow]`. See bindreams/hole#397."

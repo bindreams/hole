@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpStream};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
@@ -218,6 +219,11 @@ async fn maybe_start_plugin(
     // `diagnostic_tap = false`: one-shot probe; the user is connecting
     // for a quick test, not a debugging session. Per-conn tap metrics
     // would add noise without value here.
+    // server_test is a one-shot probe with no caller-side cancel; pass a
+    // never-signalled token so the chain runs to its natural conclusion.
+    #[allow(clippy::disallowed_methods)]
+    // One-shot CLI probe: no caller-side cancel exists. See clippy.toml CancellationToken::new rule.
+    let chain_cancel = CancellationToken::new();
     let chain = crate::proxy::plugin::start_plugin_chain(
         plugin_name,
         &plugin_path,
@@ -226,6 +232,7 @@ async fn maybe_start_plugin(
         server_port,
         None,
         false,
+        &chain_cancel,
     )
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;

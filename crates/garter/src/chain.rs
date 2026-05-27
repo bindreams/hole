@@ -219,7 +219,11 @@ impl ChainRunner {
         addrs.extend(intermediate);
         addrs.push(remote_addr);
 
-        // Shared shutdown token
+        // Shared shutdown token. ChainRunner owns its own shutdown scope —
+        // the external `cancel_token` builder option is wired into this
+        // token below so cancel propagation flows in either direction.
+        #[allow(clippy::disallowed_methods)]
+        // Garter's chain-shutdown root: distinct from any caller cancel scope. See hole's clippy.toml CancellationToken::new rule.
         let shutdown = CancellationToken::new();
         shutdown::register_signal_handler(shutdown.clone());
 

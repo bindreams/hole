@@ -327,6 +327,72 @@ def test_media_template_embeds_cab(package: ET.Element) -> None:
     )
 
 
+# Launch-condition tests ===============================================================================================
+#
+# Hole's #397 DNS refactor uses `SetInterfaceDnsSettings`, which is
+# missing on Windows builds older than 19041 (version 2004, May 2020).
+# The MSI must refuse to install on older builds rather than letting
+# the bridge crash at first proxy-start.
+
+
+def test_win10build_property_uses_registry_search(package: ET.Element) -> None:
+    """The WIN10BUILD property must read HKLM CurrentBuildNumber.
+
+    The Windows-version gate (Launch condition) reads from the
+    `CurrentBuildNumber` registry value, which is a `REG_SZ` whose
+    numeric content WiX's expression evaluator can compare as an
+    integer. The bridge requires build >= 19041 (#397).
+    """
+    win10build = None
+    for prop in package.iter(f"{{{NS['wix']}}}Property"):
+        if prop.get("Id") == "WIN10BUILD":
+            win10build = prop
+            break
+    assert win10build is not None, "Missing <Property Id='WIN10BUILD'> — #397 launch condition cannot evaluate"
+
+    search = win10build.find("wix:RegistrySearch", NS)
+    assert search is not None, "<Property Id='WIN10BUILD'> must contain a <RegistrySearch> child"
+    assert search.get("Root") == "HKLM", f"RegistrySearch Root must be HKLM, got {search.get('Root')}"
+    assert search.get("Key") == r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", (
+        f"RegistrySearch Key must point at CurrentVersion, got {search.get('Key')}"
+    )
+    assert search.get("Name") == "CurrentBuildNumber", (
+        f"RegistrySearch Name must be CurrentBuildNumber, got {search.get('Name')}"
+    )
+    assert search.get("Type") == "raw", (
+        f"RegistrySearch Type must be 'raw' so the REG_SZ flows back numerically, got {search.get('Type')}"
+    )
+
+
+def test_launch_condition_requires_build_19041(package: ET.Element) -> None:
+    """A <Launch> condition must gate install on WIN10BUILD >= 19041.
+
+    Must be an integer comparison (no quotes around 19041) so MSI's
+    expression evaluator coerces the REG_SZ to int. The 'Installed OR'
+    prefix is required so uninstall + repair don't re-evaluate the gate
+    on older builds where an old install already exists.
+    """
+    launches = list(package.iter(f"{{{NS['wix']}}}Launch"))
+    assert launches, "No <Launch> condition in hole.wxs — #397 Windows-version gate missing"
+
+    matches = [el for el in launches if "WIN10BUILD" in (el.get("Condition") or "")]
+    assert len(matches) == 1, (
+        f"Expected exactly one <Launch> condition referencing WIN10BUILD, got {len(matches)}. "
+        f"Conditions: {[el.get('Condition') for el in launches]}"
+    )
+
+    launch = matches[0]
+    assert launch.get("Condition") == "Installed OR WIN10BUILD >= 19041", (
+        f"Launch condition must be exactly 'Installed OR WIN10BUILD >= 19041' "
+        f"(integer-shaped RHS — no quotes around 19041). Got: '{launch.get('Condition')}'"
+    )
+    message = launch.get("Message") or ""
+    assert "2004" in message or "19041" in message, (
+        f"Launch condition message must name the required Windows version "
+        f"so end users can act on the refusal. Got: '{message}'"
+    )
+
+
 # Custom action attribute tests ========================================================================================
 
 

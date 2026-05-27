@@ -1,17 +1,13 @@
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use crate::dns_state::DnsPrior;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::net::{IpAddr, Ipv4Addr};
-
-#[cfg(target_os = "windows")]
-use std::net::Ipv6Addr;
 
 // Timing-log instrumentation tests (#247) =============================================================================
 //
 // These tests verify that Phase 1 diagnostic logs fire. They live outside
-// the `windows_parsers` / `macos_parsers` modules because they exercise
-// real OS command invocations (netsh / networksetup), which the parser
-// tests deliberately avoid.
+// the `macos_parsers` module because they exercise real OS command
+// invocations (networksetup), which the parser tests deliberately avoid.
 
 #[cfg(target_os = "windows")]
 mod windows_timing_logs {
@@ -21,35 +17,29 @@ mod windows_timing_logs {
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    /// Phase-4 (#247): `flush_dns_cache` must return immediately. The
-    /// flush itself runs on a detached `std::thread::spawn`'d thread so
-    /// `apply_loopback` and `RunningDns::drop` never block on the 1-5s
-    /// `ipconfig /flushdns` wall-clock. Phase-2 observation confirmed
-    /// flushdns was a major contributor to the 11.3s stall.
-    ///
-    /// The elapsed-ms DEBUG log still fires inside the spawned thread
-    /// so Phase-2 observation stays intact — we just can't assert on it
-    /// from here because `set_default` is thread-local (the spawned
-    /// thread doesn't inherit the subscriber). The contract-level
-    /// assertion below is the load-bearing one.
+    /// Post-#397 (Win32-native): `flush_dns_cache` calls
+    /// `DnsFlushResolverCache` inline (~10 ms FFI). The pre-#397
+    /// implementation detached `ipconfig /flushdns` onto a
+    /// `std::thread::spawn`'d thread because that subprocess took 1–5 s
+    /// (Phase 4 #247). The FFI is ms-scale, so inline is correct.
     #[skuld::test]
-    fn flush_dns_cache_returns_immediately() {
+    fn flush_dns_cache_returns_quickly() {
         let start = std::time::Instant::now();
         flush_dns_cache();
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "flush_dns_cache must return immediately (fire-and-forget); \
-             returned after {elapsed:?} — if flushdns is still blocking callers, \
-             the teardown-side flush in RunningDns::drop will stall too."
+            elapsed < std::time::Duration::from_millis(200),
+            "flush_dns_cache must complete quickly; \
+             returned after {elapsed:?} — the Win32 DnsFlushResolverCache \
+             FFI should be ms-scale."
         );
     }
 
-    /// `capture_adapters` must emit per-alias DEBUG timing logs so a slow
-    /// netsh query against a freshly-created TUN adapter is visible in
-    /// Phase 2 logs. Uses a nonexistent adapter name so the test doesn't
-    /// depend on any specific network configuration — `netsh show` will
-    /// return "not found" quickly, and the timing log fires regardless.
+    /// `capture_adapters` (the pre-#397 free-function shim) routes
+    /// through `Win32Real::get_settings`, which emits per-alias DEBUG
+    /// timing logs. Uses a nonexistent adapter so the test doesn't
+    /// depend on host network configuration — `ConvertInterfaceAliasToLuid`
+    /// returns ERROR_INVALID_PARAMETER quickly and the timing log fires.
     #[skuld::test]
     fn capture_adapters_emits_per_alias_elapsed_ms_debug_log() {
         use crate::dns::system::capture_adapters;
@@ -74,100 +64,6 @@ mod windows_timing_logs {
             output.contains("hole-test-bogus-adapter-xyz"),
             "expected alias in log; got:\n{output}"
         );
-    }
-}
-
-// Windows parser tests ================================================================================================
-
-#[cfg(target_os = "windows")]
-mod windows_parsers {
-    use super::{DnsPrior, IpAddr, Ipv4Addr, Ipv6Addr};
-    use crate::dns::system::windows::parse_netsh_dnsservers;
-
-    #[skuld::test]
-    fn parse_static_single() {
-        let out = "
-Configuration for interface \"Ethernet\"
-    Statically Configured DNS Servers:  1.1.1.1
-    Register with which suffix:         Primary only
-";
-        let p = parse_netsh_dnsservers(out);
-        match p {
-            DnsPrior::Static { servers } => {
-                assert_eq!(servers, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn parse_static_multiple() {
-        let out = "
-Configuration for interface \"Ethernet\"
-    Statically Configured DNS Servers:  1.1.1.1
-                                        8.8.8.8
-                                        9.9.9.9
-    Register with which suffix:         Primary only
-";
-        let p = parse_netsh_dnsservers(out);
-        match p {
-            DnsPrior::Static { servers } => {
-                assert_eq!(
-                    servers,
-                    vec![
-                        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                        IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-                    ]
-                );
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn parse_dhcp_with_ip() {
-        let out = "
-Configuration for interface \"Ethernet\"
-    DNS servers configured through DHCP:  192.168.1.1
-    Register with which suffix:           Primary only
-";
-        let p = parse_netsh_dnsservers(out);
-        assert!(matches!(p, DnsPrior::Dhcp));
-    }
-
-    #[skuld::test]
-    fn parse_dhcp_none() {
-        let out = "
-Configuration for interface \"Wi-Fi\"
-    DNS servers configured through DHCP:  None
-    Register with which suffix:           Primary only
-";
-        let p = parse_netsh_dnsservers(out);
-        assert!(matches!(p, DnsPrior::None));
-    }
-
-    #[skuld::test]
-    fn parse_empty_output_returns_none() {
-        let p = parse_netsh_dnsservers("");
-        assert!(matches!(p, DnsPrior::None));
-    }
-
-    #[skuld::test]
-    fn parse_ipv6_static() {
-        let out = "
-    Statically Configured DNS Servers:  2606:4700:4700::1111
-";
-        let p = parse_netsh_dnsservers(out);
-        match p {
-            DnsPrior::Static { servers } => {
-                assert_eq!(
-                    servers,
-                    vec![IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111))]
-                );
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
     }
 }
 

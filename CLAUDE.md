@@ -79,7 +79,91 @@ Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) wo
 
 ### Bridge test-isolation contract
 
-All production I/O in the bridge — shadowsocks tunnel lifecycle, routing table mutations, OS gateway introspection — routes through the `Proxy` trait in `crates/bridge/src/proxy.rs` and the `Routing` trait in `crates/tun-engine/src/routing.rs`. Helper types whose `Drop` impls perform cleanup must route that cleanup through trait methods, not through raw free functions. Compile-time enforcement lives in the workspace root `clippy.toml` via the `disallowed_methods` list (`tun_engine::routing::setup_routes` / `teardown_routes`). See bindreams/hole#165 for the incident that motivated the rule.
+All production I/O in the bridge — shadowsocks tunnel lifecycle, routing
+table mutations, OS gateway introspection, OS DNS resolver configuration —
+routes through three traits: `Proxy` in
+[crates/bridge/src/proxy.rs](crates/bridge/src/proxy.rs), `Routing` in
+[crates/tun-engine/src/routing.rs](crates/tun-engine/src/routing.rs), and
+`Dns` in [crates/bridge/src/dns/system.rs](crates/bridge/src/dns/system.rs).
+Helper types whose `Drop` impls perform cleanup must route that cleanup
+through trait methods, not through raw free functions. Compile-time
+enforcement lives in the workspace root `clippy.toml` via the
+`disallowed_methods` list (`tun_engine::routing::setup_routes` /
+`teardown_routes`; the Win32 DNS FFIs
+`SetInterfaceDnsSettings` / `GetInterfaceDnsSettings`). See
+bindreams/hole#165 for the incident that motivated the rule and #397 for
+the `Dns` extension.
+
+The `Dns` trait has a **two-layer test seam**:
+
+- **Outer seam (`Dns`)** — substituted by `MockDns` at
+  `ProxyManager::new_with_dns(...)`. Used by `proxy_manager_tests` to
+  verify the `start_inner` integration (cancel propagation through
+  phase 7, restore on partial apply).
+- **Inner seam (`WinDnsBackend` on Windows / `MacDnsBackend` on macOS)**
+  — substituted by `MockBackend` at
+  `SystemDns::new_with_backend(...)`. Used by `dns/system/*_tests.rs`
+  to verify each platform's apply loop observes cancel between FFIs
+  and inline-restores. Both seams are necessary: an outer-only mock
+  can pass while the production `SystemDns::apply` ignores cancel
+  internally.
+
+### Bridge cancellation contract
+
+Cooperative-cancellation propagation (Go `context.Context` style) is the
+**only** cancellation mechanism in the bridge. Future-drop cancellation
+(`tokio::select! { _ = future.cancel.cancelled() => drop, r = work => r }`
+where dropping `work` is supposed to clean up) is reserved for
+catastrophic / panic teardown.
+
+The bridge's cancel scope is rooted at the IPC `handle_start` handler in
+[crates/bridge/src/ipc.rs](crates/bridge/src/ipc.rs); every subordinate
+phase of [`ProxyManager::start_cancellable`](crates/bridge/src/proxy_manager.rs)
+receives the token (or a `cancel.child_token()`) by reference and
+observes it cooperatively. Fresh `CancellationToken::new()` inside
+`crates/bridge/src/` would shadow this chain and is banned by
+`clippy.toml`'s `disallowed_methods` list. Sanctioned production
+exceptions (each carrying a per-call-site `#[allow]` with a citation)
+are enumerated in `clippy.toml` itself. See bindreams/hole#397.
+
+The contract has three invariants:
+
+1. **Cooperative observation between phases.** Long-running async phases
+   wrap their await in `tokio::select! { biased; _ = cancel.cancelled() => Err(Cancelled), r = work => r }`,
+   or check `cancel.is_cancelled()` between iterations of a loop. The
+   one exception is when the future being raced has no async cleanup
+   obligations (e.g. `DnsForwarder::forward` — the in-flight socket
+   closes on `Drop`, which is sync-trivial); future-drop is acceptable
+   at those sites and must be documented inline.
+1. **Async cleanup is explicit.** Types with async cleanup obligations
+   expose `async fn shutdown(&mut self)` and use `drop_bomb::DebugDropBomb`
+   to enforce that callers awaited it before drop. The bomb defuses
+   inside `shutdown`. Forgetting to await before drop panics in debug
+   builds (catches the bug at first test run) and emits a `warn!` plus a
+   best-effort sync fallback in release builds.
+1. **`tokio::select!` arms must not drop work mid-cleanup.** If a
+   cancel arm needs to run async cleanup, restructure so cleanup is
+   awaited cooperatively after the select returns. A `select!` that
+   races cancel against a `spawn_blocking` doing an FFI write creates a
+   TOCTOU between the in-flight FFI and any subsequent inline-restore;
+   the in-process apply loop in [`SystemDns::apply`](crates/bridge/src/dns/system.rs)
+   demonstrates the correct pattern (cancel-check between FFIs, never
+   mid-FFI; see the inline comment at the apply loop).
+
+`Dns::Applied` types follow this discipline:
+[`SystemDnsApplied`](crates/bridge/src/dns/system.rs) owns a
+`DebugDropBomb` defused by its `shutdown()`, and is constructed only in
+the `Ok` branch of `Dns::apply` so the bomb never fires from a
+start-Err unwind. `ProxyManager::stop` awaits `Applied::shutdown()`
+before letting `RunningState` drop.
+
+**Known follow-up.** `SystemRoutes::Drop` still tears down routing
+synchronously (shelling out to `netsh` / `route`), which blocks the
+runtime worker for up to several seconds on Windows. Converting
+`Routing::Installed` to the `async fn shutdown` + `DebugDropBomb`
+discipline (mirroring `DnsApplied`) is tracked as a follow-up — same
+class as the sub-bug A symptom that #397 fixed for DNS, but on the
+cleanup path.
 
 ### Panic-dump dispatcher
 
