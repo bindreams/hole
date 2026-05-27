@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const getVersionMock = vi.fn();
+const getVersionMock = vi.fn<() => Promise<string>>();
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: () => getVersionMock() }));
 
 beforeEach(() => {

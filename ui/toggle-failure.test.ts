@@ -43,4 +43,15 @@ describe("ToggleFailure shape (regression for #397 sub-bug C)", () => {
     // produce a TS error, hence the directive.
     expect(_typeProbe).toBeDefined();
   });
+
+  it("does not accept a `kind` field even alongside the required `error`", () => {
+    // Defense against a softer re-introduction shape: making `kind`
+    // optional (`kind?: "timeout" | "err"`) instead of widening the
+    // union. The TS structural type system would accept the object
+    // literal below if `kind?` existed; the @ts-expect-error forces
+    // tsc to assert the field is genuinely absent from the interface.
+    // @ts-expect-error — extra `kind` field is not on `ToggleFailure`.
+    const _typeProbe: ToggleFailure = { error: "x", kind: "timeout" };
+    expect(_typeProbe).toBeDefined();
+  });
 });

@@ -131,6 +131,20 @@ describe("toggleFromIdle: outcome handling", () => {
     expect(h.updatePublicIp).toHaveBeenCalled();
   });
 
+  it("transitions to `disconnected` on a Cancelled outcome (bridge-side cancel)", async () => {
+    // The bridge cooperatively cancelled and reported `Cancelled` (per
+    // crates/hole/src/tray.rs::ToggleOutcome). The state machine maps
+    // this to `disconnected` — the UI may have briefly shown
+    // `cancelling`, but the settled idle state is Disconnected.
+    const h = makeHarness();
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "toggle_proxy") return Promise.resolve("cancelled");
+      return Promise.resolve();
+    });
+    await toggleFromIdle(true, h.deps);
+    expect(h.state).toBe("disconnected");
+  });
+
   it("surfaces a bridge error via toast + transitions to `connection-failed`", async () => {
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
@@ -176,10 +190,11 @@ describe("toggleFromIdle: outcome handling", () => {
     // the start is in-flight.
     const togglePromise = toggleFromIdle(true, h.deps);
     // The promise's first setState("connecting") runs synchronously
-    // (before any await). We mutate the state directly to simulate the
-    // user's Cancel-button-click side effect (which would normally call
-    // setState("cancelling")).
-    h.state = "cancelling";
+    // (before any await). We route the simulated Cancel through
+    // h.deps.setState so the harness's setState.mock.calls reflects
+    // the full transition history — same shape as production, where
+    // a Cancel click calls setState("cancelling").
+    h.deps.setState("cancelling");
     await togglePromise;
 
     // The follow-up Stop was fired (two toggle_proxy calls total).

@@ -22,12 +22,14 @@ export function initIpDisplay(): void {
 export async function updatePublicIp(): Promise<void> {
   try {
     const data = await invoke<PublicIpData>("get_public_ip");
-    const ip = data.ip || "unknown";
-    currentIp = ip;
+    // Only commit a real IP to `currentIp` — the displayed "unknown"
+    // fallback is human-readable text, not a value the user would ever
+    // want pasted from their clipboard.
+    currentIp = data.ip || "";
     if (countryFlag) setCountryFlag(countryFlag, data.country_code);
     if (ipText && countryFlag) {
       // Structure: <span class="country-flag fi fis fi-XX" id="country-flag" title="XX"></span> ip.addr
-      ipText.replaceChildren(countryFlag, document.createTextNode(` ${ip}`));
+      ipText.replaceChildren(countryFlag, document.createTextNode(` ${data.ip || "unknown"}`));
     }
   } catch (err) {
     console.error("get_public_ip failed:", err);

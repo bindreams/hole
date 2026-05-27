@@ -52,4 +52,19 @@ describe("copy button", () => {
     document.getElementById("copy-ip-btn")!.click();
     expect(writeText).toHaveBeenCalledWith("1.2.3.4");
   });
+
+  it("does NOT write the literal 'unknown' fallback to the clipboard", async () => {
+    // Footgun guard: when the IP fetch returns empty, the UI displays
+    // "unknown" as human-readable text — but that text must never be
+    // committed to `currentIp` as a value the user would paste. The
+    // copy button should be a no-op in this case.
+    invokeMock.mockResolvedValue({ ip: "", country_code: "" });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { initIpDisplay, updatePublicIp } = await import("./ip-display");
+    initIpDisplay();
+    await updatePublicIp();
+    document.getElementById("copy-ip-btn")!.click();
+    expect(writeText).not.toHaveBeenCalled();
+  });
 });
