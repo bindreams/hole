@@ -13,6 +13,7 @@ import {
   statusTextFor,
   statusWordClassFor,
 } from "./connection-state";
+import { setCountryFlag } from "./country-flag";
 import { config, loadConfig } from "./main";
 import { statusTooltipFor } from "./servers";
 import { showToast } from "./toast";
@@ -74,7 +75,7 @@ function formatUptime(totalSecs: number): string {
 const powerBtn = document.getElementById("power-btn")!;
 const statusWord = document.getElementById("status-word")!;
 const ipText = document.getElementById("ip-text")!;
-const countryBadge = document.getElementById("country-badge")!;
+const countryFlag = document.getElementById("country-flag")!;
 const copyIpBtn = document.getElementById("copy-ip-btn")!;
 const graphSvg = document.getElementById("graph-svg")!;
 const graphScaleLabel = document.getElementById("graph-scale-label")!;
@@ -259,21 +260,10 @@ export async function updatePublicIp() {
   try {
     const data = await invoke<PublicIpData>("get_public_ip");
     const ip = data.ip || "unknown";
-    const cc = data.country_code || "??";
     currentIp = ip;
-    countryBadge.textContent = cc;
-    // Set the text node after the badge. We keep the country badge element and
-    // append the IP as a text node.
-    // Structure: <span class="country" id="country-badge">CC</span> ip.addr
-    // We need to replace only the text outside the badge.
-    const existing = ipText.childNodes;
-    // Remove text nodes (keep the country badge span).
-    for (let i = existing.length - 1; i >= 0; i--) {
-      if (existing[i].nodeType === Node.TEXT_NODE) {
-        existing[i].remove();
-      }
-    }
-    ipText.appendChild(document.createTextNode(` ${ip}`));
+    setCountryFlag(countryFlag, data.country_code);
+    // Structure: <span class="country-flag fi fis fi-XX" id="country-flag" title="XX"></span> ip.addr
+    ipText.replaceChildren(countryFlag, document.createTextNode(` ${ip}`));
   } catch (err) {
     console.error("get_public_ip failed:", err);
   }

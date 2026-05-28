@@ -54,8 +54,6 @@
   --graph-fill-rx: rgba(34, 197, 94, 0.1);
   --graph-fill-tx: rgba(245, 158, 11, 0.1);
   --graph-midline: rgba(255, 255, 255, 0.06);
-  --country-bg: #1e1e35;
-  --country-text: #aaa;
   --scrollbar: #2a2a4a;
   --toggle-track: #333;
   --toggle-track-on: #22c55e;
@@ -105,8 +103,6 @@
   --graph-fill-rx: rgba(22, 163, 74, 0.12);
   --graph-fill-tx: rgba(217, 119, 6, 0.12);
   --graph-midline: rgba(0, 0, 0, 0.06);
-  --country-bg: #e8e8f0;
-  --country-text: #555;
   --scrollbar: #ccc;
   --toggle-track: #ccc;
   --toggle-track-on: #16a34a;
@@ -359,16 +355,9 @@ order. (0,2,0) > (0,1,0). */
   color: var(--text-tertiary);
 }
 
-.country {
-  display: inline-block;
-  font-family: "Inter", system-ui, sans-serif;
-  font-size: 0.55rem;
-  font-weight: 700;
-  background: var(--country-bg);
-  color: var(--country-text);
-  padding: 0.05rem 0.3rem;
-  border-radius: 3px;
-  letter-spacing: 0.5px;
+.country-flag {
+  /* Sizing (1em x 1em via .fi.fis) and background-image are owned by
+   * flag-icons; only layout-affecting properties live here. */
   vertical-align: middle;
   margin-right: 0.2rem;
 }
