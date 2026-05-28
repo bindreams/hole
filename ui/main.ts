@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { attachConsole, error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
+import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
 import { initFilters, renderFilters } from "./filters";
