@@ -14,8 +14,8 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, FrameAccumulator, StreamTag,
-    DEFAULT_UDP_TIMEOUT,
+    bind_udp, deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, FrameAccumulator,
+    StreamTag, DEFAULT_UDP_TIMEOUT,
 };
 
 #[skuld::test]
@@ -289,6 +289,29 @@ async fn udp_ipv6_remote() {
     let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     assert_eq!(round_trip(&app, client_addr, b"over-v6").await, b"over-v6");
     shutdown.cancel();
+}
+
+#[cfg(windows)]
+#[skuld::test]
+async fn bind_udp_send_to_dead_peer_does_not_poison_recv() {
+    // Windows-only regression for #415: a UDP send to a loopback peer with no
+    // listener must NOT surface a phantom WSAECONNRESET on the socket's next
+    // recv. With SIO_UDP_CONNRESET left enabled (tokio/mio default) the recv
+    // below would return Err(ConnectionReset) instead of the self-datagram,
+    // which in run_client would tear down the whole tunnel. `bind_udp` disables
+    // it.
+    let sock = bind_udp("127.0.0.1:0".parse().unwrap()).expect("bind_udp");
+    let me = sock.local_addr().unwrap();
+
+    // Send to a dead loopback port (no listener) — would poison the next recv.
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    sock.send_to(b"into the void", dead).await.unwrap();
+
+    // Then exercise the socket normally; recv must succeed, not ConnectionReset.
+    sock.send_to(b"still alive", me).await.unwrap();
+    let mut buf = [0u8; 32];
+    let (n, _) = sock.recv_from(&mut buf).await.expect("recv must not be poisoned");
+    assert_eq!(&buf[..n], b"still alive");
 }
 
 #[skuld::test]

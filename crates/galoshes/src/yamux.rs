@@ -217,6 +217,61 @@ fn unspecified_for(target: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Bind a non-blocking tokio [`UdpSocket`], with `SIO_UDP_CONNRESET` disabled on
+/// Windows.
+///
+/// Both UDP relay sockets here send *and* receive on the same handle. On Windows
+/// a UDP `send_to` to a loopback peer with no live listener makes the kernel
+/// surface the resulting ICMP port-unreachable as a phantom `WSAECONNRESET`
+/// (10054) on the socket's *next* `recv` — which, on the client's shared socket,
+/// would tear the whole tunnel down (every flow reconnects). The peers here are
+/// loopback (SS_LOCAL on the client; the ss server's plugin loopback on the
+/// server) and routinely come and go, so this is reachable under ordinary UDP
+/// churn (e.g. finished DNS queries). Disabling `SIO_UDP_CONNRESET` is the
+/// standard fix (also applied by quinn / hickory-dns); tokio/mio leave the
+/// Windows default (enabled). See bindreams/hole#415 and the documented hazard
+/// in `crates/bridge/src/dns/forwarder.rs`.
+pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    // Bind via std so the raw handle is available for the Windows ioctl before
+    // the socket is registered with tokio's reactor.
+    let sock = std::net::UdpSocket::bind(addr)?;
+    sock.set_nonblocking(true)?;
+    #[cfg(windows)]
+    disable_udp_connreset(&sock)?;
+    UdpSocket::from_std(sock)
+}
+
+#[cfg(windows)]
+fn disable_udp_connreset(sock: &std::net::UdpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket as _;
+
+    use windows::Win32::Networking::WinSock::{WSAIoctl, SOCKET};
+
+    // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) == 0x9800000C. Passing FALSE
+    // disables the phantom-reset behavior described on `bind_udp`.
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    let disable: u32 = 0; // BOOL FALSE
+    let mut bytes_returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            SOCKET(sock.as_raw_socket() as usize),
+            SIO_UDP_CONNRESET,
+            Some(std::ptr::addr_of!(disable).cast()),
+            std::mem::size_of::<u32>() as u32,
+            None,
+            0,
+            &mut bytes_returned,
+            None,
+            None,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Write a stream's leading tag byte and flush it. Every yamux substream
 /// begins with one [`StreamTag`] so the server can dispatch TCP vs UDP.
 async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Result<()> {
@@ -246,7 +301,7 @@ async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -
     // Bind in the remote's address family, else an IPv6 `remote` (ss server
     // configured with `server: "::"` hands the plugin an `[::1]` loopback)
     // fails the connect with an address-family mismatch (#415, defect B).
-    let udp = UdpSocket::bind(unspecified_for(remote)).await.context("bind udp")?;
+    let udp = bind_udp(unspecified_for(remote)).context("bind udp")?;
     udp.connect(remote).await.context("connect udp")?;
 
     let mut read_buf = [0u8; 65536 + 2];
@@ -384,10 +439,18 @@ async fn run_udp_association(
         }
     };
 
-    // Close the outbound channel before the (awaiting) stream teardown so a
-    // datagram the `run_client` loop tries to forward during the teardown
-    // window hits `Closed` and re-creates the association, rather than being
-    // silently buffered into a receiver that will never read it.
+    // Close the outbound channel so that, from here on, a datagram the
+    // `run_client` loop tries to forward hits `Closed` and re-creates the
+    // association instead of vanishing into a receiver that will never read it.
+    // This does not recover datagrams already buffered (or `try_send`-accepted
+    // in the brief, multi-thread-only window between the loop `break` and this
+    // call): those are dropped when `outbound_rx` is dropped at return. That is
+    // correct NAT-teardown lossy-UDP behavior — an `evicted` flow was idle for
+    // `udp_timeout`, so a datagram arriving exactly at eviction is the first of
+    // a resumed flow that the app will retransmit (DNS/QUIC do); on an error
+    // teardown the stream is already dead and those datagrams could not have
+    // been delivered anyway. Conntrack/shadowsocks-rust drop the same boundary
+    // packet.
     outbound_rx.close();
 
     tracing::debug!(peer = %peer, reason, "udp association closed");
@@ -410,7 +473,7 @@ pub(crate) async fn run_client(
     // detached association tasks (which hold `Arc<UdpSocket>` clones) for the
     // port and could fail the rebind, terminating the client.
     let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
-    let udp_socket = Arc::new(UdpSocket::bind(local).await.context("bind local UDP")?);
+    let udp_socket = Arc::new(bind_udp(local).context("bind local UDP")?);
 
     // Report the actual bound UDP address (test seam). Production passes `None`.
     if let Some(tx) = bound_addr_tx {
