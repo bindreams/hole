@@ -14,9 +14,12 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    bind_udp, deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, FrameAccumulator,
-    StreamTag, DEFAULT_UDP_TIMEOUT,
+    deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, FrameAccumulator, StreamTag,
+    DEFAULT_UDP_TIMEOUT,
 };
+// Only the Windows-gated CONNRESET regression test uses this.
+#[cfg(windows)]
+use crate::yamux::bind_udp;
 
 #[skuld::test]
 fn stream_tag_tcp_roundtrip() {
