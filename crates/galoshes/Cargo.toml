@@ -34,6 +34,9 @@ libc = "0.2"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Enable garter's `test_utils::WaitableWriter` for the E2E relay tests
+# (the module is gated behind garter's `test-utils` feature).
+garter = { path = "../garter", features = ["test-utils"] }
 
 [build-dependencies]
 sha2 = "0.11"

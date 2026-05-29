@@ -1,13 +1,27 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::AsyncReadExt as _;
 use futures::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
+
+/// Maximum buffered outbound datagrams per UDP association before new ones are
+/// dropped. Bounded (not unbounded) so a stalled association — e.g. yamux
+/// backpressure while the app floods UDP — can't grow without limit; dropping
+/// on a full buffer is the correct lossy-UDP semantic. This is a buffer size,
+/// not a retry/timeout budget.
+const UDP_ASSOC_CHANNEL_CAPACITY: usize = 64;
+
+/// Default UDP NAT idle-eviction timeout when `udp_timeout` is not configured
+/// in `SS_PLUGIN_OPTIONS`. Matches shadowsocks-rust's `udp_timeout` default.
+pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 
 // Protocol framing ====================================================================================================
 
@@ -54,6 +68,43 @@ pub fn deframe_udp_datagram(buf: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     Some((&buf[2..2 + len], &buf[2 + len..]))
+}
+
+/// Reassembles length-prefixed UDP datagrams from a yamux substream.
+///
+/// yamux substreams are reliable **byte** streams, not message-preserving:
+/// one `read` may return a partial frame or several coalesced frames. This
+/// buffers raw bytes and drains every complete frame, retaining any trailing
+/// partial for the next `push`. Without it, a single `deframe` per `read`
+/// (the pre-#415 behavior) corrupts split frames and drops coalesced ones.
+///
+/// Buffer growth is bounded: the 2-byte length prefix is a `u16`, so a
+/// pending frame never exceeds `2 + u16::MAX` bytes.
+#[derive(Debug, Default)]
+pub(crate) struct FrameAccumulator {
+    buf: Vec<u8>,
+}
+
+impl FrameAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append freshly-read bytes.
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Pop the next complete datagram payload, or `None` if the buffer does
+    /// not yet hold a full frame.
+    pub(crate) fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let (payload, consumed) = {
+            let (payload, rest) = deframe_udp_datagram(&self.buf)?;
+            (payload.to_vec(), self.buf.len() - rest.len())
+        };
+        self.buf.drain(..consumed);
+        Some(payload)
+    }
 }
 
 // Driver ==============================================================================================================
@@ -153,6 +204,26 @@ async fn open_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> Result<yamux::S
 
 // TCP/UDP relay helpers ===============================================================================================
 
+/// An unspecified-address `SocketAddr` of the same family as `target`, port 0.
+///
+/// A UDP socket must be bound in the same address family as the peer it will
+/// `connect()`/`send_to()`; binding IPv4 (`0.0.0.0`) then connecting an IPv6
+/// peer fails with an address-family error (#415, defect B).
+fn unspecified_for(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    }
+}
+
+/// Write a stream's leading tag byte and flush it. Every yamux substream
+/// begins with one [`StreamTag`] so the server can dispatch TCP vs UDP.
+async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Result<()> {
+    stream.write_all(&[tag.to_byte()]).await?;
+    stream.flush().await
+}
+
 /// Relay between a tokio TCP stream and a yamux stream (bidirectional).
 async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -> Result<()> {
     // Convert yamux stream (futures AsyncRead/Write) to tokio-compatible.
@@ -172,22 +243,27 @@ async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -
 
 /// Relay UDP datagrams on the server side: yamux stream <-> remote UDP socket.
 async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -> Result<()> {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.context("bind udp")?;
+    // Bind in the remote's address family, else an IPv6 `remote` (ss server
+    // configured with `server: "::"` hands the plugin an `[::1]` loopback)
+    // fails the connect with an address-family mismatch (#415, defect B).
+    let udp = UdpSocket::bind(unspecified_for(remote)).await.context("bind udp")?;
     udp.connect(remote).await.context("connect udp")?;
 
-    let mut recv_buf = [0u8; 65536 + 2];
+    let mut read_buf = [0u8; 65536 + 2];
     let mut udp_buf = [0u8; 65536];
+    let mut acc = FrameAccumulator::new();
 
     loop {
         tokio::select! {
             // yamux -> UDP
-            result = yamux_stream.read(&mut recv_buf) => {
+            result = yamux_stream.read(&mut read_buf) => {
                 let n = result.context("yamux read")?;
                 if n == 0 {
                     break;
                 }
-                if let Some((payload, _)) = deframe_udp_datagram(&recv_buf[..n]) {
-                    udp.send(payload).await.context("udp send")?;
+                acc.push(&read_buf[..n]);
+                while let Some(payload) = acc.next_frame() {
+                    udp.send(&payload).await.context("udp send")?;
                 }
             }
             // UDP -> yamux
@@ -224,11 +300,97 @@ async fn connect_with_backoff(addr: SocketAddr, shutdown: &CancellationToken) ->
     }
 }
 
-async fn run_client(
+/// One client-side UDP NAT association.
+///
+/// Relays datagrams for a single originating local peer over a dedicated yamux
+/// stream, bidirectionally (mirroring [`relay_udp_server`]), until the
+/// association is idle-evicted or the stream/connection closes. Outbound
+/// datagrams arrive on `outbound_rx` from the [`run_client`] loop; inbound
+/// replies are delivered straight to `peer` via the shared `udp_socket`.
+///
+/// On exit it closes the stream (FINs the substream so the server's
+/// `relay_udp_server` read returns 0 and its UDP socket is reclaimed) and
+/// notifies the loop via `cleanup_tx` so the stale table entry is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_association(
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    udp_socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    generation: u64,
+    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+    cleanup_tx: mpsc::Sender<(SocketAddr, u64)>,
+    udp_timeout: Duration,
+) {
+    let mut stream = match open_stream(&open_tx).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(peer = %peer, error = %e, "failed to open yamux stream for UDP");
+            let _ = cleanup_tx.send((peer, generation)).await;
+            return;
+        }
+    };
+    if let Err(e) = write_tag(&mut stream, StreamTag::Udp).await {
+        tracing::error!(peer = %peer, error = %e, "failed to write UDP tag");
+        let _ = cleanup_tx.send((peer, generation)).await;
+        return;
+    }
+
+    let mut read_buf = [0u8; 65536 + 2];
+    let mut acc = FrameAccumulator::new();
+
+    // NAT idle-eviction timer. The delay IS the behavior under management
+    // (conntrack-style idle expiry of a UDP association), not synchronization
+    // between our own code paths — sanctioned per the synchronization
+    // invariant's "the delay IS the behavior" exception. See bindreams/hole#415.
+    let idle = tokio::time::sleep(udp_timeout);
+    tokio::pin!(idle);
+
+    let reason = loop {
+        tokio::select! {
+            // local app -> server
+            maybe = outbound_rx.recv() => {
+                let Some(payload) = maybe else { break "channel closed" };
+                idle.as_mut().reset(Instant::now() + udp_timeout);
+                let framed = frame_udp_datagram(&payload);
+                if stream.write_all(&framed).await.is_err() {
+                    break "stream write error";
+                }
+                if stream.flush().await.is_err() {
+                    break "stream flush error";
+                }
+            }
+            // server -> local app
+            result = stream.read(&mut read_buf) => {
+                let n = match result {
+                    Ok(0) => break "stream closed",
+                    Ok(n) => n,
+                    Err(_) => break "stream read error",
+                };
+                idle.as_mut().reset(Instant::now() + udp_timeout);
+                acc.push(&read_buf[..n]);
+                while let Some(payload) = acc.next_frame() {
+                    if let Err(e) = udp_socket.send_to(&payload, peer).await {
+                        tracing::debug!(peer = %peer, error = %e, "failed to send UDP reply to local peer");
+                    }
+                }
+            }
+            // NAT idle eviction.
+            _ = &mut idle => break "evicted",
+        }
+    };
+
+    tracing::debug!(peer = %peer, reason, "udp association closed");
+    let _ = stream.close().await;
+    let _ = cleanup_tx.send((peer, generation)).await;
+}
+
+pub(crate) async fn run_client(
     config: yamux::Config,
     local: SocketAddr,
     remote: SocketAddr,
+    udp_timeout: Duration,
     shutdown: CancellationToken,
+    mut bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
     loop {
         // Connect to the remote yamux server.
@@ -247,11 +409,28 @@ async fn run_client(
 
         let driver = tokio::spawn(drive_connection(conn, open_rx, _inbound_tx));
 
-        // Bind local TCP + UDP listeners.
+        // Bind local TCP + UDP listeners (fresh per connection).
         let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
-        let udp_socket = UdpSocket::bind(local).await.context("bind local UDP")?;
+        let udp_socket = Arc::new(UdpSocket::bind(local).await.context("bind local UDP")?);
+
+        // Signal the actual bound UDP address on the FIRST successful bind only
+        // (test seam; `run_client` rebinds on reconnect but the oneshot fires
+        // once). Production passes `None`.
+        if let Some(tx) = bound_addr_tx.take() {
+            let addr = udp_socket.local_addr().context("local udp addr")?;
+            let _ = tx.send(addr);
+        }
 
         let result: Result<()> = async {
+            // NAT association table: local peer -> (generation, outbound sender).
+            // Owned solely by this loop (no shared mutex) and scoped to this
+            // connection — on reconnect it drops, every association task sees
+            // its `outbound_rx` close and exits, and the next iteration starts
+            // empty. `generation` closes the re-create-during-teardown race:
+            // a stale cleanup only removes an entry whose generation matches.
+            let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
+            let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
+            let mut next_gen: u64 = 0;
             let mut udp_buf = [0u8; 65536];
 
             loop {
@@ -264,13 +443,8 @@ async fn run_client(
                         tokio::spawn(async move {
                             match open_stream(&open_tx).await {
                                 Ok(mut yamux_stream) => {
-                                    // Write tag byte.
-                                    if let Err(e) = yamux_stream.write_all(&[StreamTag::Tcp.to_byte()]).await {
+                                    if let Err(e) = write_tag(&mut yamux_stream, StreamTag::Tcp).await {
                                         tracing::error!(error = %e, "failed to write TCP tag");
-                                        return;
-                                    }
-                                    if let Err(e) = yamux_stream.flush().await {
-                                        tracing::error!(error = %e, "failed to flush TCP tag");
                                         return;
                                     }
                                     if let Err(e) = relay_tcp(yamux_stream, tcp_stream).await {
@@ -283,42 +457,54 @@ async fn run_client(
                             }
                         });
                     }
-                    // Receive local UDP datagrams.
+                    // Receive local UDP datagrams; route each to its peer's association.
                     recv = udp_socket.recv_from(&mut udp_buf) => {
-                        let (n, _peer) = recv.context("udp recv")?;
-                        let open_tx = open_tx.clone();
+                        let (n, peer) = recv.context("udp recv")?;
                         let payload = udp_buf[..n].to_vec();
-                        tokio::spawn(async move {
-                            match open_stream(&open_tx).await {
-                                Ok(mut yamux_stream) => {
-                                    // Write tag byte.
-                                    if let Err(e) = yamux_stream.write_all(&[StreamTag::Udp.to_byte()]).await {
-                                        tracing::error!(error = %e, "failed to write UDP tag");
-                                        return;
-                                    }
-                                    if let Err(e) = yamux_stream.flush().await {
-                                        tracing::error!(error = %e, "failed to flush UDP tag");
-                                        return;
-                                    }
-                                    // Send the initial datagram.
-                                    let framed = frame_udp_datagram(&payload);
-                                    if let Err(e) = yamux_stream.write_all(&framed).await {
-                                        tracing::error!(error = %e, "failed to write initial UDP datagram");
-                                        return;
-                                    }
-                                    if let Err(e) = yamux_stream.flush().await {
-                                        tracing::error!(error = %e, "failed to flush UDP datagram");
-                                        return;
-                                    }
-                                    // One datagram per stream; bidirectional UDP relay
-                                    // would keep the stream open longer.
-                                    let _ = yamux_stream.close().await;
+
+                        // Forward to an existing association if one is live.
+                        // `Closed` returns the payload so we can re-create
+                        // without cloning on the hot path; `Full` drops it
+                        // (correct lossy-UDP semantics).
+                        let payload = match associations.get(&peer) {
+                            Some((_, tx)) => match tx.try_send(payload) {
+                                Ok(()) => continue,
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::debug!(peer = %peer, "udp association buffer full, dropping datagram");
+                                    continue;
                                 }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "failed to open yamux stream for UDP");
+                                Err(mpsc::error::TrySendError::Closed(payload)) => {
+                                    associations.remove(&peer);
+                                    payload
                                 }
+                            },
+                            None => payload,
+                        };
+
+                        // Create a new association.
+                        let generation = next_gen;
+                        next_gen += 1;
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(UDP_ASSOC_CHANNEL_CAPACITY);
+                        // First datagram always fits the fresh buffer.
+                        let _ = tx.try_send(payload);
+                        associations.insert(peer, (generation, tx));
+                        tokio::spawn(run_udp_association(
+                            open_tx.clone(),
+                            Arc::clone(&udp_socket),
+                            peer,
+                            generation,
+                            rx,
+                            cleanup_tx.clone(),
+                            udp_timeout,
+                        ));
+                    }
+                    // An association task exited; drop its entry iff still current.
+                    Some((peer, generation)) = cleanup_rx.recv() => {
+                        if let Some((current, _)) = associations.get(&peer) {
+                            if *current == generation {
+                                associations.remove(&peer);
                             }
-                        });
+                        }
                     }
                 }
             }
@@ -343,16 +529,23 @@ async fn run_client(
 
 // Server mode =========================================================================================================
 
-async fn run_server(
+pub(crate) async fn run_server(
     config: yamux::Config,
     local: SocketAddr,
     remote: SocketAddr,
     shutdown: CancellationToken,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(local)
         .await
         .with_context(|| format!("bind yamux server on {local}"))?;
     tracing::info!(local = %local, "yamux server listening");
+
+    // Signal the actual bound listen address (test seam). Production passes `None`.
+    if let Some(tx) = bound_addr_tx {
+        let addr = listener.local_addr().context("local tcp addr")?;
+        let _ = tx.send(addr);
+    }
 
     loop {
         // Accept one underlying TCP connection.
@@ -424,16 +617,46 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
 
 // Plugin ==============================================================================================================
 
+/// Parse the optional client-side `udp_timeout` (whole seconds) from an
+/// `SS_PLUGIN_OPTIONS` string.
+///
+/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The last occurrence
+/// wins (consistent with v2ray-plugin's duplicate-key semantics). A value that
+/// is not a positive integer is a hard error — `0` would evict every
+/// association immediately, breaking all UDP. v2ray-plugin ignores this key,
+/// so it can share the same options string.
+pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
+    let Some(opts) = plugin_options else {
+        return Ok(DEFAULT_UDP_TIMEOUT);
+    };
+    let mut timeout = DEFAULT_UDP_TIMEOUT;
+    for (key, value) in garter::parse_plugin_options(opts) {
+        if key == "udp_timeout" {
+            let secs: u64 = value
+                .parse()
+                .with_context(|| format!("invalid udp_timeout (expected a positive integer of seconds): {value:?}"))?;
+            if secs == 0 {
+                anyhow::bail!("udp_timeout must be greater than 0 seconds");
+            }
+            timeout = Duration::from_secs(secs);
+        }
+    }
+    Ok(timeout)
+}
+
 pub struct YamuxPlugin {
     config: yamux::Config,
     is_server: bool,
+    /// Client-side UDP NAT idle-eviction timeout. Ignored in server mode.
+    udp_timeout: Duration,
 }
 
 impl YamuxPlugin {
-    pub fn new(is_server: bool) -> Self {
+    pub fn new(is_server: bool, udp_timeout: Duration) -> Self {
         Self {
             config: yamux::Config::default(),
             is_server,
+            udp_timeout,
         }
     }
 }
@@ -455,9 +678,9 @@ impl garter::ChainPlugin for YamuxPlugin {
         shutdown: CancellationToken,
     ) -> garter::Result<()> {
         let result = if self.is_server {
-            run_server(self.config, local, remote, shutdown).await
+            run_server(self.config, local, remote, shutdown, None).await
         } else {
-            run_client(self.config, local, remote, shutdown).await
+            run_client(self.config, local, remote, self.udp_timeout, shutdown, None).await
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))
