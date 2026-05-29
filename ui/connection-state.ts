@@ -6,8 +6,9 @@
 // type, the text/CSS mapping, and the small set of predicates that the
 // DOM-wiring layer (`sidebar.ts`) uses to decide what to render.
 //
-// See `docs/superpowers/specs/` design notes for the full transition
-// graph and rationale (backend cancellation, 15 s client timeout, etc.).
+// The transition graph and rationale (idle states, transitions,
+// backend-cooperative cancellation) is documented in this file's
+// exported predicates and in `toggle-flow.ts`.
 
 export type ConnectionState =
   | "disconnected" //       red,       "Disconnected",       click → start
@@ -32,6 +33,10 @@ export const IDLE_STATES = new Set<ConnectionState>([
 /// `cancelling` or `disconnecting`; `connecting` is the only transition
 /// state where a click fires `cancel_proxy`.
 export const TRANSITION_STATES = new Set<ConnectionState>(["connecting", "disconnecting", "cancelling"]);
+
+/// Backend `ToggleOutcome` (Rust enum, lowercase-serialized).
+/// Must match `crates/hole/src/tray.rs::ToggleOutcome`.
+export type ToggleOutcome = "running" | "stopped" | "cancelled";
 
 /// True if the UI represents the proxy as "running" for the user — i.e.
 /// clicking the button should initiate a disconnect. Includes the
@@ -100,7 +105,7 @@ export function powerBtnClassFor(state: ConnectionState): string {
 
 /// Map the backend-side `ToggleOutcome` variants (serialized lowercase)
 /// to the frontend state that should result when a toggle succeeds.
-export function stateForToggleOutcome(outcome: "running" | "stopped" | "cancelled"): ConnectionState {
+export function stateForToggleOutcome(outcome: ToggleOutcome): ConnectionState {
   switch (outcome) {
     case "running":
       return "connected";
