@@ -346,7 +346,12 @@ async fn run_udp_association(
     tokio::pin!(idle);
 
     let reason = loop {
+        // `biased`: traffic in either direction always wins over the idle
+        // timer, so an association is never evicted while a datagram is already
+        // buffered or a reply is pending. The timer fires only when both
+        // directions are genuinely idle.
         tokio::select! {
+            biased;
             // local app -> server
             maybe = outbound_rx.recv() => {
                 let Some(payload) = maybe else { break "channel closed" };
@@ -379,6 +384,12 @@ async fn run_udp_association(
         }
     };
 
+    // Close the outbound channel before the (awaiting) stream teardown so a
+    // datagram the `run_client` loop tries to forward during the teardown
+    // window hits `Closed` and re-creates the association, rather than being
+    // silently buffered into a receiver that will never read it.
+    outbound_rx.close();
+
     tracing::debug!(peer = %peer, reason, "udp association closed");
     let _ = stream.close().await;
     let _ = cleanup_tx.send((peer, generation)).await;
@@ -390,8 +401,23 @@ pub(crate) async fn run_client(
     remote: SocketAddr,
     udp_timeout: Duration,
     shutdown: CancellationToken,
-    mut bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
+    // Bind the local TCP + UDP listeners once for the client's lifetime. They
+    // belong to `local` (the SS_LOCAL address), not to any single upstream
+    // connection, so they persist across reconnects — only the yamux connection
+    // churns. Binding per-reconnect would race the previous connection's
+    // detached association tasks (which hold `Arc<UdpSocket>` clones) for the
+    // port and could fail the rebind, terminating the client.
+    let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
+    let udp_socket = Arc::new(UdpSocket::bind(local).await.context("bind local UDP")?);
+
+    // Report the actual bound UDP address (test seam). Production passes `None`.
+    if let Some(tx) = bound_addr_tx {
+        let addr = udp_socket.local_addr().context("local udp addr")?;
+        let _ = tx.send(addr);
+    }
+
     loop {
         // Connect to the remote yamux server.
         let tcp = match connect_with_backoff(remote, &shutdown).await {
@@ -408,18 +434,6 @@ pub(crate) async fn run_client(
         let (_inbound_tx, _inbound_rx) = mpsc::channel::<yamux::Stream>(32);
 
         let driver = tokio::spawn(drive_connection(conn, open_rx, _inbound_tx));
-
-        // Bind local TCP + UDP listeners (fresh per connection).
-        let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
-        let udp_socket = Arc::new(UdpSocket::bind(local).await.context("bind local UDP")?);
-
-        // Signal the actual bound UDP address on the FIRST successful bind only
-        // (test seam; `run_client` rebinds on reconnect but the oneshot fires
-        // once). Production passes `None`.
-        if let Some(tx) = bound_addr_tx.take() {
-            let addr = udp_socket.local_addr().context("local udp addr")?;
-            let _ = tx.send(addr);
-        }
 
         let result: Result<()> = async {
             // NAT association table: local peer -> (generation, outbound sender).
