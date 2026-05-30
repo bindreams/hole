@@ -95,3 +95,76 @@ fn empty_transports_deserializes_to_empty_set() {
         other => panic!("expected Ready, got {other:?}"),
     }
 }
+
+#[skuld::test]
+fn ready_serializes_to_canonical_wire_form() {
+    let ev = SitrepEvent::Ready {
+        listen: "127.0.0.1:1984".parse().unwrap(),
+        transports: Transports::TCP,
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"ready","listen":"127.0.0.1:1984","transports":["tcp"]}"#
+    );
+}
+
+#[skuld::test]
+fn ready_serializes_tcp_before_udp() {
+    // Pin transport ordering in the serialized array (TCP first, then UDP).
+    let ev = SitrepEvent::Ready {
+        listen: "127.0.0.1:1984".parse().unwrap(),
+        transports: Transports::TCP | Transports::UDP,
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"ready","listen":"127.0.0.1:1984","transports":["tcp","udp"]}"#
+    );
+}
+
+#[skuld::test]
+fn hello_serializes_to_canonical_wire_form() {
+    let ev = SitrepEvent::Hello {
+        protocol: SITREP_PROTOCOL.to_string(),
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"hello","protocol":"sitrep-1.0.0"}"#
+    );
+}
+
+#[skuld::test]
+fn bind_conflict_serializes_to_canonical_wire_form() {
+    let ev = SitrepEvent::BindConflict {
+        errno: 48,
+        addr: "127.0.0.1:1984".parse().unwrap(),
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"bind_conflict","errno":48,"addr":"127.0.0.1:1984"}"#
+    );
+}
+
+#[skuld::test]
+fn fatal_omits_errno_key_when_none() {
+    // skip_serializing_if = Option::is_none → no "errno" key on the wire.
+    let ev = SitrepEvent::Fatal {
+        detail: "config invalid".to_string(),
+        errno: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"fatal","detail":"config invalid"}"#
+    );
+}
+
+#[skuld::test]
+fn fatal_includes_errno_key_when_some() {
+    let ev = SitrepEvent::Fatal {
+        detail: "boom".to_string(),
+        errno: Some(13),
+    };
+    assert_eq!(
+        serde_json::to_string(&ev).unwrap(),
+        r#"{"event":"fatal","detail":"boom","errno":13}"#
+    );
+}

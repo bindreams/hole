@@ -97,6 +97,10 @@ pub enum ProtocolSupport {
 /// - `Ok(None)` — a log line (non-JSON), a JSON object without a known
 ///   `event` (unknown event = ignored, forward-compat), or a JSON object
 ///   that isn't a sitrep envelope. Callers treat this as log passthrough.
+///   Note: a `{`-prefixed line whose `event` matches a known variant but
+///   contains a malformed field (e.g. an unparseable `listen` address) is
+///   also swallowed to `Ok(None)` — the reserved `Err` arm is where a
+///   future strict mode would surface it.
 /// - `Err(_)` — reserved; currently never returned (unknown events are
 ///   ignored, not errors). Kept in the signature so a future strict mode
 ///   can surface malformed envelopes without an API break.
