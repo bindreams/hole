@@ -336,7 +336,7 @@ responses, and the protocol does not constrain that choice.
 
 [`garter`](https://crates.io/crates/garter) is the reference
 implementation of sitrep. Its sitrep module — `src/sitrep.rs` —
-defines the wire types and the `SITREP_PROTOCOL` constant
+will define the wire types and the `SITREP_PROTOCOL` constant
 (`"sitrep-1.0.0"`).
 
 > Note: at the time this document is first published, `src/sitrep.rs`
