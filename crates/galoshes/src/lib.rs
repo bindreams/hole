@@ -1,10 +1,13 @@
 #![cfg_attr(v2ray_plugin_missing, allow(dead_code, unused_imports))]
 
 pub mod embedded;
+pub mod sitrep_out;
 pub mod yamux;
 
 #[cfg(test)]
 mod embedded_tests;
+#[cfg(test)]
+mod sitrep_out_tests;
 #[cfg(test)]
 mod yamux_tests;
 

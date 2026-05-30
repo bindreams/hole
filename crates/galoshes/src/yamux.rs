@@ -460,9 +460,17 @@ impl garter::ChainPlugin for YamuxPlugin {
         // success report TCP|UDP readiness, on shutdown-first drop `ready`
         // unsent (RecvError — the "shutdown before ready" semantics).
         //
-        // TODO(galoshes readiness, later task): once galoshes speaks sitrep,
-        // emit a structured `ready` from inside run_server/run_client at the
-        // exact bind point instead of probing.
+        // This is galoshes' INTERNAL hop-readiness signal: it feeds
+        // galoshes' OWN `ChainRunner` aggregator, which intersects it with
+        // the inner v2ray hop and fires the chain-level `on_ready`. The
+        // PROCESS-level sitrep the bridge reads is emitted separately in
+        // `main.rs` off that `on_ready` outcome (see `galoshes::sitrep_out`).
+        // This probe knows only its own hop, not the chain, so it cannot
+        // own the process-stdout contract.
+        //
+        // A future refinement could replace the TCP-connect probe with a
+        // structured `ready` emitted from inside run_server/run_client at
+        // the exact bind point; the probe is the current pragmatic stand-in.
         let probe_local = local;
         let probe_shutdown = shutdown.clone();
         tokio::spawn(async move {
