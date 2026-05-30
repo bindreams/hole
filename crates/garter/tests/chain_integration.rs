@@ -499,6 +499,12 @@ async fn empty_transports_ready_surfaces_fatal() {
 /// probe succeeds and the chain reaches `Ok(ChainReady)`. A client then
 /// relays a payload through, proving the probe-fallback readiness is real
 /// and not just a fired channel.
+///
+/// The `MOCK_PLUGIN_BAD_PROTOCOL` knob emits its ignored `ready` with
+/// `transports: [tcp, udp]`, while the tier-2 TCP self-probe always
+/// reports `transports: [tcp]` only. Asserting `TCP`-only on the
+/// `ChainReady` discriminates the source and proves that the bad-major
+/// `ready` was not honored.
 #[skuld::test]
 async fn version_skew_falls_back_to_probe() {
     let mock_path = mock_plugin_path();
@@ -548,6 +554,17 @@ async fn version_skew_falls_back_to_probe() {
         .await
         .expect("chain never signaled ready")
         .expect("unknown-major should fall back to probe, not a start error");
+
+    // The probe-fallback readiness reports Transports::TCP (the tier-2
+    // self-probe is TCP-connect only). If the consumer had WRONGLY honored
+    // the unknown-major plugin's `ready` (which this knob emits with
+    // [tcp,udp]), transports would include UDP. Asserting TCP-only proves
+    // readiness came from the probe, not the ignored bad-major ready.
+    assert_eq!(
+        chain_ready.transports,
+        garter::Transports::TCP,
+        "version-skew readiness must come from the tier-2 TCP probe, not the ignored bad-major ready"
+    );
 
     let mut client = TcpStream::connect(chain_ready.listen)
         .await

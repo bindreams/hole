@@ -121,9 +121,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // sitrep ready: listener is bound & accepting. With
     // MOCK_PLUGIN_EMPTY_TRANSPORTS the transports set is empty (a protocol
-    // violation the consumer rejects as Fatal).
+    // violation the consumer rejects as Fatal). With MOCK_PLUGIN_BAD_PROTOCOL
+    // the ready emits TCP|UDP so the tier-2 probe (which always reports TCP
+    // only) is distinguishable from a wrongly-honored bad-major ready.
     let ready_transports = if empty_transports {
         Transports::empty()
+    } else if bad_protocol {
+        Transports::TCP | Transports::UDP
     } else {
         Transports::TCP
     };
