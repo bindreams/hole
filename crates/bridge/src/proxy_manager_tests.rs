@@ -1098,6 +1098,50 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
         });
 }
 
+// #414 — transports-driven UDP-drop policy ============================================================================
+//
+// The three `RunningState`/`Dispatcher::new` start sites read
+// `udp_available_from_chain(plugin_chain.transports())` instead of the
+// static `plugin_supports_udp(config)`. The derivation is the testable
+// unit: a TCP-only chain (`[tcp]`) yields `false`, a TCP+UDP chain yields
+// `true`, and no plugin yields `true`. Standing up a real `ProxyManager`
+// start needs elevation (routing/TUN), so the derivation is extracted
+// into `udp_available_from_chain(Option<Transports>)` and tested directly
+// — the same value flows into all three start sites.
+
+#[skuld::test]
+fn udp_unavailable_when_chain_reports_tcp_only() {
+    // A TCP-only plugin (plain v2ray-plugin) reports `[tcp]` via sitrep.
+    assert!(!udp_available_from_chain(Some(garter::Transports::TCP)));
+}
+
+#[skuld::test]
+fn udp_available_when_chain_reports_tcp_and_udp() {
+    // A UDP-capable plugin (galoshes, YAMUX) reports `[tcp, udp]`.
+    assert!(udp_available_from_chain(Some(
+        garter::Transports::TCP | garter::Transports::UDP
+    )));
+}
+
+#[skuld::test]
+fn udp_available_when_chain_reports_udp_only() {
+    // Defensive: UDP present in the set is sufficient regardless of TCP.
+    assert!(udp_available_from_chain(Some(garter::Transports::UDP)));
+}
+
+#[skuld::test]
+fn udp_available_when_no_plugin() {
+    // No plugin chain — the raw SOCKS5 path always carries UDP.
+    assert!(udp_available_from_chain(None));
+}
+
+#[skuld::test]
+fn udp_unavailable_when_chain_reports_empty_transports() {
+    // Degenerate (a chain that serves nothing): UDP is not present, so
+    // the privacy-preserving default is to drop Proxy-routed UDP.
+    assert!(!udp_available_from_chain(Some(garter::Transports::empty())));
+}
+
 // #388 — forwarder self-test gate tests ===============================================================================
 //
 // `start_inner` runs `run_forwarder_self_test` synchronously BEFORE

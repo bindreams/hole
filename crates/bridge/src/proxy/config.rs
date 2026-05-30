@@ -49,6 +49,14 @@ pub enum ProxyError {
     WintunLoad { path: PathBuf, message: String },
     #[error("plugin error: {0}")]
     Plugin(String),
+    /// A plugin reported a typed bind conflict (`StartError::BindConflict`
+    /// via sitrep — #414) at its local listener. This is the retryable
+    /// class: `proxy_err_to_io_err` synthesizes an `AddrInUse`-kind
+    /// `io::Error` from it so `bind_ephemeral` allocates a fresh port and
+    /// retries. The `errno` is the plugin's host-native OS error (0 if
+    /// unknown), preserved for `bridge.log` diagnostics.
+    #[error("plugin bind conflict on {addr} (errno {errno})")]
+    BindRace { errno: i32, addr: SocketAddr },
     /// `tunnel_mode == Full` requires the SOCKS5 listener, because the
     /// TUN dispatcher hands captured traffic to it on `local_port`.
     #[error("tunnel_mode=full requires the SOCKS5 listener; enable proxy_socks5 or switch to tunnel_mode=socks-only")]
@@ -278,6 +286,14 @@ pub fn resolve_plugin_path(name: &str) -> String {
 /// [`hole_common::protocol::BridgeResponse::Status::udp_proxy_available`]
 /// keeps its historical name for API stability. This helper uses the
 /// more accurate internal name.
+// TODO(#414 plan 2): remove this helper once port-alloc also derives UDP
+// capability from reported transports. The UDP-drop policy no longer calls
+// it — `proxy_manager.rs` now reads `PluginChain::transports()` (the live
+// sitrep signal) instead. It survives because the underlying static
+// `PluginDescriptor.udp_supported` is still read at port-alloc time (via
+// `plugin::plugin_protocols`), and Plan 2 retires both together. (Currently
+// only `config_tests.rs` exercises this `pub` helper directly — kept `pub`
+// + re-exported, so no dead-code warning fires.)
 pub fn plugin_supports_udp(config: &ProxyConfig) -> bool {
     match &config.server.plugin {
         None => true,

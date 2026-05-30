@@ -63,6 +63,27 @@ struct ProxyStartedDiag<'a> {
     ipv6_bypass_available: bool,
 }
 
+/// Derive whether `Proxy`-routed UDP flows can be carried through the
+/// tunnel, from a live plugin chain's sitrep-reported transports (#414).
+///
+/// - `Some(transports)` — a plugin chain is running; UDP is available iff
+///   the end-to-end transport intersection it reported includes
+///   [`garter::Transports::UDP`]. This replaces the static
+///   `PluginDescriptor.udp_supported` guess with the authoritative
+///   runtime signal.
+/// - `None` — no plugin chain; the raw SOCKS5 path always carries UDP, so
+///   UDP is available.
+///
+/// Takes `Option<Transports>` rather than `Option<&PluginChain>` so it is
+/// trivially unit-testable without standing up a real chain (which owns a
+/// `JoinHandle` + `CancellationToken`).
+fn udp_available_from_chain(transports: Option<garter::Transports>) -> bool {
+    match transports {
+        Some(t) => t.contains(garter::Transports::UDP),
+        None => true,
+    }
+}
+
 // State ===============================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -438,6 +459,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
 
+        // UDP availability: when a plugin chain is running, use the
+        // transports it actually reported via sitrep (#414) — the
+        // authoritative runtime signal, replacing the static
+        // `PluginDescriptor.udp_supported` guess. With no plugin, the raw
+        // SOCKS5 path carries UDP, so default to available. Computed once
+        // here (in scope for both the SocksOnly and Full branches below)
+        // so all three start sites read the same live value.
+        let udp_proxy_available = udp_available_from_chain(plugin_chain.as_ref().map(|c| c.transports()));
+
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
         let plugin_local = plugin_chain.as_ref().map(|c| c.local_addr());
@@ -502,7 +532,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 proxy: running_proxy,
                 server_ip: None,
                 started_at: Instant::now(),
-                udp_proxy_available: crate::proxy::plugin_supports_udp(config),
+                udp_proxy_available,
                 ipv6_bypass_available: false,
             });
         }
@@ -600,7 +630,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 gw_info.interface_index,
                 gw_info.ipv6_available,
                 config.server.plugin.clone(),
-                crate::proxy::plugin_supports_udp(config),
+                udp_proxy_available,
                 ruleset,
                 local_dns_endpoint,
             )?;
@@ -670,7 +700,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             proxy: running_proxy,
             server_ip: Some(server_ip),
             started_at: Instant::now(),
-            udp_proxy_available: crate::proxy::plugin_supports_udp(config),
+            udp_proxy_available,
             ipv6_bypass_available: gw_info.ipv6_available,
         })
     }
