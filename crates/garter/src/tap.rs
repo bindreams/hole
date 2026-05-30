@@ -19,12 +19,15 @@
 //! 2. Spawn the inner plugin's `run` future in a task, configured to bind
 //!    that internal port.
 //! 3. Wait for the inner plugin to actually accept TCP via
-//!    [`crate::chain::poll_ready`] (same backoff schedule [`ChainRunner`]
-//!    uses for its own readiness probe). Bounded at 30s; on timeout the
+//!    [`crate::chain::poll_ready`], racing the inner task's `JoinHandle`
+//!    so an early inner failure unblocks us. (The inner's own readiness
+//!    channel is discarded — the tap detects inner readiness by the probe
+//!    and inner failure by the join.) Bounded at 30s; on timeout the
 //!    inner task is aborted and `Error::Chain` propagates.
-//! 4. Bind the tap's public listener on `local` (only after step 3 — the
-//!    bind has to be observable to `ChainRunner::poll_ready` only when
-//!    the data plane is actually wired through).
+//! 4. Bind the tap's public listener on `local` (only after step 3, so the
+//!    public bind happens only once the data plane is actually wired
+//!    through), then report the tap's OWN readiness on the `ready` channel
+//!    passed to [`ChainPlugin::run`] — the chain aggregator awaits that.
 //! 5. Accept loop in a `JoinSet`; per-connection forwarder calls
 //!    `tokio::io::copy_bidirectional` with [`CountingStream`] wrappers.
 //! 6. On shutdown: abort all in-flight forwarders, await the inner task,
@@ -115,10 +118,11 @@ impl ChainPlugin for TapPlugin {
             }
         };
 
-        // 2. Spawn the inner plugin against `inner_local`, giving it its
-        //    own readiness channel. The tap consumes the inner's readiness
-        //    only to know the data plane is wired; it reports its OWN
-        //    readiness (below) once the public listener is bound.
+        // 2. Spawn the inner plugin against `inner_local`. The trait
+        //    requires a readiness channel, but the tap discards the inner's
+        //    (it detects inner readiness via the TCP probe in step 3 and
+        //    inner failure via the join); the tap reports its OWN readiness
+        //    (below) once the public listener is bound.
         let inner_shutdown = shutdown.clone();
         let (inner_ready_tx, _inner_ready_rx) = oneshot::channel();
         let mut inner_handle = tokio::spawn(self.inner.run(inner_local, remote, inner_shutdown, inner_ready_tx));
