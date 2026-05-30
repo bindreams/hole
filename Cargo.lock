@@ -3953,6 +3953,8 @@ dependencies = [
 name = "mock-plugin"
 version = "0.1.0"
 dependencies = [
+ "garter",
+ "serde_json",
  "tokio",
 ]
 
