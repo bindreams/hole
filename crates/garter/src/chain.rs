@@ -34,10 +34,13 @@ pub struct ChainReady {
 /// public-facing endpoint that external clients connect to) to
 /// `SS_LOCAL_*` (the local `ssserver` instance). The plugin chain is
 /// supplied in the SAME order in both modes (data-source-side first),
-/// but garter inverts the address walk and the `on_ready` probe target
-/// so position 0 forwards to `SS_LOCAL` and position N-1 listens on
-/// `SS_REMOTE`. This is what the SIP003 spec calls "server mode" and
-/// what `ssserver --plugin <chain-runner>` requires.
+/// but garter inverts the address wiring so position 0 forwards to
+/// `SS_LOCAL` and position N-1 listens on `SS_REMOTE` (the public
+/// endpoint). Accordingly, the chain-level readiness address reported
+/// via [`ChainRunner::on_ready`] is the position N-1 plugin's listen
+/// address in Server mode (versus position 0 in Client mode). This is
+/// what the SIP003 spec calls "server mode" and what
+/// `ssserver --plugin <chain-runner>` requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
