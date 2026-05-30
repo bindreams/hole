@@ -37,12 +37,28 @@ byte-level diagnostics.
 - `Mode::Server` — data flows from the public-facing endpoint
   (`SS_REMOTE_*`) through the chain back to a local `ssserver`
   (`SS_LOCAL_*`). The plugin add-order stays the same in both modes
-  (data-source-side first); garter inverts the address wiring and the
-  `on_ready` probe target accordingly.
+  (data-source-side first); in Server mode garter inverts the address
+  wiring — including which plugin position faces the public endpoint.
+  Per-plugin readiness is declared by each link (see the sitrep
+  protocol below) and aggregated by the runner.
 
 Use `Mode::from_plugin_options(env.plugin_options.as_deref())` to derive
 the mode automatically from the SIP003 `server` keyword in
 `SS_PLUGIN_OPTIONS`.
+
+## sitrep protocol
+
+A SIP003 plugin reports its startup to the host that spawned it —
+readiness, the actual bound listen address, the transports it serves,
+and any typed start failure — over **sitrep**, a one-way,
+line-delimited JSON control stream on the plugin's stdout. It replaces
+connect-probing the plugin's port and scraping its logs.
+
+`garter` is the reference implementation of sitrep, but the protocol is
+independently adoptable: any SIP003 / SIP003u plugin or host may
+implement it without depending on `garter`.
+
+See [SITREP.md](SITREP.md) for the full normative specification.
 
 ## Example
 
