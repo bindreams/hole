@@ -74,3 +74,11 @@ fn sip003_env_client_mode_when_options_only_have_servername() {
     assert_eq!(env.ss_remote_host, "203.0.113.1");
     assert_eq!(env.ss_remote_port, 8388);
 }
+
+// Readiness-mode tests ================================================================================================
+
+#[skuld::test]
+fn readiness_mode_defaults_to_probe() {
+    let p = crate::BinaryPlugin::new("/nonexistent", None);
+    assert_eq!(p.readiness_mode_for_test(), crate::binary::ReadinessMode::Probe);
+}

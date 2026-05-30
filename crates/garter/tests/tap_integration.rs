@@ -89,7 +89,10 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
 
     let shutdown = CancellationToken::new();
     let plugin_shutdown = shutdown.clone();
-    let plugin_handle = tokio::spawn(async move { tap.run(chain_local, echo_addr, plugin_shutdown).await });
+    // This test synchronizes on the "plugin tap: ready" tracing event, not
+    // the readiness channel; a throwaway oneshot satisfies the new param.
+    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+    let plugin_handle = tokio::spawn(async move { tap.run(chain_local, echo_addr, plugin_shutdown, ready_tx).await });
 
     // Park until tap signals ready via the tracing event the
     // `WaitableWriter` is watching for. Deterministic, no polling.

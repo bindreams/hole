@@ -21,6 +21,7 @@ impl ChainPlugin for NoopPlugin {
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
     ) -> crate::Result<()> {
         Ok(())
     }
@@ -40,7 +41,8 @@ async fn noop_plugin_runs_and_returns() {
     let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let remote: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let shutdown = CancellationToken::new();
+    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
 
-    let result = plugin.run(local, remote, shutdown).await;
+    let result = plugin.run(local, remote, shutdown, ready_tx).await;
     assert!(result.is_ok());
 }

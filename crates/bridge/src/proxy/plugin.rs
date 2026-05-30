@@ -298,6 +298,10 @@ async fn spawn_plugin_runner_at(
     // start mid-spawn, abort the partially-spawned chain and return
     // ProxyError::Cancelled so the caller short-circuits cleanly instead
     // of waiting up to READINESS_TIMEOUT for a chain it no longer wants.
+    // `ready_rx` now yields `Result<ChainReady, StartError>` (per-plugin
+    // readiness aggregated by the runner — #414); the timeout adds one
+    // `Result` layer and the channel another. Flatten and extract the
+    // chain-public listen address.
     let ready_addr = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -305,7 +309,12 @@ async fn spawn_plugin_runner_at(
             return Err(ProxyError::Cancelled);
         }
         r = tokio::time::timeout(READINESS_TIMEOUT, ready_rx) => match r {
-            Ok(Ok(addr)) => addr,
+            Ok(Ok(Ok(chain_ready))) => chain_ready.listen,
+            Ok(Ok(Err(start_err))) => {
+                cancel.cancel();
+                handle.abort();
+                return Err(ProxyError::Plugin(format!("plugin failed to start: {start_err}")));
+            }
             Ok(Err(_)) => {
                 cancel.cancel();
                 handle.abort();

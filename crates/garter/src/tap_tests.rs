@@ -74,10 +74,16 @@ impl ChainPlugin for StubPlugin {
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
     ) -> crate::Result<()> {
         let listener = TcpListener::bind(local)
             .await
             .map_err(|e| crate::Error::Chain(format!("stub bind {local}: {e}")))?;
+        let actual = listener.local_addr().unwrap_or(local);
+        let _ = ready.send(Ok(crate::sitrep::PluginReady {
+            listen: actual,
+            transports: crate::sitrep::Transports::TCP,
+        }));
         let behavior = self.behavior;
         loop {
             tokio::select! {
@@ -160,7 +166,10 @@ where
     let closed_rx = writer.wait_for("plugin tap: closed");
 
     let plugin_shutdown = shutdown.clone();
-    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown).await });
+    // The tests synchronize on the "plugin tap: ready" tracing event, not
+    // the readiness channel; a throwaway oneshot satisfies the new param.
+    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
     // Park until tap signals ready via tracing event. No timeout — the
     // test framework bounds wall time; if tap is broken the failure is
@@ -336,7 +345,10 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     let ready_rx = writer.wait_for("plugin tap: ready");
 
     let plugin_shutdown = shutdown.clone();
-    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown).await });
+    // The tests synchronize on the "plugin tap: ready" tracing event, not
+    // the readiness channel; a throwaway oneshot satisfies the new param.
+    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+    let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
     // Park until tap signals ready via tracing event. Deterministic.
     tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))

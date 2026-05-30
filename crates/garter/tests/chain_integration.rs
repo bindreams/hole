@@ -92,7 +92,10 @@ async fn two_plugin_chain_relays_data() {
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
     // Park until the chain signals ready. Deterministic, no poll-retry.
-    ready_rx.await.expect("chain never signaled ready");
+    ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("chain should be ready, not a start error");
     let mut client = TcpStream::connect(chain_local).await.expect("connect to chain local");
     client.write_all(b"hello through chain").await.unwrap();
 
@@ -163,7 +166,10 @@ async fn pid_sink_fires_once_per_binary_plugin() {
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    ready_rx.await.expect("chain should become ready");
+    ready_rx
+        .await
+        .expect("ready_tx dropped")
+        .expect("chain should become ready");
 
     {
         let recorded = pids.lock().unwrap();
@@ -230,9 +236,12 @@ async fn two_plugin_chain_server_mode_relays_data() {
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
     // on_ready fires when the OUTER plugin has bound the public port.
-    let ready_addr = ready_rx.await.expect("chain never signaled ready");
+    let chain_ready = ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("chain should be ready, not a start error");
     assert_eq!(
-        ready_addr.port(),
+        chain_ready.listen.port(),
         public_addr.port(),
         "on_ready in Server mode must report SS_REMOTE (the public port)"
     );

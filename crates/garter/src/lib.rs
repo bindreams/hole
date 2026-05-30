@@ -13,8 +13,8 @@ pub mod test_utils;
 #[doc(hidden)]
 pub mod tracing_test;
 
-pub use binary::{BinaryPlugin, PidSink};
-pub use chain::{ChainRunner, Mode};
+pub use binary::{BinaryPlugin, PidSink, ReadinessMode};
+pub use chain::{ChainReady, ChainRunner, Mode};
 pub use counting::{CountingStream, StreamCounters};
 pub use error::{Error, Result};
 pub use plugin::ChainPlugin;
