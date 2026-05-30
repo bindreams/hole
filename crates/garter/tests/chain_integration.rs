@@ -37,16 +37,25 @@ fn mock_plugin_path() -> PathBuf {
 
 /// Spin up an echo server and a chain of 2 mock plugins, send data through,
 /// verify it arrives.
+///
+/// This is the #414 regression test. Readiness is now signaled by BOTH
+/// plugins' sitrep `ready` events (both plugins run in `ExpectSitrep`
+/// mode); the client connects only after the aggregator has collected
+/// every plugin's `ready`, so the connect can never race ahead of a bound
+/// listener. Pre-#414 the client raced the readiness signal and saw
+/// intermittent Connection reset/refused.
 #[skuld::test]
 async fn two_plugin_chain_relays_data() {
     let mock_path = mock_plugin_path();
 
-    // Multi-connection echo server. `on_ready`'s TCP-connect probe is
-    // forwarded through the chain to the echo server, consuming an
-    // accept slot before the real client connection arrives — so echo
-    // must loop. (The previous poll-based readiness check connected
-    // directly to the outermost listener before traffic flowed through
-    // the chain, masking this.) See bindreams/hole#383.
+    // Multi-connection echo server. Under `ExpectSitrep` there is NO
+    // readiness probe connecting through the chain (the old poll-based
+    // readiness check connected to the outermost listener and consumed an
+    // accept slot — that rationale no longer applies, since each plugin
+    // now declares readiness directly via its sitrep `ready` event). The
+    // single real client connection would be served by a single-accept
+    // echo, but multi-accept is retained as a harmless safety margin and
+    // mirrors the server-mode sister test. See bindreams/hole#414.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
 
@@ -71,13 +80,17 @@ async fn two_plugin_chain_relays_data() {
 
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Build chain: mock-plugin-1 -> mock-plugin-2. `on_ready` fires
-    // when the outermost plugin has bound `chain_local` — see
-    // bindreams/hole#383 for why the previous poll-connect was a flake
-    // hazard.
+    // Build chain: mock-plugin-1 -> mock-plugin-2, both in ExpectSitrep
+    // mode so readiness comes from each plugin's sitrep `ready` event.
+    // `on_ready` fires `Ok(ChainReady)` once EVERY plugin has emitted
+    // `ready`.
     let runner = ChainRunner::new()
-        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
-        .add(Box::new(BinaryPlugin::new(&mock_path, None)))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::ExpectSitrep),
+        ))
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
 
@@ -92,11 +105,14 @@ async fn two_plugin_chain_relays_data() {
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
     // Park until the chain signals ready. Deterministic, no poll-retry.
-    ready_rx
+    // Connect to the authoritative bound address reported by the chain.
+    let chain_ready = ready_rx
         .await
         .expect("chain never signaled ready")
         .expect("chain should be ready, not a start error");
-    let mut client = TcpStream::connect(chain_local).await.expect("connect to chain local");
+    let mut client = TcpStream::connect(chain_ready.listen)
+        .await
+        .expect("connect to chain local");
     client.write_all(b"hello through chain").await.unwrap();
 
     let mut buf = [0u8; 1024];
@@ -128,11 +144,12 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     });
 
     // Single-accept echo: this test only awaits `on_ready` and checks
-    // pid counts — it does not send any client traffic. `on_ready`'s
-    // TCP probe is forwarded through the chain and consumes this one
-    // accept slot, which is sufficient because no real client follows.
-    // The sister test (`two_plugin_chain_relays_data`) does send
-    // traffic and therefore uses a multi-accept echo.
+    // pid counts — it does not send any client traffic. The plugins run
+    // in the default `Probe` readiness mode, whose self-probe TCP-connects
+    // to each plugin's OWN listener (not through the chain to the echo),
+    // so the echo accept slot is never even reached here. A single-accept
+    // echo is therefore ample. The sister test
+    // (`two_plugin_chain_relays_data`) does send real client traffic.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -254,6 +271,291 @@ async fn two_plugin_chain_server_mode_relays_data() {
     let mut buf = [0u8; 1024];
     let n = client.read(&mut buf).await.expect("read failed");
     assert_eq!(&buf[..n], b"hello server-mode chain");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// Tier-2 fallback: a plugin that emits NO sitrep handshake (a pre-sitrep
+/// plain forwarder) still readies — readiness comes from the default
+/// `Probe` self-probe TCP-connect, not from a sitrep `ready` event. Proves
+/// the tier-2 path is live end-to-end (the chain reaches `Ok(ChainReady)`
+/// AND relays a payload through to the echo).
+#[skuld::test]
+async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
+    let mock_path = mock_plugin_path();
+
+    // Multi-accept echo. In `Probe` mode the self-probe TCP-connects to
+    // the plugin's own listener (not through the chain), so it does not
+    // consume an echo accept slot — but keep multi-accept as a harmless
+    // safety margin.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    // Single plugin, NO_SITREP so it emits nothing on stdout, default
+    // `Probe` readiness (do NOT set ExpectSitrep) — readiness must come
+    // from the self-probe.
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).env("MOCK_PLUGIN_NO_SITREP", "1"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("chain should ready via tier-2 probe, not a start error");
+
+    let mut client = TcpStream::connect(chain_ready.listen)
+        .await
+        .expect("connect to chain local");
+    client.write_all(b"hello via probe").await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read from chain returned error");
+    assert_eq!(&buf[..n], b"hello via probe");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// A plugin that emits `fatal` then exits surfaces a typed
+/// `StartError::Fatal` on the readiness channel, AND the chain `run()`
+/// future returns `Err`. The plugin exits before serving, so no client
+/// traffic is exchanged.
+#[skuld::test]
+async fn fatal_start_error_surfaces_typed() {
+    let mock_path = mock_plugin_path();
+
+    // No echo / client needed: the plugin exits before binding.
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "fatal"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9, // discard; never dialed (plugin exits first)
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::Fatal { .. })),
+        "expected StartError::Fatal, got {outcome:?}"
+    );
+
+    // The chain's lifecycle channel independently observes the nonzero exit.
+    let run_result = chain_task.await.expect("chain task panicked");
+    assert!(run_result.is_err(), "chain run() should return Err on fatal exit");
+}
+
+/// A plugin that emits `bind_conflict` then exits surfaces a typed
+/// `StartError::BindConflict` with the host-native errno and the
+/// allocated listen address.
+#[skuld::test]
+async fn bind_conflict_start_error_surfaces_typed() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "bind_conflict"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    match outcome {
+        Err(garter::StartError::BindConflict { errno, addr }) => {
+            // Host-native errno (10048 / 98 / 48) — assert nonzero rather
+            // than a specific foreign constant.
+            assert_ne!(errno, 0, "bind_conflict errno should be the host-native value");
+            // mock-plugin emits `addr: local_addr`, which in a single-plugin
+            // Client chain is the chain's local (public) port.
+            assert_eq!(
+                addr.port(),
+                chain_local.port(),
+                "bind_conflict addr should be the allocated chain local port"
+            );
+        }
+        other => panic!("expected StartError::BindConflict, got {other:?}"),
+    }
+
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// A `ready` event that lists an empty transports set is a SITREP
+/// protocol violation; the consumer rejects it as `StartError::Fatal`.
+#[skuld::test]
+async fn empty_transports_ready_surfaces_fatal() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_EMPTY_TRANSPORTS", "1"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::Fatal { .. })),
+        "empty transports should surface StartError::Fatal, got {outcome:?}"
+    );
+
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// Version-skew fallback: a plugin advertises an unknown sitrep MAJOR
+/// (`sitrep-2.0.0`) in its `hello`. The consumer's protocol gate hands
+/// readiness to the tier-2 self-probe (and drains the rest of stdout to
+/// EOF — the deadlock-fix path). The plugin still binds + emits `ready`
+/// (which is ignored because the handshake never validated), so the
+/// probe succeeds and the chain reaches `Ok(ChainReady)`. A client then
+/// relays a payload through, proving the probe-fallback readiness is real
+/// and not just a fired channel.
+#[skuld::test]
+async fn version_skew_falls_back_to_probe() {
+    let mock_path = mock_plugin_path();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_BAD_PROTOCOL", "1"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("unknown-major should fall back to probe, not a start error");
+
+    let mut client = TcpStream::connect(chain_ready.listen)
+        .await
+        .expect("connect to chain local");
+    client.write_all(b"hello across version skew").await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read from chain returned error");
+    assert_eq!(&buf[..n], b"hello across version skew");
 
     drop(client);
     echo_task.abort();

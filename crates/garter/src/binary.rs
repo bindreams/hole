@@ -53,6 +53,7 @@ pub struct BinaryPlugin {
     name: String,
     pid_sink: Option<PidSink>,
     readiness: ReadinessMode,
+    extra_env: Vec<(String, String)>,
 }
 
 impl BinaryPlugin {
@@ -65,12 +66,21 @@ impl BinaryPlugin {
             name,
             pid_sink: None,
             readiness: ReadinessMode::default(),
+            extra_env: Vec::new(),
         }
     }
 
     /// Set a callback that fires with the child PID immediately after spawn.
     pub fn pid_sink(mut self, sink: PidSink) -> Self {
         self.pid_sink = Some(sink);
+        self
+    }
+
+    /// Inject an additional environment variable into the spawned child
+    /// process. Primarily for tests (fault injection); production plugins
+    /// are configured via `SS_PLUGIN_OPTIONS`.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.push((key.into(), value.into()));
         self
     }
 
@@ -136,6 +146,9 @@ impl ChainPlugin for BinaryPlugin {
         cmd.env("SS_REMOTE_PORT", env.ss_remote_port.to_string());
         if let Some(ref opts) = self.options {
             cmd.env("SS_PLUGIN_OPTIONS", opts);
+        }
+        for (k, v) in &self.extra_env {
+            cmd.env(k, v);
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

@@ -4,8 +4,14 @@ use garter::sitrep::{SitrepEvent, Transports, SITREP_PROTOCOL};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 
-fn emit(ev: &SitrepEvent) {
-    // sitrep events go to STDOUT, one JSON object per line.
+/// Emit a sitrep event to STDOUT (one JSON object per line) unless
+/// `sitrep_enabled` is false, in which case the plugin behaves like a
+/// pre-sitrep plain forwarder (prints nothing to stdout). Gated by the
+/// `MOCK_PLUGIN_NO_SITREP` knob — see `main`.
+fn emit(ev: &SitrepEvent, sitrep_enabled: bool) {
+    if !sitrep_enabled {
+        return;
+    }
     println!("{}", serde_json::to_string(ev).expect("serialize sitrep event"));
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -40,18 +46,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // sitrep handshake: ALWAYS the first stdout line.
-    emit(&SitrepEvent::Hello {
-        protocol: SITREP_PROTOCOL.to_string(),
-    });
+    // Knob: MOCK_PLUGIN_NO_SITREP — suppress ALL stdout sitrep emits so the
+    // plugin behaves like a pre-sitrep plain forwarder (the tier-2 self-probe
+    // path). It still binds + forwards; it just prints nothing to stdout.
+    // Fault knobs that emit-then-exit still EXIT (the emit is just skipped).
+    let sitrep_enabled = std::env::var_os("MOCK_PLUGIN_NO_SITREP").is_none();
+    // Knob: MOCK_PLUGIN_BAD_PROTOCOL — emit a `hello` with an unknown major
+    // (`sitrep-2.0.0`) so the consumer's protocol gate falls back to tier-2
+    // probe; the plugin still binds + emits `ready` (which the consumer
+    // ignores because handshake_ok stayed false).
+    let bad_protocol = std::env::var_os("MOCK_PLUGIN_BAD_PROTOCOL").is_some();
+    // Knob: MOCK_PLUGIN_EMPTY_TRANSPORTS — emit `ready` with an empty
+    // transports set (a SITREP protocol violation) so the consumer rejects
+    // it as Fatal. The `hello` handshake is still well-formed.
+    let empty_transports = std::env::var_os("MOCK_PLUGIN_EMPTY_TRANSPORTS").is_some();
+
+    // sitrep handshake: ALWAYS the first stdout line (when sitrep is enabled).
+    let hello_protocol = if bad_protocol {
+        "sitrep-2.0.0".to_string()
+    } else {
+        SITREP_PROTOCOL.to_string()
+    };
+    emit(
+        &SitrepEvent::Hello {
+            protocol: hello_protocol,
+        },
+        sitrep_enabled,
+    );
 
     // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();
     if fail == "fatal" {
-        emit(&SitrepEvent::Fatal {
-            detail: "injected fatal".into(),
-            errno: None,
-        });
+        emit(
+            &SitrepEvent::Fatal {
+                detail: "injected fatal".into(),
+                errno: None,
+            },
+            sitrep_enabled,
+        );
         std::process::exit(1);
     }
     // Host-native errno: AddrInUse is 48 on macOS, 98 on Linux, 10048 (WSA)
@@ -74,21 +106,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if fail == "bind_conflict" || (fail == "bind_conflict_once" && first_failure_for_sentinel()) {
-        emit(&SitrepEvent::BindConflict {
-            errno: addr_in_use_errno,
-            addr: local_addr,
-        });
+        emit(
+            &SitrepEvent::BindConflict {
+                errno: addr_in_use_errno,
+                addr: local_addr,
+            },
+            sitrep_enabled,
+        );
         std::process::exit(1);
     }
 
     eprintln!("mock-plugin: listening on {local_addr}, forwarding to {remote_addr}");
     let listener = TcpListener::bind(local_addr).await?;
 
-    // sitrep ready: listener is bound & accepting.
-    emit(&SitrepEvent::Ready {
-        listen: local_addr,
-        transports: Transports::TCP,
-    });
+    // sitrep ready: listener is bound & accepting. With
+    // MOCK_PLUGIN_EMPTY_TRANSPORTS the transports set is empty (a protocol
+    // violation the consumer rejects as Fatal).
+    let ready_transports = if empty_transports {
+        Transports::empty()
+    } else {
+        Transports::TCP
+    };
+    emit(
+        &SitrepEvent::Ready {
+            listen: local_addr,
+            transports: ready_transports,
+        },
+        sitrep_enabled,
+    );
 
     loop {
         let (inbound, peer) = listener.accept().await?;
