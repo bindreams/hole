@@ -31,9 +31,17 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# WSAIoctl(SIO_UDP_CONNRESET) — see `bind_udp` in yamux.rs (#415).
+# Win32_System_IO supplies WSAOVERLAPPED, referenced by WSAIoctl's signature.
+windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Enable garter's `test_utils::WaitableWriter` for the E2E relay tests
+# (the module is gated behind garter's `test-utils` feature).
+garter = { path = "../garter", features = ["test-utils"] }
 
 [build-dependencies]
 sha2 = "0.11"

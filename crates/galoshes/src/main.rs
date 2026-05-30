@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let verified = v2ray_binary.prepare()?;
 
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
-    let yamux_plugin = galoshes::yamux::YamuxPlugin::new(mode == Mode::Server);
+    // Parse the galoshes-specific client UDP NAT idle-eviction timeout from the
+    // shared options string before any I/O so a misconfiguration fails loudly
+    // at startup. v2ray-plugin ignores this key (it only reads keys it knows).
+    let udp_timeout = galoshes::yamux::parse_udp_timeout(env.plugin_options.as_deref())?;
+    let yamux_plugin = galoshes::yamux::YamuxPlugin::new(mode == Mode::Server, udp_timeout);
     let v2ray_plugin = BinaryPlugin::new(verified.exec_path(), env.plugin_options.as_deref());
 
     let runner = ChainRunner::new()
