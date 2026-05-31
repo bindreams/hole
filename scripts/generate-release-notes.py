@@ -14,7 +14,7 @@ Usage:
     uv run scripts/generate-release-notes.py <track> --new-tag <tag>
     uv run scripts/generate-release-notes.py <track> --new-tag <tag> --head <ref>
 
-`<track>` is one of `hole`, `galoshes`, `garter`, `v2ray-plugin`.
+`<track>` is one of `hole`, `galoshes`, `garter`, `ex-ray`.
 
 The previous tag is auto-discovered as the highest-versioned tag
 matching `releases/<track>/v*` that's an ancestor of `<head>` (default
@@ -285,7 +285,7 @@ def render_notes(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("track", choices=["hole", "galoshes", "garter", "v2ray-plugin"])
+    parser.add_argument("track", choices=["hole", "galoshes", "garter", "ex-ray"])
     parser.add_argument("--new-tag", required=True, help="Tag being released (e.g. releases/hole/v0.2.0)")
     parser.add_argument("--head", default="HEAD", help="Git ref representing the new release commit (default: HEAD)")
     parser.add_argument(
@@ -379,22 +379,22 @@ def test_tag_version_re():
     m = TAG_VERSION_RE.match("releases/hole/v1.2.3")
     assert m is not None
     assert m.groups() == ("1", "2", "3", None)
-    m = TAG_VERSION_RE.match("releases/v2ray-plugin/v1.3.3-hole.1")
+    m = TAG_VERSION_RE.match("releases/ex-ray/v0.1.0")
     assert m is not None
-    assert m.groups() == ("1", "3", "3", "hole.1")
+    assert m.groups() == ("0", "1", "0", None)
 
 
 def test_path_spec_basic():
     spec = build_path_spec([
         "crates/hole/**",
         ".github/workflows/draft-release-hole.yaml",
-        "external/v2ray-plugin/**",
+        "crates/ex-ray/**",
     ])
     assert spec.match_file("crates/hole/src/main.rs")
     assert spec.match_file("crates/hole/Cargo.toml")
     assert not spec.match_file("crates/galoshes/src/main.rs")
     assert spec.match_file(".github/workflows/draft-release-hole.yaml")
-    assert spec.match_file("external/v2ray-plugin/main.go")
+    assert spec.match_file("crates/ex-ray/main.go")
 
 
 def test_path_spec_workspace_engineering_patterns():
@@ -409,7 +409,7 @@ def test_path_spec_workspace_engineering_patterns():
     spec = build_path_spec([
         "crates/hole/**",
         "crates/common/**",
-        "external/v2ray-plugin/**",
+        "crates/ex-ray/**",
         ".github/workflows/draft-release-hole.yaml",
         "Cargo.toml",
         "Cargo.lock",
@@ -424,8 +424,8 @@ def test_path_spec_workspace_engineering_patterns():
         ("crates/hole/src/main.rs", True),
         ("crates/hole/Cargo.toml", True),
         ("crates/galoshes/src/main.rs", False),
-        ("external/v2ray-plugin/main.go", True),
-        ("external/v2ray-plugin/sub/dir/file.go", True),
+        ("crates/ex-ray/main.go", True),
+        ("crates/ex-ray/sub/dir/file.go", True),
         (".github/workflows/draft-release-hole.yaml", True),
         (".github/workflows/draft-release-galoshes.yaml", False),
         ("Cargo.toml", True),
@@ -445,10 +445,9 @@ def test_path_spec_workspace_engineering_patterns():
         ("crates/garter/Cargo.toml", False),
         ("crates/mock-plugin/Cargo.toml", False),
         ("crates/galoshes/prek.toml", False),
-        # external/v2ray-plugin/Cargo.toml IS matched, but via the
-        # `external/v2ray-plugin/**` pattern (not via root-anchored
-        # `Cargo.toml`). The match is correct.
-        ("external/v2ray-plugin/Cargo.toml", True),
+        # crates/ex-ray/go.mod IS matched, but via the
+        # `crates/ex-ray/**` pattern (not via root-anchored `Cargo.toml`).
+        ("crates/ex-ray/go.mod", True),
     ]
     for path, expected in cases:
         assert spec.match_file(path) == expected, f"path={path!r} expected={expected}"
@@ -497,7 +496,7 @@ def test_integration_filtering_against_real_history():
     history and assert include-path filtering works.
 
     The negative-assertion probe is range-constrained to the SAME range
-    the script walks (previous-v2ray-plugin-tag..HEAD), so a "hole-only"
+    the script walks (previous-ex-ray-tag..HEAD), so a "hole-only"
     commit outside that range doesn't make the probe vacuously pass.
 
     Per CLAUDE.md "Tests must never silently skip on missing dependencies":
@@ -508,17 +507,16 @@ def test_integration_filtering_against_real_history():
     if shutil.which("uv") is None:
         pytest.fail("uv not on PATH; CI must provision it (CLAUDE.md coding-style rule).")
     repo_root = Path(__file__).resolve().parent.parent
-    prev_tag = find_previous_tag(repo_root, "v2ray-plugin", "HEAD")
+    prev_tag = find_previous_tag(repo_root, "ex-ray", "HEAD")
     if prev_tag is None:
         pytest.fail(
-            "No releases/v2ray-plugin/v* ancestor of HEAD; CI must "
+            "No releases/ex-ray/v* ancestor of HEAD; CI must "
             "fetch tags (fetch-depth: 0 or `git fetch --tags`)."
         )
 
     script = repo_root / "scripts" / "generate-release-notes.py"
     result = subprocess.run(
-        ["uv", "run",
-         str(script), "v2ray-plugin", "--new-tag", "releases/v2ray-plugin/v999.0.0", "--head", "HEAD"],
+        ["uv", "run", str(script), "ex-ray", "--new-tag", "releases/ex-ray/v999.0.0", "--head", "HEAD"],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -530,11 +528,11 @@ def test_integration_filtering_against_real_history():
     assert "**Full Changelog**:" in out, f"Missing Full Changelog link: {out[-200:]}"
 
     # Negative assertion: a commit that touches ONLY hole-track paths
-    # within the same range must NOT appear in v2ray-plugin notes.
+    # within the same range must NOT appear in ex-ray notes.
     # Iterate recent commits in range, find one whose every file matches
-    # hole's include_paths but no v2ray-plugin include_paths.
+    # hole's include_paths but no ex-ray include_paths.
     hole_spec = build_path_spec(load_config(repo_root, "hole").include_paths)
-    v2ray_spec = build_path_spec(load_config(repo_root, "v2ray-plugin").include_paths)
+    ex_ray_spec = build_path_spec(load_config(repo_root, "ex-ray").include_paths)
     all_commits = subprocess.run(
         ["git", "log", "--format=%H", "--no-merges", f"{prev_tag}..HEAD"],
         cwd=repo_root,
@@ -553,7 +551,7 @@ def test_integration_filtering_against_real_history():
         files = [f for f in files if f.strip()]
         if not files:
             continue
-        hole_only = all(hole_spec.match_file(f) and not v2ray_spec.match_file(f) for f in files)
+        hole_only = all(hole_spec.match_file(f) and not ex_ray_spec.match_file(f) for f in files)
         if not hole_only:
             continue
         subject = subprocess.run(
@@ -568,7 +566,7 @@ def test_integration_filtering_against_real_history():
             continue
         pr_num = m.group(1)
         assert not re.search(rf"#{pr_num}\b", out), (
-            f"v2ray-plugin notes contain hole-only PR #{pr_num} ({sha[:8]}); "
+            f"ex-ray notes contain hole-only PR #{pr_num} ({sha[:8]}); "
             f"include-path filtering may be broken. Subject: {subject}"
         )
         return
@@ -580,7 +578,7 @@ def test_shared_categories_file_loaded():
     repo_root = Path(__file__).resolve().parent.parent
     shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text())
     expected_titles = [c["title"] for c in shared["categories"]]
-    for track in ["hole", "galoshes", "garter", "v2ray-plugin"]:
+    for track in ["hole", "galoshes", "garter", "ex-ray"]:
         config = load_config(repo_root, track)
         assert [c.title
                 for c in config.categories] == expected_titles, (f"Track {track} categories don't match shared file")
@@ -589,7 +587,7 @@ def test_shared_categories_file_loaded():
 def test_per_track_configs_dont_duplicate_categories():
     """Per-track files must not redeclare categories (single source of truth)."""
     repo_root = Path(__file__).resolve().parent.parent
-    for track in ["hole", "galoshes", "garter", "v2ray-plugin"]:
+    for track in ["hole", "galoshes", "garter", "ex-ray"]:
         raw = yaml.safe_load((repo_root / ".github" / f"release-{track}.yaml").read_text())
         assert "categories" not in raw, (
             f"release-{track}.yaml must not declare `categories:`; "
@@ -687,25 +685,27 @@ def test_find_previous_tag_ignores_non_ancestor(tmp_path):
 
 
 def test_find_previous_tag_bare_beats_prerelease(tmp_path):
-    """Per semver: 1.3.3 > 1.3.3-hole.1."""
+    """Per semver: 1.3.3 > 1.3.3-rc.1. Tests the sorting logic for any track
+    that might have pre-release tags (TAG_VERSION_RE supports arbitrary pre-release
+    suffixes for forward-compatibility)."""
     repo = _init_test_repo(tmp_path)
     _commit(repo, "c1")
-    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.1"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/ex-ray/v1.3.3-rc.1"], cwd=repo, check=True)
     _commit(repo, "c2")
-    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/ex-ray/v1.3.3"], cwd=repo, check=True)
     _commit(repo, "c3")
-    assert find_previous_tag(repo, "v2ray-plugin", "HEAD") == "releases/v2ray-plugin/v1.3.3"
+    assert find_previous_tag(repo, "ex-ray", "HEAD") == "releases/ex-ray/v1.3.3"
 
 
 def test_find_previous_tag_higher_prerelease_iteration(tmp_path):
-    """Lexical sort puts hole.2 > hole.1 (and would put hole.10 < hole.2 — fragility noted)."""
+    """Lexical sort puts rc.2 > rc.1 (and would put rc.10 < rc.2 — fragility noted)."""
     repo = _init_test_repo(tmp_path)
     _commit(repo, "c1")
-    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.1"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/ex-ray/v1.3.3-rc.1"], cwd=repo, check=True)
     _commit(repo, "c2")
-    subprocess.run(["git", "tag", "releases/v2ray-plugin/v1.3.3-hole.2"], cwd=repo, check=True)
+    subprocess.run(["git", "tag", "releases/ex-ray/v1.3.3-rc.2"], cwd=repo, check=True)
     _commit(repo, "c3")
-    assert find_previous_tag(repo, "v2ray-plugin", "HEAD") == "releases/v2ray-plugin/v1.3.3-hole.2"
+    assert find_previous_tag(repo, "ex-ray", "HEAD") == "releases/ex-ray/v1.3.3-rc.2"
 
 
 def test_find_previous_tag_skips_malformed_tags(tmp_path):
