@@ -13,11 +13,14 @@
 //! and the cached binary hasn't been corrupted since" — the cheap re-run
 //! skip. The pinned commit, not a pinned hash, is the supply-chain anchor.
 //!
-//! The pin is `e9af1cd…`, which CLAUDE.md documents as Hole's current
-//! vendored v2ray-plugin base — so the upstream build this produces is
-//! byte-source-equivalent to what Hole vendored, the cleanest interop
-//! baseline (an ex-ray-vs-stock round-trip is comparing ex-ray against the
-//! exact upstream revision its v2ray-core shim tracks).
+//! The pin is `e9af1cd…` — the `shadowsocks/v2ray-plugin` upstream revision
+//! that Hole vendored before #414 replaced the vendored subrepo with the
+//! first-party `crates/ex-ray/` shim. Building stock upstream at exactly that
+//! revision makes this the cleanest interop baseline: an ex-ray-vs-stock
+//! round-trip compares ex-ray against the exact upstream revision its
+//! v2ray-core shim tracks. (Pre-#414 this commit was recorded in
+//! `external/v2ray-plugin/.gitrepo`; that subrepo is now deleted, so the pin
+//! + rationale live here as the single durable anchor.)
 //!
 //! Output: `<repo>/.cache/upstream-v2ray-plugin/<commit>/v2ray-plugin-<host-triple>{.exe}`.
 
@@ -26,12 +29,13 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// Pinned upstream commit. == Hole's current vendored v2ray-plugin base
-/// (`e9af1cdd2549d528deb20a4ab8d61c5fbe51f306`, documented in CLAUDE.md's
-/// "v2ray-plugin embedding" section). Bumping this is a deliberate one-line
-/// change: update the SHA, delete the `.cache/upstream-v2ray-plugin/<old>`
-/// entry, and re-run `cargo xtask provision-upstream-v2ray` to clone, build,
-/// and regenerate the `.verified` sentinel for the new commit.
+/// Pinned upstream `shadowsocks/v2ray-plugin` commit
+/// (`e9af1cdd2549d528deb20a4ab8d61c5fbe51f306`) — the revision Hole vendored
+/// before #414 (see the module docstring for why this is the interop
+/// baseline). Bumping this is a deliberate one-line change: update the SHA,
+/// delete the `.cache/upstream-v2ray-plugin/<old>` entry, and re-run
+/// `cargo xtask provision-upstream-v2ray` to clone, build, and regenerate the
+/// `.verified` sentinel for the new commit.
 pub const PINNED_COMMIT: &str = "e9af1cdd2549d528deb20a4ab8d61c5fbe51f306";
 
 /// Upstream repository cloned to obtain the pinned commit.

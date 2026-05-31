@@ -99,7 +99,7 @@ targets:
     # own `cargo build --release` + `cargo xtask stage --profile release`, so
     # depending on `hole` (debug) would force a redundant debug compile that
     # nothing consumes. We depend instead on the same sidecars `hole` does, so
-    # the MSI build still has v2ray-plugin, galoshes, and wintun.dll on disk.
+    # the MSI build still has ex-ray, galoshes, and wintun.dll on disk.
     #
     # `frontend-build` is on the depends list because msi-installer runs
     # plain `cargo build --release` (not `npx tauri build`), so Tauri's
