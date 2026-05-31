@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
 pub mod test_binaries;
+pub mod upstream_v2ray;
 pub mod wintun;
 
 #[cfg(test)]
@@ -97,6 +98,14 @@ pub enum Command {
     /// Output goes into `<repo>/.cache/golangci-lint/<version>/`. Used by the
     /// `go-fmt` / `go-lint` prek hooks against the `crates/ex-ray/` Go module.
     GolangciLint,
+    /// Clone + build the pinned upstream shadowsocks/v2ray-plugin for the
+    /// ex-ray cross-implementation interop test.
+    ///
+    /// Output goes into `<repo>/.cache/upstream-v2ray-plugin/<commit>/`. This
+    /// is a TEST dependency, deliberately NOT part of `cargo xtask deps` —
+    /// keeping the build-deps lean. The `interop-test` build.yaml target runs
+    /// it before the interop round-trip tests.
+    ProvisionUpstreamV2ray,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -193,6 +202,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::GolangciLint => run_golangci_lint(),
+        Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -236,6 +246,13 @@ pub fn run_golangci_lint() -> Result<()> {
     let repo_root = repo_root()?;
     let path = golangci_lint::ensure(&repo_root)?;
     println!("xtask: golangci-lint at {}", path.display());
+    Ok(())
+}
+
+pub fn run_provision_upstream_v2ray() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = upstream_v2ray::ensure(&repo_root)?;
+    println!("xtask: upstream v2ray-plugin at {}", path.display());
     Ok(())
 }
 

@@ -432,15 +432,19 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
 ///
 /// Per-plugin syntax differs:
 ///
-/// - **`v2ray-plugin`**: appends `loglevel=debug` (semicolon-separated;
-///   v2ray-plugin honors the LAST occurrence of any duplicate key, so a
-///   user's earlier `loglevel=warning` still loses to our debug).
+/// - **`v2ray-plugin`** / **`ex-ray`**: appends `loglevel=debug`
+///   (semicolon-separated). Both honor the LAST occurrence of any
+///   duplicate key (same v2ray-core log config), so a user's earlier
+///   `loglevel=warning` still loses to our debug. The friendly wire name
+///   `v2ray-plugin` resolves to the first-party `ex-ray` binary
+///   (`hole_common::plugin`), but a config may also name `ex-ray`
+///   directly; this arm covers both spellings (#414).
 /// - Anything else: pass through unchanged. (`galoshes` is a Rust
 ///   `ChainPlugin` and not started via this binary path; future binary
 ///   plugins can be added here.)
 fn inject_plugin_debug_logging(plugin_name: &str, opts: Option<&str>) -> Option<String> {
     match plugin_name {
-        "v2ray-plugin" => Some(append_sip003_directive(opts, "loglevel=debug")),
+        "v2ray-plugin" | "ex-ray" => Some(append_sip003_directive(opts, "loglevel=debug")),
         _ => opts.map(String::from),
     }
 }
@@ -499,6 +503,48 @@ mod inject_tests {
     fn v2ray_plugin_empty_string_treated_as_no_opts() {
         assert_eq!(
             inject_plugin_debug_logging("v2ray-plugin", Some("")).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_no_opts_gets_loglevel_debug() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", None).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_existing_opts_get_loglevel_appended() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("host=example.com;path=/foo")).as_deref(),
+            Some("host=example.com;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_user_loglevel_warning_overridden_by_appended_debug() {
+        // ex-ray uses the same v2ray-core log config: it honors the LAST
+        // occurrence; appended debug wins.
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("loglevel=warning;path=/foo")).as_deref(),
+            Some("loglevel=warning;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_trailing_semicolon_collapsed() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("host=example.com;")).as_deref(),
+            Some("host=example.com;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_empty_string_treated_as_no_opts() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("")).as_deref(),
             Some("loglevel=debug")
         );
     }

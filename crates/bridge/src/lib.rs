@@ -24,6 +24,16 @@ pub mod socket;
 #[cfg(test)]
 mod test_support;
 
+// Cross-implementation interop tests (ex-ray ↔ stock v2ray-plugin). Like
+// `test_support`, there is no business-logic counterpart — it's a
+// cross-cutting integration test spanning the server harness + `server_test`
+// runner + provisioned upstream binary, so it's registered directly here
+// rather than as a sibling of a single source file. Unlike `server_test_tests`
+// (Linux-only behind #197/#200), it uses no TUN/routing and runs everywhere.
+#[cfg(test)]
+#[path = "interop_tests.rs"]
+mod interop_tests;
+
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
 // See `crates/test-observability/` and bindreams/hole#301.
