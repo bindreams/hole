@@ -264,10 +264,9 @@ async fn ipv6_upstream_skipped_when_no_v6_bypass() {
 
 #[skuld::test]
 async fn duplicate_server_in_list_creates_one_throttle_entry() {
-    // Two identical dead addresses share one per-IP throttle entry.
-    // The throttle counts `logged + suppressed` per server — in #248's
-    // Phase-2 shape, a single failure burst against the same server does
-    // not duplicate state across the map.
+    // Two identical dead addresses share one per-IP throttle entry; a
+    // single failure burst against the same server doesn't duplicate
+    // state across the map.
     let dead_addr = unused_tcp_port().await;
     let fwd = DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), dead_addr.ip()]),
@@ -288,10 +287,9 @@ async fn duplicate_server_in_list_creates_one_throttle_entry() {
 
 #[skuld::test]
 async fn throttle_logs_first_n_then_suppresses() {
-    // The #248 bug was fully invisible after the first-per-server log
-    // line because of dedup-forever. This test pins the replacement
-    // behavior: first LOG_FULL_LIMIT=3 failures log in full, subsequent
-    // ones are counted as suppressed.
+    // Pins the per-server log throttle: the first LOG_FULL_LIMIT=3
+    // failures log in full, subsequent ones are counted as suppressed
+    // (never silently dedup-forever).
     let dead_addr = unused_tcp_port().await;
     let fwd = DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip()]),
@@ -514,13 +512,12 @@ fn question_end_rejects_truncated() {
     assert!(question_end(q).is_none());
 }
 
-// Phase 1 #248 — typed error + source-chain logging ===================================================================
+// Typed upstream errors + source-chain logging ========================================================================
 //
-// These tests drive the introduction of `UpstreamLayer` + `UpstreamErr` in
-// `forwarder.rs`, plus the `layer=...`, `elapsed_ms=...`, `caused_by=...`
-// fields on the "upstream failed" warn log line. Phase 2 observation uses
-// these fields to tell SOCKS5-layer failures from TLS-layer failures from
-// mid-tunnel EOFs, all of which surface as bare `tls handshake eof` today.
+// These tests assert the `layer=...`, `elapsed_ms=...`, `caused_by=...`
+// fields on the "upstream failed" warn log line, so connect-layer,
+// TLS-layer, IO-layer, and timeout failures are distinguishable rather
+// than all collapsing to a bare `tls handshake eof`.
 
 #[cfg(test)]
 mod typed_error_logs {

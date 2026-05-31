@@ -50,7 +50,7 @@ pub enum ProxyError {
     #[error("plugin error: {0}")]
     Plugin(String),
     /// A plugin reported a typed bind conflict (`StartError::BindConflict`
-    /// via sitrep — #414) at its local listener. This is the retryable
+    /// via sitrep) at its local listener. This is the retryable
     /// class: `proxy_err_to_io_err` synthesizes an `AddrInUse`-kind
     /// `io::Error` from it so `bind_ephemeral` allocates a fresh port and
     /// retries. The `errno` is the plugin's host-native OS error (0 if
@@ -75,9 +75,9 @@ pub enum ProxyError {
     InvalidListenerPort { field: &'static str },
     /// The DNS forwarder self-test failed before TUN routes were installed.
     /// `routes` / `system DNS` were never touched on this path — the user's
-    /// system DNS is untouched. Used by the start-time gate added in #388
-    /// to prevent the GUI from reporting "Running" while a dead plugin
-    /// chain hijacks all DNS into the tunnel.
+    /// system DNS is untouched. Used by the start-time self-test gate so the
+    /// GUI never reports "Running" while a dead plugin chain would hijack all
+    /// DNS into the tunnel.
     #[error("forwarder self-test failed after {attempts} attempts in {elapsed_ms}ms: {reason}")]
     ForwarderSelfTestFailed {
         reason: String,
@@ -131,19 +131,6 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 ///   to relay datagrams through the SS tunnel; in SocksOnly mode the
 ///   listener exposes UDP ASSOCIATE to local SOCKS5 clients
 ///   (hev-socks5-tunnel, ss-tunnel, proxychains-ng UDP, …).
-///
-///   Pre-#250, SocksOnly forced `TcpOnly` under #189's "select_all
-///   drops the TCP listener when UDP completes early" attribution.
-///   That attribution had no log evidence: `LogTracer` *is* installed
-///   (via `tracing-subscriber`'s default features → `try_init`), but
-///   the bridge's `HOLE_BRIDGE_LOG` parser dropped every directive
-///   after the first comma, so `shadowsocks_service=*` directives in
-///   a multi-crate filter were silently lost. #267 fixes that. The
-///   original symptom for #189 was actually wintun-induced loopback
-///   breakage on the Azure-hosted Windows runner (#200), correctly
-///   addressed by PR #207's two-pass test ordering (`SKULD_LABELS=tun`
-///   runs last so loopback-using tests precede any wintun adapter
-///   destruction).
 /// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
 ///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
 ///
@@ -198,7 +185,6 @@ pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -
         .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;
 
     // No PluginConfig is set — Garter manages the plugin lifecycle externally.
-
     let mut ss_config = Config::new(ConfigType::Local);
 
     // Server

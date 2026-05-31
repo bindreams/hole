@@ -12,9 +12,8 @@ use std::path::Path;
 /// All comma-separated directives are honored: the env var is split, each
 /// piece is trimmed, blanks are dropped, and the rest are passed to
 /// `EnvFilter::add_directive` in order via [`hole_common::logging::init_multi`].
-/// Pre-#267 only the first directive made it through, which silently hid
-/// shadowsocks-service's relay byte-count TRACE logs (`L2R N bytes, R2L M
-/// bytes`) — the load-bearing diagnostic for #248.
+/// This is needed so e.g. `shadowsocks_service=trace` relay byte-count
+/// logs (`L2R N bytes, R2L M bytes`) survive alongside `hole_bridge=debug`.
 ///
 /// `RUST_LOG` is also still honored upstream of the directive list (via
 /// `EnvFilter::from_env_lossy` inside `init_multi`), so e.g.

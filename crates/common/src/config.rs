@@ -148,9 +148,8 @@ pub struct AppConfig {
     /// `bytes_to_plugin` / `bytes_from_plugin` / `ttfb_ms` / `close_kind`
     /// land in `bridge.log`. Off by default — adds a loopback round-trip
     /// per byte, inappropriate at browser-traffic scale. Enable when
-    /// reproducing a #248-class "tunnel returns nothing" failure (e.g.
-    /// bindreams/hole#388, where the v2ray-plugin outbound WebSocket
-    /// silently hung). See CLAUDE.md "Plugin tap" section.
+    /// reproducing a "tunnel returns nothing" failure (e.g. a plugin
+    /// outbound that silently hangs). See CLAUDE.md "Plugin tap" section.
     ///
     /// **Reaches service mode**: this flag travels via [`ProxyConfig`]
     /// in the IPC `BridgeRequest::Start` payload, unlike the

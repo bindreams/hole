@@ -51,9 +51,9 @@ impl Socks5Connector {
 #[async_trait]
 impl UpstreamConnector for Socks5Connector {
     async fn connect_tcp(&self, target: SocketAddr) -> io::Result<ConnectedStream> {
-        // Time the SOCKS5 handshake + CONNECT — per #248, this separates
-        // "SOCKS5 handshake took 3s" from "handshake instant, but TLS
-        // EOF'd immediately after" in the Phase-2 breakdown.
+        // Time the SOCKS5 handshake + CONNECT so the elapsed_ms log
+        // separates a slow handshake from an instant handshake followed by
+        // an immediate TLS-layer EOF.
         let started = Instant::now();
         let result = Socks5Stream::connect(self.socks5_listener, target).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -63,7 +63,7 @@ impl UpstreamConnector for Socks5Connector {
                 // `into_inner()` returns the underlying `TcpStream` — after
                 // the CONNECT handshake the relay is a pure byte pipe. Wrap
                 // in a CountingStream so the forwarder can read post-SOCKS5
-                // byte counts on TLS-layer failure (diagnostic for #248).
+                // byte counts on a TLS-layer failure.
                 let counting = CountingStream::new(stream.into_inner());
                 let counters = counting.counters();
                 Ok(ConnectedStream {

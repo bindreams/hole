@@ -58,10 +58,9 @@ pub fn encode_socks5_udp(dst: SocketAddr, domain: Option<&str>, payload: &[u8]) 
 ///
 /// If the datagram's ATYP is `Domain` (0x03), the returned `SocketAddr`
 /// carries `IpAddr::V4(Ipv4Addr::UNSPECIFIED)` (i.e. `0.0.0.0`) as a
-/// sentinel — callers must NOT use it as a connect target. This is a
-/// pre-existing contract retained from the split-return shape; a richer
+/// sentinel — callers must NOT use it as a connect target. A richer
 /// return type distinguishing IP vs Domain is tracked as a follow-up
-/// (see bindreams/hole#229).
+/// (bindreams/hole#229).
 pub fn decode_socks5_udp(data: &[u8]) -> Option<(SocketAddr, usize)> {
     // Minimum: RSV(2) + FRAG(1) + ATYP(1) + addr(4 for IPv4) + port(2) = 10
     if data.len() < 10 {
@@ -85,8 +84,7 @@ pub fn decode_socks5_udp(data: &[u8]) -> Option<(SocketAddr, usize)> {
             Some((SocketAddr::new(ip, port), 10))
         }
         0x03 => {
-            // Domain: 1-byte length + domain string (we return 0.0.0.0 as IP
-            // since the caller typically doesn't need it for incoming replies).
+            // Domain: 1-byte length + domain string + port.
             let dlen = data[4] as usize;
             let header_len = 4 + 1 + dlen + 2;
             if data.len() < header_len {

@@ -84,8 +84,6 @@ Rotation steps (key compromise, lost key, scheduled rotation):
 
 ## Crates.io dry-run staleness
 
-(Originally framed as "TOCTOU" — strictly it's stale validation, not a check-then-act race.)
-
 The `garter` draft workflow runs `cargo publish --dry-run -p garter` at validate time to fail-fast on broken metadata (missing fields, license issues, unresolvable deps). The actual `cargo publish` runs later in the publish workflow. Between those two moments, a transitive dep could be yanked, an upstream registry change could land, or `Cargo.lock` could drift.
 
 On publish failure:
@@ -110,4 +108,4 @@ CLAUDE.md notes galoshes is "shipped alongside hole.exe AND released standalone.
 
 ### ex-ray rollback
 
-The `ex-ray` track uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking — it replaced the retired vendored `v2ray-plugin` track in #414). Its version lives in [`crates/ex-ray/version.toml`](../crates/ex-ray/version.toml) and is validated by [`xtask-lib/src/ex_ray_version.rs`](../xtask-lib/src/ex_ray_version.rs). Rollback follows the standard non-crates.io track procedure (delete the tag + release; re-cut against a patched commit) — there is no `-hole.N` lineage sequence to keep gap-free. Because galoshes embeds ex-ray and hole bundles galoshes, a defective ex-ray that has already shipped inside a hole release also requires the bundled-galoshes rollback above (re-cut hole with a fixed galoshes that embeds the fixed ex-ray).
+The `ex-ray` track uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking). Its version lives in [`crates/ex-ray/version.toml`](../crates/ex-ray/version.toml) and is validated by [`xtask-lib/src/ex_ray_version.rs`](../xtask-lib/src/ex_ray_version.rs). Rollback follows the standard non-crates.io track procedure (delete the tag + release; re-cut against a patched commit). Because galoshes embeds ex-ray and hole bundles galoshes, a defective ex-ray that has already shipped inside a hole release also requires the bundled-galoshes rollback above (re-cut hole with a fixed galoshes that embeds the fixed ex-ray).

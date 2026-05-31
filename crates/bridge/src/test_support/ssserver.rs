@@ -233,11 +233,9 @@ pub(crate) fn locate_upstream_v2ray() -> PathBuf {
 
 /// Locate the galoshes binary built by `cargo xtask galoshes`.
 ///
-/// Post-monorepo-merge galoshes is a regular workspace member
-/// (`crates/galoshes/`) built into `<repo>/target/release/galoshes{.exe}` by
-/// [`xtask::galoshes::build`] (always release — it embeds ex-ray at compile
-/// time). Repointed from the stale `external/galoshes/target/release/` path
-/// in #414.
+/// galoshes is a regular workspace member (`crates/galoshes/`) built into
+/// `<repo>/target/release/galoshes{.exe}` by [`xtask::galoshes::build`]
+/// (always release — it embeds ex-ray at compile time).
 pub(crate) fn locate_built_galoshes() -> PathBuf {
     let bin = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
     workspace_root().join("target").join("release").join(bin)

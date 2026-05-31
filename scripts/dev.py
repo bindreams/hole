@@ -95,13 +95,11 @@ def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None)
     """Run `npm install` unconditionally to keep `node_modules/` in sync with
     `package-lock.json`.
 
-    Unconditional install is deliberate: a prior version of this function
-    skipped on `node_modules/` existing, which silently hid dependency
-    additions pulled from a new commit (e.g. #148 adding
-    `@tauri-apps/plugin-log`) and left Vite failing to resolve the import.
-    `npm install` on a healthy tree costs ~1s, dominated by cargo below;
-    `--no-audit --no-fund` trims the output to a single line so dev.py's
-    startup stays quiet on the happy path."""
+    Unconditional install is deliberate: a conditional skip-on-exists would
+    silently miss dependency additions pulled from a new commit and leave Vite
+    failing to resolve the import. `npm install` on a healthy tree costs ~1s,
+    dominated by cargo below; `--no-audit --no-fund` trims the output to a
+    single line so dev.py's startup stays quiet on the happy path."""
     print(f"{BOLD}Syncing npm dependencies...{RESET}")
     # Run as the invoking user so `node_modules/` is not owned by root.
     result = subprocess.run(
@@ -119,9 +117,8 @@ def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> No
     """Build the `hole` target via the orchestrator.
 
     `cargo xtask build hole` walks the build.yaml DAG: ex-ray → galoshes
-    + wintun → cargo build (debug) → stage. Replaces the prior `cargo xtask
-    deps` + `cargo build` sequence with a single declarative invocation. The
-    per-pid stage that follows in main() is dev.py-specific and stays separate.
+    + wintun → cargo build (debug) → stage. The per-pid stage that follows in
+    main() is dev.py-specific and stays separate.
 
     Runs as the invoking user so `target/` and `.cache/` are not owned by root
     on macOS-under-sudo.
@@ -160,11 +157,9 @@ def prefix_stream(
       continuation line (indented YAML body, stdlib panic frames, etc.)
       is part of the previous entry. The whole entry is buffered and
       flushed as a single atomic write under ``lock`` once the next
-      entry-start arrives — or on EOF — so other streams cannot
-      interleave their lines into the middle of a multi-line entry.
-      The panic backtrace in bindreams/hole#393 was the motivating
-      case: ``[client]`` log lines split the bridge's ``backtrace: |2``
-      block into pieces.
+      entry-start arrives — or on EOF — so concurrent streams cannot
+      split a multi-line entry (such as a panic backtrace) across each
+      other.
 
     - ``buffer_entries=False``: each line is printed directly under
       ``lock``. Used for streams that have no timestamp anchor (Vite),
@@ -335,12 +330,12 @@ def shutdown(
             proc.kill()
 
     # Drain the prefix_stream readers so any entry buffered in-flight
-    # (the bridge's panic before exit, in particular — see bindreams/hole#393)
-    # gets flushed to the console. Each thread's natural exit happens
-    # quickly after its subprocess's stdout closes; the 5 s budget is
-    # the graceful-failure bound for the external readline returning
-    # (CLAUDE.md "external event with graceful failure bound" — the
-    # exception class for sync against an out-of-process I/O event).
+    # (the bridge's panic before exit, in particular) gets flushed to the
+    # console. Each thread's natural exit happens quickly after its
+    # subprocess's stdout closes; the 5 s budget is the graceful-failure
+    # bound for the external readline returning (CLAUDE.md "external event
+    # with graceful failure bound" — the exception class for sync against
+    # an out-of-process I/O event).
     if prefix_threads is not None:
         for t in prefix_threads:
             t.join(timeout=5)

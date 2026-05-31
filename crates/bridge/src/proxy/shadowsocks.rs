@@ -36,9 +36,9 @@ impl Proxy for ShadowsocksProxy {
         debug!("shadowsocks_service Server constructed");
         debug!("spawning shadowsocks server.run() task");
         let handle = tokio::spawn(async move {
-            // First log inside the spawned task: a gap between
+            // First log inside the spawned task: a gap between the
             // "spawning" and "entered" timestamps in the bridge log
-            // means the tokio runtime is starved (#200 H1 hypothesis).
+            // means the tokio runtime is starved.
             debug!("shadowsocks server task entered");
             let result = server.run().await;
             // server.run() contains an infinite accept loop — it should never
@@ -65,14 +65,13 @@ impl Proxy for ShadowsocksProxy {
 ///   point (the normal Stop request flow).
 /// - `Drop` — cancel-unwind cleanup. Aborts the task best-effort and
 ///   returns immediately. Used when the value goes out of scope under
-///   an error-path `?` (e.g. the #388 forwarder self-test gate inside
+///   an error-path `?` (e.g. the forwarder self-test gate inside
 ///   `start_inner`) or when the surrounding future is cancelled (e.g.
 ///   the `tokio::select!` in `start_cancellable`), where there is no
 ///   `.await` point to host a graceful stop.
 ///
 /// Both paths abort the task; the only thing `Drop` loses vs `stop()`
-/// is the ability to observe task-internal panics. See bindreams/hole#393
-/// for the incident that motivated documenting the dual contract.
+/// is the ability to observe task-internal panics.
 pub struct ShadowsocksRunning {
     handle: Option<JoinHandle<io::Result<()>>>,
 }
@@ -95,8 +94,7 @@ impl RunningProxy for ShadowsocksRunning {
 
     /// Graceful shutdown: aborts the task and awaits its result. Distinguishes
     /// cancellation (expected from `abort()`) from panics (wrapped as
-    /// `ProxyError::Runtime`). Strict improvement over the pre-refactor
-    /// `let _ = handle.await;` which silently dropped task results.
+    /// `ProxyError::Runtime`).
     async fn stop(mut self) -> Result<(), ProxyError> {
         let Some(h) = self.handle.take() else {
             return Ok(());

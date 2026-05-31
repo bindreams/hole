@@ -41,8 +41,7 @@ fn read_version_nonzero_from_file() {
 
 #[skuld::test]
 fn read_version_rejects_pre_release() {
-    // ex-ray is first-party plain semver; the retired v2ray-plugin `hole.N`
-    // lineage form is no longer accepted.
+    // Pre-release / lineage suffixes are rejected; ex-ray is plain strict semver.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_version_toml(root, "1.3.3-hole.1");

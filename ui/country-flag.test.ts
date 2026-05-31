@@ -68,10 +68,8 @@ describe("setCountryFlag", () => {
     expect(el.classList.contains("fi-xx")).toBe(true);
   });
 
-  // The PublicIpData type at ui/types.ts:92 says `country_code: string`,
-  // but the backend's ipinfo.io `body["country"].as_str().unwrap_or("??")`
-  // fallback in crates/hole/src/commands.rs — a null upstream would
-  // still produce "??", but defense in depth.
+  // Backend always sends a string (ipinfo.io fallback coerces to "??");
+  // null/undefined is defense-in-depth.
   // biome-ignore lint/suspicious/noExplicitAny: cast through to test the runtime guard
   it("null / undefined: same as '??'", () => {
     setCountryFlag(el, null as any);

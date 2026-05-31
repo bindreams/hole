@@ -21,10 +21,9 @@ import (
 var VERSION = "ex-ray"
 
 // parseOptsIntoFlags reads SS_PLUGIN env vars and cross-assigns them into the
-// package-level flag pointers. This is the env-remap seam: it is split out of
-// buildV2Ray so main() can compute the listen address and run the confirming
-// probe BETWEEN the remap and core.New (the probe needs the resolved
-// *localAddr:*localPort, the config needs the remap to have happened).
+// package-level flag pointers. It is split out of buildV2Ray so main() can run
+// the confirming probe on the resolved *localAddr:*localPort BETWEEN the remap
+// and core.New.
 //
 // localAddr/localPort always name the inbound listener bound by this process,
 // in BOTH modes:
@@ -33,17 +32,12 @@ var VERSION = "ex-ray"
 //   - server mode: the SS server cross-assigns — localAddr/localPort take the
 //     SS_REMOTE_* values (the public listen endpoint) and remoteAddr/remotePort
 //     take SS_LOCAL_* (the ss-server loopback to forward into).
-//
-// The cross-assignment below mirrors that: under `*server`, a `localAddr`
-// option lands in *remoteAddr and a `remoteAddr` option lands in *localAddr
-// (likewise for ports).
 func parseOptsIntoFlags() {
 	opts, err := parseEnv()
 	if err != nil {
 		// parseEnv only errors on a malformed SS_PLUGIN_OPTIONS string; with
 		// no SS_* env set it returns empty opts and nil. Either way, leave the
-		// flag defaults in place (matches the prior behavior, which guarded the
-		// whole remap block on `err == nil`).
+		// flag defaults in place.
 		return
 	}
 
@@ -190,13 +184,9 @@ func main() {
 
 	parseOptsIntoFlags()
 
-	// quic mode binds a UDP-based wire listener, not TCP. ex-ray's TCP
-	// confirming-probe + transports=["tcp"] would be a lie for quic, so v1
-	// refuses it explicitly rather than mis-probing. Hole only ever uses the
-	// default websocket transport; ex-ray-as-standalone-server with quic is a
-	// documented v1 gap. (A correct quic path would UDP-probe and report
-	// ["udp"], but only once we are certain the quic inbound binds exactly that
-	// UDP addr — until then the honest signal is a typed fatal.)
+	// quic mode binds a UDP wire listener; ex-ray's TCP confirming-probe and
+	// transports=["tcp"] only describe TCP, so reject quic rather than
+	// mis-report. Hole always uses the default websocket transport.
 	if *mode == "quic" {
 		emitFatal("quic mode not supported by ex-ray v1", nil)
 		os.Exit(23)
@@ -259,9 +249,7 @@ func main() {
 	// listener is accepting once Start returns nil. quic was already fatal'd
 	// out above, so the served transport is TCP (websocket/default).
 	//
-	// localListenAddr is authoritative: ex-ray rejects port 0 (above), so for
-	// every accepted input the requested port == the bound port (v2ray-core
-	// binds it; Start() returning nil confirms).
+	// port 0 was rejected above, so the bound port equals the requested one.
 	emitReady(localListenAddr, []string{"tcp"})
 
 	<-osSignals

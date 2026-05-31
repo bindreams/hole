@@ -143,10 +143,7 @@ fn redirect_captures_subprocess_stdout_via_inheritance(#[fixture(temp_dir)] dir:
 /// The relay's `tee.write_all(buf)` goes through a
 /// `tracing_appender::NonBlocking` worker whose drain is asynchronous;
 /// without `flush` dropping the `WorkerGuard`s, the tee target can be
-/// empty when the test reads it. Historically the child scenario
-/// relied on a wall-clock `sleep(150ms)` to mask this; the sleep was
-/// removed in #383 and the test caught the regression on darwin/amd64
-/// (slowest CI runner) before merge. Do not weaken the
+/// empty when the test reads it. Do not weaken the
 /// `tee_stderr`/`tee_stdout` assertions — they are the canonical
 /// regression gate for the flush contract.
 #[skuld::test]
@@ -488,7 +485,7 @@ fn cleanup_legacy_daily_logs_tolerates_missing_directory(#[fixture(temp_dir)] di
 
 #[skuld::test]
 fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
-    // Runs as a subprocess: post-#301 the parent has the
+    // Runs as a subprocess: the parent already has the
     // `hole-test-observability` global subscriber installed, so the
     // production `init()`'s `set_global_default` would fail in-process
     // and the file layer would never receive events. The child has a

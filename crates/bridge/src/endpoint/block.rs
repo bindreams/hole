@@ -84,14 +84,12 @@ impl BlockEndpoint {
     }
 
     /// Log the IPv6-unreachable-bypass drop. Emits two complementary
-    /// signals, matching pre-refactor behavior:
+    /// signals:
     ///
     /// - A one-shot `warn!` via `ipv6_unreachable_warned` that describes
     ///   the infrastructure-level scenario (no upstream IPv6 connectivity).
     /// - A per-(rule_index, dst) rate-limited `info!` that records which
-    ///   destinations the cascade dropped. This preserves the visibility
-    ///   pre-refactor `dispatch_udp`/`dispatch_tcp_bypass` had when the
-    ///   IPv6 check fell through to `FilterAction::Block`.
+    ///   destinations the cascade dropped.
     pub fn log_ipv6_bypass_unreachable(&self, rule_index: u32, dst: SocketAddr, l4: &'static str) {
         if !self.ipv6_unreachable_warned.swap(true, Ordering::Relaxed) {
             warn!("IPv6 bypass unreachable; upstream interface has no IPv6 connectivity");

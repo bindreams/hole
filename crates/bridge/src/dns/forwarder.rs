@@ -1,15 +1,14 @@
 //! `DnsForwarder` — pure-bytes DNS forwarding over one of four upstream
 //! transports. Preserves the client's transaction ID so it can serve as a
-//! drop-in forwarder for both `LocalDnsServer` (sub-step e) and
-//! `LocalDnsEndpoint` (sub-step f).
+//! drop-in forwarder for both `LocalDnsServer` (OS-facing loopback:53) and
+//! `LocalDnsEndpoint` (in-tunnel UDP/53 intercept).
 //!
 //! Serving strategy: walk `DnsConfig.servers` in order, try each with the
 //! configured `DnsProtocol`, return the first successful reply. Return a
 //! synthesized SERVFAIL if every server fails.
 //!
 //! IPv6 server entries are skipped (with a deduplicated WARN) when the
-//! upstream interface has no IPv6 connectivity — matches the spec in the
-//! plan.
+//! upstream interface has no IPv6 connectivity.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -28,11 +27,11 @@ use crate::dns::providers;
 
 // Typed errors ========================================================================================================
 
-/// Which layer of the upstream stack emitted the error. Lets #248
-/// observation distinguish SOCKS5-layer failures from TLS handshake
-/// failures from mid-stream I/O EOFs from outer-budget timeout
-/// cancellation — all of which previously surfaced as a bare `io::Error`
-/// with message `"tls handshake eof"` or similar.
+/// Which layer of the upstream stack emitted the error — lets the
+/// failure log distinguish SOCKS5/connect from TLS-handshake from
+/// mid-stream I/O from outer-budget timeout cancellation, which would
+/// otherwise all collapse to a bare `io::Error` (`"tls handshake eof"`
+/// or similar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamLayer {
     /// TCP or UDP connect. For `Socks5Connector`, this includes the
@@ -50,7 +49,7 @@ pub enum UpstreamLayer {
     /// Outer `UPSTREAM_TIMEOUT` budget fired. Distinct from `Io` so
     /// observers can tell "inner future completed with error at 2573ms"
     /// from "outer timer cancelled the future at exactly 3000ms" —
-    /// different root causes, different fixes. Ref #248.
+    /// different root causes, different fixes.
     Timeout,
 }
 
@@ -137,9 +136,9 @@ impl UpstreamErr {
 }
 
 /// Walk `std::error::Error::source()` and join the chain with ` -> `.
-/// Used as the `caused_by=...` log field so Phase 2 sees the inner
-/// io::ErrorKind (e.g. `ConnectionRefused`, `UnexpectedEof`) instead of
-/// just the outer message.
+/// Used as the `caused_by=...` log field so the failure log surfaces the
+/// inner io::ErrorKind (e.g. `ConnectionRefused`, `UnexpectedEof`) instead
+/// of just the outer message.
 fn format_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut s = format!("{e}");
     let mut current = e.source();
@@ -202,10 +201,8 @@ const LOG_FULL_LIMIT: u32 = 3;
 /// Minimum interval between summary lines per server.
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Per-server state for log-first-N-then-summarize. Replaces the previous
-/// per-server dedup-forever `log_once` on the upstream-failure path, which
-/// hid all but the first failure per server IP and blocked Phase-2
-/// observation of #248.
+/// Per-server state for log-first-N-then-summarize on the upstream-failure
+/// path.
 ///
 /// - First [`LOG_FULL_LIMIT`] failures per server are logged in full.
 /// - After that, a rolling summary line `upstream failed (N suppressed

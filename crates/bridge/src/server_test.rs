@@ -1,7 +1,8 @@
 //! One-shot shadowsocks client test runner.
 //!
-//! Completely isolated from `ProxyManager` / `ProxyState`. Each call optionally
-//! spawns a transient v2ray-plugin sidecar, opens a single TCP relay through
+//! Completely isolated from `ProxyManager` / `ProxyState`. Each call
+//! optionally spawns a transient SIP003 plugin sidecar (e.g.
+//! v2ray-plugin/ex-ray), opens a single TCP relay through
 //! the configured shadowsocks server to a public-internet sentinel, and
 //! reports a granular per-phase outcome. Concurrent calls are safe — each
 //! gets its own plugin process and its own [`ProxyClientStream`].
@@ -88,24 +89,19 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
 
     // Phase 3: try each sentinel until one returns bytes or both fail.
     //
-    // Diagnosis for v1 AEAD ciphers (the dominant deployment): the rust
-    // shadowsocks server enters `ignore_until_end` on AEAD decryption failure
-    // — it silently drains the client forever rather than closing the stream
-    // (anti-probing). So a HANDSHAKE FAILURE produces a CLIENT TIMEOUT, not
-    // a clean EOF. Conversely, when the handshake succeeds but the upstream
-    // connect fails (server alive but cannot reach the public internet), the
-    // SS server tunnels our request, fails the outbound connect, and closes
-    // our tunnel side cleanly — producing EOF on the client.
+    // Diagnosis for v1 AEAD ciphers (the dominant deployment): on AEAD
+    // decryption failure the rust SS server silently drains the client
+    // forever (anti-probing `ignore_until_end`), so a HANDSHAKE FAILURE
+    // produces a CLIENT TIMEOUT, not a clean EOF; whereas a successful
+    // handshake with a failed upstream connect closes our tunnel side
+    // cleanly, producing EOF. Hence: Timeout → most likely wrong creds;
+    // EOF → most likely upstream failure. Two sentinels are tried in
+    // series so a transient hiccup doesn't poison the diagnosis; the first
+    // definitive timeout breaks early.
     //
-    // So: Timeout → most likely wrong creds; EOF → most likely upstream
-    // failure. Two sentinels are tried in series so a transient single-sentinel
-    // hiccup does not poison the diagnosis. The first definitive timeout
-    // breaks early because it is unlikely to clear on the second attempt.
-    //
-    // AEAD-2022 caveat: with 2022 ciphers, the server closes immediately on
-    // bad creds (RST via SO_LINGER 0), producing EOF on the client. That
-    // case is misdiagnosed as `ServerCannotReachInternet` here. The v1 path
-    // is the priority — 2022 deployments are still rare in practice.
+    // AEAD-2022 caveat: 2022 ciphers close immediately on bad creds (RST
+    // via SO_LINGER 0), producing EOF — misdiagnosed as
+    // `ServerCannotReachInternet`. The v1 path is the priority.
     let context: SharedContext = Context::new_shared(ServerType::Local);
     let mut handshake_timeout_observed = false;
     for sentinel in &cfg.sentinels {
@@ -294,8 +290,8 @@ async fn try_sentinel(
     }
 }
 
-// Tests skipped in CI: macOS PluginConfig port race (#197),
-// Windows WSAETIMEDOUT (#200).
+// Gated to non-macOS/non-Windows: macOS PluginConfig port race;
+// Windows WSAETIMEDOUT flakiness.
 #[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
 #[path = "server_test_tests.rs"]
 mod server_test_tests;

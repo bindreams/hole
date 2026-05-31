@@ -39,23 +39,16 @@ pub(crate) const DIST_BIN: skuld::Label;
 /// **Skuld serial vs label propagation.** Skuld merges a consumed
 /// fixture's `serial` into the test's effective serial constraint, so
 /// a test consuming `[fixture(ssserver_*)]` (each marked `serial =
-/// PORT_ALLOC`) inherits the serial gate transitively — its execution
-/// blocks against fixture init that holds the same serial slot. The
-/// **label list** itself does NOT propagate: only the `serial`
-/// constraint does. Tests that need to participate in `PORT_ALLOC`
-/// mutual exclusion as a label-bearing party (so other `serial =
-/// PORT_ALLOC` tests block against them too) must declare the label
-/// explicitly. See `cipher_chacha20_*_roundtrip`, the `run_test_*`
-/// family in `server_test_tests.rs`, and
-/// `run_test_with_v2ray_plugin_happy_path` for examples.
+/// PORT_ALLOC`) inherits the serial gate transitively. The **label
+/// list** itself does NOT propagate: only the `serial` constraint does.
+/// So a test that allocates ports outside a serialized fixture must
+/// declare `PORT_ALLOC` and `serial = PORT_ALLOC` explicitly to
+/// participate in the mutual exclusion.
 ///
-/// After bindreams/hole#285 the four `ssserver_*` fixtures own their
-/// own (allocate, bind) retry loop via
-/// [`hole_common::port_alloc::bind_ephemeral`], so the
-/// pre-allocate-then-bind TOCTOU window the label originally protected
-/// inside fixture init is gone. The label remains because per memory's
-/// "no feature regressions for test flakes" rule, the serialization
-/// stays until a soak run proves it's safe to remove.
+/// The `ssserver_*` fixtures fold allocate+bind into one
+/// [`hole_common::port_alloc::bind_ephemeral`] retry loop inside fixture
+/// init, but the serial label is kept conservatively so concurrent
+/// label-bearing tests don't pick the same port at the same instant.
 #[skuld::label]
 pub(crate) const PORT_ALLOC: skuld::Label;
 #[skuld::label]

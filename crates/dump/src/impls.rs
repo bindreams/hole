@@ -1,8 +1,8 @@
 //! Built-in [`Dump`] impls for common standard-library types.
 //!
-//! Kept in one file for v1 so the set is easy to audit. Each section is
-//! demarcated with the workspace section-comment style. A future commit
-//! may split this into `impls/` topic files if it outgrows ergonomics.
+//! Kept in one file so the set is easy to audit; each section is
+//! demarcated with the workspace section-comment style. Split into
+//! `impls/` topic files if it outgrows one file.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

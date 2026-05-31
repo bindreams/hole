@@ -94,11 +94,9 @@ fn expand(input: ItemStruct) -> syn::Result<proc_macro2::TokenStream> {
         #vis mod #sealed_mod {
             use super::*;
 
-            // Pub-fielded shadow — reached via Deref from the frozen struct.
-            // Exposed (pub) so that field visibility carries through to readers
-            // outside the sealed module; construction requires going through
-            // `Mut...::freeze`, which is the only path that can set the
-            // private `inner` field below.
+            // Pub-fielded shadow, reached via Deref from the frozen struct.
+            // Pub so field visibility carries through to outside readers; only
+            // `Mut...::freeze` can construct it (sets the private `inner` below).
             pub struct #inner_ident {
                 #(
                     #( #field_docs )*

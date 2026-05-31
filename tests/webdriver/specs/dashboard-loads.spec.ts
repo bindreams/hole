@@ -1,5 +1,5 @@
-// Regression gate for #372 — the dashboard webview must load the bundled
-// frontend, not WebView2's "localhost refused to connect" error page.
+// Regression gate: the dashboard webview must load the bundled frontend,
+// not WebView2's "localhost refused to connect" error page.
 //
 // Failure modes this guards against:
 // - hole.exe compiled with `cfg(dev)` ON (missing `tauri/custom-protocol`),
@@ -10,8 +10,7 @@
 // The wdio.conf.ts `before` hook parks the suite until `init()` in
 // ui/main.ts has signaled completion via the `wait_ui_ready` Tauri
 // command. By the time these specs run, the page is loaded and the
-// app's init() has finished — no per-test wait needed. See
-// bindreams/hole#383 for the flake that motivated this design.
+// app's init() has finished — no per-test wait needed.
 
 describe("Dashboard window", () => {
   it("loads the bundled HTML (not the WebView2 error page)", async () => {

@@ -9,9 +9,9 @@ import msi_installer
 from msi_installer import BuildError, find_wix_exe, get_version, ui_extension_path
 from msi_installer import _accept_wix_eula
 
-# Note: hardlink/copy logic moved to `xtask::stage` (Rust). See xtask/src/stage.rs
-# and xtask/src/stage_tests.rs. The msi-installer Python project no longer
-# owns BINDIR composition — `stage_files()` delegates to `cargo xtask stage`.
+# BINDIR composition lives in xtask (xtask/src/stage.rs, xtask/src/stage_tests.rs);
+# `stage_files()` delegates to `cargo xtask stage`, so there are no hardlink/copy
+# unit tests here.
 
 # get_version tests ====================================================================================================
 

@@ -19,7 +19,7 @@ pub enum ReadinessMode {
     /// Parse the child's stdout for a sitrep `hello`/`ready` handshake.
     /// Use for plugins known to speak sitrep (ex-ray, galoshes-embedded).
     ExpectSitrep,
-    /// Self-probe `local` with a TCP connect (the relocated poll_ready).
+    /// Self-probe `local` with a TCP connect (via [`crate::chain::poll_ready`]).
     /// The conservative default for arbitrary / legacy plugins.
     #[default]
     Probe,
@@ -31,7 +31,7 @@ pub enum ReadinessMode {
 /// mode `local → SS_LOCAL_*` and `remote → SS_REMOTE_*`; in server mode
 /// the pair is swapped so the binary's own server-mode address swap
 /// (v2ray-plugin `parseEnv`, etc.) restores the chain's intended
-/// direction. See bindreams/hole#396 for the incident.
+/// direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sip003Env {
     pub ss_local_host: String,
@@ -174,9 +174,8 @@ impl ChainPlugin for BinaryPlugin {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stdout_task = match self.readiness {
             ReadinessMode::Probe => {
-                // Tier-2: the stdout reader is a pure log passthrough
-                // (unchanged from the pre-sitrep behavior); a separate
-                // self-probe task owns readiness.
+                // Tier-2: the stdout reader is a pure log passthrough; a
+                // separate self-probe task owns readiness.
                 let plugin_name = self.name.clone();
                 let log_task = tokio::spawn(async move {
                     let reader = BufReader::new(stdout);
@@ -196,9 +195,8 @@ impl ChainPlugin for BinaryPlugin {
                 });
 
                 // Self-probe readiness. On a successful connect, report TCP
-                // readiness; on shutdown-first, drop `ready` unsent
-                // (RecvError, matching the old "shutdown before ready"
-                // semantics).
+                // readiness; on shutdown-first, drop `ready` unsent (the
+                // receiver gets RecvError: shutdown happened before readiness).
                 let probe_local = local;
                 let probe_shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -239,21 +237,14 @@ impl ChainPlugin for BinaryPlugin {
 
         // Wait for child exit or shutdown signal.
         //
-        // Readiness duality / backstop (see the trait + chain aggregator):
-        //
-        // - DOUBLE-REPORT IS CORRECT. In ExpectSitrep a plugin that emits
-        //   `fatal` then exits nonzero produces BOTH a `StartError::Fatal`
-        //   via the readiness sender (the START-GATE for `on_ready`) AND the
-        //   `child.wait()` → `Err` return below (the LIFECYCLE error that
-        //   drives `record_exit`/teardown). Keep both; do NOT suppress
-        //   either — they are intentionally separate observers of one event.
-        //
-        // - ORPHANED READINESS ON CLEAN SHUTDOWN IS THE INTENDED BACKSTOP.
-        //   If the child binds, never emits `ready`, then the parent shuts
-        //   down, the sitrep reader holds the readiness sender until stdout
-        //   EOF; the 100ms drain may abandon the task, dropping the sender
-        //   unsent → the aggregator sees RecvError → `Fatal{"exited before
-        //   ready"}`. That is CORRECT — the plugin did fail to ready.
+        // The readiness sender (start-gate for `on_ready`) and this
+        // `child.wait()` Err return (lifecycle error driving teardown) are two
+        // intentionally separate observers of one exit; a plugin that emits
+        // `fatal` then exits nonzero fires both, and neither must be suppressed.
+        // If the child binds but never readies and is then shut down, the
+        // sender is dropped unsent and the aggregator synthesizes `Fatal{exited
+        // before ready}`. See `run_readiness_aggregator` in chain.rs for the
+        // full two-channel rationale.
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
             status = child.wait() => {

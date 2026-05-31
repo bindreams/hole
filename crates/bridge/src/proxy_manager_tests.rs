@@ -93,9 +93,8 @@ impl Proxy for MockProxy {
         if self.state.fail_start.load(Ordering::SeqCst) {
             return Err(ProxyError::Runtime(io::Error::other("mock start failure")));
         }
-        // Spawn a long-sleeping task to simulate a running proxy — matches
-        // the pre-refactor `MockBackend::start_ss` behavior so `is_alive()`
-        // works realistically.
+        // Spawn a long-sleeping task to simulate a running proxy so the
+        // returned handle reports `is_alive()` realistically.
         let handle = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             Ok(())
@@ -891,12 +890,11 @@ fn reload_when_not_running_starts() {
     });
 }
 
-// Phase-1 instrumentation tests for #247 ==============================================================================
+// DNS-apply instrumentation tests =====================================================================================
 
-/// Smoke-test: `apply_dns_settings` emits an INFO log `"apply_dns_settings done"`
-/// with an `elapsed_ms` field. Phase-2 observation of #247 depends on this
-/// line appearing at INFO so users don't need to raise the log level to
-/// diagnose the ~10s stall.
+/// Smoke-test: `apply_dns_settings` must emit an INFO log
+/// `"apply_dns_settings done"` with an `elapsed_ms` field so the ~10s
+/// stall is diagnosable without raising the log level.
 ///
 /// Uses a nonexistent upstream interface name so the underlying `netsh` /
 /// `networksetup` calls fail fast (adapter not found), but the wrapping
@@ -970,14 +968,14 @@ fn dns_apply_emits_done_info_log() {
         });
 }
 
-// Phase 4 #247 — TUN skipped from capture, kept in apply ==============================================================
+// TUN skipped from capture, kept in apply =============================================================================
 //
 // The TUN adapter is created by `routing.install` immediately before
 // `apply_dns_settings` runs. Its prior DNS is whatever Windows defaults a
 // brand-new adapter to — unknowable and uninteresting. Calling
 // `netsh show dnsservers` against a freshly-created adapter is also the
-// slowest case on Windows (observed in Phase 2 as part of the 11.3s stall
-// in #247). So capture runs on upstream only; apply still runs on both.
+// slowest case on Windows. So capture runs on upstream only; apply still
+// runs on both.
 //
 // Test strategy: DEBUG-level log capture, assert the per-alias lines from
 // `dns::system::windows` show the expected asymmetry.
@@ -1024,7 +1022,7 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
 
             // Upstream alias uses a distinctive name so we can grep for it.
             // Mirrors `start_inner`'s phase 7 wiring: capture_aliases=
-            // [upstream] (TUN skipped per Phase 4 #247), apply_aliases=
+            // [upstream] (TUN skipped), apply_aliases=
             // [TUN, upstream].
             let dns = SystemDns::default();
             let mut applied = dns
@@ -1052,7 +1050,7 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
             // surfaces `"DNS capture: adapter not found; skipping
             // alias=..."` (debug); apply surfaces `"DNS apply failed;
             // continuing alias=..."` (warn). Capture must NEVER carry
-            // the TUN alias (Phase 4 #247); apply MUST carry both.
+            // the TUN alias; apply MUST carry both.
 
             // CAPTURE side: only the upstream alias appears.
             let capture_lines: Vec<&str> = output
@@ -1098,16 +1096,15 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
         });
 }
 
-// #414 — transports-driven UDP-drop policy ============================================================================
+// Transports-driven UDP-drop policy ===================================================================================
 //
 // The three `RunningState`/`Dispatcher::new` start sites read
-// `udp_available_from_chain(plugin_chain.transports())` instead of the
-// static `plugin_supports_udp(config)`. The derivation is the testable
-// unit: a TCP-only chain (`[tcp]`) yields `false`, a TCP+UDP chain yields
-// `true`, and no plugin yields `true`. Standing up a real `ProxyManager`
-// start needs elevation (routing/TUN), so the derivation is extracted
-// into `udp_available_from_chain(Option<Transports>)` and tested directly
-// — the same value flows into all three start sites.
+// `udp_available_from_chain(plugin_chain.transports())`. The derivation
+// is the testable unit: a TCP-only chain (`[tcp]`) yields `false`, a
+// TCP+UDP chain yields `true`, and no plugin yields `true`. Standing up a
+// real `ProxyManager` start needs elevation (routing/TUN), so the
+// derivation is extracted into `udp_available_from_chain(Option<Transports>)`
+// and tested directly — the same value flows into all three start sites.
 
 #[skuld::test]
 fn udp_unavailable_when_chain_reports_tcp_only() {
@@ -1142,14 +1139,13 @@ fn udp_unavailable_when_chain_reports_empty_transports() {
     assert!(!udp_available_from_chain(Some(garter::Transports::empty())));
 }
 
-// #388 — forwarder self-test gate tests ===============================================================================
+// Forwarder self-test gate tests ======================================================================================
 //
 // `start_inner` runs `run_forwarder_self_test` synchronously BEFORE
 // installing TUN routes / applying system DNS. A failed gate returns
 // `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned RAII
 // guards unwind without ever hijacking the user's system DNS into a
-// dead tunnel. Pre-#388 the self-test was fire-and-forget; the proxy
-// committed Running before the test even completed.
+// dead tunnel.
 
 #[cfg(test)]
 mod self_test {
@@ -1283,7 +1279,7 @@ mod self_test {
         assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
     }
 
-    /// **#388**: when self-test fails AND `diagnostic_plugin_tap=true`,
+    /// When self-test fails AND `diagnostic_plugin_tap=true`,
     /// emit a `warn!` breadcrumb pointing the reader to the tap output
     /// above. Const-anchored so a text change breaks only the const.
     #[skuld::test]
@@ -1324,7 +1320,7 @@ mod self_test {
         );
     }
 
-    /// **#388**: when self-test fails AND tap is OFF, emit a `warn!`
+    /// When self-test fails AND tap is OFF, emit a `warn!`
     /// remediation hint pointing the reader to the config flag.
     #[skuld::test]
     fn self_test_failure_without_tap_emits_remediation_hint() {
@@ -1394,7 +1390,7 @@ mod self_test {
             });
     }
 
-    /// **#388**: `is_dns_reply_ok` reply-decode contract — direct unit
+    /// `is_dns_reply_ok` reply-decode contract — direct unit
     /// tests of the RCODE check. Without these, a regression in the
     /// mask (`0x0F` → `0xF0`) or the length check would only surface
     /// once the gate runs against real upstream DNS in production.
@@ -1488,9 +1484,7 @@ mod self_test {
     /// returns `ProxyError::Runtime(io::Error)`, not the
     /// `ForwarderSelfTestFailed` variant under test. The gate IS still
     /// exercised on those platforms via the DistHarness e2e tests
-    /// (bridge runs elevated). Lifting this gate to non-Windows
-    /// requires a port-injection seam in `bind_ladder` —
-    /// follow-up tracked separately.
+    /// (bridge runs elevated).
     #[skuld::test]
     #[cfg(target_os = "windows")]
     fn start_blocks_on_forwarder_self_test_failure() {

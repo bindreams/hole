@@ -344,7 +344,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         proxy_socks5: false,
         proxy_http: true,
         local_port_http: 5555,
-        diagnostic_plugin_tap: true, // #388: set to non-default to anchor the roundtrip
+        diagnostic_plugin_tap: true, // set to non-default to anchor the roundtrip
         ..Default::default()
     };
     config.save(&path).unwrap();

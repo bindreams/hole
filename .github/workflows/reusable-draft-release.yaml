@@ -6,9 +6,7 @@ name: Reusable Draft Release
 #
 # Hole (MSI + DMG, per-platform build targets, requires Node + uv) and
 # ex-ray (Go-built, requires setup-go instead of setup-build) do NOT
-# fit this shape and are NOT supported by this reusable. PR 7c will
-# decide whether to expand this reusable's input surface or introduce
-# additional track-specific reusables.
+# fit this shape and are NOT supported by this reusable.
 #
 # See #321 (introduction) and CLAUDE.md "Releases" for context.
 

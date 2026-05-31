@@ -61,18 +61,10 @@ pub(crate) async fn allocate_ephemeral_port(protocols: Protocols) -> u16 {
 /// attempts fit in a 10 s budget. The wrapper forces fast retries so the
 /// histogram reflects the actual attempt distribution.
 ///
-/// Diagnostics use `eprintln!` on purpose. Pre-#301 the rationale was
-/// to avoid the #147 LogTracer regression — any global tracing
-/// subscriber install would set `log::max_level=Trace` and tip
-/// `server_test_tests` into Windows CI timeout. Since #301 the
-/// workspace ships `hole-test-observability` with an EnvFilter that
-/// level-rejects noisy log events before `tracing-log` allocates,
-/// so a `tracing::info!` here would actually be captured by
-/// Skuld/nextest on failure. `eprintln!` is retained because this
-/// diagnostic is intentionally always-on (not filterable) — it's a
-/// load-bearing histogram for understanding TCP-connect failure
-/// shapes on the runner, and we'd lose it if it went through the
-/// filter. See `crates/bridge/src/ipc_tests.rs` for the #301 follow-up.
+/// Diagnostics use `eprintln!` (not tracing) because this connect-failure
+/// histogram is intentionally always-on and must not be droppable by a
+/// log filter — it's load-bearing for understanding TCP-connect failure
+/// shapes on the runner.
 pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
     let start = Instant::now();
     let mut attempts: u32 = 0;
@@ -138,9 +130,9 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
 }
 
 /// Dump Windows TCP table state for `port` to stderr. Called from
-/// `wait_for_port` immediately before `panic!` to disambiguate H1–H5 in
-/// #200: shows whether the port is in LISTEN state at the moment the test
-/// gives up, and on which address family.
+/// `wait_for_port` immediately before `panic!` for diagnosis: shows
+/// whether the port is in LISTEN state at the moment the test gives up,
+/// and on which address family.
 ///
 /// Synchronous `std::process::Command::output()` is acceptable here — we
 /// are about to panic and the test has already failed. A stuck PowerShell
@@ -189,7 +181,7 @@ fn capture_windows_tcp_state(port: u16) {
         Err(e) => eprintln!("[wait_for_port] netstat spawn failed: {e}"),
     }
 
-    // Belt-and-suspenders for H4 (IPv6 listener bound while we connect IPv4).
+    // Belt-and-suspenders: catch an IPv6 listener bound while we connect IPv4.
     let ps6 = format!(
         "Get-NetTCPConnection -LocalPort {port} -AddressFamily IPv6 -ErrorAction SilentlyContinue \
          | Format-Table -AutoSize | Out-String"
@@ -206,12 +198,11 @@ fn capture_windows_tcp_state(port: u16) {
         }
     }
 
-    // Routing table — critical for #200 root cause. If the previous
-    // TUN-mode test left a stale `0.0.0.0/1` route pointing at a
-    // destroyed TUN adapter, SYNs to 127.0.0.1 never reach the loopback
-    // adapter. `route print -4` shows the IPv4 routing table including
-    // interface indices so we can spot rows referencing a vanished
-    // hole-tun.
+    // Routing table. If a previous TUN-mode test left a stale `0.0.0.0/1`
+    // route pointing at a destroyed TUN adapter, SYNs to 127.0.0.1 never
+    // reach the loopback adapter. `route print -4` shows the IPv4 routing
+    // table including interface indices so we can spot rows referencing a
+    // vanished hole-tun.
     match std::process::Command::new("route").args(["print", "-4"]).output() {
         Ok(o) => {
             eprintln!(
@@ -225,7 +216,7 @@ fn capture_windows_tcp_state(port: u16) {
     // Interface list — shows which interface indices currently exist,
     // so we can correlate route print's interface column with live
     // adapters (a route referencing a non-existent interface index is
-    // the #200 smoking gun).
+    // the smoking gun).
     match std::process::Command::new("netsh")
         .args(["interface", "ipv4", "show", "interfaces"])
         .output()
@@ -248,10 +239,9 @@ fn capture_windows_tcp_state(port: u16) {
     // also avoids the `show filters` admin-elevation requirement for
     // the test process. See crates/bridge/src/diagnostics/wfp.rs.
     //
-    // The test-process TCP control-loopback probe that used to live
-    // here served its purpose (CI run 3 on PR #207 showed loopback is
-    // broken machine-wide, ruling out H8). Removing it now keeps the
-    // failure capture focused on cheap evidence we don't already have.
+    // A test-process TCP control-loopback probe was removed once it had
+    // shown loopback can break machine-wide; the failure capture stays
+    // focused on cheap evidence we don't already have.
 
     // ICMP loopback probe. If ping 127.0.0.1 succeeds while TCP
     // connects hang, we're seeing the SYN-not-transmitted shape

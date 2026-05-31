@@ -1,7 +1,7 @@
 //! Proc-macro support for the `dump` crate — provides
 //! `#[derive(Dump)]`.
 //!
-//! v1 attribute vocabulary:
+//! Supported attributes:
 //!
 //! - Field: `#[dump(skip)]`, `#[dump(rename = "...")]`,
 //!   `#[dump(secret)]`.
@@ -20,8 +20,8 @@
 //! stripped before the substitution runs, matching what the YAML key
 //! should look like to a reader.
 //!
-//! Future commits may add `flatten`, `via`, and `tag`. The derive emits
-//! absolute paths (`::dump::...`) so it works from any downstream crate.
+//! The derive emits absolute paths (`::dump::...`) so it works from any
+//! downstream crate.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

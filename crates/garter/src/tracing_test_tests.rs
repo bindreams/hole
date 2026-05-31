@@ -126,11 +126,10 @@ fn helper_silently_passes_when_called_before_block_on() {
     );
 }
 
-/// Issue #302 explicitly requests this regression: demonstrate that
-/// the raw `set_default` + multi-thread runtime + `tokio::spawn`
-/// combination drops the spawned-task event. The oneshot channel
-/// synchronously confirms the spawned task ran (so a missing event
-/// can't be explained away as "spawn hadn't started").
+/// Demonstrates that raw `set_default` + a multi-thread runtime + `tokio::spawn`
+/// drops the spawned-task event (the helper would have panicked instead). The
+/// oneshot confirms the spawned task ran so a missing event is not just "spawn
+/// hadn't started."
 #[skuld::test]
 fn raw_set_default_on_multi_thread_loses_spawned_events() {
     let writer = VecWriter::default();

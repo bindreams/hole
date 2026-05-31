@@ -27,7 +27,7 @@ pub struct Socks5Endpoint {
     /// SOCKS5 itself (SOCKS5 always supports UDP via ASSOCIATE) — this
     /// reflects the plugin chain's reported capability, derived from the
     /// live sitrep `transports` via `udp_available_from_chain` in
-    /// `proxy_manager.rs` (#414).
+    /// `proxy_manager.rs`.
     udp_supported: bool,
     /// Static label for [`Endpoint::name`].
     label: String,

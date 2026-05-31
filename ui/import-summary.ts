@@ -13,8 +13,8 @@ export type SummaryKind = "success" | "info";
  * which were already delivered via blocking dialogs in the per-file catch).
  *
  * Partial-failure case (totalAppended > 0 AND totalFailed > 0): the toast
- * MUST mention the failed count so the user isn't fooled into thinking
- * everything went well — see bindreams/hole#385's Phase 2 review.
+ * MUST mention the failed count so the user isn't misled into thinking
+ * everything succeeded.
  */
 export function postImportSummary(
   totalAppended: number,

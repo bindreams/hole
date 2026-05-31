@@ -109,9 +109,8 @@ fn parse_lines(layer: &str, raw: &[u8]) -> Vec<CapturedEvent> {
 struct ChildHarness {
     file_writer: VecWriter,
     stderr_writer: VecWriter,
-    /// If Some, `finish` flushes through this relay (in-band sentinel +
-    /// mpsc ack) before snapshotting the writers. Scenarios that don't
-    /// redirect (none currently) would leave it as None.
+    /// Some when the scenario installed the FD redirect; `finish` drains
+    /// it before snapshotting. None for non-redirecting scenarios.
     relays: Option<StdioRelayHandles>,
 }
 
@@ -159,7 +158,6 @@ fn finish(harness: &mut ChildHarness) -> ChildResult {
     // Flush the stdio relay deterministically: write a sentinel through
     // stderr/stdout, block on the reader's ack, then drain the
     // NonBlocking tee writers' WorkerGuards. No sleep.
-    // See bindreams/hole#383.
     if let Some(relays) = harness.relays.as_mut() {
         relays.flush().expect("relay flush");
     }
@@ -199,13 +197,11 @@ pub(crate) fn run_child(kind: &str) {
 /// Runs in a subprocess so that the production `init()`'s
 /// `set_global_default` succeeds — the parent test binary already
 /// has the `hole-test-observability` global subscriber installed.
-/// See bindreams/hole#301.
 fn scenario_log_bridge_to_file() {
     let log_dir_str = std::env::var("HOLE_LOGGING_TEST_LOG_DIR").expect("HOLE_LOGGING_TEST_LOG_DIR var");
     let log_dir = std::path::Path::new(&log_dir_str);
     // The redirect would eat the libtest-mimic per-test result lines; we
-    // need its diagnostics if the child fails. Disabled the same way the
-    // pre-#301 in-process test did.
+    // need its diagnostics if the child fails.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
     let guard = super::init(log_dir, "test.log", "info");
     log::info!("from-log-crate-bridge-test");

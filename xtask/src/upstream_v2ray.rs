@@ -13,14 +13,13 @@
 //! and the cached binary hasn't been corrupted since" — the cheap re-run
 //! skip. The pinned commit, not a pinned hash, is the supply-chain anchor.
 //!
-//! The pin is `e9af1cd…` — the `shadowsocks/v2ray-plugin` upstream revision
-//! that Hole vendored before #414 replaced the vendored subrepo with the
-//! first-party `crates/ex-ray/` shim. Building stock upstream at exactly that
-//! revision makes this the cleanest interop baseline: an ex-ray-vs-stock
-//! round-trip compares ex-ray against the exact upstream revision its
-//! v2ray-core shim tracks. (Pre-#414 this commit was recorded in
-//! `external/v2ray-plugin/.gitrepo`; that subrepo is now deleted, so the pin
-//! + rationale live here as the single durable anchor.)
+//! The pin is `e9af1cd…` — the `shadowsocks/v2ray-plugin` revision Hole's
+//! earlier v2ray-plugin track was pinned to. `ex-ray` is wire-compatible with
+//! that protocol, so building stock upstream at exactly this revision is the
+//! cleanest interop baseline: an ex-ray-vs-stock round-trip exercises
+//! wire-compat against a known upstream build. The pinned commit (not a
+//! pinned hash) is the supply-chain anchor and lives here as the single
+//! durable record.
 //!
 //! Output: `<repo>/.cache/upstream-v2ray-plugin/<commit>/v2ray-plugin-<host-triple>{.exe}`.
 
