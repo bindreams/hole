@@ -203,8 +203,16 @@ targets:
     # near-instant no-network cache hit on re-run), and `ex-ray` builds the
     # first-party shim. `depends: hole-tests` chains the bridge test-binary
     # compile (the full DAG: ex-ray → galoshes → wintun → hole → hole-tests).
-    # So `cargo xtask run interop-test` provisions-then-tests identically
-    # locally and in CI.
+    # So `cargo xtask run interop-test` provisions-then-tests in one command
+    # locally.
+    #
+    # In CI the interop tests run as part of the `test-hole` job's non-TUN
+    # pass (they're plain `package(hole-bridge)` tests); that job runs the
+    # SAME `cargo xtask provision-upstream-v2ray` step before nextest, so the
+    # upstream binary is present there too. This target is the local
+    # focused-run convenience — it does not have its own CI job (which would
+    # rebuild the whole hole DAG just to run three tests `test-hole` already
+    # builds the binary for).
     #
     # Platforms match `hole-tests` — that's where the hole-bridge test binary
     # is compiled. The tests themselves are platform-agnostic (verified on

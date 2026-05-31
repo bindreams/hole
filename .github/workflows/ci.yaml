@@ -201,7 +201,9 @@ jobs:
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Bumped 30→45 in #414: the non-TUN pass now also provisions stock
+    # upstream v2ray-plugin and runs the cross-impl interop tests (~78s each).
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +235,16 @@ jobs:
       - name: Build hole test binaries
         shell: bash
         run: cargo xtask build hole-tests
+
+      # The cross-impl interop tests in hole-bridge (`test(interop)`) fail-loud
+      # if the stock upstream v2ray-plugin binary is absent — they spawn it
+      # alongside ex-ray to prove wire-compat both directions. Provision it
+      # (clone + build the pinned upstream commit, cached under `.cache/`)
+      # before the non-TUN pass that runs them. ex-ray itself is already built
+      # by the `build hole-tests` DAG above. See `xtask/src/upstream_v2ray.rs`.
+      - name: Provision upstream v2ray-plugin (cross-impl interop)
+        shell: bash
+        run: cargo xtask provision-upstream-v2ray
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
