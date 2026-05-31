@@ -311,22 +311,27 @@ pub fn plugin_supports_udp(config: &ProxyConfig) -> bool {
 /// contains no path separators — PATH lookup can only find binaries in directories
 /// that an administrator placed on PATH (standard system-level trust model).
 pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
+    // Map the config token to its on-disk binary name. A known friendly
+    // name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`); an
+    // unknown name falls back to itself so arbitrary plugins are
+    // unaffected. See bindreams/hole#414.
+    let binary = hole_common::plugin::lookup(name).map(|d| d.binary_name).unwrap_or(name);
     if let Some(exe) = bridge_exe {
         // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
         // but the sibling plugin binary is next to the real binary.
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(dir) = exe.parent() {
-            let candidate = if cfg!(windows) && !name.ends_with(".exe") {
-                dir.join(format!("{name}.exe"))
+            let candidate = if cfg!(windows) && !binary.ends_with(".exe") {
+                dir.join(format!("{binary}.exe"))
             } else {
-                dir.join(name)
+                dir.join(binary)
             };
             if candidate.is_file() {
                 return candidate.to_string_lossy().to_string();
             }
         }
     }
-    name.to_string()
+    binary.to_string()
 }
 
 #[cfg(test)]
