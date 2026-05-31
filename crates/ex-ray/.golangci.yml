@@ -9,12 +9,7 @@ linters:
     - revive
     - misspell
     - unconvert
-  # gosec is deliberately OFF. Task 1 ported `generateConfig` / `readCertificate`
-  # verbatim from upstream v2ray-plugin, and gosec would fire G102 (all-interface
-  # bind), G304 (variable file path) and os.Exit findings on faithful-copy code.
-  # Enabling it would require pre-declared //nolint:gosec exclusions on the port;
-  # deferred as a follow-up — tracked in bindreams/hole#422. Leave off until
-  # intentionally audited.
+    - gosec
 
 formatters:
   # gofumpt is a strict superset of gofmt. `golangci-lint fmt` formats; the
