@@ -51,3 +51,59 @@ func TestUint32OptOutOfRange(t *testing.T) {
 		}
 	}
 }
+
+// withFlags saves the mux/fwmark/server globals, applies the given values, and
+// returns a restore func for defer. generateConfig reads these package-level
+// flag pointers, so tests must leave them as they found them.
+func withFlags(t *testing.T, muxV, fwmarkV int, serverV bool) func() {
+	t.Helper()
+	origMux, origFwmark, origServer := *mux, *fwmark, *server
+	*mux, *fwmark, *server = muxV, fwmarkV, serverV
+	return func() { *mux, *fwmark, *server = origMux, origFwmark, origServer }
+}
+
+// generateConfig validates mux/fwmark *before* the server/client split, so an
+// out-of-range value must be rejected identically in BOTH modes — the "uniform
+// validation" invariant. A future refactor that pushed validation back down
+// into the client-only cast site would silently regress server mode (where a
+// negative mux still flips connectionReuse); this test guards against that.
+func TestGenerateConfigRejectsOutOfRange(t *testing.T) {
+	cases := []struct {
+		desc      string
+		server    bool
+		mux       int
+		fwmark    int
+		wantInErr string
+	}{
+		{"negative mux, client mode", false, -1, 0, "mux"},
+		{"negative mux, server mode", true, -1, 0, "mux"},
+		{"oversize mux, server mode", true, math.MaxUint32 + 1, 0, "mux"},
+		{"negative fwmark, client mode", false, 1, -1, "fwmark"},
+		{"negative fwmark, server mode", true, 1, -1, "fwmark"},
+	}
+	for _, c := range cases {
+		restore := withFlags(t, c.mux, c.fwmark, c.server)
+		_, err := generateConfig()
+		restore()
+		if err == nil {
+			t.Errorf("%s: generateConfig() = nil error, want error mentioning %q", c.desc, c.wantInErr)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantInErr) {
+			t.Errorf("%s: generateConfig() error %q does not mention %q", c.desc, err.Error(), c.wantInErr)
+		}
+	}
+}
+
+// The Hole default (mux=1, fwmark=0) and any in-range value must build a config
+// without error in both modes — proves the hardening adds no false rejections.
+func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
+	for _, srv := range []bool{false, true} {
+		restore := withFlags(t, 1, 0, srv)
+		_, err := generateConfig()
+		restore()
+		if err != nil {
+			t.Errorf("server=%v: generateConfig() with valid defaults returned error: %v", srv, err)
+		}
+	}
+}

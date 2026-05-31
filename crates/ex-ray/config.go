@@ -104,8 +104,8 @@ func parseLocalAddr(localAddr string) []string {
 // out-of-range values loudly instead of letting them silently wrap. The bound
 // guard wrapping the conversion is gosec G115's recognized mitigation, so the
 // cast needs no //nolint. The error propagates through generateConfig ->
-// buildV2Ray -> main's emitFatal + os.Exit(23), the same loud-failure path as a
-// bad port (main.go).
+// buildV2Ray -> main's emitFatal + os.Exit(23), the same config-error path
+// (exit 23) as an invalid remotePort (main.go).
 func uint32Opt(name string, v int) (uint32, error) {
 	if v >= 0 && v <= math.MaxUint32 {
 		return uint32(v), nil
