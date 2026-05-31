@@ -67,8 +67,10 @@ pub enum ImportFailure {
 /// `ImportError::Parse(_)` collapses to `CorruptedJson` (no detail) to
 /// avoid leaking JSON parse-error messages (which can include fragments
 /// of file content). The `supported` plugin list is fetched directly
-/// from the single source of truth at
-/// [`hole_common::plugin::KNOWN_PLUGINS`] — no comma-string round-trip.
+/// from the single source of truth via
+/// [`hole_common::plugin::user_visible_plugin_names`] — no comma-string
+/// round-trip, and the non-user-visible `ex-ray` impl-detail entry is
+/// filtered out (bindreams/hole#414).
 fn to_import_failure(err: import::ImportError) -> ImportFailure {
     match err {
         import::ImportError::Parse(_) => ImportFailure::CorruptedJson,
@@ -77,7 +79,12 @@ fn to_import_failure(err: import::ImportError) -> ImportFailure {
         },
         import::ImportError::UnsupportedPlugin { name } => ImportFailure::UnsupportedPlugin {
             plugin: name,
-            supported: hole_common::plugin::known_plugin_names().map(String::from).collect(),
+            // Only user-visible plugins — `ex-ray` is an impl detail of
+            // `v2ray-plugin` and must not appear in the GUI's supported
+            // list (bindreams/hole#414).
+            supported: hole_common::plugin::user_visible_plugin_names()
+                .map(String::from)
+                .collect(),
         },
         import::ImportError::InvalidValue(detail) => ImportFailure::InvalidValue { detail },
     }

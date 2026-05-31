@@ -1,10 +1,10 @@
-name: Publish Release (v2ray-plugin)
+name: Publish Release (ex-ray)
 
 on:
   workflow_dispatch:
     inputs: &inputs
       version:
-        description: "v2ray-plugin release version (e.g. 0.1.0)"
+        description: "ex-ray release version (e.g. 0.1.0)"
         required: true
         type: string
   workflow_call:
@@ -26,10 +26,10 @@ jobs:
         run: |
           V="${{ inputs.version }}"
           V="${V#v}"
-          V="${V#releases/v2ray-plugin/v}"
-          # Accept X.Y.Z (bare) or X.Y.Z-hole.N. See draft workflow + xtask-lib/src/v2ray_plugin_version.rs.
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-hole\.[1-9][0-9]*)?$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
-          echo "tag=releases/v2ray-plugin/v${V}" >> "$GITHUB_OUTPUT"
+          V="${V#releases/ex-ray/v}"
+          # ex-ray is first-party: plain semver only (X.Y.Z).
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
+          echo "tag=releases/ex-ray/v${V}" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists
         run: |

@@ -12,12 +12,14 @@ use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
+pub mod ex_ray;
 pub mod galoshes;
+pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
 pub mod test_binaries;
-pub mod v2ray_plugin;
+pub mod upstream_v2ray;
 pub mod wintun;
 
 #[cfg(test)]
@@ -77,30 +79,44 @@ pub enum Command {
         #[arg(long, requires = "with_tests")]
         tests_out_dir: Option<PathBuf>,
     },
-    /// Build the v2ray-plugin sidecar from `external/v2ray-plugin/`.
+    /// Build the ex-ray sidecar from `crates/ex-ray/`.
     ///
-    /// Output goes into `<repo>/.cache/v2ray-plugin/`. Replaces the previous
+    /// Output goes into `<repo>/.cache/ex-ray/`. Replaces the previous
     /// build.rs side effect.
-    V2rayPlugin,
+    ExRay,
     /// Build the galoshes sidecar (workspace member `crates/galoshes/`).
     ///
-    /// Expects v2ray-plugin to have been built first into `.cache/v2ray-plugin/`
-    /// (the `deps` command runs v2ray-plugin → galoshes in that order).
+    /// Expects ex-ray to have been built first into `.cache/ex-ray/`
+    /// (the `deps` command runs ex-ray → galoshes in that order).
     Galoshes,
     /// Download and verify wintun.dll on Windows.
     ///
     /// Output goes into `<repo>/.cache/wintun/`. No-op on non-Windows.
     Wintun,
+    /// Download and verify the golangci-lint binary for the host platform.
+    ///
+    /// Output goes into `<repo>/.cache/golangci-lint/<version>/`. Used by the
+    /// `go-fmt` / `go-lint` prek hooks against the `crates/ex-ray/` Go module.
+    GolangciLint,
+    /// Clone + build the pinned upstream shadowsocks/v2ray-plugin for the
+    /// ex-ray cross-implementation interop test.
+    ///
+    /// Output goes into `<repo>/.cache/upstream-v2ray-plugin/<commit>/`. This
+    /// is a TEST dependency, deliberately NOT part of `cargo xtask deps` —
+    /// keeping the build-deps lean. The `interop-test` build.yaml target runs
+    /// it before the interop round-trip tests.
+    ProvisionUpstreamV2ray,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
-    /// Currently: `v2ray-plugin` + `galoshes` + `wintun`.
+    /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
     Deps,
     /// Print or validate the workspace version for a release group.
     ///
-    /// Each release group (`hole`, `garter`, `galoshes`, `v2ray-plugin`)
+    /// Each release group (`hole`, `garter`, `galoshes`, `ex-ray`)
     /// has its own version, declared in member Cargo.tomls via
-    /// `[package.metadata.hole-release].group` and validated against the
-    /// nearest `releases/<group>/v<X.Y.Z>` git tag.
+    /// `[package.metadata.hole-release].group` (or, for `ex-ray`, in
+    /// `crates/ex-ray/version.toml`) and validated against the nearest
+    /// `releases/<group>/v<X.Y.Z>` git tag.
     Version {
         /// Release group to operate on. Required for `--check`. Without
         /// `--group`, prints a table of every group's resolved version.
@@ -183,9 +199,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::V2rayPlugin => run_v2ray_plugin(),
+        Command::ExRay => run_ex_ray(),
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
+        Command::GolangciLint => run_golangci_lint(),
+        Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -202,10 +220,10 @@ pub fn run_stage(profile: Profile, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_v2ray_plugin() -> Result<()> {
+pub fn run_ex_ray() -> Result<()> {
     let repo_root = repo_root()?;
-    let path = v2ray_plugin::build(&repo_root)?;
-    println!("xtask: v2ray-plugin built at {}", path.display());
+    let path = ex_ray::build(&repo_root)?;
+    println!("xtask: ex-ray built at {}", path.display());
     Ok(())
 }
 
@@ -225,10 +243,25 @@ pub fn run_galoshes() -> Result<()> {
     Ok(())
 }
 
+pub fn run_golangci_lint() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = golangci_lint::ensure(&repo_root)?;
+    println!("xtask: golangci-lint at {}", path.display());
+    Ok(())
+}
+
+pub fn run_provision_upstream_v2ray() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = upstream_v2ray::ensure(&repo_root)?;
+    println!("xtask: upstream v2ray-plugin at {}", path.display());
+    Ok(())
+}
+
 pub fn run_deps() -> Result<()> {
-    run_v2ray_plugin()?;
+    run_ex_ray()?;
     run_galoshes()?;
     run_wintun()?;
+    run_golangci_lint()?;
     Ok(())
 }
 

@@ -9,21 +9,18 @@ fn stage_creates_out_dir_and_links_or_copies_files() {
 
     // Two source files. Stage them under renamed dest names.
     let src1 = src_dir.path().join("hole.exe");
-    let src2 = src_dir.path().join("v2ray-plugin-x86_64.exe");
+    let src2 = src_dir.path().join("ex-ray-x86_64.exe");
     fs::write(&src1, b"hole content").unwrap();
     fs::write(&src2, b"plugin content").unwrap();
 
-    let files = vec![
-        BindirFile::new(src1, "hole.exe"),
-        BindirFile::new(src2, "v2ray-plugin.exe"),
-    ];
+    let files = vec![BindirFile::new(src1, "hole.exe"), BindirFile::new(src2, "ex-ray.exe")];
 
     // Use a fresh subdirectory of dst_dir to verify create_dir_all is called.
     let out = dst_dir.path().join("staged");
     stage(&out, &files).unwrap();
 
     let staged_hole = out.join("hole.exe");
-    let staged_plugin = out.join("v2ray-plugin.exe");
+    let staged_plugin = out.join("ex-ray.exe");
     assert!(staged_hole.is_file());
     assert!(staged_plugin.is_file());
     assert_eq!(fs::read(&staged_hole).unwrap(), b"hole content");

@@ -268,39 +268,6 @@ pub fn resolve_plugin_path(name: &str) -> String {
     resolve_plugin_path_inner(name, std::env::current_exe().ok())
 }
 
-/// Whether the configured plugin can carry UDP through the SS tunnel.
-///
-/// Returns `false` when a TCP-only plugin is configured (e.g. plain
-/// v2ray-plugin). Returns `true` for plugins with UDP support (e.g.
-/// galoshes, which uses YAMUX multiplexing), and `true` when no plugin
-/// is configured (SS itself always supports UDP).
-///
-/// This is the bridge-internal name, plumbed into
-/// [`crate::endpoint::Socks5Endpoint::supports_udp`]. The cascade in
-/// [`crate::hole_router::HoleRouter::resolve_endpoint`] uses the
-/// capability to enforce hole's privacy invariant: UDP-via-Proxy flows
-/// are dropped, not cascaded to the clear-text bypass, when this
-/// returns `false`.
-///
-/// **Naming note.** The corresponding wire-protocol field
-/// [`hole_common::protocol::BridgeResponse::Status::udp_proxy_available`]
-/// keeps its historical name for API stability. This helper uses the
-/// more accurate internal name.
-// TODO(#414 plan 2): remove this helper once port-alloc also derives UDP
-// capability from reported transports. The UDP-drop policy no longer calls
-// it — `proxy_manager.rs` now reads `PluginChain::transports()` (the live
-// sitrep signal) instead. It survives because the underlying static
-// `PluginDescriptor.udp_supported` is still read at port-alloc time (via
-// `plugin::plugin_protocols`), and Plan 2 retires both together. (Currently
-// only `config_tests.rs` exercises this `pub` helper directly — kept `pub`
-// + re-exported, so no dead-code warning fires.)
-pub fn plugin_supports_udp(config: &ProxyConfig) -> bool {
-    match &config.server.plugin {
-        None => true,
-        Some(name) => plugin::lookup(name).is_some_and(|p| p.udp_supported),
-    }
-}
-
 /// Inner implementation that accepts an explicit exe path for testability.
 ///
 /// Looks for the plugin binary in the same directory as the bridge executable.
@@ -311,22 +278,27 @@ pub fn plugin_supports_udp(config: &ProxyConfig) -> bool {
 /// contains no path separators — PATH lookup can only find binaries in directories
 /// that an administrator placed on PATH (standard system-level trust model).
 pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
+    // Map the config token to its on-disk binary name. A known friendly
+    // name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`); an
+    // unknown name falls back to itself so arbitrary plugins are
+    // unaffected. See bindreams/hole#414.
+    let binary = plugin::lookup(name).map(|d| d.binary_name).unwrap_or(name);
     if let Some(exe) = bridge_exe {
         // Canonicalize to resolve symlinks — the bridge may be registered via symlink,
         // but the sibling plugin binary is next to the real binary.
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(dir) = exe.parent() {
-            let candidate = if cfg!(windows) && !name.ends_with(".exe") {
-                dir.join(format!("{name}.exe"))
+            let candidate = if cfg!(windows) && !binary.ends_with(".exe") {
+                dir.join(format!("{binary}.exe"))
             } else {
-                dir.join(name)
+                dir.join(binary)
             };
             if candidate.is_file() {
                 return candidate.to_string_lossy().to_string();
             }
         }
     }
-    name.to_string()
+    binary.to_string()
 }
 
 #[cfg(test)]

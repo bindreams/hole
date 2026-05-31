@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hole_common::plugin::plugin_protocols;
 use hole_common::port_alloc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -99,8 +98,9 @@ impl Drop for PluginChain {
 /// `plugin_name` selects the protocol set for the local port allocation
 /// — UDP-capable plugins (galoshes) need the port verified for both TCP
 /// and UDP so their internal dual bind on the local address can't hit
-/// the Windows cross-protocol excluded-port race. See
-/// [`hole_common::plugin::plugin_protocols`].
+/// the Windows cross-protocol excluded-port race. The config name is
+/// first resolved to its on-disk binary name, then mapped via
+/// [`hole_common::plugin::plugin_alloc_protocols`].
 ///
 /// Goes through [`port_alloc::bind_ephemeral`] for structural
 /// consistency with the other ephemeral-bind sites in the workspace.
@@ -138,7 +138,14 @@ pub async fn start_plugin_chain(
     // Per-plugin syntax differs; for plugins we don't have a known
     // directive for, the options pass through unchanged.
     let merged_opts = inject_plugin_debug_logging(plugin_name, plugin_opts);
-    let protocols = plugin_protocols(plugin_name);
+    // Resolve the config name to its on-disk binary name before sizing the
+    // handoff port — `plugin_alloc_protocols` is keyed by binary name so
+    // `v2ray-plugin` (→ `ex-ray`) and unknown plugins get a TCP-only port
+    // while galoshes gets a UDP-capable one (#414).
+    let binary = hole_common::plugin::lookup(plugin_name)
+        .map(|d| d.binary_name)
+        .unwrap_or(plugin_name);
+    let protocols = hole_common::plugin::plugin_alloc_protocols(binary);
 
     let (_port, (handle, cancel, ready_addr, transports)) =
         port_alloc::bind_ephemeral(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols, |port| {
@@ -425,15 +432,19 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
 ///
 /// Per-plugin syntax differs:
 ///
-/// - **`v2ray-plugin`**: appends `loglevel=debug` (semicolon-separated;
-///   v2ray-plugin honors the LAST occurrence of any duplicate key, so a
-///   user's earlier `loglevel=warning` still loses to our debug).
+/// - **`v2ray-plugin`** / **`ex-ray`**: appends `loglevel=debug`
+///   (semicolon-separated). Both honor the LAST occurrence of any
+///   duplicate key (same v2ray-core log config), so a user's earlier
+///   `loglevel=warning` still loses to our debug. The friendly wire name
+///   `v2ray-plugin` resolves to the first-party `ex-ray` binary
+///   (`hole_common::plugin`), but a config may also name `ex-ray`
+///   directly; this arm covers both spellings (#414).
 /// - Anything else: pass through unchanged. (`galoshes` is a Rust
 ///   `ChainPlugin` and not started via this binary path; future binary
 ///   plugins can be added here.)
 fn inject_plugin_debug_logging(plugin_name: &str, opts: Option<&str>) -> Option<String> {
     match plugin_name {
-        "v2ray-plugin" => Some(append_sip003_directive(opts, "loglevel=debug")),
+        "v2ray-plugin" | "ex-ray" => Some(append_sip003_directive(opts, "loglevel=debug")),
         _ => opts.map(String::from),
     }
 }
@@ -492,6 +503,48 @@ mod inject_tests {
     fn v2ray_plugin_empty_string_treated_as_no_opts() {
         assert_eq!(
             inject_plugin_debug_logging("v2ray-plugin", Some("")).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_no_opts_gets_loglevel_debug() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", None).as_deref(),
+            Some("loglevel=debug")
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_existing_opts_get_loglevel_appended() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("host=example.com;path=/foo")).as_deref(),
+            Some("host=example.com;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_user_loglevel_warning_overridden_by_appended_debug() {
+        // ex-ray uses the same v2ray-core log config: it honors the LAST
+        // occurrence; appended debug wins.
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("loglevel=warning;path=/foo")).as_deref(),
+            Some("loglevel=warning;path=/foo;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_trailing_semicolon_collapsed() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("host=example.com;")).as_deref(),
+            Some("host=example.com;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
+    fn ex_ray_empty_string_treated_as_no_opts() {
+        assert_eq!(
+            inject_plugin_debug_logging("ex-ray", Some("")).as_deref(),
             Some("loglevel=debug")
         );
     }

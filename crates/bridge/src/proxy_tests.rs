@@ -237,16 +237,48 @@ fn plugin_name_bare_name_accepted() {
 // Plugin path resolution tests ========================================================================================
 
 #[skuld::test]
-fn resolve_falls_back_to_bare_name_when_not_found() {
+fn resolve_falls_back_to_binary_name_when_not_found() {
+    // A known config name falls back to its `binary_name`, not the raw
+    // config token — `v2ray-plugin` → `ex-ray` (#414).
     let nonexistent = std::path::PathBuf::from("/nonexistent/dir/hole");
     let result = resolve_plugin_path_inner("v2ray-plugin", Some(nonexistent));
-    assert_eq!(result, "v2ray-plugin");
+    assert_eq!(result, "ex-ray");
 }
 
 #[skuld::test]
-fn resolve_falls_back_when_exe_unknown() {
+fn resolve_falls_back_to_binary_name_when_exe_unknown() {
     let result = resolve_plugin_path_inner("v2ray-plugin", None);
-    assert_eq!(result, "v2ray-plugin");
+    assert_eq!(result, "ex-ray");
+}
+
+#[skuld::test]
+fn resolve_unknown_name_falls_back_to_itself() {
+    // An unknown (non-bundled) plugin name is unaffected by binary_name
+    // resolution — it falls back to the bare name for a PATH lookup.
+    let result = resolve_plugin_path_inner("some-custom-plugin", None);
+    assert_eq!(result, "some-custom-plugin");
+}
+
+#[skuld::test]
+fn resolve_v2ray_plugin_name_finds_ex_ray_sibling() {
+    // The interop promise: a `plugin=v2ray-plugin` config resolves to a
+    // path ending in `ex-ray{.exe}`, NOT `v2ray-plugin.exe` (#414).
+    let dir = std::env::temp_dir().join(format!("hole-resolve-exray-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let binary_name = if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" };
+    let plugin_file = dir.join(binary_name);
+    std::fs::write(&plugin_file, b"fake").unwrap();
+
+    let fake_exe = dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
+    std::fs::write(&fake_exe, b"fake").unwrap();
+
+    let result = resolve_plugin_path_inner("v2ray-plugin", Some(fake_exe));
+
+    let canonical = std::fs::canonicalize(&plugin_file).unwrap();
+    assert_eq!(result, canonical.to_string_lossy());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[skuld::test]

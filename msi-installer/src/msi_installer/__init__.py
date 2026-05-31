@@ -1,6 +1,6 @@
 """Build the Hole Windows MSI installer.
 
-Prerequisites: Rust toolchain, Go toolchain (for v2ray-plugin).
+Prerequisites: Rust toolchain, Go toolchain (for ex-ray).
 WiX is downloaded automatically on first run.
 
 Usage: uv run --directory msi-installer build
@@ -54,7 +54,7 @@ def cargo_build(console: Console) -> None:
 def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     """Stage the runnable BINDIR via `cargo xtask stage`.
 
-    The canonical list of files (hole.exe + v2ray-plugin.exe + wintun.dll on
+    The canonical list of files (hole.exe + ex-ray.exe + wintun.dll on
     Windows) lives in `xtask/src/bindir.rs::bindir_files()`. dev.py and this
     function both call into the same xtask subcommand, so adding a new BINDIR
     file is a one-line change in xtask and both consumers pick it up

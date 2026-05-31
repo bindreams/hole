@@ -13,7 +13,7 @@ include_paths:
   # changes belong in garter release notes; galoshes consumers wanting
   # garter-library detail can read the garter release notes directly.
   - crates/galoshes/**
-  - external/v2ray-plugin/**
+  - crates/ex-ray/**
   - .github/workflows/draft-release-galoshes.yaml
   - .github/workflows/publish-release-galoshes.yaml
   - .github/release-galoshes.yaml

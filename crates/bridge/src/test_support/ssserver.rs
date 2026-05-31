@@ -114,11 +114,18 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
     spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts).await
 }
 
-/// Spin up a real shadowsocks server with v2ray-plugin (QUIC transport) in
-/// front. QUIC auto-enables TLS inside v2ray-plugin
-/// ([main.go:142](../../../external/v2ray-plugin/main.go)), so the cert+key
-/// pair must still be supplied. The plugin's public listen port is verified
-/// for `Protocols::UDP` because QUIC runs over UDP.
+/// Spin up a real shadowsocks server with a QUIC-transport plugin in front.
+/// QUIC auto-enables TLS in `generateConfig`
+/// ([crates/ex-ray/config.go:133](../../../ex-ray/config.go), the `case "quic"`
+/// arm sets `*tlsEnabled = true`), so the cert+key pair must still be supplied.
+/// The plugin's public listen port is verified for `Protocols::UDP` because
+/// QUIC runs over UDP.
+///
+/// Note: `ex-ray`'s standalone CLI rejects `mode=quic` at startup
+/// ([crates/ex-ray/main.go:200](../../../ex-ray/main.go)) — its v1 confirming
+/// probe is TCP-only. This helper is only ever fed the **galoshes** binary,
+/// which drives its embedded plugin for the QUIC wire transport, so the QUIC
+/// config path in `config.go` is what runs here, not the standalone CLI gate.
 pub(crate) async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,
@@ -180,35 +187,58 @@ async fn spawn_ss_with_plugin(
     (public_addr, handle)
 }
 
-/// Locate the cargo-built `v2ray-plugin` binary in the target directory.
-/// Respects `CARGO_TARGET_DIR`.
-pub(crate) fn locate_built_v2ray_plugin() -> PathBuf {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    let bin = if cfg!(windows) {
-        "v2ray-plugin.exe"
-    } else {
-        "v2ray-plugin"
-    };
-    target_dir.join(profile).join(bin)
+/// Workspace root, derived from this crate's `CARGO_MANIFEST_DIR`
+/// (`<root>/crates/bridge`). The locators below all hang off it.
+fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Locate the ex-ray binary built by `cargo xtask ex-ray`.
+///
+/// ex-ray is the first-party v2ray-core shim that replaced the vendored
+/// v2ray-plugin (#414). It is built into `<repo>/.cache/ex-ray/` under a
+/// host-triple filename; the path is derived from
+/// [`xtask::ex_ray::output_name`] so the test and the build orchestrator stay
+/// in lock-step (a triple-map drift breaks compilation, not a silent
+/// wrong-path lookup).
+///
+/// The friendly wire name `v2ray-plugin` resolves to this binary via
+/// `hole_common::plugin`, so this is the binary the runner's `entry.plugin =
+/// "v2ray-plugin"` (or `"ex-ray"`) path spawns once it's handed
+/// `plugin_path_override`.
+pub(crate) fn locate_ex_ray() -> PathBuf {
+    workspace_root()
+        .join(".cache")
+        .join("ex-ray")
+        .join(xtask::ex_ray::output_name())
+}
+
+/// Locate the pinned upstream shadowsocks/v2ray-plugin binary provisioned by
+/// `cargo xtask provision-upstream-v2ray`.
+///
+/// Lives at `<repo>/.cache/upstream-v2ray-plugin/<PINNED_COMMIT>/`. The path
+/// (commit + host-triple filename) comes from
+/// [`xtask::upstream_v2ray::cached_binary_path`], so the single source of
+/// truth for the pinned commit is the xtask module — the test never hardcodes
+/// it. Used by the cross-implementation interop test to prove ex-ray is
+/// wire-compatible with genuine upstream v2ray-plugin in both directions.
+pub(crate) fn locate_upstream_v2ray() -> PathBuf {
+    xtask::upstream_v2ray::cached_binary_path(&workspace_root())
 }
 
 /// Locate the galoshes binary built by `cargo xtask galoshes`.
 ///
-/// Galoshes is built inside the galoshes subrepo's own target directory,
-/// always in release mode (it embeds v2ray-plugin at compile time).
+/// Post-monorepo-merge galoshes is a regular workspace member
+/// (`crates/galoshes/`) built into `<repo>/target/release/galoshes{.exe}` by
+/// [`xtask::galoshes::build`] (always release — it embeds ex-ray at compile
+/// time). Repointed from the stale `external/galoshes/target/release/` path
+/// in #414.
 pub(crate) fn locate_built_galoshes() -> PathBuf {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
     let bin = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
-    workspace_root
-        .join("external")
-        .join("galoshes")
-        .join("target")
-        .join("release")
-        .join(bin)
+    workspace_root().join("target").join("release").join(bin)
 }

@@ -18,7 +18,8 @@
 //! * [`crate::dns::server::LocalDnsServer::bind`][0] (via hole-bridge) —
 //!   UDP+TCP on the same ephemeral loopback port.
 //! * `proxy::plugin::start_plugin_chain` — SIP003 plugin port (TCP or
-//!   TCP+UDP depending on plugin's `udp_supported` bit).
+//!   TCP+UDP depending on the plugin binary's
+//!   [`plugin_alloc_protocols`][crate::plugin::plugin_alloc_protocols]).
 //! * `test_support::ssserver::start_real_ss_server*` — in-process
 //!   shadowsocks server fixtures.
 //!

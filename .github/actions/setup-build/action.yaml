@@ -40,6 +40,6 @@ runs:
 
     - uses: mozilla-actions/sccache-action@v0.0.10
 
-    - name: Fetch runtime deps (v2ray-plugin, wintun)
+    - name: Fetch runtime deps (ex-ray, wintun)
       shell: bash
       run: cargo xtask deps

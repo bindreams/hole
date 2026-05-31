@@ -28,7 +28,7 @@
       "signingIdentity": "-"
     },
     "externalBin": [
-      ".cache/v2ray-plugin/v2ray-plugin"
+      ".cache/ex-ray/ex-ray"
     ],
     "icon": [
       ".cache/icons/32x32.png",

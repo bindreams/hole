@@ -1,6 +1,6 @@
 # Hole
 
-Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin support for macOS and Windows.
+Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin support (via the bundled first-party `ex-ray` binary) for macOS and Windows.
 
 ## Features
 
@@ -9,7 +9,7 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 - **DNS leak prevention** — all DNS traffic routed through the tunnel
 - **System tray** — Enable/Disable, Start at Login, Settings, Exit
 - **Server import** — import from shadowsocks client config files (single and multi-server)
-- **v2ray-plugin** support (built from source)
+- **v2ray-plugin** support — the v2ray-plugin wire protocol, served by the bundled first-party `ex-ray` binary (built from Go source)
 - **Logging** with daily rotation
 
 ## Architecture
@@ -37,7 +37,7 @@ ID + notarization is in place (#365).
 Prerequisites: Rust toolchain, Go toolchain, Node.js (for Tauri CLI and E2E tests).
 
 ```sh
-# One-time fetch of runtime deps (builds v2ray-plugin from Go source,
+# One-time fetch of runtime deps (builds ex-ray from Go source,
 # downloads + verifies wintun.dll on Windows). Cached after the first run.
 cargo xtask deps
 
@@ -61,11 +61,11 @@ crates/
   hole/      hole        — Tauri app + CLI + bridge entry point (binary name: "hole")
   garter/    garter      — SIP003u plugin-chain runner library (Apache-2.0, on crates.io)
   garter-bin/ garter-bin — `garter` CLI binary for plugin developers (Apache-2.0)
-  galoshes/  galoshes    — bundled+standalone SIP003u plugin (yamux + v2ray-plugin) (Apache-2.0)
+  galoshes/  galoshes    — bundled+standalone SIP003u plugin (yamux + embedded ex-ray) (Apache-2.0)
+  ex-ray/    ex-ray      — first-party Go SIP003u plugin on v2ray-core, wire-compatible with v2ray-plugin (Apache-2.0)
+  mock-plugin/ mock-plugin — minimal SIP003u echo plugin for garter tests (Apache-2.0)
 xtask/      workspace task runner (`cargo xtask <stage|deps|version|...>`)
 xtask-lib/  shared helper crate used by xtask AND crates/hole/build.rs
-external/
-  v2ray-plugin/  v2ray-plugin source (git-subrepo of shadowsocks/v2ray-plugin)
 msi-installer/  WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 ui/             Frontend HTML/CSS/JS
 scripts/        Utility scripts
@@ -88,9 +88,10 @@ Four independent release tracks, each tagged as
   [crates.io/crates/garter](https://crates.io/crates/garter), plus
   `garter` CLI binaries via GitHub release for plugin developers.
   Apache-2.0.
-- **`v2ray-plugin`** — Hole-patched v2ray-plugin builds matching
-  shadowsocks/v2ray-plugin upstream's release-asset shape, for users
-  who want our security patches on a non-Hole shadowsocks deployment.
+- **`ex-ray`** — first-party SIP003u plugin built on v2ray-core,
+  wire-compatible with shadowsocks/v2ray-plugin. 6-platform binaries for
+  users who want to pair it with a non-Hole shadowsocks deployment.
+  Apache-2.0.
 
 ## Testing
 

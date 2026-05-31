@@ -1,20 +1,22 @@
-#![cfg_attr(v2ray_plugin_missing, allow(dead_code, unused_imports))]
+#![cfg_attr(ex_ray_missing, allow(dead_code, unused_imports))]
 
 use galoshes::sitrep_out::{chain_result_to_event, emit};
-use garter::{BinaryPlugin, ChainReady, ChainRunner, Mode, PluginEnv, SitrepEvent, StartError, SITREP_PROTOCOL};
+use garter::{
+    BinaryPlugin, ChainReady, ChainRunner, Mode, PluginEnv, ReadinessMode, SitrepEvent, StartError, SITREP_PROTOCOL,
+};
 
-#[cfg(not(v2ray_plugin_missing))]
-const V2RAY_BYTES: &[u8] = include_bytes!(env!("V2RAY_PLUGIN_PATH"));
-#[cfg(v2ray_plugin_missing)]
-const V2RAY_BYTES: &[u8] = b"";
+#[cfg(not(ex_ray_missing))]
+const EX_RAY_BYTES: &[u8] = include_bytes!(env!("EX_RAY_PATH"));
+#[cfg(ex_ray_missing)]
+const EX_RAY_BYTES: &[u8] = b"";
 
-#[cfg(v2ray_plugin_missing)]
+#[cfg(ex_ray_missing)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    anyhow::bail!("galoshes was compiled without v2ray-plugin. Run `cargo xtask v2ray-plugin` and rebuild.");
+    anyhow::bail!("galoshes was compiled without ex-ray. Run `cargo xtask ex-ray` and rebuild.");
 }
 
-#[cfg(not(v2ray_plugin_missing))]
+#[cfg(not(ex_ray_missing))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Sanctioned production caller of `fmt::SubscriberBuilder::init`;
@@ -41,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Parse SHA256 from build-time env
     let sha256 = {
-        let hex = env!("V2RAY_SHA256");
+        let hex = env!("EX_RAY_SHA256");
         let mut bytes = [0u8; 32];
         for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
             bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
@@ -49,24 +51,25 @@ async fn main() -> anyhow::Result<()> {
         bytes
     };
 
-    let v2ray_binary = galoshes::embedded::EmbeddedBinary {
-        name: "v2ray-plugin",
-        data: V2RAY_BYTES,
+    let ex_ray_binary = galoshes::embedded::EmbeddedBinary {
+        name: "ex-ray",
+        data: EX_RAY_BYTES,
         sha256,
     };
 
-    let verified = v2ray_binary.prepare()?;
+    let verified = ex_ray_binary.prepare()?;
 
     let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
     // Parse the galoshes-specific client UDP NAT idle-eviction timeout from the
     // shared options string before any I/O so a misconfiguration fails loudly
-    // at startup. v2ray-plugin ignores this key (it only reads keys it knows).
+    // at startup. ex-ray ignores unrecognized keys (it only reads keys it knows).
     let udp_timeout = galoshes::yamux::parse_udp_timeout(env.plugin_options.as_deref())?;
     let yamux_plugin = galoshes::yamux::YamuxPlugin::new(mode == Mode::Server, udp_timeout);
-    let v2ray_plugin = BinaryPlugin::new(verified.exec_path(), env.plugin_options.as_deref());
+    let ex_ray_plugin =
+        BinaryPlugin::new(verified.exec_path(), env.plugin_options.as_deref()).readiness(ReadinessMode::ExpectSitrep);
 
     // Bridge-facing readiness: galoshes' OWN ChainRunner aggregates the
-    // per-plugin readiness of [yamux, v2ray] and fires this channel with
+    // per-plugin readiness of [yamux, ex-ray] and fires this channel with
     // the chain-level outcome. We map that to a PROCESS-stdout sitrep event
     // (overriding the inner-chain transport intersection with galoshes'
     // true TCP|UDP capability — see `sitrep_out`) so the bridge sees a
@@ -88,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         .mode(mode)
         .on_ready(ready_tx)
         .add(Box::new(yamux_plugin))
-        .add(Box::new(v2ray_plugin));
+        .add(Box::new(ex_ray_plugin));
 
     // `verified` must remain alive here -- its open handle prevents TOCTOU
     // attacks on the extracted binary. It is dropped after `run()` returns.

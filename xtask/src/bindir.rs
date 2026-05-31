@@ -103,18 +103,18 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
         files.push(BindirFile::directory(dsym_src, "hole.dSYM".to_string()));
     }
 
-    // 2. v2ray-plugin sidecar. Built by `cargo xtask v2ray-plugin` into
-    //    `.cache/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}`. The
+    // 2. ex-ray sidecar. Built by `cargo xtask ex-ray` into
+    //    `.cache/ex-ray/ex-ray-<target-triple>{.exe}`. The
     //    target-triple varies (`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
     //    etc.) so we glob and assert exactly one match.
-    let v2ray_glob_pattern = if cfg!(windows) {
-        ".cache/v2ray-plugin/v2ray-plugin-*.exe"
+    let ex_ray_glob_pattern = if cfg!(windows) {
+        ".cache/ex-ray/ex-ray-*.exe"
     } else {
-        ".cache/v2ray-plugin/v2ray-plugin-*"
+        ".cache/ex-ray/ex-ray-*"
     };
-    let v2ray_src = unique_glob_match(repo_root, v2ray_glob_pattern)?;
-    let v2ray_dest = format!("v2ray-plugin{exe_suffix}");
-    files.push(BindirFile::new(v2ray_src, v2ray_dest));
+    let ex_ray_src = unique_glob_match(repo_root, ex_ray_glob_pattern)?;
+    let ex_ray_dest = format!("ex-ray{exe_suffix}");
+    files.push(BindirFile::new(ex_ray_src, ex_ray_dest));
 
     // 3. galoshes sidecar. Built by `cargo xtask galoshes` into
     //    `target/release/galoshes{.exe}` (the unified workspace target dir

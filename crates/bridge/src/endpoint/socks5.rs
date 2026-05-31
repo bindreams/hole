@@ -25,8 +25,9 @@ pub struct Socks5Endpoint {
     plugin_name: Option<String>,
     /// Whether the SS↔server chain can carry UDP. Not a property of
     /// SOCKS5 itself (SOCKS5 always supports UDP via ASSOCIATE) — this
-    /// reflects the plugin's capability, plumbed from
-    /// [`crate::proxy::config::plugin_supports_udp`].
+    /// reflects the plugin chain's reported capability, derived from the
+    /// live sitrep `transports` via `udp_available_from_chain` in
+    /// `proxy_manager.rs` (#414).
     udp_supported: bool,
     /// Static label for [`Endpoint::name`].
     label: String,

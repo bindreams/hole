@@ -24,7 +24,7 @@ import { showToast } from "./toast";
 import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./types";
 
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
-/// after a JSON import). 50 concurrent v2ray-plugin processes is non-trivial
+/// after a JSON import). 50 concurrent plugin processes is non-trivial
 /// RAM and looks like a port scan from one IP to commercial SS providers.
 export const TEST_CONCURRENCY = 5;
 

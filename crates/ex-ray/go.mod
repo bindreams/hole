@@ -1,4 +1,4 @@
-module github.com/shadowsocks/v2ray-plugin
+module github.com/bindreams/hole/ex-ray
 
 go 1.25.5
 

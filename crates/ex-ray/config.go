@@ -4,14 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"os/user"
-	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/proto" //nolint:staticcheck // SA1019: derived verbatim from upstream v2ray-plugin, which still uses the v1 proto package; `transportSettings proto.Message` is only handed to v2ray-core's serial.ToTypedMessage. Migrating to google.golang.org/protobuf/proto would drop a direct go.mod dependency, out of scope for the quality-gate task.
 	"google.golang.org/protobuf/types/known/anypb"
 
 	_ "github.com/v2fly/v2ray-core/v5/app/proxyman/inbound"
@@ -36,8 +33,6 @@ import (
 )
 
 var (
-	VERSION = "custom"
-
 	vpn        = flag.Bool("V", false, "Run in VPN mode.")
 	fastOpen   = flag.Bool("fast-open", false, "Enable TCP fast open.")
 	localAddr  = flag.String("localAddr", "127.0.0.1", "local address to listen on.")
@@ -54,7 +49,7 @@ var (
 	mux        = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
 	server     = flag.Bool("server", false, "Run in server mode")
 	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
-	version    = flag.Bool("version", false, "Show current version of v2ray-plugin")
+	version    = flag.Bool("version", false, "Show current version of ex-ray")
 	fwmark     = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
 )
 
@@ -233,177 +228,27 @@ func generateConfig() (*core.Config, error) {
 			}},
 			App: apps,
 		}, nil
-	} else {
-		senderConfig := proxyman.SenderConfig{StreamSettings: &streamConfig}
-		if connectionReuse {
-			senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: uint32(*mux)}
-		}
-		return &core.Config{
-			Inbound: []*core.InboundHandlerConfig{{
-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(lport),
-					Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
-				}),
-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(net.LocalHostIP),
-					Networks: []net.Network{net.Network_TCP},
-				}),
-			}},
-			Outbound: []*core.OutboundHandlerConfig{{
-				SenderSettings: serial.ToTypedMessage(&senderConfig),
-				ProxySettings:  outboundProxy,
-			}},
-			App: apps,
-		}, nil
-	}
-}
-
-func startV2Ray() (core.Server, error) {
-
-	opts, err := parseEnv()
-
-	if err == nil {
-		if c, b := opts.Get("mode"); b {
-			*mode = c
-		}
-		if c, b := opts.Get("mux"); b {
-			if i, err := strconv.Atoi(c); err == nil {
-				*mux = i
-			} else {
-				logWarn("failed to parse mux, use default value")
-			}
-		}
-		if _, b := opts.Get("tls"); b {
-			*tlsEnabled = true
-		}
-		if c, b := opts.Get("host"); b {
-			*host = c
-		}
-		if c, b := opts.Get("path"); b {
-			*path = c
-		}
-		if c, b := opts.Get("cert"); b {
-			*cert = c
-		}
-		if c, b := opts.Get("certRaw"); b {
-			*certRaw = c
-		}
-		if c, b := opts.Get("key"); b {
-			*key = c
-		}
-		if c, b := opts.Get("loglevel"); b {
-			*logLevel = c
-		}
-		if _, b := opts.Get("server"); b {
-			*server = true
-		}
-		if c, b := opts.Get("localAddr"); b {
-			if *server {
-				*remoteAddr = c
-			} else {
-				*localAddr = c
-			}
-		}
-		if c, b := opts.Get("localPort"); b {
-			if *server {
-				*remotePort = c
-			} else {
-				*localPort = c
-			}
-		}
-		if c, b := opts.Get("remoteAddr"); b {
-			if *server {
-				*localAddr = c
-			} else {
-				*remoteAddr = c
-			}
-		}
-		if c, b := opts.Get("remotePort"); b {
-			if *server {
-				*localPort = c
-			} else {
-				*remotePort = c
-			}
-		}
-
-		if _, b := opts.Get("fastOpen"); b {
-			*fastOpen = true
-		}
-
-		if _, b := opts.Get("__android_vpn"); b {
-			*vpn = true
-		}
-
-		if c, b := opts.Get("fwmark"); b {
-			if i, err := strconv.Atoi(c); err == nil {
-				*fwmark = i
-			} else {
-				logWarn("failed to parse fwmark, use default value")
-			}
-		}
-
-		if *vpn {
-			registerControlFunc()
-		}
 	}
 
-	config, err := generateConfig()
-	if err != nil {
-		return nil, newError("failed to parse config").Base(err)
+	senderConfig := proxyman.SenderConfig{StreamSettings: &streamConfig}
+	if connectionReuse {
+		senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: uint32(*mux)}
 	}
-	instance, err := core.New(config)
-	if err != nil {
-		return nil, newError("failed to create v2ray instance").Base(err)
-	}
-	return instance, nil
-}
-
-func printCoreVersion() {
-	version := core.VersionStatement()
-	for _, s := range version {
-		logInfo(s)
-	}
-}
-
-func printVersion() {
-	fmt.Println("v2ray-plugin", VERSION)
-	fmt.Println("Go version", runtime.Version())
-	fmt.Println("Yet another SIP003 plugin for shadowsocks")
-}
-
-func main() {
-	flag.Parse()
-
-	if *version {
-		printVersion()
-		return
-	}
-
-	logInit()
-
-	printCoreVersion()
-
-	server, err := startV2Ray()
-	if err != nil {
-		logFatal(err.Error())
-		// Configuration error. Exit with a special value to prevent systemd from restarting.
-		os.Exit(23)
-	}
-	if err := server.Start(); err != nil {
-		logFatal("failed to start server:", err.Error())
-		os.Exit(1)
-	}
-
-	defer func() {
-		err := server.Close()
-		if err != nil {
-			logWarn(err.Error())
-		}
-	}()
-
-	{
-		osSignals := make(chan os.Signal, 1)
-		signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM)
-		<-osSignals
-	}
+	return &core.Config{
+		Inbound: []*core.InboundHandlerConfig{{
+			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+				PortRange: net.SinglePortRange(lport),
+				Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+			}),
+			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+				Address:  net.NewIPOrDomain(net.LocalHostIP),
+				Networks: []net.Network{net.Network_TCP},
+			}),
+		}},
+		Outbound: []*core.OutboundHandlerConfig{{
+			SenderSettings: serial.ToTypedMessage(&senderConfig),
+			ProxySettings:  outboundProxy,
+		}},
+		App: apps,
+	}, nil
 }

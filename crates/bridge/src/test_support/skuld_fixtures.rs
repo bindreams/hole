@@ -1,11 +1,11 @@
 //! Process-scoped skuld fixtures wrapping the in-process shadowsocks +
-//! v2ray-plugin helpers from [`super::ssserver`] and the HTTP sentinel from
+//! plugin helpers from [`super::ssserver`] and the HTTP sentinel from
 //! [`super::http_target`].
 //!
 //! ## Why process scope?
 //!
 //! Each fixture spins up a real `shadowsocks_service::server::Server` and,
-//! for the plugin variants, also a v2ray-plugin subprocess. Setup cost
+//! for the plugin variants, also a plugin subprocess. Setup cost
 //! dominates wall time. Process scope means each fixture is built at most
 //! once per test binary, shared across all tests that request it.
 //!
@@ -170,7 +170,7 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
 }
 
 /// Shadowsocks server fronted by galoshes (QUIC transport). QUIC
-/// auto-enables TLS inside the wrapped v2ray-plugin so the cert+key pair is required.
+/// auto-enables TLS inside the wrapped ex-ray so the cert+key pair is required.
 #[skuld::fixture(scope = process, serial = PORT_ALLOC)]
 pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();

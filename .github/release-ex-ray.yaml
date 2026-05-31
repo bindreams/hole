@@ -1,0 +1,26 @@
+# Per-track release notes config for the `ex-ray` release group.
+# Consumed by scripts/generate-release-notes.py at release time.
+#
+# See CONTRIBUTING.md "Commit messages — Conventional Commits".
+
+initial_release: |
+  Initial release of `ex-ray` as a standalone Hole-published track.
+  ex-ray is the first-party v2ray-core SIP003 shim (#414). It ships
+  the same six-platform matrix as galoshes and garter.
+
+include_paths:
+  - crates/ex-ray/**
+  - .github/workflows/draft-release-ex-ray.yaml
+  - .github/workflows/publish-release-ex-ray.yaml
+  - .github/release-ex-ray.yaml
+  # Workspace-engineering files affect every release track. See #312.
+  - xtask/**
+  - xtask-lib/**
+  - scripts/generate-release-notes.py
+  - Cargo.toml
+  - Cargo.lock
+  - build.yaml
+  - prek.toml
+  - clippy.toml
+
+# Categories live in .github/release-categories.yaml (shared across all four tracks).

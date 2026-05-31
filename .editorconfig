@@ -10,6 +10,11 @@ charset = utf-8
 indent_style = space
 indent_size = 4
 
+# gofmt/gofumpt indent with tabs. golangci-lint's formatters are authoritative
+# for Go (so editorconfig-checker excludes Go in prek.toml).
+[*.go]
+indent_style = tab
+
 [*.{yaml,yml,toml,json}]
 indent_style = space
 indent_size = 2

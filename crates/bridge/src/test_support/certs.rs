@@ -5,21 +5,27 @@
 //! single ECDSA-P256 cert in a process-scoped tempdir and reference it from
 //! both ends.
 //!
+//! These constraints are dictated by the wire protocol, which is served by
+//! the first-party `ex-ray` binary ([crates/ex-ray/config.go]) that replaced
+//! the vendored `external/v2ray-plugin` (#414).
+//!
 //! ## Cert constraints
 //!
-//! Three things must be true or v2ray-plugin's TLS handshake fails:
+//! Three things must be true or the TLS handshake fails:
 //!
 //! 1. **SAN `DNS:cloudfront.com`** — Go's `crypto/tls` rejects CN-only certs
 //!    since Go 1.15. `rcgen::CertificateParams::new(vec!["cloudfront.com"])`
 //!    populates the Subject Alternative Name correctly by default.
-//! 2. **`is_ca = Ca(Unconstrained)`** — v2ray-plugin's client mode uses
+//! 2. **`is_ca = Ca(Unconstrained)`** — client mode uses
 //!    `Usage: Certificate_AUTHORITY_VERIFY` on the provided cert
-//!    ([external/v2ray-plugin/main.go:187](../../../external/v2ray-plugin/main.go)),
-//!    treating it as a trust anchor. For a self-signed leaf to verify
-//!    against itself as a trust anchor, it must be marked as a CA.
-//! 3. **`host=cloudfront.com`** plugin_opt on both client and server. v2ray-plugin
-//!    uses this as `tls.Config{ServerName: *host}`. Mismatch between client
-//!    SNI and server cert SAN = handshake failure.
+//!    ([crates/ex-ray/config.go:182](../../../ex-ray/config.go), the
+//!    `!*server` branch of `generateConfig`), treating it as a trust anchor.
+//!    For a self-signed leaf to verify against itself as a trust anchor, it
+//!    must be marked as a CA.
+//! 3. **`host=cloudfront.com`** plugin_opt on both client and server. The
+//!    plugin uses this as `tls.Config{ServerName: *host}`
+//!    ([crates/ex-ray/config.go:161](../../../ex-ray/config.go)). Mismatch
+//!    between client SNI and server cert SAN = handshake failure.
 
 use std::path::PathBuf;
 
@@ -47,12 +53,13 @@ impl TestCerts {
 
 /// Render a path for embedding in a SIP003 `plugin_opts` string.
 ///
-/// v2ray-plugin's args parser treats backslashes as escape characters
-/// (`\X` is unescaped to `X`), which mangles Windows paths like
+/// ex-ray's args parser treats backslashes as escape characters
+/// ([crates/ex-ray/args.go](../../../ex-ray/args.go) `indexUnescaped`: `\X` is
+/// unescaped to `X`), which mangles Windows paths like
 /// `C:\Users\foo\AppData\...` into `C:UsersfooAppData...`. Workarounds:
 ///
 /// 1. Replace backslashes with forward slashes — Windows accepts forward
-///    slashes in file paths and v2ray-plugin's underlying `os.Open` does
+///    slashes in file paths and the plugin's underlying `os.Open` does
 ///    too.
 /// 2. Or double the backslashes (`\\`) in the plugin_opts string.
 ///
@@ -72,8 +79,8 @@ pub(crate) fn generate_test_certs() -> TestCerts {
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     // Explicit key usages: CA needs KeyCertSign + DigitalSignature; the
     // same cert is also presented as the server's leaf, so it needs
-    // ServerAuth EKU. Without these, Go's crypto/x509 (v2ray-plugin's
-    // verifier) rejects the cert during chain validation.
+    // ServerAuth EKU. Without these, Go's crypto/x509 (ex-ray's
+    // verifier, via v2ray-core) rejects the cert during chain validation.
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyCertSign,

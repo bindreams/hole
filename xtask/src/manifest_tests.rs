@@ -570,7 +570,7 @@ fn production_build_yaml_parses() {
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
     // Sanity: a few targets we always expect to exist.
     for name in [
-        "v2ray-plugin",
+        "ex-ray",
         "galoshes",
         "hole",
         "hole-msi",

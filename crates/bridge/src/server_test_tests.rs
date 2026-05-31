@@ -14,7 +14,7 @@ use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
 use crate::test_support::ssserver::{
-    locate_built_v2ray_plugin, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
+    locate_ex_ray, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
     TEST_PASSWORD,
 };
 use hole_common::config::ServerEntry;
@@ -374,15 +374,16 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 
 /// Test 10: end-to-end happy path through v2ray-plugin (websocket, no TLS).
 ///
-/// Spins up a real shadowsocks server with a server-mode v2ray-plugin in
-/// front, then runs the test runner with `entry.plugin = "v2ray-plugin"`.
-/// The runner spawns its own client-mode v2ray-plugin via [`Plugin::start`],
-/// which talks WS to the server-mode instance, which forwards to the SS
-/// server, which forwards to the fake sentinel. End-to-end success →
+/// Spins up a real shadowsocks server with a server-mode ex-ray (the binary
+/// the friendly `v2ray-plugin` wire name resolves to, #414) in front, then
+/// runs the test runner with `entry.plugin = "v2ray-plugin"`. The runner
+/// spawns its own client-mode ex-ray via [`Plugin::start`], which talks WS
+/// to the server-mode instance, which forwards to the SS server, which
+/// forwards to the fake sentinel. End-to-end success →
 /// [`ServerTestOutcome::Reachable`].
 ///
-/// **Skip-on-missing rule**: if the v2ray-plugin binary is not built, the
-/// test panics with a clear instruction. Per CLAUDE.md: fail loudly, never
+/// **Skip-on-missing rule**: if the ex-ray binary is not built, the test
+/// panics with a clear instruction. Per CLAUDE.md: fail loudly, never
 /// silently skip on missing dependencies.
 ///
 /// `labels = [PORT_ALLOC]` + `serial = PORT_ALLOC`: this test has the same
@@ -392,12 +393,9 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
 /// skuld coordination's `can_start` check.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_with_v2ray_plugin_happy_path() {
-    let plugin_path = locate_built_v2ray_plugin();
+    let plugin_path = locate_ex_ray();
     if !plugin_path.is_file() {
-        panic!(
-            "v2ray-plugin not built at {plugin_path:?} — \
-             run 'cargo build --workspace --no-default-features' before 'cargo test'"
-        );
+        panic!("ex-ray not built at {plugin_path:?} — run 'cargo xtask ex-ray' before 'cargo test'");
     }
 
     rt().block_on(async {

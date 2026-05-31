@@ -68,7 +68,7 @@ fn group_parse_known() {
     assert_eq!(Group::parse("hole").unwrap(), Group::Hole);
     assert_eq!(Group::parse("garter").unwrap(), Group::Garter);
     assert_eq!(Group::parse("galoshes").unwrap(), Group::Galoshes);
-    assert_eq!(Group::parse("v2ray-plugin").unwrap(), Group::V2rayPlugin);
+    assert_eq!(Group::parse("ex-ray").unwrap(), Group::ExRay);
 }
 
 #[skuld::test]
@@ -86,7 +86,7 @@ fn group_tag_glob() {
 #[skuld::test]
 fn group_tag_prefix() {
     assert_eq!(Group::Hole.tag_prefix(), "releases/hole/v");
-    assert_eq!(Group::V2rayPlugin.tag_prefix(), "releases/v2ray-plugin/v");
+    assert_eq!(Group::ExRay.tag_prefix(), "releases/ex-ray/v");
 }
 
 #[skuld::test]
@@ -250,11 +250,10 @@ members = ["a", "b"]
     assert!(format!("{err:#}").contains("inconsistent"));
 }
 
-// The two v2ray-plugin-specific tests that used to live here
-// (workspace_versions_v2ray_plugin_from_external_file,
-// workspace_versions_v2ray_plugin_rejects_pre_release) moved to
-// v2ray_plugin_version_tests.rs alongside the dedicated module, since
-// read_workspace_versions no longer populates Group::V2rayPlugin.
+// The `ex-ray` group has no Cargo.toml workspace member, so
+// read_workspace_versions never populates Group::ExRay — its version is
+// read from `crates/ex-ray/version.toml` and validated in
+// ex_ray_version_tests.rs alongside the dedicated module.
 
 #[skuld::test]
 fn workspace_versions_unknown_group_rejected() {

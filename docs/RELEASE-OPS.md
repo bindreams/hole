@@ -108,6 +108,6 @@ CLAUDE.md notes galoshes is "shipped alongside hole.exe AND released standalone.
 1. Roll back the **standalone** galoshes release using the procedure above (so server operators don't deploy it fresh).
 1. Roll back the **bundled** copy by cutting a new hole release with a fixed galoshes. The bundled bytes are baked into the MSI/DMG — patching galoshes alone does not retroactively fix already-installed hole.
 
-### v2ray-plugin lineage rollback
+### ex-ray rollback
 
-The v2ray-plugin track uses `X.Y.Z-hole.N` lineage versioning (per CLAUDE.md). The "no-gaps" sequence validator in [`xtask-lib/src/v2ray_plugin_version.rs`](../xtask-lib/src/v2ray_plugin_version.rs) rejects skipped N values. After rolling back `1.3.3-hole.1`, the next attempt must be `1.3.3-hole.2` (the rollback removed the tag; the validator looks at tag history not release history, so the gap is invisible to it).
+The `ex-ray` track uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking — it replaced the retired vendored `v2ray-plugin` track in #414). Its version lives in [`crates/ex-ray/version.toml`](../crates/ex-ray/version.toml) and is validated by [`xtask-lib/src/ex_ray_version.rs`](../xtask-lib/src/ex_ray_version.rs). Rollback follows the standard non-crates.io track procedure (delete the tag + release; re-cut against a patched commit) — there is no `-hole.N` lineage sequence to keep gap-free. Because galoshes embeds ex-ray and hole bundles galoshes, a defective ex-ray that has already shipped inside a hole release also requires the bundled-galoshes rollback above (re-cut hole with a fixed galoshes that embeds the fixed ex-ray).

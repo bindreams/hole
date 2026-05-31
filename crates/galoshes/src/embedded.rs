@@ -225,7 +225,7 @@ fn check_dir_executable(dir: &Path) -> Result<()> {
     if is_noexec_mount(dir)? {
         bail!(
             "runtime directory {} is mounted noexec; galoshes cannot exec the embedded \
-             v2ray-plugin from this location. Set XDG_RUNTIME_DIR to a directory on an \
+             ex-ray plugin from this location. Set XDG_RUNTIME_DIR to a directory on an \
              exec-capable mount, or remount this filesystem with the exec option.",
             dir.display(),
         );

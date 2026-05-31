@@ -1,7 +1,7 @@
 //! Shared test fixtures for bridge integration tests.
 //!
 //! Spawns real in-process shadowsocks servers (via `shadowsocks-service`'s
-//! `server` feature, already a dev-dep) and optional v2ray-plugin
+//! `server` feature, already a dev-dep) and optional plugin
 //! subprocesses, with variants for each supported transport. Consumed by
 //! `*_tests.rs` files across the crate.
 //!

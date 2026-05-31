@@ -67,7 +67,7 @@ pub struct UpdateInfo {
 const REPO: &str = "bindreams/hole";
 
 /// Tag-name prefix for hole's release track. Per the four-track release
-/// model (#291), other products (`galoshes`, `garter`, `v2ray-plugin`)
+/// model (#291), other products (`galoshes`, `garter`, `ex-ray`)
 /// use their own `releases/<product>/v...` prefixes and must be ignored
 /// by the hole auto-updater.
 const HOLE_TAG_PREFIX: &str = "releases/hole/v";

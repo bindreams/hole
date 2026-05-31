@@ -10,7 +10,7 @@
 //!    after; runs do not depend on other runs).
 //!
 //! Pure orchestration only — no incremental / up-to-date checks. The leaf
-//! commands (`cargo build`, `cargo xtask v2ray-plugin`, etc.) own that.
+//! commands (`cargo build`, `cargo xtask ex-ray`, etc.) own that.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

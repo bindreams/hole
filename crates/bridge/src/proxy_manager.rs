@@ -556,7 +556,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         //   0. (above) plugin_chain spawn  — plugin subprocess is alive
         //      from this point. NOT a system-state mutation (the chain
         //      Drop SIGTERMs it on unwind) but the user sees the
-        //      v2ray-plugin process briefly.
+        //      plugin process briefly.
         //   1. proxy.start  — binds local SS listener
         //   2. build_local_dns  — binds loopback DNS server (Err on no
         //      listen capacity, or on degenerate dns.enabled + empty
