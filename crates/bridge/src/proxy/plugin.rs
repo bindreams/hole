@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hole_common::plugin::plugin_protocols;
 use hole_common::port_alloc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -99,8 +98,9 @@ impl Drop for PluginChain {
 /// `plugin_name` selects the protocol set for the local port allocation
 /// — UDP-capable plugins (galoshes) need the port verified for both TCP
 /// and UDP so their internal dual bind on the local address can't hit
-/// the Windows cross-protocol excluded-port race. See
-/// [`hole_common::plugin::plugin_protocols`].
+/// the Windows cross-protocol excluded-port race. The config name is
+/// first resolved to its on-disk binary name, then mapped via
+/// [`hole_common::plugin::plugin_alloc_protocols`].
 ///
 /// Goes through [`port_alloc::bind_ephemeral`] for structural
 /// consistency with the other ephemeral-bind sites in the workspace.
@@ -138,7 +138,14 @@ pub async fn start_plugin_chain(
     // Per-plugin syntax differs; for plugins we don't have a known
     // directive for, the options pass through unchanged.
     let merged_opts = inject_plugin_debug_logging(plugin_name, plugin_opts);
-    let protocols = plugin_protocols(plugin_name);
+    // Resolve the config name to its on-disk binary name before sizing the
+    // handoff port — `plugin_alloc_protocols` is keyed by binary name so
+    // `v2ray-plugin` (→ `ex-ray`) and unknown plugins get a TCP-only port
+    // while galoshes gets a UDP-capable one (#414).
+    let binary = hole_common::plugin::lookup(plugin_name)
+        .map(|d| d.binary_name)
+        .unwrap_or(plugin_name);
+    let protocols = hole_common::plugin::plugin_alloc_protocols(binary);
 
     let (_port, (handle, cancel, ready_addr, transports)) =
         port_alloc::bind_ephemeral(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols, |port| {

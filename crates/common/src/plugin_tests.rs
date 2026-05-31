@@ -6,7 +6,6 @@ fn lookup_v2ray_plugin_returns_descriptor() {
     assert_eq!(desc.name, "v2ray-plugin");
     // The friendly wire name resolves to the `ex-ray` binary (#414).
     assert_eq!(desc.binary_name, "ex-ray");
-    assert!(!desc.udp_supported);
     assert!(desc.user_visible);
 }
 
@@ -15,7 +14,6 @@ fn lookup_ex_ray_returns_descriptor() {
     let desc = plugin::lookup("ex-ray").expect("ex-ray should be known");
     assert_eq!(desc.name, "ex-ray");
     assert_eq!(desc.binary_name, "ex-ray");
-    assert!(!desc.udp_supported);
     // Impl detail — hidden from the user-facing supported list.
     assert!(!desc.user_visible);
 }
@@ -25,7 +23,6 @@ fn lookup_galoshes_returns_descriptor() {
     let desc = plugin::lookup("galoshes").expect("galoshes should be known");
     assert_eq!(desc.name, "galoshes");
     assert_eq!(desc.binary_name, "galoshes");
-    assert!(desc.udp_supported);
     assert!(desc.user_visible);
 }
 
@@ -66,23 +63,32 @@ fn is_known_false_for_unknown() {
     assert!(!plugin::is_known(""));
 }
 
+// `plugin_alloc_protocols` is keyed by BINARY name (the on-disk binary),
+// not the config token — the proxy manager resolves the config name to
+// its `binary_name` before allocating the handoff port (#414).
+
 #[skuld::test]
-fn plugin_protocols_v2ray_is_tcp_only() {
+fn alloc_protocols_ex_ray_is_tcp_only() {
     use crate::port_alloc::Protocols;
-    assert_eq!(plugin::plugin_protocols("v2ray-plugin"), Protocols::TCP);
+    // `v2ray-plugin` resolves to the `ex-ray` binary, which is TCP-only.
+    assert_eq!(plugin::plugin_alloc_protocols("ex-ray"), Protocols::TCP);
 }
 
 #[skuld::test]
-fn plugin_protocols_galoshes_is_tcp_and_udp() {
+fn alloc_protocols_galoshes_is_tcp_and_udp() {
     use crate::port_alloc::Protocols;
-    assert_eq!(plugin::plugin_protocols("galoshes"), Protocols::TCP | Protocols::UDP);
+    // galoshes binds UDP for YAMUX, so its handoff port must be
+    // UDP-capable to avoid the Windows cross-protocol excluded-port race.
+    assert_eq!(
+        plugin::plugin_alloc_protocols("galoshes"),
+        Protocols::TCP | Protocols::UDP
+    );
 }
 
 #[skuld::test]
-fn plugin_protocols_unknown_defaults_to_tcp() {
+fn alloc_protocols_unknown_defaults_to_tcp() {
     use crate::port_alloc::Protocols;
-    // Conservative default — unknown plugins are treated as TCP-only to
-    // match the `udp_supported: false` default for unregistered names.
-    assert_eq!(plugin::plugin_protocols("xyzzy"), Protocols::TCP);
-    assert_eq!(plugin::plugin_protocols(""), Protocols::TCP);
+    // Conservative default — unknown binaries are treated as TCP-only.
+    assert_eq!(plugin::plugin_alloc_protocols("xyzzy"), Protocols::TCP);
+    assert_eq!(plugin::plugin_alloc_protocols(""), Protocols::TCP);
 }

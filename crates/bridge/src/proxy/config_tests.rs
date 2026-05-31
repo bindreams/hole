@@ -33,31 +33,10 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-#[skuld::test]
-fn udp_available_without_plugin() {
-    assert!(plugin_supports_udp(&sample_config()));
-}
-
-#[skuld::test]
-fn udp_unavailable_with_v2ray_plugin() {
-    let mut cfg = sample_config();
-    cfg.server.plugin = Some("v2ray-plugin".into());
-    assert!(!plugin_supports_udp(&cfg));
-}
-
-#[skuld::test]
-fn udp_available_with_galoshes() {
-    let mut cfg = sample_config();
-    cfg.server.plugin = Some("galoshes".into());
-    assert!(plugin_supports_udp(&cfg));
-}
-
-#[skuld::test]
-fn udp_unavailable_with_unknown_plugin() {
-    let mut cfg = sample_config();
-    cfg.server.plugin = Some("some-custom-plugin".into());
-    assert!(!plugin_supports_udp(&cfg));
-}
+// The static `plugin_supports_udp(config)` helper was retired in #414 —
+// the runtime UDP-drop policy now derives capability from the plugin's
+// reported sitrep `transports` (`udp_available_from_chain` in
+// `proxy_manager.rs`), tested in `proxy_manager_tests.rs`.
 
 #[skuld::test]
 fn config_with_plugin_local_overrides_server_address() {
