@@ -1,4 +1,4 @@
-#![cfg_attr(v2ray_plugin_missing, allow(dead_code, unused_imports))]
+#![cfg_attr(ex_ray_missing, allow(dead_code, unused_imports))]
 
 pub mod embedded;
 pub mod sitrep_out;
