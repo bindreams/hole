@@ -199,7 +199,10 @@ fn interop_stock_client_ex_ray_server() {
 
 /// QUIC cross-impl tests, mirroring the websocket trio above but over the QUIC
 /// transport (`mode=quic`) — the path #421 unblocked (ex-ray's v1 confirming
-/// probe rejected `mode=quic`).
+/// probe rejected `mode=quic`). Two of the three directions run; the
+/// stock-as-QUIC-server direction (`interop_quic_ex_ray_client_stock_server`)
+/// is `#[ignore]`d because the pinned stock plugin's quic-go v0.48.1 panics as
+/// a QUIC server on Go ≥1.24 (bindreams/hole#428).
 ///
 /// **Non-Windows gate.** QUIC mandates TLS, and these tests present a
 /// self-signed cert (SAN `cloudfront.com`, CA) that the client trusts as a
@@ -327,7 +330,20 @@ mod quic {
     /// QUIC cross-impl direction 1: ex-ray CLIENT talking to a stock-v2ray-plugin
     /// QUIC SERVER. Proves ex-ray's QUIC client wire output is understood by
     /// genuine upstream v2ray-plugin.
+    ///
+    /// **Disabled (`#[ignore]`).** The pinned stock v2ray-plugin is frozen on
+    /// quic-go v0.48.1, which panics as a QUIC *server* on Go ≥1.24
+    /// (`crypto/tls bug: where's my session ticket?` — Go 1.24 changed the
+    /// crypto/tls QUIC session-ticket API; quic-go fixed it in v0.49.0). The
+    /// stock binary therefore cannot hold the server role on our CI Go
+    /// toolchain. This is server-only and NOT a wire incompatibility — ex-ray's
+    /// QUIC client is still exercised by `interop_quic_ex_ray_both_ends`, and
+    /// ex-ray's QUIC server is cross-validated against a genuine stock client by
+    /// `interop_quic_stock_client_ex_ray_server`. Tracked in bindreams/hole#428;
+    /// re-enable when the stock reference can serve QUIC again (upstream bump or
+    /// a frozen-Go≤1.23 stock build).
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+    #[ignore = "stock v2ray-plugin (quic-go 0.48.1) panics as a QUIC server on Go >=1.24 — see bindreams/hole#428"]
     fn interop_quic_ex_ray_client_stock_server() {
         let ex_ray = locate_ex_ray();
         let stock = locate_upstream_v2ray();
