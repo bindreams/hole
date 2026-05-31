@@ -202,6 +202,19 @@ func main() {
 		os.Exit(23)
 	}
 
+	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
+	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
+	// inbound listener's bound port via any public API (the confirming-probe
+	// binds a separate ephemeral socket it releases, so it cannot reveal
+	// v2ray-core's eventual bind). Echoing ":0" as `ready.listen` would be a
+	// silent spec violation (SITREP.md: listen MUST be the bound address).
+	// Hole always hands ex-ray a concrete pre-allocated port; a port-0 input
+	// is a misconfiguration we fail loudly on rather than mis-report.
+	if *localPort == "0" || *localPort == "" {
+		emitFatal("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)", nil)
+		os.Exit(23) // config-class error
+	}
+
 	// localAddr/localPort name the inbound listener in both modes (see
 	// parseOptsIntoFlags for the client/server SS_*_* mapping). This is the
 	// address the confirming-probe checks and that emitReady reports.
@@ -246,18 +259,9 @@ func main() {
 	// listener is accepting once Start returns nil. quic was already fatal'd
 	// out above, so the served transport is TCP (websocket/default).
 	//
-	// `listen` reports the REQUESTED address (*localAddr:*localPort), not a
-	// port v2ray-core re-queried after bind. SITREP's `ready` contract asks
-	// for the authoritative BOUND address to enable the OS-assigned-port
-	// (bind-`:0`) pattern, but v2ray-core's core.New/Start exposes no API to
-	// read back the dokodemo inbound's actual bound port, and the
-	// confirming-probe binds-and-releases a DIFFERENT ephemeral socket. The
-	// Hole/garter handoff always passes a concrete pre-allocated non-zero port
-	// (garter::chain::allocate_one_port), so requested == bound and this is
-	// authoritative in practice. A caller that passes SS_LOCAL_PORT=0 would
-	// get `:0` echoed back — an unsupported v1 gap, not a silent mis-report
-	// for any real Hole path. Closing the gap needs v2ray-core listener
-	// introspection (out of scope for the sitrep wiring task).
+	// localListenAddr is authoritative: ex-ray rejects port 0 (above), so for
+	// every accepted input the requested port == the bound port (v2ray-core
+	// binds it; Start() returning nil confirms).
 	emitReady(localListenAddr, []string{"tcp"})
 
 	<-osSignals
