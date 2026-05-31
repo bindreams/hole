@@ -122,10 +122,9 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Se
 # `WinDnsBackend::Win32Real` impl. Direct callers bypass the
 # `MockBackend` test seam exactly the same way the #165 `setup_routes`
 # bypass did. The free-function shims `capture_adapters` /
-# `apply_loopback` / `platform_restore_adapter` in
-# `crates/bridge/src/dns/system/windows.rs` already route through
-# `Win32Real::default()`; the bans below cover anything reaching the
-# raw `windows` crate paths directly.
+# `platform_restore_adapter` in `crates/bridge/src/dns/system/windows.rs`
+# already route through `Win32Real::default()`; the bans below cover
+# anything reaching the raw `windows` crate paths directly.
 #
 # Sanctioned suppressions: only the two `Win32Real::{get_settings,
 # set_loopback, restore}` call sites in `dns/system/windows.rs`. Each
@@ -163,9 +162,8 @@ allow-invalid = true
 # phase of `proxy_manager::start_inner` via `child_token()`. Any fresh
 # token rooted elsewhere is unreachable from that root, and any
 # in-flight work observing only that fresh token cannot be preempted.
-# The historical regression at `plugin.rs:237` (a fresh token shadowing
-# the bridge cancel during plugin-chain spawn) is the case this rule
-# guards against.
+# This rule guards against a fresh token in the plugin-chain spawn path
+# shadowing the bridge cancel.
 #
 # **Scope is workspace-wide, not bridge-only.** Cargo's `clippy.toml`
 # resolution is workspace-rooted; there is no per-crate override

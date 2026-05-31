@@ -3,8 +3,9 @@
 //! The bridge writes the chosen loopback bind address and prior system-DNS
 //! settings to a JSON file when the DNS forwarder starts, clears it on clean
 //! shutdown, and reads it on startup to restore DNS leaked by a previous
-//! crashed run. Mirrors the `route_state.rs` / `plugin_state.rs`
-//! crash-recovery pattern.
+//! crashed run. Mirrors the `tun_engine::routing::state`
+//! (crates/tun-engine/src/routing/state.rs) / `plugin_state` crash-recovery
+//! pattern.
 //!
 //! Single-writer assumption: the bridge is the only writer of this file
 //! within a process, and only one bridge runs at a time (the IPC socket bind

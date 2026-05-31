@@ -6,10 +6,6 @@
 //! is the third leg: human-readable, multi-line, YAML-shaped output
 //! suited for logging large structured values where Debug jams everything
 //! onto one unreadable line.
-//!
-//! This commit introduces only the data model and trait; the `dump!`
-//! macro, YAML formatter, derive macro, and built-in impls ship in
-//! subsequent commits.
 
 mod debug_bridge;
 mod display;

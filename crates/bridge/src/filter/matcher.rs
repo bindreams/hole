@@ -201,10 +201,9 @@ fn canonicalize_domain(input: &str) -> Result<String, CompileError> {
 /// just because the sniffer handed us something we couldn't canonicalize,
 /// since rule compilation has already rejected its own malformed inputs.
 ///
-/// This is exposed publicly so the dispatcher (Plans 2/3) can call it
-/// once per connection at `ConnInfo` construction time. The matcher
-/// also calls it internally so contracts hold even if the dispatcher
-/// forgets.
+/// Exposed publicly for callers that want to pre-canonicalize a domain.
+/// The matcher calls it internally on every match, so passing the raw
+/// sniffer string is fine — that is exactly what the dispatcher does.
 pub fn canonicalize_for_match(domain: &str) -> String {
     let trimmed = domain.trim_end_matches('.');
     if trimmed.is_empty() {

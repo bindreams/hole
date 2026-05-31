@@ -415,8 +415,8 @@ fn run_test_with_v2ray_plugin_happy_path() {
         );
         entry.plugin = Some("v2ray-plugin".into());
 
-        // Generous plugin window for cold start. The CI default of 2 s in
-        // fast_test_config is too short for the WS handshake.
+        // Generous plugin window for cold start. fast_test_config's 800 ms
+        // SS/sentinel timeouts are too short for the WS handshake.
         let cfg = TestConfig {
             plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
             // Generous SS connect/sentinel timeouts because the WS handshake

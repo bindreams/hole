@@ -216,8 +216,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleO
     // Bridge install gate: if the user is trying to enable the proxy and
     // the bridge isn't installed yet, prompt for installation BEFORE
     // flipping any config state. Cancelling here leaves `config.enabled`
-    // untouched (no rollback needed). Replaces the prior launch-time
-    // install check at `setup::check_bridge_on_launch`.
+    // untouched (no rollback needed).
     if enabled
         && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled
         && !crate::setup::prompt_bridge_install(app.clone()).await

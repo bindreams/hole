@@ -16,8 +16,9 @@ pub(crate) fn default_user_subdir(leaf: &str) -> PathBuf {
 
 /// Default state directory: `<state>/hole/state`.
 ///
-/// Used to persist the bridge's route-recovery state file
-/// (`bridge-routes.json`) between runs. Resolved against the current
+/// Used to persist the bridge's crash-recovery state files
+/// (`bridge-routes.json`, `bridge-dns.json`, `bridge-plugins.json`) between
+/// runs. Resolved against the current
 /// effective user's profile — under `sudo` on macOS this is
 /// `/var/root/Library/Application Support/hole/state`, so dev tooling
 /// must pass an explicit `--state-dir` to place it somewhere the

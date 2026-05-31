@@ -54,11 +54,10 @@ def cargo_build(console: Console) -> None:
 def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     """Stage the runnable BINDIR via `cargo xtask stage`.
 
-    The canonical list of files (hole.exe + ex-ray.exe + wintun.dll on
-    Windows) lives in `xtask/src/bindir.rs::bindir_files()`. dev.py and this
-    function both call into the same xtask subcommand, so adding a new BINDIR
-    file is a one-line change in xtask and both consumers pick it up
-    automatically. See issue #143.
+    The canonical list of files lives in `xtask/src/bindir.rs`
+    (`bindir_files()`). dev.py and this function both call into the same xtask
+    subcommand, so adding a new BINDIR file is a one-line change in xtask and
+    both consumers pick it up automatically. See issue #143.
     """
     console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
     result = subprocess.run(

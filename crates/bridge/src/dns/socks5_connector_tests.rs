@@ -103,7 +103,8 @@ async fn udp_associate_rejected_for_tcp_only_plugin() {
 }
 
 /// Start a fake SOCKS5 proxy that accepts UDP ASSOCIATE and advertises a
-/// relay on 127.0.0.1 at a preset port. Returns both addresses.
+/// relay on 127.0.0.1 at a preset port. Returns the proxy's listen
+/// address; the relay port it advertises is the `relay_port` argument.
 async fn start_udp_accepting_proxy(relay_port: u16) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

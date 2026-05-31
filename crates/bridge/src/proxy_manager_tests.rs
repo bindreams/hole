@@ -1190,7 +1190,7 @@ mod self_test {
     /// Empty servers → `run_forwarder_self_test` logs `skipped` and
     /// returns `Ok(0)`. Empty-servers in production is rejected at
     /// `build_local_dns` *before* `run_forwarder_self_test` is even
-    /// called (test below: `gate_returns_err_for_empty_servers_via_build_local_dns`);
+    /// called (test below: `build_local_dns_returns_err_for_empty_servers`);
     /// this test pins the helper's contract in isolation.
     #[skuld::test]
     fn self_test_empty_servers_returns_ok_zero() {

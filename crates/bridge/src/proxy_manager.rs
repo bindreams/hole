@@ -117,20 +117,19 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     #[allow(dead_code)]
     dns: Option<D::Applied>,
     /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
-    /// handler tasks. Drops SECOND. `None` in SocksOnly mode and under
-    /// `#[cfg(test)]`.
+    /// handler tasks. `None` in SocksOnly mode and under `#[cfg(test)]`.
     #[allow(dead_code)]
     dispatcher: Option<crate::dispatcher::Dispatcher>,
-    /// Garter-managed plugin chain. Drops SECOND (cancel token triggers
-    /// SIP003u graceful shutdown). `None` when no plugin is configured.
+    /// Garter-managed plugin chain; drop triggers SIP003u graceful
+    /// shutdown via the cancel token. `None` when no plugin is configured.
     #[allow(dead_code)]
     plugin_chain: Option<crate::proxy::plugin::PluginChain>,
-    /// Installed routes. Dropped THIRD. `None` in SocksOnly mode.
+    /// Installed routes. `None` in SocksOnly mode.
     #[allow(dead_code)]
     routes: Option<R::Installed>,
-    /// Handle on the running proxy. Dropped LAST. Drop aborts
-    /// the task (best-effort); supported graceful shutdown is via
-    /// `stop().await` from [`ProxyManager::stop`].
+    /// Handle on the running proxy. Drop aborts the task (best-effort);
+    /// supported graceful shutdown is via `stop().await` from
+    /// [`ProxyManager::stop`].
     proxy: P::Running,
     server_ip: Option<IpAddr>,
     started_at: Instant,
@@ -569,7 +568,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         //      reachable through the cascade
         //   5. routing.install  — TUN routes go live, intercept_udp53
         //      activates
-        //   6. apply_dns_settings  — system DNS pointed at our loopback
+        //   6. Dns::apply  — system DNS pointed at our loopback
         //
         // Reordering steps 3..=6 re-introduces the #388 symptom (dead-
         // tunnel DNS hijack with the GUI reporting "Running"). The
@@ -598,7 +597,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         };
 
         // Phase 4: blocking forwarder self-test gate. Runs synchronously
-        // BEFORE Dispatcher::new / routing.install / apply_dns_settings.
+        // BEFORE Dispatcher::new / routing.install / Dns::apply.
         // On Err, the locally-owned `running_proxy` Drop aborts the SS
         // task and `plugin_chain` (further up the stack) Drop SIGTERMs
         // the chain. System state is untouched. `run_forwarder_self_test`
@@ -999,7 +998,7 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 ///
 /// **#388 change**: replaces the pre-#388 `spawn_forwarder_self_test`
 /// (fire-and-forget). Called from `start_inner` BEFORE
-/// `Dispatcher::new` / `routing.install` / `apply_dns_settings`. A
+/// `Dispatcher::new` / `routing.install` / `Dns::apply`. A
 /// failure short-circuits the start; the locally-owned `running_proxy` +
 /// `plugin_chain` RAII guards unwind without ever hijacking system DNS
 /// into a dead tunnel.

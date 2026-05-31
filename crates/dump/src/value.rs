@@ -9,8 +9,9 @@ pub enum DumpValue {
     /// YAML `null` / `~`.
     Null,
     Bool(bool),
-    /// Signed integer up to `i128`. `UInt` exists separately so that
-    /// the `i64::MAX..=u128::MAX` range round-trips losslessly.
+    /// Signed integer up to `i128`. `UInt` exists separately so the
+    /// `i128::MAX..=u128::MAX` range round-trips losslessly (values
+    /// above `i128::MAX` don't fit in `Int`).
     Int(i128),
     UInt(u128),
     /// NaN and ±infinity are emitted as `.nan` / `.inf` / `-.inf` per

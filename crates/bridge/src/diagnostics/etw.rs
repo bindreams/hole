@@ -294,7 +294,8 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
         .build();
 
     // Split-lifecycle: start session without the internal processing
-    // thread so we own the join handle. See [Drain on Drop] in module doc.
+    // thread so we own the join handle. See the "Drain on Drop" section
+    // of the module doc.
     //
     // Buffer sizing: now that [`TCPIP_KEYWORDS`] = !0, kernel event
     // volume per connect rises substantially (SendPath events are no

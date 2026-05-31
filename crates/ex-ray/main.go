@@ -22,7 +22,7 @@ var VERSION = "ex-ray"
 
 // parseOptsIntoFlags reads SS_PLUGIN env vars and cross-assigns them into the
 // package-level flag pointers. This is the env-remap seam: it is split out of
-// startV2Ray so main() can compute the listen address and run the confirming
+// buildV2Ray so main() can compute the listen address and run the confirming
 // probe BETWEEN the remap and core.New (the probe needs the resolved
 // *localAddr:*localPort, the config needs the remap to have happened).
 //

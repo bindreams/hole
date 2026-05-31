@@ -6,8 +6,6 @@ import (
 	"os"
 )
 
-// Key–value mappings for the representation of client and server options.
-
 // Args maps a string key to a list of values. It is similar to url.Values.
 type Args map[string][]string
 

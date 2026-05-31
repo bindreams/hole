@@ -19,7 +19,7 @@
 //!   `windows::*` types) so the mock can be constructed without depending
 //!   on the Win32 crate.
 //!
-//! - The free-function shims [`capture_adapters`] / [`apply_loopback`] /
+//! - The free-function shims [`capture_adapters`] /
 //!   [`platform_restore_adapter`] / [`flush_dns_cache`] keep the
 //!   crash-recovery call sites (see [`crate::dns::recovery`]) intact.
 //!   Each shim instantiates [`Win32Real`] and delegates. The
@@ -30,9 +30,9 @@
 //!
 //! `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` were added in
 //! Windows 10 build 19041 (version 2004, May 2020). Pre-19041 systems
-//! will fail to link at runtime. The MSI installer `WIN10BUILD >=
-//! 19041` launch condition gate is tracked separately (see #397 plan
-//! step 12).
+//! would fail at runtime, so the MSI gates install on `WIN10BUILD >=
+//! 19041` (see `msi-installer/src/msi_installer/hole.wxs`); the
+//! unsupported FFI is never reached on shipped installs.
 //!
 //! ## v4 vs v6
 //!
@@ -67,7 +67,6 @@ unsafe extern "system" {
     fn DnsFlushResolverCache() -> i32;
 }
 
-use super::AppliedAdapter;
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 // WinDnsBackend trait =================================================================================================
@@ -404,33 +403,6 @@ pub fn capture_adapters(aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> 
         "capture_adapters"
     );
     Ok(out)
-}
-
-/// Apply `loopback_ip` as the v4 DNS server on each adapter in `aliases`.
-/// Returns one [`AppliedAdapter`] per adapter that was successfully set.
-/// Callers flush the DNS cache separately via [`flush_dns_cache`].
-pub fn apply_loopback(aliases: &[String], loopback_ip: IpAddr) -> io::Result<Vec<AppliedAdapter>> {
-    let started = Instant::now();
-    let backend = Win32Real;
-    let mut applied = Vec::with_capacity(aliases.len());
-    for alias in aliases {
-        if let Err(e) = backend.set_loopback(alias, loopback_ip) {
-            tracing::warn!(%alias, error = %e, "DNS apply failed; continuing");
-            continue;
-        }
-        applied.push(AppliedAdapter {
-            id: AdapterId::WindowsAlias { value: alias.clone() },
-            name_at_capture: alias.clone(),
-        });
-    }
-    flush_dns_cache();
-    tracing::debug!(
-        aliases = aliases.len(),
-        applied = applied.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "apply_loopback"
-    );
-    Ok(applied)
 }
 
 /// Restore one adapter. Invoked from [`super::restore_all`].

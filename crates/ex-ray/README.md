@@ -15,11 +15,9 @@ has). Its config-building construction is derived from
 `shadowsocks/v2ray-plugin` (MIT-licensed); see the root
 [`NOTICES.md`](../../NOTICES.md) for attribution.
 
-ex-ray exists to give Hole a plugin it fully controls: later it grows a
-"sitrep" control protocol on stdout and forces all logs to stderr. As of
-this commit it is a plain scaffold — it compiles and runs equivalently to
-the stock v2ray-plugin shim, with no sitrep support and no log-routing
-changes yet. **Sitrep support is added in a later commit.**
+ex-ray exists to give Hole a plugin it fully controls: it speaks a "sitrep"
+control protocol on stdout (see [`../garter/SITREP.md`](../garter/SITREP.md))
+and forces all v2ray-core logs to stderr.
 
 ## Build
 

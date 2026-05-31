@@ -1,5 +1,5 @@
-// Shared `cli_log!` macro, used by CLI command paths in both the binary
-// (`main.rs` + `cli.rs`) and the library (`path_management.rs`, `setup.rs`).
+// Shared `cli_log!` macro, used by CLI command paths in the binary
+// (`cli.rs`) and the library (`path_management.rs`, `setup.rs`).
 // Lives in its own file so it can be declared from both `lib.rs` and
 // `main.rs` without the fragile cross-binary sibling-module dance.
 

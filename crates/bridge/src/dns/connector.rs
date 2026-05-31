@@ -2,12 +2,11 @@
 //!
 //! Two impls live behind [`UpstreamConnector`]:
 //!
-//! - [`DirectConnector`] — plain loopback / direct connection to an
-//!   upstream resolver. Used in tests and in the not-yet-wired sub-step
-//!   (c) path.
-//! - `Socks5Connector` (sub-step d) — routes every outbound connection
-//!   through the local shadowsocks SOCKS5 listener so user filter rules
-//!   cannot strand the forwarder.
+//! - [`DirectConnector`] — plain direct connection to an upstream
+//!   resolver; used by tests.
+//! - [`Socks5Connector`] — production path; routes every outbound
+//!   connection through the local shadowsocks SOCKS5 listener so user
+//!   filter rules cannot strand the forwarder.
 //!
 //! The trait returns [`ConnectedStream`] — a `BoxedStream` paired with
 //! [`StreamCounters`] observed by a [`CountingStream`] wrapper around
@@ -38,10 +37,10 @@ pub use garter::counting::{CountingStream, StreamCounters};
 pub trait AsyncDuplex: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> AsyncDuplex for T {}
 
-/// Boxed TCP stream — direct `TcpStream` or a SOCKS5-wrapped
-/// `Socks5Stream<TcpStream>` at runtime. Always wrapped in a
-/// [`CountingStream`] before boxing, so its byte counts are observable
-/// via the paired [`StreamCounters`].
+/// Boxed TCP stream — always a `CountingStream` wrapping a bare
+/// `TcpStream` (the SOCKS5 connector unwraps `Socks5Stream` to its inner
+/// `TcpStream` after CONNECT). Boxing erases the source so byte-counting
+/// is uniform via the paired [`StreamCounters`].
 pub type BoxedStream = Box<dyn AsyncDuplex>;
 
 /// A stream paired with its byte counters. Returned by

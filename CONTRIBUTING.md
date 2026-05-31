@@ -203,7 +203,7 @@ npm run dev &                                          # Vite on port 1420
 HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```
 
-`cargo xtask stage` populates a directory with `hole.exe`, `ex-ray.exe`, and (on Windows) `wintun.dll` — the same layout as the installed MSI in `Program Files\hole\bin\`. The canonical file list lives in [xtask/src/bindir.rs](xtask/src/bindir.rs); adding a new BINDIR file is a one-line change there and both `dev.py` and `msi-installer` pick it up automatically. The bridge binary must be staged out of the cargo target dir because the running bridge holds a file lock on its own exe — without staging, the next `cargo build` would fail with "Access is denied". The `ex-ray` sidecar (which serves the `v2ray-plugin` wire protocol) must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy.rs) finds it.
+`cargo xtask stage` populates a directory with `hole.exe`, `ex-ray.exe`, and (on Windows) `wintun.dll` — the same layout as the installed MSI in `Program Files\hole\bin\`. The canonical file list lives in [xtask/src/bindir.rs](xtask/src/bindir.rs); adding a new BINDIR file is a one-line change there and both `dev.py` and `msi-installer` pick it up automatically. The bridge binary must be staged out of the cargo target dir because the running bridge holds a file lock on its own exe — without staging, the next `cargo build` would fail with "Access is denied". The `ex-ray` sidecar (which serves the `v2ray-plugin` wire protocol) must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy/config.rs) finds it.
 
 ### Flags
 

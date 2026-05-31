@@ -412,7 +412,7 @@ async fn self_test_error_downcastable_to_typed_marker() {
 // Winsock matrix, and is not reproducible by a vanilla wildcard
 // `SO_REUSEADDR` bind. The load-bearing defense for that bug is the
 // post-bind self-test (see `bind_with_probe_returns_err_when_probe_fails`
-// + `bind_walks_to_next_addr_when_probe_fails_on_first`), which catches
+// + `probe_invoked_once_per_bind_with_probe_call`), which catches
 // any inbound-routing hijack (ICS, LSP/WFP shim, NKE, kernel firewall)
 // regardless of mechanism — the sentinel datagram simply doesn't come
 // back within budget, and `bind_ladder` walks to `127.53.0.X:53`.

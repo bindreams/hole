@@ -1,4 +1,4 @@
-// IPC server — HTTP/1.1 REST API over local Unix domain socket.
+//! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
 use tun_engine::routing::Routing;
 
@@ -403,7 +403,7 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
     };
 
     // vpn_server and internet are computed by the GUI from the selected
-    // ServerEntry's persisted validation state (see ui/sidebar.ts). The
+    // ServerEntry's persisted validation state (see ui/diagnostics.ts). The
     // wire fields are kept for backward compat but always "unknown" here.
     let vpn_server = "unknown".to_string();
     let internet = "unknown".to_string();

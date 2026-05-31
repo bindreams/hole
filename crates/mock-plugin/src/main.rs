@@ -88,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Host-native errno: AddrInUse is 48 on macOS, 98 on Linux, 10048 (WSA)
     // on Windows. The bridge's BindRace mapping sets ErrorKind directly and
-    // ignores this number for classification (see Task 9), so a representative
+    // ignores this number for classification (see `ProxyError::BindRace`
+    // handling in crates/bridge/src/proxy/plugin.rs), so a representative
     // non-zero value is fine — but emit the real host value for diagnostic
     // honesty rather than a hardcoded foreign constant.
     let addr_in_use_errno: i32 = {

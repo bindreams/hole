@@ -4,7 +4,7 @@
 // ConnectionFailed, DisconnectionFailed) and three transition states
 // (Connecting, Disconnecting, Cancelling). This module owns the state
 // type, the text/CSS mapping, and the small set of predicates that the
-// DOM-wiring layer (`sidebar.ts`) uses to decide what to render.
+// DOM-wiring layer (`power-button.ts`) uses to decide what to render.
 //
 // The transition graph and rationale (idle states, transitions,
 // backend-cooperative cancellation) is documented in this file's
@@ -39,9 +39,8 @@ export const TRANSITION_STATES = new Set<ConnectionState>(["connecting", "discon
 export type ToggleOutcome = "running" | "stopped" | "cancelled";
 
 /// True if the UI represents the proxy as "running" for the user — i.e.
-/// clicking the button should initiate a disconnect. Includes the
-/// optimistic Running state and the DisconnectionFailed state (where the
-/// proxy is still up because a stop failed).
+/// clicking the button should initiate a disconnect. True for `connected`
+/// and for `disconnection-failed` (proxy still up because a stop failed).
 export function isEffectivelyOn(state: ConnectionState): boolean {
   return state === "connected" || state === "disconnection-failed";
 }

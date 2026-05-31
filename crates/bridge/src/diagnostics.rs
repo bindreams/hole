@@ -1,22 +1,24 @@
-// Bridge runtime diagnostics — cross-cutting observability helpers.
-//
-// Modules here emit through the standard `tracing` subscriber so whatever
-// shows up in CI also shows up in user bug reports via `hole bridge log`.
-// Nothing here owns state beyond the single-call execution; these are
-// "take a snapshot and log it" helpers, not long-lived subsystems.
-//
-// # Shared conventions
-//
-// - Every submodule exposes `log_snapshot(phase: &'static str)` that
-//   runs its probe(s) and emits `info!` / `warn!` / `debug!` tiered
-//   output. See `wfp.rs` for the canonical shape.
-// - `WATCH_SUBSTRINGS` is the case-insensitive set of strings we treat
-//   as "possible wintun/hole residue" across all probes. Kept here so
-//   adding a new watch word (e.g. a different TUN driver someday)
-//   updates every probe at once.
-// - `DEBUG_OUTPUT_CAP_BYTES` caps debug-level output sizes per probe
-//   source so the bridge's size-rotated log file cannot be blown out
-//   by a single snapshot even when a probe produces multi-MB output.
+//! Bridge runtime diagnostics — cross-cutting observability helpers.
+//!
+//! Modules here emit through the standard `tracing` subscriber so whatever
+//! shows up in CI also shows up in user bug reports via `hole bridge log`.
+//! Nothing here owns state beyond the single-call execution; these are
+//! "take a snapshot and log it" helpers, not long-lived subsystems.
+//!
+//! # Shared conventions
+//!
+//! - The snapshot probes (`wfp`, `ndis`) each expose
+//!   `log_snapshot(phase: &'static str)` that runs its probe(s) and emits
+//!   `info!` / `warn!` / `debug!` tiered output; see `wfp.rs` for the
+//!   canonical shape. The `etw` consumer and `etw_sweep` follow their own
+//!   shapes.
+//! - `WATCH_SUBSTRINGS` is the case-insensitive set of strings we treat
+//!   as "possible wintun/hole residue" across all probes. Kept here so
+//!   adding a new watch word (e.g. a different TUN driver someday)
+//!   updates every probe at once.
+//! - `DEBUG_OUTPUT_CAP_BYTES` caps debug-level output sizes per probe
+//!   source so the bridge's size-rotated log file cannot be blown out
+//!   by a single snapshot even when a probe produces multi-MB output.
 
 #[cfg(target_os = "windows")]
 pub mod etw;

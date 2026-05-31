@@ -2,7 +2,7 @@
 //!
 //! **This is the single source of truth.** Adding a new file that must sit
 //! next to `hole.exe` is one line in `bindir_files()` below — both
-//! `scripts/dev.py` and `msi-installer/__init__.py:stage_files()` call into
+//! `scripts/dev.py` and `msi-installer/src/msi_installer/__init__.py:stage_files()` call into
 //! this via `cargo xtask stage`, so they pick it up automatically.
 //!
 //! See issue #143 for the motivation.

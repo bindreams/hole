@@ -17,8 +17,9 @@ pub enum ImportError {
     /// must modify the profile to use one of the bundled plugins.
     ///
     /// The "bundled list" in the error message is derived from
-    /// [`crate::plugin::known_plugin_names_joined`] (the single source
-    /// of truth at [`crate::plugin::KNOWN_PLUGINS`]) so it can't drift.
+    /// [`crate::plugin::known_plugin_names_joined`], which lists only the
+    /// user-visible plugins from [`crate::plugin::KNOWN_PLUGINS`] (so the
+    /// `ex-ray` impl-detail entry is hidden) so it can't drift.
     #[error(
         "plugin \"{name}\" is not bundled with Hole. Bundled plugins: {}",
         crate::plugin::known_plugin_names_joined()

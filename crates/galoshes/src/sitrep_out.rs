@@ -3,14 +3,14 @@
 //! galoshes is spawned by the bridge as a `BinaryPlugin` and the bridge
 //! reads sitrep events from galoshes' **process stdout**. Internally
 //! galoshes builds its own `garter::ChainRunner` over a 2-plugin chain
-//! (`YamuxPlugin` outer + embedded `v2ray-plugin` inner); that runner's
+//! (`YamuxPlugin` outer + embedded `ex-ray` inner); that runner's
 //! `on_ready` channel fires the chain-level outcome. This module maps that
 //! chain-level outcome onto the PROCESS-level sitrep event galoshes emits
 //! on stdout.
 //!
 //! The mapping logic is split out here (rather than living inline in
 //! `main.rs`) so it is unit-testable without spawning the binary or
-//! requiring the embedded v2ray-plugin to be present.
+//! requiring the embedded ex-ray binary to be present.
 
 use std::io::Write as _;
 
@@ -21,11 +21,11 @@ use garter::{ChainReady, SitrepEvent, StartError, Transports};
 ///
 /// **This is deliberately NOT the inner chain's transport intersection.**
 /// galoshes' whole purpose is to carry UDP-over-YAMUX: its outer
-/// `YamuxPlugin` hop serves TCP *and* UDP, while the embedded v2ray-plugin
+/// `YamuxPlugin` hop serves TCP *and* UDP, while the embedded ex-ray
 /// inner hop is a TCP-only SIP003 transport (it reports `TCP` via the
 /// tier-2 probe). The naive chain intersection (`YamuxPlugin` TCP|UDP ∩
-/// v2ray TCP = TCP) would therefore lose galoshes' UDP capability. But the
-/// v2ray hop being TCP-only is an implementation detail *below* galoshes'
+/// ex-ray TCP = TCP) would therefore lose galoshes' UDP capability. But the
+/// ex-ray hop being TCP-only is an implementation detail *below* galoshes'
 /// abstraction: galoshes frames UDP datagrams over a YAMUX stream and the
 /// inner TCP hop carries them transparently. galoshes is precisely the
 /// component that ADDS UDP capability, so it reports its own true

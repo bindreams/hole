@@ -356,7 +356,7 @@ targets:
 fn target_with_no_run_steps_is_legal() {
     // The `run:` field is optional. Targets without it deserialize with an
     // empty `Vec<Step>`. `cargo xtask run X` will reject these at invocation
-    // time (orchestrate_tests::run_run_errors_on_empty_run pins that), but
+    // time (orchestrate_tests::execute_run_errors_on_empty_run pins that), but
     // the manifest itself accepts them.
     let m = parse(
         r"

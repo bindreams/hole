@@ -335,18 +335,12 @@ responses, and the protocol does not constrain that choice.
 ## Reference implementation
 
 [`garter`](https://crates.io/crates/garter) is the reference
-implementation of sitrep. Its sitrep module — `src/sitrep.rs` —
-will define the wire types and the `SITREP_PROTOCOL` constant
-(`"sitrep-1.0.0"`).
+implementation of sitrep. Its sitrep module (`src/sitrep.rs`) defines
+the wire types and the `SITREP_PROTOCOL` constant (`"sitrep-1.0.0"`).
 
-> Note: at the time this document is first published, `src/sitrep.rs`
-> is forthcoming — it is added in the implementation work that follows
-> this standard. The standard is the source of truth; the module
-> conforms to it, not the reverse.
-
-Conforming emitters that ship at the time of this document: the
-`mock-plugin` test plugin and the `galoshes` SIP003u plugin, both in
-the Hole workspace. The protocol is independently adoptable: any
+Conforming emitters in the Hole workspace: the `mock-plugin` test
+plugin, the `galoshes` SIP003u plugin, and the `ex-ray` plugin. The
+protocol is independently adoptable: any
 SIP003 / SIP003u plugin or host may implement it without depending on
 `garter`.
 

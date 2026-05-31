@@ -10,7 +10,7 @@ Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin supp
 - **System tray** — Enable/Disable, Start at Login, Settings, Exit
 - **Server import** — import from shadowsocks client config files (single and multi-server)
 - **v2ray-plugin** support — the v2ray-plugin wire protocol, served by the bundled first-party `ex-ray` binary (built from Go source)
-- **Logging** with daily rotation
+- **Logging** to stderr + a size-rotated file (10 MiB, one backup kept)
 
 ## Architecture
 

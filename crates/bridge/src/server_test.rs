@@ -36,8 +36,9 @@ pub struct TestConfig {
     /// Two sentinel `host:port` strings (the second is the fallback).
     pub sentinels: [String; 2],
     /// Optional override for the plugin path. `None` → use
-    /// [`resolve_plugin_path_inner`]. Tests use this to point at the
-    /// cargo-built v2ray-plugin without depending on `PATH`.
+    /// [`resolve_plugin_path_inner`]. Tests use this to point at a specific
+    /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
+    /// upstream v2ray-plugin) without depending on `PATH`.
     pub plugin_path_override: Option<String>,
 }
 

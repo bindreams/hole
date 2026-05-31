@@ -2,7 +2,8 @@ use crate::config::{FilterRule, ServerEntry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// Generated from api/openapi.yaml — StatusResponse, ErrorResponse, EmptyResponse, route constants
+/// Typify-generated API types from `api/openapi.yaml` — `StatusResponse`,
+/// `ErrorResponse`, `EmptyResponse`, and route constants.
 #[allow(clippy::derivable_impls)]
 mod api_generated {
     include!(concat!(env!("OUT_DIR"), "/api_generated.rs"));
@@ -52,9 +53,9 @@ pub enum BridgeRequest {
     },
 }
 
-/// Error-payload message string that identifies a cancelled start. Both bridge
-/// and client compare against this constant rather than re-parsing the error
-/// text.
+/// The exact string the bridge writes into `ErrorResponse` when a `Start` is
+/// cancelled; the client matches against it. Changing it is a
+/// wire-compatibility break.
 pub const CANCELLED_MESSAGE: &str = "cancelled";
 
 /// Client-side response enum. Used by the GUI client API and elevation flow.

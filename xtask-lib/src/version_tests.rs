@@ -425,8 +425,8 @@ fn multi_component_bump_rejected() {
 
 // validate_against_tag ================================================================================================
 //
-// These tests exercise the bootstrap path (no tag yet) since we cannot
-// easily create real tags inside a tempdir without spawning git init.
+// These cover the bootstrap (no-tag) path; the tagged/exact paths are
+// exercised in ex_ray_version_tests.rs via create_tag().
 // The error path (--exact without a tag) is structural and worth pinning.
 
 #[skuld::test]
