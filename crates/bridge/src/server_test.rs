@@ -69,8 +69,14 @@ impl TestConfig {
 pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTestOutcome {
     let started = Instant::now();
 
-    // Phase 1: pre-flight DNS + TCP probe.
-    if let Err(out) = preflight(&entry.server, entry.server_port, cfg.preflight_timeout).await {
+    // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
+    // public endpoint is UDP-only, so a raw TCP connect can't validate it (it
+    // would always surface as a false TcpRefused/TcpTimeout). The full tunnel
+    // handshake below still produces a correct diagnosis for an unreachable
+    // QUIC server. See bindreams/hole#421.
+    if server_endpoint_is_udp(entry) {
+        debug!("server_test: skipping TCP preflight for UDP (quic) server endpoint");
+    } else if let Err(out) = preflight(&entry.server, entry.server_port, cfg.preflight_timeout).await {
         return out;
     }
 
@@ -145,6 +151,25 @@ enum SentinelOutcome {
     Mismatch { detail: String },
     Timeout,
     Internal(String),
+}
+
+/// True if the server's public endpoint is reached over UDP rather than TCP,
+/// i.e. the configured plugin negotiates a QUIC transport (`mode=quic`). The
+/// raw TCP preflight probe is meaningless for such an endpoint — there is no
+/// TCP listener to connect to — so [`run_server_test`] skips it and lets the
+/// full tunnel handshake produce the diagnosis. Covers a direct
+/// v2ray-plugin/ex-ray QUIC server AND a galoshes server (which passes
+/// `mode=quic` through to its embedded ex-ray). Parses the SIP003 options with
+/// the same parser `garter::Mode::from_plugin_options` uses for the `server`
+/// key, so this is config parsing — not a stringified-type-recovery hack. See
+/// bindreams/hole#421.
+fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
+    entry.plugin.is_some()
+        && entry.plugin_opts.as_deref().is_some_and(|opts| {
+            garter::parse_plugin_options(opts)
+                .iter()
+                .any(|(k, v)| k == "mode" && v == "quic")
+        })
 }
 
 /// DNS-resolve (when needed) and raw-TCP-connect to `host:port`. Returns
@@ -298,3 +323,10 @@ async fn try_sentinel(
 #[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
 #[path = "server_test_tests.rs"]
 mod server_test_tests;
+
+// `server_endpoint_is_udp` is a pure function with no I/O, so its tests are
+// NOT subject to the #197/#200 platform gate above — they must run everywhere
+// (the QUIC interop tests that depend on the preflight skip run on Windows).
+#[cfg(test)]
+#[path = "server_test_preflight_tests.rs"]
+mod server_test_preflight_tests;

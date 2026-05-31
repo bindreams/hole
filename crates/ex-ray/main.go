@@ -145,17 +145,44 @@ func buildV2Ray() (core.Server, error) {
 	return instance, nil
 }
 
-// confirmingProbe binds (and immediately releases) listenAddr to confirm the
-// address is bindable before core.New stands up the real listener. A failure
-// here is the typed bind_conflict signal — the host can map the OS errno onto
-// its own retry policy without scraping v2ray-core's log text.
-func confirmingProbe(listenAddr string) error {
+// confirmingProbe binds (and immediately releases) listenAddr on the given
+// network ("tcp" or "udp") to confirm the address is bindable before core.New
+// stands up the real listener. A failure here is the typed bind_conflict
+// signal — the host can map the OS errno onto its own retry policy without
+// scraping v2ray-core's log text. The network is chosen by listenerNetwork so
+// the probe always matches the transport v2ray-core will actually bind.
+func confirmingProbe(network, listenAddr string) error {
 	var lc net.ListenConfig
+	if network == "udp" {
+		pc, err := lc.ListenPacket(context.Background(), "udp", listenAddr)
+		if err != nil {
+			return err
+		}
+		return pc.Close()
+	}
 	ln, err := lc.Listen(context.Background(), "tcp", listenAddr)
 	if err != nil {
 		return err
 	}
 	return ln.Close()
+}
+
+// listenerNetwork reports the IP transport of the inbound listener ex-ray
+// binds, derived from the resolved mode/server flags. Only server+quic binds a
+// UDP listener (the quic inbound faces the remote client); client mode (a plain
+// TCP dokodemo inbound — quic, if configured, applies only to the upstream hop)
+// and server+websocket are both TCP. The confirming-probe network AND the
+// sitrep `transports` value both derive from this single function, so they can
+// never disagree — that divergence (a UDP listener mis-reported as ["tcp"]) was
+// the exact hazard the v1 quic rejection avoided by refusing quic outright. An
+// unknown *mode returns "tcp" here and is then rejected by generateConfig's
+// switch default before emitReady, so no false "ready" can escape. See
+// bindreams/hole#421.
+func listenerNetwork() string {
+	if *server && *mode == "quic" {
+		return "udp"
+	}
+	return "tcp"
 }
 
 func printCoreVersion() {
@@ -190,18 +217,6 @@ func main() {
 
 	parseOptsIntoFlags()
 
-	// quic mode binds a UDP-based wire listener, not TCP. ex-ray's TCP
-	// confirming-probe + transports=["tcp"] would be a lie for quic, so v1
-	// refuses it explicitly rather than mis-probing. Hole only ever uses the
-	// default websocket transport; ex-ray-as-standalone-server with quic is a
-	// documented v1 gap. (A correct quic path would UDP-probe and report
-	// ["udp"], but only once we are certain the quic inbound binds exactly that
-	// UDP addr — until then the honest signal is a typed fatal.)
-	if *mode == "quic" {
-		emitFatal("quic mode not supported by ex-ray v1", nil)
-		os.Exit(23)
-	}
-
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
 	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
 	// inbound listener's bound port via any public API (the confirming-probe
@@ -220,7 +235,12 @@ func main() {
 	// address the confirming-probe checks and that emitReady reports.
 	localListenAddr := net.JoinHostPort(*localAddr, *localPort)
 
-	if err := confirmingProbe(localListenAddr); err != nil {
+	// network is the transport the inbound listener binds (server+quic → "udp",
+	// everything else → "tcp"). Both the probe below and emitReady use it, so a
+	// quic server UDP-probes its UDP listener and reports transports=["udp"].
+	network := listenerNetwork()
+
+	if err := confirmingProbe(network, localListenAddr); err != nil {
 		var se syscall.Errno
 		if errors.As(err, &se) {
 			emitBindConflict(int(se), localListenAddr)
@@ -256,13 +276,14 @@ func main() {
 	}()
 
 	// v2ray-core's Start is synchronous through the listener bind, so the
-	// listener is accepting once Start returns nil. quic was already fatal'd
-	// out above, so the served transport is TCP (websocket/default).
+	// listener is accepting once Start returns nil. The served transport is
+	// `network` (server+quic → "udp", else "tcp"), the same value the
+	// confirming-probe used above — so the sitrep can never mis-describe it.
 	//
 	// localListenAddr is authoritative: ex-ray rejects port 0 (above), so for
 	// every accepted input the requested port == the bound port (v2ray-core
 	// binds it; Start() returning nil confirms).
-	emitReady(localListenAddr, []string{"tcp"})
+	emitReady(localListenAddr, []string{network})
 
 	<-osSignals
 }
