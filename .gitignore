@@ -27,3 +27,8 @@ ui/dist/
 __pycache__/
 .venv/
 .pytest_cache/
+
+# ex-ray dev-build artifact from a bare `go build ./...` in the module dir.
+# The real build output goes to .cache/ via `cargo xtask` (already ignored).
+/crates/ex-ray/ex-ray
+/crates/ex-ray/ex-ray.exe
