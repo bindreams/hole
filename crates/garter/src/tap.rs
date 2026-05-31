@@ -131,10 +131,11 @@ impl ChainPlugin for TapPlugin {
         //    against the inner task itself so an early plugin failure
         //    doesn't leave us blocked on a port that will never bind.
         let ready_token = shutdown.clone();
+        // The join arm diverges (returns), so this `select!` always yields
+        // the timeout arm's `Result<Option<SocketAddr>, Elapsed>` — no
+        // `Option` wrapper / impossible `None` state to handle below.
         let ready_outcome = tokio::select! {
-            r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => {
-                Some(r)
-            }
+            r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => r,
             join = &mut inner_handle => {
                 // Inner exited before binding — propagate its result. No
                 // tap listener was ever opened. Report the inner's failure
@@ -151,14 +152,14 @@ impl ChainPlugin for TapPlugin {
             }
         };
         match ready_outcome {
-            Some(Ok(Some(_))) => {}
-            Some(Ok(None)) => {
+            Ok(Some(_)) => {}
+            Ok(None) => {
                 // Shutdown fired before inner was ready. Drop `ready` unsent
                 // (RecvError, matching the "shutdown before ready"
                 // semantics). Wait for inner to unwind and propagate.
                 return drain_inner(plugin_name.as_str(), inner_handle).await;
             }
-            Some(Err(_)) => {
+            Err(_) => {
                 inner_handle.abort();
                 let _ = inner_handle.await;
                 let _ = ready.send(Err(StartError::Fatal {
@@ -171,7 +172,6 @@ impl ChainPlugin for TapPlugin {
                     "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
                 )));
             }
-            None => unreachable!(),
         }
 
         // 4. Bind the public-facing tap listener.
@@ -286,7 +286,10 @@ fn allocate_inner_port(ip: IpAddr) -> io::Result<SocketAddr> {
             },
         }
     }
-    Err(last_err.unwrap_or_else(|| io::Error::other("alloc_inner_port: no error captured")))
+    // Reaching here means the loop ran its full `INNER_PORT_ALLOC_ATTEMPTS`
+    // (>= 1) iterations and every one took the transient-error branch, each
+    // of which records `last_err` — so it is always `Some` at this point.
+    Err(last_err.expect("INNER_PORT_ALLOC_ATTEMPTS >= 1 and every transient retry records last_err"))
 }
 
 async fn handle_tap_connection(

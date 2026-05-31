@@ -250,15 +250,12 @@ def render_bullet(commit: Commit) -> str:
 def render_notes(
     grouped: dict[str, list[Commit]],
     new_tag: str,
-    previous_tag: str | None,
+    previous_tag: str,
     repo_url: str,
 ) -> str:
+    # `main` handles the first-of-track case (previous_tag is None) and
+    # returns before calling this, so `previous_tag` is always a real tag here.
     parts: list[str] = []
-
-    if previous_tag is None:
-        # Caller should have already emitted initial_release stub; this
-        # branch is defensive.
-        return f"Initial release {new_tag}.\n"
 
     # Non-empty category list rendered as `## <title>` followed by bullets.
     has_any = any(commits for commits in grouped.values())

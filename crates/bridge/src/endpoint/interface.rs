@@ -39,11 +39,14 @@ impl InterfaceEndpoint {
 #[async_trait]
 impl Endpoint for InterfaceEndpoint {
     async fn serve_tcp(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()> {
-        if dst.is_ipv6() && !self.ipv6_available {
-            debug_assert!(false, "InterfaceEndpoint::serve_tcp IPv6 dst despite !ipv6_available");
-            tracing::error!(%dst, "cascade invariant violated: InterfaceEndpoint::serve_tcp v6 on !v6; dropping");
-            return Ok(());
-        }
+        // Precondition: the `HoleRouter::resolve_endpoint` cascade drops
+        // `Bypass` + IPv6 when `!supports_ipv6_dst()`, so this endpoint
+        // never serves an IPv6 dst it can't reach. `ipv6_available` is
+        // immutable, so this is a true contract (zero-cost in release).
+        debug_assert!(
+            !dst.is_ipv6() || self.ipv6_available,
+            "InterfaceEndpoint::serve_tcp: IPv6 dst despite !ipv6_available — cascade should have dropped"
+        );
 
         let mut upstream = create_bypass_tcp(dst, self.iface_index).await?;
         copy_bidirectional(flow, &mut upstream).await?;
@@ -51,11 +54,13 @@ impl Endpoint for InterfaceEndpoint {
     }
 
     async fn serve_udp(&self, mut flow: UdpFlow, dst: SocketAddr) -> io::Result<()> {
-        if dst.is_ipv6() && !self.ipv6_available {
-            debug_assert!(false, "InterfaceEndpoint::serve_udp IPv6 dst despite !ipv6_available");
-            tracing::error!(%dst, "cascade invariant violated: InterfaceEndpoint::serve_udp v6 on !v6; dropping");
-            return Ok(());
-        }
+        // Precondition mirror of `serve_tcp`: the cascade drops `Bypass` +
+        // IPv6 when `!supports_ipv6_dst()`. `ipv6_available` is immutable, so
+        // this is a true contract (zero-cost in release).
+        debug_assert!(
+            !dst.is_ipv6() || self.ipv6_available,
+            "InterfaceEndpoint::serve_udp: IPv6 dst despite !ipv6_available — cascade should have dropped"
+        );
 
         let socket = create_bypass_udp(self.iface_index, dst.is_ipv6()).await?;
         socket.connect(dst).await?;

@@ -76,10 +76,9 @@ pub fn decode_socks5_udp(data: &[u8]) -> Option<(SocketAddr, usize)> {
     let atyp = data[3];
     match atyp {
         0x01 => {
-            // IPv4: 4 bytes address
-            if data.len() < 10 {
-                return None;
-            }
+            // IPv4: 4 bytes address. The function-level `data.len() < 10`
+            // guard above already covers the minimum IPv4 datagram, so no
+            // per-arm length re-check is needed here.
             let ip = IpAddr::V4(Ipv4Addr::new(data[4], data[5], data[6], data[7]));
             let port = u16::from_be_bytes([data[8], data[9]]);
             Some((SocketAddr::new(ip, port), 10))
