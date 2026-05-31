@@ -8,8 +8,20 @@ use tracing::Instrument;
 
 use crate::plugin::ChainPlugin;
 use crate::shutdown;
+use crate::sitrep::{PluginReady, StartError, Transports};
 
 const MAX_PORT_RETRIES: usize = 3;
+
+/// Whole-chain readiness reported via [`ChainRunner::on_ready`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainReady {
+    /// The address the data-source-facing plugin is accepting on
+    /// (position 0 in Client mode, position N-1 in Server mode).
+    pub listen: SocketAddr,
+    /// End-to-end transports: the intersection across all hops. A
+    /// transport is carried only if every plugin in the chain serves it.
+    pub transports: Transports,
+}
 
 /// Direction of the SIP003 chain.
 ///
@@ -22,10 +34,13 @@ const MAX_PORT_RETRIES: usize = 3;
 /// public-facing endpoint that external clients connect to) to
 /// `SS_LOCAL_*` (the local `ssserver` instance). The plugin chain is
 /// supplied in the SAME order in both modes (data-source-side first),
-/// but garter inverts the address walk and the `on_ready` probe target
-/// so position 0 forwards to `SS_LOCAL` and position N-1 listens on
-/// `SS_REMOTE`. This is what the SIP003 spec calls "server mode" and
-/// what `ssserver --plugin <chain-runner>` requires.
+/// but garter inverts the address wiring so position 0 forwards to
+/// `SS_LOCAL` and position N-1 listens on `SS_REMOTE` (the public
+/// endpoint). Accordingly, the chain-level readiness address reported
+/// via [`ChainRunner::on_ready`] is the position N-1 plugin's listen
+/// address in Server mode (versus position 0 in Client mode). This is
+/// what the SIP003 spec calls "server mode" and what
+/// `ssserver --plugin <chain-runner>` requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
@@ -122,7 +137,7 @@ fn allocate_one_port() -> crate::Result<SocketAddr> {
 pub struct ChainRunner {
     plugins: Vec<Box<dyn ChainPlugin>>,
     drain_timeout: Duration,
-    ready_tx: Option<oneshot::Sender<SocketAddr>>,
+    ready_tx: Option<oneshot::Sender<Result<ChainReady, StartError>>>,
     external_cancel: Option<CancellationToken>,
     mode: Mode,
 }
@@ -172,16 +187,20 @@ impl ChainRunner {
         self
     }
 
-    /// Register a oneshot that fires when the first plugin in the chain is
-    /// confirmed listening on its local address.
+    /// Register a oneshot that fires when the whole chain is ready, or
+    /// with the first plugin's start error if any plugin fails to start.
     ///
-    /// Readiness is detected via a TCP connect probe, which means the plugin
-    /// will briefly accept and then see a connection reset. The probe has no
-    /// overall timeout — callers should apply their own timeout on the receiver.
+    /// Fires `Ok(ChainReady)` once EVERY plugin has reported `PluginReady`;
+    /// `Err(StartError)` as soon as any plugin reports a start failure or
+    /// exits before readying. Each plugin owns its own readiness now (it
+    /// sends through the `ready` channel passed to [`ChainPlugin::run`]);
+    /// the aggregator below collects the N per-plugin results into a single
+    /// chain-level outcome.
     ///
-    /// If the plugin exits before becoming ready, `tx` is dropped and the
-    /// receiver gets `RecvError`.
-    pub fn on_ready(mut self, tx: oneshot::Sender<SocketAddr>) -> Self {
+    /// If shutdown fires before every plugin has readied, `tx` is dropped
+    /// and the receiver gets `RecvError` (the prior "shutdown before ready"
+    /// semantics).
+    pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
     }
@@ -243,10 +262,13 @@ impl ChainRunner {
         // Capture `Copy` field before the partial move below.
         let mode = self.mode;
 
-        // Spawn all plugins. In Client mode, plugin i listens on addrs[i] and
-        // forwards to addrs[i+1]. In Server mode, the direction is inverted:
-        // plugin i listens on addrs[i+1] and forwards to addrs[i]. See `Mode`.
+        // Spawn all plugins, each with its own readiness channel. In Client
+        // mode, plugin i listens on addrs[i] and forwards to addrs[i+1]. In
+        // Server mode, the direction is inverted: plugin i listens on
+        // addrs[i+1] and forwards to addrs[i]. See `Mode`. The aggregator
+        // below collects the N per-plugin readiness results.
         let mut set = tokio::task::JoinSet::new();
+        let mut ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)> = Vec::with_capacity(n);
         for (i, plugin) in self.plugins.into_iter().enumerate() {
             let (local, remote) = match mode {
                 Mode::Client => (addrs[i], addrs[i + 1]),
@@ -254,6 +276,8 @@ impl ChainRunner {
             };
             let token = shutdown.child_token();
             let plugin_name = plugin.name().to_string();
+            let (rtx, rrx) = oneshot::channel();
+            ready_rxs.push((i, rrx));
 
             let span = tracing::info_span!(
                 "plugin",
@@ -262,27 +286,19 @@ impl ChainRunner {
                 chain_mode = ?mode,
             );
             set.spawn(async move {
-                let result = plugin.run(local, remote, token).instrument(span).await;
+                let result = plugin.run(local, remote, token, rtx).instrument(span).await;
                 (plugin_name, result)
             });
         }
 
-        // Readiness polling: probe the public-facing local address. In Client
-        // mode that is the position-0 plugin (addrs[0] = SS_LOCAL); in Server
-        // mode it is the position-(N-1) plugin (addrs[n] = SS_REMOTE).
+        // Readiness aggregator: await all N plugin results, racing the
+        // shared shutdown token so a cancel during startup doesn't hang.
+        // The aggregator body lives in a free async fn (not an inline
+        // `async move`) because `#[debug_requires]` rewrites `return` in
+        // this fn's body into `break 'run`, which is illegal across an
+        // async-block boundary; a free fn keeps the rewrite out of it.
         if let Some(ready_tx) = self.ready_tx {
-            let probe_addr = match mode {
-                Mode::Client => addrs[0],
-                Mode::Server => addrs[n],
-            };
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                if let Some(addr) = poll_ready(probe_addr, shutdown).await {
-                    let _ = ready_tx.send(addr);
-                }
-                // If poll_ready returns None (shutdown before ready), ready_tx
-                // is dropped and the receiver gets RecvError.
-            });
+            tokio::spawn(run_readiness_aggregator(ready_rxs, n, mode, shutdown.clone(), ready_tx));
         }
 
         // Phase 1: run unbounded until either all plugins exit naturally or
@@ -327,6 +343,72 @@ impl ChainRunner {
 }
 
 // Helpers =============================================================================================================
+
+/// Aggregate the N per-plugin readiness results into a single chain-level
+/// outcome on `ready_tx`.
+///
+/// Awaits each plugin's `ready` receiver in turn, racing the shared
+/// `shutdown` token so a cancel during startup doesn't hang. The
+/// position-0 plugin's reported `listen` is the chain's public address in
+/// Client mode; in Server mode it is position N-1. The chain's transports
+/// are the intersection across all hops.
+async fn run_readiness_aggregator(
+    ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
+    n: usize,
+    mode: Mode,
+    shutdown: CancellationToken,
+    ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
+) {
+    let mut plugin_listens: Vec<Option<SocketAddr>> = vec![None; n];
+    // Intersection identity (the full transport set); each plugin's
+    // reported transports narrow this. `all()` lives on the
+    // `bitflags::Flags` trait for this generated type.
+    let mut transports = <Transports as bitflags::Flags>::all();
+    let public_index = match mode {
+        Mode::Client => 0,
+        Mode::Server => n - 1,
+    };
+    for (i, rrx) in ready_rxs {
+        let outcome = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                // Shutdown before all plugins readied → drop ready_tx;
+                // receiver gets RecvError. Matches the old "shutdown before
+                // ready" semantics.
+                return;
+            }
+            r = rrx => r,
+        };
+        match outcome {
+            Ok(Ok(pr)) => {
+                plugin_listens[i] = Some(pr.listen);
+                transports &= pr.transports;
+            }
+            Ok(Err(start_err)) => {
+                let _ = ready_tx.send(Err(start_err));
+                return;
+            }
+            Err(_recv) => {
+                // Plugin dropped its sender unsent → it exited before
+                // readying. Synthesize a process-exit Fatal. This is the
+                // START-GATE channel; the SAME exit is independently
+                // observed by the Phase-1 record_exit loop, which sets
+                // first_error + cancels — that is the LIFECYCLE channel that
+                // becomes run()'s return. The two are intentionally separate
+                // observers of one event (typed cause to on_ready AND
+                // lifecycle error to teardown). Do NOT try to reconcile them
+                // into one value.
+                let _ = ready_tx.send(Err(StartError::Fatal {
+                    detail: "plugin exited before becoming ready".into(),
+                    errno: None,
+                }));
+                return;
+            }
+        }
+    }
+    let listen = plugin_listens[public_index].expect("public plugin must have reported a listen address");
+    let _ = ready_tx.send(Ok(ChainReady { listen, transports }));
+}
 
 /// Shared handler for a single plugin-task exit result. Updates
 /// `first_error` on a first-write-wins basis and fires `shutdown` so the

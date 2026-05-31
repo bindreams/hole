@@ -5,6 +5,7 @@ pub mod error;
 pub mod plugin;
 pub mod shutdown;
 pub mod sip003;
+pub mod sitrep;
 pub mod tap;
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -12,13 +13,14 @@ pub mod test_utils;
 #[doc(hidden)]
 pub mod tracing_test;
 
-pub use binary::{BinaryPlugin, PidSink};
-pub use chain::{ChainRunner, Mode};
+pub use binary::{BinaryPlugin, PidSink, ReadinessMode};
+pub use chain::{ChainReady, ChainRunner, Mode};
 pub use counting::{CountingStream, StreamCounters};
 pub use error::{Error, Result};
 pub use plugin::ChainPlugin;
 pub use sip003::parse_plugin_options;
 pub use sip003::PluginEnv;
+pub use sitrep::{PluginReady, ProtocolSupport, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 pub use tap::TapPlugin;
 
 #[cfg(test)]
@@ -35,6 +37,8 @@ mod plugin_tests;
 mod shutdown_tests;
 #[cfg(test)]
 mod sip003_tests;
+#[cfg(test)]
+mod sitrep_tests;
 #[cfg(test)]
 mod tap_tests;
 #[cfg(test)]

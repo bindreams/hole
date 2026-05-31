@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chain::{allocate_ports, ChainRunner};
 use crate::plugin::ChainPlugin;
+use crate::sitrep::{PluginReady, StartError, Transports};
 
 // Port allocation tests ===============================================================================================
 
@@ -139,7 +140,10 @@ impl ChainPlugin for InstantPlugin {
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
+        // Exits immediately without ever readying; dropping `_ready` unsent
+        // is the "exited before ready" backstop the aggregator handles.
         Ok(())
     }
 }
@@ -160,8 +164,49 @@ impl ChainPlugin for ListeningPlugin {
         local: SocketAddr,
         _remote: SocketAddr,
         shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
-        let _listener = tokio::net::TcpListener::bind(local).await?;
+        let listener = tokio::net::TcpListener::bind(local).await?;
+        let actual = listener.local_addr().unwrap_or(local);
+        let _ = ready.send(Ok(PluginReady {
+            listen: actual,
+            transports: Transports::TCP,
+        }));
+        let _listener = listener;
+        shutdown.cancelled().await;
+        Ok(())
+    }
+}
+
+/// Plugin that binds a TCP listener, reports a caller-chosen transport
+/// set on readiness, then waits for shutdown. Used to exercise the
+/// aggregator's transports-intersection across hops without a real
+/// subprocess.
+struct TransportsPlugin {
+    name: String,
+    transports: Transports,
+}
+
+#[async_trait::async_trait]
+impl ChainPlugin for TransportsPlugin {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    ) -> crate::Result<()> {
+        let listener = tokio::net::TcpListener::bind(local).await?;
+        let actual = listener.local_addr().unwrap_or(local);
+        let _ = ready.send(Ok(PluginReady {
+            listen: actual,
+            transports: self.transports,
+        }));
+        let _listener = listener;
         shutdown.cancelled().await;
         Ok(())
     }
@@ -181,7 +226,10 @@ impl ChainPlugin for FailingPlugin {
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
+        // Fails before readying; dropping `_ready` unsent is the
+        // "exited before ready" backstop.
         Err(crate::Error::PluginExit {
             name: "failing".into(),
             code: 1,
@@ -207,6 +255,7 @@ impl ChainPlugin for StubbornPlugin {
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         std::future::pending::<crate::Result<()>>().await
     }
@@ -227,6 +276,7 @@ impl ChainPlugin for PanickingPlugin {
         _local: SocketAddr,
         _remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         panic!("deliberate panic for testing")
     }
@@ -275,10 +325,13 @@ async fn on_ready_fires_with_local_addr() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // rx fires with the local address once the plugin is listening.
-    let ready_addr = rx.await.expect("ready_tx was dropped without sending");
+    // rx fires with the chain-ready payload once every plugin is listening.
+    let chain_ready = rx
+        .await
+        .expect("ready_tx was dropped without sending")
+        .expect("chain should be ready, not a start error");
 
-    assert_eq!(ready_addr.port(), addr.port());
+    assert_eq!(chain_ready.listen.port(), addr.port());
 
     // Clean up: abort the chain (it's waiting for shutdown).
     handle.abort();
@@ -295,16 +348,71 @@ async fn on_ready_dropped_on_plugin_failure() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // The plugin fails immediately, so ready_tx is dropped → rx gets RecvError.
-    let result = rx.await;
-    assert!(
-        result.is_err(),
-        "rx should get RecvError when plugin fails before ready"
-    );
+    // The plugin exits before readying, so the aggregator synthesizes a
+    // process-exit `StartError::Fatal` and sends it through ready_tx.
+    let outcome = rx.await.expect("aggregator should report a start error, not drop");
+    match outcome {
+        Err(StartError::Fatal { detail, .. }) => {
+            assert!(
+                detail.contains("exited before becoming ready"),
+                "expected exited-before-ready Fatal, got: {detail}"
+            );
+        }
+        other => panic!("expected StartError::Fatal, got {other:?}"),
+    }
 
     // The chain should have returned an error.
     let chain_result = handle.await.unwrap();
     assert!(chain_result.is_err());
+}
+
+/// The aggregator reports the end-to-end transports as the intersection
+/// across every hop: a transport is carried only if EVERY plugin serves
+/// it. Here a TCP|UDP hop and a TCP-only hop must intersect to TCP. The
+/// `listen` must be the position-0 plugin's (Client mode), not whichever
+/// readied first.
+#[skuld::test]
+async fn on_ready_transports_are_intersection_across_hops() {
+    let (tx, rx) = oneshot::channel();
+
+    // Position 0 is the chain-public hop; it serves TCP+UDP. Position 1
+    // (downstream) is TCP-only, so the end-to-end set narrows to TCP.
+    let addrs = allocate_ports(1).unwrap();
+    let public_addr = addrs[0];
+
+    let runner = ChainRunner::new()
+        .add(Box::new(TransportsPlugin {
+            name: "public".into(),
+            transports: Transports::TCP | Transports::UDP,
+        }))
+        .add(Box::new(TransportsPlugin {
+            name: "downstream".into(),
+            transports: Transports::TCP,
+        }))
+        .on_ready(tx);
+
+    let mut env = test_env();
+    env.local_port = public_addr.port();
+
+    let handle = tokio::spawn(runner.run(env));
+
+    let chain_ready = rx
+        .await
+        .expect("ready_tx dropped")
+        .expect("chain should be ready, not a start error");
+
+    assert_eq!(
+        chain_ready.transports,
+        Transports::TCP,
+        "end-to-end transports must be the intersection (TCP+UDP ∩ TCP = TCP)"
+    );
+    assert_eq!(
+        chain_ready.listen.port(),
+        public_addr.port(),
+        "Client-mode listen must be the position-0 (public) plugin's bind, not whichever readied first"
+    );
+
+    handle.abort();
 }
 
 // External cancellation tests =========================================================================================
@@ -328,7 +436,10 @@ async fn cancel_token_triggers_graceful_shutdown() {
     let handle = tokio::spawn(runner.run(env));
 
     // Wait for the plugin to actually bind (no sleep race).
-    ready_rx.await.expect("plugin should become ready");
+    ready_rx
+        .await
+        .expect("ready_tx dropped")
+        .expect("plugin should become ready");
 
     // Cancel externally.
     cancel.cancel();
@@ -363,6 +474,7 @@ impl ChainPlugin for RecordingPlugin {
         local: SocketAddr,
         remote: SocketAddr,
         _shutdown: CancellationToken,
+        _ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         *self.record.lock().unwrap() = Some((local, remote));
         Ok(())
@@ -453,11 +565,11 @@ async fn chain_runner_server_mode_inverts_on_ready_probe_target() {
     };
 
     let handle = tokio::spawn(runner.run(env));
-    let ready_addr = rx.await.expect("ready_tx dropped");
+    let chain_ready = rx.await.expect("ready_tx dropped").expect("chain should be ready");
     assert_eq!(
-        ready_addr.port(),
+        chain_ready.listen.port(),
         listen_addr.port(),
-        "on_ready in Server mode must probe SS_REMOTE (outer's local), not SS_LOCAL (inner's remote)"
+        "on_ready in Server mode must report SS_REMOTE (outer's local), not SS_LOCAL (inner's remote)"
     );
     handle.abort();
 }

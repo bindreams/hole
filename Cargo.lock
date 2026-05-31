@@ -2190,6 +2190,7 @@ dependencies = [
  "garter",
  "hole-test-observability",
  "libc",
+ "serde_json",
  "sha2 0.11.0",
  "skuld",
  "tempfile",
@@ -2204,12 +2205,16 @@ dependencies = [
 
 [[package]]
 name = "garter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
+ "bitflags 2.11.1",
  "contracts",
  "hole-test-observability",
  "libc",
+ "semver",
+ "serde",
+ "serde_json",
  "skuld",
  "socket2",
  "thiserror 2.0.18",
@@ -2222,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "garter-bin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "garter",
@@ -3950,6 +3955,8 @@ dependencies = [
 name = "mock-plugin"
 version = "0.1.0"
 dependencies = [
+ "garter",
+ "serde_json",
  "tokio",
 ]
 

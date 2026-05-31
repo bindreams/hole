@@ -753,7 +753,35 @@ impl garter::ChainPlugin for YamuxPlugin {
         local: SocketAddr,
         remote: SocketAddr,
         shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<garter::PluginReady, garter::StartError>>,
     ) -> garter::Result<()> {
+        // Self-probe readiness: a YAMUX plugin serves both TCP and UDP at
+        // its local listener. Spawn a TCP-connect probe against `local`; on
+        // success report TCP|UDP readiness, on shutdown-first drop `ready`
+        // unsent (RecvError — the "shutdown before ready" semantics).
+        //
+        // This is galoshes' INTERNAL hop-readiness signal: it feeds
+        // galoshes' OWN `ChainRunner` aggregator, which intersects it with
+        // the inner v2ray hop and fires the chain-level `on_ready`. The
+        // PROCESS-level sitrep the bridge reads is emitted separately in
+        // `main.rs` off that `on_ready` outcome (see `galoshes::sitrep_out`).
+        // This probe knows only its own hop, not the chain, so it cannot
+        // own the process-stdout contract.
+        //
+        // A future refinement could replace the TCP-connect probe with a
+        // structured `ready` emitted from inside run_server/run_client at
+        // the exact bind point; the probe is the current pragmatic stand-in.
+        let probe_local = local;
+        let probe_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if probe_tcp_ready(probe_local, &probe_shutdown).await {
+                let _ = ready.send(Ok(garter::PluginReady {
+                    listen: probe_local,
+                    transports: garter::Transports::TCP | garter::Transports::UDP,
+                }));
+            }
+        });
+
         let result = if self.is_server {
             run_server(self.config, local, remote, shutdown, None).await
         } else {
@@ -761,5 +789,30 @@ impl garter::ChainPlugin for YamuxPlugin {
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))
+    }
+}
+
+/// TCP-connect probe with exponential backoff. Returns `true` once `addr`
+/// accepts a connection, `false` if shutdown fires first. Mirrors garter's
+/// internal `poll_ready` (not exported), used to detect the YAMUX local
+/// listener coming up.
+async fn probe_tcp_ready(addr: SocketAddr, shutdown: &CancellationToken) -> bool {
+    let mut delay = Duration::from_millis(10);
+    let max_delay = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            result = TcpStream::connect(addr) => {
+                if result.is_ok() {
+                    return true;
+                }
+            }
+            () = shutdown.cancelled() => return false,
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {
+                delay = (delay * 2).min(max_delay);
+            }
+            () = shutdown.cancelled() => return false,
+        }
     }
 }

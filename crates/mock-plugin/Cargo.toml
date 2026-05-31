@@ -9,4 +9,6 @@ publish = false
 workspace = true
 
 [dependencies]
+garter = { path = "../garter" }
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }
