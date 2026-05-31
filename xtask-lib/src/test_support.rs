@@ -1,5 +1,5 @@
 //! Test-only helpers shared across `version_tests.rs` and
-//! `v2ray_plugin_version_tests.rs`. Compiled only under `#[cfg(test)]`.
+//! `ex_ray_version_tests.rs`. Compiled only under `#[cfg(test)]`.
 
 use std::path::Path;
 use std::process::Command;

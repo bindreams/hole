@@ -112,10 +112,11 @@ pub enum Command {
     Deps,
     /// Print or validate the workspace version for a release group.
     ///
-    /// Each release group (`hole`, `garter`, `galoshes`, `v2ray-plugin`)
+    /// Each release group (`hole`, `garter`, `galoshes`, `ex-ray`)
     /// has its own version, declared in member Cargo.tomls via
-    /// `[package.metadata.hole-release].group` and validated against the
-    /// nearest `releases/<group>/v<X.Y.Z>` git tag.
+    /// `[package.metadata.hole-release].group` (or, for `ex-ray`, in
+    /// `crates/ex-ray/version.toml`) and validated against the nearest
+    /// `releases/<group>/v<X.Y.Z>` git tag.
     Version {
         /// Release group to operate on. Required for `--check`. Without
         /// `--group`, prints a table of every group's resolved version.

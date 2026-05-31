@@ -8,7 +8,7 @@
 //! `msi-installer/src/msi_installer/__init__.py::get_version`, and
 //! `scripts/check-version.py`. This crate is the single source of truth.
 
-pub mod v2ray_plugin_version;
+pub mod ex_ray_version;
 pub mod version;
 
 #[cfg(test)]
@@ -19,8 +19,8 @@ mod test_support;
 mod version_tests;
 
 #[cfg(test)]
-#[path = "v2ray_plugin_version_tests.rs"]
-mod v2ray_plugin_version_tests;
+#[path = "ex_ray_version_tests.rs"]
+mod ex_ray_version_tests;
 
 #[cfg(test)]
 fn main() {

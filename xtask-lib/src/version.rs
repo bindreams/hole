@@ -16,12 +16,13 @@
 //! - **Tag version**: the nearest ancestor tag matching the group's tag
 //!   glob (`releases/<group>/v<X.Y.Z>`), parsed back into strict semver.
 //!
-//! The non-Rust `v2ray-plugin` group is handled by a separate module
-//! [`crate::v2ray_plugin_version`] which implements its own shape rules
-//! (lineage-aware, allowing `X.Y.Z-hole.N` pre-release) and sequence
-//! enforcement. The dispatcher entry points in this module
-//! ([`cargo_toml_version_for_group`], [`validate_against_tag`]) branch on
-//! `Group::V2rayPlugin` and delegate to that module.
+//! The non-Rust `ex-ray` group has no Cargo.toml — it is a first-party Go
+//! crate whose version lives in `crates/ex-ray/version.toml`. The
+//! dispatcher entry point [`cargo_toml_version_for_group`] reads that file
+//! via [`crate::ex_ray_version::read_version`]; otherwise `ex-ray` is a
+//! plain-semver group validated identically to hole/garter/galoshes
+//! (`is_valid_next` one-bump-ahead rule, strict `releases/ex-ray/v<X.Y.Z>`
+//! tags). No lineage / pre-release scheme applies.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -38,7 +39,7 @@ pub enum Group {
     Hole,
     Garter,
     Galoshes,
-    V2rayPlugin,
+    ExRay,
 }
 
 impl Group {
@@ -47,7 +48,7 @@ impl Group {
             Self::Hole => "hole",
             Self::Garter => "garter",
             Self::Galoshes => "galoshes",
-            Self::V2rayPlugin => "v2ray-plugin",
+            Self::ExRay => "ex-ray",
         }
     }
 
@@ -56,13 +57,13 @@ impl Group {
             "hole" => Ok(Self::Hole),
             "garter" => Ok(Self::Garter),
             "galoshes" => Ok(Self::Galoshes),
-            "v2ray-plugin" => Ok(Self::V2rayPlugin),
-            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, v2ray-plugin)"),
+            "ex-ray" => Ok(Self::ExRay),
+            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, ex-ray)"),
         }
     }
 
     pub fn all() -> &'static [Group] {
-        &[Self::Hole, Self::Garter, Self::Galoshes, Self::V2rayPlugin]
+        &[Self::Hole, Self::Garter, Self::Galoshes, Self::ExRay]
     }
 
     /// `git describe --match <this>` glob for nearest-tag lookups for this
@@ -93,8 +94,10 @@ pub struct WorkspaceVersions {
 
 /// Read every workspace member, parse their group metadata, enforce
 /// drift-prevention (publishable-but-ungrouped crates are rejected) and
-/// within-group version equality. Also reads
-/// `external/v2ray-plugin/version.toml` for the v2ray-plugin group.
+/// within-group version equality. The `ex-ray` group has no Cargo.toml
+/// member; its version is served separately by
+/// [`crate::ex_ray_version::read_version`] (see
+/// [`cargo_toml_version_for_group`]).
 pub fn read_workspace_versions(repo_root: &Path) -> Result<WorkspaceVersions> {
     let root_toml = repo_root.join("Cargo.toml");
     let root_text =
@@ -164,12 +167,10 @@ pub fn read_workspace_versions(repo_root: &Path) -> Result<WorkspaceVersions> {
         by_group.insert(group, entries.into_iter().next().unwrap().1);
     }
 
-    // V2rayPlugin is NOT populated here — it's served by
-    // `crate::v2ray_plugin_version` via the per-group dispatcher in
-    // `cargo_toml_version_for_group`. Keeping it out of this map avoids
-    // baking the strict-semver shape rules of the workspace-member groups
-    // into a code path that has to accommodate v2ray-plugin's looser
-    // `hole.N` pre-release form.
+    // ExRay is NOT populated here — it has no Cargo.toml workspace member.
+    // Its version comes from `crates/ex-ray/version.toml` via the per-group
+    // dispatcher in `cargo_toml_version_for_group`
+    // (`crate::ex_ray_version::read_version`).
 
     Ok(WorkspaceVersions { by_group })
 }
@@ -215,12 +216,13 @@ fn parse_strict_version(package: &toml::Table, cargo_path: &Path) -> Result<Vers
 /// Convenience: return the version for `group`.
 ///
 /// For Cargo.toml-based groups (Hole, Garter, Galoshes), reads workspace
-/// members via `read_workspace_versions`. For `Group::V2rayPlugin`,
-/// delegates to [`crate::v2ray_plugin_version::read_version`] which has
-/// its own shape rules (allows `X.Y.Z-hole.N` pre-release).
+/// members via `read_workspace_versions`. For `Group::ExRay` (a Go crate
+/// with no Cargo.toml), delegates to
+/// [`crate::ex_ray_version::read_version`] which reads
+/// `crates/ex-ray/version.toml`. Both paths return plain strict semver.
 pub fn cargo_toml_version_for_group(repo_root: &Path, group: Group) -> Result<Version> {
-    if group == Group::V2rayPlugin {
-        return crate::v2ray_plugin_version::read_version(repo_root);
+    if group == Group::ExRay {
+        return crate::ex_ray_version::read_version(repo_root);
     }
     let ws = read_workspace_versions(repo_root)?;
     ws.by_group
@@ -255,8 +257,8 @@ fn nearest_ancestor_tag(repo_root: &Path, group: Group) -> Result<Option<(Versio
 /// Enumerate every `releases/<group>/v...` tag that is an ancestor of HEAD,
 /// parsed to its semver and paired with its full tag name. Returned order
 /// is unsorted — callers that only need the highest can call
-/// `nearest_ancestor_tag` instead; callers that need the full set (e.g.
-/// the v2ray-plugin sequence-no-gap check) call this directly.
+/// `nearest_ancestor_tag` instead; callers that need the full set call this
+/// directly.
 ///
 /// Malformed tags matching the glob are silently skipped — a hand-created
 /// `releases/hole/v1.0.0-rc1` does not poison the lookup.
@@ -302,40 +304,26 @@ fn parse_tag_to_version(tag: &str, group: Group) -> Result<Version> {
     let semver_str = tag
         .strip_prefix(&prefix)
         .ok_or_else(|| anyhow!("tag '{tag}' does not start with '{prefix}'"))?;
-    match group {
-        Group::V2rayPlugin => {
-            // V2rayPlugin tags allow `X.Y.Z-hole.N` pre-release (and bare
-            // `X.Y.Z`); the shape rules live in v2ray_plugin_version.
-            crate::v2ray_plugin_version::parse_version_string(semver_str)
-                .with_context(|| format!("tag '{tag}' does not match v2ray-plugin shape"))
-        }
-        Group::Hole | Group::Garter | Group::Galoshes => {
-            let parsed =
-                Version::parse(semver_str).with_context(|| format!("tag '{tag}' is not valid semver after prefix"))?;
-            if !parsed.pre.is_empty() || !parsed.build.is_empty() {
-                bail!("tag '{tag}' must be strict releases/<group>/vMAJOR.MINOR.PATCH");
-            }
-            Ok(parsed)
-        }
+    // All four groups (including ex-ray, a first-party Go crate) use strict
+    // `MAJOR.MINOR.PATCH` release tags — no pre-release / build lineage.
+    let parsed = Version::parse(semver_str).with_context(|| format!("tag '{tag}' is not valid semver after prefix"))?;
+    if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+        bail!("tag '{tag}' must be strict releases/<group>/vMAJOR.MINOR.PATCH");
     }
+    Ok(parsed)
 }
 
 /// Validate the group's declared version against the relevant tag(s).
 ///
-/// For Cargo.toml-based groups (Hole, Garter, Galoshes):
-/// - With `exact`: Cargo.toml version must equal the nearest ancestor tag.
+/// Applies uniformly to all four groups (Hole, Garter, Galoshes, ExRay).
+/// The only per-group difference is the version source —
+/// [`cargo_toml_version_for_group`] reads Cargo.toml for the first three
+/// and `crates/ex-ray/version.toml` for ExRay — after which the rules are
+/// identical:
+/// - With `exact`: declared version must equal the nearest ancestor tag.
 /// - Without `exact`: equality or one-patch/minor/major-bump ahead per
 ///   [`is_valid_next`]. Bootstrap state (no tag yet) is permissive.
-///
-/// For [`Group::V2rayPlugin`]: delegates to
-/// [`crate::v2ray_plugin_version::validate_against_tag`] which enforces
-/// shape (`X.Y.Z` or `X.Y.Z-hole.N`) and sequence-no-gap rules. The
-/// `is_valid_next` "one-bump-ahead" rule does NOT apply to v2ray-plugin.
 pub fn validate_against_tag(repo_root: &Path, group: Group, exact: bool) -> Result<Version> {
-    if group == Group::V2rayPlugin {
-        return crate::v2ray_plugin_version::validate_against_tag(repo_root, exact);
-    }
-
     let cargo_ver = cargo_toml_version_for_group(repo_root, group)?;
     let Some(tag_ver) = nearest_tag_version(repo_root, group)? else {
         if exact {
