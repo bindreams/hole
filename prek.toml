@@ -35,6 +35,34 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
+id = "go-fmt"
+name = "golangci-lint fmt (ex-ray)"
+# prek (0.3.6) has no per-hook working-directory field, so this `cd`s into the
+# Go module via a bash wrapper. golangci-lint is provisioned by
+# `cargo xtask deps` into .cache/ — referenced by absolute path (resolved from
+# the repo root via `git rev-parse`) so there's no PATH dependency and the hook
+# behaves identically locally and in CI. `fmt --diff` is check-only (the v2
+# formatters/gofumpt run). `crates/ex-ray` is the only Go module today; if a
+# second appears, extend this hook (Task 12's grep catches strays).
+entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" fmt --diff'"
+language = "system"
+# types=["go"] means the hook is SKIPPED when no .go file is staged (same as the
+# Rust hooks). A `.golangci.yml`-only change still surfaces in CI's --all-files run.
+types = ["go"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "go-lint"
+name = "golangci-lint run (ex-ray)"
+# `run` = the v2 linters (incl. govet, which subsumes `go vet`). `fmt` and `run`
+# are both needed — golangci-lint v2 separates formatting from linting. Same
+# bash-wrapper + absolute-cache-path rationale as `go-fmt` above.
+entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" run'"
+language = "system"
+types = ["go"]
+pass_filenames = false
+
+[[repos.hooks]]
 id = "check-version-hole"
 name = "check hole group Cargo.toml version vs git tag"
 entry = "cargo xtask version --check --group hole"
@@ -108,7 +136,7 @@ hooks = [
 repo = "https://github.com/editorconfig-checker/editorconfig-checker.python"
 rev = "3.2.1"
 hooks = [
-  { id = "editorconfig-checker", exclude_types = ["rust", "markdown", "python"] },
+  { id = "editorconfig-checker", exclude_types = ["rust", "markdown", "python", "go"] },
 ]
 
 [[repos]]

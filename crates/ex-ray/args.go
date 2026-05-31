@@ -3,16 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"net"
 	"os"
-	"sort"
-	"strings"
 )
-
-func isIPv6(str string) bool {
-	ip := net.ParseIP(str)
-	return ip != nil && strings.Contains(str, ":")
-}
 
 // Key–value mappings for the representation of client and server options.
 
@@ -66,35 +58,35 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 // Parse SS_PLUGIN options from environment variables
 func parseEnv() (opts Args, err error) {
 	opts = make(Args)
-	ss_remote_host := os.Getenv("SS_REMOTE_HOST")
-	ss_remote_port := os.Getenv("SS_REMOTE_PORT")
-	ss_local_host := os.Getenv("SS_LOCAL_HOST")
-	ss_local_port := os.Getenv("SS_LOCAL_PORT")
-	if len(ss_remote_host) == 0 {
+	ssRemoteHost := os.Getenv("SS_REMOTE_HOST")
+	ssRemotePort := os.Getenv("SS_REMOTE_PORT")
+	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
+	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
+	if len(ssRemoteHost) == 0 {
 		return
 	}
-	if len(ss_remote_port) == 0 {
+	if len(ssRemotePort) == 0 {
 		return
 	}
-	if len(ss_local_host) == 0 {
+	if len(ssLocalHost) == 0 {
 		return
 	}
-	if len(ss_local_port) == 0 {
+	if len(ssLocalPort) == 0 {
 		return
 	}
 
-	opts.Add("remoteAddr", ss_remote_host)
-	opts.Add("remotePort", ss_remote_port)
-	opts.Add("localAddr", ss_local_host)
-	opts.Add("localPort", ss_local_port)
+	opts.Add("remoteAddr", ssRemoteHost)
+	opts.Add("remotePort", ssRemotePort)
+	opts.Add("localAddr", ssLocalHost)
+	opts.Add("localPort", ssLocalPort)
 
-	ss_plugin_options := os.Getenv("SS_PLUGIN_OPTIONS")
-	if len(ss_plugin_options) > 0 {
-		other_opts, err := parsePluginOptions(ss_plugin_options)
+	ssPluginOptions := os.Getenv("SS_PLUGIN_OPTIONS")
+	if len(ssPluginOptions) > 0 {
+		otherOpts, err := parsePluginOptions(ssPluginOptions)
 		if err != nil {
 			return nil, err
 		}
-		for k, v := range other_opts {
+		for k, v := range otherOpts {
 			opts[k] = v
 		}
 	}
@@ -151,46 +143,4 @@ func parsePluginOptions(s string) (opts Args, err error) {
 		i++
 	}
 	return opts, nil
-}
-
-// Escape backslashes and all the bytes that are in set.
-func backslashEscape(s string, set []byte) string {
-	var buf bytes.Buffer
-	for _, b := range []byte(s) {
-		if b == '\\' || bytes.IndexByte(set, b) != -1 {
-			buf.WriteByte('\\')
-		}
-		buf.WriteByte(b)
-	}
-	return buf.String()
-}
-
-// Encode a name–value mapping so that it is suitable to go in the ARGS option
-// of an SMETHOD line. The output is sorted by key. The "ARGS:" prefix is not
-// added.
-//
-// "Equal signs and commas [and backslashes] must be escaped with a backslash."
-func encodeSmethodArgs(args Args) string {
-	if args == nil {
-		return ""
-	}
-
-	keys := make([]string, 0, len(args))
-	for key := range args {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	escape := func(s string) string {
-		return backslashEscape(s, []byte{'=', ','})
-	}
-
-	var pairs []string
-	for _, key := range keys {
-		for _, value := range args[key] {
-			pairs = append(pairs, escape(key)+"="+escape(value))
-		}
-	}
-
-	return strings.Join(pairs, ",")
 }

@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  # `standard` = errcheck, govet, ineffassign, staticcheck, unused.
+  # govet subsumes the old `go vet` hook; ineffassign is already in the set
+  # (do NOT also list it under `enable`).
+  default: standard
+  enable:
+    - revive
+    - misspell
+    - unconvert
+  # gosec is deliberately OFF. Task 1 ported `generateConfig` / `readCertificate`
+  # verbatim from upstream v2ray-plugin, and gosec would fire G102 (all-interface
+  # bind), G304 (variable file path) and os.Exit findings on faithful-copy code.
+  # Enabling it would require pre-declared //nolint:gosec exclusions on the port;
+  # deferred as a follow-up (see Task-1b plan). Leave off until intentionally
+  # audited.
+
+formatters:
+  # gofumpt is a strict superset of gofmt. `golangci-lint fmt` formats; the
+  # `go-fmt` prek hook runs `fmt --diff` (check-only). Authoritative for Go
+  # formatting (so `.editorconfig`/editorconfig-checker excludes Go).
+  enable:
+    - gofumpt

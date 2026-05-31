@@ -23,12 +23,16 @@ clap = { version = "4", features = ["derive"] }
 glob = "0.3"
 xtask-lib = { path = "../xtask-lib" }
 
-# `cargo xtask wintun` (Windows-only at runtime, but the deps are unconditional
-# so the workspace `cargo check` is identical across platforms — easier to keep
-# everyone on the same lockfile).
+# `cargo xtask wintun` / `cargo xtask golangci-lint` (download + extract +
+# SHA256-verify runtime/lint binaries). Deps are unconditional so the workspace
+# `cargo check` is identical across platforms — easier to keep everyone on the
+# same lockfile. golangci-lint ships `.zip` (windows) and `.tar.gz`
+# (linux/darwin) archives, so we need both `zip` and `flate2`+`tar`.
 sha2 = "0.11"
 ureq = "3"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
 
 # `cargo xtask build|test|list` (build.yaml manifest + DAG orchestration).
 serde = { version = "1", features = ["derive"] }

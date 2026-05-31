@@ -1,3 +1,6 @@
+// Command ex-ray is a first-party SIP003 shadowsocks plugin built on
+// v2ray-core. It is wire-compatible with shadowsocks/v2ray-plugin servers
+// and clients; see README.md for the design rationale.
 package main
 
 import (
@@ -15,7 +18,6 @@ import (
 var VERSION = "ex-ray"
 
 func startV2Ray() (core.Server, error) {
-
 	opts, err := parseEnv()
 
 	if err == nil {

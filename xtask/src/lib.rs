@@ -13,6 +13,7 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod galoshes;
+pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
@@ -91,9 +92,14 @@ pub enum Command {
     ///
     /// Output goes into `<repo>/.cache/wintun/`. No-op on non-Windows.
     Wintun,
+    /// Download and verify the golangci-lint binary for the host platform.
+    ///
+    /// Output goes into `<repo>/.cache/golangci-lint/<version>/`. Used by the
+    /// `go-fmt` / `go-lint` prek hooks against the `crates/ex-ray/` Go module.
+    GolangciLint,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
-    /// Currently: `v2ray-plugin` + `galoshes` + `wintun`.
+    /// Currently: `v2ray-plugin` + `galoshes` + `wintun` + `golangci-lint`.
     Deps,
     /// Print or validate the workspace version for a release group.
     ///
@@ -186,6 +192,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::V2rayPlugin => run_v2ray_plugin(),
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
+        Command::GolangciLint => run_golangci_lint(),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -225,10 +232,18 @@ pub fn run_galoshes() -> Result<()> {
     Ok(())
 }
 
+pub fn run_golangci_lint() -> Result<()> {
+    let repo_root = repo_root()?;
+    let path = golangci_lint::ensure(&repo_root)?;
+    println!("xtask: golangci-lint at {}", path.display());
+    Ok(())
+}
+
 pub fn run_deps() -> Result<()> {
     run_v2ray_plugin()?;
     run_galoshes()?;
     run_wintun()?;
+    run_golangci_lint()?;
     Ok(())
 }
 

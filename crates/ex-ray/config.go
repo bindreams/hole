@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/proto" //nolint:staticcheck // SA1019: derived verbatim from upstream v2ray-plugin, which still uses the v1 proto package; `transportSettings proto.Message` is only handed to v2ray-core's serial.ToTypedMessage. Migrating to google.golang.org/protobuf/proto would drop a direct go.mod dependency, out of scope for the quality-gate task.
 	"google.golang.org/protobuf/types/known/anypb"
 
 	_ "github.com/v2fly/v2ray-core/v5/app/proxyman/inbound"
@@ -228,27 +228,27 @@ func generateConfig() (*core.Config, error) {
 			}},
 			App: apps,
 		}, nil
-	} else {
-		senderConfig := proxyman.SenderConfig{StreamSettings: &streamConfig}
-		if connectionReuse {
-			senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: uint32(*mux)}
-		}
-		return &core.Config{
-			Inbound: []*core.InboundHandlerConfig{{
-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: net.SinglePortRange(lport),
-					Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
-				}),
-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(net.LocalHostIP),
-					Networks: []net.Network{net.Network_TCP},
-				}),
-			}},
-			Outbound: []*core.OutboundHandlerConfig{{
-				SenderSettings: serial.ToTypedMessage(&senderConfig),
-				ProxySettings:  outboundProxy,
-			}},
-			App: apps,
-		}, nil
 	}
+
+	senderConfig := proxyman.SenderConfig{StreamSettings: &streamConfig}
+	if connectionReuse {
+		senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: uint32(*mux)}
+	}
+	return &core.Config{
+		Inbound: []*core.InboundHandlerConfig{{
+			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+				PortRange: net.SinglePortRange(lport),
+				Listen:    net.NewIPOrDomain(net.ParseAddress(*localAddr)),
+			}),
+			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+				Address:  net.NewIPOrDomain(net.LocalHostIP),
+				Networks: []net.Network{net.Network_TCP},
+			}),
+		}},
+		Outbound: []*core.OutboundHandlerConfig{{
+			SenderSettings: serial.ToTypedMessage(&senderConfig),
+			ProxySettings:  outboundProxy,
+		}},
+		App: apps,
+	}, nil
 }
