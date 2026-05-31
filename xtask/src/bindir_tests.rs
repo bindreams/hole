@@ -27,17 +27,17 @@ fn fake_repo() -> tempfile::TempDir {
         }
     }
 
-    // .cache/v2ray-plugin/v2ray-plugin-<triple>{.exe} — exactly one match
-    let v2ray = root.join(".cache").join("v2ray-plugin");
-    fs::create_dir_all(&v2ray).unwrap();
-    let v2ray_name = if cfg!(windows) {
-        "v2ray-plugin-x86_64-pc-windows-msvc.exe"
+    // .cache/ex-ray/ex-ray-<triple>{.exe} — exactly one match
+    let ex_ray = root.join(".cache").join("ex-ray");
+    fs::create_dir_all(&ex_ray).unwrap();
+    let ex_ray_name = if cfg!(windows) {
+        "ex-ray-x86_64-pc-windows-msvc.exe"
     } else if cfg!(target_arch = "aarch64") {
-        "v2ray-plugin-aarch64-apple-darwin"
+        "ex-ray-aarch64-apple-darwin"
     } else {
-        "v2ray-plugin-x86_64-apple-darwin"
+        "ex-ray-x86_64-apple-darwin"
     };
-    fs::write(v2ray.join(v2ray_name), b"fake v2ray-plugin").unwrap();
+    fs::write(ex_ray.join(ex_ray_name), b"fake ex-ray").unwrap();
 
     // target/release/galoshes{.exe} (unified workspace target dir)
     let galoshes = root.join("target").join("release");
@@ -75,7 +75,7 @@ fn bindir_contains_expected_files() {
         vec![
             "hole.exe",
             "hole.pdb",
-            "v2ray-plugin.exe",
+            "ex-ray.exe",
             "galoshes.exe",
             "wintun.dll",
             "NOTICES.md"
@@ -83,13 +83,10 @@ fn bindir_contains_expected_files() {
     );
 
     #[cfg(target_os = "macos")]
-    assert_eq!(
-        names,
-        vec!["hole", "hole.dSYM", "v2ray-plugin", "galoshes", "NOTICES.md"]
-    );
+    assert_eq!(names, vec!["hole", "hole.dSYM", "ex-ray", "galoshes", "NOTICES.md"]);
 
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    assert_eq!(names, vec!["hole", "v2ray-plugin", "galoshes", "NOTICES.md"]);
+    assert_eq!(names, vec!["hole", "ex-ray", "galoshes", "NOTICES.md"]);
 }
 
 #[skuld::test]
@@ -114,23 +111,20 @@ fn bindir_uses_correct_profile_dir() {
 
     // Sidecar paths are profile-independent (they live in .cache/, not target/).
     // Look up by name rather than index because debug symbols (added in #393)
-    // shift the v2ray-plugin slot off index 1 on Windows/macOS.
-    let debug_sidecar = debug_files
-        .iter()
-        .find(|f| f.dest_name.starts_with("v2ray-plugin"))
-        .unwrap();
+    // shift the ex-ray slot off index 1 on Windows/macOS.
+    let debug_sidecar = debug_files.iter().find(|f| f.dest_name.starts_with("ex-ray")).unwrap();
     let release_sidecar = release_files
         .iter()
-        .find(|f| f.dest_name.starts_with("v2ray-plugin"))
+        .find(|f| f.dest_name.starts_with("ex-ray"))
         .unwrap();
     assert_eq!(debug_sidecar.source, release_sidecar.source);
 }
 
 #[skuld::test]
-fn bindir_errors_when_v2ray_glob_has_zero_matches() {
+fn bindir_errors_when_ex_ray_glob_has_zero_matches() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    // Set up only the hole binary, no v2ray-plugin glob match.
+    // Set up only the hole binary, no ex-ray glob match.
     let target = root.join("target").join("debug");
     fs::create_dir_all(&target).unwrap();
     let name = if cfg!(windows) { "hole.exe" } else { "hole" };
@@ -139,13 +133,13 @@ fn bindir_errors_when_v2ray_glob_has_zero_matches() {
     let err = bindir_files(Profile::Debug, root).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("no files matched") && msg.contains("v2ray-plugin"),
-        "expected v2ray-plugin glob error, got: {msg}"
+        msg.contains("no files matched") && msg.contains("ex-ray"),
+        "expected ex-ray glob error, got: {msg}"
     );
 }
 
 #[skuld::test]
-fn bindir_errors_when_v2ray_glob_has_multiple_matches() {
+fn bindir_errors_when_ex_ray_glob_has_multiple_matches() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let target = root.join("target").join("debug");
@@ -153,17 +147,17 @@ fn bindir_errors_when_v2ray_glob_has_multiple_matches() {
     let name = if cfg!(windows) { "hole.exe" } else { "hole" };
     fs::write(target.join(name), b"x").unwrap();
 
-    let v2ray = root.join(".cache").join("v2ray-plugin");
-    fs::create_dir_all(&v2ray).unwrap();
+    let ex_ray = root.join(".cache").join("ex-ray");
+    fs::create_dir_all(&ex_ray).unwrap();
     // Two matches — should error.
     let suffix = if cfg!(windows) { ".exe" } else { "" };
-    fs::write(v2ray.join(format!("v2ray-plugin-a{suffix}")), b"x").unwrap();
-    fs::write(v2ray.join(format!("v2ray-plugin-b{suffix}")), b"x").unwrap();
+    fs::write(ex_ray.join(format!("ex-ray-a{suffix}")), b"x").unwrap();
+    fs::write(ex_ray.join(format!("ex-ray-b{suffix}")), b"x").unwrap();
 
     let err = bindir_files(Profile::Debug, root).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("expected exactly 1 file") && msg.contains("v2ray-plugin"),
+        msg.contains("expected exactly 1 file") && msg.contains("ex-ray"),
         "expected multiple-match error, got: {msg}"
     );
 }

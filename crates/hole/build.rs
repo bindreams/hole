@@ -26,7 +26,7 @@ fn main() {
     generate_icons(icons_dir, &cache_icons_dir);
     generate_tray_icons(icons_dir);
 
-    // Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download)
+    // Runtime asset acquisition (ex-ray Go build, wintun.dll download)
     // moved to `cargo xtask deps` in Commit 4 of this PR. See issue #143.
 
     ensure_external_bin_stub(&repo_root);
@@ -39,13 +39,11 @@ fn main() {
 fn ensure_external_bin_stub(repo_root: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let suffix = if target.contains("windows") { ".exe" } else { "" };
-    let path = repo_root
-        .join(".cache/v2ray-plugin")
-        .join(format!("v2ray-plugin-{target}{suffix}"));
+    let path = repo_root.join(".cache/ex-ray").join(format!("ex-ray-{target}{suffix}"));
     if !path.exists() {
-        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create .cache/v2ray-plugin/");
-        std::fs::File::create(&path).expect("failed to create v2ray-plugin stub");
-        println!("cargo:warning=created empty v2ray-plugin stub — run `cargo xtask deps` for a real build");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create .cache/ex-ray/");
+        std::fs::File::create(&path).expect("failed to create ex-ray stub");
+        println!("cargo:warning=created empty ex-ray stub — run `cargo xtask deps` for a real build");
     }
 }
 

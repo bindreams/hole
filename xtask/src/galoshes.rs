@@ -1,7 +1,7 @@
 //! Build the galoshes sidecar. Post-monorepo-merge, galoshes is a
 //! regular workspace member at `crates/galoshes/`; it embeds the
-//! v2ray-plugin binary produced by [`super::v2ray_plugin::build`]
-//! (which writes to `<repo>/.cache/v2ray-plugin/`, where galoshes's
+//! ex-ray binary produced by [`super::ex_ray::build`]
+//! (which writes to `<repo>/.cache/ex-ray/`, where galoshes's
 //! `build.rs` picks it up).
 //!
 //! Output: `<repo>/target/release/galoshes{.exe}`.
@@ -12,8 +12,8 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 /// Build (or rebuild) the galoshes binary in release mode. Assumes the
-/// v2ray-plugin binary has already been produced at
-/// `<repo>/.cache/v2ray-plugin/` by [`super::v2ray_plugin::build`] (which
+/// ex-ray binary has already been produced at
+/// `<repo>/.cache/ex-ray/` by [`super::ex_ray::build`] (which
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
     let status = Command::new("cargo")

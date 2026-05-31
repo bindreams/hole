@@ -12,13 +12,13 @@ use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
+pub mod ex_ray;
 pub mod galoshes;
 pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
 pub mod test_binaries;
-pub mod v2ray_plugin;
 pub mod wintun;
 
 #[cfg(test)]
@@ -78,15 +78,15 @@ pub enum Command {
         #[arg(long, requires = "with_tests")]
         tests_out_dir: Option<PathBuf>,
     },
-    /// Build the v2ray-plugin sidecar from `external/v2ray-plugin/`.
+    /// Build the ex-ray sidecar from `crates/ex-ray/`.
     ///
-    /// Output goes into `<repo>/.cache/v2ray-plugin/`. Replaces the previous
+    /// Output goes into `<repo>/.cache/ex-ray/`. Replaces the previous
     /// build.rs side effect.
-    V2rayPlugin,
+    ExRay,
     /// Build the galoshes sidecar (workspace member `crates/galoshes/`).
     ///
-    /// Expects v2ray-plugin to have been built first into `.cache/v2ray-plugin/`
-    /// (the `deps` command runs v2ray-plugin → galoshes in that order).
+    /// Expects ex-ray to have been built first into `.cache/ex-ray/`
+    /// (the `deps` command runs ex-ray → galoshes in that order).
     Galoshes,
     /// Download and verify wintun.dll on Windows.
     ///
@@ -99,7 +99,7 @@ pub enum Command {
     GolangciLint,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
-    /// Currently: `v2ray-plugin` + `galoshes` + `wintun` + `golangci-lint`.
+    /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
     Deps,
     /// Print or validate the workspace version for a release group.
     ///
@@ -189,7 +189,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::V2rayPlugin => run_v2ray_plugin(),
+        Command::ExRay => run_ex_ray(),
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
         Command::GolangciLint => run_golangci_lint(),
@@ -209,10 +209,10 @@ pub fn run_stage(profile: Profile, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_v2ray_plugin() -> Result<()> {
+pub fn run_ex_ray() -> Result<()> {
     let repo_root = repo_root()?;
-    let path = v2ray_plugin::build(&repo_root)?;
-    println!("xtask: v2ray-plugin built at {}", path.display());
+    let path = ex_ray::build(&repo_root)?;
+    println!("xtask: ex-ray built at {}", path.display());
     Ok(())
 }
 
@@ -240,7 +240,7 @@ pub fn run_golangci_lint() -> Result<()> {
 }
 
 pub fn run_deps() -> Result<()> {
-    run_v2ray_plugin()?;
+    run_ex_ray()?;
     run_galoshes()?;
     run_wintun()?;
     run_golangci_lint()?;

@@ -1,11 +1,12 @@
-//! Build the v2ray-plugin sidecar from `external/v2ray-plugin/` (Go source).
+//! Build the ex-ray sidecar from `crates/ex-ray/` (Go source).
 //!
 //! This was previously [`crates/hole/build.rs::build_v2ray_plugin`] — moved
-//! into xtask in Commit 4 because the v2ray-plugin binary is a runtime
-//! dependency of the bridge, not a compile-time input to any Rust crate.
-//! See issue #143.
+//! into xtask in Commit 4 because the plugin binary is a runtime dependency
+//! of the bridge, not a compile-time input to any Rust crate. See issue #143.
+//! Repointed from the vendored `external/v2ray-plugin/` to the first-party
+//! `crates/ex-ray/` Go module in issue #414.
 //!
-//! Output: `<repo>/.cache/v2ray-plugin/v2ray-plugin-<target-triple>{.exe}`.
+//! Output: `<repo>/.cache/ex-ray/ex-ray-<target-triple>{.exe}`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 /// Returns the platform-specific output filename matching what shadowsocks-rust
 /// expects and what `crates/galoshes/build.rs` reads via
-/// `v2ray-plugin-{TARGET}{ext}`. The trailing `.exe` is included on Windows.
+/// `ex-ray-{TARGET}{ext}`. The trailing `.exe` is included on Windows.
 ///
 /// Supports every target triple in the workspace CI matrix (Hole's
 /// Windows/macOS release set plus the ex-Galoshes Linux / Windows-arm64
@@ -22,27 +23,27 @@ use anyhow::{anyhow, bail, Context, Result};
 pub fn output_name() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        "v2ray-plugin-x86_64-pc-windows-msvc.exe"
+        "ex-ray-x86_64-pc-windows-msvc.exe"
     }
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
-        "v2ray-plugin-aarch64-pc-windows-msvc.exe"
+        "ex-ray-aarch64-pc-windows-msvc.exe"
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "v2ray-plugin-aarch64-apple-darwin"
+        "ex-ray-aarch64-apple-darwin"
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "v2ray-plugin-x86_64-apple-darwin"
+        "ex-ray-x86_64-apple-darwin"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "v2ray-plugin-x86_64-unknown-linux-gnu"
+        "ex-ray-x86_64-unknown-linux-gnu"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        "v2ray-plugin-aarch64-unknown-linux-gnu"
+        "ex-ray-aarch64-unknown-linux-gnu"
     }
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
@@ -52,16 +53,16 @@ pub fn output_name() -> &'static str {
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
     )))]
-    compile_error!("unsupported platform for v2ray-plugin sidecar");
+    compile_error!("unsupported platform for ex-ray sidecar");
 }
 
-/// Build (or rebuild) the v2ray-plugin binary for the host platform.
+/// Build (or rebuild) the ex-ray binary for the host platform.
 ///
 /// Go's own build cache makes this near-instant if nothing changed; we
 /// deliberately don't add our own freshness check on top.
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
-    let source_dir = repo_root.join("external").join("v2ray-plugin");
-    let output_dir = repo_root.join(".cache").join("v2ray-plugin");
+    let source_dir = repo_root.join("crates").join("ex-ray");
+    let output_dir = repo_root.join(".cache").join("ex-ray");
     let output_path = output_dir.join(output_name());
 
     std::fs::create_dir_all(&output_dir).with_context(|| format!("failed to create {}", output_dir.display()))?;
