@@ -60,11 +60,11 @@ def test_main_binary_is_not_linker_signed(installed_app: Path) -> None:
 
 
 def test_sidecar_has_real_signature(installed_app: Path) -> None:
-    output = _codesign_dv(installed_app / "Contents" / "MacOS" / "v2ray-plugin")
+    output = _codesign_dv(installed_app / "Contents" / "MacOS" / "ex-ray")
     assert "Identifier=a.out" not in output, (
-        f"v2ray-plugin sidecar still has the Go-linker default identifier 'a.out' "
+        f"ex-ray sidecar still has the Go-linker default identifier 'a.out' "
         f"— Tauri's codesign step did not re-sign it:\n{output}"
     )
     assert "linker-signed" not in output, (
-        f"v2ray-plugin sidecar still carries the linker-applied ad-hoc signature:\n{output}"
+        f"ex-ray sidecar still carries the linker-applied ad-hoc signature:\n{output}"
     )

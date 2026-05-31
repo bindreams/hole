@@ -6,7 +6,7 @@
 """Sign a draft GitHub release's SHA256SUMS and upload the signature.
 
 Only `hole` releases are signed (minisign supply-chain integrity for the
-auto-updated binary distribution); `galoshes`, `garter`, and `v2ray-plugin`
+auto-updated binary distribution); `galoshes`, `garter`, and `ex-ray`
 ship unsigned per release-pipeline decisions in #291.
 
 Usage:

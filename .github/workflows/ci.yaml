@@ -225,7 +225,7 @@ jobs:
         run: cargo binstall --no-confirm --locked cargo-nextest
 
       # Compile test binaries via the orchestrator (resolves the full DAG:
-      # v2ray-plugin → galoshes → wintun → hole → hole-tests) but don't run
+      # ex-ray → galoshes → wintun → hole → hole-tests) but don't run
       # them yet — running tests is not part of the build process. The two
       # nextest invocations below execute the pre-built binaries with
       # different SKULD_LABELS filters; see #200 for the NDIS-loopback
@@ -313,7 +313,7 @@ jobs:
         shell: pwsh
         run: |
           $binDir = "C:\Program Files\hole\bin"
-          foreach ($f in @("hole.exe", "v2ray-plugin.exe", "wintun.dll")) {
+          foreach ($f in @("hole.exe", "ex-ray.exe", "wintun.dll")) {
             if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
           }
           $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue

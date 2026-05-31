@@ -9,12 +9,12 @@
 //! workspace root. Paths:
 //!
 //! - `target/debug/dist/bin/hole[.exe]` — the bridge/GUI binary
-//! - `target/debug/dist/bin/v2ray-plugin[.exe]` — the Go plugin sidecar
+//! - `target/debug/dist/bin/ex-ray[.exe]` — the Go plugin sidecar
 //! - `target/debug/dist/bin/wintun.dll` (Windows only)
 //!
 //! Each `DistHarness::spawn()` call runs `hole bridge run` from that
 //! directory, which means `current_exe()` is `dist/bin/hole` and
-//! `resolve_plugin_path` finds `v2ray-plugin` next to it — the same
+//! `resolve_plugin_path` finds `ex-ray` next to it — the same
 //! resolution path production uses.
 //!
 //! ## Concurrency

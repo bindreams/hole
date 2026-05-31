@@ -10,7 +10,7 @@
 //! The production bridge resolves its plugin binary by looking next to
 //! `current_exe()`. Under `cargo test` the test binary lives at
 //! `target/<profile>/deps/hole_bridge-<hash>.exe`, which does not have
-//! `v2ray-plugin` as a sibling. The dist directory IS the production
+//! `ex-ray` as a sibling. The dist directory IS the production
 //! layout, so spawning from it exercises the real plugin resolution path
 //! without any test-only seams in production code. See PR #164 follow-up
 //! plan for the full rationale.

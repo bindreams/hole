@@ -93,13 +93,13 @@ fn candidate_tags_empty_when_no_newer() {
 
 #[skuld::test]
 fn candidate_tags_filters_other_product_tracks() {
-    // Other release-track tags (galoshes, garter, v2ray-plugin) must not
+    // Other release-track tags (galoshes, garter, ex-ray) must not
     // trigger hole auto-updates even when they are higher-versioned.
     let tags = vec![
         hole_tag("1.0.0"),
         tag("releases/galoshes/v9.9.9"),
         tag("releases/garter/v9.9.9"),
-        tag("releases/v2ray-plugin/v9.9.9"),
+        tag("releases/ex-ray/v9.9.9"),
         // Legacy `v0.1.0` tag predating the new scheme — must be ignored.
         tag("v0.1.0"),
     ];

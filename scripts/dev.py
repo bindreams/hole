@@ -413,7 +413,7 @@ def main() -> None:
     ensure_node_modules(npm, target_user)
     cargo_build(cargo, target_user)
 
-    # Stage the runnable BINDIR (hole.exe + v2ray-plugin.exe + wintun.dll on
+    # Stage the runnable BINDIR (hole.exe + ex-ray.exe + wintun.dll on
     # Windows) in a per-pid subdir under TEMP. The contents and naming are
     # owned by `cargo xtask stage` — see xtask/src/bindir.rs for the canonical
     # file list. Per-pid isolation prevents collisions between concurrent
