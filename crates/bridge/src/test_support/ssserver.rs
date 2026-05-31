@@ -114,11 +114,18 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
     spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, &opts).await
 }
 
-/// Spin up a real shadowsocks server with v2ray-plugin (QUIC transport) in
-/// front. QUIC auto-enables TLS inside v2ray-plugin
-/// ([main.go:142](../../../external/v2ray-plugin/main.go)), so the cert+key
-/// pair must still be supplied. The plugin's public listen port is verified
-/// for `Protocols::UDP` because QUIC runs over UDP.
+/// Spin up a real shadowsocks server with a QUIC-transport plugin in front.
+/// QUIC auto-enables TLS in `generateConfig`
+/// ([crates/ex-ray/config.go:133](../../../ex-ray/config.go), the `case "quic"`
+/// arm sets `*tlsEnabled = true`), so the cert+key pair must still be supplied.
+/// The plugin's public listen port is verified for `Protocols::UDP` because
+/// QUIC runs over UDP.
+///
+/// Note: `ex-ray`'s standalone CLI rejects `mode=quic` at startup
+/// ([crates/ex-ray/main.go:200](../../../ex-ray/main.go)) — its v1 confirming
+/// probe is TCP-only. This helper is only ever fed the **galoshes** binary,
+/// which drives its embedded plugin for the QUIC wire transport, so the QUIC
+/// config path in `config.go` is what runs here, not the standalone CLI gate.
 pub(crate) async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,

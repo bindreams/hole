@@ -203,12 +203,15 @@ def reset_macos(state: dict | None) -> None:
             "remove any host routes pointing at a stale hole-tun interface."
         )
 
-    print("Killing bridge and v2ray-plugin processes...")
+    print("Killing bridge and ex-ray processes...")
     # Match both the installed binary (`/usr/local/bin/hole bridge run ...`)
     # and the dev-copied binary (`$TMPDIR/hole-dev-<pid>/hole bridge run ...`).
     # ERE: `hole` followed by zero-or-more non-space chars, then ` bridge run`.
     run(["pkill", "-fE", r"hole[^ ]* bridge run"])
-    run(["pkill", "-f", "v2ray-plugin"])
+    # The bridge spawns `ex-ray` directly; galoshes extracts + spawns the
+    # embedded `ex-ray`. This script tracks the current build, so it reaps
+    # `ex-ray` only (not the retired `v2ray-plugin` name).
+    run(["pkill", "-f", "ex-ray"])
 
     print("Flushing route cache and DNS cache...")
     run(["route", "-n", "flush"])
@@ -251,7 +254,7 @@ def reset_windows(state: dict | None) -> None:
             "remove any host routes pointing at a stale hole-tun interface."
         )
 
-    print("Stopping HoleBridge service and killing bridge + v2ray-plugin processes...")
+    print("Stopping HoleBridge service and killing bridge + ex-ray processes...")
     run([
         "powershell",
         "-Command",
@@ -274,7 +277,7 @@ def reset_windows(state: dict | None) -> None:
     run([
         "powershell",
         "-Command",
-        'Get-Process -Name "v2ray-plugin" -ErrorAction SilentlyContinue | Stop-Process -Force',
+        'Get-Process -Name "ex-ray" -ErrorAction SilentlyContinue | Stop-Process -Force',
     ])
 
     print("Removing wintun adapters...")
