@@ -165,9 +165,9 @@ pub struct ProxyConfig {
     /// land in the log. Sourced from
     /// [`crate::config::AppConfig::diagnostic_plugin_tap`]; the bridge
     /// can also be opted in via the `HOLE_BRIDGE_PLUGIN_TAP=1` env var
-    /// (dev-shell only — env vars don't survive into SCM/launchd
-    /// contexts). Added in bindreams/hole#388 to give service-mode
-    /// reproductions a knob the env var can't reach.
+    /// (dev-shell only — env vars don't survive into SCM/launchd). The
+    /// config flag exists so service-mode reproductions have a knob the
+    /// env var can't reach.
     #[serde(default)]
     pub diagnostic_plugin_tap: bool,
 }

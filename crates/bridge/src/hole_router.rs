@@ -196,9 +196,8 @@ impl HoleRouter {
                     .log_udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
             }
             (DropReason::UdpProxyUnavailable { .. }, L4Proto::Tcp) => {
-                // Cascade never produces this combination (the invariant
-                // is UDP-only). Stay silent rather than emitting a misleading
-                // log; the debug_assert makes the contract explicit in tests.
+                // Unreachable: UdpProxyUnavailable is UDP-only. debug_assert
+                // guards the contract.
                 debug_assert!(false, "UdpProxyUnavailable produced for TCP flow");
             }
             (DropReason::Ipv6BypassUnreachable { rule_index }, l4) => {

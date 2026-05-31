@@ -57,7 +57,7 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     The canonical list of files lives in `xtask/src/bindir.rs`
     (`bindir_files()`). dev.py and this function both call into the same xtask
     subcommand, so adding a new BINDIR file is a one-line change in xtask and
-    both consumers pick it up automatically. See issue #143.
+    both consumers pick it up automatically.
     """
     console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
     result = subprocess.run(
@@ -165,10 +165,7 @@ def _accept_wix_eula(wix_exe: Path, version: str) -> None:
     Required since WiX v7 (error WIX7015 from any wix subcommand otherwise).
     `wix eula accept wix<major>` writes a marker file at
     ``~/.wix/wix<major>-osmf-eula.txt``; subsequent wix invocations consult
-    that file. Fast-pathed here: if the marker exists, skip the subprocess
-    entirely. Otherwise spawn `wix eula accept` and fail loudly on nonzero
-    exit (corrupt extract, missing write permission, upstream rename of
-    the eulaId — any of these should surface, not be tolerated).
+    that file.
 
     The eulaId mirrors WixToolset.Sdk's WixToolsetExtensionPackageFolder
     convention (one per major release: wix5, wix6, wix7, ...).

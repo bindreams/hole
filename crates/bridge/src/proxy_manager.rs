@@ -1,6 +1,6 @@
 // Proxy lifecycle manager — start/stop/reload orchestration.
 //
-// # Design notes (post-#165, post-#397)
+// # Design notes
 //
 // `ProxyManager` is parameterized over two traits:
 // - `P: Proxy`     — the proxy backend (production: `ShadowsocksProxy`).
@@ -13,14 +13,12 @@
 // aborting the shadowsocks task and tearing down routes without the
 // ProxyManager fields ever being mutated.
 //
-// **Cancellation is cooperative (#397).** The pre-#397 design wrapped
-// `start_inner` in an outer `tokio::select!` and relied on future-drop
-// for cancel propagation; that approach is fundamentally incompatible
-// with phases that need async cleanup (DNS apply, see #395) — once a
-// sync FFI is on a tokio worker the future can't be preempted. The
-// current design threads a `CancellationToken` *into* `start_inner` and
-// has every long-running phase observe it cooperatively. RAII Drop is
-// retained as the catastrophic / panic teardown safety net only.
+// **Cancellation is cooperative.** A `CancellationToken` is threaded
+// *into* `start_inner` and every long-running phase observes it
+// cooperatively. Future-drop cancellation (an outer `tokio::select!`)
+// can't preempt a phase that needs async cleanup (DNS apply) — once a
+// sync FFI is on a tokio worker the future can't be preempted. RAII Drop
+// is retained as the catastrophic / panic teardown safety net only.
 //
 // A cycle's transient state lives in `Option<RunningState<P, R>>`. When
 // `stop()` takes the state, the proxy handle is explicitly
@@ -32,8 +30,7 @@
 //
 // There are deliberately no getters for `proxy` or `routing` — test access
 // to mock state happens via `Arc` clones captured before the mock is
-// handed to `new`. Re-adding a getter would recreate the encapsulation
-// smell the pre-#165 `pub fn backend(&self)` carried.
+// handed to `new`. A getter would recreate an encapsulation smell.
 
 use std::net::IpAddr;
 use std::time::Instant;
@@ -64,13 +61,11 @@ struct ProxyStartedDiag<'a> {
 }
 
 /// Derive whether `Proxy`-routed UDP flows can be carried through the
-/// tunnel, from a live plugin chain's sitrep-reported transports (#414).
+/// tunnel, from a live plugin chain's sitrep-reported transports.
 ///
 /// - `Some(transports)` — a plugin chain is running; UDP is available iff
 ///   the end-to-end transport intersection it reported includes
-///   [`garter::Transports::UDP`]. This replaces the static
-///   `PluginDescriptor.udp_supported` guess with the authoritative
-///   runtime signal.
+///   [`garter::Transports::UDP`].
 /// - `None` — no plugin chain; the raw SOCKS5 path always carries UDP, so
 ///   UDP is available.
 ///
@@ -272,15 +267,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `Err(ProxyError::Cancelled)` and rolls back partial state (via
     /// the RAII guards inside `start_inner`) without mutating `self`.
     ///
-    /// **Cooperative cancellation (#397).** The pre-#397 implementation
-    /// wrapped `start_inner` in an outer `tokio::select! { cancel.cancelled() => …, r = start_inner => r }`
-    /// and relied on future-drop to unwind locally-owned RAII guards.
-    /// That approach is sound for sync-cleanable resources but cannot
-    /// preempt phases whose inner future never yields (sync FFI on a
-    /// tokio worker, the #395 symptom). The current design instead
-    /// threads the token *into* `start_inner` and has every long-running
-    /// phase observe it cooperatively — see the `start_inner` doc and
-    /// the per-phase cancel-aware wrappers.
+    /// **Cooperative cancellation.** The token is threaded *into*
+    /// `start_inner` and every long-running phase observes it
+    /// cooperatively — see the `start_inner` doc and the per-phase
+    /// cancel-aware wrappers. (Future-drop cancellation — racing
+    /// `start_inner` against the token in an outer `tokio::select!` —
+    /// cannot preempt a phase whose inner future never yields, e.g. a
+    /// sync FFI on a tokio worker.)
     ///
     /// Three race scenarios are handled correctly:
     ///
@@ -370,7 +363,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Produce a [`RunningState`] without touching `self`.
     ///
-    /// **Cooperative cancellation (#397).** Each long-running phase
+    /// **Cooperative cancellation.** Each long-running phase
     /// observes the supplied `cancel` token and returns
     /// `Err(ProxyError::Cancelled)` cooperatively. Earlier RAII guards
     /// drop in reverse-declaration order when the function returns Err,
@@ -407,8 +400,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///   of any partially-applied adapters before `DnsError::Cancelled`
     ///   propagates back as `ProxyError::Cancelled`. The
     ///   `SystemDnsApplied` guard is returned only on the `Ok` path,
-    ///   so the `DebugDropBomb` is never armed during an Err unwind
-    ///   (`#397` plan-review #8).
+    ///   so the `DebugDropBomb` is never armed during an Err unwind.
     ///
     /// CRITICAL ORDERING: the routing provider is responsible for
     /// persisting the recovery state BEFORE mutating routes. A panic
@@ -459,12 +451,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
 
         // UDP availability: when a plugin chain is running, use the
-        // transports it actually reported via sitrep (#414) — the
-        // authoritative runtime signal, replacing the static
-        // `PluginDescriptor.udp_supported` guess. With no plugin, the raw
-        // SOCKS5 path carries UDP, so default to available. Computed once
-        // here (in scope for both the SocksOnly and Full branches below)
-        // so all three start sites read the same live value.
+        // transports it reported via sitrep; with no plugin the raw SOCKS5
+        // path carries UDP, so default to available. Computed once here (in
+        // scope for both the SocksOnly and Full branches below) so all
+        // three start sites read the same live value.
         let udp_proxy_available = udp_available_from_chain(plugin_chain.as_ref().map(|c| c.transports()));
 
         // Build shadowsocks config. When a plugin chain is running,
@@ -487,14 +477,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             };
             debug!("proxy.start returned Ok");
 
-            // In-bridge SOCKS5 loopback self-test (#200 H2 vs H3 disambiguation).
-            // When the test harness sets `HOLE_BRIDGE_SELF_TEST`, spawn a task
-            // that connects to our own SOCKS5 port from inside the bridge.
-            // Compare with the test process's external connect outcome:
+            // Harness-only (HOLE_BRIDGE_SELF_TEST): connect to our own SOCKS5
+            // port from inside the bridge to distinguish a broken cross-process
+            // loopback from a broken/never-opened listener. Compare with the
+            // test process's external connect outcome:
             //   self-OK + ext-OK            → no bug
-            //   self-OK + ext-WSAETIMEDOUT  → cross-process loopback broken (H2)
-            //   self-WSAETIMEDOUT           → listener broken (H1/H3)
-            //   self-ECONNREFUSED           → listener never opened (H3)
+            //   self-OK + ext-WSAETIMEDOUT  → cross-process loopback broken
+            //   self-WSAETIMEDOUT           → listener broken
+            //   self-ECONNREFUSED           → listener never opened
             // No pre-sleep: Server::new().await has already done bind+listen
             // so the kernel queues SYNs into the backlog regardless of whether
             // user-space accept() has been called. Any failure IS the signal.
@@ -550,7 +540,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
 
-        // CRITICAL ORDERING (bindreams/hole#388):
+        // CRITICAL ORDERING:
         //
         //   0. (above) plugin_chain spawn  — plugin subprocess is alive
         //      from this point. NOT a system-state mutation (the chain
@@ -570,8 +560,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         //      activates
         //   6. Dns::apply  — system DNS pointed at our loopback
         //
-        // Reordering steps 3..=6 re-introduces the #388 symptom (dead-
-        // tunnel DNS hijack with the GUI reporting "Running"). The
+        // Reordering steps 3..=6 re-introduces a dead-tunnel DNS hijack
+        // with the GUI reporting "Running". The
         // start_blocks_on_forwarder_self_test_failure test catches the
         // most likely regression (asserting routing.install was NOT
         // called when the gate fails).
@@ -658,13 +648,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // FFIs runs the inline-restore on partially-applied adapters
         // and returns `DnsError::Cancelled`, which we map back to
         // `ProxyError::Cancelled`. Non-cancel failures (Io) downgrade
-        // to a `warn!` + `None`, preserving the pre-#397
-        // "best-effort apply" semantics so a single adapter failure
-        // doesn't tank an otherwise-working start.
+        // to a `warn!` + `None`: best-effort apply, so a single adapter
+        // failure doesn't tank an otherwise-working start.
         let dns_applied = if let Some(srv) = local_dns_server {
             // Capture runs on upstream only; the TUN was created by
             // `routing.install` above so its prior is definitionally
-            // "defaults" (Phase 4 #247 — fast-path nonsensical capture).
+            // "defaults" (capturing it is nonsensical).
             // Apply runs on both: TUN needs loopback DNS so the OS's
             // best-route-to-DNS lookup lands on our forwarder when the
             // TUN becomes the primary interface.
@@ -817,10 +806,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// **Error-discard note**: this function cannot await the dead
     /// handle, so the underlying task's `io::Result` is discarded.
     /// Callers that need the task's error must use `stop().await`
-    /// instead. The graceful duplication-fix from pre-#165 is complete
-    /// (this is now one line) but the sync-vs-async limitation is
-    /// fundamental to Rust — we do not make `check_health` async
-    /// because every caller would have to be made async too.
+    /// instead. Not made async because every caller would then have to
+    /// be made async too.
     pub fn check_health(&mut self) {
         if let Some(state) = &self.running {
             if !state.proxy.is_alive() {
@@ -878,28 +865,17 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E test skip policy in CI:
+// E2E test skip policy in CI. All driven by the galoshes internal port
+// race in shadowsocks-service's `PluginConfig` (bindreams/hole#197, open):
 //
-// - **macOS**: the entire module is skipped. The galoshes test set
-//   reliably hits #197 (internal port race in shadowsocks-service's
-//   `PluginConfig`). The non-galoshes tests work but the coverage
-//   uplift from running them in isolation on macOS wasn't judged worth
-//   the module-level complexity — re-enable the module when #197 has
-//   a custom server-side launcher.
-//
+// - **macOS**: the entire module is skipped — the galoshes test set
+//   reliably hits the race.
 // - **Windows**: the module runs, but the *galoshes* tests inside are
-//   individually `#[cfg(not(target_os = "windows"))]`-gated because the
-//   same #197 race fires here too. Everything else (the `ssserver_none`
-//   + cipher roundtrips that were the #200 canonical repro) runs and
-//   stays green. The `#[cfg]` gating lives in
-//   `proxy_manager_e2e_tests.rs` next to each affected test so the
-//   skip reason is co-located with the test.
-//
-// - **Linux**: the module runs fully. Linux CI is the only platform
-//   where the full galoshes matrix is exercised.
-//
-// See #200 (H7 TCPIP investigation, now dormant with `diagnostics::etw`
-// permanently on) and #197 (galoshes bind race, still open).
+//   individually `#[cfg(not(target_os = "windows"))]`-gated; everything
+//   else runs. The `#[cfg]` gating lives in `proxy_manager_e2e_tests.rs`
+//   next to each affected test so the skip reason is co-located.
+// - **Linux**: the module runs fully — the only platform where the full
+//   galoshes matrix is exercised.
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
@@ -996,12 +972,10 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// (depending on whether it was enabled this run — see
 /// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
 ///
-/// **#388 change**: replaces the pre-#388 `spawn_forwarder_self_test`
-/// (fire-and-forget). Called from `start_inner` BEFORE
-/// `Dispatcher::new` / `routing.install` / `Dns::apply`. A
-/// failure short-circuits the start; the locally-owned `running_proxy` +
-/// `plugin_chain` RAII guards unwind without ever hijacking system DNS
-/// into a dead tunnel.
+/// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
+/// `routing.install` / `Dns::apply`. A failure short-circuits the start;
+/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
+/// without ever hijacking system DNS into a dead tunnel.
 async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,

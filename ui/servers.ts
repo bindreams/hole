@@ -170,10 +170,8 @@ async function selectServer(id: string) {
   if (!config) return;
   config.selected_server = id;
   renderServers();
-  // The diagnostics dots depend on the *selected* server's validation
-  // state — recompute them whenever the selection changes. (Note: the
-  // pollDiagnostics path also calls updateDiagnostics(); both flow through
-  // the same function so the cached bridge data is reused.)
+  // The diagnostics dots depend on the selected server's validation
+  // state — recompute on selection change.
   updateDiagnostics();
   await saveConfig();
 }
@@ -227,12 +225,8 @@ export async function importFromDialog() {
   try {
     newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
   } catch (err) {
-    // Tauri serializes the Rust-side `ImportFailure` enum to JSON; the
-    // `invoke` rejection delivers the deserialized object verbatim
-    // (happy path). A transport-layer failure (e.g. channel closed) can
-    // also surface as a string/Error here — `showImportFailureDialog`
-    // accepts `unknown` and routes both shapes through
-    // `describeUnknownImportError`.
+    // Rust `ImportFailure` enum (happy path) or a transport-layer
+    // string/Error; `showImportFailureDialog` handles both.
     console.error("import from dialog failed:", err);
     await showImportFailureDialog(err);
     return;

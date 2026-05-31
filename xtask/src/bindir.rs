@@ -14,9 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::Profile;
 
 /// Source kind for a BINDIR entry. Files use hard-link-then-copy;
-/// directory bundles (macOS `.dSYM`) recurse a copy. Introduced for
-/// bindreams/hole#393 so panic-backtrace symbols ship on both
-/// platforms.
+/// directory bundles (macOS `.dSYM`) recurse a copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindirSource {
     /// Single regular file. Staged via hard-link with copy fallback.
@@ -84,7 +82,7 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     //     backtraces in dev (`scripts/dev.py`) and production (the MSI)
     //     resolve frame names and line numbers. Without these, the panic
     //     hook at `crates/common/src/logging.rs::install_panic_hook` renders
-    //     every frame as `<unknown>`. See bindreams/hole#393.
+    //     every frame as `<unknown>`.
     //
     //     The workspace `[profile.release].debug = "limited"` guarantees the
     //     PDB/dSYM exists for release builds (cargo's default is `false`).
@@ -136,7 +134,7 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     //    that the GPL-3.0 binary distribution bundles. Apache-2.0 §4(d)
     //    requires the NOTICE file to be preserved in derivative works; since
     //    the installer's license dialog only shows GPL-3.0 text, the file
-    //    must accompany the binaries on disk. See bindreams/hole#363 review.
+    //    must accompany the binaries on disk.
     let notices_src = repo_root.join("NOTICES.md");
     files.push(BindirFile::new(notices_src, "NOTICES.md".to_string()));
 

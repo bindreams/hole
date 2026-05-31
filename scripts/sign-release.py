@@ -7,7 +7,8 @@
 
 Only `hole` releases are signed (minisign supply-chain integrity for the
 auto-updated binary distribution); `galoshes`, `garter`, and `ex-ray`
-ship unsigned per release-pipeline decisions in #291.
+ship unsigned — they are either embedded into hole and covered by its
+signature, or built-from-source by their consumers who pin SHA256 directly.
 
 Usage:
     uv run scripts/sign-release.py 1.0.0

@@ -23,13 +23,13 @@
 //! `GetFileInformationByHandle` — a non-blocking `GetFileType` check
 //! to weed out pipes / consoles / char devices that share the `File`
 //! object-type with real disk files. Only `FILE_TYPE_DISK` handles
-//! reach the file-id comparison. An earlier iteration ran the
-//! file-id query on a worker thread with a timeout (Process Explorer
-//! pattern), but leaked worker threads trigger a Rust runtime abort
-//! ("operation failed to complete synchronously, aborting") on
-//! Windows CI. The `GetFileType` pre-filter makes the inline call
-//! safe; the per-PID and overall deadlines below cap worst-case time
-//! on legitimate-but-slow disk handles (e.g. remote SMB).
+//! reach the file-id comparison. The non-blocking `GetFileType`
+//! pre-filter keeps the inline `GetFileInformationByHandle` safe (no
+//! worker-thread/timeout dance, which risked a Rust runtime abort —
+//! "operation failed to complete synchronously, aborting" — from
+//! leaked worker threads on Windows CI); the per-PID and overall
+//! deadlines below cap worst-case time on legitimate-but-slow disk
+//! handles (e.g. remote SMB).
 //!
 //! When `OpenProcess(DUP_HANDLE)` is denied (non-admin session, PPL
 //! processes like Defender's MsMpEng.exe, System PID 4) we don't list
@@ -53,10 +53,9 @@
 //! - **PID reuse race**: the handle table is a snapshot, but a PID
 //!   could be recycled between snapshot and `OpenProcess`. Rare on
 //!   x64 and this is a best-effort diagnostic.
-//! - **Elevation**: on a non-admin runner,
-//!   `PROCESS_QUERY_LIMITED_INFORMATION` against PPL processes like
-//!   MsMpEng.exe fails → we skip that PID. Windows GitHub Actions
-//!   runners run as Administrator, so this is fine in CI.
+//!
+//! (Elevation: PPL processes like MsMpEng.exe deny `OpenProcess` and
+//! are skipped, as documented inline at the denied-PID path.)
 
 #![allow(clippy::missing_safety_doc)]
 

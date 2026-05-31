@@ -1,7 +1,8 @@
 //! Best-effort post-teardown wintun adapter cleanup.
 //!
-//! Belt-and-suspenders for the [`Dispatcher::drop`](../../bridge/src/dispatcher.rs)
-//! architectural fix added in bindreams/hole#388 — covers:
+//! A safety net for paths where [`Dispatcher::drop`](../../bridge/src/dispatcher.rs)
+//! does not get to drain the engine task and let wintun's own Drop
+//! release the adapter:
 //!
 //! - **Panic / SIGKILL** paths where Drops don't run at all.
 //! - **Current-thread runtime** test paths where `block_in_place` would

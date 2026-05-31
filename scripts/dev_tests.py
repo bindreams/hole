@@ -81,9 +81,8 @@ def test_directory_services_failure_returns_empty_list(capsys):
 
 # prefix_stream tests (platform-agnostic) ==============================================================================
 #
-# Anchor the panic-backtrace incident from bindreams/hole#393: a
-# multi-line tracing entry from the bridge must not be interleaved
-# with [client] lines from the GUI subprocess.
+# These tests pin the no-interleave invariant: a multi-line tracing entry
+# from one stream must not be split by lines from another.
 
 
 def _strip_ansi(s: str) -> str:

@@ -166,8 +166,9 @@ where
     let closed_rx = writer.wait_for("plugin tap: closed");
 
     let plugin_shutdown = shutdown.clone();
-    // The tests synchronize on the "plugin tap: ready" tracing event, not
-    // the readiness channel; a throwaway oneshot satisfies the new param.
+    // These tests synchronize on the "plugin tap: ready" tracing event rather
+    // than the readiness channel, so a throwaway oneshot is passed for the
+    // unused `ready` param.
     let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
@@ -181,9 +182,7 @@ where
     // Run the user-supplied client interaction.
     client_body(local).await;
 
-    // Park until tap logs "closed" for the connection — the event-driven
-    // replacement for the previous 200ms sleep that hoped close had
-    // landed in the writer.
+    // Park until the tap logs "closed" for the connection (event-driven, no sleep).
     tokio::task::spawn_blocking(move || closed_rx.recv().expect("tap never signaled close"))
         .await
         .unwrap();
@@ -345,8 +344,9 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     let ready_rx = writer.wait_for("plugin tap: ready");
 
     let plugin_shutdown = shutdown.clone();
-    // The tests synchronize on the "plugin tap: ready" tracing event, not
-    // the readiness channel; a throwaway oneshot satisfies the new param.
+    // These tests synchronize on the "plugin tap: ready" tracing event rather
+    // than the readiness channel, so a throwaway oneshot is passed for the
+    // unused `ready` param.
     let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 

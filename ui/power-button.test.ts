@@ -69,13 +69,8 @@ describe("power-button state machine", () => {
     invokeMock.mockReturnValue(new Promise(() => {}));
     const { initPowerButton, updateProxyStatus, getConnectionState } = await import("./power-button");
     initPowerButton();
-    // Force the failed state via the polling seam — we have no public
-    // setter for transition-state-to-failed-state, but polling can
-    // observe idle states only, so we instead drive through an outcome.
-    // Simpler approach: assert that a click from disconnected drives
-    // toggle_proxy with the connecting path. The test for
-    // connection-failed is structurally equivalent because
-    // isEffectivelyOn returns the same false for both.
+    // connection-failed and disconnected are both idle states where
+    // isEffectivelyOn() is false, so a click drives the same connect path.
     updateProxyStatus({ running: false }); // ensures state is `disconnected`
     expect(getConnectionState()).toBe("disconnected");
     document.getElementById("power-btn")!.click();

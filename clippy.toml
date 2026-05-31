@@ -2,17 +2,14 @@
 path = "hyper::client::conn::http1::SendRequest::send_request"
 reason = "Must call sender.ready().await before send_request() (tower::Service contract). Use a wrapper type that enforces this."
 
-# Bridge trait-contract enforcement (bindreams/hole#165 mitigation) ----
+# Bridge trait-contract enforcement ------------------------------------------------------------------------------------
 #
 # The `Proxy` and `Routing` traits are the only sanctioned entry points
 # for spawning tunnels and mutating host routing tables. Direct calls to
 # the underlying free functions / constructors bypass mock-based test
-# isolation and caused the #165 incident (unit tests shelling out to
-# real `netsh`, corrupting loopback state on Windows CI runners).
-#
-# Legitimate callers (the trait implementations themselves and the
-# crash-recovery path) suppress the lint with a per-site
-# `#[allow(clippy::disallowed_methods)]` plus a comment.
+# isolation (unit tests would shell out to real `netsh`, corrupting
+# loopback state on Windows CI runners — see #165). Legitimate callers
+# suppress the lint with a per-site `#[allow]` + comment.
 
 [[disallowed-methods]]
 path = "tun_engine::routing::setup_routes"
@@ -22,30 +19,21 @@ reason = "Route setup must go through `Routing::install`. Only `SystemRouting::i
 path = "tun_engine::routing::teardown_routes"
 reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."
 
-# Port allocation — enforce bind_ephemeral over raw free_port (#285, #300) -
+# Port allocation — enforce bind_ephemeral over raw free_port ----------------------------------------------------------
 #
-# Direct callers of `port_alloc::free_port` skip the
-# divorced-port-number TOCTOU absorption that
-# `port_alloc::bind_ephemeral` provides by folding the caller's bind
-# into the same retry loop. On Windows the OS maintains independent
-# TCP/UDP excluded-port-range tables (Hyper-V / WSL / Docker dynamic
-# reservations); a port that passes a TCP probe can still fail UDP
-# bind with WSAEACCES. Three production sites (LocalDnsServer::bind,
-# start_plugin_chain, test_support::ssserver::start_real_ss_server*)
-# go through `bind_ephemeral`; new sites must too.
-#
-# The one sanctioned suppression is
-# `test_support::port_alloc::allocate_ephemeral_port` — it returns the
-# port to the caller for external configuration (JSON config to a
-# subprocess), which the closure shape of `bind_ephemeral` cannot
-# accommodate. Suppress with `#[allow(clippy::disallowed_methods)]`
-# plus a comment citing why the wrapper shape doesn't fit.
+# Direct callers of `port_alloc::free_port` skip the divorced-port-number
+# TOCTOU absorption that `port_alloc::bind_ephemeral` provides by folding
+# the caller's bind into the same retry loop. On Windows the OS maintains
+# independent TCP/UDP excluded-port-range tables (Hyper-V / WSL / Docker
+# dynamic reservations); a port that passes a TCP probe can still fail
+# UDP bind with WSAEACCES. New sites must go through `bind_ephemeral`.
+# See bindreams/hole#285 and #300.
 
 [[disallowed-methods]]
 path = "hole_common::port_alloc::free_port"
 reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285 and #300."
 
-# tracing subscriber test invariant (bindreams/hole#302) ---------------------------------------------------------------
+# tracing subscriber test invariant ------------------------------------------------------------------------------------
 #
 # `tracing::subscriber::set_default` returns a thread-local guard. On a
 # multi-thread tokio runtime, `tokio::spawn`'d tasks run on workers
@@ -53,16 +41,7 @@ reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bin
 # install a per-test subscriber as their assertion target must route
 # through `garter::tracing_test::set_default_in_current_thread`, which
 # checks the runtime flavor at install time and panics on multi-thread.
-#
-# Sanctioned suppressions: the helper itself uses an inline
-# `#[allow(clippy::disallowed_methods)]` to call the real function;
-# `garter::tracing_test_tests::raw_set_default_on_multi_thread_loses_spawned_events`
-# uses it to deliberately demonstrate the bug the helper protects against.
-# `crates/test-observability/src/lib_tests.rs` also uses an inline
-# `#[allow]` for its own sync tests that exercise the global-default
-# dispatch — no tokio runtime is present so the helper's check is
-# vacuous, and the test-observability crate already sits beneath garter
-# in the workspace dep graph (cycle avoidance).
+# Sanctioned suppressions carry an inline `#[allow]`. See bindreams/hole#302.
 
 [[disallowed-methods]]
 path = "tracing::subscriber::set_default"
@@ -77,20 +56,11 @@ path = "tracing::dispatcher::set_default"
 reason = "Use `garter::tracing_test::set_default_in_current_thread` — `tracing::subscriber::set_default` delegates to this lower-level function; disallowing the underlying form keeps the same thread-local-guard footgun out of reach for code that reaches under the abstraction. See bindreams/hole#302."
 
 # Test-time subscriber install — only hole-test-observability and the
-# production logging::init_multi site may install global tracing
-# subscribers via the `try_init` family. Direct callers in tests
+# production logging::init_multi / binary-main sites may install global
+# tracing subscribers via the `try_init` family. Direct callers in tests
 # trigger the #147 LogTracer perf regression that times out
-# `server_test_tests` on Windows CI. See bindreams/hole#301.
-#
-# Sanctioned suppressions:
-# 1. `crates/common/src/logging.rs::init_multi` — the production
-#    bridge logger; gated by a per-site `#[allow]` with a citation.
-# 2. `crates/test-observability/src/lib.rs` only ever uses the bare
-#    `tracing::subscriber::set_global_default` function, not
-#    `SubscriberInitExt::try_init`, so the rule does not bite it.
-# 3. `crates/galoshes/src/main.rs` and `crates/garter-bin/src/main.rs`
-#    are production binary mains that use `tracing_subscriber::fmt().init()`;
-#    sanctioned via per-site `#[allow]`.
+# `server_test_tests` on Windows CI. Sanctioned sites carry a per-site
+# `#[allow]` with a citation. See bindreams/hole#301.
 
 [[disallowed-methods]]
 path = "tracing_subscriber::util::SubscriberInitExt::init"
@@ -115,21 +85,14 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Pr
 path = "tracing_subscriber::fmt::SubscriberBuilder::try_init"
 reason = "Use hole_test_observability::register!() at lib.rs level for tests. See bindreams/hole#301."
 
-# Bridge Dns trait — Win32 native DNS FFI (bindreams/hole#397) ---------------------------------------------------------
+# Bridge Dns trait — Win32 native DNS FFI ------------------------------------------------------------------------------
 #
 # The Win32 DNS settings FFIs (`SetInterfaceDnsSettings` /
 # `GetInterfaceDnsSettings`) must only be called from inside the
-# `WinDnsBackend::Win32Real` impl. Direct callers bypass the
-# `MockBackend` test seam exactly the same way the #165 `setup_routes`
-# bypass did. The free-function shims `capture_adapters` /
-# `platform_restore_adapter` in `crates/bridge/src/dns/system/windows.rs`
-# already route through `Win32Real::default()`; the bans below cover
-# anything reaching the raw `windows` crate paths directly.
-#
-# Sanctioned suppressions: only the two `Win32Real::{get_settings,
-# set_loopback, restore}` call sites in `dns/system/windows.rs`. Each
-# uses `#[allow(clippy::disallowed_methods)]` with a comment citing
-# this rule.
+# `WinDnsBackend::Win32Real` impl, so unit tests can substitute
+# `MockBackend`. The bans below cover anything reaching the raw `windows`
+# crate paths directly; the `Win32Real` call sites in
+# `dns/system/windows.rs` carry a per-site `#[allow]`. See bindreams/hole#397.
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::IpHelper::SetInterfaceDnsSettings"
@@ -153,51 +116,22 @@ path = "windows::Win32::NetworkManagement::Dns::DnsFlushResolverCache"
 reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
 allow-invalid = true
 
-# Bridge cancellation contract (bindreams/hole#397) --------------------------------------------------------------------
+# Bridge cancellation contract -----------------------------------------------------------------------------------------
 #
 # Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats
-# the cooperative-cancellation propagation that the #397 refactor put
-# in place: a bridge cancel signal from the user's "Cancel" button
-# travels from `ipc.rs::handle_start`'s root token down through every
-# phase of `proxy_manager::start_inner` via `child_token()`. Any fresh
-# token rooted elsewhere is unreachable from that root, and any
-# in-flight work observing only that fresh token cannot be preempted.
-# This rule guards against a fresh token in the plugin-chain spawn path
-# shadowing the bridge cancel.
+# the cooperative-cancellation propagation: a bridge cancel signal from
+# the user's "Cancel" button travels from `ipc.rs::handle_start`'s root
+# token down through every phase of `proxy_manager::start_inner` via
+# `child_token()`. Any fresh token rooted elsewhere is unreachable from
+# that root, and in-flight work observing only that fresh token cannot
+# be preempted.
 #
-# **Scope is workspace-wide, not bridge-only.** Cargo's `clippy.toml`
-# resolution is workspace-rooted; there is no per-crate override
-# without splitting workspaces. As a consequence, ex-Galoshes crates
-# (`garter`, `galoshes`, `garter-bin`, `mock-plugin`) that legitimately
-# spawn their own root tokens — for test harnesses, signal handlers,
-# and subsystem owners outside the bridge's IPC cancel chain — carry a
-# module-level `#![allow(clippy::disallowed_methods)]` in the affected
-# test / lib files. This is accepted noise; the alternative
-# (cargo-supported per-crate clippy.toml) does not exist as of cargo
-# 1.93. If a future cargo gains per-crate overrides, narrow the rule's
-# scope and remove the ex-Galoshes module-level allows.
-#
-# Sanctioned bridge-side suppressions, each with a per-call-site
-# `#[allow(clippy::disallowed_methods)]` plus comment citing this rule:
-#
-# 1. `crates/bridge/src/ipc.rs::handle_start` — the IPC root. Every
-#    bridge cancel scope descends from this one token.
-# 2. `crates/bridge/src/dispatcher.rs::Dispatcher::new` — the
-#    Dispatcher owns its own subsystem cancel scope tied to its
-#    lifecycle (started in `new`, cancelled in `shutdown`); it is not
-#    a child of the start-cancel.
-# 3. `crates/bridge/src/proxy_manager.rs::ProxyManager::start` — the
-#    non-cancellable convenience shim that explicitly creates a fresh
-#    never-signalled token because the caller (tests, `reload`) does
-#    not want cancel semantics.
-# 4. `crates/bridge/src/server_test.rs` — the one-shot `test-server`
-#    CLI probe, no caller-side cancel; never-signalled token by design.
-#
-# Bridge test files use module-level `#![allow(clippy::disallowed_methods)]`
-# because `CancellationToken::new` is pervasive there as the test
-# harness's root signal and per-call suppressions would dominate the
-# file. The module-level shape is `#![allow(...)]` near the top with a
-# comment citing this rule.
+# Scope is workspace-wide (clippy.toml is workspace-rooted, no per-crate
+# override in cargo today); ex-Galoshes crates that legitimately spawn
+# their own root tokens carry a module-level `#![allow]`. The sanctioned
+# bridge-side production sites are enumerated in the `reason =` string
+# below; each carries a per-site `#[allow]` + comment citing this rule.
+# See bindreams/hole#397.
 
 [[disallowed-methods]]
 path = "tokio_util::sync::CancellationToken::new"

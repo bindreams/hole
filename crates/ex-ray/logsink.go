@@ -17,14 +17,10 @@ func stderrConsoleCreator(_ vlog.LogType, _ vlog.HandlerCreatorOptions) (clog.Ha
 }
 
 func init() {
-	// (a) Replace the Console HandlerCreator so the log app's error+access
-	//     loggers build a stderr writer (CreateStderrLogWriter) instead of
-	//     the default stdout. RegisterHandlerCreator overwrites
-	//     handlerCreatorMap[Console]; createHandler reads it lazily inside core.New.
+	// (a) The app loggers (error + access): override Console to use stderr.
 	common.Must(vlog.RegisterHandlerCreator(vlog.LogType_Console, stderrConsoleCreator))
 
-	// (b) Belt-and-suspenders: the common/log package-init registers a stdout
-	//     global handler for anything logged before app/log.New runs. Replace
-	//     it with stderr so even pre-app logs cannot touch fd 1.
+	// (b) The pre-app global handler: anything logged before app/log.New runs
+	//     defaults to stdout, so override it to stderr too.
 	clog.RegisterHandler(clog.NewLogger(clog.CreateStderrLogWriter()))
 }

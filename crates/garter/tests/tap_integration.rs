@@ -57,12 +57,9 @@ async fn tap_relays_data_through_binary_plugin_to_echo_server() {
 
     let mock_path = mock_plugin_path();
 
-    // Multi-connection echo server. The TapPlugin's readiness probe
-    // (TCP-connect to inner_local) is forwarded through mock-plugin to
-    // the echo server, consuming an accept slot before the real client
-    // connection arrives. So the echo server must loop to handle every
-    // forwarded connection — otherwise the second one (the real client
-    // payload) hangs forever.
+    // Multi-connection echo server. The tap's readiness probe connects to
+    // mock-plugin, which dials the echo on accept, consuming one slot before
+    // the real client — so the echo must loop.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     let echo_task = tokio::spawn(async move {

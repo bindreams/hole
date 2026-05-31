@@ -150,22 +150,17 @@ impl Dispatcher {
 /// `Drop` provides a safety net for non-graceful paths (panic, cancel
 /// mid-`start_inner`, `start_inner` Err that drops the local dispatcher).
 ///
-/// **#388 rationale**: pre-#388 this only called `cancel + abort`. The
-/// spawned task that owns the `tun::AsyncDevice` (and therefore the
-/// kernel wintun adapter handle) was abort-flagged but not joined, so
-/// runtime shutdown could happen before the task was polled to its end —
-/// leaving the kernel adapter alive until reboot or
-/// `scripts/network-reset.py`. `block_on` inside Drop works on the
-/// multi-thread runtime the bridge uses in production. Current-thread
-/// runtimes (skuld tests) take the abort-only fallback path, with the
-/// PowerShell `Remove-NetAdapter` shell-out in `SystemRoutes::drop` as
-/// the belt-and-suspenders second layer.
+/// The spawned task owns the `tun::AsyncDevice` (and therefore the
+/// kernel wintun adapter handle); an abort-only path can let runtime
+/// shutdown precede the task being polled to completion, leaking the
+/// kernel adapter until reboot or `scripts/network-reset.py`. `block_on`
+/// inside Drop works on the multi-thread runtime the bridge uses in
+/// production. Current-thread runtimes (skuld tests) take the abort-only
+/// fallback path, with the PowerShell `Remove-NetAdapter` shell-out in
+/// `SystemRoutes::drop` as the belt-and-suspenders second layer.
 ///
-/// **Graceful path interaction**: `ProxyManager::stop` →
-/// `Dispatcher::shutdown` already calls
-/// `tokio::time::timeout(2s, handle).await`, so the handle is `None`
-/// here on the normal stop path and only the abort fallback runs
-/// (a no-op).
+/// On the normal stop path `shutdown()` has already drained the handle,
+/// so `Drop` only runs the no-op abort fallback.
 impl Drop for Dispatcher {
     fn drop(&mut self) {
         self.cancel.cancel();

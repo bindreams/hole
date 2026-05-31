@@ -54,8 +54,8 @@ pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
     let mount_dir = tempfile::TempDir::with_prefix("hole-dmg-mount-")?;
 
     // Mount the DMG. Use `.output()` (not `.status()`) so a mount failure's
-    // stderr reaches the tracing file log — historically these errors went
-    // to inherited stdio and were lost in GUI-background install contexts.
+    // stderr reaches the tracing file log — in GUI-background installs there
+    // is no inherited stdio to catch it.
     let attach_args = hdiutil_attach_args(path, mount_dir.path());
     let attach_args_ref: Vec<&str> = attach_args.iter().map(|s| s.as_str()).collect();
     let output = std::process::Command::new("hdiutil").args(&attach_args_ref).output()?;

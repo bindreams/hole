@@ -10,16 +10,10 @@
 //!
 //! The trait returns [`ConnectedStream`] — a `BoxedStream` paired with
 //! [`StreamCounters`] observed by a [`CountingStream`] wrapper around
-//! the underlying socket. The counters are what lets the forwarder log
-//! `tcp_wrote` / `tcp_read` on a TLS-layer failure in #248
-//! diagnostics: `read=0` means the peer FIN'd before sending a byte;
-//! `read=<small>` means mid-handshake close; `read=<KBs>` means full
-//! handshake bytes delivered then close.
-//!
-//! `CountingStream` and `StreamCounters` were lifted to
-//! [`garter::counting`] in #267 so the new `TapPlugin` decorator and
-//! this DNS forwarder can share one wrapper. Apache → GPL one-way
-//! direction is preserved.
+//! the underlying socket. The counters let the forwarder log
+//! `tcp_wrote` / `tcp_read` on a TLS-layer failure: `read=0` means the
+//! peer FIN'd before sending a byte; `read=<small>` means mid-handshake
+//! close; `read=<KBs>` means full handshake bytes delivered then close.
 
 use std::io;
 use std::net::SocketAddr;

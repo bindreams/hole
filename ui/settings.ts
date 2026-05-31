@@ -1,4 +1,4 @@
-// Settings section: toggle switches, custom dropdowns, theme switching, proxy config.
+// Settings section: toggle switches, custom dropdowns, theme switching, proxy + DNS forwarder config.
 
 import { config, saveConfig } from "./main";
 import type { DnsConfig, DnsProtocol } from "./types";
@@ -283,8 +283,8 @@ function wireDnsControls() {
     patchDns({ intercept_udp53: on });
   });
 
-  // DNS protocol dropdown — kebab-to-snake with the same helper used by
-  // the theme/on-startup dropdowns; maps "plain-udp" → "plain_udp", etc.
+  // DNS protocol dropdown — hand-wired (not via wireDropdown) because it
+  // patches config.dns, not a top-level config key.
   const btn = document.getElementById("select-dns-protocol")!;
   const menu = document.getElementById("menu-dns-protocol")!;
   btn.addEventListener("click", (e) => {

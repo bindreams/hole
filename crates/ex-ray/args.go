@@ -9,10 +9,8 @@ import (
 // Args maps a string key to a list of values. It is similar to url.Values.
 type Args map[string][]string
 
-// Get the first value associated with the given key. If there are any values
-// associated with the key, the value return has the value and ok is set to
-// true. If there are no values for the given key, value is "" and ok is false.
-// If you need access to multiple values, use the map directly.
+// Get returns the first value for key, or ("", false) if absent. Use the map
+// directly for multiple values.
 func (args Args) Get(key string) (value string, ok bool) {
 	if args == nil {
 		return "", false
@@ -91,12 +89,8 @@ func parseEnv() (opts Args, err error) {
 	return opts, nil
 }
 
-// Parse a name–value mapping as from SS_PLUGIN_OPTIONS.
-//
-// "<value> is a k=v string value with options that are to be passed to the
-// transport. semicolons, equal signs and backslashes must be escaped
-// with a backslash."
-// Example: secret=nou;cache=/tmp/cache;secret=yes
+// parsePluginOptions parses a SS_PLUGIN_OPTIONS k=v;k=v string (';', '=', '\\'
+// are backslash-escaped). Example: secret=nou;cache=/tmp/cache;secret=yes
 func parsePluginOptions(s string) (opts Args, err error) {
 	opts = make(Args)
 	if len(s) == 0 {

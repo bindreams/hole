@@ -14,10 +14,9 @@ use crate::gateway::{get_default_gateway_info, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
 /// Incremented once per command in [`run_commands`]. Exposed so
-/// `diagnostics` handlers and tests can observe invariant violations
-/// (see the `proxy_manager_tests_never_spawn_routing_subprocess`
-/// regression test). The one-instruction `fetch_add` has negligible
-/// production cost — far below the millisecond-scale subprocess itself.
+/// `diagnostics` handlers and tests can assert the no-routing-subprocess
+/// invariant. The one-instruction `fetch_add` has negligible production
+/// cost — far below the millisecond-scale subprocess itself.
 pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // Command builders ====================================================================================================
@@ -86,16 +85,14 @@ pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<Str
 /// fixed split routes, and on a healthy system all four of those calls fail
 /// because nothing leaked.
 ///
-/// **Teardown** (added 2026-05 for bindreams/hole#388) is *also* best-effort
-/// because [`setup_routes`] is NOT transactional — when a setup command fails
-/// midway, the defensive [`teardown_routes`] call deletes routes that were
-/// never installed (empirically `netsh interface ip delete route 0.0.0.0/1
-/// <adapter>` exits non-zero when the route is absent, and the bare `route
-/// delete <ip>` does the same). The pre-#388 framing of "any warn here is a
-/// real production teardown failure" assumed transactional install, which we
-/// don't have. Real teardown failures (e.g. "adapter unavailable") surface
-/// via the bridge's post-teardown `Remove-NetAdapter` reporting and via
-/// state-file persistence failures.
+/// **Teardown** is *also* best-effort because [`setup_routes`] is NOT
+/// transactional — when a setup command fails midway, the defensive
+/// [`teardown_routes`] call deletes routes that were never installed
+/// (empirically `netsh interface ip delete route 0.0.0.0/1 <adapter>`
+/// exits non-zero when the route is absent, and the bare `route delete
+/// <ip>` does the same). Real teardown failures (e.g. "adapter
+/// unavailable") surface via the bridge's post-teardown
+/// `Remove-NetAdapter` reporting and via state-file persistence failures.
 ///
 /// Adding a new `PHASE_*` constant that should silently tolerate non-zero
 /// exit codes MUST be paired with a matching arm here.
@@ -116,7 +113,7 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
         if output.status.success() {
             // Success log at debug level. Kept out of info to avoid
             // drowning the per-run log in route noise, but visible when
-            // #200-style investigations turn on hole_bridge=debug.
+            // an investigation turns on hole_bridge=debug.
             // stdout/stderr included because netsh sometimes prints a
             // non-empty stdout on success (e.g. "Ok.") that is still
             // worth having in the trace.
@@ -124,7 +121,7 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
                    stdout = %stdout.trim(), stderr = %stderr.trim(),
                    "route command succeeded");
         } else if recovery {
-            // Recovery and teardown phases (post-#388) — see is_recovery_phase
+            // Recovery and teardown phases — see is_recovery_phase
             // doc-comment. Non-zero exits here are the unavoidable consequence
             // of non-transactional install + best-effort cleanup; warning would
             // drown legitimate signal.
@@ -168,18 +165,14 @@ where
     // Read the state file first. If absent, there's nothing to recover —
     // return early without poking any global routing state.
     //
-    // Previously this function unconditionally issued split-route
-    // teardown commands on every startup, on the rationale that the
-    // commands are idempotent. That was a problem under the test
-    // harness: running multiple bridge subprocesses in parallel (one
-    // TUN + one SOCKS5, say) caused each subprocess's startup recovery
-    // to concurrently `netsh delete route ... hole-tun`, and a
-    // SOCKS5-only bridge's recovery would rip routes out from under a
-    // concurrent TUN bridge mid-flight. State-file-driven recovery is
-    // strictly sufficient: the caller's write-ordering contract
-    // guarantees the state file is persisted BEFORE any route mutation,
-    // so a crashed run that installed routes MUST have left a state file
-    // behind.
+    // State-file-driven recovery (not unconditional split-route teardown)
+    // is required so concurrent bridge subprocesses don't rip routes out
+    // from under each other: a SOCKS5-only bridge unconditionally issuing
+    // `netsh delete route ... hole-tun` on startup would tear down the
+    // routes of a concurrent TUN bridge mid-flight. The caller's
+    // write-ordering contract guarantees the state file is persisted
+    // BEFORE any route mutation, so a crashed run that installed routes
+    // MUST have left a state file behind.
     let Some(st) = state::load(state_dir) else {
         debug!("no route-state file found, nothing to recover");
         return;
@@ -307,11 +300,10 @@ impl Routing for SystemRouting {
 
         // Install the routes. On failure, defensively tear down whatever
         // may have been partially installed and clear the stale state
-        // file before returning. This belt-and-suspenders cleanup
-        // preserves a robustness property the old code relied on:
-        // `run_commands` currently returns `Err` only on process-spawn
-        // failure, but a future change that makes it early-exit on first
-        // non-zero status would otherwise leak partial routes.
+        // file before returning. Defensive rollback: `run_commands`
+        // currently returns `Err` only on process-spawn failure, but a
+        // future early-exit-on-non-zero change would otherwise leak
+        // partial routes.
         #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
         if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name) {
             #[allow(clippy::disallowed_methods)] // defensive rollback inside install
@@ -335,9 +327,8 @@ impl Routing for SystemRouting {
 
 /// RAII guard returned by [`SystemRouting::install`]. Dropping this value
 /// tears down the installed routes and clears the crash-recovery state
-/// file. Replaces the pre-#165 `RouteGuard` struct whose `Drop` bypassed
-/// the `ProxyBackend` trait and shelled out to `netsh` unconditionally —
-/// see the incident report.
+/// file. Teardown routes through the `Routing` trait, never a raw
+/// free-function `netsh` call.
 pub struct SystemRoutes {
     tun_name: String,
     server_ip: IpAddr,
@@ -347,8 +338,8 @@ pub struct SystemRoutes {
 
 impl Drop for SystemRoutes {
     fn drop(&mut self) {
-        // Unconditional entry log so we can prove this Drop actually ran
-        // on Stop (#200 T2 hypothesis: teardown skipped entirely).
+        // Unconditional entry log so a reader can confirm this Drop
+        // actually ran on Stop (teardown-skipped diagnosis).
         info!(
             tun = %self.tun_name,
             server_ip = %self.server_ip,
@@ -367,12 +358,12 @@ impl Drop for SystemRoutes {
         if let Err(e) = state::clear(&self.state_dir) {
             warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
         }
-        // **#388**: belt-and-suspenders post-teardown wintun adapter cleanup.
-        // The architectural fix in `bridge::Dispatcher::drop` synchronously
-        // drains the engine task so wintun's own Drop runs — this is the
-        // safety net for paths that bypass it (panic, current-thread runtime
-        // tests, Drop 2s-timeout fallback). PowerShell `Remove-NetAdapter`
-        // is idempotent on missing adapters. See adapter_cleanup docs.
+        // Belt-and-suspenders post-teardown wintun adapter cleanup.
+        // `bridge::Dispatcher::drop` synchronously drains the engine task
+        // so wintun's own Drop runs; this is the safety net for paths that
+        // bypass it (panic, current-thread runtime tests, Drop 2s-timeout
+        // fallback). PowerShell `Remove-NetAdapter` is idempotent on
+        // missing adapters. See adapter_cleanup docs.
         crate::adapter_cleanup::remove_adapter(&self.tun_name);
         // Note: WFP/NDIS post-teardown snapshots live in bridge's Stop
         // path, not here — tun-engine can't depend on the bridge's

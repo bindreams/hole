@@ -82,9 +82,7 @@ impl Routing for StubRouting {
 }
 
 struct StubRoutes {
-    // Held only so tests can replicate production-like state-dir behavior
-    // if they ever need it. Currently unused — the foreground test never
-    // calls start, just binds the IPC server and queries status.
+    // Unused; held only to mirror production's state-dir-owning routes type.
     _state_dir: PathBuf,
 }
 
@@ -134,7 +132,7 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
         });
 
         // Park until the server task signals the IPC socket is bound.
-        // Deterministic, no poll-retry. See bindreams/hole#383.
+        // Deterministic, no poll-retry.
         ready_rx.await.expect("server task dropped ready sender before bind");
         let stream = crate::socket::LocalStream::connect(&path)
             .await
@@ -167,9 +165,8 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
 
         // Trigger graceful shutdown and verify the task completes cleanly
         shutdown_tx.send(()).unwrap();
-        // Await the server task directly; if it hangs, the test framework's
-        // timeout surfaces a clear "test took too long" failure. No
-        // arbitrary wait-with-timeout. See bindreams/hole#383.
+        // Await the server task directly; deterministic, the framework
+        // timeout surfaces a hang as "test took too long".
         server_handle.await.expect("server task panicked");
     });
 }

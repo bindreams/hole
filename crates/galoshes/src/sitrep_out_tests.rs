@@ -17,9 +17,8 @@ fn galoshes_transports_is_tcp_and_udp() {
 
 #[skuld::test]
 fn ready_overrides_tcp_only_chain_to_tcp_udp() {
-    // The inner chain reports TCP only (v2ray hop is tier-2-probed TCP),
-    // but galoshes must forward TCP|UDP — it carries UDP over YAMUX. This
-    // override is the whole reason this mapping exists.
+    // Pins the override: inner chain reports TCP-only, but the Ready event must
+    // advertise TCP|UDP (galoshes carries UDP over YAMUX). See GALOSHES_TRANSPORTS.
     let chain_ready = ChainReady {
         listen: addr(),
         transports: Transports::TCP,

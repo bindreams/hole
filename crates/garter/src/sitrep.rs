@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 bitflags::bitflags! {
     /// IP transports a plugin actually serves at its local listener.
-    /// Reported on `ready`; retires the static `udp_supported` flag.
+    /// Reported on `ready` — the authoritative per-plugin transport set.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Transports: u8 {
         const TCP = 0b01;

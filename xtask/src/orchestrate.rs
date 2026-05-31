@@ -190,8 +190,7 @@ fn join_platforms(plats: &[Platform]) -> String {
 /// Stash directory (relative to the cargo `target/<profile>/` dir) where
 /// relocated copies of the running xtask binary live. Sibling of the running
 /// exe so the path is local to whatever target tree we were launched from,
-/// and so `cargo clean` wipes us along with everything else. Naming follows
-/// the project's `.tmp/<role>/` convention (`/var/run/`-style).
+/// and so `cargo clean` wipes us along with everything else.
 #[cfg(windows)]
 const STASH_SUBDIR: &[&str] = &[".tmp", "run"];
 
@@ -320,13 +319,10 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
 ///
 /// On Unix, this is just `bash` from PATH.
 ///
-/// On Windows, two installations commonly resolve `bash` from a Windows-side
-/// `CreateProcess` lookup: **Git Bash** (MSYS2-based, ships with Git for
-/// Windows) and **WSL bash** (`C:\Windows\System32\bash.exe`, the WSL
-/// launcher). Build orchestration must use Git Bash — WSL bash runs commands
-/// inside a Linux distribution where `cargo.exe` is invisible and Windows-form
-/// paths in `build.yaml` are interpreted as Linux paths. The two are not
-/// interchangeable.
+/// On Windows, build orchestration must use Git Bash (MSYS2-based, ships with
+/// Git for Windows), not WSL bash (`C:\Windows\System32\bash.exe`): WSL bash
+/// runs commands inside a Linux distribution where `cargo.exe` is invisible
+/// and Windows-form `build.yaml` paths are mis-parsed as Linux paths.
 ///
 /// Resolution order on Windows:
 /// 1. `$HOLE_BUILD_BASH` env var — explicit override.

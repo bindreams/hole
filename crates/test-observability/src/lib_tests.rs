@@ -5,11 +5,10 @@
 //! 1. [`install_subscriber_dispatches_info_events`] — confirms the
 //!    global subscriber is wired up: an `info!` event reaches a
 //!    sibling `set_default` capture buffer.
-//! 2. [`shadowsocks_service_trace_is_filter_rejected_cheaply`] — the
-//!    #147 perf-trap gate. Even with `LogTracer` installed,
-//!    `log::trace!` from a noisy third-party namespace must be
-//!    level-rejected at `Dispatch::enabled()` before `tracing-log`
-//!    allocates.
+//! 2. [`shadowsocks_service_trace_is_filter_rejected_cheaply`] — even
+//!    with `LogTracer` installed, `log::trace!` from a noisy
+//!    third-party namespace must be level-rejected at
+//!    `Dispatch::enabled()` before `tracing-log` allocates.
 
 use super::*;
 use std::io;
