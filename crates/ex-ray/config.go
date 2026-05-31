@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"strconv"
@@ -99,6 +100,19 @@ func parseLocalAddr(localAddr string) []string {
 	return strings.Split(localAddr, "|")
 }
 
+// uint32Opt converts an operator-supplied integer option to uint32, rejecting
+// out-of-range values loudly instead of letting them silently wrap. The bound
+// guard wrapping the conversion is gosec G115's recognized mitigation, so the
+// cast needs no //nolint. The error propagates through generateConfig ->
+// buildV2Ray -> main's emitFatal + os.Exit(23), the same loud-failure path as a
+// bad port (main.go).
+func uint32Opt(name string, v int) (uint32, error) {
+	if v >= 0 && v <= math.MaxUint32 {
+		return uint32(v), nil
+	}
+	return 0, newError("invalid", name, "(expected 0..4294967295), got:", v)
+}
+
 func generateConfig() (*core.Config, error) {
 	lport, err := net.PortFromString(*localPort)
 	if err != nil {
@@ -107,6 +121,18 @@ func generateConfig() (*core.Config, error) {
 	rport, err := strconv.ParseUint(*remotePort, 10, 32)
 	if err != nil {
 		return nil, newError("invalid remotePort:", *remotePort).Base(err)
+	}
+	// Validate operator-supplied numeric options up-front, before the
+	// server/client split, so out-of-range mux/fwmark are rejected identically
+	// in both modes. This also makes the guard dominate both cast sites below,
+	// so gosec G115 clears with no cast remaining at those sites.
+	muxU32, err := uint32Opt("mux", *mux)
+	if err != nil {
+		return nil, err
+	}
+	fwmarkU32, err := uint32Opt("fwmark", *fwmark)
+	if err != nil {
+		return nil, err
 	}
 	outboundProxy := serial.ToTypedMessage(&freedom.Config{
 		DestinationOverride: &freedom.DestinationOverride{
@@ -152,7 +178,7 @@ func generateConfig() (*core.Config, error) {
 			socketConfig.Tfo = internet.SocketConfig_Enable
 		}
 		if *fwmark != 0 {
-			socketConfig.Mark = uint32(*fwmark)
+			socketConfig.Mark = fwmarkU32
 		}
 
 		streamConfig.SocketSettings = socketConfig
@@ -232,7 +258,7 @@ func generateConfig() (*core.Config, error) {
 
 	senderConfig := proxyman.SenderConfig{StreamSettings: &streamConfig}
 	if connectionReuse {
-		senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: uint32(*mux)}
+		senderConfig.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: muxU32}
 	}
 	return &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
