@@ -1,6 +1,6 @@
 # Hole
 
-Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin support.
+Shadowsocks GUI with transparent proxy (TUN), system tray, and v2ray-plugin support (the v2ray-plugin wire protocol, served by the bundled first-party `ex-ray` binary).
 
 ## Architecture
 
@@ -260,7 +260,7 @@ debugging sessions only; `bridge.log` rotates via
 
 When the bridge's local SOCKS5 listener relays a connection to the
 plugin chain, the boundary in between is normally invisible — the
-plugin process (`v2ray-plugin`, `galoshes`) runs out-of-process and
+plugin process (`ex-ray`, `galoshes`) runs out-of-process and
 its network I/O is not captured by the bridge's ETW consumer. Two
 independent gates enable [`garter::TapPlugin`](crates/garter/src/tap.rs)
 to interpose between shadowsocks-service and the inner plugin:
@@ -315,9 +315,11 @@ connections/sec).
 appends a debug-level log directive to the plugin's `SS_PLUGIN_OPTIONS`
 when the plugin's syntax is known:
 
-- `v2ray-plugin` → appends `;loglevel=debug`. v2ray-plugin honors the
-  last occurrence of any duplicate key, so this overrides a user's
-  earlier `loglevel=warning`.
+- `v2ray-plugin` / `ex-ray` → appends `;loglevel=debug`. The config name
+  `v2ray-plugin` resolves to the first-party `ex-ray` binary, and a config
+  may also name `ex-ray` directly; the match arm covers both spellings.
+  Both honor the last occurrence of any duplicate key (same v2ray-core
+  log config), so this overrides a user's earlier `loglevel=warning`.
 
 The cost is paid in `bridge.log` volume; the bridge captures plugin
 stderr via `garter::binary` and routes it through the tracing
@@ -360,7 +362,7 @@ crash recovery, both in `<state_dir>/`:
   `routing::recover_routes` tears down any routes leaked by a previous
   crashed run.
 - **`bridge-plugins.json`** — records the PIDs and start times of plugin
-  processes (v2ray-plugin, galoshes) spawned by the bridge. Cleared on
+  processes (ex-ray, galoshes) spawned by the bridge. Cleared on
   clean shutdown. On next startup, `plugin_recovery::recover_plugins`
   kills any tracked processes that are still alive (with PID-reuse
   safety via start-time verification). The same file is also read by the
@@ -425,8 +427,14 @@ crates/garter-bin/        → garter-bin.   Apache-2.0, garter group, publish=fa
                             plugin developers; NOT shipped in Hole's MSI).
 crates/galoshes/          → galoshes.     Apache-2.0, galoshes group, publish=false.
                             Bundled SIP003u plugin: YAMUX-multiplexed TCP+UDP relay
-                            with embedded v2ray-plugin (SHA256-verified at compile time).
+                            with embedded ex-ray (SHA256-verified at compile time).
                             Shipped alongside hole.exe AND released standalone for servers.
+crates/ex-ray/            → ex-ray.        Apache-2.0, ex-ray group. NOT a Rust crate —
+                            first-party Go SIP003u plugin built on v2ray-core, wire-
+                            compatible with shadowsocks/v2ray-plugin. Replaced the
+                            vendored external/v2ray-plugin subrepo (#414). Version at
+                            crates/ex-ray/version.toml. Embedded into galoshes; also
+                            released standalone (6-platform binaries).
 crates/mock-plugin/       → mock-plugin.  Apache-2.0, no group, publish=false.
                             Minimal SIP003u TCP echo plugin for garter integration tests.
 build.yaml                → declarative build-target manifest (the DAG of `hole`,
@@ -441,12 +449,8 @@ xtask/                    → workspace task runner. Top-level commands:
                                                                     invokes the build cascade first
                             - `cargo xtask list`                  — print the target table
                             Primitive subcommands stay available for one-off use:
-                            `cargo xtask <stage|deps|v2ray-plugin|galoshes|wintun|version|...>`
+                            `cargo xtask <stage|deps|ex-ray|galoshes|wintun|version|...>`
 xtask-lib/                → shared helper crate used by xtask AND crates/hole/build.rs
-external/                 → Third-party source (git-subrepos via ingydotnet/git-subrepo,
-                            not git submodules): `v2ray-plugin` (Go). v2ray-plugin
-                            release-group version lives at
-                            external/v2ray-plugin/version.toml.
 msi-installer/            → WiX MSI installer (Python project: thin wrapper around xtask + WiX)
 dmg-installer/            → macOS DMG signature checks (Python project: pytest harness
                             asserting `Hole.app`'s codesign seal is internally consistent
@@ -462,32 +466,30 @@ distributions produced by this workspace (`hole.exe`, `hole.msi`,
 bundled `galoshes.exe`) ship as a whole under GPL-3.0 per Apache→GPL
 one-way compatibility.
 
-### v2ray-plugin embedding
+### ex-ray embedding
 
-The `galoshes` crate embeds the v2ray-plugin Go binary into its own
+The `galoshes` crate embeds the `ex-ray` Go binary into its own
 executable at compile time:
 
-1. Go source lives at [external/v2ray-plugin/](external/v2ray-plugin/),
-   managed as a `git-subrepo` of `shadowsocks/v2ray-plugin` (the ingydotnet
-   tool, not `git submodule`). Pull upstream changes with
-   `git subrepo pull external/v2ray-plugin`. Hole-local security/feature
-   patches land as ordinary commits on top. `git subrepo push` is not
-   used — we do not contribute back automatically.
-1. `cargo xtask v2ray-plugin` (or `cargo xtask deps`, which calls it
+1. Go source lives at [crates/ex-ray/](crates/ex-ray/) — a first-party,
+   normal workspace directory (NOT a git-subrepo). `ex-ray` is built on
+   v2ray-core and is wire-compatible with `shadowsocks/v2ray-plugin`; it
+   replaced the vendored `external/v2ray-plugin` subrepo (#414).
+1. `cargo xtask ex-ray` (or `cargo xtask deps`, which calls it
    first) builds the Go source into
-   `.cache/v2ray-plugin/v2ray-plugin-<host-target-triple>[.exe]`.
+   `.cache/ex-ray/ex-ray-<host-target-triple>[.exe]`.
 1. [`crates/galoshes/build.rs`](crates/galoshes/build.rs) reads that
-   cache file, computes its SHA-256, and emits `V2RAY_PLUGIN_PATH` +
-   `V2RAY_SHA256` as env vars the crate `include_bytes!`s. At runtime,
+   cache file, computes its SHA-256, and emits `EX_RAY_PATH` +
+   `EX_RAY_SHA256` as env vars the crate `include_bytes!`s. At runtime,
    `galoshes` re-hashes the embedded bytes and refuses to run on
    mismatch — compile-time binary integrity.
-1. `output_name()` in `xtask/src/v2ray_plugin.rs` maps the host target
+1. `output_name()` in `xtask/src/ex_ray.rs` maps the host target
    triple to the expected cache filename; it covers all six target
    triples in the CI matrix (Hole's Windows/macOS set plus ex-Galoshes
    Linux x64/arm64 and Windows-arm64).
 
 **Runtime extraction directory.** At startup galoshes writes the
-embedded v2ray-plugin to a per-user runtime dir resolved by
+embedded ex-ray to a per-user runtime dir resolved by
 [`embedded::runtime_dir`](crates/galoshes/src/embedded.rs):
 `$XDG_RUNTIME_DIR/galoshes` if set (honored cross-platform), else the
 platform default — `$HOME/.cache/galoshes` on Linux,
@@ -509,7 +511,7 @@ Build orchestration is owned by `xtask/`. The canonical list of files that
 go into the runnable BINDIR (next to `hole.exe`) lives in
 [xtask/src/bindir.rs](xtask/src/bindir.rs); both `scripts/dev.py` and
 `msi-installer` call `cargo xtask stage` instead of duplicating composition.
-Runtime asset acquisition (v2ray-plugin Go build, wintun.dll download) lives
+Runtime asset acquisition (ex-ray Go build, wintun.dll download) lives
 in `cargo xtask deps`. `crates/hole/build.rs` is restricted to compile-time
 metadata (icon generation, git version via `xtask-lib::version`).
 
@@ -525,7 +527,7 @@ staged name is disambiguated to `{crate}-{kind}.test.exe`
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow (hot-reload, foreground bridge mode).
 
-Requires: Rust toolchain, Go toolchain (for v2ray-plugin), Node.js.
+Requires: Rust toolchain, Go toolchain (for ex-ray), Node.js.
 
 ```sh
 npm install                      # install frontend dependencies (first time only)
@@ -744,19 +746,19 @@ Version per group is declared in each crate's
 `xtask-lib::version` (publishable-but-ungrouped crates are rejected;
 within-group versions must match).
 
-| Product        | Group members                                                                                                               | Artifacts                                                                | Signed         | crates.io     |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
-| `hole`         | `hole, hole-common, hole-bridge, hole-test-observability, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders` | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
-| `galoshes`     | `galoshes`                                                                                                                  | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
-| `garter`       | `garter, garter-bin`                                                                                                        | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
-| `v2ray-plugin` | (not a Rust crate — version in `external/v2ray-plugin/version.toml`, lineage form `X.Y.Z[-hole.N]`)                         | 6-platform tar.gz set (upstream parity + windows-arm64) + `SHA256SUMS`   | No             | n/a           |
+| Product    | Group members                                                                                                               | Artifacts                                                                | Signed         | crates.io     |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------- | ------------- |
+| `hole`     | `hole, hole-common, hole-bridge, hole-test-observability, tun-engine, tun-engine-macros, dump, dump-macros, handle-holders` | MSI + DMG (amd64+arm64) + `SHA256SUMS`                                   | Yes (minisign) | No            |
+| `galoshes` | `galoshes`                                                                                                                  | 6-platform server binaries + `SHA256SUMS`                                | No             | No            |
+| `garter`   | `garter, garter-bin`                                                                                                        | crates.io `garter` lib + 6-platform `garter` CLI binaries + `SHA256SUMS` | No             | `garter` only |
+| `ex-ray`   | (not a Rust crate — version in `crates/ex-ray/version.toml`, plain `X.Y.Z` semver)                                          | 6-platform binaries + `SHA256SUMS`                                       | No             | No            |
 
 Asset naming:
 
 - hole: `hole-{version}-{os}-{arch}.{msi,dmg}` (unchanged)
 - galoshes: `galoshes-{version}-{os}-{arch}[.exe]`
 - garter: `garter-{version}-{os}-{arch}[.exe]` (binary from `garter-bin`)
-- v2ray-plugin: `v2ray-plugin-{os}-{arch}-v{version}.tar.gz` (matches upstream's exact shape)
+- ex-ray: `ex-ray-{version}-{os}-{arch}[.exe]` (matches galoshes's naming)
 
 ### Why only hole is signed
 
@@ -778,18 +780,14 @@ step.
 ### `/releases/latest` pinning policy
 
 Each draft workflow pins `--latest` at `gh release create` time:
-`hole=true`, `galoshes`/`garter`/`v2ray-plugin`=`false`. Each publish
+`hole=true`, `galoshes`/`garter`/`ex-ray`=`false`. Each publish
 workflow re-asserts the same value on `gh release edit` as
 belt-and-suspenders. Without the create-time pin, GitHub re-evaluates
 `make_latest` via the legacy semver+date heuristic on first publish and
 can promote the wrong track to `/releases/latest` — this is what
-happened to `releases/v2ray-plugin/v1.3.3-hole.1` before #308.
-
-Pre-release semver versions (e.g. v2ray-plugin's `X.Y.Z-hole.N`) are
-NOT marked with `--prerelease=true`. The GitHub UI's "pre-release"
-label means "beta/RC quality" to users, which is wrong for vendor
-patches that are production-ready. `--latest=false` alone is
-sufficient to keep them out of `/releases/latest`.
+happened to `releases/v2ray-plugin/v1.3.3-hole.1` before #308 (the
+v2ray-plugin track has since been retired in favor of ex-ray, #414, but
+the create-time-pin lesson stands for every non-hole track).
 
 ### Per-product release workflows
 
@@ -799,26 +797,15 @@ sufficient to keep them out of `/releases/latest`.
 
 - **garter**: `draft-release-garter.yaml` (also runs `cargo publish --dry-run -p garter` for early failure) → `publish-release-garter.yaml`. Publish workflow is idempotent: it queries crates.io's API to see whether the version already exists (200) and skips the `cargo publish` step if so, so a re-run after a partial-failure resumes cleanly. A `dry_run: true` input runs `cargo publish --dry-run` and exits without touching crates.io or the tag.
 
-- **v2ray-plugin**: `draft-release-v2ray-plugin.yaml` → `publish-release-v2ray-plugin.yaml`. The matrix is upstream's release platform set — darwin amd64/arm64, linux amd64/arm64, windows amd64 — **plus windows-arm64**, which upstream doesn't ship but we already build and transitively test via galoshes-on-windows-arm64 (galoshes embeds v2ray-plugin). 6 platforms total. When upstream changes its set, edit the matrix and the SHA256SUMS line count in the draft workflow. Hole-local v2ray-plugin patches land via `git subrepo pull external/v2ray-plugin` followed by ordinary commits.
+- **ex-ray**: `draft-release-ex-ray.yaml` → `publish-release-ex-ray.yaml`. No signing. The matrix is the 6-platform set — darwin amd64/arm64, linux amd64/arm64, windows amd64, windows-arm64 (the same set galoshes ships, since galoshes embeds ex-ray and is tested on all six). ex-ray is first-party Go source under `crates/ex-ray/`; there is no upstream-subrepo pull.
 
-  **Lineage versioning.** v2ray-plugin's version (`external/v2ray-plugin/version.toml`) follows the convention `X.Y.Z` (we vendor upstream's `vX.Y.Z` release exactly) or `X.Y.Z-hole.N` (we vendor upstream-master between two upstream tags, with `N` counting our successive Hole-side release iterations against the same `X.Y.Z` base). Per semver, `X.Y.Z-hole.N` orders strictly above `X.Y.Z-1`'s artifacts and strictly below upstream's eventual `vX.Y.Z` — capturing exactly the "between releases" semantic. Precedent: Go modules' pseudo-versions use the same `X.Y.(Z+1)-pre` shape.
-
-  Worked example: our current vendored commit `e9af1cd` is 5 upstream-master commits past `v1.3.2` (including a v2ray-core v4→v5 migration). Bump base = `1.3.3` (next patch after upstream's last tag), iteration = `1` (first Hole release of this base) → `version = "1.3.3-hole.1"`.
-
-  **Maintainer rules** (xtask-lib/src/v2ray_plugin_version.rs enforces shape + sequence; bases are your call):
-
-  - When pulling upstream-master between two upstream tags: set `X.Y.Z` to upstream's next-patch-after-last-tag and `N` to 1 (or increment if you've cut a prior Hole release against the same base).
-  - When pulling at an upstream tag exactly: set version to that tag's bare `X.Y.Z` (no `-hole.N` suffix).
-  - On each successive Hole release with the same `X.Y.Z` base, increment `N` by exactly 1 (no gaps). The validator rejects skips.
-  - The validator does NOT cross-check against upstream's tag history (we don't have upstream's git data locally); the maintainer is responsible for picking the right `X.Y.Z` base.
-
-  **Display-version note.** Dev builds downstream of `releases/v2ray-plugin/v1.3.3-hole.1` produce `1.3.3-hole.1-snapshot+git.<hash>`. This is valid semver — the `-snapshot` extends the pre-release identifier — and intentional. Two dashes before `+git.` is not a bug.
+  **Versioning.** ex-ray uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking). Standard `releases/ex-ray/v<X.Y.Z>` tags. The version lives in `crates/ex-ray/version.toml` and is validated by `xtask-lib/src/ex_ray_version.rs`.
 
 ### Version model (`cargo xtask version`)
 
 ```
 cargo xtask version                                     # table of every group's resolved version
-cargo xtask version --group <hole|garter|galoshes|v2ray-plugin>            # one group's display version
+cargo xtask version --group <hole|garter|galoshes|ex-ray>            # one group's display version
 cargo xtask version --check --group <name>              # validate Cargo.toml vs nearest tag (one-bump-ahead OK)
 cargo xtask version --check --group <name> --exact      # validate exact match (release CI uses this)
 ```
