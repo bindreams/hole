@@ -70,19 +70,14 @@ impl Endpoint for Socks5Endpoint {
     }
 
     async fn serve_udp(&self, mut flow: UdpFlow, dst: SocketAddr) -> io::Result<()> {
-        // Defense-in-depth for the privacy invariant. The cascade
-        // (`HoleRouter::resolve_endpoint`) is supposed to keep UDP off
-        // this endpoint when `!self.udp_supported`, but we refuse to
-        // rely on comments alone for a leak-critical invariant in
-        // release builds. Log and drop on violation.
-        if !self.udp_supported {
-            debug_assert!(false, "Socks5Endpoint::serve_udp called despite udp_supported=false");
-            tracing::error!(
-                plugin = self.plugin_name.as_deref().unwrap_or("<none>"),
-                "privacy invariant violated: serve_udp called on TCP-only SOCKS5 endpoint; dropping"
-            );
-            return Ok(());
-        }
+        // Precondition: the `HoleRouter::resolve_endpoint` cascade drops
+        // `Proxy` + UDP when `!supports_udp()`, so this endpoint never
+        // serves UDP on a TCP-only plugin. `udp_supported` is immutable, so
+        // this is a true contract — assert it (zero-cost in release).
+        debug_assert!(
+            self.udp_supported,
+            "serve_udp on TCP-only SOCKS5 endpoint — HoleRouter cascade should have dropped this UDP flow"
+        );
 
         let relay = Arc::new(Socks5UdpRelay::associate(self.addr).await?);
 
