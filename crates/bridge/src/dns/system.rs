@@ -49,8 +49,8 @@ use crate::dns_state::{AdapterId, DnsPriorAdapter};
 /// substitute a mock via [`crate::proxy_manager::ProxyManager::new_with_dns`].
 ///
 /// **Why a trait, not free functions.** Direct callers of the
-/// platform-free-function surface (`apply_loopback`, `capture_adapters`,
-/// `restore_all`) outside the `SystemDns` impl are rejected by workspace
+/// platform-free-function surface (`capture_adapters`, `restore_all`)
+/// outside the `SystemDns` impl are rejected by workspace
 /// `clippy.toml` `disallowed_methods`, mirroring the `setup_routes` /
 /// `teardown_routes` enforcement at
 /// [tun_engine::routing](../../../tun_engine/routing.rs). The motivation
@@ -640,16 +640,6 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
-/// One applied DNS change, returned so a rollback on partial failure can
-/// restore exactly what was touched. Production code persists
-/// `Vec<DnsPriorAdapter>` to `bridge-dns.json` and feeds it to
-/// [`restore_all`] on shutdown.
-#[derive(Debug, Clone)]
-pub struct AppliedAdapter {
-    pub id: AdapterId,
-    pub name_at_capture: String,
-}
-
 /// Restore all adapters listed in `prior`. Each adapter is restored
 /// independently — one failure is logged and the rest proceed. This
 /// matches the crash-recovery contract (best-effort).
@@ -667,20 +657,6 @@ pub fn restore_all(prior: &[DnsPriorAdapter]) -> Vec<(AdapterId, io::Error)> {
         }
     }
     errors
-}
-
-/// Summary of the DNS state that was in effect before `apply` ran. The
-/// caller persists this (via `dns_state::save`) and feeds it to
-/// [`restore_all`] on shutdown or crash recovery.
-#[derive(Debug, Clone)]
-pub struct PriorSnapshot {
-    pub adapters: Vec<DnsPriorAdapter>,
-}
-
-impl PriorSnapshot {
-    pub fn empty() -> Self {
-        Self { adapters: Vec::new() }
-    }
 }
 
 /// Dispatch a single adapter's restore to the platform implementation.
@@ -703,11 +679,6 @@ pub fn platform_restore_adapter(_adapter: &DnsPriorAdapter) -> io::Result<()> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn capture_adapters(_aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> {
     Err(io::Error::other("system DNS capture not implemented on this target OS"))
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub fn apply_loopback(_aliases: &[String], _loopback_ip: std::net::IpAddr) -> io::Result<Vec<AppliedAdapter>> {
-    Err(io::Error::other("system DNS apply not implemented on this target OS"))
 }
 
 // Re-export DnsPrior helpers so callers don't need a separate import just

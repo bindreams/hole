@@ -20,7 +20,7 @@ pub(crate) fn init_git_repo(root: &Path) {
     git(root, &["commit", "--quiet", "-m", "init"]);
 }
 
-/// Create an annotated tag at HEAD in the repo at `root`.
+/// Create a lightweight tag at HEAD in the repo at `root`.
 pub(crate) fn create_tag(root: &Path, tag: &str) {
     let s = Command::new("git")
         .args(["tag", tag])

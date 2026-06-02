@@ -159,7 +159,7 @@ pub fn install() {
 
         // Hole's tracing-emitting panic hook. Chains before the
         // stdlib default. Idempotent via its own AtomicBool, so
-        // safe alongside any production caller of `init_logging`.
+        // safe alongside the production caller `init_multi` (which also calls `install_panic_hook`).
         // Gated to Mac/Windows because `hole-common` only compiles
         // on those platforms (see this crate's Cargo.toml); on
         // Linux/etc. (where ex-Galoshes crates get clippy-checked

@@ -69,8 +69,8 @@ describe("setCountryFlag", () => {
   });
 
   // The PublicIpData type at ui/types.ts:92 says `country_code: string`,
-  // but the backend's ipinfo.io fallback at crates/hole/src/commands.rs:483
-  // is `body["country"].as_str().unwrap_or("??")` — a null upstream would
+  // but the backend's ipinfo.io `body["country"].as_str().unwrap_or("??")`
+  // fallback in crates/hole/src/commands.rs — a null upstream would
   // still produce "??", but defense in depth.
   // biome-ignore lint/suspicious/noExplicitAny: cast through to test the runtime guard
   it("null / undefined: same as '??'", () => {

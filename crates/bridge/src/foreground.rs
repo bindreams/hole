@@ -1,4 +1,4 @@
-// Foreground bridge runner for development.
+//! Foreground bridge runner for development.
 
 use std::path::Path;
 

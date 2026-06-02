@@ -27,15 +27,6 @@ pub struct EngineConfig {
     /// smoltcp TCP socket transmit buffer (per socket, bytes).
     pub tcp_tx_buf_size: usize,
 
-    /// smoltcp UDP receive metadata slots for the DNS-intercept socket.
-    pub udp_rx_meta_slots: usize,
-    /// smoltcp UDP receive payload size for the DNS-intercept socket (bytes).
-    pub udp_rx_payload_size: usize,
-    /// smoltcp UDP transmit metadata slots for the DNS-intercept socket.
-    pub udp_tx_meta_slots: usize,
-    /// smoltcp UDP transmit payload size for the DNS-intercept socket (bytes).
-    pub udp_tx_payload_size: usize,
-
     /// Interval at which the driver polls smoltcp outside of TUN reads.
     /// Needed because handler-to-driver data arrives via mpsc and would
     /// otherwise wait for an unrelated TUN packet to wake the driver.
@@ -62,10 +53,6 @@ impl Default for MutEngineConfig {
             max_sniffers: 1024,
             tcp_rx_buf_size: 65536,
             tcp_tx_buf_size: 65536,
-            udp_rx_meta_slots: 32,
-            udp_rx_payload_size: 8192,
-            udp_tx_meta_slots: 32,
-            udp_tx_payload_size: 8192,
             poll_interval: Duration::from_millis(1),
             idle_sweep_interval: Duration::from_secs(5),
             udp_flow_idle_timeout: Duration::from_secs(30),

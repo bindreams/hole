@@ -3,7 +3,7 @@
 // FD-redirect tests run in a child process so they don't corrupt sibling tests
 // that share FD 1 / FD 2 in the test runner. The child is the same test binary
 // re-invoked with `HOLE_LOGGING_TEST_KIND` set; `lib.rs::main` dispatches early
-// (before skuld) into `logging::run_redirect_test_child`. Each child writes a
+// (before skuld) into `logging::logging_test_helpers::run_child`. Each child writes a
 // JSON result file at `HOLE_LOGGING_TEST_OUTPUT` and exits, and the parent
 // reads + asserts on it.
 
@@ -46,9 +46,9 @@ fn run_child(kind: &str, dir: &Path) -> ChildResult {
         .env("HOLE_LOGGING_TEST_KIND", kind)
         .env("HOLE_LOGGING_TEST_OUTPUT", &result_path)
         .stdin(Stdio::null())
-        // Inherit stdout/stderr to a temp file so the child's actual stdio
-        // (post-redirect, post-tee) doesn't pollute the test runner output but
-        // is still recoverable for diagnostics if the test fails.
+        // Discard the child's actual stdio (post-redirect, post-tee) so it
+        // doesn't pollute the test runner output; the test's assertions read
+        // the JSON result file, not stdio.
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

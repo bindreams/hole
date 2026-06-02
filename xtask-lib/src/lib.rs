@@ -3,10 +3,10 @@
 //! can depend on it as a build-dependency without dragging in `xtask`'s
 //! clap/glob/ureq machinery.
 //!
-//! See issue #143 for the motivation: version computation was previously
-//! duplicated across `crates/hole/build.rs::compute_git_version`,
-//! `msi-installer/src/msi_installer/__init__.py::get_version`, and
-//! `scripts/check-version.py`. This crate is the single source of truth.
+//! See issue #143 for the motivation. This crate is the single source of
+//! truth for group-aware version computation, shared by `crates/hole/build.rs`
+//! and `xtask` (`cargo xtask version`) instead of being reimplemented per
+//! consumer.
 
 pub mod ex_ray_version;
 pub mod version;

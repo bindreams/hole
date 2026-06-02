@@ -1,4 +1,4 @@
-// Bridge logging — delegates to shared logging in hole-common.
+//! Bridge logging — delegates to shared logging in hole-common.
 
 use hole_common::logging::LogGuard;
 use std::path::Path;

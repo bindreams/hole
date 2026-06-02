@@ -8,7 +8,7 @@
 //    `hole::stderr_relay` (which the file layer captures) and (b) the
 //    *saved-original* handle (which preserves dev-terminal / CLI-script
 //    visibility). Catches any third-party output that bypasses tracing —
-//    Go runtime stderr from v2ray-plugin, native libraries, the default panic
+//    Go runtime stderr from the ex-ray plugin, native libraries, the default panic
 //    printer, etc.
 //
 // 2. **Multi-layer tracing subscriber.** A `Registry` with two `fmt::layer()`s:

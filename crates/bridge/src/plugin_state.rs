@@ -1,9 +1,9 @@
-// Persisted plugin PID state for crash recovery.
-//
-// The bridge writes plugin PIDs to a JSON file when a plugin chain starts,
-// clears it on clean shutdown, and reads it on startup to kill leaked
-// plugin processes from a previous crashed run. Mirrors the
-// `route_state.rs` crash-recovery pattern.
+//! Persisted plugin PID state for crash recovery.
+//!
+//! The bridge writes plugin PIDs to a JSON file when a plugin chain starts,
+//! clears it on clean shutdown, and reads it on startup to kill leaked
+//! plugin processes from a previous crashed run. Mirrors the
+//! `routing::state` crash-recovery pattern.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -38,7 +38,7 @@ fn state_file(state_dir: &Path) -> PathBuf {
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
-/// Same atomic-write pattern as `route_state::save`.
+/// Same atomic-write pattern as `routing::state::save`.
 pub fn save(state_dir: &Path, state: &PluginState) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
 

@@ -10,7 +10,8 @@
 //!
 //! Designed for diagnostic mode — the extra loopback round-trip per byte
 //! is fine for an on-demand tap but inappropriate as default. Bridge gates
-//! it behind `HOLE_BRIDGE_PLUGIN_TAP=1`.
+//! it behind either the persistent `diagnostic_plugin_tap` config flag or
+//! the dev-only `HOLE_BRIDGE_PLUGIN_TAP=1` env var.
 //!
 //! Lifecycle:
 //! 1. Allocate an internal port for the inner plugin via probe-and-drop
@@ -270,8 +271,8 @@ async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<cr
 }
 
 /// Probe-and-drop a free TCP port on `(ip, 0)`. Retries on
-/// `AddrInUse` / `PermissionDenied` (the Windows excluded-port-range
-/// flake) up to [`INNER_PORT_ALLOC_ATTEMPTS`] times.
+/// `AddrInUse` / `PermissionDenied` / `AddrNotAvailable` (the Windows
+/// excluded-port-range flake) up to [`INNER_PORT_ALLOC_ATTEMPTS`] times.
 fn allocate_inner_port(ip: IpAddr) -> io::Result<SocketAddr> {
     let mut last_err: Option<io::Error> = None;
     for _ in 0..INNER_PORT_ALLOC_ATTEMPTS {

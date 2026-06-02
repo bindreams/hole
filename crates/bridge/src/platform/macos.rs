@@ -10,7 +10,8 @@ pub const PLIST_PATH: &str = "/Library/LaunchDaemons/com.hole.bridge.plist";
 pub const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/com.hole.bridge";
 pub const SERVICE_LOG_DIR: &str = "/var/log/hole";
 /// System state directory for the launchd daemon (Apple convention:
-/// `/var/db/<daemon>`). Holds the route-recovery state file.
+/// `/var/db/<daemon>`). Holds the bridge crash-recovery state files
+/// (DNS, routes, plugins).
 pub const SERVICE_STATE_DIR: &str = "/var/db/hole/state";
 
 // Plist generation ====================================================================================================

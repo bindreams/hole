@@ -698,9 +698,9 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
 /// `SS_PLUGIN_OPTIONS` string.
 ///
 /// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The last occurrence
-/// wins (consistent with v2ray-plugin's duplicate-key semantics). A value that
+/// wins (consistent with ex-ray's duplicate-key semantics). A value that
 /// is not a positive integer is a hard error — `0` would evict every
-/// association immediately, breaking all UDP. v2ray-plugin ignores this key,
+/// association immediately, breaking all UDP. ex-ray ignores this key,
 /// so it can share the same options string.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
@@ -762,7 +762,7 @@ impl garter::ChainPlugin for YamuxPlugin {
         //
         // This is galoshes' INTERNAL hop-readiness signal: it feeds
         // galoshes' OWN `ChainRunner` aggregator, which intersects it with
-        // the inner v2ray hop and fires the chain-level `on_ready`. The
+        // the inner ex-ray hop and fires the chain-level `on_ready`. The
         // PROCESS-level sitrep the bridge reads is emitted separately in
         // `main.rs` off that `on_ready` outcome (see `galoshes::sitrep_out`).
         // This probe knows only its own hop, not the chain, so it cannot

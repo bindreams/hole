@@ -1,11 +1,12 @@
 //! Generates Rust types and route constants from the OpenAPI spec at `api/openapi.yaml`.
 //!
 //! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `PublicIpResponse`, `InvalidFilter`, `FilterMetrics`.
-//! Generated constants: `ROUTE_STATUS`, `ROUTE_START`, `ROUTE_STOP`, `ROUTE_RELOAD`, `ROUTE_METRICS`, `ROUTE_DIAGNOSTICS`, `ROUTE_PUBLIC_IP`, `ROUTE_TEST_SERVER`.
+//! Generated constants: one `ROUTE_*` const per `/v1/*` path in `api/openapi.yaml` (e.g. `ROUTE_STATUS`, `ROUTE_START`, `ROUTE_STOP`, `ROUTE_CANCEL`, `ROUTE_RELOAD`, …).
 //!
-//! `ProxyConfig`, `ServerEntry`, `ValidationState`, `ServerTestOutcome`, `TestServerRequest`,
-//! and `TestServerResponse` are defined in the spec for documentation purposes
-//! but are not generated — they are hand-written in `protocol.rs` and `config.rs`.
+//! The remaining schemas — including `ProxyConfig`, `ServerEntry`, `ValidationState`,
+//! `ServerTestOutcome`, `TestServerRequest`, `TestServerResponse`, and `TunnelMode` —
+//! are defined in the spec for documentation purposes but are not generated; they are
+//! hand-written in `protocol.rs` and `config.rs`.
 
 use schemars::schema::Schema;
 use typify::{TypeSpace, TypeSpaceSettings};

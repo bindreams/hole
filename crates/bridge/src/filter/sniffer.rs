@@ -1,7 +1,7 @@
 //! Connection-level domain sniffer.
 //!
 //! When the dispatcher accepts a new TCP connection it peeks the first
-//! ~2 KiB of payload and asks the sniffer to extract a destination domain.
+//! ≤ 2 KiB of payload and asks the sniffer to extract a destination domain.
 //! The sniffer tries TLS SNI first (covers ~all HTTPS/DoH/DoT/SMTPS/IMAPS),
 //! then HTTP Host header (covers plaintext HTTP). If neither matches, the
 //! connection falls through to IP-only matching.

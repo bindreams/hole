@@ -118,8 +118,8 @@ pub fn parse_event(line: &str) -> Result<Option<SitrepEvent>, serde_json::Error>
     }
 }
 
-/// True iff `line` is a `hello` handshake whose protocol is `sitrep-*`.
-/// Used as the tier-1 detection signal on the first stdout line.
+/// A tier-1 capability check: true iff `line` is a `hello` handshake whose
+/// protocol is `sitrep-*`.
 pub fn is_hello_handshake(line: &str) -> bool {
     matches!(parse_event(line), Ok(Some(SitrepEvent::Hello { protocol })) if protocol.starts_with("sitrep-"))
 }

@@ -13,7 +13,7 @@
 //!   Production goes through [`Networksetup`]; unit tests substitute
 //!   `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
 //!
-//! - The free-function shims [`capture_adapters`] / [`apply_loopback`] /
+//! - The free-function shims [`capture_adapters`] /
 //!   [`platform_restore_adapter`] / [`flush_dns_cache`] keep the
 //!   crash-recovery / non-Dns-trait call sites (see
 //!   [`crate::dns::recovery`]) intact. Each shim instantiates
@@ -24,7 +24,6 @@ use std::net::IpAddr;
 use std::process::Command;
 use std::sync::Arc;
 
-use super::AppliedAdapter;
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 const NETWORKSETUP: &str = "networksetup";
@@ -157,23 +156,6 @@ pub fn capture_adapters(services: &[String]) -> io::Result<Vec<DnsPriorAdapter>>
         }
     }
     Ok(out)
-}
-
-pub fn apply_loopback(services: &[String], loopback_ip: IpAddr) -> io::Result<Vec<AppliedAdapter>> {
-    let backend = Networksetup;
-    let mut applied = Vec::with_capacity(services.len());
-    for svc in services {
-        if let Err(e) = backend.set_loopback(svc, loopback_ip) {
-            tracing::warn!(service = %svc, error = %e, "DNS apply failed; continuing");
-            continue;
-        }
-        applied.push(AppliedAdapter {
-            id: AdapterId::MacosServiceName { value: svc.clone() },
-            name_at_capture: svc.clone(),
-        });
-    }
-    flush_dns_cache();
-    Ok(applied)
 }
 
 /// Flush the macOS DNS cache.

@@ -272,8 +272,6 @@ impl AppConfig {
         }
     }
 
-    // Restrict config file permissions on macOS — the config contains plaintext
-    // passwords and must not be world-readable (default umask 0022 yields 0644).
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let json = serde_json::to_string_pretty(self)?;
 
@@ -289,6 +287,8 @@ impl AppConfig {
                 DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
                 std::fs::set_permissions(parent, Permissions::from_mode(0o700))?;
             }
+            // Restrict config file permissions on macOS — the config contains plaintext
+            // passwords and must not be world-readable (default umask 0022 yields 0644).
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)

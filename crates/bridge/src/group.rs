@@ -1,8 +1,8 @@
-// OS group management for IPC access control.
-//
-// Creates and manages a local "hole" group that gates access to the bridge's
-// IPC socket/pipe. Members of this group (plus root/Administrators) can
-// communicate with the bridge.
+//! OS group management for IPC access control.
+//!
+//! Creates and manages a local "hole" group that gates access to the bridge's
+//! IPC socket/pipe. Members of this group (plus root/Administrators) can
+//! communicate with the bridge.
 
 use std::io;
 

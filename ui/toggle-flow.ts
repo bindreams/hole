@@ -1,6 +1,6 @@
-// Orchestration for the power-button toggle flow. Extracted from
-// sidebar.ts so the IPC-call + state-transition logic is unit-testable
-// without DOM scaffolding. sidebar.ts owns the DOM and wires
+// Orchestration for the power-button toggle flow, separated from DOM
+// wiring so the IPC-call + state-transition logic is unit-testable
+// without DOM scaffolding. power-button.ts owns the DOM and wires
 // `handlePowerClick` to call `toggleFromIdle` with a deps object
 // assembled from local state. See bindreams/hole#397 (sub-bug C) for
 // the timer-removal context and #393 for the failure-toast extraction
@@ -27,7 +27,7 @@ export interface ToggleDeps {
   /// Read the current `ConnectionState`. Used by the cancel-raced-with-
   /// success branch to detect whether the user clicked Cancel mid-start.
   getState(): ConnectionState;
-  /// Apply a new `ConnectionState`. sidebar.ts threads this into its
+  /// Apply a new `ConnectionState`. power-button.ts threads this into its
   /// DOM repaint pipeline.
   setState(next: ConnectionState): void;
   /// Refresh the displayed public IP. Awaited fire-and-forget at the

@@ -77,9 +77,7 @@ fn bridge_request_cancel_json_roundtrip() {
 
 #[skuld::test]
 fn cancelled_message_constant_is_stable() {
-    // The bridge writes this exact string into ErrorResponse when a Start is
-    // cancelled; the client matches against it. Changing it is a breaking
-    // change to the client/bridge contract.
+    // Pins the wire-contract value (see `CANCELLED_MESSAGE` docs in protocol.rs).
     assert_eq!(CANCELLED_MESSAGE, "cancelled");
 }
 

@@ -910,7 +910,7 @@ async fn error_message(resp: http::Response<hyper::body::Incoming>) -> String {
 #[skuld::test]
 fn cancel_while_start_in_flight_returns_cancelled() {
     // Two concurrent connections. A posts Start against a gated mock so
-    // start_ss hangs. B posts Cancel. A's Start response must come back
+    // start hangs inside MockProxy::start. B posts Cancel. A's Start response must come back
     // with 500 + "cancelled" promptly (not after the full gate duration,
     // which never elapses in this test).
     rt().block_on(async {
@@ -954,7 +954,7 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         let (_client_a, resp_a) = start_future.await.expect("start task panicked");
         assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
 
-        // Release the gate so the mock's start_ss future can settle if it
+        // Release the gate so the mock's start() future can settle if it
         // is still parked anywhere; harmless no-op if already dropped.
         gate.notify_one();
         // run_n(2) returns naturally once both connections are handled, so
@@ -969,7 +969,7 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
     // A cancel arriving before any start is in flight pre-arms a flag
     // that the next start consumes. The next Start returns 500 +
     // "cancelled" immediately without even attempting to acquire the
-    // proxy mutex or call backend.start_ss.
+    // proxy mutex or call Proxy::start.
     rt().block_on(async {
         let path = test_socket_path("cancel-prearm");
         let server = IpcServer::bind(&path, mock_proxy()).unwrap();
@@ -1021,7 +1021,7 @@ fn cancel_with_no_start_is_ack_idempotent() {
 
 #[skuld::test]
 fn concurrent_start_is_rejected_with_conflict() {
-    // Client A holds a start parked in start_ss on the gate. Client B
+    // Client A holds a start parked inside MockProxy::start on the gate. Client B
     // sends a second Start concurrently. B must be rejected with 409
     // Conflict rather than silently overwriting A's token slot — the
     // slot is single-occupancy because a Cancel targets exactly one
@@ -1034,7 +1034,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         // 3 connections: A start, B start, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
-        // Client A parks in start_ss.
+        // Client A parks inside MockProxy::start.
         let path_a = path.clone();
         let a_future = tokio::spawn(async move {
             let mut client_a = TestClient::connect(&path_a).await;
@@ -1130,7 +1130,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         // 3 connections: A start, B cancel, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
-        // Client A parks in start_ss.
+        // Client A parks inside MockProxy::start.
         let path_a = path.clone();
         let a_future = tokio::spawn(async move {
             let mut client_a = TestClient::connect(&path_a).await;

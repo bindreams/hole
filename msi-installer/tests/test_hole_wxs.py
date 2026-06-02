@@ -1,6 +1,6 @@
 """Static validation tests for hole.wxs.
 
-Parse the WiX v6 source and verify structural correctness without building.
+Parse the WiX source (hole.wxs) and verify structural correctness without building.
 """
 
 import re

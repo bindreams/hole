@@ -22,7 +22,9 @@ const METHODS: &[&[u8]] = &[
 ];
 
 /// Maximum bytes scanned for the `Host:` header. We don't want to
-/// chase pathologically long header sections.
+/// chase pathologically long header sections. In production the
+/// upstream peek caps the buffer at 2048 bytes, so this bound only
+/// engages for direct callers/tests.
 const MAX_SCAN: usize = 4096;
 
 /// Try to extract the `Host` header value from a buffer that starts

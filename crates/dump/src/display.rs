@@ -8,7 +8,7 @@ use crate::DumpValue;
 
 /// Owns a [`DumpValue`] and renders it as YAML via [`std::fmt::Display`].
 ///
-/// This is what the `dump!` macro (added in a later commit) returns.
+/// This is what the [`crate::dump!`] macro returns.
 /// `Clone` is derived because `tracing` captures field values into
 /// span storage, and non-`Clone` wrappers are an ergonomic trap.
 #[derive(Clone, Debug)]

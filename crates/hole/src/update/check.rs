@@ -155,7 +155,7 @@ fn fetch_release_for_tag(tag_name: &str) -> Result<Option<GitHubRelease>, Update
 /// Filter and sort tags into candidate versions, highest first.
 ///
 /// A tag is a candidate if:
-/// - It parses as a valid strict semver (`vMAJOR.MINOR.PATCH`).
+/// - It is a hole-track tag (`releases/hole/v<MAJOR.MINOR.PATCH>`), parsed via `parse_hole_tag`.
 /// - Its version is greater than `current`, or equal to `current` when `is_snapshot` is true.
 pub(crate) fn candidate_tags(
     tags: &[GitHubTag],

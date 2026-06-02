@@ -32,9 +32,7 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     relocated-extract test (#357) has files to find post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
-    # hole.pdb shipped alongside hole.exe for symbolicated panic
-    # backtraces — see bindreams/hole#393. Mirrors the bindir layout
-    # produced by `cargo xtask stage`.
+    # Mirror the bindir layout from `cargo xtask stage` (hole.exe + hole.pdb + ex-ray.exe + wintun.dll + NOTICES.md).
     for name in ("hole.exe", "hole.pdb", "ex-ray.exe", "wintun.dll", "NOTICES.md"):
         (d / name).write_bytes(b"x" * 1024)
     return d

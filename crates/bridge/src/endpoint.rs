@@ -78,7 +78,7 @@ pub trait Endpoint: Send + Sync {
     /// SOCKS5 carries IPv6 addresses via ATYP.
     fn supports_ipv6_dst(&self) -> bool;
 
-    /// Short diagnostic label (e.g. `"socks5"`, `"interface"`,
+    /// Short diagnostic label (e.g. `"socks5(ex-ray)"`, `"interface(#5)"`,
     /// `"block"`). Backed by the endpoint's own storage — no allocation
     /// per call.
     fn name(&self) -> &str;

@@ -146,10 +146,9 @@ async fn pid_sink_fires_once_per_binary_plugin() {
     // Single-accept echo: this test only awaits `on_ready` and checks
     // pid counts — it does not send any client traffic. The plugins run
     // in the default `Probe` readiness mode, whose self-probe TCP-connects
-    // to each plugin's OWN listener (not through the chain to the echo),
-    // so the echo accept slot is never even reached here. A single-accept
-    // echo is therefore ample. The sister test
-    // (`two_plugin_chain_relays_data`) does send real client traffic.
+    // to each plugin's OWN listener (not through the chain to the echo).
+    // The sister test (`two_plugin_chain_relays_data`) does send real
+    // client traffic.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     tokio::spawn(async move {

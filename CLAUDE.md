@@ -315,7 +315,7 @@ connections/sec).
 appends a debug-level log directive to the plugin's `SS_PLUGIN_OPTIONS`
 when the plugin's syntax is known:
 
-- `v2ray-plugin` / `ex-ray` → appends `;loglevel=debug`. The config name
+- `v2ray-plugin` / `ex-ray` → appends `loglevel=debug` (semicolon-separated). The config name
   `v2ray-plugin` resolves to the first-party `ex-ray` binary, and a config
   may also name `ex-ray` directly; the match arm covers both spellings.
   Both honor the last occurrence of any duplicate key (same v2ray-core
@@ -354,8 +354,8 @@ hole path remove                  → remove hole from system PATH
 
 ### Crash recovery
 
-While a proxy is active, the bridge persists two small state files for
-crash recovery, both in `<state_dir>/`:
+While a proxy is active, the bridge persists several small state files for
+crash recovery in `<state_dir>/`:
 
 - **`bridge-routes.json`** — records the installed TUN name, server IP,
   and upstream interface. Cleared on clean shutdown. On next startup,
@@ -384,7 +384,7 @@ crash recovery, both in `<state_dir>/`:
   `hole-bridge-etw-`. Sweep is keyed on the name prefix only, safe
   against PID reuse.
 
-All three recovery paths run *after* the IPC socket is bound. If the
+All recovery paths run *after* the IPC socket is bound. If the
 in-bridge recovery fails or the process can't restart,
 `scripts/network-reset.py` reads the route state file and performs an
 equivalent cleanup from outside (plugin reaping by name as a last
@@ -660,7 +660,7 @@ the class:
 1. **Test-of-timing.** The delay IS the behavior under test
    ([`SlowWriter` in logging_test_helpers.rs:379](crates/common/src/logging/logging_test_helpers.rs#L379)
    verifying backpressure-induced drops, or
-   [`SilentAfterRead { delay }` in tap_tests.rs:139](crates/garter/src/tap_tests.rs#L139)
+   [`SilentAfterRead` in tap_tests.rs](crates/garter/src/tap_tests.rs)
    exercising idle-close semantics).
 1. **External event with graceful failure bound.** The retry budget
    for a *remote/out-of-process* operation that might genuinely never

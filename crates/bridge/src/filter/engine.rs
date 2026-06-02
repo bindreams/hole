@@ -10,8 +10,8 @@ use hole_common::config::FilterAction;
 
 use super::rules::RuleSet;
 
-/// Layer-4 protocol of a connection. Filter rules apply to both
-/// uniformly today, but downstream code (Plans 2/3) may branch on this.
+/// Layer-4 protocol of a connection. The dispatcher branches on this:
+/// TCP flows are peeked for a domain, UDP flows are matched on IP only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L4Proto {
     Tcp,

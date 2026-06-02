@@ -119,9 +119,9 @@ pub(crate) enum BridgeAction {
         /// Override the log directory
         #[arg(long)]
         log_dir: Option<std::path::PathBuf>,
-        /// Override the directory where the bridge writes its route-recovery
-        /// state file (`bridge-routes.json`). Default: platform-specific
-        /// user state dir.
+        /// Override the directory where the bridge writes its crash-recovery
+        /// state files (`bridge-routes.json`, `bridge-dns.json`,
+        /// `bridge-plugins.json`). Default: platform-specific user state dir.
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
     },
@@ -261,12 +261,11 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
 
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
 ///
-/// For write-action subcommands (Upgrade, Bridge::{Install, Uninstall, Status,
-/// GrantAccess, IpcSend}, and Path), install a CLI log guard so that
+/// For write-action subcommands, install a CLI log guard so that
 /// `cli_log!(...)` calls are recorded in `gui-cli.log` in addition to the
 /// user-facing terminal output. See [`should_install_cli_log_guard`] for
-/// the exemption list and [`resolve_cli_log_dir`] for how the directory is
-/// chosen.
+/// exactly which subcommands are exempted and [`resolve_cli_log_dir`] for
+/// how the directory is chosen.
 pub(crate) fn dispatch(command: Command) -> ! {
     let _cli_log_guard =
         resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli.log", "hole=info"));

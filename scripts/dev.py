@@ -15,11 +15,11 @@ and the GUI so they read your real ~/Library config, while the bridge
 inherits root. On Windows, UAC is token-based so all three inherit the
 elevated token without an identity change.
 
-The bridge binary and its v2ray-plugin sidecar are staged in a per-pid
-subdirectory under the system temp dir (`$TMPDIR/hole-dev-<pid>/` or
+The bridge binary and its sidecars (ex-ray, galoshes) are staged in a
+per-pid subdirectory under the system temp dir (`$TMPDIR/hole-dev-<pid>/` or
 `%TEMP%\hole-dev-<pid>\`) so they sit side-by-side under their canonical
 names — same layout as the installed MSI in `Program Files\hole\bin\`.
-This is what `resolve_plugin_path_inner` (crates/bridge/src/proxy.rs)
+This is what `resolve_plugin_path_inner` (crates/bridge/src/proxy/config.rs)
 expects, and it isolates concurrent dev.py runs from each other.
 
 Dev uses the production IPC permission path: `hole bridge grant-access`
@@ -118,7 +118,7 @@ def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None)
 def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
     """Build the `hole` target via the orchestrator.
 
-    `cargo xtask build hole` walks the build.yaml DAG: v2ray-plugin → galoshes
+    `cargo xtask build hole` walks the build.yaml DAG: ex-ray → galoshes
     + wintun → cargo build (debug) → stage. Replaces the prior `cargo xtask
     deps` + `cargo build` sequence with a single declarative invocation. The
     per-pid stage that follows in main() is dev.py-specific and stays separate.

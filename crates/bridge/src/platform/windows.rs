@@ -198,9 +198,10 @@ fn service_log_dir() -> PathBuf {
 
 /// System state directory for the Windows service (`C:\ProgramData\hole\state`).
 ///
-/// Used for the route-recovery state file (`bridge-routes.json`). Writable by
-/// LocalSystem; pre-created by `install()` so the service has somewhere to
-/// write on its first run.
+/// Holds the bridge crash-recovery state files (`bridge-dns.json`,
+/// `bridge-routes.json`, `bridge-plugins.json`). Writable by LocalSystem;
+/// pre-created by `install()` so the service has somewhere to write on its
+/// first run.
 fn service_state_dir() -> PathBuf {
     PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
         .join("hole")

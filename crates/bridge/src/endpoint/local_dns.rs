@@ -68,6 +68,7 @@ impl Endpoint for LocalDnsEndpoint {
     }
 
     fn supports_udp(&self) -> bool {
+        // The forwarder always carries UDP — that is its entire purpose.
         true
     }
 
