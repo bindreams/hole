@@ -105,8 +105,7 @@ pub fn is_file_contention(err: &io::Error) -> bool {
 /// * `PermissionDenied` — Windows `WSAEACCES`: the OS's independent
 ///   TCP/UDP excluded-port-range tables disagree about whether a
 ///   just-allocated port is bindable, or another socket holds the port
-///   with `SO_EXCLUSIVEADDRUSE` on a wildcard address. See
-///   bindreams/galoshes#20 for the deterministic reproducer.
+///   with `SO_EXCLUSIVEADDRUSE` on a wildcard address.
 /// * `AddrNotAvailable` — same excluded-port-range class; distinct from
 ///   `WSAEACCES` only in whether the kernel rejects the bind at the
 ///   address-reservation layer or the permission layer
