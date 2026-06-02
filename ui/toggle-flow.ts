@@ -2,9 +2,7 @@
 // wiring so the IPC-call + state-transition logic is unit-testable
 // without DOM scaffolding. power-button.ts owns the DOM and wires
 // `handlePowerClick` to call `toggleFromIdle` with a deps object
-// assembled from local state. See bindreams/hole#397 (sub-bug C) for
-// the timer-removal context and #393 for the failure-toast extraction
-// precedent.
+// assembled from local state.
 
 import { type ConnectionState, stateForToggleOutcome, type ToggleOutcome } from "./connection-state";
 import type { ToastKind } from "./toast";
@@ -49,14 +47,12 @@ export interface ToggleDeps {
 /// Issue `toggle_proxy` and apply the resulting state transition.
 ///
 /// The UI stays in `connecting`/`disconnecting` until the bridge IPC
-/// returns. There is no client-side timeout — the user's `Cancel`
-/// button (which fires `cancel_proxy` on a fresh bridge connection)
-/// is the escape hatch for a genuinely-hung bridge. The 15 s
-/// `Promise.race` that existed pre-#397 sub-bug C was load-bearing
-/// only while the bridge could ignore `Cancel` mid-`apply_dns_settings`;
-/// PR #406 fixed that with cooperative cancellation, making the
-/// client-side timer redundant and user-hostile on slow machines
-/// (false-failure toast while the bridge was still making progress).
+/// returns. There is no client-side timeout: the bridge supports
+/// cooperative cancellation, so the user's `Cancel` button (which fires
+/// `cancel_proxy` on a fresh bridge connection) is the escape hatch for
+/// a genuinely-hung bridge. A client-side timer would only produce
+/// false-failure toasts on slow machines while the bridge is still
+/// making progress.
 export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps): Promise<void> {
   deps.setState(goingToConnect ? "connecting" : "disconnecting");
 

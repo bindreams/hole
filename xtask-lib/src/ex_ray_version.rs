@@ -5,13 +5,11 @@
 //! the hole/garter/galoshes groups. Instead it lives in
 //! `crates/ex-ray/version.toml` as a top-level `version = "X.Y.Z"` key.
 //!
-//! Unlike the retired `v2ray-plugin` group — which vendored an upstream
-//! project and used a lineage-aware `X.Y.Z-hole.N` pre-release scheme —
-//! ex-ray is first-party and uses plain strict semver. There is no
-//! lineage or pre-release form. Validation against `releases/ex-ray/v...`
-//! tags goes through the generic [`crate::version::validate_against_tag`]
-//! path (the `is_valid_next` one-bump-ahead rule), identical to the
-//! Cargo.toml-based groups.
+//! ex-ray uses plain strict MAJOR.MINOR.PATCH semver (no pre-release or
+//! lineage form). Validation against `releases/ex-ray/v...` tags goes
+//! through the generic [`crate::version::validate_against_tag`] path (the
+//! `is_valid_next` one-bump-ahead rule), identical to the Cargo.toml-based
+//! groups.
 
 use std::path::Path;
 

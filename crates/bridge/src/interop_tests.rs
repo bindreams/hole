@@ -6,8 +6,8 @@
 //! both ways." A self-test (ex-ray↔ex-ray) cannot substantiate that claim —
 //! it only proves ex-ray agrees with itself. These tests run a REAL
 //! cross-process round-trip against a PINNED upstream v2ray-plugin build
-//! (`xtask::upstream_v2ray::PINNED_COMMIT` == Hole's vendored base), sending
-//! real bytes through real plugin subprocesses:
+//! (`xtask::upstream_v2ray::PINNED_COMMIT`), sending real bytes through
+//! real plugin subprocesses:
 //!
 //! - **ex-ray client ↔ stock-v2ray-plugin server** (`interop_ex_ray_client_stock_server`)
 //! - **stock-v2ray-plugin client ↔ ex-ray server** (`interop_stock_client_ex_ray_server`)

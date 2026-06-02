@@ -32,8 +32,7 @@ jobs:
           V="${{ inputs.version }}"
           V="${V#v}"
           V="${V#releases/ex-ray/v}"
-          # ex-ray is first-party: plain semver only (X.Y.Z). No lineage
-          # suffix — that was specific to the vendored v2ray-plugin track.
+          # ex-ray uses plain semver only (X.Y.Z), no pre-release/lineage suffix.
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version: '${{ inputs.version }}'"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
@@ -43,12 +42,9 @@ jobs:
       - name: Validate version.toml matches version
         run: cargo xtask version --check --exact --group ex-ray
 
-  # Native-runner matrix. ex-ray is first-party, so the platform set
-  # matches the galoshes/garter 6-platform convention:
+  # Native-runner matrix over the galoshes/garter 6-platform set:
   # windows amd64/arm64, darwin amd64/arm64, linux amd64/arm64.
-  # Asset naming follows galoshes' bare-binary convention:
-  #   ex-ray-{version}-{os}-{arch}[.exe]
-  # (not the upstream v2ray-plugin tar.gz shape — ex-ray is first-party).
+  # Assets named ex-ray-{version}-{os}-{arch}[.exe].
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     needs: validate
@@ -77,8 +73,7 @@ jobs:
         shell: bash
         run: cargo xtask ex-ray
 
-      # Stage with galoshes' bare-binary naming convention:
-      #   ex-ray-{version}-{os}-{arch}[.exe]
+      # Stage as ex-ray-{version}-{os}-{arch}[.exe]
       # Source: .cache/ex-ray/ex-ray-<target-triple>{.exe}
       - name: Stage with ex-ray naming convention
         shell: bash

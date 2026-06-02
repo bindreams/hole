@@ -197,9 +197,9 @@ fn canonicalize_domain(input: &str) -> Result<String, CompileError> {
 /// Canonicalize a connection-side domain at match time. Best-effort:
 /// runs IDNA normalization + lowercase + trailing-dot strip. On any
 /// failure (malformed Unicode, idna error, empty string), returns the
-/// trimmed input lowercased verbatim — we never reject a connection
-/// just because the sniffer handed us something we couldn't canonicalize,
-/// since rule compilation has already rejected its own malformed inputs.
+/// trimmed input lowercased verbatim — we never reject a connection just
+/// because the sniffer handed us something uncanonicalizable (rule
+/// compilation has already rejected its own malformed inputs).
 ///
 /// Exposed publicly for callers that want to pre-canonicalize a domain.
 /// The matcher calls it internally on every match, so passing the raw

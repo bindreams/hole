@@ -101,7 +101,7 @@ jobs:
           cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file ci-artifacts/tests.tar.zst
 
       # The artifact is consumed by test-garter and test-galoshes only;
-      # test-hole does its own build (#266 tracks unifying that).
+      # test-hole does its own build.
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
@@ -195,14 +195,13 @@ jobs:
   # test-hole runs a fresh build + nextest run (no archive). Hole tests have
   # too many environmental couplings (trybuild --offline registry, dist_fixture
   # workspace state, ipc_tests) for the archive-then-test pattern to work
-  # reliably without significant additional plumbing. #266 tracks moving
-  # test-hole onto archive once the couplings are addressed; for now this
-  # matches the pre-refactor build+test shape, scoped to Hole crates.
+  # reliably without significant additional plumbing — see #266 for the
+  # tracking work to move test-hole onto the archive once those are addressed.
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # Bumped 30→45 in #414: the non-TUN pass now also provisions stock
-    # upstream v2ray-plugin and runs the cross-impl interop tests (~78s each).
+    # 45min: the non-TUN pass provisions stock upstream v2ray-plugin and runs
+    # the cross-impl interop tests (~78s each).
     timeout-minutes: 45
     strategy:
       fail-fast: false

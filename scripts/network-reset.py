@@ -260,11 +260,11 @@ def reset_windows(state: dict | None) -> None:
         "-Command",
         'Stop-Service -Name "HoleBridge" -Force -ErrorAction SilentlyContinue',
     ])
-    # The dev bridge is now staged at `%TEMP%\hole-dev-<pid>\hole.exe`, so
+    # The dev bridge is staged at `%TEMP%\hole-dev-<pid>\hole.exe`, so
     # `Name = 'hole.exe'` matches both installed and dev. The `LIKE 'hole%.exe'`
-    # wildcard is kept to also catch any older `hole-dev-bridge-<pid>.exe`
-    # left behind by an earlier dev.py version. Command-line filter ensures we
-    # only hit the bridge subcommand and not the GUI.
+    # wildcard also catches any stale dev bridge left by an older dev.py naming
+    # scheme. Command-line filter ensures we only hit the bridge subcommand and
+    # not the GUI.
     run([
         "powershell",
         "-Command",

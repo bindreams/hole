@@ -1,9 +1,7 @@
 //! Unit tests for `ShadowsocksRunning`'s lifecycle, focused on the
-//! Drop contract: dropping with a live handle must NOT panic. The
-//! pre-#393 `debug_assert!` in `Drop::drop` fired on legitimate
-//! RAII-unwind paths (e.g. an error short-circuiting `start_inner`
-//! between `proxy.start().await` and the next `?`), killing the
-//! bridge mid-response and masking the real error.
+//! Drop contract: dropping a wrapper that still owns a live ss task
+//! must NOT panic — RAII-unwind paths drop it between
+//! `proxy.start().await` and the next `?` in `start_inner`.
 
 use super::ShadowsocksRunning;
 use crate::proxy::{ProxyError, RunningProxy};

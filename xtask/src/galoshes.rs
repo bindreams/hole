@@ -1,8 +1,7 @@
-//! Build the galoshes sidecar. Post-monorepo-merge, galoshes is a
-//! regular workspace member at `crates/galoshes/`; it embeds the
-//! ex-ray binary produced by [`super::ex_ray::build`]
-//! (which writes to `<repo>/.cache/ex-ray/`, where galoshes's
-//! `build.rs` picks it up).
+//! Build the galoshes sidecar (workspace member `crates/galoshes/`). It
+//! embeds the ex-ray binary produced by [`super::ex_ray::build`]
+//! (written to `<repo>/.cache/ex-ray/`, where galoshes's `build.rs` picks
+//! it up).
 //!
 //! Output: `<repo>/target/release/galoshes{.exe}`.
 

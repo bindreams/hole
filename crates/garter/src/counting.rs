@@ -12,10 +12,9 @@
 //! distinguishes "upstream sent nothing for the whole connection" from
 //! "upstream sent some bytes then closed."
 //!
-//! Lifted into `garter` (Apache-2.0) from `hole-bridge`'s DNS forwarder
-//! (which had its own copy at `dns/connector.rs`) so both the bridge's
-//! DNS path and the new `TapPlugin` decorator can share the type
-//! without cycling Apache → GPL → Apache. Bridge re-imports from here.
+//! Lives in `garter` (Apache-2.0) so both the bridge's DNS path and the
+//! `TapPlugin` decorator can share it without an Apache → GPL → Apache
+//! dependency cycle.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

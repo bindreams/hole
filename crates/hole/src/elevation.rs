@@ -76,7 +76,7 @@ pub async fn prompt_elevation(app: &AppHandle, request: BridgeRequest) -> bool {
     run_ipc_send_elevated(app, &request).await
 }
 
-/// Base64-encode a BridgeRequest (test helper for the legacy `--base64` CLI flag).
+/// Base64-encode a BridgeRequest (test helper for the `--base64` CLI flag).
 #[cfg(test)]
 pub fn encode_request(request: &BridgeRequest) -> String {
     use base64::Engine;

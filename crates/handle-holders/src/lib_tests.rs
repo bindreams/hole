@@ -14,26 +14,15 @@ fn find_holders_missing_file_returns_empty() {
     );
 }
 
-/// Cross-platform ctor-linkage regression test for #301.
+/// Asserts the `register!()` ctor installed a global default in THIS
+/// consumer binary: after the ctor has run, `set_global_default` must
+/// fail. A linker DCE'ing the ctor's `#[used]` static would make
+/// `set_global_default` *succeed* here (no prior install).
 ///
-/// The `hole_test_observability::register!()` invocation at the top
-/// of `lib.rs` expands to a `ctor::declarative::ctor!` block emitting
-/// a `#[used]` static in THIS crate's object file. If a future MSVC
-/// link.exe / lld / ld / ld64 change (or a workspace refactor) DCE'd
-/// the static, our test subscriber would silently disappear from
-/// this binary.
-///
-/// We detect this by asserting that AFTER our ctor has run, calling
-/// `set_global_default` again fails — proving a global default is
-/// already installed. The failure mode of a DCE'd ctor would be
-/// `set_global_default` *succeeding* here (no prior install).
-///
-/// Lives in `handle-holders` rather than `test-observability`
-/// because the test must run inside a CONSUMER crate's test binary —
-/// the regression we're guarding against is "consumer's
-/// `#[cfg(test)] register!()` macro fired the ctor in the consumer's
-/// object file." Inside test-observability's own test binary, the
-/// ctor is in the crate itself; that doesn't exercise the same path.
+/// Lives in `handle-holders`, not `test-observability`, because it
+/// must run inside a CONSUMER crate's test binary — test-observability's
+/// own ctor lives in the crate itself and doesn't exercise the same
+/// linkage path. See bindreams/hole#301.
 #[skuld::test]
 fn hole_test_observability_ctor_fired_in_this_binary() {
     let subscriber = tracing_subscriber::registry();

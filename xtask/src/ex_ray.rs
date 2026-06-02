@@ -1,10 +1,8 @@
 //! Build the ex-ray sidecar from `crates/ex-ray/` (Go source).
 //!
-//! This was previously [`crates/hole/build.rs::build_v2ray_plugin`] — moved
-//! into xtask in Commit 4 because the plugin binary is a runtime dependency
-//! of the bridge, not a compile-time input to any Rust crate. See issue #143.
-//! Repointed from the vendored `external/v2ray-plugin/` to the first-party
-//! `crates/ex-ray/` Go module in issue #414.
+//! The plugin binary is a runtime dependency of the bridge, not a
+//! compile-time input to any Rust crate, so it lives in xtask rather than a
+//! build.rs.
 //!
 //! Output: `<repo>/.cache/ex-ray/ex-ray-<target-triple>{.exe}`.
 

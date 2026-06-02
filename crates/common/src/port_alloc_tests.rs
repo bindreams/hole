@@ -1,7 +1,6 @@
 // `free_port` is the unit under test in this module; the clippy
 // disallowed_methods lint applies to higher-level callers but tests
-// must exercise the primitive directly. See workspace `clippy.toml` and
-// bindreams/hole#285.
+// must exercise the primitive directly. See workspace `clippy.toml`.
 #![allow(clippy::disallowed_methods)]
 
 use super::{bind_ephemeral, ensure_port_free, free_port, is_log_milestone, Protocols};
@@ -239,9 +238,8 @@ async fn bind_ephemeral_retries_through_many_bind_races_until_success() {
 
 #[skuld::test]
 async fn bind_ephemeral_invokes_closure_once_per_iteration() {
-    // Auditability invariant: per-iteration closure cost (e.g. plugin
-    // subprocess spawns at `start_plugin_chain`) is exactly one
-    // invocation per loop turn — no double-fires, no skips.
+    // Invariant: exactly one closure invocation per loop iteration —
+    // no double-fires, no skips.
     const RACES: u32 = 20;
     let calls = Cell::new(0u32);
     let _ = bind_ephemeral(LOCALHOST, Protocols::TCP, |port| {

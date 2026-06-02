@@ -58,13 +58,10 @@ function setVpnDot(v: ValidationState | null | undefined): void {
 function setInternetDot(v: ValidationState | null | undefined): void {
   const el = DIAG_ELEMENTS.internet;
   if (!el) return;
-  // Internet is "ok" only when the most recent test reached the sentinel
-  // HTTP roundtrip — i.e. a real test result with non-sentinel latency.
-  // The "validated on connect" path (latency_ms == LATENCY_VALIDATED_ON_CONNECT)
-  // does NOT prove sentinel reachability, so the dot stays gray. The dot
-  // is "unknown" (gray), NEVER red, when the test failed earlier — we have
-  // no positive evidence of "internet broken", only "test didn't get that
-  // far".
+  // "ok" only on a real test roundtrip (non-sentinel latency); the
+  // validated-on-connect path (latency_ms == LATENCY_VALIDATED_ON_CONNECT)
+  // proves nothing about internet reachability. Failure stays gray, never
+  // red — absence of evidence, not evidence of breakage.
   if (v?.outcome.kind === "reachable" && v.outcome.latency_ms !== LATENCY_VALIDATED_ON_CONNECT) {
     el.className = "nd ok";
     el.title = "Reachable through the VPN.";

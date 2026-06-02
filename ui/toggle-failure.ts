@@ -1,12 +1,7 @@
 // Pure helper: format the toast message for a `toggle_proxy` failure.
 // Extracted so the message shape is unit-testable without DOM/Tauri-
-// mock plumbing.
-//
-// See bindreams/hole#393 for the original incident — a real bridge
-// failure was silently invisible to the user because the toggle flow
-// only logged to console. See #397 sub-bug C for the timeout-arm
-// removal: the union collapsed from a discriminated union to a
-// single interface once the 15 s client-side timer was deleted.
+// mock plumbing. Surfaces real bridge failures to the user instead of
+// only logging to console.
 
 import type { ToastKind } from "./toast";
 

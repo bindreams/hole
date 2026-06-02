@@ -6,10 +6,8 @@
 //! then HTTP Host header (covers plaintext HTTP). If neither matches, the
 //! connection falls through to IP-only matching.
 //!
-//! This is hole's primary name-recovery mechanism — the previous FakeDns
-//! reverse-lookup path was dropped with the shift to peek-first rule
-//! matching. QUIC/UDP and non-TLS/non-HTTP TCP are IP-only as a
-//! documented trade-off.
+//! This is hole's primary name-recovery mechanism. QUIC/UDP and
+//! non-TLS/non-HTTP TCP are IP-only as a documented trade-off.
 //!
 //! Both submodules are pure functions over a `&[u8]` buffer. Tests
 //! exercise them with static fixtures of real ClientHellos and HTTP

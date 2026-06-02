@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto" //nolint:staticcheck // SA1019: derived verbatim from upstream v2ray-plugin, which still uses the v1 proto package; `transportSettings proto.Message` is only handed to v2ray-core's serial.ToTypedMessage. Migrating to google.golang.org/protobuf/proto would drop a direct go.mod dependency, out of scope for the quality-gate task.
+	"github.com/golang/protobuf/proto" //nolint:staticcheck // SA1019: v2ray-core's serial.ToTypedMessage takes a v1 github.com/golang/protobuf/proto.Message; migrating would add a dependency for no benefit.
 	"google.golang.org/protobuf/types/known/anypb"
 
 	_ "github.com/v2fly/v2ray-core/v5/app/proxyman/inbound"

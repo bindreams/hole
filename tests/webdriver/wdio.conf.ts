@@ -42,8 +42,6 @@ export const config: Options.Testrunner = {
   // 30s `timeout` above is the framework-level failure bound (it
   // covers WebView2-itself-broken — an external-event-might-never-
   // happen scenario; not the synchronization).
-  //
-  // See bindreams/hole#383 for the flake that motivated this.
   async before() {
     const result = await browser.executeAsync<{
       ok: boolean;

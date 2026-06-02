@@ -41,8 +41,8 @@
 //! `log::debug!` events are level-rejected at `Dispatch::enabled()`
 //! before `tracing-log` allocates an `Event`.
 //!
-//! See bindreams/hole#301 (motivation), #300 (trigger flake), #147
-//! (regression constraint).
+//! See bindreams/hole#147 for the regression constraint behind the
+//! EnvFilter-default safeguard.
 
 use std::io::Write;
 use std::sync::Once;

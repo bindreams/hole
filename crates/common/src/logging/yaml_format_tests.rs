@@ -58,9 +58,8 @@ fn run_with_subscriber<F: FnOnce()>(ansi: bool, f: F) -> String {
     writer.text()
 }
 
-// Smoke demo (not a real assertion — prints captured output to stderr so a
-// human can eyeball the YAML shape). Gated behind an env var so it only
-// runs when asked.
+// Visual smoke demo: prints captured YAML to stderr. Gated behind
+// YAML_FMT_SMOKE; not an assertion.
 #[skuld::test]
 fn smoke_demo_visual() {
     if std::env::var_os("YAML_FMT_SMOKE").is_none() {

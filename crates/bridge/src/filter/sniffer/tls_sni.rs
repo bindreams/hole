@@ -4,7 +4,7 @@
 //! the ClientHello handshake message, parses its extensions, and
 //! returns the first hostname from the `server_name` extension.
 //!
-//! Limitations (deferred to v2):
+//! Limitations:
 //! - Fragmented ClientHellos that span multiple TLS records are
 //!   reported as `None`. The pre-encryption ClientHello is normally
 //!   small enough to fit in a single record.

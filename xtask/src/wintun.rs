@@ -1,11 +1,8 @@
 //! Download + verify wintun.dll on Windows.
 //!
-//! This was previously [`crates/hole/build.rs::download_wintun`] — moved into
-//! xtask in Commit 4 because wintun.dll is a runtime dependency, not a
-//! compile-time input. Crucially, having the download in `build.rs` meant
-//! that any `cargo check` would attempt the download (and fail if the
-//! network was unavailable). Moving it out lets `cargo check` succeed
-//! offline. See issue #143.
+//! wintun.dll is a runtime dependency, not a compile-time input. Keeping the
+//! download out of `build.rs` lets `cargo check` succeed offline — a download
+//! in `build.rs` would run (and fail without network) on every check.
 //!
 //! Output: `<repo>/.cache/wintun/wintun.dll` (Windows only). On non-Windows
 //! this module compiles to a no-op stub so `cargo xtask deps` works on macOS

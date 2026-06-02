@@ -22,7 +22,7 @@
 //! via [`crate::ex_ray_version::read_version`]; otherwise `ex-ray` is a
 //! plain-semver group validated identically to hole/garter/galoshes
 //! (`is_valid_next` one-bump-ahead rule, strict `releases/ex-ray/v<X.Y.Z>`
-//! tags). No lineage / pre-release scheme applies.
+//! tags).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -240,7 +240,7 @@ pub fn cargo_toml_version_for_group(repo_root: &Path, group: Group) -> Result<Ve
 /// Implemented via structural git probes (`git tag --list <glob>` for
 /// enumeration, `git merge-base --is-ancestor` for ancestry) rather than
 /// parsing `git describe` stderr — robust against locale and git-version
-/// drift in message strings (see CLAUDE.md `feedback_no_string_parsing_hacks.md`).
+/// drift in message strings.
 pub fn nearest_tag_version(repo_root: &Path, group: Group) -> Result<Option<Version>> {
     Ok(nearest_ancestor_tag(repo_root, group)?.map(|(v, _)| v))
 }
@@ -304,8 +304,8 @@ fn parse_tag_to_version(tag: &str, group: Group) -> Result<Version> {
     let semver_str = tag
         .strip_prefix(&prefix)
         .ok_or_else(|| anyhow!("tag '{tag}' does not start with '{prefix}'"))?;
-    // All four groups (including ex-ray, a first-party Go crate) use strict
-    // `MAJOR.MINOR.PATCH` release tags — no pre-release / build lineage.
+    // Release tags are strict MAJOR.MINOR.PATCH for every group; reject
+    // pre-release / build metadata.
     let parsed = Version::parse(semver_str).with_context(|| format!("tag '{tag}' is not valid semver after prefix"))?;
     if !parsed.pre.is_empty() || !parsed.build.is_empty() {
         bail!("tag '{tag}' must be strict releases/<group>/vMAJOR.MINOR.PATCH");

@@ -418,9 +418,9 @@ fn proxy_config_tunnel_mode_socks_only_roundtrips() {
     assert_eq!(decoded, cfg);
 }
 
-/// **#388**: `diagnostic_plugin_tap` survives the JSON roundtrip.
-/// Anchors the IPC contract for the field so a future rename breaks
-/// this test rather than silently dropping the field at the bridge.
+/// `diagnostic_plugin_tap` survives the JSON roundtrip. Anchors the IPC
+/// contract for the field so a future rename breaks this test rather
+/// than silently dropping the field at the bridge.
 #[skuld::test]
 fn proxy_config_diagnostic_plugin_tap_field_roundtrips() {
     let cfg = ProxyConfig {
@@ -440,9 +440,9 @@ fn proxy_config_diagnostic_plugin_tap_field_roundtrips() {
     assert_eq!(decoded, cfg);
 }
 
-/// **#388**: a legacy client (pre-#388 GUI) that omits the
-/// `diagnostic_plugin_tap` field must deserialize with the field
-/// defaulting to `false` — backward-compat contract.
+/// A legacy client that omits the `diagnostic_plugin_tap` field must
+/// deserialize with the field defaulting to `false` — backward-compat
+/// contract.
 #[skuld::test]
 fn proxy_config_diagnostic_plugin_tap_defaults_on_legacy_payload() {
     let json = r#"{

@@ -9,13 +9,10 @@
 //!
 //! # Why this exists
 //!
-//! User's explicit design requirements for this module (recorded verbatim
-//! so a future reviewer considering a scope reduction can find the
-//! reasoning without archaeology):
+//! Logging volume is intentionally unbounded here — the goal is the most
+//! comprehensive record that can diagnose hard production network issues
+//! on customer machines:
 //!
-//! - "log sizes were not a concern at all"
-//! - "most comprehensive logging that would diagnose [#200] and also
-//!   other similar production issues on customer machines"
 //! - connection-level events at `info` by default
 //! - per-packet NDIS firehose events: not even at `debug`; filtered out
 //!   at the kernel subscription level so they never reach our process
@@ -32,9 +29,8 @@
 //!    b. Builds three [`ferrisetw::Provider`]s with all keywords
 //!    enabled. High-volume firehose events are filtered in userspace
 //!    via [`HIGH_VOLUME_TCPIP_EVENTS`] rather than at the kernel
-//!    level — see [`TCPIP_KEYWORDS`] for the rationale (events 1004,
-//!    1077, and the rest of the SendPath family are critical for the
-//!    #200 investigation).
+//!    level — events 1004, 1077, and the rest of the SendPath family
+//!    must stay visible — see [`TCPIP_KEYWORDS`].
 //!    c. Starts a [`ferrisetw::UserTrace`] session named
 //!    `hole-bridge-etw-<pid>` with `buffer_size = 256` KB to absorb
 //!    the wider event volume without kernel ring-buffer overrun.
@@ -89,20 +85,20 @@
 //! GUIDs and the per-provider keyword masks. All three providers
 //! subscribe to every keyword bit (`!0`); high-volume events are
 //! dropped by event-ID in the userspace [`dispatch`] callback via
-//! [`HIGH_VOLUME_TCPIP_EVENTS`]. See the rationale comment on
-//! [`TCPIP_KEYWORDS`] — earlier versions of this module filtered at
-//! the kernel level and silently dropped events 1004 and 1077, both
-//! of which are critical to the #200 narrative.
+//! [`HIGH_VOLUME_TCPIP_EVENTS`]. Kernel-level keyword filtering is
+//! avoided because it also masks events 1004 and 1077, which must stay
+//! visible — see the rationale comment on [`TCPIP_KEYWORDS`].
 //!
-//! # AFD/WFP severity (bindreams/hole#393)
+//! # AFD/WFP severity
 //!
 //! Only TCPIP events get rich event-id-aware severity routing.
 //! AFD and WFP events are emitted at DEBUG via [`Emission::Unknown`]
-//! until either provider grows a rich handler. The cross-provider
-//! event-id collisions (AFD `1002` and `1004` overlap TCPIP
-//! `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND`) made the original
-//! event-id-only match misclassify AFD background traffic as
-//! INFO-level TCPIP events — see [`dispatch`] for the provider gate.
+//! until either provider grows a rich handler. This matters because the
+//! providers recycle small event IDs (AFD `1002`/`1004` collide with
+//! TCPIP `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND`), so an event-id-only
+//! match would misclassify AFD background traffic as INFO-level TCPIP
+//! events — [`dispatch`] gates on the provider GUID before applying
+//! TCPIP severity.
 
 use dump::{dump, DeriveDump};
 use ferrisetw::parser::Parser;
@@ -136,18 +132,15 @@ const AFD_PROVIDER: &str = "E53C6823-7BB8-44BB-90DC-3F86090D48A6";
 
 /// All TCPIP provider keywords enabled.
 ///
-/// Background: the module previously excluded the `SendPath`
-/// (`0x100000000`), `ReceivePath` (`0x200000000`), and `Packet`
-/// (`0x40000000000`) keywords at the kernel level to dodge the
-/// per-packet firehose. That exclusion silently dropped the two events
-/// the #200 investigation most needs: event **1004 `TcpTcbSynSend`**
-/// and event **1077 `SendRetransmitRound`**, both of which declare
-/// `ut:SendPath` in the TCPIP manifest. See
+/// All keywords are on because events **1004 (`TcpTcbSynSend`)** and
+/// **1077 (`SendRetransmitRound`)** declare `ut:SendPath` in the TCPIP
+/// manifest; a kernel-level `SendPath` exclusion (to dodge the
+/// per-packet firehose) would drop them. See
 /// <https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>
 /// for the keyword declarations.
 ///
-/// The high-volume noise is filtered one level up — at the userspace
-/// [`dispatch`] callback, by event-ID drop list
+/// The high-volume noise is instead filtered one level up — at the
+/// userspace [`dispatch`] callback, by event-ID drop list
 /// ([`HIGH_VOLUME_TCPIP_EVENTS`]). That keeps connect-path /
 /// retransmit-path events visible while still silencing the truly
 /// noisy per-packet IDs.
@@ -189,23 +182,21 @@ mod tcpip_events {
     pub const SEND_RETRANSMIT_ROUND: u16 = 1077;
 }
 
-/// TCPIP event IDs observed at high volume in CI logs that are not
-/// individually useful for the #200 narrative. Dropped inside
-/// [`dispatch`] to keep `HOLE_BRIDGE_LOG=debug` output readable without
-/// filtering at the kernel level (kernel filtering also masks events
-/// we care about — see [`TCPIP_KEYWORDS`]).
+/// TCPIP event IDs observed at high volume that are not individually
+/// useful — high-rate data-plane or internal-bookkeeping events.
+/// Dropped inside [`dispatch`] to keep `HOLE_BRIDGE_LOG=debug` output
+/// readable without filtering at the kernel level (kernel filtering also
+/// masks events we care about — see [`TCPIP_KEYWORDS`]).
 ///
-/// Each entry is a high-rate data-plane or internal-bookkeeping event.
-/// Sourced from the event-ID histogram of PR #207 CI run 9 bridge
-/// log. When a new Windows build adds high-volume IDs, extend this
-/// list rather than re-introducing a kernel-level keyword mask.
+/// When a new Windows build adds high-volume IDs, extend this list
+/// rather than re-introducing a kernel-level keyword mask.
 const HIGH_VOLUME_TCPIP_EVENTS: &[u16] = &[
     1300, 1324, 1370, 1371, 1391, 1396, 1397, 1443, 1454, 1551, 1589, 1590, 1626,
 ];
 
-/// Retransmit count at which we escalate from info to warn. Event 1002
-/// (and 1077) carry `RexmitCount` as a `UInt32`; three retransmits on a
-/// single flow is well into "something is wrong" territory.
+/// Retransmit count (events 1002/1077 `RexmitCount`) at which we
+/// escalate from info to warn; three retransmits on a single flow is
+/// well into "something is wrong" territory.
 const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 // Public types ========================================================================================================
@@ -297,11 +288,10 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
     // thread so we own the join handle. See the "Drain on Drop" section
     // of the module doc.
     //
-    // Buffer sizing: now that [`TCPIP_KEYWORDS`] = !0, kernel event
-    // volume per connect rises substantially (SendPath events are no
-    // longer dropped). Default `buffer_size` (32 KB per-processor) risks
-    // ring-buffer overflow when the test runner is under IO load. Widen
-    // to 256 KB; `max_buffer = 0` tells Windows to choose a reasonable
+    // Buffer sizing: with all TCPIP keywords enabled, per-connect event
+    // volume is high (SendPath included). Default `buffer_size` (32 KB
+    // per-processor) risks ring-buffer overflow under IO load; widen to
+    // 256 KB. `max_buffer = 0` tells Windows to choose a reasonable
     // ceiling. EventsLost is queried on [`EtwGuard::drop`] so an overrun
     // shows up as a nonzero count in bridge.log.
     let trace_properties = TraceProperties {
@@ -417,9 +407,7 @@ fn query_session_stats(session_name: &str) {
 /// Enumerate live ETW sessions via Win32 `QueryAllTracesW` and stop any
 /// whose name starts with `hole-bridge-etw-`. A crashed prior bridge
 /// leaves its session alive until the machine reboots; this sweeps it.
-/// Mirrors the crash-recovery pattern in [`tun_engine::routing::recover_routes`]
-/// and [`crate::plugin_recovery::recover_plugins`] — best-effort, warns
-/// on failure, never aborts startup.
+/// Best-effort: warns on failure, never aborts startup.
 ///
 /// Keyed on the `hole-bridge-etw-` name prefix (not on PID) so that a
 /// stale session whose original PID has since been recycled is still
@@ -469,14 +457,11 @@ pub(crate) unsafe fn read_wide_string(ptr: *const u16) -> String {
 /// Every event in the "has address" group above ships its IP and port
 /// atomically inside the same `win:SocketAddress` binary blob (SOCKADDR_IN
 /// / SOCKADDR_IN6), so `local` / `remote` are `Option<SocketAddr>` — not
-/// two independent `Option<IpAddr>` + `Option<u16>` pairs. A previous
-/// iteration of [`extract_fields`] also tried discrete `LocalPort` /
-/// `RemotePort` scalar fields as a fallback, but none of the subscribed
-/// events deliver a port scalar without an address blob. That fallback
-/// was removed in azhukova/240; see [`socket_addr_field`] for the
-/// replacement and its `debug!` breadcrumb. If a future Windows schema
-/// adds an event with a port-only shape, both fields will surface as
-/// `None` and the breadcrumb will surface in bridge.log.
+/// two independent `Option<IpAddr>` + `Option<u16>` pairs. No subscribed
+/// event delivers a port scalar without an address blob; if a future
+/// Windows schema adds an event with a port-only shape, both fields will
+/// surface as `None` and [`socket_addr_field`] logs a `debug!`
+/// breadcrumb to bridge.log.
 ///
 /// The `tcb` field is a kernel-internal 64-bit TCB pointer / cookie
 /// that correlates events belonging to the same TCP connection across
@@ -558,10 +543,9 @@ pub(crate) enum Emission {
 ///
 /// Drops (returns `None`) for:
 /// - events from non-bridge PIDs (primary filter — cross-process ETW is
-///   not useful for #200 and adds noise),
-/// - events in [`HIGH_VOLUME_TCPIP_EVENTS`] from the TCPIP provider (the
-///   userspace replacement for the removed kernel-keyword firehose
-///   mask).
+///   just noise here),
+/// - events in [`HIGH_VOLUME_TCPIP_EVENTS`] from the TCPIP provider
+///   (userspace firehose filter — see [`TCPIP_KEYWORDS`]).
 ///
 /// Note: provider discrimination is by [`GUID`] — the high-volume drop
 /// list is specific to TCPIP; same event IDs on WFP or AFD stay visible.
@@ -576,13 +560,12 @@ pub(crate) fn dispatch(
         return None;
     }
 
-    // **Provider gate (bindreams/hole#393).** TCPIP, AFD, and WFP all
-    // recycle small event-id integers (1002, 1004, 1017, …), so a
-    // bare `match event_id` matches AFD events as if they were TCPIP
-    // `TCB_CONNECT_REQUESTED` / `TCB_SYN_SEND` / etc. and emits them
-    // at INFO. That was the source of the ~2000-line bridge-log
-    // flood in #393. AFD and WFP have no rich handlers yet, so they
-    // surface at DEBUG via `Emission::Unknown` until one exists.
+    // Provider gate. TCPIP, AFD, and WFP all recycle small event-id
+    // integers (1002, 1004, 1017, …), so a bare `match event_id` would
+    // emit AFD/WFP events as TCPIP `TCB_CONNECT_REQUESTED` /
+    // `TCB_SYN_SEND` / etc. at INFO. AFD and WFP have no rich handlers
+    // yet, so they surface at DEBUG via `Emission::Unknown` until one
+    // exists.
     if !is_tcpip_provider(provider) {
         return Some(Emission::Unknown);
     }
@@ -686,10 +669,8 @@ fn socket_addr_field(parser: &Parser, field: &str) -> Option<SocketAddr> {
 /// [`dump!`] at emission time so the bridge log reads as block YAML
 /// (null-safe, no `Some(_)` / `None` Debug noise, kebab-case keys).
 ///
-/// Distinct from [`ParsedFields`]: this struct is the *logging* shape,
-/// whereas `ParsedFields` is the *extraction* shape. They are allowed
-/// to diverge — e.g. a future change might elide `tcb` from logs
-/// without touching the extraction path.
+/// Distinct from [`ParsedFields`]: this is the *logging* shape,
+/// `ParsedFields` is the *extraction* shape; they may diverge.
 #[derive(DeriveDump)]
 #[dump(rename_all = "kebab-case")]
 pub(crate) struct EventView<'a> {

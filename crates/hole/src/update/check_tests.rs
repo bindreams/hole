@@ -100,7 +100,7 @@ fn candidate_tags_filters_other_product_tracks() {
         tag("releases/galoshes/v9.9.9"),
         tag("releases/garter/v9.9.9"),
         tag("releases/ex-ray/v9.9.9"),
-        // Legacy `v0.1.0` tag predating the new scheme — must be ignored.
+        // Bare-semver tag (no `releases/<track>/` prefix) — must be ignored.
         tag("v0.1.0"),
     ];
     let current = ReleaseVersion::parse("0.9.0").unwrap();

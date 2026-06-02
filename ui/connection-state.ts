@@ -6,9 +6,8 @@
 // type, the text/CSS mapping, and the small set of predicates that the
 // DOM-wiring layer (`power-button.ts`) uses to decide what to render.
 //
-// The transition graph and rationale (idle states, transitions,
-// backend-cooperative cancellation) is documented in this file's
-// exported predicates and in `toggle-flow.ts`.
+// Transition/cancellation semantics live on the exported predicates
+// below and in `toggle-flow.ts`.
 
 export type ConnectionState =
   | "disconnected" //       red,       "Disconnected",       click → start
@@ -111,9 +110,7 @@ export function stateForToggleOutcome(outcome: ToggleOutcome): ConnectionState {
     case "stopped":
       return "disconnected";
     case "cancelled":
-      // Cancel during connect — we end up Disconnected. The UI may have
-      // already shown "Cancelling..." briefly; the transition settles
-      // into the idle Disconnected state.
+      // Cancelled connect settles into the idle disconnected state.
       return "disconnected";
   }
 }

@@ -3,7 +3,7 @@
 // `__holeUiReady`'s bundled-bridge wiring, this spec fails loudly
 // instead of letting downstream specs return to flake-land.
 //
-// See bindreams/hole#383 and crates/hole/src/ui_ready.rs.
+// See crates/hole/src/ui_ready.rs for the __holeUiReady test seam.
 
 describe("UI-ready sync", () => {
   it("exposes the __holeUiReady bridge on window", async () => {

@@ -1,11 +1,11 @@
 //! Generic retry helpers with exponential backoff, plus predicates for
 //! common transient-error classes:
 //!
-//! * [`is_file_contention`] — `DistHarness::spawn` uses this to convert
-//!   transient Windows Defender / macOS exec-busy errors into passes.
-//! * [`is_bind_race`] — `port_alloc::free_port` uses this to retry around
-//!   Windows WSAEACCES (independent TCP/UDP excluded-port tables),
-//!   EADDRINUSE, and EADDRNOTAVAIL on ephemeral bind paths.
+//! * [`is_file_contention`] — matches transient Windows Defender / macOS
+//!   exec-busy spawn errors so a retry converts them into passes.
+//! * [`is_bind_race`] — matches Windows WSAEACCES (independent TCP/UDP
+//!   excluded-port tables), EADDRINUSE, and EADDRNOTAVAIL on ephemeral
+//!   bind paths.
 //!
 //! Sleep uses `tokio::time::sleep`, so callers must be on a Tokio
 //! runtime. Tests use `tokio::time::pause()` so the runtime
@@ -105,8 +105,7 @@ pub fn is_file_contention(err: &io::Error) -> bool {
 /// * `PermissionDenied` — Windows `WSAEACCES`: the OS's independent
 ///   TCP/UDP excluded-port-range tables disagree about whether a
 ///   just-allocated port is bindable, or another socket holds the port
-///   with `SO_EXCLUSIVEADDRUSE` on a wildcard address. See
-///   bindreams/galoshes#20 for the deterministic reproducer.
+///   with `SO_EXCLUSIVEADDRUSE` on a wildcard address.
 /// * `AddrNotAvailable` — same excluded-port-range class; distinct from
 ///   `WSAEACCES` only in whether the kernel rejects the bind at the
 ///   address-reservation layer or the permission layer
