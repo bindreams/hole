@@ -169,14 +169,11 @@ fn e2e_ws_tls_socks_only_roundtrip(
 ///
 /// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
 ///
-/// Temporarily `#[ignore]`d: galoshes embeds `ex-ray` (#414), whose v1
-/// confirming-probe rejects `mode=quic` (`crates/ex-ray/main.go`), so
-/// galoshes-as-server-with-QUIC no longer starts. Tracked in
-/// bindreams/hole#421 — the fix (mode-aware UDP confirming-probe for
-/// server+quic) MUST remove this `#[ignore]` and confirm green here.
+/// galoshes embeds `ex-ray` (#414); ex-ray now UDP-probes its inbound and
+/// reports `transports:["udp"]` for server+quic instead of rejecting it, so
+/// galoshes-as-server-with-QUIC starts again (bindreams/hole#421).
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes server-side QUIC pending ex-ray mode=quic support — see bindreams/hole#421"]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
