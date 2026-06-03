@@ -23,11 +23,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// Pinned golangci-lint version. v2 schema (single gate: `run` lints, `fmt`
-/// formats). v2.12.2 was built with go1.26.x and its bundled Go analysis is
-/// compatible with the `crates/ex-ray/go.mod` `go 1.25.5` directive. Bump this
-/// const AND every per-platform SHA256 in [`asset_for`] together; the
-/// `.verified` sentinel invalidates the cache on a version dir change.
+/// Pinned golangci-lint version — the single Go gate (v2 schema: `run`
+/// lints, `fmt` formats). v2.12.2 was built with go1.26.x and its
+/// bundled Go analysis is compatible with the `crates/ex-ray/go.mod`
+/// `go 1.25.5` directive. Bump this const AND every per-platform SHA256 in
+/// [`asset_for`] together; the `.verified` sentinel invalidates the cache on
+/// a version dir change.
 const VERSION: &str = "2.12.2";
 
 /// One release archive: its download URL filename and the SHA256 pinned from

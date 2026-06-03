@@ -239,8 +239,8 @@ async fn setup_relay(echo_ip: IpAddr, udp_timeout: Duration) -> (SocketAddr, Can
 }
 
 /// Send one datagram from `app` to the client's local UDP port and await the
-/// echoed reply. A reply that never arrives (the pre-#415 bug) hangs until the
-/// test-framework timeout — the sanctioned "external event" failure bound.
+/// echoed reply. A reply that never arrives hangs until the test-framework
+/// timeout — the sanctioned external-event failure bound.
 async fn round_trip(app: &UdpSocket, client_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
     app.send_to(payload, client_addr).await.expect("app send");
     let mut buf = [0u8; 65536];
@@ -286,8 +286,8 @@ async fn udp_distinct_peers_isolated() {
 
 #[skuld::test]
 async fn udp_ipv6_remote() {
-    // Defect B: the server relay must bind a UDP socket in the remote's address
-    // family. An IPv6 upstream fails the pre-#415 hardcoded IPv4 bind.
+    // The server relay must bind its upstream UDP socket in the remote's address
+    // family; an IPv6 upstream must work.
     let (client_addr, shutdown) = setup_relay("::1".parse().unwrap(), DEFAULT_UDP_TIMEOUT).await;
     let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     assert_eq!(round_trip(&app, client_addr, b"over-v6").await, b"over-v6");
@@ -322,7 +322,7 @@ async fn udp_idle_eviction_and_recreation() {
     // The short idle timeout IS the behavior under test (NAT idle eviction);
     // we park on the deterministic "udp association closed" log event, never on
     // a sleep. 500ms gives a comfortable margin over a loopback round-trip so
-    // the first exchange can never race the eviction. See #415 / #383.
+    // the first exchange can never race the eviction.
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())

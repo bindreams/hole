@@ -3,8 +3,7 @@
 //! This is an in-crate emitter rather than a third-party YAML library
 //! because our output surface is narrow (block style only, a small
 //! set of tagged nodes, log-specific redaction) and we want full
-//! control over how blessed tags render. The plan authorized this
-//! fallback in place of `saphyr-emitter`.
+//! control over how blessed tags render.
 
 use std::fmt::{self, Write};
 

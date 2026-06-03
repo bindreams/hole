@@ -38,12 +38,9 @@ hole_test_observability::register!();
 fn main() {
     // Subprocess re-exec for the DistHarness panic-hook regression
     // test. Dispatches into the child-side handler BEFORE skuld
-    // initializes — so the deliberate panic doesn't interact with the
-    // test runner, AND so libtest's filter / `--nocapture` arg parsing
-    // is bypassed for the child (we want unconditional dispatch on the
-    // env var, regardless of what cargo nextest passes downstream).
-    // See `test_support/dist_harness_panic_hook_tests.rs` and
-    // bindreams/hole#303.
+    // initializes, so the deliberate panic and libtest's arg parsing are
+    // bypassed for the child (unconditional dispatch on the env var).
+    // See `test_support/dist_harness_panic_hook_tests.rs`.
     if std::env::var_os("HOLE_DIST_HARNESS_PANIC_TEST").is_some() {
         test_support::dist_harness_panic_hook_tests::run_child();
         std::process::exit(0);

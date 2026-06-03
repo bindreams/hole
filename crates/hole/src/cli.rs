@@ -53,8 +53,7 @@ pub(crate) enum ProxyAction {
         /// method, password, optional plugin/plugin_opts).
         #[arg(long)]
         config_file: std::path::PathBuf,
-        /// Local SOCKS5 port the bridge should bind. Defaults to the
-        /// production default of 4073.
+        /// Local SOCKS5 port the bridge should bind.
         #[arg(long, default_value_t = 4073)]
         local_port: u16,
         /// Local HTTP CONNECT port the bridge should bind when
@@ -221,9 +220,7 @@ pub(crate) fn parse_args() -> Cli {
 /// - `Bridge::Log` — read-only inspection. No need to write a log entry to
 ///   read one.
 ///
-/// Non-exempt (install the guard): `Upgrade`, `Bridge::{Install,
-/// Uninstall, Status, GrantAccess, IpcSend}`, `Proxy::{Start, Stop,
-/// TestServer}`, `Path::{Add, Remove}`. These all use `cli_log!` on
+/// Everything else installs the guard — those commands use `cli_log!` on
 /// failure paths and benefit from a persistent audit trail.
 pub(crate) fn should_install_cli_log_guard(command: &Command) -> bool {
     !matches!(

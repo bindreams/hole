@@ -821,12 +821,12 @@ fn diagnostics_proxy_stopped() {
 
         // Bridge IPC is up (we are handling this request); the proxy is stopped
         // but no operation has failed, so `pm.last_error()` is None and the
-        // diagnostics handler reports `bridge = "ok"` (issue #142). App is
-        // always "ok" by convention (bridge can't observe the GUI directly).
-        // Network is computed from the host's default gateway and the
-        // MockRouting returns Ok. vpn_server and internet are always "unknown"
-        // on the wire — the GUI computes them from the selected ServerEntry's
-        // persisted validation state (#150).
+        // diagnostics handler reports `bridge = "ok"`. App is always "ok" by
+        // convention (bridge can't observe the GUI directly). Network is
+        // computed from the host's default gateway and the MockRouting returns
+        // Ok. vpn_server and internet are always "unknown" on the wire — the
+        // GUI computes them from the selected ServerEntry's persisted
+        // validation state.
         assert_eq!(diag.app, "ok");
         assert_eq!(diag.bridge, "ok");
         assert_eq!(diag.network, "ok");
@@ -869,33 +869,14 @@ fn diagnostics_bridge_error_after_failed_start() {
     });
 }
 
-// The bridge's error-log emission on IPC handler failure is a single
-// `error!(error = %e, "proxy start failed")` call in `handle_start` (and
-// the analogous calls in `handle_stop`/`handle_reload`). A dedicated
-// log-capture test for these is currently NOT in this file; the same
-// error path is exercised end-to-end by `start_failure_returns_error`
-// (line ~363), which verifies the HTTP 500 response and error message.
-//
-// Historical note: pre-#301, the comment here documented the #147
-// constraint — `tracing_subscriber::fmt().init()` calls
-// `LogTracer::init()`, which sets `log::max_level=Trace` and routes
-// every `log::*!` from `shadowsocks-service`/`tokio`/`mio` through
-// `tracing-log`, allocating per event. That overhead tipped
-// `server_test_tests` (real localhost TCP + 5 s timeouts) into CI
-// timeout on Windows runners.
-//
-// Since #301, the workspace ships `hole-test-observability` (a
-// dev-dep installed via `hole_test_observability::register!()` in
-// every test-bearing crate's `lib.rs`). It installs a global
-// subscriber via `set_global_default` (not `try_init`) with an
-// EnvFilter that level-rejects noisy third-party log events before
-// `tracing-log` allocates. Adding a thread-local
-// `set_default`-based capture for the IPC error paths would now be
-// safe; doing so is a follow-up, not in scope for #301.
+// No dedicated log-capture test for the `error!("proxy start failed")`
+// path (and the analogous `handle_stop`/`handle_reload` calls); the
+// HTTP-500 + error message is covered by `start_failure_returns_error`
+// (line ~363). A thread-local `set_default` capture could be added now
+// that the global subscriber level-rejects noisy third-party events.
 
-// public_ip handler test is intentionally omitted — it makes an external HTTP call
-// to ipinfo.io which is not available in CI and cannot be easily mocked without
-// adding an HTTP client abstraction layer (a follow-up concern).
+// No public_ip handler test: it makes a live HTTP call to ipinfo.io that
+// can't be mocked without an HTTP-client seam.
 
 // Cancel tests ========================================================================================================
 
@@ -957,8 +938,8 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         // Release the gate so the mock's start() future can settle if it
         // is still parked anywhere; harmless no-op if already dropped.
         gate.notify_one();
-        // run_n(2) returns naturally once both connections are handled, so
-        // no abort is needed — but use a bounded await to surface any leak.
+        // run_n(2) returns once both connections are handled; abort is a
+        // belt-and-suspenders cleanup.
         handle.abort();
         let _ = handle.await;
     });
@@ -1025,7 +1006,7 @@ fn concurrent_start_is_rejected_with_conflict() {
     // sends a second Start concurrently. B must be rejected with 409
     // Conflict rather than silently overwriting A's token slot — the
     // slot is single-occupancy because a Cancel targets exactly one
-    // in-flight start. This covers the pre-fix bug in review #4.
+    // in-flight start.
     rt().block_on(async {
         let path = test_socket_path("concurrent-start");
         let gate = Arc::new(tokio::sync::Notify::new());

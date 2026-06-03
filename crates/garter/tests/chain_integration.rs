@@ -38,24 +38,16 @@ fn mock_plugin_path() -> PathBuf {
 /// Spin up an echo server and a chain of 2 mock plugins, send data through,
 /// verify it arrives.
 ///
-/// This is the #414 regression test. Readiness is now signaled by BOTH
-/// plugins' sitrep `ready` events (both plugins run in `ExpectSitrep`
-/// mode); the client connects only after the aggregator has collected
-/// every plugin's `ready`, so the connect can never race ahead of a bound
-/// listener. Pre-#414 the client raced the readiness signal and saw
-/// intermittent Connection reset/refused.
+/// Readiness is signaled by both plugins' sitrep `ready` events (both run in
+/// `ExpectSitrep` mode); the client connects only after the aggregator collects
+/// every `ready`, so the connect can never race ahead of a bound listener.
 #[skuld::test]
 async fn two_plugin_chain_relays_data() {
     let mock_path = mock_plugin_path();
 
-    // Multi-connection echo server. Under `ExpectSitrep` there is NO
-    // readiness probe connecting through the chain (the old poll-based
-    // readiness check connected to the outermost listener and consumed an
-    // accept slot — that rationale no longer applies, since each plugin
-    // now declares readiness directly via its sitrep `ready` event). The
-    // single real client connection would be served by a single-accept
-    // echo, but multi-accept is retained as a harmless safety margin and
-    // mirrors the server-mode sister test. See bindreams/hole#414.
+    // Multi-connection echo server. Under `ExpectSitrep` no probe connects
+    // through the chain, so a single accept would suffice — multi-accept is a
+    // harmless margin mirroring the server-mode sister test.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
 
@@ -124,10 +116,8 @@ async fn two_plugin_chain_relays_data() {
     drop(client);
     echo_task.abort();
 
-    // Chain plugins loop on accept() indefinitely. The skuld test
-    // harness drops the tokio runtime at the end of the test; tasks
-    // are cancelled and kill_on_drop terminates the child processes.
-    // No explicit wait needed.
+    // Plugins loop on accept() forever; abort the chain task to tear them down
+    // (kill_on_drop reaps the children).
     chain_task.abort();
     let _ = chain_task.await;
 }
@@ -286,10 +276,9 @@ async fn two_plugin_chain_server_mode_relays_data() {
 async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
     let mock_path = mock_plugin_path();
 
-    // Multi-accept echo. In `Probe` mode the self-probe TCP-connects to
-    // the plugin's own listener (not through the chain), so it does not
-    // consume an echo accept slot — but keep multi-accept as a harmless
-    // safety margin.
+    // Multi-accept echo. In `Probe` mode the self-probe TCP-connects to the
+    // plugin's own listener (not through the chain), so a single accept would
+    // suffice — multi-accept is a harmless margin.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     let echo_task = tokio::spawn(async move {

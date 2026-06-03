@@ -5,28 +5,16 @@
 //! a `SocketAddr` and carries bytes to that destination. Higher-layer
 //! concerns (name recovery, policy) live in [`crate::hole_router`].
 //!
-//! ## Role vs. mechanism
-//!
-//! - **Role** is the dispatcher's vocabulary — *why* this endpoint was
-//!   chosen. Values are [`FilterAction`] variants (Proxy / Bypass / Block).
-//! - **Mechanism** is the endpoint's vocabulary — *how* it carries the
-//!   flow. Types are [`Socks5Endpoint`], [`InterfaceEndpoint`], and
-//!   [`BlockEndpoint`].
-//!
-//! `HoleRouter` wires them: Role::Proxy → `Socks5Endpoint`, Role::Bypass
-//! → `InterfaceEndpoint`, Role::Block → `BlockEndpoint`. Tests can wire
-//! any mechanism to any slot via `MockEndpoint`.
+//! See [`crate::hole_router`] for the role→mechanism wiring (Proxy →
+//! [`Socks5Endpoint`], Bypass → [`InterfaceEndpoint`], Block →
+//! [`BlockEndpoint`]) and the full cascade. Tests can wire any mechanism
+//! to any slot via `MockEndpoint`.
 //!
 //! ## UDP-drop privacy invariant
 //!
-//! Hole is a VPN. The cascade in [`crate::hole_router`] drops UDP flows
-//! whose rule resolved to `Proxy` when [`Endpoint::supports_udp`] returns
-//! `false` (TCP-only plugin) — it never falls through to the clear-text
-//! bypass. This preserves the VPN guarantee: "if the user asked for
-//! proxied traffic and we can't proxy it, we refuse to leak it." See
-//! `BlockEndpoint` for the drop logging.
-//!
-//! [`FilterAction`]: hole_common::config::FilterAction
+//! UDP flows that resolve to `Proxy` but can't be proxied (TCP-only
+//! plugin, [`Endpoint::supports_udp`] is `false`) are dropped, not
+//! bypassed — see [`crate::hole_router`] and [`BlockEndpoint`].
 
 pub mod block;
 pub mod interface;

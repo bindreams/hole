@@ -303,7 +303,7 @@ fn missing_server_port_and_port_names_both_alternatives() {
     assert!(msg.contains("port"), "error should also name 'port': {msg}");
 }
 
-// Plugin-shipped validation (bindreams/hole#385 Phase 2) ==============================================================
+// Plugin-shipped validation ===========================================================================================
 // Hole ships only v2ray-plugin and galoshes. Importing a config that
 // references any other plugin name fails at parse time so the user
 // gets an immediate, actionable error instead of a runtime failure

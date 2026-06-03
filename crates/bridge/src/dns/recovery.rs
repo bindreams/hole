@@ -6,12 +6,12 @@
 //! restores each adapter's prior DNS, deletes the file.
 //!
 //! **Order in the startup cascade:** this runs *before*
-//! `routing::recover_routes` (plan §Components / §Lifecycle). If the
-//! process is killed mid-recovery, the user is more likely left with
-//! functional DNS + broken routes (fixable via `route delete`) than
-//! broken DNS + functional routes (much harder for the user to diagnose).
-//! DNS restore is also cheaper (2–4 `netsh`/`networksetup` calls per
-//! adapter) than route recovery, so this front-loads the cheap cleanup.
+//! `routing::recover_routes`. If the process is killed mid-recovery, the
+//! user is more likely left with functional DNS + broken routes (fixable
+//! via `route delete`) than broken DNS + functional routes (much harder
+//! for the user to diagnose). DNS restore is also cheaper (a few DNS FFIs
+//! / `networksetup` calls per adapter) than route recovery, so this
+//! front-loads the cheap cleanup.
 
 use std::path::Path;
 

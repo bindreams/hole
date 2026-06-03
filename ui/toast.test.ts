@@ -61,14 +61,11 @@ describe("showToast", () => {
   it("caps visible toasts at 5; the oldest is dismissed when a 6th arrives", () => {
     const toasts: HTMLDivElement[] = [];
     for (let i = 0; i < 5; i++) toasts.push(showToast(`t${i}`, "info"));
-    // All 5 should be live.
     for (const t of toasts) expect(t.isConnected).toBe(true);
 
-    // The 6th evicts the oldest (toasts[0]).
     const sixth = showToast("t5", "info");
     expect(sixth.isConnected).toBe(true);
     expect(toasts[0].isConnected).toBe(false);
-    // The other four remain.
     for (let i = 1; i < 5; i++) expect(toasts[i].isConnected).toBe(true);
   });
 

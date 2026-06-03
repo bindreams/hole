@@ -2,8 +2,7 @@
 #
 # Schema and semantics live in xtask/src/manifest.rs (deserializers, validation)
 # and xtask/src/orchestrate.rs (DAG, execution). User-facing summary in CLAUDE.md
-# under "Build". Design rationale: docs ../i-want-to-brainstorm-zippy-lightning.md
-# (and ../i-want-to-explore-joyful-lynx.md for the `run:` field).
+# under "Build".
 #
 # Platform shape: `<os>/<arch>` (Docker / GOOS-style), where
 #   os   ∈ {windows, darwin, linux}
@@ -30,11 +29,8 @@
 # policy diverges from the canonical local invocation.
 
 targets:
-  # ex-ray: first-party v2ray-core SIP003 shim that replaced the vendored
-  # v2ray-plugin (#414). Built from `crates/ex-ray/` into `.cache/ex-ray/`;
-  # galoshes embeds it at compile time. Renamed from the stale `v2ray-plugin`
-  # target (whose `build: cargo xtask v2ray-plugin` step broke when the xtask
-  # subcommand was renamed to `ex-ray` in #414).
+  # ex-ray: first-party v2ray-core SIP003 shim. Built from `crates/ex-ray/`
+  # into `.cache/ex-ray/`; galoshes embeds it at compile time.
   ex-ray:
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
@@ -86,7 +82,7 @@ targets:
     # loads from the Vite dev server (`http://localhost:1420`) instead of
     # demanding pre-built embedded assets at `ui/dist/`. The hole crate's
     # default = ["tauri/custom-protocol"] is meant for production builds
-    # (hole-msi / hole-dmg). See bindreams/hole#372.
+    # (hole-msi / hole-dmg) — see the frontend-build note.
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
@@ -101,14 +97,8 @@ targets:
     # nothing consumes. We depend instead on the same sidecars `hole` does, so
     # the MSI build still has ex-ray, galoshes, and wintun.dll on disk.
     #
-    # `frontend-build` is on the depends list because msi-installer runs
-    # plain `cargo build --release` (not `npx tauri build`), so Tauri's
-    # `beforeBuildCommand: "npm run build"` is **never executed** — the only
-    # thing that triggers it is the Tauri CLI. With the hole crate's
-    # default-on `tauri/custom-protocol` feature, tauri-codegen panics at
-    # compile time if `ui/dist/` is missing (it short-circuits and embeds
-    # empty assets only when `cfg(dev) = true`). frontend-build produces
-    # `ui/dist/` ahead of the cargo invocation. See bindreams/hole#372.
+    # `frontend-build` is on the depends list so `ui/dist/` exists before the
+    # Rust build — see the frontend-build note.
     depends: [galoshes, wintun, frontend-build]
     platforms: [windows/amd64]
     build: uv run --directory msi-installer build
@@ -118,12 +108,7 @@ targets:
     # wintun dep on darwin (it doesn't apply to that platform).
     #
     # `frontend-build` is a dep so `node_modules/` (with `@tauri-apps/cli`)
-    # exists before `npx tauri build` runs — otherwise npx fails with "could
-    # not determine executable to run". Tauri then runs
-    # `beforeBuildCommand: "npm run build"` again (vite build executes
-    # twice — ~10-15s waste), but the redundancy keeps `npx tauri build`
-    # self-sufficient for ad-hoc developer use outside the orchestrator.
-    # See bindreams/hole#372.
+    # exists before `npx tauri build` runs — see the frontend-build note.
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build: npx tauri build
@@ -166,15 +151,14 @@ targets:
 
   # ===== Test targets =======================================================
   # `build:` compiles test binaries (--no-run); `run:` is the canonical local
-  # nextest invocation. CI may diverge — see test-hole's SKULD_LABELS gating
-  # and the archive-based test-garter / test-galoshes jobs.
+  # nextest invocation. CI may diverge from it (see the header note above).
 
   hole-tests:
     # `--no-default-features` matches the `hole` target's debug build: tests
     # compile main.rs (which expands `tauri::generate_context!()`), and
     # production-mode generate_context panics at compile time on missing
     # `ui/dist/`. Tests don't need bundled frontend assets — they exercise
-    # CLI / IPC / bridge paths, not the webview. See bindreams/hole#372.
+    # CLI / IPC / bridge paths, not the webview (see the frontend-build note).
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build: >

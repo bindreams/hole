@@ -73,10 +73,10 @@ pub fn deframe_udp_datagram(buf: &[u8]) -> Option<(&[u8], &[u8])> {
 /// Reassembles length-prefixed UDP datagrams from a yamux substream.
 ///
 /// yamux substreams are reliable **byte** streams, not message-preserving:
-/// one `read` may return a partial frame or several coalesced frames. This
-/// buffers raw bytes and drains every complete frame, retaining any trailing
-/// partial for the next `push`. Without it, a single `deframe` per `read`
-/// (the pre-#415 behavior) corrupts split frames and drops coalesced ones.
+/// one `read` may return a partial frame or several coalesced frames. A single
+/// `deframe` per `read` would corrupt frames split across reads and drop frames
+/// coalesced into one read; the accumulator drains every complete frame and
+/// retains the trailing partial for the next `push`.
 ///
 /// Buffer growth is bounded: the 2-byte length prefix is a `u16`, so a
 /// pending frame never exceeds `2 + u16::MAX` bytes.
@@ -208,7 +208,7 @@ async fn open_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> Result<yamux::S
 ///
 /// A UDP socket must be bound in the same address family as the peer it will
 /// `connect()`/`send_to()`; binding IPv4 (`0.0.0.0`) then connecting an IPv6
-/// peer fails with an address-family error (#415, defect B).
+/// peer fails with an address-family error.
 fn unspecified_for(target: SocketAddr) -> SocketAddr {
     if target.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -229,8 +229,8 @@ fn unspecified_for(target: SocketAddr) -> SocketAddr {
 /// server) and routinely come and go, so this is reachable under ordinary UDP
 /// churn (e.g. finished DNS queries). Disabling `SIO_UDP_CONNRESET` is the
 /// standard fix (also applied by quinn / hickory-dns); tokio/mio leave the
-/// Windows default (enabled). See bindreams/hole#415 and the documented hazard
-/// in `crates/bridge/src/dns/forwarder.rs`.
+/// Windows default (enabled). See the documented hazard in
+/// `crates/bridge/src/dns/forwarder.rs`.
 pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // Bind via std so the raw handle is available for the Windows ioctl before
     // the socket is registered with tokio's reactor.
@@ -300,7 +300,7 @@ async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -
 async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -> Result<()> {
     // Bind in the remote's address family, else an IPv6 `remote` (ss server
     // configured with `server: "::"` hands the plugin an `[::1]` loopback)
-    // fails the connect with an address-family mismatch (#415, defect B).
+    // fails the connect with an address-family mismatch.
     let udp = bind_udp(unspecified_for(remote)).context("bind udp")?;
     udp.connect(remote).await.context("connect udp")?;
 
@@ -396,7 +396,7 @@ async fn run_udp_association(
     // NAT idle-eviction timer. The delay IS the behavior under management
     // (conntrack-style idle expiry of a UDP association), not synchronization
     // between our own code paths — sanctioned per the synchronization
-    // invariant's "the delay IS the behavior" exception. See bindreams/hole#415.
+    // invariant's "the delay IS the behavior" exception.
     let idle = tokio::time::sleep(udp_timeout);
     tokio::pin!(idle);
 

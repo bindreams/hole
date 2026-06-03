@@ -268,13 +268,11 @@ mod tun {
     /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
     ///
-    /// Currently disabled even on Windows because the galoshes
-    /// `PluginConfig` bind race (#197) fires here too. The `mod tun`
-    /// guard above is `cfg(target_os = "windows")`, so an additional
-    /// `cfg(not(target_os = "windows"))` here resolves to always-false
-    /// — the test is effectively never compiled until #197 is fixed.
-    /// Keeping the function as a placeholder so the test-matrix docs
-    /// stay intact; re-enable by removing this cfg once #197 lands.
+    /// Gated never-compile via the contradictory cfg pair (the `mod tun`
+    /// guard above is `cfg(target_os = "windows")`, this is
+    /// `cfg(not(target_os = "windows"))`) because the galoshes
+    /// `PluginConfig` bind race fires here too (bindreams/hole#197).
+    /// Remove the cfg once #197 lands.
     #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(

@@ -27,7 +27,8 @@ fn main() {
     generate_tray_icons(icons_dir);
 
     // Runtime asset acquisition (ex-ray Go build, wintun.dll download)
-    // moved to `cargo xtask deps` in Commit 4 of this PR. See issue #143.
+    // lives in `cargo xtask deps`, not here — this build.rs is
+    // compile-time metadata only.
 
     ensure_external_bin_stub(&repo_root);
     tauri_build::build();
@@ -68,7 +69,7 @@ fn emit_version_env(repo_root: &Path) {
     // Rerun triggers: branch ref changes, tag changes, packed-refs. The
     // version computation itself lives in xtask-lib so it's testable and
     // shared with `cargo xtask version` (which the prek hook + release CI
-    // workflow use). See xtask-lib/src/version.rs and issue #143.
+    // workflow use). See xtask-lib/src/version.rs.
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
         if let Some(refpath) = head.trim().strip_prefix("ref: ") {

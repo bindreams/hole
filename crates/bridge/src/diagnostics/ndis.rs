@@ -12,7 +12,7 @@
 //!   inventory, including NDIS Lightweight Filters (LWFs). A wintun
 //!   LWF still bound to the loopback pseudo-interface or to a
 //!   Hyper-V vSwitch adapter after wintun.sys unloads is exactly the
-//!   kind of below-WFP breakage #200 points at.
+//!   kind of below-WFP breakage this module hunts for.
 //! - [`Get-VMSwitchExtension`] — Hyper-V vSwitch extensions. The CI
 //!   runner exposes a `vEthernet (nat)` switch; an extension registered
 //!   by wintun and not deregistered on adapter teardown would also

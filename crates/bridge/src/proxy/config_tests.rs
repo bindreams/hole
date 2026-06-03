@@ -33,10 +33,9 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
-// The static `plugin_supports_udp(config)` helper was retired in #414 —
-// the runtime UDP-drop policy now derives capability from the plugin's
-// reported sitrep `transports` (`udp_available_from_chain` in
-// `proxy_manager.rs`), tested in `proxy_manager_tests.rs`.
+// UDP-drop capability is derived at runtime from the plugin's reported
+// sitrep `transports` (`udp_available_from_chain` in `proxy_manager.rs`),
+// tested in `proxy_manager_tests.rs`.
 
 #[skuld::test]
 fn config_with_plugin_local_overrides_server_address() {
@@ -157,9 +156,8 @@ fn http_listener_is_tcp_only_in_full_mode() {
 
 #[skuld::test]
 fn socks5_full_mode_is_tcp_and_udp() {
-    // Regression guard for the existing (pre-#242) behaviour: Full mode +
-    // SOCKS5 enabled => TcpAndUdp, which lets the dispatcher use UDP
-    // ASSOCIATE.
+    // Full mode + SOCKS5 enabled => TcpAndUdp, which lets the dispatcher
+    // use UDP ASSOCIATE.
     let cfg = sample_config();
     assert_eq!(cfg.tunnel_mode, hole_common::protocol::TunnelMode::Full);
     let ss_config = build_ss_config(&cfg, None).unwrap();
@@ -169,10 +167,9 @@ fn socks5_full_mode_is_tcp_and_udp() {
 
 #[skuld::test]
 fn socks5_socks_only_mode_is_tcp_and_udp() {
-    // Post-#250: SocksOnly exposes UDP-ASSOCIATE to local SOCKS5 clients
+    // SocksOnly exposes UDP-ASSOCIATE to local SOCKS5 clients
     // (hev-socks5-tunnel, ss-tunnel, proxychains-ng UDP, the in-bridge
-    // DNS forwarder's UDP path). Pre-#250 this asserted TcpOnly under
-    // #189's mis-attributed select_all hypothesis.
+    // DNS forwarder's UDP path), so the SOCKS5 listener is TcpAndUdp.
     let mut cfg = sample_config();
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
     let ss_config = build_ss_config(&cfg, None).unwrap();

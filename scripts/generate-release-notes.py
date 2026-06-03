@@ -597,9 +597,9 @@ def test_categories_cover_all_semantic_pr_types():
     either in an explicit category, or via the "Other" catch-all
     (category with empty types list).
 
-    Per S5 (b): catch-all is an acceptable runtime fallback. The test
-    enforces that if "Other" is ever removed, every type must have an
-    explicit category.
+    A catch-all category is an acceptable runtime fallback. This test
+    enforces that if the "Other" catch-all is removed, every semantic-pr
+    type must have an explicit category.
     """
     repo_root = Path(__file__).resolve().parent.parent
     semantic = yaml.safe_load((repo_root / ".github/workflows/semantic-pr.yaml").read_text())

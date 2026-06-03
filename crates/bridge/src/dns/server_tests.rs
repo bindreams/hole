@@ -143,17 +143,10 @@ fn sample_query(tx_id: u16) -> Vec<u8> {
 async fn start_server_with_stub() -> (LocalDnsServer, SocketAddr, tokio::task::JoinHandle<()>) {
     let (upstream, up_task) = start_stub_upstream().await;
 
-    // Direct-connector forwarder targeting the stub UDP upstream via the
-    // forwarder's `forward_on_port` wouldn't fit the real API; instead we
-    // pass the upstream IP as the forwarder's server, but the forwarder
-    // hard-codes DNS_PORT_PLAIN=53. The stub is on an ephemeral port, so
-    // direct-connector UDP would not reach it. Work around by running the
-    // whole thing through the forwarder's public `forward` with an
-    // upstream on :53 — but we have no privilege to bind :53 in CI.
-    //
-    // Instead: use a forwarder with a *broken* server list and rely on
-    // SERVFAIL being a well-formed reply for the server-layer tests.
-    // (Separate forwarder-layer tests already cover upstream wiring.)
+    // The forwarder hard-codes DNS port 53, which CI can't reach without
+    // privilege, so this helper points it at an unroutable upstream
+    // (TEST-NET-1). Server-layer tests assert on the well-formed SERVFAIL
+    // reply; forwarder-layer upstream wiring is covered in forwarder_tests.
     let _ = upstream; // kept alive via `up_task`
     let cfg = DnsConfig {
         enabled: true,
@@ -399,27 +392,16 @@ async fn self_test_error_downcastable_to_typed_marker() {
 
 // Wildcard-holder coverage note:
 //
-// An earlier draft included a Windows-only test that pre-bound
-// `0.0.0.0:P/UDP` with `SO_REUSEADDR` (simulating ICS / svchost) and
-// asserted that `LocalDnsServer::bind(127.0.0.1:P)` with
-// `SO_EXCLUSIVEADDRUSE` returned `Err`. **Empirically the bind returns
-// `Ok`**: per MSDN's documented Winsock matrix, `SO_EXCLUSIVEADDRUSE`
-// on a specific-address bind does not refuse coexistence with a
-// `SO_REUSEADDR` wildcard holder — they target different addresses, so
-// the kernel allows both. The production bug (svchost wins inbound
-// routing on `127.0.0.1:53` despite Hole binding the specific address)
-// is caused by ICS-specific kernel-level routing, not by the documented
-// Winsock matrix, and is not reproducible by a vanilla wildcard
-// `SO_REUSEADDR` bind. The load-bearing defense for that bug is the
-// post-bind self-test (see `bind_with_probe_returns_err_when_probe_fails`
-// + `probe_invoked_once_per_bind_with_probe_call`), which catches
-// any inbound-routing hijack (ICS, LSP/WFP shim, NKE, kernel firewall)
-// regardless of mechanism — the sentinel datagram simply doesn't come
-// back within budget, and `bind_ladder` walks to `127.53.0.X:53`.
-//
-// `SO_EXCLUSIVEADDRUSE` on `bind_udp_socket` / `bind_tcp_listener` is
-// kept as forward-looking defense: it prevents a future process from
-// using `SO_REUSEADDR` to steal traffic from Hole's already-bound
-// listener. That scenario is not the #398 production bug and isn't
-// deterministically testable without a second-binder simulation that
-// adds complexity for unclear benefit.
+// A vanilla `SO_REUSEADDR` wildcard bind on `0.0.0.0:P/UDP` does NOT
+// reproduce the inbound-routing hijack: per MSDN's Winsock matrix,
+// `SO_EXCLUSIVEADDRUSE` on a specific-address bind coexists with a
+// `SO_REUSEADDR` wildcard holder (different addresses), so
+// `LocalDnsServer::bind(127.0.0.1:P)` returns `Ok`. The hijack (a
+// wildcard holder winning inbound routing on `127.0.0.1:53` despite
+// Hole's specific bind) comes from kernel-level routing override, not
+// the documented matrix. The load-bearing defense is the post-bind
+// self-test (verified by `bind_with_probe_returns_err_when_probe_fails`
+// + `probe_invoked_once_per_bind_with_probe_call`): the sentinel
+// datagram doesn't come back, so `bind_ladder` walks to `127.53.0.X:53`.
+// `SO_EXCLUSIVEADDRUSE` is kept as forward-looking defense against a
+// FUTURE `SO_REUSEADDR` binder stealing already-bound traffic.

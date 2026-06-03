@@ -235,13 +235,12 @@ fn setup_with_spaced_interface_name_includes_full_name() {
     );
 }
 
-// `SystemRoutes` construction tests removed post-#165: the type now has
-// private fields (no pub constructor) and is always produced via
-// `SystemRouting::install`. Field-storage assertions would require
-// either making fields public or exercising `install` with real netsh —
-// the latter is exactly what the refactor disallows. The critical
-// invariant ("Drop tears down via the trait, not the free function") is
-// covered in bridge by `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
+// `SystemRoutes` has private fields and no pub constructor — it is
+// always produced via `SystemRouting::install`, so field-storage
+// assertions aren't possible without exercising real netsh (which the
+// trait seam disallows). The critical invariant ("Drop tears down via
+// the trait, not the free function") is covered in bridge by
+// `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
 
 // Phase classifier ====================================================================================================
 //
@@ -257,14 +256,13 @@ fn recover_phases_are_classified_as_expected_failures() {
     assert!(is_recovery_phase(PHASE_RECOVER_BYPASS));
 }
 
-/// **#388**: `PHASE_TEARDOWN` is also a best-effort phase. Empirically
-/// `netsh interface ip delete route 0.0.0.0/1 <adapter>` and the bare
-/// `route delete <ip>` both exit non-zero when the route is absent,
-/// and `setup_routes` is NOT transactional — a failed mid-install
-/// leaves an arbitrary subset of routes present, so teardown must
-/// tolerate missing routes silently. Real teardown failures surface
-/// elsewhere (post-teardown `Remove-NetAdapter` reporting, state-file
-/// persistence errors).
+/// `PHASE_TEARDOWN` is best-effort: `netsh interface ip delete route
+/// 0.0.0.0/1 <adapter>` and the bare `route delete <ip>` both exit
+/// non-zero when the route is absent, and `setup_routes` is NOT
+/// transactional — a failed mid-install leaves an arbitrary subset of
+/// routes present, so teardown must tolerate missing routes silently.
+/// Real teardown failures surface elsewhere (post-teardown
+/// `Remove-NetAdapter` reporting, state-file persistence errors).
 #[skuld::test]
 fn teardown_phase_is_classified_as_expected_failures() {
     assert!(is_recovery_phase(PHASE_TEARDOWN));
@@ -292,15 +290,11 @@ fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) ->
 
 #[skuld::test]
 fn recover_without_state_file_is_a_noop() {
-    // With state-file-driven recovery, the absence of a state file
-    // means the previous run never installed any routes (the caller's
-    // write-ordering contract persists the state file BEFORE any
-    // routing mutation). So recovery issues zero commands.
-    //
-    // This is load-bearing for the e2e test harness, which runs
-    // multiple bridge subprocesses in parallel: a SOCKS5-only bridge
-    // with an empty state dir must not issue `netsh delete route`
-    // calls that would rip routes out from under a concurrent TUN
+    // No state file means the previous run installed no routes (the
+    // write-ordering contract persists state BEFORE any routing
+    // mutation), so recovery issues zero commands. Load-bearing for the
+    // parallel e2e harness: a SOCKS5-only bridge with an empty state dir
+    // must not `netsh delete route` out from under a concurrent TUN
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());

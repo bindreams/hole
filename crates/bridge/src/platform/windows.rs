@@ -128,7 +128,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(error = %e, "recover_plugins task panicked");
         }
 
-        // Capture WFP + NDIS state after recovery. See #200 and
+        // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
             tracing::warn!(error = %e, "wfp startup snapshot task panicked");

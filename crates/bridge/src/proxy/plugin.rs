@@ -31,10 +31,9 @@ pub struct PluginChain {
     handle: tokio::task::JoinHandle<garter::Result<()>>,
     cancel: CancellationToken,
     local_addr: SocketAddr,
-    /// Transports the live chain actually reported via sitrep `ready`
-    /// (#414) — the end-to-end intersection across every hop. The UDP-drop
-    /// policy in `proxy_manager.rs` reads this as the authoritative runtime
-    /// signal, replacing the static `PluginDescriptor.udp_supported` guess.
+    /// Transports the live chain reported via its sitrep `ready` message —
+    /// the end-to-end intersection across every hop. The UDP-drop policy in
+    /// `proxy_manager.rs` reads this as the authoritative runtime signal.
     transports: garter::Transports,
     state_dir: Option<PathBuf>,
 }
@@ -53,8 +52,8 @@ impl PluginChain {
         self.local_addr
     }
 
-    /// Transports the live chain reported via sitrep `ready` (#414). The
-    /// UDP-drop policy reads this to decide whether `Proxy`-routed UDP
+    /// Transports the live chain reported via its sitrep `ready` message.
+    /// The UDP-drop policy reads this to decide whether `Proxy`-routed UDP
     /// flows can be carried through the tunnel or must be dropped.
     pub fn transports(&self) -> garter::Transports {
         self.transports
@@ -102,21 +101,14 @@ impl Drop for PluginChain {
 /// first resolved to its on-disk binary name, then mapped via
 /// [`hole_common::plugin::plugin_alloc_protocols`].
 ///
-/// Goes through [`port_alloc::bind_ephemeral`] for structural
-/// consistency with the other ephemeral-bind sites in the workspace.
-/// The retry on `op` is structurally decorative for this site: the
-/// plugin subprocess binds `local_addr` itself, so a Windows
-/// excluded-range failure surfaces as a `ProxyError::Plugin` (oneshot
-/// timeout / exit before ready) rather than an `io::Error`, and
-/// `is_bind_race` cannot classify it. Plugin failures are converted
-/// to `io::Error::other` (non-bind-race), which `bind_ephemeral`
-/// propagates immediately. The in-process probe step inside
-/// `bind_ephemeral` (run before each `op` call) catches the Windows
-/// excluded-range disagreement class before the subprocess spawn —
-/// that is the load-bearing race mitigation at this site. The
-/// residual probe-drop-to-subprocess-bind TOCTOU is tracked in
-/// bindreams/hole#304. See bindreams/hole#285 §"Where the fix
-/// actually lands" for the rendezvous-port race class history.
+/// Allocates the handoff port via [`port_alloc::bind_ephemeral`]. The
+/// plugin subprocess binds `local_addr` out-of-process, so its bind
+/// failures arrive as `ProxyError::Plugin` (oneshot timeout / exit before
+/// ready), are converted to `io::Error::other` (non-bind-race), and
+/// propagate immediately. `bind_ephemeral`'s in-process probe step (run
+/// before each `op` call) is what catches the Windows excluded-range
+/// race class here, before the subprocess spawn. The residual
+/// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
 #[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin_name: &str,
@@ -241,7 +233,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// A plugin `StartError::BindConflict` (the only retryable start class)
 /// maps to [`ProxyError::BindRace`] so the outer `bind_ephemeral` retries
 /// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
-#[allow(clippy::too_many_arguments)] // 9 args — already at the limit before #397 added cancel; bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
     plugin_path: &str,
@@ -297,13 +289,12 @@ async fn spawn_plugin_runner_at(
         plugin_options: merged_opts.map(String::from),
     };
 
-    // #267 + #388: wrap plugin in counting `TapPlugin` so per-TCP
-    // connection byte flow + close-kind become visible in `bridge.log`.
-    // Two gates compose:
+    // Wrap plugin in counting `TapPlugin` so per-TCP connection byte flow
+    // + close-kind become visible in `bridge.log`. Two gates compose:
     //   - `AppConfig.diagnostic_plugin_tap` via `ProxyConfig` IPC field
-    //     (reaches service mode — #388).
+    //     (reaches service mode).
     //   - `HOLE_BRIDGE_PLUGIN_TAP=1` env var (dev shell only — env vars
-    //     don't survive into SCM/launchd contexts — #267).
+    //     don't survive into SCM/launchd contexts).
     // Off by default; the extra loopback hop is cheap on debug-mode
     // reproduction but inappropriate at browser-traffic scale.
     let tap_source = resolve_tap_source(diagnostic_tap);
@@ -379,8 +370,8 @@ async fn spawn_plugin_runner_at(
 ///
 /// `spawn_plugin_runner_at` emits exactly three variants:
 ///
-/// - [`ProxyError::BindRace`] (a plugin's `StartError::BindConflict`,
-///   #414) — synthesized into an `AddrInUse`-kind `io::Error` so
+/// - [`ProxyError::BindRace`] (a plugin's `StartError::BindConflict`)
+///   — synthesized into an `AddrInUse`-kind `io::Error` so
 ///   [`hole_common::retry::is_bind_race`] classifies it as retryable and
 ///   `bind_ephemeral` allocates a fresh port. This is the load-bearing
 ///   case: a plugin that loses its local-port bind race gets retried
@@ -392,7 +383,7 @@ async fn spawn_plugin_runner_at(
 ///   `bind_ephemeral` already catches Windows excluded-range
 ///   disagreements before the subprocess spawn (stderr-based
 ///   classification of subprocess bind failures is bindreams/hole#304).
-/// - [`ProxyError::Cancelled`] (bridge cancel observed mid-spawn, #397)
+/// - [`ProxyError::Cancelled`] (bridge cancel observed mid-spawn)
 ///   — a non-bind-race `io::Error::other`; the outer `start_plugin_chain`
 ///   distinguishes it via `cancel.is_cancelled()` to re-emit the
 ///   canonical variant.
@@ -405,8 +396,7 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
             // (which keys on ErrorKind, not raw_os_error) classifies it on
             // every OS regardless of the platform-native errno value
             // (errno 48 is AddrInUse on macOS but garbage on Windows). The
-            // errno is preserved in the message for bridge.log diagnostics
-            // (#414).
+            // errno is preserved in the message for bridge.log diagnostics.
             std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!("plugin bind conflict on {addr} (errno {errno})"),

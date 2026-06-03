@@ -23,9 +23,9 @@
 //! ## Platform implementations
 //!
 //! - **Windows** — Direct Win32 calls via [`windows::WinDnsBackend`] +
-//!   [`windows::Win32Real`]. Pre-#397 this layer shelled out to `netsh`.
-//!   Adapter identity is the friendly alias ("Wi-Fi", "wintun") which
-//!   resolves to a LUID-then-GUID inside `Win32Real`.
+//!   [`windows::Win32Real`]. Adapter identity is the friendly alias
+//!   ("Wi-Fi", "wintun") which resolves to a LUID-then-GUID inside
+//!   `Win32Real`.
 //! - **macOS** — `networksetup -{getdnsservers,setdnsservers}`. Adapter
 //!   identity is the service name (e.g. "Wi-Fi"). Reasonably stable
 //!   across short periods; a user who renames a service mid-session
@@ -81,7 +81,7 @@ pub trait Dns: Send + Sync + 'static {
     /// between per-adapter I/O operations and inline-restore any
     /// partially-applied adapters before returning
     /// [`DnsError::Cancelled`]. Cancel-check granularity is between calls,
-    /// not mid-call — see the plan for #397 for rationale.
+    /// not mid-call (an in-flight FFI write cannot be safely interrupted).
     fn apply(
         &self,
         local_dns_server: crate::dns::server::LocalDnsServer,
@@ -113,9 +113,8 @@ pub enum DnsError {
 
     /// Capture or apply failed at the platform level. The bridge logs a
     /// warning and continues with a degraded `RunningState.dns = None`
-    /// (preserves the pre-#397 behavior: forwarder is up but OS
-    /// resolvers haven't been redirected). Non-cancel failures are NOT
-    /// fatal to proxy start.
+    /// (forwarder up, OS resolvers not redirected). Non-cancel failures
+    /// are NOT fatal to proxy start.
     #[error("DNS apply failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -163,8 +162,8 @@ impl SystemDns {
     }
 
     /// Construct a [`SystemDns`] with a specific [`windows::WinDnsBackend`]
-    /// implementation. Used by Layer-2 unit tests (`windows_tests.rs`) to
-    /// substitute a mock. Production code uses [`Self::new`].
+    /// implementation. Used by `windows_tests.rs` to substitute a mock;
+    /// production uses [`Self::new`].
     #[cfg(target_os = "windows")]
     pub fn new_with_backend(backend: Arc<dyn windows::WinDnsBackend>) -> Self {
         Self { backend }
@@ -593,10 +592,8 @@ impl Drop for SystemDnsApplied {
     /// missed-shutdown bugs); release builds suppress the panic and we
     /// run the best-effort sync restore below.
     ///
-    /// The release-mode signal is `shutdown_completed`, NOT
-    /// `bomb.is_defused()` — the latter is `true` unconditionally in
-    /// release (`drop_bomb::FakeBomb`), which would make this path
-    /// dead code in release. See the `shutdown_completed` field doc.
+    /// The release signal is `shutdown_completed`, not `bomb.is_defused()`
+    /// — see the `shutdown_completed` field doc.
     fn drop(&mut self) {
         if self.shutdown_completed {
             return;

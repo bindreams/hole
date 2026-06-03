@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 /// A `MakeWriter`-compatible `Vec<u8>` accumulator that also fires
 /// `mpsc` acks the first time any registered substring is observed in
 /// a written line. Lets tests park on `recv()` until a specific log
-/// event has been emitted — no polling, no sleep. See
-/// bindreams/hole#383.
+/// event has been emitted — no polling, no sleep.
 #[derive(Clone, Default)]
 pub struct WaitableWriter {
     inner: Arc<Mutex<Vec<u8>>>,

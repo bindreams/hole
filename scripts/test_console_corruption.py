@@ -57,12 +57,10 @@ def mode_flags(mode: int) -> str:
 
 def run_and_terminate(cmd: list[str], *, stdin_devnull: bool) -> None:
     """Launch a subprocess, wait until it signals it has finished startup
-    (via the Vite "ready in" line on stdout), then terminate it. Reading
-    a deterministic marker replaces a sleep-based "wait briefly" — see
-    bindreams/hole#383. If the subprocess exits before emitting the
-    marker (Vite changed its output format, npm failed, etc.), we
-    panic loudly: the corruption check is only meaningful against a
-    subprocess that actually set up its console handlers.
+    (via the Vite "ready in" line on stdout), then terminate it. If the
+    subprocess exits before emitting the marker (Vite changed its output
+    format, npm failed, etc.), we fail loudly: the corruption check is only
+    meaningful against a subprocess that actually set up its console handlers.
     """
     stdin_arg = subprocess.DEVNULL if stdin_devnull else None
     proc = subprocess.Popen(

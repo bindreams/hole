@@ -40,13 +40,8 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
 
 /// Fast defaults for tests that don't need plugin startup.
 ///
-/// Reverted to pre-#165 values in PR-A (#169). The #165 bug was that
-/// every test that went through `ProxyManager::start/stop` shelled out
-/// to real `netsh`/`route` via a RouteGuard that bypassed the backend
-/// trait, corrupting loopback state over time. Now that the refactor
-/// eliminates the bypass, tests no longer touch the routing table, so
-/// the original tight timeouts hold. If CI fails after this revert,
-/// investigate root cause — do NOT bump the values back.
+/// These tests no longer touch the routing table, so tight timeouts are
+/// safe. If CI fails, investigate root cause rather than bumping these.
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
         preflight_timeout: Duration::from_millis(500),

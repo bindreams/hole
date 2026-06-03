@@ -693,13 +693,13 @@ async fn handle_check_for_updates(app: AppHandle) {
 }
 
 pub(crate) fn open_settings_window(app: &AppHandle) {
-    // Always build the dashboard fresh. Under the destroy-on-close lifecycle
-    // (issue #144), the previous "reuse if already open" short-circuit had a
-    // microsecond race where the wry runtime had cleared the window inner
-    // but Tauri's manager hadn't yet removed the entry — `get_webview_window`
-    // would return `Some` but `show()` would silently no-op, and the user
-    // would see nothing happen. The webview cold-start cost (~200–500 ms) is
-    // acceptable for an infrequently-opened settings panel.
+    // Always rebuild the dashboard fresh rather than reusing an open window:
+    // with windows destroyed (not hidden) on close, a
+    // `get_webview_window()`/`show()` reuse path can race the window teardown
+    // (the wry runtime clears the window inner before Tauri's manager removes
+    // the entry, so `get_webview_window` returns `Some` but `show()` silently
+    // no-ops) and the user sees nothing happen. Cold-start (~200–500 ms) is
+    // acceptable for an infrequently-opened panel.
     //
     // The per-window menu listener registered below is stored in a
     // `HashMap<String, ...>` keyed by window label inside Tauri's
@@ -712,18 +712,9 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
         .max_inner_size(800.0, 4096.0)
         .resizable(true)
         .maximizable(false)
-        // `.devtools(true)` calls `SetAreDevToolsEnabled(true)` on Windows
-        // (unconditional in Wry) and `setInspectable(true)` on macOS (gated
-        // by `tauri/devtools` Cargo feature, which Cargo.toml enables above).
-        // Enabled unconditionally — including in release builds — so end
-        // users can self-diagnose webview issues (#372 had to be reproduced
-        // blind because devtools were off).
-        //
-        // F12 → "open devtools" is bound natively by WebView2 once devtools
-        // are enabled. macOS users access the inspector via Safari → Develop.
-        // Side effect: an "Inspect" item appears in WebView2's right-click
-        // context menu (which is shown unconditionally regardless of this
-        // setting).
+        // Devtools enabled unconditionally (incl. release) so users can
+        // self-diagnose webview issues. F12 opens it on Windows; macOS via
+        // Safari → Develop. Adds an "Inspect" context-menu item.
         .devtools(true);
 
     // Menu bar (all platforms) ----------------------------------------------------------------------------------------

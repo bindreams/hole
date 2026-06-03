@@ -576,7 +576,7 @@ fn apply_import_emits_summary_event() {
     );
 }
 
-// ImportFailure sanitization (bindreams/hole#385 Phase 2) =============================================================
+// ImportFailure sanitization ==========================================================================================
 // `to_import_failure` converts the file-I/O + parse error surface into
 // the tagged enum the frontend deserializes. The conversion is the only
 // place where (a) `serde_json::Error`'s parse-error message (which echoes
