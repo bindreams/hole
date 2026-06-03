@@ -1,6 +1,13 @@
-use crate::embedded::EmbeddedBinary;
+use crate::embedded::{runtime_dir, EmbeddedBinary};
 
 const TEST_DATA: &[u8] = b"#!/bin/sh\necho hello\n";
+
+#[skuld::test]
+fn runtime_dir_is_public() {
+    // Compile-time guard: runtime_dir is pub so main() can source the crash
+    // marker dir. A regression to private fails to compile here.
+    let _f: fn() -> anyhow::Result<std::path::PathBuf> = runtime_dir;
+}
 
 fn test_sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};

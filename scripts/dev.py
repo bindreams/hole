@@ -131,7 +131,10 @@ def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> No
         [cargo, "xtask", "build", "hole"],
         stdout=sys.stdout,
         stderr=sys.stderr,
-        env=drop_env({**os.environ}, target_user),
+        # HOLE_CRASH_DUMPS opts galoshes' xtask build into the dev-only
+        # minidump feature (bindreams/hole#438), matching the hole target's
+        # --features tombstone/crash-dumps. Never set in release/MSI builds.
+        env=drop_env({**os.environ, "HOLE_CRASH_DUMPS": "1"}, target_user),
         **drop_kwargs(target_user),
     )
     if result.returncode != 0:

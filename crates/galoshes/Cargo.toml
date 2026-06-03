@@ -11,6 +11,14 @@ group = "galoshes"
 [lints]
 workspace = true
 
+[features]
+# Dev-only minidump passthrough (bindreams/hole#438). NON-DEFAULT. Enabled
+# only by `cargo xtask galoshes` when HOLE_CRASH_DUMPS is set (dev path via
+# scripts/dev.py). Release / MSI / standalone galoshes builds never set it,
+# so minidump-writer is absent from the windows-arm64 galoshes matrix (where
+# it has no support). The marker→breadcrumb path still works there.
+crash-dumps = ["tombstone/crash-dumps"]
+
 [lib]
 harness = false
 
@@ -28,6 +36,7 @@ futures = "0.3"
 yamux = "0.13"
 sha2 = "0.11"
 tempfile = "3"
+tombstone = { path = "../tombstone" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

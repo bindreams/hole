@@ -2244,6 +2244,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tombstone",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2",
