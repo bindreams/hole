@@ -118,6 +118,15 @@ impl BinaryPlugin {
     }
 }
 
+/// Environment variables always injected into a binary plugin's child
+/// process, independent of SIP003 config. `GOTRACEBACK=crash` makes a Go
+/// plugin (ex-ray) dump full goroutine state to stderr on a native fault
+/// (the bridge relays that stderr through tracing). Harmless to Rust
+/// plugins, which ignore it. See bindreams/hole#438.
+pub(crate) fn fixed_plugin_env() -> &'static [(&'static str, &'static str)] {
+    &[("GOTRACEBACK", "crash")]
+}
+
 fn extract_name(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -146,6 +155,9 @@ impl ChainPlugin for BinaryPlugin {
         cmd.env("SS_REMOTE_PORT", env.ss_remote_port.to_string());
         if let Some(ref opts) = self.options {
             cmd.env("SS_PLUGIN_OPTIONS", opts);
+        }
+        for (k, v) in fixed_plugin_env() {
+            cmd.env(k, v);
         }
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
