@@ -13,23 +13,22 @@
 //! flake on transient excluded-range pressure (if too low). See
 //! bindreams/hole#300.
 //!
-//! Three consumers in the bridge route through `bind_ephemeral`:
+//! Consumers across the workspace route through `bind_ephemeral`:
 //!
-//! * [`crate::dns::server::LocalDnsServer::bind`][0] (via hole-bridge) —
-//!   UDP+TCP on the same ephemeral loopback port.
-//! * `proxy::plugin::start_plugin_chain` — SIP003 plugin port (TCP or
-//!   TCP+UDP depending on the plugin binary's
-//!   [`plugin_alloc_protocols`][crate::plugin::plugin_alloc_protocols]).
-//! * `test_support::ssserver::start_real_ss_server*` — in-process
-//!   shadowsocks server fixtures.
+//! * `hole-bridge`'s `LocalDnsServer::bind` — UDP+TCP on the same ephemeral
+//!   loopback port.
+//! * `hole-bridge`'s `proxy::plugin::start_plugin_chain` — SIP003 plugin port
+//!   (TCP or TCP+UDP per the plugin binary's
+//!   `hole_common::plugin::plugin_alloc_protocols`).
+//! * `plugin-e2e`'s `ssserver::start_real_ss_server*` — in-process shadowsocks
+//!   server fixtures.
 //!
 //! Direct [`free_port`] callers must explicitly justify why the
 //! `bind_ephemeral` closure shape doesn't fit, suppressing the
-//! `disallowed_methods` clippy lint (see workspace `clippy.toml`). The
-//! one current case is `test_support::port_alloc::allocate_ephemeral_port`,
-//! which hands the port across a process boundary via JSON config.
-//!
-//! [0]: https://github.com/bindreams/hole/blob/main/crates/bridge/src/dns/server.rs
+//! `disallowed_methods` clippy lint (see workspace `clippy.toml`). The one
+//! current case is `hole-bridge`'s
+//! `test_support::port_alloc::allocate_ephemeral_port`, which hands the port
+//! across a process boundary via JSON config.
 //!
 //! The OS kernel has no "free for both TCP and UDP" primitive; we probe
 //! one transport via `bind(:0)`, then verify the remaining transports
@@ -113,7 +112,7 @@ pub async fn free_port(ip: IpAddr, protocols: Protocols) -> io::Result<u16> {
         match free_port_once(ip, primary, rest).await {
             Ok(port) => {
                 debug!(
-                    target: "hole_common::port_alloc",
+                    target: "util::port_alloc",
                     ip = %ip,
                     port = port,
                     protocols = %protocols,
@@ -175,7 +174,7 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
     };
     match &result {
         Ok(bound) => debug!(
-            target: "hole_common::port_alloc",
+            target: "util::port_alloc",
             ip = %addr.ip(),
             port = bound.port(),
             transport = %transport,
@@ -183,7 +182,7 @@ async fn probe_bind(addr: SocketAddr, transport: Protocols) -> io::Result<u16> {
             "probe_bind"
         ),
         Err(e) => debug!(
-            target: "hole_common::port_alloc",
+            target: "util::port_alloc",
             ip = %addr.ip(),
             port = addr.port(),
             transport = %transport,
@@ -246,7 +245,7 @@ where
         match bind_ephemeral_once(ip, primary, rest, &op).await {
             Ok((port, value)) => {
                 debug!(
-                    target: "hole_common::port_alloc",
+                    target: "util::port_alloc",
                     ip = %ip,
                     port = port,
                     protocols = %protocols,
@@ -286,7 +285,7 @@ where
 /// without flooding logs on the common happy path.
 ///
 /// `debug!` volume is O(n) (one per iteration) — operators debugging a
-/// stuck loop with `HOLE_BRIDGE_LOG=hole_common::port_alloc=debug`
+/// stuck loop with `HOLE_BRIDGE_LOG=util::port_alloc=debug`
 /// should expect proportional volume. `info!` volume is O(log n) by
 /// construction via [`is_log_milestone`], so default-log-level
 /// observability stays bounded regardless of loop length.
@@ -297,7 +296,7 @@ fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Erro
     // function on retries (attempt >= 1 after a failure), so the
     // smallest value we ever see is 1.
     debug!(
-        target: "hole_common::port_alloc",
+        target: "util::port_alloc",
         attempt = attempt,
         ip = %ip,
         protocols = %protocols,
@@ -306,7 +305,7 @@ fn emit_retry_log(attempt: u64, ip: IpAddr, protocols: Protocols, err: &io::Erro
     );
     if is_log_milestone(attempt) {
         info!(
-            target: "hole_common::port_alloc",
+            target: "util::port_alloc",
             attempt = attempt,
             ip = %ip,
             protocols = %protocols,

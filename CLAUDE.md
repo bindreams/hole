@@ -198,17 +198,17 @@ child. See bindreams/hole#303 for the extraction rationale.
 Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:
 
 1. **`handle-holders` workspace crate** — pure query API: `find_holders(&Path)` returns every process currently holding the file, `log_holders(&Path)` logs them at `tracing::error!`. Windows uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` with a non-blocking `GetFileType == FILE_TYPE_DISK` pre-filter to avoid pipe/device hangs, then `DuplicateHandle` + `GetFileInformationByHandle` for file-id comparison. macOS shells out to `lsof -F pc`. Best-effort — never introduces a new failure mode.
-1. **`hole_common::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
-1. **`hole_common::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
+1. **`util::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
+1. **`util::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
 
 `DistHarness::spawn` composes them: `retry_if(|| cmd.spawn(), is_file_contention, 3, 500ms)`, and on terminal failure calls `handle_holders::log_holders(&hole_exe)` before propagating. See bindreams/hole#208 for the incident that motivated this.
 
 ### Port allocation
 
-Getting a free port for local binding or SIP003 subprocess handoff goes through `hole_common::port_alloc` ([crates/common/src/port_alloc.rs](crates/common/src/port_alloc.rs)):
+Getting a free port for local binding or SIP003 subprocess handoff goes through `util::port_alloc` ([crates/util/src/port_alloc.rs](crates/util/src/port_alloc.rs)) — a small Apache-2.0 utility crate so both Hole's GPL crates and the Apache plugin world can depend on it (#435):
 
 - `Protocols` — bitflag set of `TCP | UDP`. `hole_common::plugin::plugin_alloc_protocols(binary_name)` maps a plugin binary to the transports to verify-free at handoff-port allocation time (galoshes → `TCP | UDP`, ex-ray/unknown → `TCP`). This is the pre-spawn port-sizing concern only; the runtime UDP-drop policy derives capability from the plugin's reported sitrep `transports` (#414).
-- `bind_ephemeral(ip, protocols, op) -> io::Result<(u16, T)>` — **the canonical entry point.** Allocates a port, calls `op(port)`, and retries the whole (allocate, bind) cycle on `is_bind_race` errors. **Unbounded retry**: the only terminations are success or a non-bind-race error. Yields between iterations. No attempts budget — see "no budget" below. Three production sites use it: `LocalDnsServer::bind`, `start_plugin_chain`, and `test_support::ssserver::start_real_ss_server*`.
+- `bind_ephemeral(ip, protocols, op) -> io::Result<(u16, T)>` — **the canonical entry point.** Allocates a port, calls `op(port)`, and retries the whole (allocate, bind) cycle on `is_bind_race` errors. **Unbounded retry**: the only terminations are success or a non-bind-race error. Yields between iterations. No attempts budget — see "no budget" below. Three sites use it: `LocalDnsServer::bind` and `start_plugin_chain` (production), and `plugin_e2e::ssserver::start_real_ss_server*` (the plugin-e2e test fixtures).
 - `free_port(ip, protocols) -> io::Result<u16>` — primitive: returns a port verified free for every transport in `protocols`, divorced from any bound socket. Multi-transport is implemented as "pick via one transport, verify the rest via `ensure_port_free`, retry on mismatch." Unbounded retry on `is_bind_race`; yields between iterations. **Direct callers are rejected by clippy `disallowed_methods`** — use `bind_ephemeral` instead, or suppress with `#[allow]` + comment when the port must be returned to the caller before the bind happens (`test_support::port_alloc::allocate_ephemeral_port` is the sanctioned exception). See bindreams/hole#285 and #300.
 - `ensure_port_free(addr, protocols)` — pure probe without allocation; binds one socket per transport and drops.
 
@@ -434,6 +434,17 @@ crates/ex-ray/            → ex-ray.        Apache-2.0, ex-ray group. NOT a Rus
                             released standalone (6-platform binaries).
 crates/mock-plugin/       → mock-plugin.  Apache-2.0, no group, publish=false.
                             Minimal SIP003u TCP echo plugin for garter integration tests.
+crates/util/              → util.         Apache-2.0, no group, publish=false.
+                            Small cross-platform utilities (port_alloc, retry). Apache so
+                            both Hole's GPL crates AND the Apache plugin world can depend
+                            on it without license friction. See bindreams/hole#435.
+crates/plugin-e2e/        → plugin-e2e.   GPL-3.0, no group, publish=false.
+                            Plugin interop/e2e area: shared ss-server / cert / sentinel /
+                            garter-roundtrip harness (dev-dep'd by hole-bridge) + the
+                            ex-ray↔stock interop suite (6-platform) and galoshes
+                            server↔client roundtrips (Linux-only, #197). GPL via its
+                            `xtask` build-locator dep; the Apache plugins it exercises stay
+                            Apache. See bindreams/hole#435.
 build.yaml                → declarative build-target manifest (the DAG of `hole`,
                             `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, `clippy-*`,
                             `prek`, `frontend-check`, etc.) consumed by

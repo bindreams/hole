@@ -250,7 +250,7 @@ targets:
     # crates only via -p filters. The two clippy- targets together cover the
     # full 6-platform CI matrix without overlap.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
-    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin -p plugin-e2e --all-targets -- -D warnings
+    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin -p plugin-e2e -p util --all-targets -- -D warnings
 
   prek:
     # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in

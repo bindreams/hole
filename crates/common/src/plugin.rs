@@ -90,8 +90,8 @@ pub fn known_plugin_names_joined() -> String {
 /// single source of truth for whether `Proxy`-routed UDP flows are
 /// carried or dropped). This function only decides which transports
 /// to *verify-free* at allocation time.
-pub fn plugin_alloc_protocols(binary_name: &str) -> crate::port_alloc::Protocols {
-    use crate::port_alloc::Protocols;
+pub fn plugin_alloc_protocols(binary_name: &str) -> util::port_alloc::Protocols {
+    use util::port_alloc::Protocols;
     match binary_name {
         "galoshes" => Protocols::TCP | Protocols::UDP,
         _ => Protocols::TCP,

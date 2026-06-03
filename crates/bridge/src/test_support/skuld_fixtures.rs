@@ -46,7 +46,7 @@ pub(crate) const DIST_BIN: skuld::Label;
 /// participate in the mutual exclusion.
 ///
 /// The `ssserver_*` fixtures fold allocate+bind into one
-/// [`hole_common::port_alloc::bind_ephemeral`] retry loop inside fixture
+/// [`util::port_alloc::bind_ephemeral`] retry loop inside fixture
 /// init, but the serial label is kept conservatively so concurrent
 /// label-bearing tests don't pick the same port at the same instant.
 #[skuld::label]

@@ -17,7 +17,7 @@
 //! one transport).
 //!
 //! Ephemeral-port callers of [`LocalDnsServer::bind`] (port 0, used by
-//! tests) delegate to [`hole_common::port_alloc::bind_ephemeral`] to
+//! tests) delegate to [`util::port_alloc::bind_ephemeral`] to
 //! absorb the Windows-specific bind race where the OS's independent
 //! TCP/UDP excluded-port-range tables disagree. Fixed-port callers
 //! ([`LocalDnsServer::bind_ladder`] with port 53) bypass the wrapper:
@@ -37,12 +37,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use hole_common::port_alloc::{self, Protocols};
-use hole_common::retry::is_bind_race;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use util::port_alloc::{self, Protocols};
+use util::retry::is_bind_race;
 
 use crate::dns::forwarder::DnsForwarder;
 
@@ -72,7 +72,7 @@ impl LocalDnsServer {
     /// need UDP and TCP on the same address.
     ///
     /// When `addr.port() == 0` the bind is delegated to
-    /// [`hole_common::port_alloc::bind_ephemeral`], which absorbs the
+    /// [`util::port_alloc::bind_ephemeral`], which absorbs the
     /// Windows `WSAEACCES` race where the OS's independent TCP/UDP
     /// excluded-port-range tables reject a freshly-allocated port on
     /// the paired transport. Fixed-port callers skip the wrapper —

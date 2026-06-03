@@ -3,20 +3,20 @@
 //! Each helper spins up a real `shadowsocks_service::server::Server`
 //! bound to a loopback port the fixture allocates and binds in a single
 //! retry-wrapped operation via
-//! [`hole_common::port_alloc::bind_ephemeral`] (the same allocate-and-bind
+//! [`util::port_alloc::bind_ephemeral`] (the same allocate-and-bind
 //! retry pattern Hole's own loopback binders use). The returned
 //! [`JoinHandle`]s own the server loop and must be kept alive for the
 //! duration of the test that uses them.
 
 use crate::certs::TestCerts;
 use base64::Engine as _;
-use hole_common::port_alloc::{self, Protocols};
 use shadowsocks::config::{Mode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::plugin::PluginConfig;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::task::JoinHandle;
+use util::port_alloc::{self, Protocols};
 
 pub const TEST_METHOD_STR: &str = "aes-256-gcm";
 pub const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;

@@ -14,7 +14,7 @@ harness = false
 
 [dependencies]
 garter = { path = "../garter" }
-hole-common = { path = "../common" }
+util = { path = "../util" }
 xtask = { path = "../../xtask" }
 shadowsocks = "=1.24.0"
 shadowsocks-service = { version = "1", features = ["server", "local", "aead-cipher-2022"] }

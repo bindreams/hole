@@ -16,6 +16,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+util = { path = "../util" }
 handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
 dump = { path = "../dump" }

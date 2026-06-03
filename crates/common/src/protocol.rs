@@ -287,13 +287,6 @@ pub fn default_bridge_socket_path() -> PathBuf {
             .join("hole")
             .join("hole-bridge.sock")
     }
-    // Hole does not ship on Linux; this arm exists only so `hole-common`
-    // compiles on Linux for the `plugin-e2e` test harness (which depends on
-    // `hole_common::port_alloc`). The value is never used at runtime.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        PathBuf::from("/var/run/hole-bridge.sock")
-    }
 }
 
 /// Actionable instructions shown when a client is denied access to the bridge.

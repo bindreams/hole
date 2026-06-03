@@ -30,7 +30,7 @@ reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `Syst
 # See bindreams/hole#285 and #300.
 
 [[disallowed-methods]]
-path = "hole_common::port_alloc::free_port"
+path = "util::port_alloc::free_port"
 reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285 and #300."
 
 # tracing subscriber test invariant ------------------------------------------------------------------------------------

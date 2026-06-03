@@ -22,11 +22,11 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use hole_common::config::ServerEntry;
-use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use util::port_alloc::Protocols;
 
 // Helpers =============================================================================================================
 

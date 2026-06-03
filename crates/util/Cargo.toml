@@ -1,0 +1,28 @@
+[package]
+name = "util"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "Small cross-platform workspace utilities (ephemeral port allocation, retry-with-backoff). Apache-2.0 so both Hole's GPL crates and the Apache plugin world (garter/galoshes/plugin-e2e) can depend on it without license friction."
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+bitflags = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
+# `retry_tests` uses `tokio::time::pause()` to auto-advance the mock clock
+# instead of burning wall-clock seconds on exponential backoff.
+tokio = { version = "1", features = ["test-util"] }
