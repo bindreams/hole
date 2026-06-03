@@ -30,8 +30,7 @@ pub(crate) mod udp_echo;
 
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.
 ///
-/// Lives at the module root because it's useful to every test file, not just
-/// ssserver-related ones.
+/// Lives at the module root because it's useful to every test file.
 pub(crate) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }

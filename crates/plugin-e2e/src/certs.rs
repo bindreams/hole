@@ -18,13 +18,13 @@
 //!    populates the Subject Alternative Name correctly by default.
 //! 2. **`is_ca = Ca(Unconstrained)`** — client mode uses
 //!    `Usage: Certificate_AUTHORITY_VERIFY` on the provided cert
-//!    ([crates/ex-ray/config.go:182](../../../ex-ray/config.go), the
+//!    ([crates/ex-ray/config.go:182](../../ex-ray/config.go), the
 //!    `!*server` branch of `generateConfig`), treating it as a trust anchor.
 //!    For a self-signed leaf to verify against itself as a trust anchor, it
 //!    must be marked as a CA.
 //! 3. **`host=cloudfront.com`** plugin_opt on both client and server. The
 //!    plugin uses this as `tls.Config{ServerName: *host}`
-//!    ([crates/ex-ray/config.go:161](../../../ex-ray/config.go)). Mismatch
+//!    ([crates/ex-ray/config.go:161](../../ex-ray/config.go)). Mismatch
 //!    between client SNI and server cert SAN = handshake failure.
 
 use std::path::PathBuf;
@@ -54,7 +54,7 @@ impl TestCerts {
 /// Render a path for embedding in a SIP003 `plugin_opts` string.
 ///
 /// ex-ray's args parser treats backslashes as escape characters
-/// ([crates/ex-ray/args.go](../../../ex-ray/args.go) `indexUnescaped`: `\X` is
+/// ([crates/ex-ray/args.go](../../ex-ray/args.go) `indexUnescaped`: `\X` is
 /// unescaped to `X`), which mangles Windows paths like
 /// `C:\Users\foo\AppData\...` into `C:UsersfooAppData...`. Workarounds:
 ///

@@ -115,7 +115,7 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
 
 /// Spin up a real shadowsocks server with a QUIC-transport plugin in front.
 /// QUIC auto-enables TLS in `generateConfig`
-/// ([crates/ex-ray/config.go:133](../../../ex-ray/config.go), the `case "quic"`
+/// ([crates/ex-ray/config.go:133](../../ex-ray/config.go), the `case "quic"`
 /// arm sets `*tlsEnabled = true`), so the cert+key pair must still be supplied.
 /// The plugin's public listen port is verified for `Protocols::UDP` because
 /// QUIC runs over UDP.

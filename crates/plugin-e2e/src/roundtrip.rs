@@ -5,9 +5,9 @@
 //! always TCP loopback regardless of the client↔server transport
 //! (WS/WS-TLS/QUIC live between the plugin processes).
 //!
-//! `CancellationToken::new` here is sanctioned: this crate is outside the
-//! bridge's cooperative-cancel chain. See hole's `clippy.toml` rule.
-#![allow(clippy::disallowed_methods)]
+//! This crate sits outside the bridge's cooperative-cancel chain, so the lone
+//! `CancellationToken::new` below carries a sanctioned per-call-site allow
+//! (hole's `clippy.toml` `CancellationToken::new` rule).
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -80,6 +80,9 @@ pub async fn run_roundtrip(
         Err(e) => return Roundtrip::ChainFailed(format!("allocate local port: {e}")),
     };
 
+    // Sanctioned: this crate is outside the bridge cancel chain (clippy.toml
+    // `CancellationToken::new` rule); the chain owns this token's whole life.
+    #[allow(clippy::disallowed_methods)]
     let cancel = CancellationToken::new();
     let (ready_tx, ready_rx) = oneshot::channel();
     let plugin = garter::BinaryPlugin::new(client_plugin_path, client_opts);
