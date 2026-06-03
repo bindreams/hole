@@ -124,7 +124,7 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
 /// or a bare **ex-ray** / stock-v2ray-plugin binary: since bindreams/hole#421,
 /// ex-ray UDP-probes its inbound and reports `transports:["udp"]` for
 /// server+quic rather than rejecting it, so the standalone server path is fed
-/// directly by the QUIC interop tests in `interop_tests.rs`.
+/// directly by the QUIC interop tests in `plugin-e2e/tests/interop.rs`.
 pub async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,

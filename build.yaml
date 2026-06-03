@@ -190,40 +190,27 @@ targets:
           + package(dump) + package(dump-macros)
           + package(handle-holders)'
 
-  interop-test:
-    # Cross-implementation interop tests: ex-ray ↔ stock upstream v2ray-plugin,
-    # both directions, plus the ex-ray↔ex-ray fast inner loop. The tests live
-    # in `hole-bridge` (`interop_tests.rs`) and send real bytes through real
-    # plugin subprocesses over a loopback shadowsocks server — no TUN, no
-    # routing, no elevation.
+  plugin-e2e-tests:
+    # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray↔stock interop
+    # (all 6 platforms; QUIC `not(windows)`) + galoshes server↔client roundtrips
+    # (Linux-only, #197). These spawn plugin BINARIES, so they need on-disk
+    # artifacts: ex-ray + galoshes (via `cargo xtask deps` and the
+    # `depends: galoshes` chain) and the pinned stock v2ray-plugin (provisioned
+    # in `build:` below). Deliberately NOT on the archive lane — that lane ships
+    # no on-disk binaries — so this target gets its own `test-plugin-e2e` CI job.
     #
-    # `build:` provisions BOTH plugin binaries the tests fail-loud on if
-    # missing: `provision-upstream-v2ray` clones+builds the PINNED upstream
-    # commit (cached under `.cache/upstream-v2ray-plugin/<commit>/`, a
-    # near-instant no-network cache hit on re-run), and `ex-ray` builds the
-    # first-party shim. `depends: hole-tests` chains the bridge test-binary
-    # compile (the full DAG: ex-ray → galoshes → wintun → hole → hole-tests).
-    # So `cargo xtask run interop-test` provisions-then-tests in one command
-    # locally.
-    #
-    # In CI the interop tests run as part of the `test-hole` job's non-TUN
-    # pass (they're plain `package(hole-bridge)` tests); that job runs the
-    # SAME `cargo xtask provision-upstream-v2ray` step before nextest, so the
-    # upstream binary is present there too. This target is the local
-    # focused-run convenience — it does not have its own CI job (which would
-    # rebuild the whole hole DAG just to run three tests `test-hole` already
-    # builds the binary for).
-    #
-    # Platforms match `hole-tests` — that's where the hole-bridge test binary
-    # is compiled. The tests themselves are platform-agnostic (verified on
-    # windows/amd64); add linux here only once a CI job builds the hole-bridge
-    # test binary on linux.
-    depends: hole-tests
-    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    # `depends: galoshes` chains ex-ray → galoshes, so both are on disk before
+    # these build steps run; only the stock upstream binary needs a dedicated
+    # provisioning step (a near-instant no-network cache hit on re-run). So
+    # `cargo xtask run plugin-e2e-tests` provisions-then-tests in one command
+    # locally, and CI's `test-plugin-e2e` job calls the same.
+    depends: galoshes
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build:
       - cargo xtask provision-upstream-v2ray
-      - cargo xtask ex-ray
-    run: cargo nextest run --no-default-features -p hole-bridge -E 'test(interop)'
+      - cargo nextest run --no-run -p plugin-e2e
+    run: cargo nextest run -p plugin-e2e
 
   galoshes-tests:
     depends: galoshes
@@ -279,7 +266,7 @@ targets:
     # crates only via -p filters. The two clippy- targets together cover the
     # full 6-platform CI matrix without overlap.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
-    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin --all-targets -- -D warnings
+    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin -p plugin-e2e --all-targets -- -D warnings
 
   prek:
     # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in

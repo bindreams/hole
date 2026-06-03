@@ -236,16 +236,6 @@ jobs:
         shell: bash
         run: cargo xtask build hole-tests
 
-      # The cross-impl interop tests in hole-bridge (`test(interop)`) fail-loud
-      # if the stock upstream v2ray-plugin binary is absent — they spawn it
-      # alongside ex-ray to prove wire-compat both directions. Provision it
-      # (clone + build the pinned upstream commit, cached under `.cache/`)
-      # before the non-TUN pass that runs them. ex-ray itself is already built
-      # by the `build hole-tests` DAG above. See `xtask/src/upstream_v2ray.rs`.
-      - name: Provision upstream v2ray-plugin (cross-impl interop)
-        shell: bash
-        run: cargo xtask provision-upstream-v2ray
-
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set → different fingerprint → fresh build), which expands
@@ -287,6 +277,51 @@ jobs:
           path: ${{ runner.temp }}/**/bridge.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray<->stock interop on
+  # all 6 platforms (QUIC not(windows)) + galoshes server<->client roundtrips
+  # (cfg(linux), #197). A fresh build (NOT the archive lane that test-garter /
+  # test-galoshes use) because these spawn plugin BINARIES and need on-disk
+  # artifacts: ex-ray + galoshes (from setup-build's `cargo xtask deps`) and the
+  # pinned stock v2ray-plugin (provisioned by the `plugin-e2e-tests` build.yaml
+  # target). Shaped like `test-hole`.
+  test-plugin-e2e:
+    name: Test plugin-e2e (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows, arch: amd64, runner: windows-latest }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-build
+
+      - uses: cargo-bins/cargo-binstall@v1.19.1
+
+      - name: Install nextest
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall --no-confirm --locked cargo-nextest
+
+      # `cargo xtask run plugin-e2e-tests` runs the target's build cascade
+      # (provision-upstream-v2ray + the `--no-run` compile; ex-ray + galoshes via
+      # the `depends: galoshes` chain) and then the nextest run. setup-build's
+      # `cargo xtask deps` has already built ex-ray + galoshes. Interop runs on
+      # all 6 platforms (QUIC not(windows)); galoshes roundtrips are cfg(linux).
+      - name: Test plugin-e2e
+        shell: bash
+        run: cargo xtask run plugin-e2e-tests
 
 
   test-installer:
