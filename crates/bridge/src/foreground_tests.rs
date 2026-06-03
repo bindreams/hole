@@ -1,6 +1,43 @@
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use crate::proxy_manager::ProxyManager;
 use bytes::Bytes;
+
+#[skuld::test]
+fn sweep_wiring_reports_and_deletes_bridge_marker() {
+    // HONESTY NOTE (plan §Task 7 Step 2, review S6): this test asserts that
+    // the bridge crate can reach `tombstone::sweep` and that the sweep
+    // CONTRACT (breadcrumb + marker deletion) holds in the bridge's tracing
+    // context. It does NOT assert that foreground.rs / macos.rs / windows.rs
+    // actually CALL sweep at the right point in the startup sequence — that
+    // PLACEMENT is verified by code review, exactly as the sibling
+    // recover_routes / recover_plugins / recover_dns_config call placements
+    // are likewise untested (the entry-point bodies block on server.run()).
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let log_dir = tempfile::tempdir().expect("tempdir");
+    let marker = log_dir.path().join("crash-bridge-123.marker");
+    std::fs::write(
+        &marker,
+        "tombstone-marker v1\nkind=bridge\npid=123\ntid=0\ncode=0xc0000005\nfault_addr=0x0\ntime=1\n",
+    )
+    .unwrap();
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+    let rx = writer.wait_for("native crash detected in previous run");
+
+    // This is the exact call the foreground/service entry points make.
+    tombstone::sweep(log_dir.path());
+
+    rx.recv().expect("breadcrumb emitted");
+    assert!(!marker.exists(), "marker deleted");
+}
 use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;

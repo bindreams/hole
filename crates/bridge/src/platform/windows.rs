@@ -90,6 +90,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::paths::default_state_dir);
+        let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
@@ -126,6 +127,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_for_plugins)).await
         {
             tracing::warn!(error = %e, "recover_plugins task panicked");
+        }
+        // Native-crash observability (bindreams/hole#438): sweep crash
+        // markers left by a previously-crashed service bridge. Markers land
+        // in the service log dir (C:\ProgramData\hole\logs), NOT state_dir.
+        let log_dir_sweep = log_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
+            tracing::warn!(error = %e, "crash sweep task panicked");
         }
 
         // Capture WFP + NDIS state after recovery. See #200 and
