@@ -274,19 +274,25 @@ impl AppConfig {
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let json = serde_json::to_string_pretty(self)?;
 
-        #[cfg(target_os = "macos")]
+        // Hole ships on macOS; the broader `unix` gate (rather than
+        // `target_os = "macos"`) also lets `hole-common` compile on Linux for
+        // the `plugin-e2e` test harness (#435). Hole is not a shipped Linux
+        // product, so on Linux this path is compile-only; the Unix permission
+        // hardening below is correct for any Unix regardless.
+        #[cfg(unix)]
         {
             use std::fs::{DirBuilder, OpenOptions, Permissions};
             use std::io::Write;
             use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-            // Only the leaf directory (e.g. `hole/`) is created by us — ancestor directories
-            // like `~/Library/Application Support/` are system-managed and already exist.
+            // Only the leaf directory (e.g. `hole/`) is created by us — ancestor
+            // directories (e.g. `~/Library/Application Support/` on macOS) are
+            // system-managed and already exist.
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
                 std::fs::set_permissions(parent, Permissions::from_mode(0o700))?;
             }
-            // Restrict config file permissions on macOS — the config contains plaintext
+            // Restrict config file permissions — the config contains plaintext
             // passwords and must not be world-readable (default umask 0022 yields 0644).
             let mut file = OpenOptions::new()
                 .write(true)
@@ -298,18 +304,12 @@ impl AppConfig {
             file.write_all(json.as_bytes())?;
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(windows)]
         {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, json)?;
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = json;
-            compile_error!("save() is not implemented for this platform");
         }
 
         Ok(())
