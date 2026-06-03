@@ -150,8 +150,58 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
 /// the marker (leaving any sibling `.dmp`). Best-effort; tolerant of
 /// malformed/partial markers.
 pub fn sweep(log_dir: &Path) {
-    let _ = log_dir;
-    // Implemented in the sweep task.
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        // Missing/unreadable dir — nothing to report. Best-effort.
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_marker = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("crash-") && n.ends_with(".marker"))
+            .unwrap_or(false);
+        if !is_marker {
+            continue;
+        }
+        report_one(&path);
+        // Delete on report (dedup): a marker is reported exactly once by
+        // whichever process sweeps first. Leave any sibling .dmp.
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn report_one(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        tracing::error!(
+            target: "crash",
+            marker = %path.display(),
+            "native crash detected in previous run (marker unreadable)"
+        );
+        return;
+    };
+    let Some(rec) = parse_marker(&text) else {
+        tracing::error!(
+            target: "crash",
+            marker = %path.display(),
+            "native crash detected in previous run (marker malformed)"
+        );
+        return;
+    };
+    // A sibling .dmp (dev builds only) sits next to the marker.
+    let dmp = path.with_extension("dmp");
+    let dmp_path = dmp.exists().then(|| dmp.display().to_string());
+    tracing::error!(
+        target: "crash",
+        kind = rec.kind,
+        pid = rec.pid,
+        tid = rec.tid,
+        code = format_args!("0x{:x}", rec.code),
+        fault_addr = format_args!("0x{:x}", rec.fault_addr),
+        time = rec.time,
+        dump = dmp_path.as_deref(),
+        "native crash detected in previous run"
+    );
 }
 
 #[cfg(test)]

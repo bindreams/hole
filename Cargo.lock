@@ -7557,6 +7557,7 @@ name = "tombstone"
 version = "0.1.0"
 dependencies = [
  "crash-handler",
+ "garter",
  "hole-test-observability",
  "minidump-writer",
  "sadness-generator",
