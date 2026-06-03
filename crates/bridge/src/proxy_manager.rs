@@ -878,33 +878,23 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E test skip policy in CI:
+// E2E test platform policy (#435):
 //
-// - **macOS**: the entire module is skipped. The galoshes test set
-//   reliably hits #197 (internal port race in shadowsocks-service's
-//   `PluginConfig`). The non-galoshes tests work but the coverage
-//   uplift from running them in isolation on macOS wasn't judged worth
-//   the module-level complexity — re-enable the module when #197 has
-//   a custom server-side launcher.
-//
-// - **Windows**: the module runs, but the *galoshes* tests inside are
-//   individually `#[cfg(not(target_os = "windows"))]`-gated because the
-//   same #197 race fires here too. Everything else (the `ssserver_none`
-//   + cipher roundtrips that were the #200 canonical repro) runs and
-//   stays green. The `#[cfg]` gating lives in
-//   `proxy_manager_e2e_tests.rs` next to each affected test so the
-//   skip reason is co-located with the test.
-//
-// - **Linux**: the module runs fully. Linux CI is the only platform
-//   where the full galoshes matrix is exercised.
-//
-// See #200 (H7 TCPIP investigation, now dormant with `diagnostics::etw`
-// permanently on) and #197 (galoshes bind race, still open).
-#[cfg(all(test, not(target_os = "macos")))]
+// - **Non-galoshes** DistHarness e2e (`e2e_none`, lifecycle, cipher, and the
+//   listener-selection tests) run on every Hole platform (Win+mac). The
+//   modules are no longer macOS-gated.
+// - **galoshes-fronted** tests need a galoshes *server*, which hits the #197
+//   `PluginConfig` port race on Win+mac, so each is individually
+//   `#[cfg(not(any(target_os = "windows", target_os = "macos")))]`-gated
+//   (Linux-only) with the skip reason co-located. There is no Linux hole-bridge
+//   CI job, so the bridge→galoshes e2e tests are orphaned until #197 lands a
+//   custom server-side launcher; the galoshes server↔client transport coverage
+//   proper now lives in the `plugin-e2e` crate's Linux CI lane (#435).
+#[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]
 mod proxy_manager_listener_e2e_tests;
 

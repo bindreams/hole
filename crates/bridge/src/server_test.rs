@@ -319,9 +319,13 @@ async fn try_sentinel(
     }
 }
 
-// Tests skipped in CI: macOS PluginConfig port race (#197),
-// Windows WSAETIMEDOUT (#200).
-#[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
+// `server_test_tests` test Hole's own `run_server_test` connectivity tester.
+// They run on every Hole platform (Win+mac): the non-plugin cases are
+// platform-agnostic, and the one plugin case uses BARE ex-ray server mode (no
+// yamux, so no #197 — proven by the interop suite passing on Win+mac). #200
+// (Windows DistHarness flakiness) is closed and does not apply to these
+// in-process tests. Previously Linux-only-gated, so they ran on no CI job. See #435.
+#[cfg(test)]
 #[path = "server_test_tests.rs"]
 mod server_test_tests;
 

@@ -139,10 +139,10 @@ fn e2e_none_socks_only_roundtrip(
 
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
-/// Skipped on Windows (and macOS via the module gate) because the
-/// `PluginConfig` port TOCTOU in `shadowsocks-service` — tracked in
-/// #197 — causes yamux-server inside galoshes to lose the bind race.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: the galoshes *server* hits the #197 `PluginConfig` port race on
+/// Win+mac (yamux-server loses the bind). The galoshes WS transport proper is
+/// covered on Linux by `plugin-e2e`'s `galoshes_ws_roundtrip` (#435).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -154,8 +154,9 @@ fn e2e_ws_socks_only_roundtrip(
 
 /// Test 3: SocksOnly mode with galoshes (websocket + TLS).
 ///
-/// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race as
+/// `e2e_ws_socks_only_roundtrip` (Win+mac). See #435.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -167,12 +168,13 @@ fn e2e_ws_tls_socks_only_roundtrip(
 
 /// Test 4: SocksOnly mode with galoshes (QUIC).
 ///
-/// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
-///
-/// galoshes embeds `ex-ray` (#414); ex-ray now UDP-probes its inbound and
-/// reports `transports:["udp"]` for server+quic instead of rejecting it, so
-/// galoshes-as-server-with-QUIC starts again (bindreams/hole#421).
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race as
+/// `e2e_ws_socks_only_roundtrip` (Win+mac). galoshes embeds `ex-ray` (#414),
+/// which UDP-probes its inbound and reports `transports:["udp"]` for
+/// server+quic, so galoshes-as-server-with-QUIC starts again (#421); the QUIC
+/// transport proper is covered on Linux by `plugin-e2e`'s
+/// `galoshes_quic_roundtrip` (#435).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -536,8 +538,8 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// Windows-skipped: same #197 galoshes bind race.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race (Win+mac). See #435.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
