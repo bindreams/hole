@@ -122,3 +122,28 @@ crash_class_test!(crash_marker_heap_corruption, "heap_corruption", windows);
 
 // Unix-only fault class.
 crash_class_test!(crash_marker_bus, "bus", unix);
+
+// Gated on BOTH features (crash-dumps = the .dmp branch under test;
+// crash-child = it spawns the crash_child bin via run_crash_child) AND on
+// Win/mac — Linux intentionally writes NO in-process .dmp (the carve-out),
+// so this assertion is meaningful only on the platforms with a dump branch.
+#[cfg(all(feature = "crash-dumps", feature = "crash-child", any(windows, target_os = "macos")))]
+#[skuld::test]
+fn crash_writes_minidump_segfault() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _ = run_crash_child("segfault", dir.path());
+    // The .dmp sits next to the marker: crash-test-<pid>.dmp.
+    let dmp = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("crash-test-") && n.ends_with(".dmp"))
+                .unwrap_or(false)
+        });
+    let dmp = dmp.expect("minidump written under crash-dumps feature");
+    let len = std::fs::metadata(&dmp).expect("dmp metadata").len();
+    assert!(len > 0, "minidump is non-empty");
+}
