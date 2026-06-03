@@ -390,6 +390,107 @@ in-bridge recovery fails or the process can't restart,
 equivalent cleanup from outside (plugin reaping by name as a last
 resort; ETW sessions are best-effort via `logman stop` from the shell).
 
+### Native-crash observability (`tombstone`)
+
+Native faults — access violation / SIGSEGV, stack overflow, SIGABRT (incl.
+`abort()`), SIGILL, SIGFPE, SIGBUS, heap corruption, plus Windows
+invalid-parameter / pure-virtual-call — bypass Rust's *unwinding* panic hook
+(`install_panic_hook` only sees panics). The first-party Apache-2.0
+[`tombstone`](crates/tombstone/) crate closes that gap with `crash-handler`.
+
+`tombstone::attach(kind, log_dir)` is called at the single logging chokepoint
+([`init_multi`](crates/common/src/logging.rs), immediately after
+`install_panic_hook()`), so GUI / CLI / bridge-foreground / bridge-service
+are all covered; galoshes attaches directly in its own `main`. The handler is
+held in a `static OnceLock<CrashHandler>` for the process lifetime (it
+detaches on Drop); a second `attach` is a no-op.
+
+On a fault, `on_crash` runs in a **compromised context** (heap + locks
+unsafe). It does the minimum signal-safe work: write a fixed-format
+`crash-<kind>-<pid>.marker` (magic line + kind/pid/tid/code/fault_addr/time)
+from a stack buffer via a raw `CreateFileW`/`WriteFile` (Windows) or
+`open`/`write` (every Unix — macOS + Linux share the syscall path) — no heap,
+no `format!`, no locks, no tracing; the marker path is pre-encoded at `attach`
+time. The per-OS field extraction differs (Windows: `ExceptionRecord`; macOS:
+`CrashContext.exception: Option<ExceptionInfo>`; Linux:
+`CrashContext.siginfo.ssi_signo`/`ssi_addr` + `.pid`/`.tid` — `code` carries
+the signal number on Linux). It then returns `Handled(false)` on all three
+platforms so the OS default path still runs (WER LocalDumps on Windows; the
+previous Mach exception port → `.ips` on macOS; default signal disposition →
+core dump on Linux). All I/O errors are swallowed — a double-fault would
+destroy the original crash.
+
+Mirroring Hole's "a dead process leaves a file; the next process reports it"
+idiom (`bridge-routes.json`, ETW sweep), `tombstone::sweep(log_dir)` runs at
+the next start of the same kind — in the bridge startup-recovery sequence
+(foreground + both services, via `spawn_blocking` beside the `recover_*`
+calls) and inline in GUI `launch_gui`. It parses each marker, emits
+`tracing::error!(target: "crash", …)` (heap intact now), and deletes the
+marker (leaving any `.dmp`). Markers land in `log_dir` (next to `bridge.log`
+/ `gui.log`), NOT `state_dir`, so the elevated bridge's marker is readable by
+the unprivileged GUI/dev user. The foreground bridge + GUI share
+`…/hole/logs`; the **installed service** bridge writes to
+`C:\ProgramData\hole\logs` (Windows) / `/var/log/hole` (macOS), so a
+service-mode crash is swept by the next service start, not by the GUI.
+galoshes markers land in galoshes' own runtime dir
+([`embedded::runtime_dir`](crates/galoshes/src/embedded.rs)) and are swept on
+the next galoshes start.
+
+**Platform coverage.** The marker write + sweep breadcrumb path works on
+**Windows, macOS, AND Linux** (`crash-handler` is first-tier on all three;
+the marker writer is `cfg(unix)`-shared between macOS and Linux). This matters
+because `galoshes` depends on `tombstone` and ships a Linux release, so
+`tombstone` MUST compile and function on Linux.
+
+**Linux test-coverage boundary (honest gap).** The cross-platform +
+unix-class crash tests (`crash_marker_segfault`, `_stack_overflow`, `_abort`,
+`_illegal_instruction`, `_floating_point`, `_trap`, `_bus`) run at RUNTIME
+only on Windows + macOS (the `hole-tests` target is a Win/mac CI lane).
+Tombstone's **Linux behavior is compile-verified** by the galoshes Linux
+release build (galoshes depends on `tombstone`, so a Linux compile failure of
+the `cfg(target_os = "linux")` `extract_fault_fields` arm or the `cfg(unix)`
+marker writer would fail that build). Runtime-exercising the Linux fault arm
+is a known follow-up — ideally by running tombstone's `crash-child`-gated
+crash tests on the existing 6-platform plugin-e2e lane (bindreams/hole#435's
+test-separation work). Until then, Linux runtime crash capture is verified by
+the same `crash-handler`/`sadness-generator` upstream test matrix, not by a
+Hole-side runtime assertion.
+
+**Dev-only minidumps — Win/mac only.** Under the non-default `crash-dumps`
+cargo feature (`tombstone/crash-dumps`, passthrough from `hole-common` /
+`hole` / `galoshes`), `on_crash` additionally best-effort writes a
+memory-bearing `crash-<kind>-<pid>.dmp` via `minidump-writer` (Windows
+`MinidumpWriter::dump_crash_context`; macOS
+`MinidumpWriter::with_crash_context(...).dump(...)`). The dump call site is
+gated `#[cfg(all(feature = "crash-dumps", any(windows, target_os = "macos")))]`
+— there is **intentionally no in-process minidump on Linux** (in-process
+self-dumping there is unreliable; deferred to a future out-of-process
+monitor). On Linux, even with `crash-dumps` enabled, only the marker is
+written. `minidump-writer` stays a plain (non-target-gated) optional dep so
+the `dep:`-feature resolver works on a Linux `cargo build`; it simply links
+unused there. `build.yaml`'s `hole` and `hole-tests` targets pass
+`--features tombstone/crash-dumps`; `scripts/dev.py` sets `HOLE_CRASH_DUMPS=1`
+so the `cargo xtask galoshes` build enables `galoshes/crash-dumps`.
+`hole-msi` / `hole-dmg` and release/standalone galoshes builds do **not**, so
+`minidump-writer` never links into a shipped binary — important because
+process memory holds keys + user traffic, and because `minidump-writer` has no
+Windows-aarch64 support (the galoshes windows-arm64 matrix would otherwise
+fail to build; the marker/breadcrumb path still works there).
+
+**Plugin coverage.** ex-ray (Go) is spawned with `GOTRACEBACK=crash`
+(injected in [`garter::BinaryPlugin::run`](crates/garter/src/binary.rs),
+covering both the bridge→ex-ray and galoshes→ex-ray spawn paths) so a Go
+fault dumps full goroutine state to the relayed stderr. A mid-run plugin
+process death is logged loudly with structured `exit_code` / `killed` fields
+by [`record_exit`](crates/garter/src/chain.rs).
+
+**Known gap (accepted, NOT tested).** Windows `__fastfail` / `int 29h` —
+including `/GS` stack-cookie failures and an explicit `std::process::abort()`
+on Windows — is uncatchable by the handler by design. There is no negative
+test asserting its absence: a future `crash-handler`/OS change that *does*
+capture it would be a welcome improvement, not a regression. On macOS,
+`abort()` → SIGABRT → is caught.
+
 ## Workspace layout
 
 Each publishable workspace member declares a release group in
