@@ -187,11 +187,9 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             None,
         );
         if let Ok(handle) = h {
-            if !handle.is_invalid() {
-                let mut written = 0u32;
-                let _ = WriteFile(handle, Some(&buf[..n]), Some(&mut written), None);
-                let _ = CloseHandle(handle);
-            }
+            let mut written = 0u32;
+            let _ = WriteFile(handle, Some(&buf[..n]), Some(&mut written), None);
+            let _ = CloseHandle(handle);
         }
     }
 }
@@ -451,21 +449,30 @@ pub fn attach(kind: &'static str, log_dir: &Path) {
         marker_path_c.push(0);
         HandlerState { kind, marker_path_c }
     };
-    // If HANDLER_STATE is already set (shouldn't happen given the CRASH_HANDLER
-    // guard above, but be defensive), bail without attaching.
-    if HANDLER_STATE.set(state).is_err() {
-        return;
-    }
-    let state_ref: &'static HandlerState = HANDLER_STATE.get().expect("just set");
+    // Reuse an existing state if attach was previously called (e.g. a prior
+    // attach whose CrashHandler::attach failed) so a retry can still install
+    // the handler. OnceLock pins the first kind/log_dir, which is correct:
+    // attach is always called with the same process's kind + log_dir.
+    let state_ref: &'static HandlerState = match HANDLER_STATE.get() {
+        Some(existing) => existing,
+        None => {
+            let _ = HANDLER_STATE.set(state);
+            // Another thread could have won the race; either way get() is now Some.
+            match HANDLER_STATE.get() {
+                Some(s) => s,
+                None => return, // unreachable in practice; bail rather than unwrap
+            }
+        }
+    };
 
     let event = Box::new(MarkerCrashEvent { state: state_ref });
     // SAFETY: crash-handler requires the closure/handler to be valid; our
     // MarkerCrashEvent borrows only 'static state and does signal-safe work.
     match crash_handler::CrashHandler::attach(event) {
         Ok(handler) => {
-            // Store to keep it alive (Drop = detach). Ignore the Err arm:
-            // if another thread won the race the handler we just attached
-            // would detach on drop, which is acceptable (idempotent intent).
+            // Store to keep the handler alive (Drop = detach). A concurrent winner is
+            // already prevented by the CRASH_HANDLER fast-path + HANDLER_STATE init
+            // above; the discard just ignores the benign already-set case.
             let _ = CRASH_HANDLER.set(handler);
         }
         Err(e) => {
@@ -480,7 +487,9 @@ struct MarkerCrashEvent {
 
 // SAFETY: on_crash runs in a COMPROMISED context (heap + locks unsafe). For
 // the always-on marker it does ONLY signal-safe work: a raw file open/write
-// from a stack buffer + the pre-encoded marker path, with no heap allocation,
+// from a stack buffer + the pre-encoded marker path, with no heap allocation
+// on the success path (the windows-crate wrappers allocate only on their
+// discarded failure paths, where the marker is lost anyway — best-effort),
 // no `format!`, no locks, and no tracing — this path is total across
 // Windows / macOS / Linux. The minidump branch is DEV-ONLY (never linked in
 // release/shipped binaries), Win/mac ONLY (no in-process minidump on Linux —
