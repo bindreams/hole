@@ -170,3 +170,48 @@ async fn sweep_tolerates_missing_dir() {
     let missing = dir.path().join("does-not-exist");
     crate::sweep(&missing); // no panic, no-op
 }
+
+#[skuld::test]
+async fn sweep_reports_malformed_marker() {
+    // A marker whose first line is NOT the magic still emits a breadcrumb
+    // (the "malformed" wording) AND is deleted. Exercises report_one's
+    // parse_marker == None branch.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("crash-bridge-77.marker");
+    std::fs::write(&marker, "garbage first line\nkind=bridge\n").expect("write");
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let rx = writer.wait_for("marker malformed");
+    crate::sweep(dir.path());
+    rx.recv().expect("malformed breadcrumb emitted");
+
+    let snap = writer.snapshot();
+    assert!(snap.contains("crash"), "target=crash expected: {snap}");
+    assert!(!marker.exists(), "malformed marker deleted after report");
+}
+
+#[skuld::test]
+async fn sweep_reports_unreadable_marker() {
+    // A "marker" that is actually a directory makes read_to_string fail with
+    // an I/O error, exercising report_one's read-error branch (the
+    // "unreadable" wording). Must not panic; the breadcrumb is emitted.
+    // (A directory-as-marker is the cleanly-reachable read-error case on
+    // Windows, where chmod-style unreadability is awkward.)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("crash-bridge-88.marker");
+    std::fs::create_dir(&marker).expect("create dir-marker");
+
+    let (subscriber, writer) = make_subscriber();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let rx = writer.wait_for("marker unreadable");
+    crate::sweep(dir.path());
+    rx.recv().expect("unreadable breadcrumb emitted");
+
+    let snap = writer.snapshot();
+    assert!(snap.contains("crash"), "target=crash expected: {snap}");
+    // sweep's remove_file can't delete a directory; best-effort means no
+    // panic, which the test reaching this line proves.
+}

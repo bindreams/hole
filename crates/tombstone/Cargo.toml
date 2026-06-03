@@ -37,6 +37,29 @@ minidump-writer = { workspace = true, optional = true }
 sadness-generator = { workspace = true, optional = true }
 tracing = "0.1"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# crash-context is needed on BOTH macOS and Linux:
+#  - macOS: the by-value MinidumpWriter::with_crash_context path rebuilds a
+#    CrashContext field-by-field and needs crash_context::ExceptionInfo in
+#    scope (crash-handler re-exports CrashContext but NOT ExceptionInfo, and
+#    CrashContext is not Clone).
+#  - Linux: extract_fault_fields reads crash_context::CrashContext's
+#    `siginfo: libc::signalfd_siginfo`, `pid`, `tid` fields directly.
+# See review S1 + the Linux verification (bindreams/hole#438).
+crash-context = { workspace = true }
+# Shared marker writer (open/write/close) + clock_gettime + the Linux
+# signalfd_siginfo field access. macOS + Linux.
+libc = "0.2"
+
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
@@ -56,3 +79,11 @@ garter = { path = "../garter", features = ["test-utils"] }
 name = "crash_child"
 path = "src/bin/crash_child.rs"
 required-features = ["crash-child"]
+
+# Out-of-process per-fault-class crash tests. Integration target (not a
+# unit-test module) because CARGO_BIN_EXE_crash_child is only set for
+# tests/*.rs. harness = false because skuld provides its own run_all main.
+[[test]]
+name = "crash_child"
+path = "tests/crash_child.rs"
+harness = false

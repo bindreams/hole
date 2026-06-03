@@ -7556,15 +7556,18 @@ dependencies = [
 name = "tombstone"
 version = "0.1.0"
 dependencies = [
+ "crash-context",
  "crash-handler",
  "garter",
  "hole-test-observability",
+ "libc",
  "minidump-writer",
  "sadness-generator",
  "skuld",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows 0.62.2",
 ]
 
 [[package]]
