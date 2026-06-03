@@ -1,6 +1,17 @@
 use crate::proxy::{Proxy, ProxyError, RunningProxy};
 use crate::proxy_manager::ProxyManager;
 use bytes::Bytes;
+use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
+use tokio::task::JoinHandle;
+use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::Routing;
+use tun_engine::RoutingError;
 
 #[skuld::test]
 fn sweep_wiring_reports_and_deletes_bridge_marker() {
@@ -38,17 +49,6 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     rx.recv().expect("breadcrumb emitted");
     assert!(!marker.exists(), "marker deleted");
 }
-use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
-use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
-use tokio::task::JoinHandle;
-use tun_engine::gateway::GatewayInfo;
-use tun_engine::routing::Routing;
-use tun_engine::RoutingError;
 
 // Minimal stub types used only for the foreground-run IPC smoke test.
 // None of their methods are exercised by this test — we only construct
