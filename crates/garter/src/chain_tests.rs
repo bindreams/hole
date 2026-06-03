@@ -854,6 +854,51 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     }
 }
 
+// record_exit structured-field tests ==================================================================================
+
+/// `record_exit` must emit structured `exit_code` and `killed` fields on a
+/// plugin-exit error so the mid-run death is machine-parseable in bridge.log
+/// (bindreams/hole#438 — the "third silent gap": ex-ray vanished with no
+/// exit line).
+///
+/// The test asserts that the rendered tracing output contains the FIELD NAME
+/// `exit_code` (not just the rendered error string which happens to include
+/// the code). The field name `exit_code` was absent from the pre-task log
+/// line (`error!(plugin = %name, error = %e, "exited with error")`), so this
+/// is a genuine fail-before/pass-after gate.
+#[skuld::test]
+async fn record_exit_logs_structured_exit_code() {
+    use crate::test_utils::WaitableWriter;
+    use crate::tracing_test::set_default_in_current_thread;
+    use tokio_util::sync::CancellationToken;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+    let rx = writer.wait_for("exited with error");
+
+    let mut first_error = None;
+    let shutdown = CancellationToken::new();
+    let result = Ok((
+        "ex-ray".to_string(),
+        Err(crate::Error::PluginExit {
+            name: "ex-ray".to_string(),
+            code: 139,
+        }),
+    ));
+    crate::chain::record_exit(result, &mut first_error, &shutdown);
+
+    rx.recv().expect("breadcrumb emitted");
+    let snap = writer.snapshot();
+    assert!(snap.contains("exit_code"), "structured exit_code field: {snap}");
+    assert!(snap.contains("139"), "exit code value surfaced: {snap}");
+    assert!(snap.contains("ex-ray"), "plugin name: {snap}");
+}
+
 /// A plugin panic surfaces through `record_exit`'s `JoinError` arm as a
 /// `Chain` error whose message identifies the panic.
 #[skuld::test]

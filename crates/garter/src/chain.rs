@@ -414,7 +414,7 @@ async fn run_readiness_aggregator(
 /// `first_error` on a first-write-wins basis and fires `shutdown` so the
 /// rest of the chain stops. Called from both Phase 1 and Phase 2 of
 /// `ChainRunner::run`.
-fn record_exit(
+pub(crate) fn record_exit(
     result: Result<(String, crate::Result<()>), tokio::task::JoinError>,
     first_error: &mut Option<crate::Error>,
     shutdown: &CancellationToken,
@@ -425,7 +425,22 @@ fn record_exit(
             shutdown.cancel();
         }
         Ok((name, Err(e))) => {
-            tracing::error!(plugin = %name, error = %e, "exited with error");
+            // Surface the process exit code / signal as structured fields so
+            // a mid-run plugin death is loud + machine-parseable in bridge.log
+            // (bindreams/hole#438 — the "third silent gap": ex-ray vanished
+            // with no exit line).
+            let exit_code = match &e {
+                crate::Error::PluginExit { code, .. } => Some(*code),
+                _ => None,
+            };
+            let killed = matches!(e, crate::Error::PluginKilled { .. });
+            tracing::error!(
+                plugin = %name,
+                exit_code,
+                killed,
+                error = %e,
+                "exited with error"
+            );
             if first_error.is_none() {
                 *first_error = Some(e);
             }
