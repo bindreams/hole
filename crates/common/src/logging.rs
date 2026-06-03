@@ -502,8 +502,8 @@ const MAX_ROTATED_LOGS: usize = 1;
 /// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
 /// guard that must be held for the process lifetime to ensure logs are
 /// flushed and the relay reader threads stay alive.
-pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogGuard {
-    init_multi(log_dir, log_filename, [default_directive])
+pub fn init(log_dir: &Path, kind: &'static str, log_filename: &str, default_directive: &str) -> LogGuard {
+    init_multi(log_dir, kind, log_filename, [default_directive])
 }
 
 /// Initialize logging with one or more caller-supplied filter directives.
@@ -522,7 +522,7 @@ pub fn init(log_dir: &Path, log_filename: &str, default_directive: &str) -> LogG
 /// `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
 /// `init` accepts only one directive and silently dropping the rest is the
 /// kind of thing that hides production diagnostics (#248).
-pub fn init_multi<I>(log_dir: &Path, log_filename: &str, directives: I) -> LogGuard
+pub fn init_multi<I>(log_dir: &Path, kind: &'static str, log_filename: &str, directives: I) -> LogGuard
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -634,6 +634,13 @@ where
     }
 
     install_panic_hook();
+
+    // Native-crash observability (bindreams/hole#438). Installed AFTER the
+    // panic hook (disjoint paths: panics unwind into the hook with the heap
+    // intact; native faults are caught here). Idempotent + best-effort;
+    // never panics. `kind` labels the marker; `log_dir` is user-readable
+    // even for the elevated bridge.
+    tombstone::attach(kind, log_dir);
 
     LogGuard {
         _file: file_guard,

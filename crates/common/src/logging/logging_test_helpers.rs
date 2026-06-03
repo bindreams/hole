@@ -207,7 +207,7 @@ fn scenario_log_bridge_to_file() {
     // need its diagnostics if the child fails. Disabled the same way the
     // pre-#301 in-process test did.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let guard = super::init(log_dir, "test.log", "info");
+    let guard = super::init(log_dir, "test", "test.log", "info");
     log::info!("from-log-crate-bridge-test");
     // Drop the guard explicitly so the `tracing_appender::NonBlocking`
     // worker thread flushes its in-flight events to disk before the

@@ -27,9 +27,9 @@ pub fn init(log_dir: &Path) -> LogGuard {
     // passing zero directives to `init_multi` (which would let the global
     // INFO default win without any bridge-specific override).
     if directives.is_empty() {
-        hole_common::logging::init_multi(log_dir, "bridge.log", ["hole_bridge=info"])
+        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", ["hole_bridge=info"])
     } else {
-        hole_common::logging::init_multi(log_dir, "bridge.log", directives)
+        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", directives)
     }
 }
 

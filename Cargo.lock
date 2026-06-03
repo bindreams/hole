@@ -3038,6 +3038,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tombstone",
  "tracing",
  "tracing-appender",
  "tracing-log",
