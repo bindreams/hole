@@ -1,0 +1,46 @@
+[package]
+name = "plugin-e2e"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+description = "Plugin interop/e2e test area: shared shadowsocks+plugin harness and the ex-ray/galoshes system-test suites."
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+garter = { path = "../garter" }
+hole-common = { path = "../common" }
+xtask = { path = "../../xtask" }
+shadowsocks = "=1.24.0"
+shadowsocks-service = { version = "1", features = ["server", "local", "aead-cipher-2022"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+rcgen = "0.14"
+tempfile = "3"
+rand = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
+
+# Each integration-test binary uses skuld's custom harness (not libtest), so
+# it must declare `harness = false` AND provide its own `fn main()` that calls
+# `skuld::run_all()` — same pattern as garter's `[[test]]` blocks. Without
+# these, libtest is used and `#[skuld::test]`s are never discovered.
+[[test]]
+name = "interop"
+path = "tests/interop.rs"
+harness = false
+
+[[test]]
+name = "roundtrip"
+path = "tests/roundtrip.rs"
+harness = false

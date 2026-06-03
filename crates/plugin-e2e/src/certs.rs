@@ -33,7 +33,7 @@ use std::path::PathBuf;
 ///
 /// The tempdir lives for as long as the struct does. Dropping it removes
 /// both files.
-pub(crate) struct TestCerts {
+pub struct TestCerts {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     _tempdir: tempfile::TempDir,
@@ -64,14 +64,14 @@ impl TestCerts {
 /// 2. Or double the backslashes (`\\`) in the plugin_opts string.
 ///
 /// Option 1 is simpler and is what we use here.
-pub(crate) fn path_for_plugin_opts(path: &std::path::Path) -> String {
+pub fn path_for_plugin_opts(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
 /// Generate a self-signed CA cert with SAN `DNS:cloudfront.com` and write it
 /// to a fresh tempdir. Panics if rcgen or std::fs fails — tests want loud
 /// errors here.
-pub(crate) fn generate_test_certs() -> TestCerts {
+pub fn generate_test_certs() -> TestCerts {
     use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
     let mut params = CertificateParams::new(vec!["cloudfront.com".to_string()])

@@ -65,12 +65,12 @@ pub(crate) const IPV6: skuld::Label;
 
 // Fixtures ============================================================================================================
 
-use crate::test_support::certs::{path_for_plugin_opts, TestCerts};
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};
-use crate::test_support::ssserver::{
-    locate_built_galoshes, start_real_ss_server, start_real_ss_server_with_plugin_quic,
-    start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR,
-    TEST_PASSWORD,
+use plugin_e2e::certs::{path_for_plugin_opts, TestCerts};
+use plugin_e2e::locators::locate_built_galoshes;
+use plugin_e2e::ssserver::{
+    start_real_ss_server, start_real_ss_server_with_plugin_quic, start_real_ss_server_with_plugin_ws,
+    start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
 };
 use std::net::SocketAddr;
 
@@ -103,7 +103,7 @@ fn require_galoshes() -> String {
 
 #[skuld::fixture(scope = process)]
 pub(crate) fn test_certs() -> Result<TestCerts, String> {
-    Ok(crate::test_support::certs::generate_test_certs())
+    Ok(plugin_e2e::certs::generate_test_certs())
 }
 
 /// Plain shadowsocks server, no plugin. `serial = PORT_ALLOC` per the

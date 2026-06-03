@@ -2905,7 +2905,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "base64 0.22.1",
  "bytes",
  "default-net",
  "drop_bomb",
@@ -2927,8 +2926,8 @@ dependencies = [
  "ipnet",
  "libc",
  "lru",
+ "plugin-e2e",
  "rand 0.10.1",
- "rcgen",
  "regex",
  "rustls",
  "rustls-pki-types",
@@ -4934,6 +4933,27 @@ dependencies = [
  "quick-xml",
  "serde",
  "time",
+]
+
+[[package]]
+name = "plugin-e2e"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "garter",
+ "hex",
+ "hole-common",
+ "hole-test-observability",
+ "rand 0.10.1",
+ "rcgen",
+ "shadowsocks",
+ "shadowsocks-service",
+ "skuld",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "xtask",
 ]
 
 [[package]]
