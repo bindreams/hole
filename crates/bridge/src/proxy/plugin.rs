@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hole_common::port_alloc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use util::port_alloc;
 
 use super::ProxyError;
 
@@ -372,7 +372,7 @@ async fn spawn_plugin_runner_at(
 ///
 /// - [`ProxyError::BindRace`] (a plugin's `StartError::BindConflict`)
 ///   — synthesized into an `AddrInUse`-kind `io::Error` so
-///   [`hole_common::retry::is_bind_race`] classifies it as retryable and
+///   [`util::retry::is_bind_race`] classifies it as retryable and
 ///   `bind_ephemeral` allocates a fresh port. This is the load-bearing
 ///   case: a plugin that loses its local-port bind race gets retried
 ///   in-band like the in-process binders, instead of failing the start.

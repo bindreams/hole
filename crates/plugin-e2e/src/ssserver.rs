@@ -3,25 +3,24 @@
 //! Each helper spins up a real `shadowsocks_service::server::Server`
 //! bound to a loopback port the fixture allocates and binds in a single
 //! retry-wrapped operation via
-//! [`hole_common::port_alloc::bind_ephemeral`], mirroring the
-//! [`crate::dns::server::LocalDnsServer::bind`] pattern. The returned
+//! [`util::port_alloc::bind_ephemeral`] (the same allocate-and-bind
+//! retry pattern Hole's own loopback binders use). The returned
 //! [`JoinHandle`]s own the server loop and must be kept alive for the
 //! duration of the test that uses them.
 
-use crate::test_support::certs::TestCerts;
+use crate::certs::TestCerts;
 use base64::Engine as _;
-use hole_common::port_alloc::{self, Protocols};
 use shadowsocks::config::{Mode, ServerConfig};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::plugin::PluginConfig;
 use shadowsocks_service::server::ServerBuilder as SsServerBuilder;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use tokio::task::JoinHandle;
+use util::port_alloc::{self, Protocols};
 
-pub(crate) const TEST_METHOD_STR: &str = "aes-256-gcm";
-pub(crate) const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;
-pub(crate) const TEST_PASSWORD: &str = "test-password-1234";
+pub const TEST_METHOD_STR: &str = "aes-256-gcm";
+pub const TEST_METHOD: CipherKind = CipherKind::AES_256_GCM;
+pub const TEST_PASSWORD: &str = "test-password-1234";
 
 /// Generate a fresh random "password" for the given cipher in the format the
 /// cipher expects.
@@ -31,7 +30,7 @@ pub(crate) const TEST_PASSWORD: &str = "test-password-1234";
 ///   Passing an arbitrary string fails inside `ServerConfig::new`.
 /// - For all other ciphers (stream, AEAD v1), the password is just an
 ///   arbitrary string and we hex-encode the random bytes for legibility.
-pub(crate) fn random_password_for(method: CipherKind) -> String {
+pub fn random_password_for(method: CipherKind) -> String {
     use rand::Rng;
     let key_len = method.key_len();
     let mut bytes = vec![0u8; key_len];
@@ -56,7 +55,7 @@ pub(crate) fn random_password_for(method: CipherKind) -> String {
 /// `svr_cfg` when constructing both `TcpServer` and `UdpServer`, so
 /// passing port 0 would hand the two sockets distinct kernel-allocated
 /// ports — the explicit allocation here keeps them on the same port.
-pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
+pub async fn start_real_ss_server(method: CipherKind, password: &str) -> (SocketAddr, JoinHandle<()>) {
     let (port, server) = port_alloc::bind_ephemeral(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         Protocols::TCP | Protocols::UDP,
@@ -86,7 +85,7 @@ pub(crate) async fn start_real_ss_server(method: CipherKind, password: &str) -> 
 /// in front. Returns the public-facing socket address and the spawned
 /// server task handle. The plugin's public listen port is verified for
 /// `Protocols::TCP` only — WS is TCP per RFC 6455.
-pub(crate) async fn start_real_ss_server_with_plugin_ws(
+pub async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
@@ -104,7 +103,7 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws(
 /// Spin up a real shadowsocks server with v2ray-plugin (websocket + TLS) in
 /// front. Same shape as [`start_real_ss_server_with_plugin_ws`] but with TLS
 /// enabled and the cert+key from `certs` mounted on the server side.
-pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
+pub async fn start_real_ss_server_with_plugin_ws_tls(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
@@ -116,7 +115,7 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
 
 /// Spin up a real shadowsocks server with a QUIC-transport plugin in front.
 /// QUIC auto-enables TLS in `generateConfig`
-/// ([crates/ex-ray/config.go:133](../../../ex-ray/config.go), the `case "quic"`
+/// ([crates/ex-ray/config.go:133](../../ex-ray/config.go), the `case "quic"`
 /// arm sets `*tlsEnabled = true`), so the cert+key pair must still be supplied.
 /// The plugin's public listen port is verified for `Protocols::UDP` because
 /// QUIC runs over UDP.
@@ -125,8 +124,8 @@ pub(crate) async fn start_real_ss_server_with_plugin_ws_tls(
 /// or a bare **ex-ray** / stock-v2ray-plugin binary: since bindreams/hole#421,
 /// ex-ray UDP-probes its inbound and reports `transports:["udp"]` for
 /// server+quic rather than rejecting it, so the standalone server path is fed
-/// directly by the QUIC interop tests in `interop_tests.rs`.
-pub(crate) async fn start_real_ss_server_with_plugin_quic(
+/// directly by the QUIC interop tests in `plugin-e2e/tests/interop.rs`.
+pub async fn start_real_ss_server_with_plugin_quic(
     method: CipherKind,
     password: &str,
     plugin_path: &str,
@@ -185,58 +184,4 @@ async fn spawn_ss_with_plugin(
         let _ = server.run().await;
     });
     (public_addr, handle)
-}
-
-/// Workspace root, derived from this crate's `CARGO_MANIFEST_DIR`
-/// (`<root>/crates/bridge`). The locators below all hang off it.
-fn workspace_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-/// Locate the ex-ray binary built by `cargo xtask ex-ray`.
-///
-/// ex-ray is the first-party v2ray-core shim that replaced the vendored
-/// v2ray-plugin (#414). It is built into `<repo>/.cache/ex-ray/` under a
-/// host-triple filename; the path is derived from
-/// [`xtask::ex_ray::output_name`] so the test and the build orchestrator stay
-/// in lock-step (a triple-map drift breaks compilation, not a silent
-/// wrong-path lookup).
-///
-/// The friendly wire name `v2ray-plugin` resolves to this binary via
-/// `hole_common::plugin`, so this is the binary the runner's `entry.plugin =
-/// "v2ray-plugin"` (or `"ex-ray"`) path spawns once it's handed
-/// `plugin_path_override`.
-pub(crate) fn locate_ex_ray() -> PathBuf {
-    workspace_root()
-        .join(".cache")
-        .join("ex-ray")
-        .join(xtask::ex_ray::output_name())
-}
-
-/// Locate the pinned upstream shadowsocks/v2ray-plugin binary provisioned by
-/// `cargo xtask provision-upstream-v2ray`.
-///
-/// Lives at `<repo>/.cache/upstream-v2ray-plugin/<PINNED_COMMIT>/`. The path
-/// (commit + host-triple filename) comes from
-/// [`xtask::upstream_v2ray::cached_binary_path`], so the single source of
-/// truth for the pinned commit is the xtask module — the test never hardcodes
-/// it. Used by the cross-implementation interop test to prove ex-ray is
-/// wire-compatible with genuine upstream v2ray-plugin in both directions.
-pub(crate) fn locate_upstream_v2ray() -> PathBuf {
-    xtask::upstream_v2ray::cached_binary_path(&workspace_root())
-}
-
-/// Locate the galoshes binary built by `cargo xtask galoshes`.
-///
-/// galoshes is a regular workspace member (`crates/galoshes/`) built into
-/// `<repo>/target/release/galoshes{.exe}` by [`xtask::galoshes::build`]
-/// (always release — it embeds ex-ray at compile time).
-pub(crate) fn locate_built_galoshes() -> PathBuf {
-    let bin = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
-    workspace_root().join("target").join("release").join(bin)
 }

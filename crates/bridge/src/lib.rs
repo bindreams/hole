@@ -24,15 +24,9 @@ pub mod socket;
 #[cfg(test)]
 mod test_support;
 
-// Cross-implementation interop tests (ex-ray ↔ stock v2ray-plugin). Like
-// `test_support`, there is no business-logic counterpart — it's a
-// cross-cutting integration test spanning the server harness + `server_test`
-// runner + provisioned upstream binary, so it's registered directly here
-// rather than as a sibling of a single source file. Unlike `server_test_tests`
-// (Linux-only, needs TUN/routing), it uses no TUN/routing and runs on every platform.
-#[cfg(test)]
-#[path = "interop_tests.rs"]
-mod interop_tests;
+// The cross-implementation interop suite (ex-ray ↔ stock v2ray-plugin) was
+// relocated to the `plugin-e2e` crate (#435) so it runs on a plugin-owned,
+// Linux-inclusive matrix instead of Hole's Win+mac bridge CI.
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.

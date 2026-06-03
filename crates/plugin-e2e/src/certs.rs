@@ -18,13 +18,13 @@
 //!    populates the Subject Alternative Name correctly by default.
 //! 2. **`is_ca = Ca(Unconstrained)`** — client mode uses
 //!    `Usage: Certificate_AUTHORITY_VERIFY` on the provided cert
-//!    ([crates/ex-ray/config.go:182](../../../ex-ray/config.go), the
+//!    ([crates/ex-ray/config.go:182](../../ex-ray/config.go), the
 //!    `!*server` branch of `generateConfig`), treating it as a trust anchor.
 //!    For a self-signed leaf to verify against itself as a trust anchor, it
 //!    must be marked as a CA.
 //! 3. **`host=cloudfront.com`** plugin_opt on both client and server. The
 //!    plugin uses this as `tls.Config{ServerName: *host}`
-//!    ([crates/ex-ray/config.go:161](../../../ex-ray/config.go)). Mismatch
+//!    ([crates/ex-ray/config.go:161](../../ex-ray/config.go)). Mismatch
 //!    between client SNI and server cert SAN = handshake failure.
 
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ use std::path::PathBuf;
 ///
 /// The tempdir lives for as long as the struct does. Dropping it removes
 /// both files.
-pub(crate) struct TestCerts {
+pub struct TestCerts {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     _tempdir: tempfile::TempDir,
@@ -54,7 +54,7 @@ impl TestCerts {
 /// Render a path for embedding in a SIP003 `plugin_opts` string.
 ///
 /// ex-ray's args parser treats backslashes as escape characters
-/// ([crates/ex-ray/args.go](../../../ex-ray/args.go) `indexUnescaped`: `\X` is
+/// ([crates/ex-ray/args.go](../../ex-ray/args.go) `indexUnescaped`: `\X` is
 /// unescaped to `X`), which mangles Windows paths like
 /// `C:\Users\foo\AppData\...` into `C:UsersfooAppData...`. Workarounds:
 ///
@@ -64,14 +64,14 @@ impl TestCerts {
 /// 2. Or double the backslashes (`\\`) in the plugin_opts string.
 ///
 /// Option 1 is simpler and is what we use here.
-pub(crate) fn path_for_plugin_opts(path: &std::path::Path) -> String {
+pub fn path_for_plugin_opts(path: &std::path::Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
 /// Generate a self-signed CA cert with SAN `DNS:cloudfront.com` and write it
 /// to a fresh tempdir. Panics if rcgen or std::fs fails — tests want loud
 /// errors here.
-pub(crate) fn generate_test_certs() -> TestCerts {
+pub fn generate_test_certs() -> TestCerts {
     use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
     let mut params = CertificateParams::new(vec!["cloudfront.com".to_string()])

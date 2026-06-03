@@ -865,22 +865,23 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E test skip policy in CI. All driven by the galoshes internal port
-// race in shadowsocks-service's `PluginConfig` (bindreams/hole#197, open):
+// E2E test platform policy (#435):
 //
-// - **macOS**: the entire module is skipped — the galoshes test set
-//   reliably hits the race.
-// - **Windows**: the module runs, but the *galoshes* tests inside are
-//   individually `#[cfg(not(target_os = "windows"))]`-gated; everything
-//   else runs. The `#[cfg]` gating lives in `proxy_manager_e2e_tests.rs`
-//   next to each affected test so the skip reason is co-located.
-// - **Linux**: the module runs fully — the only platform where the full
-//   galoshes matrix is exercised.
-#[cfg(all(test, not(target_os = "macos")))]
+// - **Non-galoshes** DistHarness e2e (`e2e_none`, lifecycle, cipher, and the
+//   listener-selection tests) run on every Hole platform (Win+mac). The
+//   modules are no longer macOS-gated.
+// - **galoshes-fronted** tests need a galoshes *server*, which hits the #197
+//   `PluginConfig` port race on Win+mac, so each is individually
+//   `#[cfg(not(any(target_os = "windows", target_os = "macos")))]`-gated
+//   (Linux-only) with the skip reason co-located. There is no Linux hole-bridge
+//   CI job, so the bridge→galoshes e2e tests are orphaned until #197 lands a
+//   custom server-side launcher; the galoshes server↔client transport coverage
+//   proper now lives in the `plugin-e2e` crate's Linux CI lane (#435).
+#[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]
 mod proxy_manager_listener_e2e_tests;
 

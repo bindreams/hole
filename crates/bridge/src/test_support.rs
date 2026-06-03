@@ -1,9 +1,11 @@
-//! Shared test fixtures for bridge integration tests.
+//! Hole-specific test infrastructure for bridge integration tests.
 //!
-//! Spawns real in-process shadowsocks servers (via `shadowsocks-service`'s
-//! `server` feature, already a dev-dep) and optional plugin
-//! subprocesses, with variants for each supported transport. Consumed by
-//! `*_tests.rs` files across the crate.
+//! The shared shadowsocks-server / cert / sentinel harness was lifted into the
+//! `plugin-e2e` crate (#435) so the plugin suites and Hole's bridge tests share
+//! one copy; the `ssserver_*` skuld fixtures here wrap those harness functions.
+//! What remains in this module is Hole-specific: the `DistHarness` (spawns
+//! `hole bridge run`), the `HttpTarget` TUN sentinel, SOCKS5/HTTP-CONNECT
+//! clients, and net discovery. Consumed by `*_tests.rs` files across the crate.
 //!
 //! **Convention deviation**: this module is registered directly from
 //! `lib.rs` rather than via the project-wide `#[path = "foo_tests.rs"] mod
@@ -14,7 +16,6 @@
 //! `mod test_support;` declaration in `lib.rs`.
 #![allow(dead_code)]
 
-pub(crate) mod certs;
 pub(crate) mod dist_fixture;
 pub(crate) mod dist_harness;
 pub(crate) mod dist_harness_panic_hook_tests;
@@ -25,13 +26,11 @@ pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod skuld_fixtures;
 pub(crate) mod socks5_client;
-pub(crate) mod ssserver;
 pub(crate) mod udp_echo;
 
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.
 ///
-/// Lives at the module root because it's useful to every test file, not just
-/// ssserver-related ones.
+/// Lives at the module root because it's useful to every test file.
 pub(crate) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }

@@ -1,6 +1,6 @@
 //! Ephemeral port allocation + liveness probe helpers for tests.
 //!
-//! Port allocation delegates to [`hole_common::port_alloc::free_port`],
+//! Port allocation delegates to [`util::port_alloc::free_port`],
 //! which runs one bind probe per transport and retries Windows-specific
 //! bind races (WSAEACCES, EADDRINUSE, EADDRNOTAVAIL) internally. Callers
 //! needing cross-test serialization still use the `PORT_ALLOC` skuld
@@ -8,7 +8,7 @@
 //! owner's bind) is identical to the kernel allocator's.
 //!
 //! For callers that bind in-process and can use a closure shape, prefer
-//! [`hole_common::port_alloc::bind_ephemeral`] instead — it folds the
+//! [`util::port_alloc::bind_ephemeral`] instead — it folds the
 //! caller's bind into the same retry loop so there is no
 //! divorced-port-number TOCTOU window. This module's
 //! [`allocate_ephemeral_port`] is reserved for the case where the port
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use hole_common::port_alloc::{self, Protocols};
+use util::port_alloc::{self, Protocols};
 
 /// Pre-allocate a port number on loopback verified free for every
 /// transport in `protocols`, and immediately drop the holder. The port

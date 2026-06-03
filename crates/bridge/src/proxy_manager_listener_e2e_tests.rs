@@ -22,11 +22,11 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use hole_common::config::ServerEntry;
-use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use util::port_alloc::Protocols;
 
 // Helpers =============================================================================================================
 
@@ -429,9 +429,10 @@ mod socks_only_udp {
         });
     }
 
-    /// Skipped on Windows: same #197 galoshes `PluginConfig` bind race as
-    /// `e2e_ws_socks_only_roundtrip`. Lift this gate once #197 is fixed.
-    #[cfg(not(target_os = "windows"))]
+    /// Linux-only: the galoshes *server* (`ssserver_ws` fixture) hits the #197
+    /// `PluginConfig` bind race on Win+mac, same as `e2e_ws_socks_only_roundtrip`.
+    /// Lift this gate once #197 lands a custom server-side launcher. See #435.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,

@@ -39,7 +39,7 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
 // retryable on EVERY OS. `proxy_err_to_io_err` synthesizes an
 // `AddrInUse`-kind `io::Error` directly (NOT via `from_raw_os_error`,
 // which is platform-fragile), and `bind_ephemeral` retries when
-// `hole_common::retry::is_bind_race` returns true. These tests pin both
+// `util::retry::is_bind_race` returns true. These tests pin both
 // halves: BindRace IS a bind race; Plugin / Cancelled are NOT.
 
 fn dummy_addr() -> SocketAddr {
@@ -60,7 +60,7 @@ fn bind_race_maps_to_retryable_addr_in_use_io_error() {
         "BindRace must synthesize an AddrInUse-kind io::Error"
     );
     assert!(
-        hole_common::retry::is_bind_race(&io_err),
+        util::retry::is_bind_race(&io_err),
         "BindRace io::Error must classify as a retryable bind race on every OS"
     );
 }
@@ -73,7 +73,7 @@ fn bind_race_with_nonzero_errno_still_retryable() {
         errno: 10048,
         addr: dummy_addr(),
     });
-    assert!(hole_common::retry::is_bind_race(&io_err));
+    assert!(util::retry::is_bind_race(&io_err));
     // The errno is preserved in the message for bridge.log diagnostics.
     assert!(
         io_err.to_string().contains("10048"),
@@ -85,7 +85,7 @@ fn bind_race_with_nonzero_errno_still_retryable() {
 fn plugin_error_is_not_a_bind_race() {
     let io_err = proxy_err_to_io_err(ProxyError::Plugin("upstream dial failed".into()));
     assert!(
-        !hole_common::retry::is_bind_race(&io_err),
+        !util::retry::is_bind_race(&io_err),
         "ProxyError::Plugin must NOT classify as a bind race (terminal failure)"
     );
 }
@@ -94,7 +94,7 @@ fn plugin_error_is_not_a_bind_race() {
 fn cancelled_is_not_a_bind_race() {
     let io_err = proxy_err_to_io_err(ProxyError::Cancelled);
     assert!(
-        !hole_common::retry::is_bind_race(&io_err),
+        !util::retry::is_bind_race(&io_err),
         "ProxyError::Cancelled must NOT classify as a bind race"
     );
 }

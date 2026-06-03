@@ -2905,7 +2905,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
- "base64 0.22.1",
  "bytes",
  "default-net",
  "drop_bomb",
@@ -2927,8 +2926,8 @@ dependencies = [
  "ipnet",
  "libc",
  "lru",
+ "plugin-e2e",
  "rand 0.10.1",
- "rcgen",
  "regex",
  "rustls",
  "rustls-pki-types",
@@ -2951,6 +2950,7 @@ dependencies = [
  "tracing-subscriber",
  "tun-engine",
  "ureq",
+ "util",
  "webpki-roots",
  "windows 0.62.2",
  "windows-service",
@@ -2961,7 +2961,6 @@ dependencies = [
 name = "hole-common"
 version = "0.2.0"
 dependencies = [
- "bitflags 2.11.1",
  "dirs 6.0.0",
  "file-rotate",
  "garter",
@@ -2984,6 +2983,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "typify",
+ "util",
  "uuid",
  "windows 0.62.2",
  "yaml_serde",
@@ -4934,6 +4934,27 @@ dependencies = [
  "quick-xml",
  "serde",
  "time",
+]
+
+[[package]]
+name = "plugin-e2e"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "garter",
+ "hex",
+ "hole-test-observability",
+ "rand 0.10.1",
+ "rcgen",
+ "shadowsocks",
+ "shadowsocks-service",
+ "skuld",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "util",
+ "xtask",
 ]
 
 [[package]]
@@ -8046,6 +8067,18 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "util"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "hole-test-observability",
+ "libc",
+ "skuld",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "uuid"

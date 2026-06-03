@@ -9,16 +9,16 @@
 //! module so `proxy_manager_e2e_tests.rs` can reuse them.
 
 use super::{run_server_test, TestConfig};
-use crate::test_support::http_target::start_fake_sentinel;
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
-use crate::test_support::ssserver::{
-    locate_ex_ray, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
-    TEST_PASSWORD,
-};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ServerTestOutcome;
+use plugin_e2e::locators::locate_ex_ray;
+use plugin_e2e::sentinel::start_fake_sentinel;
+use plugin_e2e::ssserver::{
+    start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
