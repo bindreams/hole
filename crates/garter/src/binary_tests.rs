@@ -82,3 +82,18 @@ fn readiness_mode_defaults_to_probe() {
     let p = crate::BinaryPlugin::new("/nonexistent", None);
     assert_eq!(p.readiness_mode_for_test(), crate::binary::ReadinessMode::Probe);
 }
+
+// GOTRACEBACK env test ================================================================================================
+
+#[skuld::test]
+fn fixed_env_sets_gotraceback_crash() {
+    // The always-injected env pairs include GOTRACEBACK=crash so a Go
+    // plugin (ex-ray) dumps full goroutine state to stderr on a native fault
+    // (the bridge relays that stderr through tracing). Harmless to Rust
+    // plugins, which ignore it. See bindreams/hole#438.
+    let pairs = crate::binary::fixed_plugin_env();
+    assert!(
+        pairs.iter().any(|(k, v)| *k == "GOTRACEBACK" && *v == "crash"),
+        "GOTRACEBACK=crash must be injected: {pairs:?}"
+    );
+}

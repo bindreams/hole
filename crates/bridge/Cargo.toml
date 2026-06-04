@@ -16,6 +16,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+tombstone = { path = "../tombstone" }
 util = { path = "../util" }
 handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
@@ -100,6 +101,10 @@ ferrisetw = "1.2.0"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# WaitableWriter + tracing_test::set_default_in_current_thread for the
+# sweep-wiring assertion in foreground_tests. The production dep above
+# does not enable test-utils; this override adds it for tests only.
+garter = { path = "../garter", features = ["test-utils"] }
 tokio = { version = "1", features = ["test-util"] }
 # In-process log capture in tests — verifies diagnostic spans /
 # `elapsed_ms` debug logs (#247) and the forwarder's typed-error log

@@ -84,7 +84,16 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
         }
     };
 
-    let _ = log_dir; // currently unused — reserved for future diagnostics
+    // Native-crash observability (bindreams/hole#438): report + delete any
+    // crash marker a previously-crashed bridge left in log_dir. Offloaded to
+    // a blocking thread to match the sibling recover_* calls (it is pure file
+    // I/O — no netsh/route hazard — but spawn_blocking keeps the pattern
+    // uniform and off the runtime worker). The marker is written next to
+    // bridge.log, NOT in state_dir.
+    let log_dir_sweep = log_dir.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
+        tracing::warn!(error = %e, "crash sweep task panicked");
+    }
 
     tokio::select! {
         result = server.run() => {

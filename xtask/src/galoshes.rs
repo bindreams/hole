@@ -15,8 +15,16 @@ use anyhow::{anyhow, bail, Context, Result};
 /// `<repo>/.cache/ex-ray/` by [`super::ex_ray::build`] (which
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
+    // Dev-only minidump opt-in (bindreams/hole#438). scripts/dev.py sets
+    // HOLE_CRASH_DUMPS=1; release / standalone galoshes builds do not, so
+    // minidump-writer never links into the windows-arm64 galoshes matrix.
+    let mut args: Vec<&str> = vec!["build", "--release", "-p", "galoshes"];
+    if std::env::var_os("HOLE_CRASH_DUMPS").is_some() {
+        args.push("--features");
+        args.push("galoshes/crash-dumps");
+    }
     let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "galoshes"])
+        .args(&args)
         .current_dir(repo_root)
         .status()
         .context("failed to run `cargo build -p galoshes`")?;

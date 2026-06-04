@@ -13,6 +13,14 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[skuld::test]
+fn init_signature_takes_kind() {
+    // Compile-time guard: init's signature includes a &'static str kind
+    // between log_dir and log_filename. A regression to the old 3-arg form
+    // fails to compile here.
+    let _f: fn(&std::path::Path, &'static str, &str, &str) -> crate::logging::LogGuard = crate::logging::init;
+}
+
 // Test result format ==================================================================================================
 
 /// Captured-event record written by the child to its result file.

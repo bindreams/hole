@@ -39,6 +39,22 @@ async fn main() -> anyhow::Result<()> {
         protocol: SITREP_PROTOCOL.to_string(),
     });
 
+    // Native-crash observability (bindreams/hole#438). galoshes does NOT
+    // route through hole_common::logging (it owns its own subscriber above),
+    // so it attaches + sweeps directly. Placed AFTER the Hello emit: Hello
+    // must be stdout line 1 (the bridge reads it), and runtime_dir() is
+    // fallible — it must not precede Hello. Markers are pid-keyed and sweep
+    // reports the PREVIOUS run, so ordering after Hello is correct. The
+    // marker/.dmp land in galoshes' per-user runtime dir
+    // (%LOCALAPPDATA%/galoshes etc.) — the bridge sweeps its OWN log dir, so
+    // galoshes markers are reported on the NEXT galoshes start, not by the
+    // bridge. Best-effort: a dir-resolution failure here must not block
+    // plugin startup, so attach/sweep are skipped on Err.
+    if let Ok(crash_dir) = galoshes::embedded::runtime_dir() {
+        tombstone::sweep(&crash_dir);
+        tombstone::attach("galoshes", &crash_dir);
+    }
+
     let env = PluginEnv::from_env().map_err(|e| anyhow::anyhow!("failed to parse SIP003u environment: {e}"))?;
 
     // Parse SHA256 from build-time env

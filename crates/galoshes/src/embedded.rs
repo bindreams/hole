@@ -137,7 +137,7 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 // Platform: runtime_dir ===============================================================================================
 
-fn runtime_dir() -> Result<PathBuf> {
+pub fn runtime_dir() -> Result<PathBuf> {
     let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let default_root = platform_default_env().ok();
     resolve(xdg.as_deref(), default_root.as_deref())

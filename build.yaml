@@ -86,7 +86,7 @@ targets:
     depends: [galoshes, wintun]
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build:
-      - cargo build --workspace --no-default-features
+      - cargo build --workspace --no-default-features --features tombstone/crash-dumps
       - cargo xtask stage --profile debug --out-dir target/debug/dist
     run: uv run scripts/dev.py
 
@@ -162,17 +162,17 @@ targets:
     depends: hole
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
     build: >
-      cargo nextest run --no-run --no-default-features
+      cargo nextest run --no-run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
-          + package(handle-holders)'
+          + package(handle-holders) + package(tombstone)'
     run: >
-      cargo nextest run --no-default-features
+      cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
-          + package(handle-holders)'
+          + package(handle-holders) + package(tombstone)'
 
   plugin-e2e-tests:
     # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray↔stock interop

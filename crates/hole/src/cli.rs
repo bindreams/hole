@@ -265,7 +265,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
 /// how the directory is chosen.
 pub(crate) fn dispatch(command: Command) -> ! {
     let _cli_log_guard =
-        resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli.log", "hole=info"));
+        resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info"));
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);

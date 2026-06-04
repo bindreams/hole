@@ -1,0 +1,89 @@
+[package]
+name = "tombstone"
+version = "0.1.0"
+edition.workspace = true
+# minidump-writer 0.12 floor is 1.88; crash-handler 0.7 floor is 1.85.
+# Installed toolchain (1.93) clears both; this records the floor loudly.
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+# skuld's custom-test-main pattern requires the lib's libtest harness be
+# disabled (the crate provides its own `fn main` via skuld::run_all).
+[lib]
+harness = false
+
+[features]
+# Dev/test-only: links minidump-writer so on_crash can write a
+# memory-bearing .dmp. NON-DEFAULT (opposite polarity to tauri/custom-protocol)
+# so release binaries never link minidump-writer — a privacy VPN's process
+# memory holds keys + user traffic. See bindreams/hole#438 §3/§5.4.
+crash-dumps = ["dep:minidump-writer"]
+# Builds the `crash_child` helper bin (which links sadness-generator). Enabled
+# ONLY by the test workflow (`cargo nextest run -p tombstone --features
+# crash-child,...`) so plain `cargo build --workspace` does NOT compile the
+# bin and never needs sadness-generator. See bindreams/hole#438 (review M1/M2).
+crash-child = ["dep:sadness-generator"]
+
+[dependencies]
+crash-handler = { workspace = true }
+minidump-writer = { workspace = true, optional = true }
+# OPTIONAL NON-dev dep gated behind the `crash-child` feature: the helper bin
+# is the only consumer. NOT a [dev-dependency] — that would make it
+# unreachable from the [[bin]] under the test build. See review M1/M2.
+sadness-generator = { workspace = true, optional = true }
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# crash-context is needed on BOTH macOS and Linux:
+#  - macOS: the by-value MinidumpWriter::with_crash_context path rebuilds a
+#    CrashContext field-by-field and needs crash_context::ExceptionInfo in
+#    scope (crash-handler re-exports CrashContext but NOT ExceptionInfo, and
+#    CrashContext is not Clone).
+#  - Linux: extract_fault_fields reads crash_context::CrashContext's
+#    `siginfo: libc::signalfd_siginfo`, `pid`, `tid` fields directly.
+# See review S1 + the Linux verification (bindreams/hole#438).
+crash-context = { workspace = true }
+# Shared marker writer (open/write/close) + clock_gettime + the Linux
+# signalfd_siginfo field access. macOS + Linux.
+libc = "0.2"
+
+[dev-dependencies]
+skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
+tempfile = "3"
+# The sweep tests + their helpers build a tracing subscriber via
+# `tracing_subscriber::fmt()` (only `tracing` is a non-dev dep). See review M8.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# WaitableWriter + tracing_test::set_default_in_current_thread for the
+# sweep-breadcrumb assertion (raw set_default is clippy-banned workspace-wide).
+garter = { path = "../garter", features = ["test-utils"] }
+
+# The helper bin links sadness-generator, so it only builds when the
+# `crash-child` feature is on. `cargo build --workspace --no-default-features
+# --features tombstone/crash-dumps` (the build.yaml `hole` target) does NOT
+# enable `crash-child`, so this bin is skipped → no sadness-generator link.
+[[bin]]
+name = "crash_child"
+path = "src/bin/crash_child.rs"
+required-features = ["crash-child"]
+
+# Out-of-process per-fault-class crash tests. Integration target (not a
+# unit-test module) because CARGO_BIN_EXE_crash_child is only set for
+# tests/*.rs. harness = false because skuld provides its own run_all main.
+[[test]]
+name = "crash_child"
+path = "tests/crash_child.rs"
+harness = false

@@ -60,6 +60,12 @@ fn launch_gui(show_dashboard: bool) {
 
     let _log_guard = logging::init(&log_dir);
 
+    // Native-crash observability (bindreams/hole#438): report any crash
+    // marker a previously-crashed GUI/foreground-bridge left in this dir.
+    // GUI startup is synchronous and pre-event-loop, so sweep inline (no
+    // spawn_blocking — there is no runtime worker to protect yet).
+    tombstone::sweep(&log_dir);
+
     tauri::Builder::default()
         // `UiReady` is registered on the builder (not in `.setup`) so
         // it is available to command handlers at first dispatch — the

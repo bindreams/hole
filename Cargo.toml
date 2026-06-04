@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/mock-plugin", "crates/plugin-e2e", "crates/test-observability", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/mock-plugin", "crates/plugin-e2e", "crates/test-observability", "crates/tombstone", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
 resolver = "2"
 
 [workspace.package]
@@ -45,6 +45,22 @@ contracts = "0.6"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native-crash observability (bindreams/hole#438). All MIT-OR-Apache-2.0.
+# Pinned here so common + hole + bridge + galoshes share one version.
+# `crash-context` is pinned next to crash-handler because BOTH the macOS
+# minidump by-value path (rebuilds a CrashContext field-by-field, needs
+# `crash_context::ExceptionInfo` — crash-handler re-exports CrashContext but
+# NOT ExceptionInfo, and CrashContext is not Clone) AND the Linux marker
+# writer (reads `crash_context::CrashContext::{siginfo, pid, tid}` directly)
+# need crash-context types in scope. See review S1.
+# MUST be "0.6" (not "0.7"): crash-handler 0.7 depends on crash-context "0.6",
+# so its re-exported `CrashContext` IS the 0.6 type. A "0.7" direct dep would
+# resolve to a DISTINCT, incompatible type and fail to unify with crash-handler's
+# API in the on_crash signature / minidump rebuild. (0.6.3 field shapes verified.)
+crash-handler = "0.7"
+crash-context = "0.6"
+minidump-writer = "0.12"
+sadness-generator = "0.7"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

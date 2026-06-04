@@ -21,6 +21,11 @@ workspace = true
 # `--no-default-features` to keep `cfg(dev) = true` for the Vite-served
 # workflow. See bindreams/hole#372 for the incident.
 default = ["tauri/custom-protocol"]
+# Passthrough to hole-common's dev-only minidump writer. NON-DEFAULT. The
+# dev/test build paths (build.yaml hole / hole-tests) pass
+# `--features tombstone/crash-dumps` directly; this alias lets a hand-run
+# `cargo build -p hole --features hole/crash-dumps` reach the same gate.
+crash-dumps = ["hole-common/crash-dumps"]
 
 [lib]
 name = "hole"
@@ -33,6 +38,7 @@ harness = false
 
 [dependencies]
 hole-common = { path = "../common" }
+tombstone = { path = "../tombstone" }
 hole-bridge = { path = "../bridge" }
 tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"

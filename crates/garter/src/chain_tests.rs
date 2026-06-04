@@ -841,6 +841,82 @@ async fn external_cancel_concurrent_with_plugin_error_preserves_plugin_error() {
     }
 }
 
+// record_exit structured-field tests ==================================================================================
+
+/// `record_exit` must emit a structured `exit_code` field on a `PluginExit`
+/// error so the mid-run death is machine-parseable in bridge.log.
+///
+/// The test asserts the FIELD NAME `exit_code` appears in the rendered output
+/// (not just via the error string that incidentally contains the code).
+#[skuld::test]
+async fn record_exit_logs_structured_exit_code() {
+    use crate::test_utils::WaitableWriter;
+    use crate::tracing_test::set_default_in_current_thread;
+    use tokio_util::sync::CancellationToken;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+    let rx = writer.wait_for("exited with error");
+
+    let mut first_error = None;
+    let shutdown = CancellationToken::new();
+    let result = Ok((
+        "ex-ray".to_string(),
+        Err(crate::Error::PluginExit {
+            name: "ex-ray".to_string(),
+            code: 139,
+        }),
+    ));
+    crate::chain::record_exit(result, &mut first_error, &shutdown);
+
+    rx.recv().expect("breadcrumb emitted");
+    let snap = writer.snapshot();
+    assert!(snap.contains("exit_code"), "structured exit_code field: {snap}");
+    assert!(snap.contains("139"), "exit code value surfaced: {snap}");
+    assert!(snap.contains("ex-ray"), "plugin name: {snap}");
+}
+
+/// `record_exit` must emit `killed=true` and no numeric `exit_code` on a
+/// `PluginKilled` error (signal death / SIGKILL / TerminateProcess).
+#[skuld::test]
+async fn record_exit_logs_killed_for_signal_death() {
+    use crate::test_utils::WaitableWriter;
+    use crate::tracing_test::set_default_in_current_thread;
+    use tokio_util::sync::CancellationToken;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+    let rx = writer.wait_for("exited with error");
+
+    let mut first_error = None;
+    let shutdown = CancellationToken::new();
+    let result = Ok((
+        "ex-ray".to_string(),
+        Err(crate::Error::PluginKilled {
+            name: "ex-ray".to_string(),
+        }),
+    ));
+    crate::chain::record_exit(result, &mut first_error, &shutdown);
+
+    rx.recv().expect("breadcrumb emitted");
+    let snap = writer.snapshot();
+    assert!(snap.contains("killed=true"), "killed field must be true: {snap}");
+    assert!(snap.contains("ex-ray"), "plugin name: {snap}");
+    // PluginKilled carries no exit code; tracing's fmt omits Option::None
+    // fields entirely — `exit_code` does not appear in the output at all.
+    assert!(!snap.contains("exit_code"), "no exit_code field for killed: {snap}");
+}
+
 /// A plugin panic surfaces through `record_exit`'s `JoinError` arm as a
 /// `Chain` error whose message identifies the panic.
 #[skuld::test]

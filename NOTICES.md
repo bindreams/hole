@@ -88,6 +88,35 @@ compatibility. The ex-Galoshes crates remain individually available under
 Apache-2.0 for any downstream consumer who pulls them out of this
 monorepo.
 
+## Native-crash observability dependencies (`crates/tombstone`)
+
+The `tombstone` crate (`crates/tombstone`) is first-party, licensed under
+the Apache License, Version 2.0 — deliberately permissive so the standalone
+`galoshes` binary can depend on it without acquiring a GPL edge. Copyright ©
+2025-2026 Anna Zhukova.
+
+`tombstone` links the following third-party crates, all dual-licensed
+MIT OR Apache-2.0 (both GPL-3.0-compatible):
+
+- [`crash-handler`](https://github.com/EmbarkStudios/crash-handling) and its
+  companion `crash-context` — the native-fault catcher (installs
+  `SetUnhandledExceptionFilter` + vectored handlers on Windows, task-level
+  Mach exception ports on macOS, POSIX signal handlers on Linux). Always
+  linked (Windows / macOS / Linux all first-tier).
+- [`minidump-writer`](https://github.com/rust-minidump/minidump-writer) — the
+  dev-only `.dmp` writer, linked **only** under the non-default `crash-dumps`
+  cargo feature. It is absent from all release artifacts (MSI / DMG /
+  standalone galoshes), so a memory-bearing minidump — which for a privacy
+  VPN would hold keys and user traffic — is never producible by shipped
+  binaries.
+- [`sadness-generator`](https://github.com/EmbarkStudios/crash-handling) — an
+  optional, non-default dependency enabled only by the test workflow (the
+  `crash-child` feature); never linked into any shipped binary.
+
+These crates' bytes, where linked (`crash-handler`/`crash-context` always;
+`minidump-writer` in dev builds), are covered by the combined-distribution
+GPL-3.0 terms above per MIT/Apache → GPL one-way compatibility.
+
 ## Bundled third-party UI assets
 
 The Hole GUI bundles country-flag SVGs from

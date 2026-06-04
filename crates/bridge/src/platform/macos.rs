@@ -205,13 +205,12 @@ pub fn is_running() -> bool {
 
 /// Run the bridge directly (called by launchd).
 ///
-/// `_log_dir` is accepted to keep the Windows/macOS service entry
-/// points parameter-compatible; on macOS there is no ETL capture so
-/// the value is unused today.
+/// `log_dir` is the directory the crash-marker sweep reads (markers land
+/// next to `bridge.log`; see bindreams/hole#438).
 pub fn run(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
-    _log_dir: &std::path::Path,
+    log_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -247,6 +246,13 @@ pub fn run(
             tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_plugins)).await
         {
             tracing::warn!(error = %e, "recover_plugins task panicked");
+        }
+        // Native-crash observability (bindreams/hole#438): sweep crash
+        // markers left by a previously-crashed bridge. Offloaded to a
+        // blocking thread to match the sibling recover_* calls.
+        let log_dir_sweep = log_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
+            tracing::warn!(error = %e, "crash sweep task panicked");
         }
 
         tokio::select! {
