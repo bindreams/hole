@@ -115,8 +115,6 @@ impl IpcServer {
     /// that need multiple concurrent connections — using `run()` indefinitely
     /// adds noticeable accept-poll churn on Windows (50 ms `spawn_blocking`
     /// loop) which can starve other parallel tests on slow CI runners.
-    /// Bounding the accept loop to exactly `n` iterations keeps the test
-    /// runtime cheap and predictable.
     #[cfg(test)]
     pub async fn run_n(self, n: usize) -> std::io::Result<()> {
         let mut tasks = tokio::task::JoinSet::new();
@@ -385,8 +383,8 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
     // Bridge is "error" when ProxyManager has a recorded last_error from a
     // failed start/reload/stop, and "ok" otherwise. The IPC server itself is
     // alive (we got here), but the *bridge work* may have failed silently
-    // before; reporting "ok" unconditionally would mask exactly the kind of
-    // bug class that motivated this change. See issue #142.
+    // before; reporting "ok" unconditionally would mask a bridge-work
+    // failure the live IPC server cannot otherwise reveal.
     let bridge = if pm.last_error().is_some() {
         "error".to_string()
     } else {

@@ -32,7 +32,7 @@ export const TEST_CONCURRENCY = 5;
 // `init()` has completed (success or failure). `withGlobalTauri: false`
 // strips `window.__TAURI__` from injected scripts, so this typed
 // global is the documented entry point. See
-// `crates/hole/src/ui_ready.rs` and bindreams/hole#383.
+// `crates/hole/src/ui_ready.rs`.
 declare global {
   interface Window {
     __holeUiReady?: () => Promise<{ ok: boolean; error: string | null }>;
@@ -165,15 +165,15 @@ function setupEventListeners() {
   // file paths via `tauri://drag-drop`. Without these two lines, the
   // user gets a red-crossed-circle cursor and the drop is rejected at
   // the OS layer before Tauri sees it. The handlers are window-scoped
-  // because Tauri's drop handler is also window-scoped. See #385.
+  // because Tauri's drop handler is also window-scoped.
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => e.preventDefault());
 
   // Drag-and-drop file import. The user may drop one or many files;
   // iterate, showing a BLOCKING error dialog per failure (sequential —
   // the user must acknowledge each), and aggregate any successes into
-  // a single end-of-loop toast. See bindreams/hole#385: errors used to
-  // be toasts that auto-dismiss in 10s, which is easy to miss.
+  // a single end-of-loop toast. Per-failure errors use blocking dialogs
+  // (not auto-dismiss toasts) so they can't be missed.
   listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
     // A successful drop may not fire `dragleave` on the import zone —
     // remove the visual highlight unconditionally before processing
@@ -238,13 +238,10 @@ function formatRelayArg(a: unknown): string {
 /// `@tauri-apps/plugin-log` so they land in `gui.log`. Toast presentation is
 /// per-call-site (deliberate, contextual messages); this relay is log-only.
 ///
-/// Reentrancy guard: if `logError` / `logWarn` themselves throw (e.g. a
-/// future capability mishap), the resulting promise rejection would re-enter
-/// the relay and recurse. The `inRelay` flag short-circuits the recursive
-/// call; the `.catch(origError, ...)` surfaces relay-side failures to the
-/// ORIGINAL (unpatched) `console.error` so a misconfigured plugin-log
-/// capability is loud rather than silent. `origError` bypasses the patched
-/// `console.error` so it can't re-enter the relay.
+/// Reentrancy guard: a throwing `logError` / `logWarn` would re-enter the
+/// relay and recurse. `inRelay` short-circuits the recursion; failures
+/// surface via the original (unpatched) `console.error` so a misconfigured
+/// plugin-log capability is loud rather than silent.
 function installConsoleRelay() {
   let inRelay = false;
   const origError = console.error.bind(console);

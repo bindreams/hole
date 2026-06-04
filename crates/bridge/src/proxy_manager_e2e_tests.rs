@@ -30,14 +30,14 @@ use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
-use crate::test_support::ssserver::random_password_for;
 use hole_common::config::ServerEntry;
-use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use plugin_e2e::ssserver::random_password_for;
 use shadowsocks::crypto::CipherKind;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use util::port_alloc::Protocols;
 
 // Helpers =============================================================================================================
 
@@ -139,10 +139,10 @@ fn e2e_none_socks_only_roundtrip(
 
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
-/// Skipped on Windows (and macOS via the module gate) because the
-/// `PluginConfig` port TOCTOU in `shadowsocks-service` — tracked in
-/// #197 — causes yamux-server inside galoshes to lose the bind race.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: the galoshes *server* hits the #197 `PluginConfig` port race on
+/// Win+mac (yamux-server loses the bind). The galoshes WS transport proper is
+/// covered on Linux by `plugin-e2e`'s `galoshes_ws_roundtrip` (#435).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -154,8 +154,9 @@ fn e2e_ws_socks_only_roundtrip(
 
 /// Test 3: SocksOnly mode with galoshes (websocket + TLS).
 ///
-/// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race as
+/// `e2e_ws_socks_only_roundtrip` (Win+mac). See #435.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -167,12 +168,13 @@ fn e2e_ws_tls_socks_only_roundtrip(
 
 /// Test 4: SocksOnly mode with galoshes (QUIC).
 ///
-/// Windows-skipped: same #197 bind race as `e2e_ws_socks_only_roundtrip`.
-///
-/// galoshes embeds `ex-ray` (#414); ex-ray now UDP-probes its inbound and
-/// reports `transports:["udp"]` for server+quic instead of rejecting it, so
-/// galoshes-as-server-with-QUIC starts again (bindreams/hole#421).
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race as
+/// `e2e_ws_socks_only_roundtrip` (Win+mac). galoshes embeds `ex-ray` (#414),
+/// which UDP-probes its inbound and reports `transports:["udp"]` for
+/// server+quic, so galoshes-as-server-with-QUIC starts again (#421); the QUIC
+/// transport proper is covered on Linux by `plugin-e2e`'s
+/// `galoshes_quic_roundtrip` (#435).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -266,13 +268,11 @@ mod tun {
     /// Test 6: Full mode with galoshes (websocket). Requires Windows
     /// admin.
     ///
-    /// Currently disabled even on Windows because the galoshes
-    /// `PluginConfig` bind race (#197) fires here too. The `mod tun`
-    /// guard above is `cfg(target_os = "windows")`, so an additional
-    /// `cfg(not(target_os = "windows"))` here resolves to always-false
-    /// — the test is effectively never compiled until #197 is fixed.
-    /// Keeping the function as a placeholder so the test-matrix docs
-    /// stay intact; re-enable by removing this cfg once #197 lands.
+    /// Gated never-compile via the contradictory cfg pair (the `mod tun`
+    /// guard above is `cfg(target_os = "windows")`, this is
+    /// `cfg(not(target_os = "windows"))`) because the galoshes
+    /// `PluginConfig` bind race fires here too (bindreams/hole#197).
+    /// Remove the cfg once #197 lands.
     #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(
@@ -448,7 +448,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
     rt().block_on(async {
         let method = CipherKind::CHACHA20_POLY1305;
         let password = random_password_for(method);
-        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
+        let (ss_addr, _ss_handle) = plugin_e2e::ssserver::start_real_ss_server(method, &password).await;
 
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
@@ -497,7 +497,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
     rt().block_on(async {
         let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
         let password = random_password_for(method);
-        let (ss_addr, _ss_handle) = crate::test_support::ssserver::start_real_ss_server(method, &password).await;
+        let (ss_addr, _ss_handle) = plugin_e2e::ssserver::start_real_ss_server(method, &password).await;
 
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
@@ -536,8 +536,8 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// Windows-skipped: same #197 galoshes bind race.
-#[cfg(not(target_os = "windows"))]
+/// Linux-only: same #197 galoshes-server bind race (Win+mac). See #435.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,

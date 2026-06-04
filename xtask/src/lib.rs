@@ -103,8 +103,8 @@ pub enum Command {
     ///
     /// Output goes into `<repo>/.cache/upstream-v2ray-plugin/<commit>/`. This
     /// is a TEST dependency, deliberately NOT part of `cargo xtask deps` —
-    /// keeping the build-deps lean. The `interop-test` build.yaml target runs
-    /// it before the interop round-trip tests.
+    /// keeping the build-deps lean. The `plugin-e2e-tests` build.yaml target
+    /// runs it before the interop round-trip tests.
     ProvisionUpstreamV2ray,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///

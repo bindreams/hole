@@ -20,12 +20,12 @@
 //    target `hole::panic`, then chains the previous hook so the default printer
 //    still runs in dev mode.
 //
-// Non-blocking writers split into two categories (#388):
+// Non-blocking writers split into two categories:
 // - **Stderr + stdio-relay tees** keep `.lossy(true)` — a wedged terminal
 //   (Ctrl+S, pipe consumer hung) MUST NOT block the bridge or the panic
 //   hook.
 // - **File appender** is `.lossy(false)` — the teardown burst MUST land
-//   on disk for #388 diagnostics. Hang risk is bounded by the
+//   on disk for diagnostics. Hang risk is bounded by the
 //   `buffered_lines_limit` default (128k events) and by the fact that
 //   real disk wedges are user-visible (a stop that takes >2s is reported
 //   to the IPC caller).
@@ -38,22 +38,12 @@ use tracing_subscriber::EnvFilter;
 
 // Test-only flush mechanism ===========================================================================================
 //
-// Production never flushes the relay (the relay reader threads run
-// until process exit; their Drop is a no-op by design). Tests need a
-// deterministic "all bytes written so far have been consumed by the
-// reader and emitted as tracing events" hook so they don't sleep-
-// for-sync. The mechanism: `StdioRelayHandles::flush` writes a unique
-// in-band sentinel line through stderr/stdout, then blocks on a
-// `std::sync::mpsc::sync_channel` ack that the relay reader fires
-// when it consumes the sentinel. The sentinel is intercepted before
-// the tee/emit path so it does not pollute either log surface.
-// Event-driven, no polling.
-//
-// Synchronous (mpsc, not tokio::oneshot) so test scenarios that run
+// Tests need a deterministic relay-drained hook so they don't sleep
+// for sync; production never flushes — the relay reader threads run
+// until process exit. The mechanism lives on `StdioRelayHandles::flush`
+// below. Synchronous (mpsc, not tokio::oneshot) so scenarios that run
 // outside a tokio runtime — like the FD-redirect child-process
 // scenarios in `logging_test_helpers.rs` — can use it directly.
-//
-// See bindreams/hole#383.
 
 #[cfg(test)]
 pub(crate) const RELAY_FLUSH_SENTINEL_PREFIX: &str = "__hole_relay_flush__";
@@ -447,7 +437,7 @@ pub(crate) fn install_panic_hook_for_tests() {
 /// Called from production `init_multi` and from
 /// `hole-test-observability`'s ctor; safe to invoke from both because
 /// the `PANIC_HOOK_INSTALLED` AtomicBool ensures only one hook is
-/// chained per process. See bindreams/hole#301.
+/// chained per process.
 pub fn install_panic_hook() {
     if PANIC_HOOK_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -559,21 +549,13 @@ where
         file_rotate::compression::Compression::None,
         None,
     );
-    // **#388**: the FILE appender is `lossy(false)` so the proxy-stop
-    // teardown burst (SystemRoutes::drop entered / route command
-    // succeeded ×5 / state-file clear / Remove-NetAdapter / SystemRoutes::drop
-    // completed — emitted in tens of ms) is never silently truncated.
-    // Pre-#388 the lossy(true) channel dropped these events under burst
-    // pressure, leaving `bridge.log` missing the diagnostic for a
-    // teardown that broke the user's network.
-    //
-    // Hang risk acknowledgment: a wedged disk (full filesystem, OneDrive
-    // sync stall, AV scan) now back-pressures the tracing producer.
-    // Acceptable trade-off — the panic hook routes through the same
-    // subscriber, so a hang here means a hang in panic handling, which
-    // is more visible than silent log loss. The `buffered_lines_limit`
-    // (default 128k events) caps the queue, so the back-pressure window
-    // is bounded.
+    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
+    // (SystemRoutes::drop sequence — route commands, state-file clear,
+    // Remove-NetAdapter — emitted in tens of ms) must never be silently
+    // truncated, or `bridge.log` loses the diagnostic for a teardown that
+    // broke the user's network. Trade-off: a wedged disk (full filesystem,
+    // OneDrive sync stall, AV scan) back-pressures the tracing producer,
+    // bounded by `buffered_lines_limit` (default 128k events).
     //
     // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
     // terminal (Ctrl+S on a console session) MUST NOT block the bridge.

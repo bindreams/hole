@@ -192,14 +192,12 @@ impl ChainRunner {
     ///
     /// Fires `Ok(ChainReady)` once EVERY plugin has reported `PluginReady`;
     /// `Err(StartError)` as soon as any plugin reports a start failure or
-    /// exits before readying. Each plugin owns its own readiness now (it
-    /// sends through the `ready` channel passed to [`ChainPlugin::run`]);
-    /// the aggregator below collects the N per-plugin results into a single
-    /// chain-level outcome.
+    /// exits before readying. Each plugin reports its own readiness through
+    /// the `ready` channel passed to [`ChainPlugin::run`]; the aggregator
+    /// collects the N per-plugin results into one chain-level outcome.
     ///
     /// If shutdown fires before every plugin has readied, `tx` is dropped
-    /// and the receiver gets `RecvError` (the prior "shutdown before ready"
-    /// semantics).
+    /// and the receiver gets `RecvError`.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
@@ -372,9 +370,8 @@ async fn run_readiness_aggregator(
         let outcome = tokio::select! {
             biased;
             () = shutdown.cancelled() => {
-                // Shutdown before all plugins readied → drop ready_tx;
-                // receiver gets RecvError. Matches the old "shutdown before
-                // ready" semantics.
+                // Shutdown before all plugins readied → drop ready_tx; the
+                // receiver gets RecvError.
                 return;
             }
             r = rrx => r,

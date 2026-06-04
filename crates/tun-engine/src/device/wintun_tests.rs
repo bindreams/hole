@@ -88,9 +88,8 @@ fn wintun_missing_error_message_contains_paths() {
 // a real wintun.dll to load, which couples the test to host environment, and
 // the success path would mutate process-global state (the loaded module table)
 // that other tests cannot reliably reset. The empirical verification that
-// pre-loading + bare-name reload works was done out-of-band before adopting
-// this approach (see bindreams/hole#141). Path resolution is the part with
-// non-trivial logic, and that is fully unit-tested above.
+// pre-loading + bare-name reload works was done out-of-band. Path resolution
+// is the part with non-trivial logic, and that is fully unit-tested above.
 
 #[skuld::test]
 fn ensure_loaded_does_not_panic() {

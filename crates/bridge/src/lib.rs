@@ -24,15 +24,9 @@ pub mod socket;
 #[cfg(test)]
 mod test_support;
 
-// Cross-implementation interop tests (ex-ray ↔ stock v2ray-plugin). Like
-// `test_support`, there is no business-logic counterpart — it's a
-// cross-cutting integration test spanning the server harness + `server_test`
-// runner + provisioned upstream binary, so it's registered directly here
-// rather than as a sibling of a single source file. Unlike `server_test_tests`
-// (Linux-only behind #197/#200), it uses no TUN/routing and runs everywhere.
-#[cfg(test)]
-#[path = "interop_tests.rs"]
-mod interop_tests;
+// The cross-implementation interop suite (ex-ray ↔ stock v2ray-plugin) was
+// relocated to the `plugin-e2e` crate (#435) so it runs on a plugin-owned,
+// Linux-inclusive matrix instead of Hole's Win+mac bridge CI.
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
@@ -44,12 +38,9 @@ hole_test_observability::register!();
 fn main() {
     // Subprocess re-exec for the DistHarness panic-hook regression
     // test. Dispatches into the child-side handler BEFORE skuld
-    // initializes — so the deliberate panic doesn't interact with the
-    // test runner, AND so libtest's filter / `--nocapture` arg parsing
-    // is bypassed for the child (we want unconditional dispatch on the
-    // env var, regardless of what cargo nextest passes downstream).
-    // See `test_support/dist_harness_panic_hook_tests.rs` and
-    // bindreams/hole#303.
+    // initializes, so the deliberate panic and libtest's arg parsing are
+    // bypassed for the child (unconditional dispatch on the env var).
+    // See `test_support/dist_harness_panic_hook_tests.rs`.
     if std::env::var_os("HOLE_DIST_HARNESS_PANIC_TEST").is_some() {
         test_support::dist_harness_panic_hook_tests::run_child();
         std::process::exit(0);

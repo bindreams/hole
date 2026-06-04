@@ -1,8 +1,7 @@
-// Unit tests for the pure failure-message helper. See
-// bindreams/hole#393 for the original incident (silent failure → user
-// saw no toast) and #397 sub-bug C for the timeout-arm removal: the
-// discriminated union collapsed to a single interface once the
-// client-side timer was deleted.
+// Unit tests for the pure toggle_proxy failure-message helper.
+// ToggleFailure is a single { error: unknown } interface;
+// toggleFailureToast stringifies non-string rejections defensively
+// (no [object Object]).
 
 import { describe, expect, it } from "vitest";
 import { type ToggleFailure, toggleFailureToast } from "./toggle-failure";
@@ -31,16 +30,10 @@ describe("toggleFailureToast", () => {
 
 describe("ToggleFailure shape (regression for #397 sub-bug C)", () => {
   it("no longer accepts a `kind: 'timeout'` variant at the type level", () => {
-    // @ts-expect-error — { kind: "timeout" } was a member of the
-    // ToggleFailure union pre-#397 sub-bug C. The union collapsed to
-    // a plain { error: unknown } interface after the 15 s client-side
-    // timer was removed. Re-adding a discriminated variant requires
-    // intentional restructuring; this assertion catches accidental
-    // reintroduction.
+    // @ts-expect-error — ToggleFailure is a plain { error: unknown }
+    // interface, not a discriminated union. This guards against
+    // accidentally re-adding a `kind` variant.
     const _typeProbe: ToggleFailure = { kind: "timeout" };
-    // `_typeProbe` is intentionally unused — the @ts-expect-error
-    // above is the load-bearing assertion. We expect the line to
-    // produce a TS error, hence the directive.
     expect(_typeProbe).toBeDefined();
   });
 

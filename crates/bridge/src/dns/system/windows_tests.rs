@@ -5,9 +5,8 @@
 //! [`MockBackend`] to verify cancel-aware behavior in
 //! [`crate::dns::system::SystemDns::apply`] without touching the OS.
 
-// `CancellationToken::new` is the cancel-test harness root; module-level
-// allow per clippy.toml's "Bridge cancellation contract" sanctioned-
-// test-file exception.
+// `CancellationToken::new` is the cancel-test harness root — sanctioned
+// for test files by clippy.toml's "Bridge cancellation contract" exception.
 #![allow(clippy::disallowed_methods)]
 
 use std::io;
@@ -289,18 +288,17 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     drop(applied);
 }
 
-/// Regression for the release-mode dead-code bug in `SystemDnsApplied::Drop`:
-/// the previous gate `if !self.bomb.is_defused()` was always `false` in
-/// release (`drop_bomb::FakeBomb::is_defused()` returns `true`
-/// unconditionally), so the sync-fallback restore never ran on a missed
-/// `shutdown().await` in release — the user's DNS would stay pointed at
-/// the loopback forwarder forever.
+/// `SystemDnsApplied::Drop` MUST invoke the sync-fallback restore (and
+/// flush) in **both** debug and release when `shutdown().await` was
+/// skipped, so the user's DNS isn't left pointed at the loopback
+/// forwarder. The gate is `shutdown_completed`, not `bomb.is_defused()`
+/// (the latter is `true` unconditionally in release, which would make the
+/// fallback dead code there).
 ///
-/// The fix tracks a separate `shutdown_completed: bool` field; this test
-/// asserts the manual `Drop` impl invokes the backend's `restore` for
-/// each captured prior in **both** build profiles. In debug, the bomb's
-/// own Drop still panics afterward (manual Drop runs first, then field
-/// drops trigger the bomb) — `std::panic::catch_unwind` absorbs that.
+/// This test asserts the manual `Drop` impl invokes the backend's
+/// `restore` for each captured prior. In debug, the bomb's own Drop still
+/// panics afterward (manual Drop runs first, then field drops trigger the
+/// bomb) — `std::panic::catch_unwind` absorbs that.
 #[skuld::test]
 async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
     let backend = MockBackend::new();

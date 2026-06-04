@@ -21,8 +21,7 @@ import (
 
 const sitrepProtocol = "sitrep-1.0.0"
 
-// Event structs. Field declaration order == garter's SitrepEvent field order
-// (event-tag first), so json.Marshal produces byte-identical wire lines.
+// Event structs (field order matters — see file header).
 
 type helloEvent struct {
 	Event    string `json:"event"`

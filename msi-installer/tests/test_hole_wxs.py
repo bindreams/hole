@@ -778,8 +778,8 @@ def _find_publish(publishes: list[ET.Element], dialog: str, control: str, event:
 def test_installdirdlg_next_publishes_to_shortcutsdlg(package: ET.Element) -> None:
     """Override of upstream WixUI_InstallDir's Order=4 NewDialog→VerifyReadyDlg.
 
-    Our Order must be strictly greater than 4 (upstream's value, verified from
-    WiX v6.0.2 source) so MSI processes our row after, making our NewDialog win.
+    Our Order must be strictly greater than upstream's Order=4 so MSI processes
+    our row after and our NewDialog wins.
     """
     pub = _find_publish(_ui_publishes(package), "InstallDirDlg", "Next", "NewDialog", "ShortcutsDlg")
     assert pub is not None, (

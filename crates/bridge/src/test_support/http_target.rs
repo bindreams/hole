@@ -1,15 +1,13 @@
-//! HTTP / TCP sentinel helpers for tests that need a controllable "upstream"
-//! destination.
+//! Long-lived HTTP/1.0 sentinel for the e2e proxy tests.
 //!
-//! Two flavors:
-//! - [`start_fake_sentinel`] — single-shot TCP responder used by
-//!   `server_test_tests.rs` to simulate "the internet" for the runner's
-//!   sentinel-read phase. Accepts one connection, drains the request, sends
-//!   a fixed response, closes.
-//! - [`HttpTarget`] — long-lived HTTP/1.0 server that owns its own tokio
-//!   runtime, used by the e2e proxy tests as "the public internet." Bound
-//!   to either the host's primary IPv4 (so TUN routing actually catches the
-//!   traffic) or `[::1]` (for the IPv6 axis).
+//! [`HttpTarget`] owns its own tokio runtime and acts as "the public internet"
+//! for the `DistHarness`-backed bridge tests. It binds either the host's
+//! primary IPv4 (so TUN routing actually catches the traffic) or `[::1]` (for
+//! the IPv6 axis).
+//!
+//! The single-shot [`plugin_e2e::sentinel::start_fake_sentinel`] is the
+//! plugin-side counterpart (used by `server_test_tests` and the relocated
+//! plugin suites); it lives in the shared `plugin-e2e` harness.
 
 use crate::test_support::net_discovery::detect_primary_ipv4;
 use std::net::SocketAddr;
@@ -17,25 +15,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-
-/// Bind a TCP listener on `127.0.0.1:0` that, on the first accept, drains the
-/// request (so the client's `write_all` completes cleanly without an RST race),
-/// then sends `response` and closes. Returns the bound address and the
-/// spawned task handle.
-pub(crate) async fn start_fake_sentinel(response: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        if let Ok((mut sock, _)) = listener.accept().await {
-            let mut sink = [0u8; 256];
-            let _ = sock.read(&mut sink).await;
-            let _ = sock.write_all(&response).await;
-            let _ = sock.shutdown().await;
-        }
-    });
-    (addr, handle)
-}
 
 /// What address family / interface the [`HttpTarget`] binds to.
 pub(crate) enum TargetBind {

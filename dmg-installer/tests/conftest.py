@@ -11,12 +11,9 @@ import dmg_installer
 
 REPO_ROOT = dmg_installer._find_repo_root()
 
-# The xattr value Brave writes when downloading a .dmg. Recorded verbatim
-# from a real installed bundle on 2026-05-18: the third semicolon-separated
-# field is the source app, the fourth is a per-download UUID; the leading
-# `0381` is the quarantine flags field (uncleared + user-approved bit).
-# Mirroring the exact shape ensures Gatekeeper treats the test bundle the
-# same way it treats a real user install.
+# A com.apple.quarantine xattr value matching the shape Brave writes for a
+# downloaded .dmg, so Gatekeeper assesses the test bundle on the same code
+# path as a real user install.
 QUARANTINE_VALUE = "0381;6a0b6446;Brave;FAKE0000-0000-0000-0000-000000000000"
 
 

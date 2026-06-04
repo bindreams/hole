@@ -5,14 +5,10 @@
 //!
 //! # Why not libproc
 //!
-//! `libproc 0.14`'s `pids_by_path` reports a spurious `io::Error`
-//! whenever `proc_listpidspath` returns 0 bytes (the "no matches"
-//! case): it reads the thread's `errno` without first clearing it,
-//! so leftover `errno` from an unrelated prior syscall masquerades
-//! as a fresh error. Observed on GitHub Actions macOS 14/15 runners
-//! as `EINVAL` / `ESRCH` even for valid empty enumerations. The
-//! race is in libproc's `list_pids_ret`; we can't fix it from the
-//! outside. Shelling out to `lsof` dodges the quirk.
+//! `libproc 0.14`'s `pids_by_path` reads `errno` without first
+//! clearing it, so an empty enumeration surfaces stale `errno` from an
+//! unrelated prior syscall as a spurious `io::Error` (seen on macOS CI
+//! as `EINVAL` / `ESRCH`). Shelling out to `lsof` dodges the quirk.
 //!
 //! # `lsof` output format (we use `-F`)
 //!
@@ -42,9 +38,6 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
         .stderr(Stdio::null())
         .output()?;
 
-    // lsof returns 1 when no processes have the file open; that's
-    // not an error for us. Non-zero AND stderr-like failure would
-    // return empty here too — diagnostics are best-effort.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let holders = parse_lsof_fn_output(&stdout);
 

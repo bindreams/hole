@@ -1,12 +1,10 @@
 //! Windows system DNS capture / apply / restore via the Win32 native API.
 //!
-//! Pre-#397 this layer shelled out to `netsh interface {ipv4,ipv6} ...`.
-//! Each `netsh` subprocess took ~5–7 s on Defender-active machines, and
-//! four sequential subprocess invocations per start was the 22.6 s
-//! `apply_dns_settings` stall the user reported. The current path calls
-//! `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` /
-//! `DnsFlushResolverCache` directly via the `windows = "0.62"` crate. Each
-//! FFI is ms-scale; total apply ≈ 50 ms.
+//! This layer calls `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings`
+//! / `DnsFlushResolverCache` directly via the `windows = "0.62"` crate
+//! rather than shelling out to `netsh`. Each `netsh` subprocess cost ~5–7
+//! s on Defender-active machines (four per start); the direct FFIs are
+//! ms-scale (total apply ≈ 50 ms).
 //!
 //! ## Two layers
 //!
@@ -39,10 +37,11 @@
 //! The DNS configuration on a Windows adapter is split per address
 //! family. `SetInterfaceDnsSettings` configures one family per call —
 //! select v4 vs v6 via the `DNS_SETTING_IPV6` flag in
-//! [`DNS_INTERFACE_SETTINGS::Flags`]. To match pre-#397 netsh semantics
-//! the apply path **only configures v4** (loopback is always IPv4 from
-//! [`crate::dns::server::LocalDnsServer`]). v6 is left untouched on
-//! apply and replayed verbatim from the captured prior on restore.
+//! [`DNS_INTERFACE_SETTINGS::Flags`]. The apply path **only configures
+//! v4** because the loopback resolver from
+//! [`crate::dns::server::LocalDnsServer`] is always IPv4. v6 is left
+//! untouched on apply and replayed verbatim from the captured prior on
+//! restore.
 
 use std::io;
 use std::net::IpAddr;
@@ -90,8 +89,7 @@ pub trait WinDnsBackend: Send + Sync + 'static {
     fn get_settings(&self, alias: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
     /// Point the v4 DNS resolver on `alias` at `loopback`. v6 is left
-    /// untouched (matches pre-#397 netsh semantics — `loopback` is always
-    /// IPv4 from `LocalDnsServer`).
+    /// untouched (`loopback` is always IPv4 from `LocalDnsServer`).
     fn set_loopback(&self, alias: &str, loopback: IpAddr) -> io::Result<()>;
 
     /// Restore the captured prior DNS state for `adapter`. Replays both
@@ -180,8 +178,8 @@ impl WinDnsBackend for Win32Real {
             Some(g) => g,
             None => {
                 // Adapter vanished between capture and restore (e.g. user
-                // disconnected Wi-Fi). Match pre-#397 best-effort restore
-                // semantics: warn-and-skip, not Err.
+                // disconnected Wi-Fi); restore is best-effort: warn-and-skip
+                // rather than Err.
                 tracing::warn!(%alias, "Win32Real::restore: adapter not found; skipping");
                 return Ok(());
             }
@@ -207,10 +205,9 @@ impl WinDnsBackend for Win32Real {
             "Win32Real::flush"
         );
         // `DnsFlushResolverCache` returns BOOL — nonzero on success, zero
-        // on failure. A failed flush leaves the cache stale for up to one
-        // TTL window, which is the worst-case symptom and acceptable; we
-        // surface no error to the caller (matches the pre-#397
-        // fire-and-forget `ipconfig /flushdns` semantics).
+        // on failure. A failed flush is fire-and-forget; the worst case is
+        // a stale cache for one TTL window, so we surface no error to the
+        // caller.
         Ok(())
     }
 }
@@ -229,7 +226,8 @@ fn alias_to_guid(alias: &str) -> io::Result<Option<GUID>> {
     if rc != ERROR_SUCCESS {
         // ERROR_INVALID_PARAMETER (87) is what `ConvertInterfaceAliasToLuid`
         // returns when the alias doesn't match an installed adapter — map
-        // that to `Ok(None)` to match pre-#397 "skip silently" semantics.
+        // that to `Ok(None)` so a missing alias is skipped silently rather
+        // than erroring.
         if rc.0 == 87 {
             return Ok(None);
         }
@@ -275,9 +273,7 @@ fn empty_settings(ipv6: bool) -> DNS_INTERFACE_SETTINGS {
 /// None}` trichotomy, we treat a blank `NameServer` as
 /// [`DnsPrior::Dhcp`] for v4 (the historically common case) and
 /// [`DnsPrior::None`] for v6 (Windows rarely DHCP-assigns DNS v6 servers
-/// on consumer setups). This is best-effort — the pre-#397 netsh parser
-/// had the same lossy collapse on `"DNS servers configured through DHCP:
-/// None"`.
+/// on consumer setups). This is best-effort.
 fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
     let mut settings = empty_settings(ipv6);
     // SAFETY: `settings` is an owned `DNS_INTERFACE_SETTINGS` whose
@@ -411,9 +407,7 @@ pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
 }
 
 /// Flush the OS resolver cache. Inline call to [`DnsFlushResolverCache`]
-/// (~10 ms FFI). The pre-#397 implementation detached `ipconfig /flushdns`
-/// onto a `std::thread::spawn`'d thread because the subprocess took 1–5 s
-/// (Phase 4 #247). The FFI is ms-scale; inline is correct.
+/// (~10 ms FFI); no need to detach onto a thread.
 pub fn flush_dns_cache() {
     let _ = Win32Real.flush();
 }

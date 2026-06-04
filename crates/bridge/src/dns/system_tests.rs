@@ -3,11 +3,11 @@ use crate::dns_state::DnsPrior;
 #[cfg(target_os = "macos")]
 use std::net::{IpAddr, Ipv4Addr};
 
-// Timing-log instrumentation tests (#247) =============================================================================
+// Timing-log instrumentation tests ====================================================================================
 //
-// These tests verify that Phase 1 diagnostic logs fire. They live outside
-// the `macos_parsers` module because they exercise real OS command
-// invocations (networksetup), which the parser tests deliberately avoid.
+// These tests verify the per-operation diagnostic timing logs fire. They
+// live outside the `macos_parsers` module because they invoke real OS
+// commands (networksetup), which the parser tests deliberately avoid.
 
 #[cfg(target_os = "windows")]
 mod windows_timing_logs {
@@ -17,11 +17,9 @@ mod windows_timing_logs {
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    /// Post-#397 (Win32-native): `flush_dns_cache` calls
-    /// `DnsFlushResolverCache` inline (~10 ms FFI). The pre-#397
-    /// implementation detached `ipconfig /flushdns` onto a
-    /// `std::thread::spawn`'d thread because that subprocess took 1–5 s
-    /// (Phase 4 #247). The FFI is ms-scale, so inline is correct.
+    /// `flush_dns_cache` calls the `DnsFlushResolverCache` FFI inline
+    /// (ms-scale). This test guards that it stays inline (no subprocess
+    /// detach) by asserting it returns quickly.
     #[skuld::test]
     fn flush_dns_cache_returns_quickly() {
         let start = std::time::Instant::now();
@@ -35,9 +33,9 @@ mod windows_timing_logs {
         );
     }
 
-    /// `capture_adapters` (the pre-#397 free-function shim) routes
-    /// through `Win32Real::get_settings`, which emits per-alias DEBUG
-    /// timing logs. Uses a nonexistent adapter so the test doesn't
+    /// `capture_adapters` routes through `Win32Real::get_settings`, which
+    /// emits per-alias DEBUG timing logs. Uses a nonexistent adapter so the
+    /// test doesn't
     /// depend on host network configuration — `ConvertInterfaceAliasToLuid`
     /// returns ERROR_INVALID_PARAMETER quickly and the timing log fires.
     #[skuld::test]

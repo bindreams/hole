@@ -64,10 +64,9 @@ pub fn generate_plist(binary_path: &str) -> String {
 /// caller). Returns Ok iff the exit status was success; the caller gets a
 /// structured `io::Error::other(...)` with the operation label baked in.
 ///
-/// Historically these calls used `.status()` with inherited stdio, so any
-/// launchctl error (bad plist, permissions, missing service) went straight
-/// to the bridge's terminal — lost in service mode. Capturing the output
-/// lets the file log explain what actually went wrong.
+/// Output is captured (not inherited) so launchctl errors (bad plist,
+/// permissions, missing service) land in bridge.log instead of a terminal
+/// nobody sees in service mode.
 ///
 /// Failure severity is an argument because some call sites are best-effort
 /// (e.g. `uninstall` runs `bootout` on a service that may not be loaded, and

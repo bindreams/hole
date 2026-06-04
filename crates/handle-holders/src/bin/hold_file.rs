@@ -3,8 +3,6 @@
 // handle now", then blocks on stdin EOF. The parent test reads the
 // signal byte (no sleep-based wait), runs its assertions, then closes
 // stdin via `child.kill()` — read_to_string returns and we exit.
-//
-// See bindreams/hole#383 — replaces the previous 60s sleep loop.
 
 use std::io::{Read, Write};
 

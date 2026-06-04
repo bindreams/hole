@@ -1,16 +1,13 @@
 use super::remove_adapter;
 
-/// **#388**: calling `remove_adapter` with a name that doesn't match any
-/// real adapter must complete cleanly (no panic, no hang). PowerShell's
-/// `Get-NetAdapter -ErrorAction SilentlyContinue` swallows the
-/// not-found error, so the pipe exits 0 and the function logs at
-/// `debug!` level.
+/// `remove_adapter` with a name matching no real adapter completes
+/// cleanly (no panic, no hang): `Get-NetAdapter -ErrorAction
+/// SilentlyContinue` swallows the not-found error, the pipe exits 0,
+/// and the function logs at `debug!`.
 ///
-/// **Privilege caveat**: `Remove-NetAdapter` requires elevation. When the
-/// test process is unprivileged, the inner Remove-NetAdapter step would
-/// fail with access-denied — but `Get-NetAdapter` returns nothing on
-/// our test name, so `ForEach-Object` runs zero iterations and we never
-/// hit the elevation check. So the test passes regardless of elevation.
+/// `Remove-NetAdapter` needs elevation, but `ForEach-Object` runs zero
+/// iterations on a non-matching name, so the test passes regardless of
+/// privilege.
 #[skuld::test]
 #[cfg(target_os = "windows")]
 fn remove_adapter_for_absent_name_is_silent_noop() {

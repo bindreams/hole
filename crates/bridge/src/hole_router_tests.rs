@@ -264,8 +264,6 @@ fn cascade_table() {
     }
 }
 
-// BlockEndpoint log-methods — rate-limit and one-shot behavior ========================================================
-
 // LocalDns interception ===============================================================================================
 
 #[skuld::test]
@@ -331,9 +329,9 @@ fn udp53_v6_destination_also_intercepted() {
 
 #[skuld::test]
 fn udp53_without_local_dns_keeps_existing_behavior() {
-    // When local_dns is None (intercept_udp53 disabled), the cascade
-    // reverts to the pre-refactor behavior: Proxy + UDP + !proxy_udp
-    // drops via the privacy invariant.
+    // When local_dns is None (intercept_udp53 disabled), UDP/53 follows
+    // the normal cascade: Proxy + UDP + !proxy_udp drops via the privacy
+    // invariant.
     let r = router_with(false, true);
     let got = classify(
         r.resolve_endpoint(FilterAction::Proxy, L4Proto::Udp, v4("8.8.8.8", 53), Some(0)),

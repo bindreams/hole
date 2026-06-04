@@ -60,7 +60,7 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
 
     // Capture WFP + NDIS state after recovery has had a chance to clean
     // up. Each probe emits a one-line INFO (always) + WARN on anomaly +
-    // DEBUG detail (gated). See #200.
+    // DEBUG detail (gated).
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {

@@ -10,8 +10,6 @@
 //! the end (success or failure), and the test calls `wait_ui_ready`
 //! to park on a `watch` channel until the signal arrives. No polling,
 //! no timeouts in the sync path.
-//!
-//! See bindreams/hole#383.
 
 use tokio::sync::watch;
 

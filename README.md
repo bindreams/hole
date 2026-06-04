@@ -29,8 +29,8 @@ Communication happens over IPC (Unix socket on macOS, named pipe on Windows) usi
 On first launch after installing from the DMG, macOS will say "Hole cannot be
 opened because the developer cannot be verified." Right-click the app →
 **Open** → **Open** in the confirmation dialog. This is a one-time step per
-machine; subsequent launches work normally. Tracked for removal once Developer
-ID + notarization is in place (#365).
+machine; subsequent launches work normally. This step goes away once the app
+is notarized.
 
 ## Build
 

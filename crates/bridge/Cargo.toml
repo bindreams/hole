@@ -17,6 +17,7 @@ harness = false
 [dependencies]
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
+util = { path = "../util" }
 handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
 dump = { path = "../dump" }
@@ -109,10 +110,12 @@ tokio = { version = "1", features = ["test-util"] }
 # `elapsed_ms` debug logs (#247) and the forwarder's typed-error log
 # lines (layer=..., caused_by=...) added for #248.
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-shadowsocks-service = { version = "1", features = ["server"] }
-rcgen = "0.14"
+# Shared plugin test harness (real ss-server +/- server-mode plugin, certs,
+# sentinel, the garter-based roundtrip driver, binary locators). Brings
+# shadowsocks-service's `server` feature + rcgen + base64 transitively; the
+# bridge's own tests no longer reference those directly after the move (#435).
+plugin-e2e = { path = "../plugin-e2e" }
 rand = "0.10"
-base64 = "0.22"
 # Used by `test_support::net_discovery` for primary IPv4 detection in TUN tests.
 default-net = "0.22"
 # Library dep on the workspace task runner so the dist-directory e2e test

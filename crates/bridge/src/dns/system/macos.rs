@@ -158,11 +158,8 @@ pub fn capture_adapters(services: &[String]) -> io::Result<Vec<DnsPriorAdapter>>
     Ok(out)
 }
 
-/// Flush the macOS DNS cache.
-///
-/// Pre-#397 this was a fire-and-forget detached thread because the
-/// `dscacheutil` subprocess was thought slow. The actual cost is
-/// ms-scale; inline-through-[`Networksetup::flush`] is correct.
+/// Flush the macOS DNS cache inline via [`Networksetup::flush`] — the
+/// `dscacheutil` cost is ms-scale.
 pub fn flush_dns_cache() {
     let _ = Networksetup.flush();
 }

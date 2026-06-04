@@ -17,18 +17,12 @@ use tracing::{debug, info, warn};
 const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 // ImportFailure =======================================================================================================
-//
-// Structured failure type for `import_servers_from_file`. The frontend
-// matches on the `kind` discriminator to pick a user-friendly blocking
-// dialog title + body (e.g. "This file is corrupted or in a wrong
-// format", "Unsupported plugin"). Avoids the string-parsing-hack of
-// guessing failure mode from a free-form error string at the JS
-// boundary. See bindreams/hole#385 and the JS-side `friendlyDialog`
-// helper at `ui/import-failure.ts`.
 
 /// Structured import failure surfaced to the frontend. Tagged enum
 /// (serde `tag = "kind"`) so the JS side branches on the discriminator
-/// without parsing free-form strings.
+/// to pick a user-friendly blocking dialog rather than parsing failure
+/// mode out of a free-form error string. See the JS-side `friendlyDialog`
+/// helper at `ui/import-failure.ts`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportFailure {
@@ -475,8 +469,8 @@ pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Val
     }
 
     // Bridge unreachable — fetch directly (shows ISP IP)
-    // Uses ureq v3 API (Agent-based, NOT free functions)
     let result = tokio::task::spawn_blocking(|| {
+        // ureq v3 API: Agent-based, not free functions.
         let agent = ureq::Agent::new_with_defaults();
         let body: serde_json::Value = agent
             .get("https://ipinfo.io/json")

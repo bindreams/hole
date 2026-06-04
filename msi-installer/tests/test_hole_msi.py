@@ -29,7 +29,7 @@ def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Create a staging directory with non-zero dummy binaries.
 
     Non-zero so the embedded cabinet actually contains data and the
-    relocated-extract test (#357) has files to find post-extraction.
+    relocated-extract test has files to find post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
     # Mirror the bindir layout from `cargo xtask stage` (hole.exe + hole.pdb + ex-ray.exe + wintun.dll + NOTICES.md).
@@ -390,13 +390,9 @@ def test_decompiled_has_shortcutsdlg(decompiled_tree: ET.ElementTree) -> None:
 
 # UI override-wins tests ===============================================================================================
 #
-# `wix msi decompile` lowers MSI ControlEvent rows to nested <Publish>
-# children under each Control. The order in which rows fire — the MSI Order
-# column ascending — is preserved as XML document order. For NewDialog, the
-# LAST row with a true condition wins (each fired Publish sets the new
-# dialog, last writer wins). So "our override beats upstream" is structurally
-# equivalent to "the last NewDialog <Publish> under (Dialog/Control) has our
-# target as Value".
+# `wix msi decompile` lowers MSI ControlEvent rows to nested <Publish> in MSI
+# Order order (preserved as XML document order); for NewDialog the last
+# true-condition row wins, so the override must appear last.
 
 
 def _new_dialog_targets(pkg: ET.Element, dialog_id: str, control_id: str, condition: str | None = None) -> list[str]:

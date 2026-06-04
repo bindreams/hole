@@ -60,8 +60,6 @@ impl Device {
         // IPv6: the `tun` crate's `Configuration` doesn't expose a v6
         // address setter — the OS assigns one via route/addr commands
         // elsewhere (or via smoltcp's internal address list for routing).
-        // Engine::build configures the smoltcp interface with both addrs
-        // regardless.
 
         let tun = tun::create_as_async(&tun_config).map_err(|e| DeviceError::TunOpen(std::io::Error::other(e)))?;
 

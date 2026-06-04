@@ -1,7 +1,6 @@
 //! `build.yaml` manifest: target registry for `cargo xtask build|run|list`.
 //!
-//! See `build.yaml` at the repo root for the user-facing schema and the
-//! `i-want-to-brainstorm-zippy-lightning` design doc for the rationale.
+//! See `build.yaml` at the repo root for the user-facing schema.
 //!
 //! This module owns the **types**, the **serde shape** (with all the
 //! short-syntax shorthand), and **structural validation** (no missing deps,

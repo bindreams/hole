@@ -13,8 +13,8 @@ import (
 // This is the structural guarantee that v2ray-core log output reaches
 // stderr and NOT fd 1: init() installs stderrConsoleCreator as the Console
 // HandlerCreator, so the only thing this test must confirm is that the
-// creator yields a usable handler. The bridge-level interop test
-// (interop_tests.rs) additionally exercises the live path — it parses
+// creator yields a usable handler. The plugin-e2e interop test
+// (plugin-e2e/tests/interop.rs) additionally exercises the live path — it parses
 // ex-ray's `ready` sitrep off stdout for a successful round-trip — but note
 // it does NOT assert stdout is *exclusively* sitrep (garter's ExpectSitrep
 // reader tolerates stray non-JSON stdout lines as log passthrough). Reliable

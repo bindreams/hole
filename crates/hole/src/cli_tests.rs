@@ -108,7 +108,7 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
     assert!(should_install_cli_log_guard(&Command::Path {
         action: PathAction::Add,
     }));
-    // The new Proxy subcommand variants must also install the guard so
+    // Proxy subcommand variants must also install the guard so
     // failures land in `gui-cli.log`.
     assert!(should_install_cli_log_guard(&Command::Proxy {
         action: ProxyAction::Stop,

@@ -51,7 +51,7 @@ pub fn is_known(name: &str) -> bool {
 /// order from [`KNOWN_PLUGINS`]. Covers ALL descriptors (including the
 /// non-user-visible `ex-ray` impl-detail entry) — this is the
 /// resolution / error-context list. For the user-facing supported list,
-/// use [`user_visible_plugin_names`]. See bindreams/hole#385.
+/// use [`user_visible_plugin_names`].
 pub fn known_plugin_names() -> impl Iterator<Item = &'static str> {
     KNOWN_PLUGINS.iter().map(|p| p.name)
 }
@@ -60,7 +60,6 @@ pub fn known_plugin_names() -> impl Iterator<Item = &'static str> {
 /// [`user_visible`](PluginDescriptor::user_visible) entries. `ex-ray` is
 /// an implementation detail of `v2ray-plugin` and is omitted here so the
 /// GUI's supported list and the import error message don't advertise it.
-/// See bindreams/hole#414.
 pub fn user_visible_plugin_names() -> impl Iterator<Item = &'static str> {
     KNOWN_PLUGINS.iter().filter(|p| p.user_visible).map(|p| p.name)
 }
@@ -89,10 +88,10 @@ pub fn known_plugin_names_joined() -> String {
 /// end-to-end UDP capability comes from the plugin's reported sitrep
 /// `transports` (read via `PluginChain::transports()` in the bridge — the
 /// single source of truth for whether `Proxy`-routed UDP flows are
-/// carried or dropped, #414). This function only decides which transports
+/// carried or dropped). This function only decides which transports
 /// to *verify-free* at allocation time.
-pub fn plugin_alloc_protocols(binary_name: &str) -> crate::port_alloc::Protocols {
-    use crate::port_alloc::Protocols;
+pub fn plugin_alloc_protocols(binary_name: &str) -> util::port_alloc::Protocols {
+    use util::port_alloc::Protocols;
     match binary_name {
         "galoshes" => Protocols::TCP | Protocols::UDP,
         _ => Protocols::TCP,

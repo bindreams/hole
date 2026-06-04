@@ -40,10 +40,10 @@ pub fn tray_image(state: TrayState) -> Image<'static> {
 
 // macOS ===============================================================================================================
 
-// Enabled and Disabled intentionally resolve to the same bytes (user
-// spec 2026-05-10: the designer hasn't shipped a separate disabled
-// design). The `TrayState` enum is kept so a future design can drop in
-// at this dispatch site without API churn at every call site.
+// Enabled and Disabled intentionally resolve to the same bytes (no
+// separate disabled design yet). The `TrayState` enum is kept so a
+// future design can drop in at this dispatch site without API churn at
+// every call site.
 #[cfg(target_os = "macos")]
 fn macos_image(_state: TrayState) -> Image<'static> {
     const TEMPLATE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray-template.rgba"));

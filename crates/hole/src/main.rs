@@ -100,7 +100,8 @@ fn launch_gui(show_dashboard: bool) {
         .plugin(tauri_plugin_dialog::init())
         // `.skip_logger()` is critical: `tracing-subscriber 0.3`'s default
         // features include `tracing-log`, which installs `LogTracer` as the
-        // global `log` dispatcher during `try_init` above. `tauri-plugin-log`
+        // global `log` dispatcher during `logging::init()` earlier in
+        // `launch_gui`. `tauri-plugin-log`
         // by default *also* calls `log::set_boxed_logger`, which would
         // collide — a second install fails. `skip_logger` makes the plugin
         // only handle JS→Rust IPC: incoming JS `info!`/`error!` calls become
@@ -165,12 +166,11 @@ fn launch_gui(show_dashboard: bool) {
 
 /// Tauri run-event handler. Implements the Tauri 2 equivalent of Qt's
 /// `QApplication::setQuitOnLastWindowClosed(false)` and a destroy-then-exit
-/// dance that works around tao 0.34.8 calling `std::process::exit` at the
+/// dance that works around tao calling `std::process::exit` at the
 /// end of `EventLoop::run` (which bypasses every `Drop` in the wry/Tauri
 /// tree).
 ///
-/// The wry runtime fires `RunEvent::ExitRequested` from two places
-/// (verified in tauri-runtime-wry-2.10.1/src/lib.rs):
+/// The wry runtime fires `RunEvent::ExitRequested` from two places:
 ///
 ///   - `code: None`  — last window destroyed (the user clicked X on the
 ///     dashboard). We want the app to keep running for the tray icon, so

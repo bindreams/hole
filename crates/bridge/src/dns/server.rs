@@ -5,7 +5,7 @@
 //! response caching. A `RequestHandler` wrapper would add serialization
 //! overhead and conceptual weight for no gain.
 //!
-//! Loopback bind ladder (per plan "Loopback bind-fallback ladder"):
+//! Loopback bind ladder:
 //!
 //! 1. `127.0.0.1:53` — the conventional default
 //! 2. `127.53.0.1:53 .. 127.53.0.254:53` — Hole-dedicated /24 sweep
@@ -17,7 +17,7 @@
 //! one transport).
 //!
 //! Ephemeral-port callers of [`LocalDnsServer::bind`] (port 0, used by
-//! tests) delegate to [`hole_common::port_alloc::bind_ephemeral`] to
+//! tests) delegate to [`util::port_alloc::bind_ephemeral`] to
 //! absorb the Windows-specific bind race where the OS's independent
 //! TCP/UDP excluded-port-range tables disagree. Fixed-port callers
 //! ([`LocalDnsServer::bind_ladder`] with port 53) bypass the wrapper:
@@ -37,12 +37,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use hole_common::port_alloc::{self, Protocols};
-use hole_common::retry::is_bind_race;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use util::port_alloc::{self, Protocols};
+use util::retry::is_bind_race;
 
 use crate::dns::forwarder::DnsForwarder;
 
@@ -72,7 +72,7 @@ impl LocalDnsServer {
     /// need UDP and TCP on the same address.
     ///
     /// When `addr.port() == 0` the bind is delegated to
-    /// [`hole_common::port_alloc::bind_ephemeral`], which absorbs the
+    /// [`util::port_alloc::bind_ephemeral`], which absorbs the
     /// Windows `WSAEACCES` race where the OS's independent TCP/UDP
     /// excluded-port-range tables reject a freshly-allocated port on
     /// the paired transport. Fixed-port callers skip the wrapper —
@@ -142,17 +142,16 @@ impl LocalDnsServer {
     /// UDP and TCP bind succeeds. Returns an explicit error when the whole
     /// ladder is exhausted.
     ///
-    /// **Cooperative cancel (#397).** Checks `cancel.is_cancelled()` at
-    /// each candidate boundary; on cancel returns an `io::Error::other`
-    /// whose message names the attempt count. The caller's outer
+    /// **Cooperative cancel.** Checks `cancel.is_cancelled()` at each
+    /// candidate boundary; on cancel returns an `io::Error::other` whose
+    /// message names the attempt count. The caller's outer
     /// `tokio::select!` against the same token sees the cancel first
     /// (biased ordering) and re-emits `ProxyError::Cancelled` canonically;
     /// the internal early-exit is the safety net for callers that drive
     /// `bind_ladder` without an outer select. Mid-attempt cancel
     /// granularity (cancel-during-`socket::bind`) is impractical on
     /// Windows where the bind syscall is uninterruptible; the worst-case
-    /// cancel response is the duration of one bind attempt — typically
-    /// ms — see the "Bind-ladder worst-case cancel latency" follow-up.
+    /// cancel response is the duration of one bind attempt — typically ms.
     ///
     /// Logs adaptive `info!` checkpoints at attempts 10, 20, 30 … so a
     /// stuck ladder stays visible at the default log level without
@@ -313,17 +312,12 @@ pub(super) fn ladder_candidates() -> Vec<SocketAddr> {
 // Listener factories ==================================================================================================
 //
 // Windows: build via `socket2` so we can flip `SO_EXCLUSIVEADDRUSE` before
-// `bind`. **This is forward-looking defense, not a fix for the #398
-// production bug.** Per MSDN's documented Winsock matrix,
-// `SO_EXCLUSIVEADDRUSE` on a specific-address bind does NOT refuse
-// coexistence with a pre-existing `SO_REUSEADDR` wildcard holder on
-// `0.0.0.0:P` — they target different addresses, so the kernel allows
-// both. The #398 production bug (ICS / `svchost` wins inbound routing on
-// `127.0.0.1:53` despite Hole's specific bind succeeding) is caused by
-// ICS-specific kernel-level routing override and is defended by the
-// post-bind self-test below. `SO_EXCLUSIVEADDRUSE` here prevents a
-// FUTURE process from using `SO_REUSEADDR` to steal traffic from Hole's
-// already-bound listener (the symmetric case MSDN does document).
+// `bind`. This is forward-looking defense — it prevents a FUTURE process
+// from using `SO_REUSEADDR` to steal traffic from Hole's already-bound
+// listener. It does NOT refuse a pre-existing `SO_REUSEADDR` wildcard
+// holder on `0.0.0.0:P` (per MSDN's Winsock matrix the kernel allows the
+// two different-address binds to coexist), so the actual inbound-routing
+// hijack detector is the post-bind self-test below, not this sockopt.
 //
 // `socket2 0.6` exposes no `set_exclusive_address_use` wrapper; use the
 // `windows` crate's `setsockopt` directly, mirroring
@@ -444,11 +438,9 @@ fn self_test_error(message: impl Into<String>) -> io::Error {
     io::Error::other(SelfTestError(message.into()))
 }
 
-/// 4-byte magic prefix identifying our sentinel datagrams. Real DNS
-/// payloads never start with these bytes (DNS byte 0 is the
-/// transaction-id high byte, which is random; the chance of collision
-/// is ~1/2^32 per inbound query, and even on collision the remaining
-/// discriminator fields filter it).
+/// 4-byte magic prefix identifying our sentinel datagrams. A colliding
+/// inbound query is filtered by the remaining discriminator fields (see
+/// `discriminator_matches`).
 const SENTINEL_MAGIC: [u8; 4] = *b"HOLE";
 /// Total sentinel payload size: 4 magic + 4 must-be-zero + 8 nonce.
 const SENTINEL_LEN: usize = 16;

@@ -14,8 +14,7 @@
 const ISO_ALPHA2 = /^[A-Za-z]{2}$/;
 
 export function setCountryFlag(el: HTMLElement, cc: string | null | undefined): void {
-  // Strip any prior fi-* class. flag-icons owns the .fi- prefix on this
-  // element; nothing else in the project applies fi-* classes.
+  // Strip any prior fi-* class before applying the new one.
   for (const cls of [...el.classList]) {
     if (cls.startsWith("fi-")) el.classList.remove(cls);
   }

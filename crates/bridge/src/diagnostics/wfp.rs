@@ -66,8 +66,8 @@ pub fn log_snapshot(phase: &'static str) {
 ///
 /// `file=-` writes to stdout instead of `filters.xml` in CWD.
 /// `localaddr=127.0.0.1 dir=OUT` narrows to filters that could affect
-/// outbound connects to localhost — the exact direction hanging in
-/// #200. `verbose=on` includes the provider key GUID per filter so the
+/// outbound connects to localhost — the path a TUN/loopback-routing
+/// leak would block. `verbose=on` includes the provider key GUID per filter so the
 /// debug-level output has enough information to trace a leaked filter
 /// back to its provider without needing a second `show providers` call.
 fn run_netsh() -> std::io::Result<String> {

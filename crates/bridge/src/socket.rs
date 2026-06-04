@@ -179,9 +179,8 @@ mod imp {
                         return Ok(LocalStream { inner: tokio_stream });
                     }
                     Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No pending connection — sleep briefly and retry.
-                        // The sleep yields to tokio, allowing task cancellation
-                        // on server shutdown.
+                        // Yield to tokio between accept polls so the task
+                        // can be cancelled on shutdown.
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }

@@ -1,10 +1,8 @@
 // Unit tests for the extracted toggle-flow module. The key invariant
-// tested here is the absence of a client-side `cancel_proxy` timer:
-// pre-#397 sub-bug C, `toggleFromIdle` raced toggle_proxy against a
-// 15 s setTimeout and fired cancel_proxy on its own initiative,
-// producing a false-failure UI on slow-but-working starts. After the
-// fix the UI stays in `connecting` until the bridge IPC returns; the
-// user's Cancel button is the only escape hatch.
+// tested here is that `toggleFromIdle` schedules NO client-side timer:
+// the UI stays in `connecting`/`disconnecting` until the bridge IPC
+// returns; the user's Cancel button (`cancel_proxy`) is the only escape
+// hatch.
 //
 // Sync-invariant note (CLAUDE.md §"Synchronization invariant"): this
 // test uses `vi.useFakeTimers()` + `vi.getTimerCount()` to assert the
@@ -41,12 +39,8 @@ function makeHarness(): Harness {
     h.state = next;
   });
   h.deps = {
-    // Cast: Vitest's Mock<G> for a generic-typed signature G erases the
-    // generic at the Mock-typed value, so the result type widens to
-    // Promise<unknown> at the call site. Asserting back to the original
-    // generic shape is the standard escape hatch — the actual runtime
-    // behavior is unaffected; we're just informing tsc that this Mock
-    // honors the generic signature for production assertion purposes.
+    // vi.fn erases the generic from invoke's signature; cast back so
+    // tsc accepts the typed call sites.
     invoke: h.invoke as ToggleDeps["invoke"],
     getState: () => h.state,
     setState: h.setState,
@@ -68,10 +62,8 @@ afterEach(() => {
 
 describe("toggleFromIdle: client-side timer absence (regression for #397 sub-bug C)", () => {
   it("schedules NO timers and fires no cancel_proxy while toggle_proxy is pending", async () => {
-    // toggle_proxy resolves never — simulates a slow-but-working bridge
-    // start where the IPC eventually returns Ok but takes longer than
-    // the OLD 15 s client timer. Pre-fix this would have spuriously
-    // fired cancel_proxy. Post-fix the UI just stays in `connecting`.
+    // toggle_proxy resolves never (slow-but-working bridge start). The
+    // UI must stay in `connecting` and schedule no timer.
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
       if (cmd === "toggle_proxy") return new Promise(() => {});
@@ -87,12 +79,9 @@ describe("toggleFromIdle: client-side timer absence (regression for #397 sub-bug
     await Promise.resolve();
     expect(h.state).toBe("connecting");
 
-    // STRUCTURAL ASSERTION (CLAUDE.md memory "no heuristic checks"):
-    // assert that toggleFromIdle scheduled ZERO pending timers after
-    // its synchronous prelude. This is invariant to threshold — a
-    // future PR that re-introduces a 35 s (or any other duration)
-    // client-side timer would fail this check immediately, with no
-    // dependence on a magic "advance for X ms then look" number.
+    // Structural assertion: zero pending timers, independent of any
+    // duration. Re-introducing a client-side timer of any length fails
+    // this immediately.
     expect(vi.getTimerCount()).toBe(0);
 
     // The in-flight toggle_proxy promise never resolves, so no further

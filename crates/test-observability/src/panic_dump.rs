@@ -11,18 +11,15 @@
 //! is always present in test binaries that invoke
 //! `hole_test_observability::register!()`.
 //!
-//! Originated as `DistHarness::install_panic_hook_once` in
-//! [crates/bridge/src/test_support/dist_harness.rs]; see
-//! bindreams/hole#303 for the extraction rationale (avoiding parallel
-//! per-consumer hook chains).
+//! Primary consumer: `BridgeChildLogSource` in
+//! [crates/bridge/src/test_support/dist_harness.rs].
 //!
 //! ## Contract for `dump` implementations
 //!
 //! `dump` is called from inside a panic hook. Implementations MUST
 //! swallow all I/O errors silently — a double-panic from `unwrap()`
 //! or `?` would replace the original panic's message with an I/O
-//! error, destroying the diagnostic. Mirrors the silent-on-write-error
-//! behaviour of the original `dump_harness_log`.
+//! error, destroying the diagnostic.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -79,9 +76,7 @@ fn next_key() -> u64 {
 ///
 /// On a poisoned registry mutex (e.g. a panic hook is currently
 /// iterating), registration silently no-ops and the returned guard is
-/// a tombstone — its `Drop` is also a no-op. Mirrors the
-/// silent-on-poison property of the original DistHarness
-/// `install_panic_hook_once`.
+/// a tombstone — its `Drop` is also a no-op.
 ///
 /// `next_key()` uses `AtomicU64::fetch_add(1)`; overflow is structurally
 /// out of reach (at 1 register/μs that's 584,000 years).
@@ -112,8 +107,7 @@ pub(crate) fn install_panic_hook_once() {
         std::panic::set_hook(Box::new(move |info| {
             // Diagnostic marker so operators reading raw stderr can
             // confirm the dispatcher actually fired before looking for
-            // source dumps. Inherited from the pre-#303 DistHarness
-            // panic hook.
+            // source dumps.
             let _ = writeln!(std::io::stderr().lock(), "[panic_dump] dispatcher fired: {info}");
             // Snapshot the registry under the lock, then release it
             // before iterating. Calling `dump()` while holding the

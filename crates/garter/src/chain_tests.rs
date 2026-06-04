@@ -37,20 +37,12 @@ fn allocate_multiple_ports_are_unique() {
     assert_eq!(unique.len(), 5, "all allocated ports should be unique");
 }
 
-/// A transient `WSAEACCES` at the rebind step inside `allocate_one_port` —
-/// as happens when Windows' TCP dynamic excluded-port range shifts between
-/// drop and rebind (Hyper-V / WSL2 / Docker Desktop reservations, visible via
-/// `netsh int ipv4 show excludedportrange`) or when another socket holds
-/// the port with `SO_EXCLUSIVEADDRUSE` on a wildcard interface — must be
-/// absorbed: `allocate_one_port` should retry with a fresh ephemeral port
-/// and return `Ok(addr)`, the same as it does for `WSAEADDRINUSE`.
-///
-/// The test drives this via the documented asymmetric Winsock rule: when
-/// socket A holds the port with `SO_EXCLUSIVEADDRUSE` on a **wildcard
-/// address** (`0.0.0.0:P`), a subsequent non-exclusive bind to the same
-/// port on a **specific address** (`127.0.0.1:P`) returns `WSAEACCES`, not
-/// `WSAEADDRINUSE`. This lets the test deterministically force the
-/// `WSAEACCES` path on any Windows host without admin. See GitHub #20.
+/// A transient `WSAEACCES` at the rebind step inside `allocate_one_port` must
+/// be absorbed (retry on a fresh ephemeral port, return `Ok`), the same as
+/// `WSAEADDRINUSE`. The test forces the `WSAEACCES` path deterministically via
+/// the asymmetric Winsock rule (a wildcard `SO_EXCLUSIVEADDRUSE` holder makes a
+/// later specific-address bind return `WSAEACCES`); see `allocate_one_port` in
+/// chain.rs for the full excluded-port-range rationale.
 ///
 /// Serialized against the rest of the suite because the hook runs between
 /// `drop(listener)` and the holder's `bind`; a concurrent test that probed
@@ -670,9 +662,8 @@ async fn mode_from_plugin_options_false_when_options_missing() {
 #[skuld::test]
 async fn mode_from_plugin_options_handles_mixed_options() {
     use crate::chain::Mode;
-    // Realistic postern server-side `plugin_opts`:
-    // `server;fast-open;path=/t/<token>;host=<fqdn>`. See voyager2's
-    // postern/portal/src/postern/ss_config.py.
+    // Realistic server-side `plugin_opts`:
+    // `server;fast-open;path=/t/<token>;host=<fqdn>`.
     let opts = "server;fast-open;path=/t/abc123;host=hole-stgn.binarydreams.me";
     assert_eq!(Mode::from_plugin_options(Some(opts)), Mode::Server);
 }
@@ -709,17 +700,14 @@ async fn mode_from_plugin_options_false_for_escaped_server() {
 
 // Drain-timeout semantics tests =======================================================================================
 
-/// A long-running plugin (one that ignores `shutdown` and never exits on
-/// its own) must not be killed before shutdown is requested. This is the
-/// primary regression gate for the drain-timeout scope fix: pre-fix,
-/// `drain_timeout` was applied to the whole chain lifetime, so
-/// `StubbornPlugin` was aborted after ≈ drain_timeout.
+/// A long-running plugin that ignores `shutdown` must not be killed before
+/// shutdown is requested — `drain_timeout` bounds only the drain phase, not
+/// the full chain lifetime.
 ///
-/// Uses `tokio::time::pause` + `advance` to simulate "drain_timeout * 3
-/// has elapsed in virtual time" without real wall-clock sleep. Any
-/// internal timer that would have bounded the chain at drain_timeout
-/// fires under virtual time; we then assert the chain is still alive.
-/// See bindreams/hole#383.
+/// Uses `tokio::time::pause` + `advance` to simulate elapsed virtual time
+/// without real wall-clock sleep; any internal timer that would have bounded
+/// the chain at drain_timeout fires under virtual time, and we then assert the
+/// chain is still alive.
 #[skuld::test]
 async fn long_running_plugin_survives_past_drain_timeout() {
     tokio::time::pause();
@@ -738,9 +726,8 @@ async fn long_running_plugin_survives_past_drain_timeout() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // Advance virtual time past drain_timeout. Pre-fix this would have
-    // fired the lifetime-bounding timer and the chain would exit. Post-
-    // fix, no timer bounds the lifetime — chain stays running.
+    // Advance virtual time past drain_timeout; no timer bounds the chain
+    // lifetime, so it must stay running.
     tokio::time::advance(drain_timeout * 3).await;
     assert!(
         !handle.is_finished(),

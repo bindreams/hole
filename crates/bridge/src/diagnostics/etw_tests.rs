@@ -205,9 +205,8 @@ fn dispatch_afd_with_tcpip_colliding_id_returns_unknown() {
 
 #[skuld::test]
 fn dispatch_wfp_with_tcpip_colliding_id_returns_unknown() {
-    // Symmetric coverage for WFP. WFP event-id 1002 (whatever it means
-    // semantically) must not be misclassified as TCPIP
-    // TCB_CONNECT_REQUESTED.
+    // Symmetric coverage for WFP: a WFP event sharing a TCPIP event-id
+    // must not be misclassified as TCPIP TCB_CONNECT_REQUESTED.
     let got = dispatch(
         wfp_guid(),
         tcpip_events::TCB_CONNECT_REQUESTED,
@@ -247,8 +246,8 @@ fn dispatch_drops_high_volume_tcpip_events() {
 
 #[skuld::test]
 fn dispatch_non_tcpip_provider_with_high_volume_id_short_circuits_to_unknown() {
-    // Event IDs collide across providers, but with the #393 provider
-    // gate the AFD/WFP short-circuit fires BEFORE the drop list is
+    // Event IDs collide across providers, but the provider gate
+    // short-circuits AFD/WFP to Unknown BEFORE the drop list is
     // consulted. Either way the user-visible effect is the same: no
     // INFO spam from non-TCPIP background traffic.
     for &id in HIGH_VOLUME_TCPIP_EVENTS {

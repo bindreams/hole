@@ -22,11 +22,11 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use hole_common::config::ServerEntry;
-use hole_common::port_alloc::Protocols;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+use util::port_alloc::Protocols;
 
 // Helpers =============================================================================================================
 
@@ -96,8 +96,8 @@ async fn assert_port_unbound(addr: SocketAddr) {
         }
         Err(_) => {
             // Windows Firewall stealth-drops SYNs to unbound localhost
-            // ports in some configurations (#200's cousin). Fall back to
-            // a positive check: if we can bind the port, it's free.
+            // ports in some configurations. Fall back to a positive
+            // check: if we can bind the port, it's free.
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => drop(listener),
                 Err(e) => panic!(
@@ -209,9 +209,9 @@ fn e2e_both_listeners_bound(
 // Reload hot-path =====================================================================================================
 
 /// Regression guard for the structural-same check in `ProxyManager::reload`.
-/// Before #242 the reload fast path compared only `server`, `local_port`,
-/// `tunnel_mode`. Toggling `proxy_http` alone would therefore hit the
-/// fast path and silently leave the HTTP listener unbound.
+/// Toggling `proxy_http` alone (every other structural field unchanged)
+/// must NOT take reload's no-op fast path — the HTTP listener must
+/// actually bind.
 #[skuld::test(labels = [DIST_BIN])]
 fn e2e_reload_toggling_http_listener_rebinds(
     #[fixture(dist_dir)] dist: &Path,
@@ -389,7 +389,7 @@ mod tun {
 //   `PluginConfig` bind race that gates `e2e_ws_socks_only_roundtrip`).
 //
 // Both labeled `[DIST_BIN]` (no `TUN`) → run in pass-1
-// (`SKULD_LABELS="!tun"`) where loopback delivery is intact (PR #207).
+// (`SKULD_LABELS="!tun"`) where loopback delivery is intact.
 // The galoshes variant additionally carries `PORT_ALLOC` because
 // `ssserver_ws` is `serial = PORT_ALLOC`.
 
@@ -429,9 +429,10 @@ mod socks_only_udp {
         });
     }
 
-    /// Skipped on Windows: same #197 galoshes `PluginConfig` bind race as
-    /// `e2e_ws_socks_only_roundtrip`. Lift this gate once #197 is fixed.
-    #[cfg(not(target_os = "windows"))]
+    /// Linux-only: the galoshes *server* (`ssserver_ws` fixture) hits the #197
+    /// `PluginConfig` bind race on Win+mac, same as `e2e_ws_socks_only_roundtrip`.
+    /// Lift this gate once #197 lands a custom server-side launcher. See #435.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,

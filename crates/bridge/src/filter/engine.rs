@@ -55,9 +55,8 @@ pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
             };
         }
     }
-    // Terminal fallback: never reached when the UI's locked default
-    // rules are present, but preserves "proxy everything" if a
-    // hand-edited config strips them out.
+    // Terminal fallback: preserves "proxy everything" if a hand-edited
+    // config lacks the UI's default rules.
     Decision {
         action: FilterAction::Proxy,
         rule_index: None,

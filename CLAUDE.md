@@ -18,7 +18,7 @@ GUI mode (no subcommand) is single-instance via [`tauri-plugin-single-instance`]
 
 The plugin is registered *inside* [`launch_gui`](crates/hole/src/main.rs), so every CLI subcommand path (`hole bridge run`, `hole proxy start`, `hole version`, …) bypasses the lock — multiple concurrent CLI invocations are unaffected. The callback fires on a plugin-owned thread; UI work is dispatched to the main thread via `AppHandle::run_on_main_thread` for Cocoa compatibility.
 
-**Upgrade-while-running caveat.** `hole upgrade`'s `/quiet` MSI does not relaunch the GUI on in-place upgrade (`LaunchApp` is gated on `NOT WIX_UPGRADE_DETECTED`). The old GUI keeps running on the old binary and holds the lock; a manual launch of the freshly-installed `hole.exe` will silently forward args to the old instance and exit. This is the same rough edge as the existing upgrade flow — the symptom shifts from "two tray icons after relaunch" (pre-#360) to "no visible change after relaunch" (post-#360). Fixing the upgrade flow properly (force-restart on upgrade, or version-mismatch toast) is tracked separately.
+**Upgrade-while-running caveat.** `hole upgrade`'s `/quiet` MSI does not relaunch the GUI on in-place upgrade (`LaunchApp` is gated on `NOT WIX_UPGRADE_DETECTED`). The old GUI keeps running on the old binary and holds the lock; a manual launch of the freshly-installed `hole.exe` will silently forward args to the old instance and exit (the symptom is "no visible change after relaunch"). Fixing the upgrade flow properly (force-restart on upgrade, or version-mismatch toast) is tracked separately.
 
 ### UDP policy
 
@@ -53,29 +53,26 @@ The HTTP listener's `Mode` is always `TcpOnly` regardless of
 `tunnel_mode` — HTTP CONNECT is TCP-only (RFC 7231 §4.3.6). The SOCKS5
 listener's `Mode` is always `TcpAndUdp`: in Full mode the dispatcher
 relays UDP through SOCKS5 UDP ASSOCIATE, and in SocksOnly mode the
-listener exposes UDP ASSOCIATE to local SOCKS5 clients. Pre-#250 the
-SocksOnly path was forced to `TcpOnly` under #189's mis-attributed
-"select_all" hypothesis; the real fix for the original symptom is PR
-#207's two-pass test ordering (#200).
+listener exposes UDP ASSOCIATE to local SOCKS5 clients.
 
 ### DNS forwarder
 
 Clients on TCP-only plugins (v2ray-plugin, anything without UDP multiplexing) would otherwise have no working DNS in full-tunnel mode — the OS sends UDP/53 into the TUN, the cascade drops it for privacy. The bridge ships a built-in DNS forwarder that carries DNS over the TCP tunnel.
 
 - [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs) — pure bytes-in/bytes-out forwarder. Supports PlainUdp / PlainTcp / DoT / DoH. Preserves the client's transaction ID so it can drop in as a forwarder for both [`LocalDnsServer`](crates/bridge/src/dns/server.rs) (OS-facing loopback:53) and [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) (in-tunnel UDP/53 intercept).
-- [`LocalDnsServer`](crates/bridge/src/dns/server.rs) — binds loopback `<ip>:53` UDP+TCP via a fallback ladder (`127.0.0.1:53` → `127.53.0.1..254:53` → fail). The bridge runs elevated, so port 53 binding never hits the privilege gate. **Two independent gates can advance the ladder** (bindreams/hole#398): (1) the bind syscall itself, which on Windows uses `SO_EXCLUSIVEADDRUSE` (forward-looking defense: prevents a future `SO_REUSEADDR` binder from stealing traffic from Hole's already-bound listener); and (2) a post-bind UDP loopback self-test (`SelfTestProbe` trait — production `DefaultProbe` runs on both Windows and macOS) that sends a sentinel datagram to the freshly-bound socket's own address and verifies receipt within a 600ms bounded recv. The self-test is the load-bearing defense for the #398 production bug: an `SO_REUSEADDR` wildcard `0.0.0.0:53` holder (Internet Connection Sharing / `svchost`, Pi-hole, dnscrypt-proxy) combined with ICS-specific kernel-level routing override sends inbound `127.0.0.1:53` UDP to the wildcard holder instead of Hole's specific-bind socket; the `bind(127.0.0.1:53)` call still returns `Ok` (Winsock's matrix allows the coexistence — `SO_EXCLUSIVEADDRUSE` on a specific bind does not refuse a wildcard `SO_REUSEADDR` holder per MSDN), so the self-test is what detects the hijack. The sentinel doesn't come back within 600ms → probe returns `Err` → `bind_ladder` advances to `127.53.0.X:53`. The self-test also catches LSP/WFP-shimming (Windows) or NKE / PF / kernel-firewall (macOS) hijacks that consume loopback datagrams without ever userspace-binding the port. The first-candidate (`127.0.0.1:53`) failure is logged at `info!` with a human-readable hint so users without bridge-debug logging still see why the ladder advanced.
+- [`LocalDnsServer`](crates/bridge/src/dns/server.rs) — binds loopback `<ip>:53` UDP+TCP via a fallback ladder (`127.0.0.1:53` → `127.53.0.1..254:53` → fail). The bridge runs elevated, so port 53 binding never hits the privilege gate. **Two independent gates advance the ladder**: (1) the bind syscall itself (on Windows `SO_EXCLUSIVEADDRUSE`, so a later `SO_REUSEADDR` binder can't steal traffic from Hole's listener); and (2) a post-bind UDP loopback self-test (`SelfTestProbe` trait; production `DefaultProbe` runs on Windows and macOS) that sends a sentinel datagram to the freshly-bound socket's own address and requires receipt within a 600ms bounded recv. The self-test is load-bearing because a wildcard `SO_REUSEADDR` `0.0.0.0:53` holder (ICS/`svchost`, Pi-hole, dnscrypt-proxy) can hijack inbound `127.0.0.1:53` UDP even though `bind(127.0.0.1:53)` still returns `Ok` (Winsock allows the coexistence). It also catches LSP/WFP shims (Windows) and NKE/PF/kernel-firewall shims (macOS) that consume loopback datagrams without userspace-binding the port. No sentinel within 600ms → probe `Err` → ladder advances to `127.53.0.X:53`. First-candidate failure logs at `info!` with a human-readable hint so users without bridge-debug logging still see why. See bindreams/hole#398 for the production incident.
 - [`Socks5Connector`](crates/bridge/src/dns/socks5_connector.rs) — routes the forwarder's upstream connections through the SS SOCKS5 listener on `127.0.0.1:<ss-port>` so user filter rules that `Block` the resolver IP cannot strand the forwarder's own queries. TCP uses `tokio-socks`; UDP uses a hand-rolled SOCKS5 UDP ASSOCIATE per RFC 1928.
-- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — platform-specific capture/apply/restore. Windows uses `netsh`, macOS uses `networksetup`. **Apply runs on both the TUN adapter and the upstream physical adapter; capture runs on the upstream only** (Phase 4 of #247: the TUN is freshly created by `routing.install`, its prior DNS is definitionally "defaults", and `netsh show dnsservers` against it was one of the slow paths in the 11.3s stall; on teardown the TUN is destroyed with the routes, so there's nothing to restore). Captured prior (v4 + v6, three shapes: static list / DHCP / none) is persisted to `bridge-dns.json` for crash recovery. Post-apply flush (`ipconfig /flushdns` / `dscacheutil -flushcache`) runs fire-and-forget on a detached `std::thread::spawn` — callers (setup and teardown alike) never block on it; the OS-wide DNS cache stays stale for up to its TTL (60-300s typical) after connect/disconnect, which trades a brief stale-answer window for not stalling the UI spinner 1-5s per flush.
+- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — platform-specific capture/apply/restore. Windows uses `netsh`, macOS uses `networksetup`. **Apply runs on both the TUN adapter and the upstream physical adapter; capture runs on the upstream only** (the TUN is freshly created by `routing.install`, so its prior DNS is definitionally "defaults", and on teardown it is destroyed with the routes — there's nothing to restore). Captured prior (v4 + v6, three shapes: static list / DHCP / none) is persisted to `bridge-dns.json` for crash recovery. Post-apply flush (`ipconfig /flushdns` / `dscacheutil -flushcache`) runs fire-and-forget on a detached `std::thread::spawn` — callers (setup and teardown alike) never block on it; the OS-wide DNS cache stays stale for up to its TTL (60-300s typical) after connect/disconnect, which trades a brief stale-answer window for not stalling the UI spinner 1-5s per flush.
 
 **Upgrade migration**: `AppConfig` already carries `#[serde(default)]`, so existing configs without a `dns` key deserialize with `DnsConfig::default()` — which has `enabled: true`, `protocol: Https`, `servers: [1.1.1.1, 1.0.0.1]`, `intercept_udp53: true`. This enables the forwarder silently on upgrade (per user spec: "enabled on upgrade, no notification").
 
-**Load-bearing start-time gate (#388)**: the bridge runs an inline forwarder self-test inside [`start_inner`](crates/bridge/src/proxy_manager.rs) **before** `Dispatcher::new` / `routing.install` / `apply_dns_settings`. On failure (3×1500ms / 5s budget exhausted, or no DNS servers configured, or `bind_ladder` exhausted) `start_cancellable` returns `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind. Routes, system DNS, and the wintun adapter are never touched on this path. Pre-#388 the test was fire-and-forget at `info!` and the proxy committed `Running` while `intercept_udp53` hijacked user DNS into a dead tunnel — see bindreams/hole#388. The `start_blocks_on_forwarder_self_test_failure` test is the ordering invariant guard.
+**Load-bearing start-time gate**: the bridge runs an inline forwarder self-test inside [`start_inner`](crates/bridge/src/proxy_manager.rs) **before** `Dispatcher::new` / `routing.install` / `apply_dns_settings`. On failure (3×1500ms / 5s budget exhausted, or no DNS servers configured, or `bind_ladder` exhausted) `start_cancellable` returns `Err(ProxyError::ForwarderSelfTestFailed)` and the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind. Routes, system DNS, and the wintun adapter are never touched on this path — so a forwarder that binds locally but can't reach upstream is caught before `intercept_udp53` can hijack user DNS into a dead tunnel. The `start_blocks_on_forwarder_self_test_failure` test is the ordering invariant guard.
 
-**Behavior changes from #388**:
+**Config/start-error rules:**
 
-- `dns.enabled = true` with `servers = []` is now a hard config error (was: silent skip + degenerate runtime).
-- `bind_ladder` exhaustion (all 255 loopback candidates blocked) is now a hard start error (was: silent-degrade to no forwarder). Single conflicting service (pi-hole on `127.0.0.1:53`) still succeeds via the `127.53.0.X:53` ladder.
-- A plugin chain that binds locally but can't reach upstream is now caught at start time; the GUI receives a clear error message instead of a dead tunnel.
+- `dns.enabled = true` with `servers = []` is a hard config error.
+- `bind_ladder` exhaustion (all 255 loopback candidates blocked) is a hard start error. A single conflicting service (pi-hole on `127.0.0.1:53`) still succeeds via the `127.53.0.X:53` ladder.
+- A plugin chain that binds locally but can't reach upstream is caught at start time; the GUI receives a clear error message instead of a dead tunnel.
 
 ### Bridge test-isolation contract
 
@@ -201,25 +198,25 @@ child. See bindreams/hole#303 for the extraction rationale.
 Three independent layers compose to handle transient file-contention on `Command::spawn` — typically Windows Defender scanning a freshly-built `hole.exe`, or macOS holding a writer while something tries to exec:
 
 1. **`handle-holders` workspace crate** — pure query API: `find_holders(&Path)` returns every process currently holding the file, `log_holders(&Path)` logs them at `tracing::error!`. Windows uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` with a non-blocking `GetFileType == FILE_TYPE_DISK` pre-filter to avoid pipe/device hangs, then `DuplicateHandle` + `GetFileInformationByHandle` for file-id comparison. macOS shells out to `lsof -F pc`. Best-effort — never introduces a new failure mode.
-1. **`hole_common::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
-1. **`hole_common::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
+1. **`util::retry::exp_backoff(attempt, base)`** — pure `base * 2^attempt` with saturation.
+1. **`util::retry::retry_if(op, predicate, max_attempts, base_delay)`** — generic predicate-based retry with exponential backoff. Ships with an `is_file_contention(&io::Error)` predicate that matches `ERROR_ACCESS_DENIED` (5) / `ERROR_SHARING_VIOLATION` (32) on Windows and `ETXTBSY` / `EBUSY` on macOS.
 
 `DistHarness::spawn` composes them: `retry_if(|| cmd.spawn(), is_file_contention, 3, 500ms)`, and on terminal failure calls `handle_holders::log_holders(&hole_exe)` before propagating. See bindreams/hole#208 for the incident that motivated this.
 
 ### Port allocation
 
-Getting a free port for local binding or SIP003 subprocess handoff goes through `hole_common::port_alloc` ([crates/common/src/port_alloc.rs](crates/common/src/port_alloc.rs)):
+Getting a free port for local binding or SIP003 subprocess handoff goes through `util::port_alloc` ([crates/util/src/port_alloc.rs](crates/util/src/port_alloc.rs)) — a small Apache-2.0 utility crate so both Hole's GPL crates and the Apache plugin world can depend on it (#435):
 
 - `Protocols` — bitflag set of `TCP | UDP`. `hole_common::plugin::plugin_alloc_protocols(binary_name)` maps a plugin binary to the transports to verify-free at handoff-port allocation time (galoshes → `TCP | UDP`, ex-ray/unknown → `TCP`). This is the pre-spawn port-sizing concern only; the runtime UDP-drop policy derives capability from the plugin's reported sitrep `transports` (#414).
-- `bind_ephemeral(ip, protocols, op) -> io::Result<(u16, T)>` — **the canonical entry point.** Allocates a port, calls `op(port)`, and retries the whole (allocate, bind) cycle on `is_bind_race` errors. **Unbounded retry**: the only terminations are success or a non-bind-race error. Yields between iterations. No attempts budget — see "no budget" below. Three production sites use it: `LocalDnsServer::bind`, `start_plugin_chain`, and `test_support::ssserver::start_real_ss_server*`.
+- `bind_ephemeral(ip, protocols, op) -> io::Result<(u16, T)>` — **the canonical entry point.** Allocates a port, calls `op(port)`, and retries the whole (allocate, bind) cycle on `is_bind_race` errors. **Unbounded retry**: the only terminations are success or a non-bind-race error. Yields between iterations. No attempts budget — see "no budget" below. Three sites use it: `LocalDnsServer::bind` and `start_plugin_chain` (production), and `plugin_e2e::ssserver::start_real_ss_server*` (the plugin-e2e test fixtures).
 - `free_port(ip, protocols) -> io::Result<u16>` — primitive: returns a port verified free for every transport in `protocols`, divorced from any bound socket. Multi-transport is implemented as "pick via one transport, verify the rest via `ensure_port_free`, retry on mismatch." Unbounded retry on `is_bind_race`; yields between iterations. **Direct callers are rejected by clippy `disallowed_methods`** — use `bind_ephemeral` instead, or suppress with `#[allow]` + comment when the port must be returned to the caller before the bind happens (`test_support::port_alloc::allocate_ephemeral_port` is the sanctioned exception). See bindreams/hole#285 and #300.
 - `ensure_port_free(addr, protocols)` — pure probe without allocation; binds one socket per transport and drops.
 
 `LocalDnsServer::bind` ([crates/bridge/src/dns/server.rs](crates/bridge/src/dns/server.rs)) routes port-0 callers through `bind_ephemeral` so the UDP+TCP pair bind retries together on any cross-protocol race. Fixed-port callers (`bind_ladder` on port 53) skip the wrapper — retry in place is futile, the ladder is the correct escape.
 
-The retry exists because Windows maintains **independent TCP/UDP excluded-port-range tables** (Hyper-V / WSL / Docker Desktop reservations, visible via `netsh int ipv4 show excludedportrange`); an OS-picked ephemeral port for one transport may be reserved for the other and the paired bind transiently fails. Galoshes's `garter::chain::allocate_one_port` hits the same class of bug — see bindreams/galoshes#21 for the deterministic `SO_EXCLUSIVEADDRUSE`-wildcard reproducer.
+The retry exists because Windows maintains **independent TCP/UDP excluded-port-range tables** (Hyper-V / WSL / Docker Desktop reservations, visible via `netsh int ipv4 show excludedportrange`); an OS-picked ephemeral port for one transport may be reserved for the other and the paired bind transiently fails. Galoshes's `garter::chain::allocate_one_port` hits the same class of bug (the `SO_EXCLUSIVEADDRUSE`-on-wildcard-address race).
 
-**No budget — by design.** Earlier iterations of this module capped retries at 5 (`MAX_BIND_ATTEMPTS`, `BIND_RETRY_ATTEMPTS`). On a saturated Windows runner with heavy excluded-port pressure, 5 attempts is too few; on a healthy machine the happy path is 1 attempt and a higher cap is wasted code. There is no "correct" budget — the OS allocator covers ~28K ephemeral ports and the only natural termination is success or a non-bind-race error. The current loops are unbounded and yield to the runtime each iteration. Adaptive `info!` logging at attempt milestones (10, 20, 50, 100, …) keeps a stuck loop visible at the default log level without flooding happy-path logs. See bindreams/hole#300.
+**No budget — by design.** There is no "correct" retry budget: on a saturated Windows runner with heavy excluded-port pressure a small cap is too few, while on a healthy machine the happy path is a single attempt. The OS allocator covers ~28K ephemeral ports and the only natural termination is success or a non-bind-race error, so the loops are unbounded and yield to the runtime each iteration. Adaptive `info!` logging at attempt milestones (10, 20, 50, 100, …) keeps a stuck loop visible at the default log level without flooding happy-path logs. See bindreams/hole#300.
 
 **Scope of `bind_ephemeral`.** The retry catches `is_bind_race` errors that surface from `op` as `io::Error`. Out-of-process binders (plugin subprocesses) report bind failures through other channels and are *not* in-band classifiable. The retry-asymmetry per consumer:
 
@@ -281,8 +278,8 @@ Per-TCP-connection the tap logs at `info!`:
 - `bytes_to_plugin` / `bytes_from_plugin` — raw byte counts in each
   direction, observed by [`garter::CountingStream`](crates/garter/src/counting.rs).
   `bytes_to_plugin > 0 && bytes_from_plugin == 0` is the fingerprint
-  of an upstream-dial hang — the #388 reproduction case (v2ray-plugin
-  WebSocket dial silently hung).
+  of an upstream-dial hang (the plugin accepted bytes but never
+  returned any).
 - `ttfb_ms` — milliseconds from `accept` to the first non-zero
   upstream read. `None` means the connection closed without ever
   receiving a byte from the plugin chain — the load-bearing diagnostic
@@ -538,6 +535,17 @@ crates/ex-ray/            → ex-ray.        Apache-2.0, ex-ray group. NOT a Rus
                             released standalone (6-platform binaries).
 crates/mock-plugin/       → mock-plugin.  Apache-2.0, no group, publish=false.
                             Minimal SIP003u TCP echo plugin for garter integration tests.
+crates/util/              → util.         Apache-2.0, no group, publish=false.
+                            Small cross-platform utilities (port_alloc, retry). Apache so
+                            both Hole's GPL crates AND the Apache plugin world can depend
+                            on it without license friction. See bindreams/hole#435.
+crates/plugin-e2e/        → plugin-e2e.   GPL-3.0, no group, publish=false.
+                            Plugin interop/e2e area: shared ss-server / cert / sentinel /
+                            garter-roundtrip harness (dev-dep'd by hole-bridge) + the
+                            ex-ray↔stock interop suite (6-platform) and galoshes
+                            server↔client roundtrips (Linux-only, #197). GPL via its
+                            `xtask` build-locator dep; the Apache plugins it exercises stay
+                            Apache. See bindreams/hole#435.
 build.yaml                → declarative build-target manifest (the DAG of `hole`,
                             `hole-msi`, `hole-dmg`, `galoshes`, `*-tests`, `clippy-*`,
                             `prek`, `frontend-check`, etc.) consumed by

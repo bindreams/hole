@@ -9,16 +9,16 @@
 //! module so `proxy_manager_e2e_tests.rs` can reuse them.
 
 use super::{run_server_test, TestConfig};
-use crate::test_support::http_target::start_fake_sentinel;
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::PORT_ALLOC;
-use crate::test_support::ssserver::{
-    locate_ex_ray, start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR,
-    TEST_PASSWORD,
-};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ServerTestOutcome;
+use plugin_e2e::locators::locate_ex_ray;
+use plugin_e2e::sentinel::start_fake_sentinel;
+use plugin_e2e::ssserver::{
+    start_real_ss_server, start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -40,13 +40,8 @@ fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
 
 /// Fast defaults for tests that don't need plugin startup.
 ///
-/// Reverted to pre-#165 values in PR-A (#169). The #165 bug was that
-/// every test that went through `ProxyManager::start/stop` shelled out
-/// to real `netsh`/`route` via a RouteGuard that bypassed the backend
-/// trait, corrupting loopback state over time. Now that the refactor
-/// eliminates the bypass, tests no longer touch the routing table, so
-/// the original tight timeouts hold. If CI fails after this revert,
-/// investigate root cause — do NOT bump the values back.
+/// These tests no longer touch the routing table, so tight timeouts are
+/// safe. If CI fails, investigate root cause rather than bumping these.
 fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
     TestConfig {
         preflight_timeout: Duration::from_millis(500),

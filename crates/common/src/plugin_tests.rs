@@ -69,14 +69,14 @@ fn is_known_false_for_unknown() {
 
 #[skuld::test]
 fn alloc_protocols_ex_ray_is_tcp_only() {
-    use crate::port_alloc::Protocols;
+    use util::port_alloc::Protocols;
     // `v2ray-plugin` resolves to the `ex-ray` binary, which is TCP-only.
     assert_eq!(plugin::plugin_alloc_protocols("ex-ray"), Protocols::TCP);
 }
 
 #[skuld::test]
 fn alloc_protocols_galoshes_is_tcp_and_udp() {
-    use crate::port_alloc::Protocols;
+    use util::port_alloc::Protocols;
     // galoshes binds UDP for YAMUX, so its handoff port must be
     // UDP-capable to avoid the Windows cross-protocol excluded-port race.
     assert_eq!(
@@ -87,7 +87,7 @@ fn alloc_protocols_galoshes_is_tcp_and_udp() {
 
 #[skuld::test]
 fn alloc_protocols_unknown_defaults_to_tcp() {
-    use crate::port_alloc::Protocols;
+    use util::port_alloc::Protocols;
     // Conservative default — unknown binaries are treated as TCP-only.
     assert_eq!(plugin::plugin_alloc_protocols("xyzzy"), Protocols::TCP);
     assert_eq!(plugin::plugin_alloc_protocols(""), Protocols::TCP);

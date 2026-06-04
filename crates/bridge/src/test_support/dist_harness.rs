@@ -114,15 +114,12 @@ pub(crate) struct DistHarness {
     /// registered with the workspace panic-dump dispatcher.
     ///
     /// `Option` so the manual `Drop` impl can `take()` it and drop it
-    /// explicitly BEFORE running the kill/wait shutdown sequence. The
-    /// explicit take preserves the pre-#303 semantic of unregistering
-    /// before any code that could itself panic during shutdown (Stop
-    /// send, scoped `block_on`, kill, wait). Relying on implicit
-    /// field-drop order is unsafe: Rust drops fields in declaration
-    /// order top-to-bottom, so this field would drop LAST (after
-    /// `child`), and a shutdown-time panic would re-fire the hook
-    /// with a stale `BridgeChildLogSource` whose subprocess is
-    /// mid-death and whose `bridge.log` may be mid-rotation.
+    /// BEFORE the kill/wait shutdown sequence — otherwise a shutdown-time
+    /// panic (Stop send, scoped `block_on`, kill, wait) would re-fire the
+    /// hook with a stale `BridgeChildLogSource` whose subprocess is
+    /// mid-death and whose `bridge.log` may be mid-rotation. (Relying on
+    /// implicit field-drop order is unsafe: declaration order would drop
+    /// this field last, after `child`.)
     _panic_dump_guard: Option<hole_test_observability::panic_dump::PanicDumpGuard>,
 }
 
@@ -135,13 +132,10 @@ impl DistHarness {
     /// Blocks until the bridge's IPC socket is connectable (or the
     /// spawn-ready budget expires).
     pub(crate) async fn spawn(dist_bin_dir: &Path) -> Result<Self, HarnessError> {
-        // Note: the workspace panic-dump dispatcher (see #303) is
-        // installed at ctor time by `hole_test_observability::install`,
-        // which runs strictly before any test code via the `register!`
-        // macro's `ctor::declarative::ctor!` block. The pre-#303
-        // explicit `install_panic_hook_once()` here was load-bearing
-        // as a before-fallible-work guarantee; the ctor-time install
-        // preserves that property.
+        // Note: the workspace panic-dump dispatcher is installed pre-main
+        // by `hole_test_observability::install` (via the `register!`
+        // macro's `ctor::declarative::ctor!` block), so it is already
+        // active before any fallible work here.
 
         let hole_exe = dist_bin_dir.join(if cfg!(windows) { "hole.exe" } else { "hole" });
         if !hole_exe.is_file() {
@@ -184,9 +178,9 @@ impl DistHarness {
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly
         // built `hole.exe`) lands a holder list in the log. See #208.
-        let mut child = hole_common::retry::retry_if(
+        let mut child = util::retry::retry_if(
             || cmd.spawn(),
-            hole_common::retry::is_file_contention,
+            util::retry::is_file_contention,
             MAX_SPAWN_ATTEMPTS,
             SPAWN_BACKOFF,
         )
@@ -208,8 +202,8 @@ impl DistHarness {
         );
 
         // Register the live child with the workspace panic-dump
-        // dispatcher (#303, originally #200 H3 evidence). The
-        // returned guard's `Drop` removes the source on harness drop.
+        // dispatcher. The returned guard's `Drop` removes the source on
+        // harness drop.
         let log_source = std::sync::Arc::new(BridgeChildLogSource {
             pid: child_pid,
             socket: socket_path.clone(),
@@ -309,9 +303,7 @@ impl Drop for DistHarness {
         // sequence below. If `Stop` send / scoped `block_on` / kill / wait
         // themselves panic, we don't want this harness's stale
         // `BridgeChildLogSource` dumped from the hook — the subprocess may
-        // already be dead and the bridge.log mid-rotation. Equivalent to
-        // the pre-#303 `registry().lock().remove(&registered_pid)` call at
-        // the same point in the shutdown sequence.
+        // already be dead and the bridge.log mid-rotation.
         drop(self._panic_dump_guard.take());
 
         if let Some(client) = client {
@@ -404,8 +396,7 @@ fn rand_suffix() -> String {
 /// Fail-loud on misconfigured CI: if `RUNNER_TEMP` is set but does not
 /// point at an existing directory, that's a runner bug that must be
 /// visible — silently falling back to `%TEMP%` would let CI succeed
-/// with logs landing outside the artifact-upload glob (the exact bug
-/// Commit E was written to fix).
+/// with logs landing outside the artifact-upload glob.
 fn new_tempdir() -> std::io::Result<TempDir> {
     if let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") {
         let base = std::path::Path::new(&runner_temp);
@@ -422,12 +413,9 @@ fn new_tempdir() -> std::io::Result<TempDir> {
         // `tempfile` defaults to a `.tmp` prefix (dot-leading). The
         // `actions/upload-artifact@v4` minimatch glob skips dot-prefixed
         // directories by default, so `D:\a\_temp/**/bridge.log` would
-        // match nothing if we used the default prefix — the exact failure
-        // mode observed on run 24527458402 (commit 539dd8a) where the
-        // panic hook dumped bridge.log successfully but the glob matched
-        // zero files because the tempdir was `.tmpQLMmOX`. Using
-        // `hole-e2e-` produces directories like `hole-e2e-XXXXXX` that
-        // the glob sees normally.
+        // match nothing with the default prefix. Using `hole-e2e-`
+        // produces directories like `hole-e2e-XXXXXX` that the glob sees
+        // normally.
         let mut td = tempfile::Builder::new().prefix("hole-e2e-").tempdir_in(base)?;
         // CI: disable cleanup so the upload-artifact step still sees
         // bridge.log after DistHarness drops. The GHA runner is
@@ -449,12 +437,10 @@ fn new_tempdir() -> std::io::Result<TempDir> {
 /// All I/O errors are swallowed silently — see the contract on
 /// [`hole_test_observability::panic_dump::PanicDumpSource`].
 ///
-/// Historical note: the dump used to be capped at the last 4 KB, which
-/// turned out to capture only ~4 ms of bridge activity in the #200
-/// repros — nowhere near the 5 s hang window. Nextest captures stderr
-/// per test and only prints it on failure, so the full dump is bounded
-/// in practice to a single failed test's bridge lifetime (~30 s under
-/// nextest's `terminate-after` cap).
+/// The full log is dumped (not a tail) so a multi-second hang window is
+/// fully captured. Nextest captures stderr per test and only prints it
+/// on failure, so the dump is bounded in practice to a single failed
+/// test's bridge lifetime (~30 s under nextest's `terminate-after` cap).
 pub(crate) struct BridgeChildLogSource {
     pub(crate) pid: u32,
     pub(crate) socket: PathBuf,

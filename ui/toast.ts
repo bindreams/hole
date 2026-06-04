@@ -34,11 +34,8 @@ function dismiss(toast: HTMLDivElement) {
   // if the toast was already detached, `.remove()` is a no-op.
   const idx = visible.indexOf(toast);
   if (idx !== -1) visible.splice(idx, 1);
-  // Synchronous removal — no CSS-transition wait. The workspace policy
-  // ("no timeouts for synchronization") forbids the `setTimeout(remove,
-  // 500)` backstop the original animation needed, and the deterministic
-  // alternative (transitionend) is brittle if the transition is cancelled
-  // by a property change. Toasts simply disappear.
+  // Synchronous removal — no CSS-transition wait, per the workspace policy
+  // against timeouts-for-synchronization. Toasts simply disappear.
   toast.remove();
 }
 

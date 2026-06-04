@@ -161,11 +161,8 @@ export function renderFilters() {
       tdDel.appendChild(delSpan);
     } else {
       // Default wildcard rule — show a lock icon to indicate it cannot be deleted.
-      // Inline SVG (monochrome, currentColor, evenodd) so it matches the rest of
-      // the UI's icon style instead of rendering as a colorful 🔒 emoji.
-      // innerHTML with a static SVG literal is XSS-safe (no user input) and the
-      // HTML parser correctly creates SVG-namespaced elements when parsing <svg>
-      // inside a non-SVG parent.
+      // Inline monochrome SVG to match the UI icon style. Static literal (no
+      // user input) so innerHTML is XSS-safe.
       const lockSpan = document.createElement("span");
       lockSpan.className = "filter-lock";
       lockSpan.title = "Default rule (cannot be deleted)";
