@@ -335,3 +335,37 @@ async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
         "Drop must invoke flush after sync-fallback restore"
     );
 }
+
+// empty_settings contract (regression: bindreams/hole#437) ============================================================
+//
+// CONTRACT PINS, not OOB detectors. The original 48-byte out-of-bounds FFI
+// access is NOT observable from a unit test: `MockBackend` substitutes at
+// the `WinDnsBackend` level — ABOVE `empty_settings` and the real Win32 FFI
+// — so no unit test reaches the corrupting path. These pin the constructor's
+// contract (the layer that carried the bug); the
+// `const _: () = assert!(size_of::<V1>() < size_of::<V3>())` guard in
+// windows.rs is the compile-time companion.
+
+use windows::Win32::NetworkManagement::IpHelper::{
+    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
+};
+
+#[skuld::test]
+fn empty_settings_always_stamps_version1() {
+    // #437: stamping VERSION3 onto the 64-byte V1 allocation was the OOB.
+    // windows-rs models all three DNS FFIs as taking the V1 struct, so V1
+    // is the only version that matches the buffer we allocate.
+    assert_eq!(super::empty_settings(false).Version, DNS_INTERFACE_SETTINGS_VERSION1);
+    assert_eq!(super::empty_settings(true).Version, DNS_INTERFACE_SETTINGS_VERSION1);
+}
+
+#[skuld::test]
+fn empty_settings_flags_select_family() {
+    let v4 = super::empty_settings(false).Flags;
+    assert_ne!(v4 & DNS_SETTING_NAMESERVER as u64, 0, "NAMESERVER must always be set");
+    assert_eq!(v4 & DNS_SETTING_IPV6 as u64, 0, "v4 must not set the IPV6 flag");
+
+    let v6 = super::empty_settings(true).Flags;
+    assert_ne!(v6 & DNS_SETTING_NAMESERVER as u64, 0, "NAMESERVER must always be set");
+    assert_ne!(v6 & DNS_SETTING_IPV6 as u64, 0, "v6 must set the IPV6 flag");
+}
