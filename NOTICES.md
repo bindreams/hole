@@ -109,9 +109,9 @@ MIT OR Apache-2.0 (both GPL-3.0-compatible):
   standalone galoshes), so a memory-bearing minidump — which for a privacy
   VPN would hold keys and user traffic — is never producible by shipped
   binaries.
-- [`sadness-generator`](https://github.com/EmbarkStudios/crash-handling) — a
-  dev-dependency only (deterministic fault triggers used by the
-  per-fault-class tests). Never linked into any shipped binary.
+- [`sadness-generator`](https://github.com/EmbarkStudios/crash-handling) — an
+  optional, non-default dependency enabled only by the test workflow (the
+  `crash-child` feature); never linked into any shipped binary.
 
 These crates' bytes, where linked (`crash-handler`/`crash-context` always;
 `minidump-writer` in dev builds), are covered by the combined-distribution
