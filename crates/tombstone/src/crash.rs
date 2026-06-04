@@ -258,7 +258,8 @@ fn extract_fault_fields(ctx: &crash_handler::CrashContext) -> (u64, u64, u32, u3
         None => (0, 0),
     };
     let pid = unsafe { libc::getpid() as u32 };
-    let tid = ctx.thread as u32;
+    // mach `thread_t` is already `u32` on darwin — no cast (clippy::unnecessary_cast).
+    let tid = ctx.thread;
     (code, fault_addr, pid, tid)
 }
 
