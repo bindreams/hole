@@ -214,6 +214,11 @@ leaves working DNS + broken routes, not the inverse):
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
   name prefix.
 
+Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
+`%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;
+installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
+`scripts/dev.py` passes `$TMPDIR/hole-dev/state`.
+
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
 
@@ -558,7 +563,7 @@ investigate the underlying cause rather than reaching for a filter** (#144).
 ### Console relay and toasts
 
 `console.error`/`console.warn` in `ui/` are intercepted by `installConsoleRelay()`
-(the first thing `init()` runs) and forwarded to Rust via
+in [`ui/main.ts`](ui/main.ts) (the first thing `init()` runs) and forwarded to Rust via
 `@tauri-apps/plugin-log`, landing in `gui.log`. The relay is **log-only — it does
 not show toasts** (toasts are per-call-site so a tight loop can't flood the UI).
 (Not to be confused with `attachConsole()`, which mirrors Rust→JS.) Surface
