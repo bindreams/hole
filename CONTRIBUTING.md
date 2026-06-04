@@ -1,276 +1,678 @@
 # Contributing to Hole
 
-## Architecture overview
+Product overview and install live in [README.md](README.md); an agent-facing
+architecture map lives in [CLAUDE.md](CLAUDE.md). This file is the contributor
+reference: how the system is built, how to build/run/test it, and the
+invariants you must not break.
 
-Hole is a single Rust binary (`hole`) that serves as both the GUI app and a bridge to a remote shadowsocks server:
+## Architecture
 
-- **GUI mode** (default): Tauri desktop app with system tray and settings window. Unprivileged.
-- **Bridge mode** (`hole bridge run`): Manages TUN device, routing, and the shadowsocks connection. Foreground by default; runs as a system service (Windows SCM or macOS launchd) when invoked with `--service`.
+Hole is a single Rust binary (`hole`) that is both the GUI app and a privileged
+bridge, selected by CLI arguments:
 
-The GUI and bridge communicate over a local Unix domain socket using HTTP/1.1 REST (JSON), defined in `crates/common/api/openapi.yaml`.
+- **GUI mode** (no args): Tauri desktop app — system tray, settings window,
+  config management. Unprivileged.
+- **Bridge mode** (`hole bridge run`): manages the TUN device, routing, and the
+  shadowsocks connection. Foreground by default; runs as a system service
+  (Windows SCM / macOS launchd) with `--service`. Needs elevation.
+
+GUI ↔ bridge speak HTTP/1.1 REST (JSON) over a local Unix socket (macOS) or
+named pipe (Windows), defined by `crates/common/api/openapi.yaml`.
 
 ### Build-time vs runtime tooling
 
-The frontend (`ui/`) is HTML, CSS, and TypeScript. **Node.js is used only at build time** — it runs Vite (the bundler/dev server) and the TypeScript compiler. No Node.js process exists at runtime.
+The frontend (`ui/`) is HTML/CSS/TypeScript. **Node.js is used only at build
+time** — Vite (bundler/dev server) and `tsc`. No Node process exists at runtime:
+Tauri embeds the OS webview (Edge WebView2 on Windows, WebKit on macOS) and the
+backend is pure Rust.
 
-At runtime, Tauri embeds the OS's native webview (Edge WebView2 on Windows, WebKit on macOS) to render the frontend. The backend is pure Rust.
+### Single-instance enforcement
 
-### Workspace layout
+GUI mode is single-instance via `tauri-plugin-single-instance`, keyed on the
+`com.hole.app` identifier. A second `hole` invocation forwards its `argv` + `cwd`
+to the running instance (which opens the dashboard) and exits. The lock is
+per-session on Windows (`CreateMutexW` without a `Global\` prefix — concurrent
+FUS/RDP users each get their own GUI) and machine-wide on macOS (AF_UNIX listener
+under `/tmp`). The plugin is registered *inside* `launch_gui`, so every CLI
+subcommand bypasses the lock; the callback dispatches UI work to the main thread
+via `AppHandle::run_on_main_thread`.
 
-| Directory        | Crate/Purpose                                                                           |
-| ---------------- | --------------------------------------------------------------------------------------- |
-| `crates/common/` | `hole-common` — shared types: protocol, config, logging                                 |
-| `crates/bridge/` | `hole-bridge` — bridge library (TUN/routing/shadowsocks/IPC)                            |
-| `crates/hole/`   | `hole` — Tauri app + CLI + bridge entry point (binary name: `hole`)                     |
-| `xtask/`         | workspace task runner (`cargo xtask <build\|run\|list\|stage\|...>`) — see `build.yaml` |
-| `xtask-lib/`     | shared helper crate used by xtask AND `crates/hole/build.rs`                            |
-| `crates/ex-ray/` | first-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin)         |
-| `msi-installer/` | Windows MSI installer (Python project: thin wrapper around xtask + WiX)                 |
-| `dmg-installer/` | macOS DMG signature checks (Python project: pytest harness over the built `Hole.app`)   |
-| `ui/`            | Frontend HTML/CSS/TypeScript (Vite)                                                     |
+**Upgrade-while-running caveat.** `hole upgrade`'s `/quiet` MSI does not relaunch
+the GUI on in-place upgrade (`LaunchApp` is gated on `NOT WIX_UPGRADE_DETECTED`).
+The old GUI keeps the lock, so launching the freshly-installed `hole.exe`
+silently forwards args to the old instance and exits.
 
-### Logging
+### UDP policy
 
-Both the GUI and the bridge always write logs to stderr **and** a 10 MiB rotating file (one rotated backup kept). The default log directory is `dirs::state_dir()/hole/logs` (user-local, no elevation needed):
+Hole is a VPN. UDP flows whose filter decision resolves to `Proxy` are
+**dropped, not bypassed**, when the configured plugin cannot carry UDP (plain
+v2ray-plugin is TCP-only) — bypassing to the clear-text upstream would leak the
+flow outside the tunnel. The invariant is structurally enforced by the cascade
+in [`HoleRouter::resolve_endpoint`](crates/bridge/src/hole_router.rs):
+`Proxy` + UDP + `!supports_udp()` resolves to `&self.block`, never
+`&self.bypass`. UDP-capable plugins (galoshes, via YAMUX) tunnel UDP normally.
+The three drop reasons (rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable)
+each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs)
+methods.
 
-- Windows: `%LOCALAPPDATA%\hole\logs\`
-- macOS: `~/Library/Application Support/hole/logs/`
+**UDP/53 exception.** When `DnsConfig.intercept_udp53` is enabled (default),
+UDP/53 is diverted to [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs)
+*before* the cascade reads the filter decision, so DNS works even on a TCP-only
+plugin. See [DNS forwarder](#dns-forwarder).
 
-Log files are `gui.log` and `bridge.log` respectively. When running the bridge as a service (`hole bridge install`), the service installer passes `--log-dir` pointing to a system path:
+### DNS forwarder
 
-- Windows: `C:\ProgramData\hole\logs\`
-- macOS: `/var/log/hole/`
+On TCP-only plugins, full-tunnel DNS would have no path (UDP/53 is dropped for
+privacy). The bridge carries DNS over the TCP tunnel:
 
-**WebView2 / Chromium logs.** Tauri's embedded WebView2 runtime on Windows carries its own Chromium logging facility that writes directly to the inherited stderr handle without going through our `tracing` subscriber. These lines arrive in Chromium's native `[MMDD/HHMMSS.mmm:LEVEL:file:line]` format instead of ours. The FD-level stdio safety net set up in [`crates/common/src/logging.rs`](crates/common/src/logging.rs) catches them: the reader thread tees each line to (a) a `tracing` event with target `hole::stderr_relay`, which the file layer records into `gui.log`, and (b) the saved-original stderr handle, which preserves dev-terminal visibility (`scripts/dev.py` reprints them with a `[client]` prefix). Chromium lines therefore *do* end up in `gui.log` and on the dev-mode terminal, just in Chromium's format rather than ours. If you see one, it is a real Chromium log record — investigate the underlying cause rather than reaching for a filter. See [#144](https://github.com/bindreams/hole/issues/144) for a worked example.
+- [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs) — bytes-in/out forwarder;
+  PlainUdp / PlainTcp / DoT / DoH; preserves the client's transaction ID.
+- [`LocalDnsServer`](crates/bridge/src/dns/server.rs) — binds loopback `:53`
+  UDP+TCP via a ladder `127.0.0.1:53` → `127.53.0.1..254:53` → fail. Two gates
+  advance it: the bind syscall (Windows `SO_EXCLUSIVEADDRUSE`, so a later
+  `SO_REUSEADDR` binder can't steal traffic) and a 600 ms post-bind UDP self-test
+  (`SelfTestProbe`; production `DefaultProbe`). The self-test catches a wildcard
+  `0.0.0.0:53` `SO_REUSEADDR` holder (ICS, Pi-hole, dnscrypt-proxy) that hijacks
+  loopback UDP even though `bind(127.0.0.1:53)` returns `Ok` (#398).
+- [`Socks5Connector`](crates/bridge/src/dns/socks5_connector.rs) — routes the
+  forwarder's upstream through the SS SOCKS5 listener so user `Block` rules can't
+  strand the resolver (TCP via `tokio-socks`; UDP via hand-rolled UDP ASSOCIATE,
+  RFC 1928).
+- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — Windows `netsh`, macOS
+  `networksetup`. Apply runs on the TUN **and** upstream adapters; capture runs
+  on the upstream only (the TUN is freshly created). Prior config persists to
+  `bridge-dns.json`; the post-apply cache flush is fire-and-forget.
 
-**JS → Rust console relay.** `console.error` and `console.warn` calls in `ui/` are intercepted by `installConsoleRelay()` in [`ui/main.ts`](ui/main.ts) — the first thing `init()` runs — and forwarded to Rust via `@tauri-apps/plugin-log`'s `error()` / `warn()`. Those flow through `log` → `tracing-log::LogTracer` → the file layer → `gui.log`, so dashboard-side errors are persisted alongside the Rust events for the same session. The relay is **log-only**: it does not show toasts. Toast presentation is per-call-site so blanket capture (e.g. the bounded auto-test failure-storm path) does not flood the UI. Note this is `installConsoleRelay()`, not `attachConsole()` — the latter only mirrors Rust log events into the JS console (Rust→JS, the opposite direction).
+`DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]`,
+`intercept_udp53: true` — and `AppConfig` is `#[serde(default)]`, so the
+forwarder enables silently on upgrade.
 
-**Surfacing failures to the user.** Use `showToast(message, kind)` from [`ui/toast.ts`](ui/toast.ts) at any user-visible call site that currently swallows an error into `console.error`. Toasts cap at 5 visible (oldest auto-dismissed when a 6th arrives) so a misbehaving caller in a tight loop cannot fill the screen. Errors that include filesystem paths or other PII must be redacted before they reach the toast — the detail still lands in `gui.log` via the relay or via an explicit `warn!` Rust-side. The `config.save` failure path in [`crates/hole/src/commands.rs`](crates/hole/src/commands.rs) is the canonical example: the raw `io::Error` contains the config-file path (PII on Windows), so the user-facing string is generic and the path is recorded only in `gui.log`.
+**Start-time gate (load-bearing).** A forwarder self-test runs inside
+[`start_inner`](crates/bridge/src/proxy_manager.rs) **before**
+`Dispatcher::new` / `routing.install` / `apply_dns_settings`; on failure it
+returns `ProxyError::ForwarderSelfTestFailed` and the RAII guards unwind without
+touching routes, system DNS, or the wintun adapter. Guarded by
+`start_blocks_on_forwarder_self_test_failure`.
 
-### State files (crash recovery)
+**Hard errors:** `dns.enabled = true` with `servers = []` is a config error;
+`bind_ladder` exhaustion (all 255 loopback candidates blocked) is a start error
+(a single conflict like Pi-hole on `127.0.0.1:53` still succeeds via the ladder).
 
-While a proxy is active, the bridge writes `bridge-routes.json` to its state directory recording the installed TUN name, server IP, and upstream interface. On next startup the bridge reads this file (after a successful IPC bind) to clean up any routes leaked by a previous crashed run. The file is removed on clean shutdown.
+### Listener selection invariants
 
-Default state directory:
+[`ProxyConfig`](crates/common/src/protocol.rs) has two listener toggles
+(`proxy_socks5`, `proxy_http`) plus `local_port_http` (SOCKS5 uses `local_port`).
+[`build_ss_config`](crates/bridge/src/proxy/config.rs) pushes at most two
+`LocalInstanceConfig`s and rejects three combinations up-front (surfaced as
+`BridgeResponse::Error`):
 
-- Windows: `%LOCALAPPDATA%\hole\state\`
-- macOS: `~/Library/Application Support/hole/state/`
-- Service (Windows): `C:\ProgramData\hole\state\`
-- Service (macOS): `/var/db/hole/state/`
-- `scripts/dev.py` passes an explicit `--state-dir` pointing at `$TMPDIR/hole-dev/state` so the file is easy to find.
+1. `Full && !proxy_socks5` → `TunnelRequiresSocks5` (the TUN dispatcher hands
+   captured traffic to the SOCKS5 listener; without it Full-mode flows vanish).
+1. `!proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
+1. `proxy_socks5 && proxy_http && local_port == local_port_http` →
+   `DuplicateListenerPort`.
 
-If the dev bridge is killed before clean shutdown and your internet breaks, run `scripts/network-reset.py` (it reads the same state file and performs the equivalent cleanup).
+The HTTP listener's `Mode` is always `TcpOnly` (HTTP CONNECT is TCP-only,
+RFC 7231 §4.3.6); the SOCKS5 listener's is always `TcpAndUdp`.
 
-## Port allocation
+### Bridge test-isolation contract
 
-Any code that needs an ephemeral port and follows up with an OS bind (TCP listener, UDP socket, plugin subprocess, in-process server) must go through [`hole_common::port_alloc::bind_ephemeral`](crates/common/src/port_alloc.rs). Direct calls to `port_alloc::free_port` are rejected by clippy ([`disallowed_methods`](clippy.toml)); the lint may be suppressed with `#[allow(clippy::disallowed_methods)]` plus a comment when the port must be returned to the caller before the bind happens (e.g. test fixtures that hand the port to a subprocess via JSON config — see [`test_support::port_alloc::allocate_ephemeral_port`](crates/bridge/src/test_support/port_alloc.rs)).
+All production OS-mutating I/O — shadowsocks lifecycle, routing-table mutations,
+gateway introspection, DNS resolver config — routes through three traits so tests
+can mock it: `Proxy` ([proxy.rs](crates/bridge/src/proxy.rs)), `Routing`
+([routing.rs](crates/tun-engine/src/routing.rs)), and `Dns`
+([dns/system.rs](crates/bridge/src/dns/system.rs)). **Helper types whose `Drop`
+performs cleanup must route it through trait methods, not raw free functions.**
+Compile-time enforcement is in the root [`clippy.toml`](clippy.toml)
+`disallowed_methods` list (`routing::setup_routes`/`teardown_routes`; the Win32
+DNS FFIs `SetInterfaceDnsSettings`/`GetInterfaceDnsSettings`). See #165 (the
+incident) and #397 (the `Dns` extension).
 
-**Why.** Windows maintains independent TCP/UDP excluded-port-range tables (Hyper-V/WSL/Docker dynamic reservations); a port that passes a TCP probe can still fail UDP bind with WSAEACCES. `bind_ephemeral` folds the caller's bind into the same retry loop so there is no divorced-port-number TOCTOU window: each iteration probes one transport, verifies the others, runs the caller's `op`, and retries the whole cycle on `is_bind_race` errors. The retry is **unbounded** — the only terminations are success or a non-bind-race error. Linux uses a unified excluded-port table so the bug is invisible during local development; Windows CI is the only enforcement layer. See [bindreams/hole#285](https://github.com/bindreams/hole/issues/285) and [#300](https://github.com/bindreams/hole/issues/300).
+`Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
+and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
+Both are necessary: an outer-only mock can pass while `SystemDns::apply` ignores
+cancel internally.
 
-**No budget.** Earlier iterations capped retries at 5; on a saturated Windows runner that flakes, and there is no "right" number — the OS allocator covers ~28K ephemeral ports and any fixed cap is arbitrary. The loop yields to the runtime each iteration and emits adaptive `info!` logs at attempt milestones so a stuck loop stays visible at the default log level. See [#300](https://github.com/bindreams/hole/issues/300).
+### Bridge cancellation contract
 
-**Scope.** `bind_ephemeral` retries `is_bind_race` errors that surface through the closure as `io::Error`. Out-of-process binders (plugin subprocesses) report bind failures through other channels (oneshot timeout, exit code) — not in-band classifiable. For those sites the load-bearing race mitigation comes from `bind_ephemeral`'s in-process probe step (run before each `op` call), which catches Windows excluded-range disagreements before the subprocess spawn. The residual probe-drop-to-subprocess-bind TOCTOU is tracked in [#304](https://github.com/bindreams/hole/issues/304). The three current consumers — [`LocalDnsServer::bind`](crates/bridge/src/dns/server.rs), [`start_plugin_chain`](crates/bridge/src/proxy/plugin.rs), and [`test_support::ssserver::start_real_ss_server*`](crates/bridge/src/test_support/ssserver.rs) — all route through it.
+Cooperative-cancellation propagation (Go `context.Context` style) is the **only**
+cancellation mechanism. Future-drop cancellation is reserved for catastrophic /
+panic teardown. The cancel scope is rooted at the IPC `handle_start` handler
+([ipc.rs](crates/bridge/src/ipc.rs)); every phase of
+[`ProxyManager::start_cancellable`](crates/bridge/src/proxy_manager.rs) receives
+the token by reference. A fresh `CancellationToken::new()` inside
+`crates/bridge/src/` would shadow the chain and is banned by `clippy.toml`
+(sanctioned exceptions carry a per-site `#[allow]` + citation). See #397.
 
-## Commit messages — Conventional Commits
+Three invariants:
 
-This repository squash-merges every PR, so the PR title becomes the
-commit subject on `main`. PR titles MUST follow the
-[Conventional Commits](https://www.conventionalcommits.org/) format:
+1. **Cooperative observation between phases** —
+   `tokio::select! { biased; _ = cancel.cancelled() => Err(Cancelled), r = work => r }`
+   or a `cancel.is_cancelled()` check between loop iterations. The one exception:
+   a future with no async cleanup obligation (e.g. `DnsForwarder::forward`, whose
+   socket closes on `Drop`) may be future-dropped, documented inline.
+1. **Async cleanup is explicit** — types with async cleanup expose
+   `async fn shutdown(&mut self)` and use `drop_bomb::DebugDropBomb` to enforce
+   that callers awaited it (panics in debug, `warn!` + sync fallback in release).
+1. **`select!` arms must not drop work mid-cleanup** — restructure so cleanup is
+   awaited after the select returns; see the apply loop in `SystemDns::apply`.
 
-```
-<type>(<scope>)?: <description>
-```
+[`SystemDnsApplied`](crates/bridge/src/dns/system.rs) owns a `DebugDropBomb`
+defused by `shutdown()` and is constructed only in the `Ok` branch of
+`Dns::apply`. **Known follow-up:** `SystemRoutes::Drop` still tears down routing
+synchronously (blocks the worker on `netsh`/`route`); converting it to the
+`shutdown` + `DebugDropBomb` discipline is tracked.
 
-`type` is one of: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
-`test`, `build`, `ci`, `chore`, `revert`. `scope` is optional and
-identifies an area or crate (`bridge`, `xtask`, `release`, etc.). A
-trailing `!` (e.g. `feat(api)!: …`) flags a breaking change.
+### Spawn-retry & file-contention
 
-Examples that match this convention:
+Transient `Command::spawn` contention (Windows Defender scanning a fresh
+`hole.exe`; macOS `ETXTBSY`) is handled by three layers:
 
-- `feat(bridge): add HTTPS DoH support to DNS forwarder`
-- `fix(release): use sha256sum (cross-platform) instead of shasum`
-- `refactor(xtask-lib): per-product version groups`
-- `chore(deps): bump tokio from 1.52 to 1.53`
+- [`handle-holders`](crates/handle-holders/) — query API `find_holders` /
+  `log_holders` (Windows `NtQuerySystemInformation`; macOS `lsof`). Best-effort.
+- `util::retry::exp_backoff` and `util::retry::retry_if(op, predicate, attempts, base)`, shipping an `is_file_contention` predicate
+  (`ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION`; `ETXTBSY`/`EBUSY`).
 
-Enforcement: a CI check on every PR validates the title against the
-allowed types and shape (see [.github/workflows/semantic-pr.yaml](.github/workflows/semantic-pr.yaml)).
-A non-conforming title fails the check; rename via `gh pr edit <N> --title "..."`
-or the web UI and the check re-runs automatically.
+`DistHarness::spawn` composes them (`retry_if(spawn, is_file_contention, 3, 500ms)`) and logs holders on terminal failure (#208).
 
-Why it matters operationally: the type prefix drives per-track release
-notes categorization. `scripts/generate-release-notes.py` reads each
-track's `.github/release-<track>.yaml` config, filters squash-commits
-by file paths the PR touched, and groups them under their type's
-heading (Features / Bug fixes / etc.). A PR without a recognizable type
-prefix is grouped under "Other" rather than dropped — so the existing
-non-conforming history before this policy landed remains visible — but
-new PRs must conform via the CI gate.
+### Port allocation
+
+Ephemeral-port allocation goes through `util::port_alloc`
+([crates/util/src/port_alloc.rs](crates/util/src/port_alloc.rs)) — an Apache-2.0
+crate so both Hole's GPL crates and the Apache plugin world can depend on it.
+
+- `bind_ephemeral(ip, protocols, op)` — **the canonical entry point.** Allocates
+  a port, runs `op(port)`, and retries the whole cycle on `is_bind_race` errors.
+  **Unbounded retry, no budget** — the only terminations are success or a
+  non-bind-race error; it yields each iteration and logs at attempt milestones.
+- `free_port` — primitive that returns a verified-free port divorced from a bound
+  socket. **Direct callers are clippy-`disallowed_methods`** — use
+  `bind_ephemeral`, or `#[allow]` + comment when the port must reach a subprocess
+  before the bind (`test_support::port_alloc::allocate_ephemeral_port` is the
+  sanctioned exception).
+- `ensure_port_free` — pure probe without allocation.
+
+The retry exists because Windows keeps **independent TCP/UDP excluded-port-range
+tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
+may be reserved for the other. There is no "right" budget — a saturated runner
+needs many retries, a healthy machine one. See #285, #300, #304.
+
+### Crash recovery
+
+While a proxy is active the bridge persists small state files in `<state_dir>/`,
+cleared on clean shutdown and replayed on next startup (all *after* the IPC
+socket binds; DNS recovery runs before route recovery so a mid-recovery crash
+leaves working DNS + broken routes, not the inverse):
+
+- **`bridge-routes.json`** — TUN name, server IP, upstream interface;
+  `routing::recover_routes` tears down leaked routes.
+- **`bridge-plugins.json`** — plugin PIDs + start times;
+  `plugin_recovery::recover_plugins` kills survivors (PID-reuse-safe).
+- **`bridge-dns.json`** — prior system DNS; `dns::recovery::recover_dns_config`
+  restores it.
+- **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
+  `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
+  name prefix.
+
+If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
+performs equivalent cleanup from outside.
+
+### Native-crash observability (tombstone)
+
+Native faults (SIGSEGV/access-violation, stack overflow, SIGABRT/`abort()`,
+SIGILL/FPE/BUS, heap corruption, Windows invalid-parameter/pure-virtual) bypass
+Rust's unwinding panic hook. The first-party Apache-2.0
+[`tombstone`](crates/tombstone/) crate (built on `crash-handler`) closes the gap.
+
+`tombstone::attach(kind, log_dir)` is called at the logging chokepoint
+([`init_multi`](crates/common/src/logging.rs), right after
+`install_panic_hook()`), covering GUI/CLI/bridge; galoshes attaches in its own
+`main`. On a fault, `on_crash` runs in a compromised context and does only
+signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
+syscalls (no heap/locks/`format!`), then return `Handled(false)` so the OS
+default path (WER / `.ips` / core dump) still runs. All I/O errors are swallowed.
+`tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
+`tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
+`log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
+unprivileged GUI.
+
+- **Platform coverage:** marker + sweep work on Windows, macOS, **and Linux**
+  (galoshes ships a Linux release, so `tombstone` must compile and run there).
+  Linux runtime crash tests are a known gap (compile-verified via the galoshes
+  Linux build; runtime-exercised only on the Win/mac `hole-tests` lane).
+- **Dev-only minidumps:** under the non-default `crash-dumps` feature, `on_crash`
+  also writes a `.dmp` via `minidump-writer` — **Windows/macOS only** (no
+  in-process Linux self-dump). `minidump-writer` never links into a shipped
+  binary (process memory holds keys + traffic, and it has no Windows-aarch64
+  support).
+- **Plugins:** ex-ray is spawned with `GOTRACEBACK=crash`; `record_exit` logs a
+  mid-run plugin death with `exit_code`/`killed`.
+- **Known gap (accepted, untested):** Windows `__fastfail` / `int 29h` (incl.
+  `/GS` stack-cookie failures and `std::process::abort()` on Windows) is
+  uncatchable by design. On macOS `abort()` → SIGABRT is caught.
+
+### Panic-dump dispatcher
+
+`hole-test-observability` ships a workspace-shared panic-hook dispatcher
+([panic_dump](crates/test-observability/src/panic_dump.rs)). On a test panic it
+iterates registered `PanicDumpSource`s, then chains to the previous hook.
+**Contract:** `dump()` MUST swallow all I/O errors — a double-panic would replace
+the original message. Registration is RAII (`register` → guard). The dispatcher
+is installed at ctor time, so consumers just `register()`. Current consumer:
+`BridgeChildLogSource` dumps each live `DistHarness` child's `bridge.log` (#303).
+
+## Workspace layout
+
+Each publishable member declares a release group in
+`[package.metadata.hole-release].group` (enforced by `xtask-lib::version`).
+`publish = false` means not pushed to crates.io.
+
+| Directory / file                   | Crate · license · group                | Purpose                                                                         |
+| ---------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------- |
+| `crates/common/`                   | `hole-common` · GPL · hole             | Shared types: protocol, config, import, logging                                 |
+| `crates/bridge/`                   | `hole-bridge` · GPL · hole             | Bridge library (TUN/routing/SS/IPC/DNS)                                         |
+| `crates/hole/`                     | `hole` · GPL · hole                    | Tauri app + CLI + bridge entry (binary `hole`)                                  |
+| `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                        |
+| `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                   |
+| `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                              |
+| `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                         |
+| `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                               |
+| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI                        |
+| `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                     |
+| `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin) |
+| `crates/mock-plugin/`              | Apache · —                             | Minimal SIP003u echo plugin for garter tests                                    |
+| `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                            |
+| `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)       |
+| `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                 |
+| `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                   |
+| `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                   |
+| `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                       |
+
+The Apache crates are Apache-2.0 per-crate (see [NOTICES.md](NOTICES.md)); Hole's
+own crates are GPL-3.0-or-later. Combined distributions (`hole.exe`, `hole.msi`,
+bundled `galoshes.exe`) ship as a whole under GPL via Apache→GPL one-way
+compatibility.
+
+**ex-ray embedding.** `galoshes` embeds the ex-ray Go binary at compile time:
+`cargo xtask ex-ray` builds it into `.cache/ex-ray/`;
+[`galoshes/build.rs`](crates/galoshes/build.rs) emits `EX_RAY_PATH` +
+`EX_RAY_SHA256`, and galoshes re-hashes the embedded bytes at runtime and refuses
+to run on mismatch. At startup galoshes extracts ex-ray to
+[`embedded::runtime_dir`](crates/galoshes/src/embedded.rs)
+(`$XDG_RUNTIME_DIR/galoshes` else the platform cache dir; bails if neither is
+set) and probes it for `noexec` (statvfs/statfs) — the Linux `/tmp` fallback was
+removed because tmpfs is commonly `noexec` (#401).
 
 ## Prerequisites
 
 - Rust toolchain
-- Go toolchain (for ex-ray, built by `cargo xtask deps`)
-- Node.js ≥24 (constraint pinned via `engines.node` in [package.json](package.json); current Active LTS)
+- Go toolchain (for ex-ray; built by `cargo xtask deps`)
+- Node.js ≥24 (pinned via `engines.node` in [package.json](package.json))
 
 ### npm dependency management
 
-`scripts/dev.py` runs `npm install`, which updates `package-lock.json` to match `package.json` whenever the two have drifted. PR-time CI runs `npm ci` via the `frontend-build` xtask target, which is strict — it fails if `package-lock.json` and `package.json` are inconsistent. **If you modify `package.json` directly, commit the resulting `package-lock.json` change in the same commit, or CI will reject the PR.** Renovate handles routine npm updates automatically (see [.github/renovate.json](.github/renovate.json)).
+`scripts/dev.py` runs `npm install`, which updates `package-lock.json` when it
+drifts from `package.json`. PR CI runs strict `npm ci` (via `frontend-build`),
+which fails on inconsistency. **If you edit `package.json`, commit the resulting
+`package-lock.json` in the same commit, or CI rejects the PR.** Renovate handles
+routine updates ([renovate.json](.github/renovate.json)).
+
+## Build
+
+Requires the toolchains above. `build.yaml` is the single source of truth for the
+build graph; `cargo xtask list` prints the target table.
+
+```sh
+npm install                  # frontend deps (first time only)
+cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (cached)
+cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
+cargo xtask run hole         # dev mode (= build hole + scripts/dev.py)
+cargo xtask run hole-tests   # canonical local nextest invocation
+```
+
+### Tauri dev/prod feature toggle
+
+The `hole` crate defaults to `tauri/custom-protocol` (**production mode**:
+`cfg(dev) = false`, webview loads bundled `tauri.localhost`, `tauri-codegen`
+embeds `ui/dist/` and panics if it's missing). With `--no-default-features`
+(**dev mode**) the webview loads Vite's `http://localhost:1420` and `ui/dist/` is
+not required. The `hole` / `hole-tests` xtask targets pass
+`--no-default-features`; `hole-msi` / `hole-dmg` use the default and depend on
+`frontend-build`. **Running `cargo build -p hole` directly: add
+`--no-default-features` for dev, or `cargo xtask build frontend-build` first.**
+See #372.
+
+### Windows installer
+
+```sh
+uv run --directory msi-installer build       # builds hole.msi in target\release\
+msiexec /i target\release\hole.msi [/quiet]  # install (interactive / unattended)
+cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build validation
+```
+
+### macOS DMG
+
+```sh
+cargo xtask build hole-dmg       # produces .dmg (npx tauri build under the hood)
+cargo xtask run hole-dmg-tests   # mount + assert .app code signature is intact
+```
 
 ## Development
 
 ### Running in dev mode
 
-Dev mode creates a **real TUN interface** and modifies the routing table — it matches the production bridge code path. This requires elevation:
+Dev mode creates a **real TUN interface** and edits the routing table (the
+production bridge path), so it needs elevation:
 
 ```sh
 # Windows: from an elevated PowerShell
 cargo xtask run hole
 
-# macOS — build first as your user, then elevate to run.
+# macOS: build as your user first, then elevate to run
 cargo xtask build hole
 sudo cargo xtask run hole
 ```
 
-`cargo xtask run hole` builds the `hole` target and then launches `scripts/dev.py`, which builds the workspace, starts Vite, and launches the bridge + GUI with multiplexed, color-coded logs. Frontend changes (`ui/`) hot-reload instantly via Vite HMR. Rust changes require Ctrl+C and re-run.
+`cargo xtask run hole` launches `scripts/dev.py`, which builds the workspace,
+starts Vite, and launches bridge + GUI with multiplexed color-coded logs.
+Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and re-run.
 
-**`--no-default-features` for direct cargo invocations.** The `hole` crate defaults to enabling `tauri/custom-protocol`, which puts Tauri in production mode (`cfg(dev) = false`, webview loads bundled assets from `tauri.localhost`). The dev/test build.yaml targets (`hole`, `hole-tests`, `clippy-hole`) pass `--no-default-features` to flip back to dev mode, where the webview loads from Vite's `http://localhost:1420` and `ui/dist/` is not required. If you run cargo directly for hole — e.g. `cargo build -p hole`, `cargo clippy -p hole`, `cargo test -p hole` — add `--no-default-features` or you'll panic at compile time on missing `ui/dist/`. The orchestrator (`cargo xtask build hole`, `cargo xtask run hole-tests`, etc.) handles this automatically.
-
-**Lock collision with an installed GUI.** The dev binary uses the same Tauri identifier (`com.hole.app`) as the released MSI/DMG build, so the [single-instance lock](CLAUDE.md#single-instance-enforcement) treats them as the same app. If an MSI-installed `hole.exe` is already running (e.g. via autostart), `cargo xtask run hole` will silently forward its args to that instance and the dev GUI won't appear. Quit the installed Hole (tray → Exit) before starting dev mode.
-
-**Why the explicit `cargo xtask build hole` on macOS.** `cargo xtask run` always invokes the build cascade for the target before its `run:` steps; under `sudo` that cascade runs as root and would leave `target/` and `target/debug/dist/` files owned by root. `dev.py` already drops privileges around its own internal `cargo xtask build hole` (see lines 130-134 / 336-340 in [scripts/dev.py](scripts/dev.py)), but the orchestrator's pre-cascade fires *before* dev.py gets control. Running `cargo xtask build hole` unprivileged first warms the cargo cache so the elevated `run` cascade is a no-op, sidestepping the ownership issue. Windows is unaffected — UAC elevation is token-based and all subprocesses naturally share the same user identity.
-
-On macOS, `dev.py` detects `SUDO_USER` and drops privileges for the GUI and Vite subprocesses (via POSIX `setuid`/`setgid` + `extra_groups`) so they read your real `~/Library` config while the bridge inherits root. On Windows, UAC elevation is token-based, so all subprocesses naturally share the same user identity — no drop is needed.
-
-Before starting the bridge, `dev.py` invokes `hole bridge grant-access` to create the `hole` group, add your user to it, and (on Windows) write the installer-user-SID file. The bridge then uses the production `IpcServer::bind` + `apply_socket_permissions` path — the same DACL/group/SDDL code that runs in the installed service. Dev exercises this path on every run.
-
-If the dev process crashes or is killed and your internet breaks, run `scripts/network-reset.py` — also requires elevation — to recover. It reads the same state file the bridge writes and targets the exact leaked routes.
-
-Dev mode does **not** remove you from the `hole` group on exit (same as production: once granted access you keep it until `hole bridge uninstall`, which deletes the group). This means re-running `dev.py` after a crash is a no-op on the group-add step.
-
-On macOS, `dseditgroup` membership changes are reflected in `getgrouplist` immediately for newly-spawned processes in the normal case. If DirectoryService has cached the old membership (rare; seen on heavily-loaded systems or across user sessions), the dropped GUI may report "permission denied" when connecting to the dev socket. Re-running `dev.py` refreshes the cache; logging out and back in forces it.
+- **Why build first on macOS:** `run` invokes the build cascade before `run:`
+  steps; under `sudo` that would leave `target/` root-owned. Building unprivileged
+  first warms the cache so the elevated cascade is a no-op. (Windows UAC is
+  token-based — unaffected.)
+- On macOS `dev.py` detects `SUDO_USER` and drops privileges (setuid/setgid +
+  `extra_groups`) for the GUI/Vite so they read your real `~/Library`, while the
+  bridge inherits root.
+- `dev.py` runs `hole bridge grant-access` (creates the `hole` group, adds your
+  user) so the bridge exercises the production DACL/group path on every run. The
+  group is **not** removed on exit (same as production).
 
 ### Manual workflow
 
-If you prefer separate terminals or need more control:
-
-**Terminal 1 — Bridge (elevated):**
-
-Windows (elevated PowerShell):
+Separate terminals, more control. **Terminal 1 — bridge (elevated):**
 
 ```powershell
-cargo xtask build hole                                                    # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"   # per-session BINDIR (hole.exe + sidecars + wintun.dll)
-& "$env:TEMP\hole-dev-manual\hole.exe" bridge grant-access                # create hole group, add user
+# Windows (elevated PowerShell)
+cargo xtask build hole
+cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"
+& "$env:TEMP\hole-dev-manual\hole.exe" bridge grant-access
 & "$env:TEMP\hole-dev-manual\hole.exe" bridge run `
-    --socket-path "$env:TEMP\hole-dev.sock" `
-    --state-dir   "$env:TEMP\hole-dev-state"
+    --socket-path "$env:TEMP\hole-dev.sock" --state-dir "$env:TEMP\hole-dev-state"
 ```
-
-macOS (under sudo):
 
 ```sh
-cargo xtask build hole                                                    # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"     # per-session BINDIR (hole + sidecars)
-"$TMPDIR/hole-dev-manual/hole" bridge grant-access                        # create hole group, add user
+# macOS (under sudo)
+cargo xtask build hole
+cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"
+"$TMPDIR/hole-dev-manual/hole" bridge grant-access
 "$TMPDIR/hole-dev-manual/hole" bridge run \
-    --socket-path "$TMPDIR/hole-dev.sock" \
-    --state-dir   "$TMPDIR/hole-dev-state"
+    --socket-path "$TMPDIR/hole-dev.sock" --state-dir "$TMPDIR/hole-dev-state"
 ```
-
-`cargo xtask build hole` walks the `build.yaml` DAG: it builds ex-ray
-(Go), galoshes (workspace member), downloads wintun on Windows, then runs
-`cargo build --workspace --no-default-features` (debug) and `cargo xtask stage --profile debug --out-dir target/debug/dist`. Use `cargo xtask list` to print the full target
-table; `cargo xtask build --all` builds every target applicable to the host
-platform; `cargo xtask run <name>` builds and then performs the named
-target's `run:` action — running tests (`hole-tests`), linters
-(`clippy-hole`, `prek`, `frontend-check`), or dev mode (`hole`).
 
 **Terminal 2 — Vite + GUI (unelevated):**
 
-Windows (PowerShell):
-
 ```powershell
-npm run dev                                            # Vite on port 1420 (run in its own terminal)
-$env:HOLE_BRIDGE_SOCKET = "$env:TEMP\hole-dev.sock"
-target\debug\hole.exe
+# Windows
+npm run dev                                       # Vite on port 1420
+$env:HOLE_BRIDGE_SOCKET = "$env:TEMP\hole-dev.sock"; target\debug\hole.exe
 ```
 
-macOS (bash):
-
 ```sh
-npm run dev &                                          # Vite on port 1420
+# macOS
+npm run dev &                                     # Vite on port 1420
 HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```
 
-`cargo xtask stage` populates a directory with `hole.exe`, `ex-ray.exe`, and (on Windows) `wintun.dll` — the same layout as the installed MSI in `Program Files\hole\bin\`. The canonical file list lives in [xtask/src/bindir.rs](xtask/src/bindir.rs); adding a new BINDIR file is a one-line change there and both `dev.py` and `msi-installer` pick it up automatically. The bridge binary must be staged out of the cargo target dir because the running bridge holds a file lock on its own exe — without staging, the next `cargo build` would fail with "Access is denied". The `ex-ray` sidecar (which serves the `v2ray-plugin` wire protocol) must be a sibling of the bridge so [resolve_plugin_path_inner](crates/bridge/src/proxy/config.rs) finds it.
+`cargo xtask stage` populates a BINDIR (`hole` + `ex-ray` sidecar + `wintun.dll`
+on Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
+staged out of the cargo target dir because the running bridge file-locks its own
+exe; the `ex-ray` sidecar must be a sibling so `resolve_plugin_path_inner` finds
+it. The canonical file list is [xtask/src/bindir.rs](xtask/src/bindir.rs).
 
 ### Flags
 
-- `hole bridge run` defaults to foreground mode, logging to stderr + file. **Requires elevation** for TUN/routing.
-- `--service`: register with the Windows Service / macOS launchd dispatcher. The service installer passes this automatically.
-- `--log-dir DIR`: override the default log directory.
-- `--state-dir DIR`: override the default route-state directory (crash-recovery file).
-- `--socket-path PATH`: override the default IPC socket location.
-- `HOLE_BRIDGE_SOCKET` env var: tells the GUI to connect to a dev bridge at a custom socket path.
+- `hole bridge run` — foreground, logs to stderr + file. **Needs elevation.**
+- `--service` — register with Windows SCM / macOS launchd (the service installer
+  passes this).
+- `--log-dir` / `--state-dir` / `--socket-path` — override defaults.
+- `HOLE_BRIDGE_SOCKET` env var — tells the GUI to connect to a dev bridge socket.
 
 ### Notes
 
-- Running `hole bridge run` requires elevation (for TUN/routing). `scripts/dev.py` enforces this at startup.
-- Use absolute paths (like `$TEMP`) for `--socket-path` to avoid Windows AF_UNIX path length limits.
-- The first run of `cargo xtask deps` is slow (compiles ex-ray from Go, downloads wintun on Windows). Subsequent runs are near-instant: Go's build cache short-circuits, and the wintun download is sha256-sentineled. Icons are generated by `crates/hole/build.rs` on every cargo build but cached in `.cache/icons/`.
+- Use absolute paths (e.g. `$TEMP`) for `--socket-path` to avoid Windows AF_UNIX
+  path-length limits.
+- The dev binary shares `com.hole.app` with the installed build, so if an
+  installed `hole.exe` is running, dev launches forward to it and the dev GUI
+  won't appear — quit the installed Hole first.
+- If a dev crash breaks routing, run `scripts/network-reset.py` (elevated).
+- First `cargo xtask deps` is slow (compiles ex-ray, downloads wintun);
+  subsequent runs are near-instant (Go build cache + sha256-sentineled download).
 
 ## Testing
 
+Unit tests use the [skuld](https://github.com/bindreams/skuld) framework
+(`#[skuld::test]`, not `#[test]`); test files are siblings (`foo.rs` →
+`foo_tests.rs`).
+
 ```sh
-cargo test --workspace --no-default-features
+cargo xtask run hole-tests                       # canonical local invocation
+cargo test --workspace --no-default-features     # plain cargo equivalent
+npm run test:e2e                                 # E2E (requires a release build)
 ```
 
-### Avoiding Windows Firewall prompts on every rebuild
+### Avoiding Windows Firewall prompts
 
-Bridge tests bind a TCP listener on all interfaces (for TUN routing), so Windows Firewall prompts for "allow access to local networks" when the test binary starts. Cargo names test binaries `target/debug/deps/hole_bridge-{hash}.exe` with a content-hash suffix that churns on every rebuild, so Firewall never caches consent. On a fullscreen-capable setup the prompt also closes fullscreen apps.
-
-To approve once and never again:
+Bridge tests bind a TCP listener on all interfaces, so Windows Firewall prompts
+on each rebuild (cargo's content-hash test-binary names churn, defeating cached
+consent). Stage tests at a stable path once:
 
 ```sh
 cargo xtask stage --with-tests \
-    --out-dir target/debug/dist/bin \
-    --tests-out-dir target/debug/dist/tests
+    --out-dir target/debug/dist/bin --tests-out-dir target/debug/dist/tests
 ./target/debug/dist/tests/hole_bridge.test.exe   # approve the prompt once
 ```
 
-Test execution may report failures on that first run — individual tests aren't the point here. The goal is simply for `hole_bridge.test.exe` to bind its socket so Windows Firewall shows the prompt against a path that won't churn.
-
-Subsequent `cargo xtask stage --with-tests` runs reuse the same stable path, so Firewall consent persists. Re-run the staging command after each source change — the staged binary does not update automatically. When two cargo targets share a name (e.g. the `hole` crate's lib and bin), dest names get disambiguated to `hole-lib.test.exe` / `hole-bin.test.exe`.
+Re-run the staging command after each source change (the staged binary doesn't
+auto-update). Co-named lib/bin targets disambiguate to `hole-lib.test.exe` /
+`hole-bin.test.exe` (#210).
 
 ### Investigating Windows CI flakes
 
-When Windows CI fails with a timeout in `server_test_tests` or loopback connects time out unexpectedly, work through these steps IN ORDER before proposing any timeout bump. (bindreams/hole#165, for example, was a unit test that shelled out to `netsh` via an RAII guard that bypassed the backend trait.)
+When Windows CI times out in `server_test_tests` or loopback connects hang, work
+through these IN ORDER before proposing any timeout bump:
 
-1. **If the failure is `PermissionDenied` / `WSAEACCES` / os error 10013 on a socket bind**, the canonical entry point [`hole_common::port_alloc::bind_ephemeral`](crates/common/src/port_alloc.rs) handles this case by folding the caller's bind into an unbounded retry loop on `is_bind_race` (also matched: `AddrInUse` / `AddrNotAvailable`). The loop has no budget — if you see it grind, look for adaptive `info!` log lines at attempt milestones (10, 20, 50, 100, …). A loop that never converges means the machine's TCP or UDP excluded-port range covers most of the dynamic range. Inspect with `netsh int ipv4 show excludedportrange tcp`, `netsh int ipv4 show excludedportrange udp`, `netsh int ipv6 show excludedportrange tcp`, `netsh int ipv6 show excludedportrange udp`, and `netsh int ipv4 show dynamicportrange tcp`. Hyper-V / WSL / Docker Desktop are the typical reservation sources. See bindreams/hole#253, bindreams/hole#285, and bindreams/hole#300 for the cross-protocol mechanism. New code paths must go through `bind_ephemeral`; clippy `disallowed_methods` rejects raw `free_port` callers.
+1. **`PermissionDenied`/`WSAEACCES`/os error 10013 on bind** — handled by
+   [`bind_ephemeral`](#port-allocation)'s unbounded `is_bind_race` retry. A loop
+   that never converges means the machine's excluded-port range covers most of
+   the dynamic range; inspect `netsh int ipv4 show excludedportrange tcp` (and
+   `udp`/`ipv6`). Hyper-V/WSL/Docker are typical sources.
+1. **`Access is denied (os error 5)` on spawn** — grep for `file-lock holder`;
+   `DistHarness::spawn` retries + enumerates holders (#208). `MsMpEng.exe`
+   (Defender) is the usual culprit (PPL-protected → may be unenumerable).
+1. **Grep for `routing subprocesses` / `netsh|route add|route delete`** — the
+   `proxy_manager_tests_never_spawn_routing_subprocess` test asserts `N == 0`. A
+   hit means a code path bypassed the `Routing` trait.
+1. **Run `cargo clippy --workspace --no-default-features`** — `disallowed_methods`
+   rejects raw `routing::setup_routes`/`teardown_routes` and
+   `shadowsocks_service::local::Server::new` outside trait impls.
+1. **Check for new `std::process::Command::new` in `crates/bridge/src/`** — not
+   clippy-covered; each is a potential test-time subprocess leak.
+1. **Check skuld's per-test `pass (NN ms)` lines** for a duration outlier.
+1. **Compare with a recent main CI run** on the same runner image.
+1. **Only if all the above rule out code issues**, consider the runner image
+   changed — open a tracking issue and reconstruct a packet-capture job.
 
-1. **If the failure is `Access is denied (os error 5)` on spawn**, grep the log for `file-lock holder`. `DistHarness::spawn` retries three times with 500 ms exponential backoff on file-contention errors, and on terminal failure calls `handle_holders::log_holders` to enumerate processes holding `hole.exe` (see bindreams/hole#208). Expect `MsMpEng.exe` (Windows Defender) as the typical culprit. If no holders appear but the spawn still fails, Defender is PPL-protected and our non-`SeDebugPrivilege` enumeration skipped it — the `info!` line "file-lock holder enumeration skipped PIDs we couldn't open" is the tell.
+**Do NOT:** bump timeouts in `server_test_tests.rs` before steps 1–5; mark tests
+`#[cfg_attr(windows, ignore)]`; add `--test-threads=1`; serialize via bare
+`#[skuld::test(serial)]` (use a fixture/resource label); or add per-test
+timeouts. Job-level timeouts (`build` 30m, `test-hole` 20m, `test-garter`/
+`test-galoshes` 10m) are the only global timeouts.
 
-1. **Grep the failing test output for `routing subprocesses` or `netsh|route add|route delete`.** The #165 fix added a regression test (`proxy_manager_tests_never_spawn_routing_subprocess`) that prints `"proxy_manager start/stop cycles spawned N routing subprocesses"` and asserts `N == 0`. If that assertion fires, a new code path has bypassed the `Routing` trait — find the new `Drop` impl or helper that calls the free `routing::setup_routes`/`teardown_routes` functions and route it through the trait. Clippy's `disallowed_methods` lint should have caught this at build time; if it didn't, the lint needs tightening.
+### Test invariants
 
-1. **Run `cargo clippy --workspace --no-default-features` locally against the failing branch.** The `disallowed_methods` lint rejects calls to `routing::setup_routes`, `routing::teardown_routes`, and `shadowsocks_service::local::Server::new` from anywhere except the trait implementations themselves. A new hit means the bridge contract is being violated.
+- **Test observability** — every test-bearing crate dev-deps
+  `hole-test-observability` and calls `hole_test_observability::register!()` once
+  per binary. A pre-main ctor installs a process-global `tracing_subscriber`
+  (stderr), `RUST_BACKTRACE=full`, and Hole's tracing panic hook. Override via
+  `HOLE_TEST_LOG`. Third-party `log::trace!` is level-rejected before allocation
+  (the #147 perf guard). (#301)
+- **No raw subscriber init** — `clippy.toml` disallows
+  `tracing_subscriber::fmt().init()` / `try_init()` workspace-wide (one
+  `#[allow]`-suppressed production caller in `crates/common/src/logging.rs`).
+- **Per-test subscribers** — install via
+  [`garter::tracing_test::set_default_in_current_thread`](crates/garter/src/tracing_test.rs),
+  not raw `tracing::subscriber::set_default` (clippy-disallowed): the guard is
+  thread-local, so on a multi-thread runtime `tokio::spawn`'d tasks lose it.
+  `#[skuld::test] async fn` builds a current-thread runtime automatically (#302).
+- **No sleeps for synchronization** — `thread::sleep`, `tokio::time::sleep`,
+  `browser.pause()`, and any timeout-bounded poll (`waitUntil({ timeout })`,
+  `tokio::time::timeout(d, wait_for_x)`) are forbidden for sync. Two exception
+  classes, each with a one-line comment naming it: (1) **test-of-timing** (the
+  delay IS the behavior under test) and (2) **external event with graceful
+  failure bound** (a remote/out-of-process op that might never succeed; the
+  framework/job timeout is the failure-to-human signal). Use the codebase's
+  rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
+  `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
 
-1. **Check for new `std::process::Command::new` calls in recent diffs to `crates/bridge/src/`.** Not covered by the clippy lint (too broad a ban would break platform/group.rs). Each new usage is a potential test-time subprocess leak.
+## Logging & diagnostics
 
-1. **Check the runner-level duration lines in skuld's stderr** — skuld prints `[skuld] <test>: pass (NN ms)` for every test. Any test whose duration is a significant outlier compared to main is the load driver.
+### Log destinations
 
-1. **Compare with a recent main branch CI run on the same runner image.** If main passes and your branch doesn't, the delta is in your branch (necessary but not sufficient — #165 was a latent bug that a new branch tripped via timing).
+Both GUI and bridge write to stderr **and** a 10 MiB rotating file (one backup).
+Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 
-1. **Only if all of the above rule out code-level issues**, consider that the CI runner image itself has changed. Open a tracking issue and reconstruct a packet-capture CI job — do not bump timeouts without completing the investigation.
+- Windows `%LOCALAPPDATA%\hole\logs\`, macOS `~/Library/Application Support/hole/logs/`
+- Installed service: Windows `C:\ProgramData\hole\logs\`, macOS `/var/log/hole/`
 
-**Do NOT, under any circumstances:**
+### WebView2 and Chromium logs
 
-- Bump timeouts in `server_test_tests.rs` without completing steps 1-5
-- Mark failing tests with `#[cfg_attr(windows, ignore)]`
-- Add `--test-threads=1` to the Windows CI invocation
-- Serialize tests via bare `#[skuld::test(serial)]` except for structural invariant checks. Resource-contention serialization belongs on the fixture that models the resource (`#[skuld::fixture(serial = LABEL)]`) or on the test carrying the resource's label: `#[skuld::test(labels = [LABEL], serial = LABEL)]`. Labels live in `crates/bridge/src/test_support/skuld_fixtures.rs` (`DIST_BIN`, `PORT_ALLOC`, `TUN`, `IPV6`). Label names are cross-crate reserved via skuld's SQLite coordinator — adding the same label name in another crate will unintentionally serialize tests across crates.
-- Add a per-test timeout. Job-level timeouts in `.github/workflows/ci.yaml` — `build` 30m, `test-hole` 20m, `test-garter`/`test-galoshes` 10m — are the sole global test timeouts. Developers wanting local per-test hang protection can set `NEXTEST_SLOW_TIMEOUT` in their shell.
+Windows WebView2 writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
+straight to the inherited stderr, bypassing our `tracing` subscriber. The
+FD-level stdio safety net in
+[`crates/common/src/logging.rs`](crates/common/src/logging.rs) tees each line to
+a `tracing` event (target `hole::stderr_relay`, recorded into `gui.log`) and to
+the original stderr (dev terminal). **A Chromium line is a real log record —
+investigate the underlying cause rather than reaching for a filter** (#144).
 
-## Release operations
+### Console relay and toasts
 
-See [docs/RELEASE-OPS.md](docs/RELEASE-OPS.md) for the rollback procedure, minisign key rotation, and the crates.io dry-run TOCTOU note.
+`console.error`/`console.warn` in `ui/` are intercepted by `installConsoleRelay()`
+(the first thing `init()` runs) and forwarded to Rust via
+`@tauri-apps/plugin-log`, landing in `gui.log`. The relay is **log-only — it does
+not show toasts** (toasts are per-call-site so a tight loop can't flood the UI).
+(Not to be confused with `attachConsole()`, which mirrors Rust→JS.) Surface
+user-visible failures with `showToast(message, kind)` from
+[`ui/toast.ts`](ui/toast.ts) (caps at 5 visible). **Errors containing filesystem
+paths or other PII must be redacted before reaching a toast** — the detail still
+lands in `gui.log`. The `config.save` path in
+[`commands.rs`](crates/hole/src/commands.rs) is canonical: the raw `io::Error`
+holds the config-file path (PII on Windows), so the toast string is generic and
+the path is recorded only in `gui.log`.
+
+### Logging directives (HOLE_BRIDGE_LOG)
+
+`HOLE_BRIDGE_LOG` takes a comma-separated list of `tracing` directives (default
+`hole_bridge=info`); `RUST_LOG` is also honored and both compose. Example:
+`hole_bridge=debug,shadowsocks_service=trace` adds shadowsocks-service per-relay
+byte counts (`L2R N bytes, R2L M bytes`) — a load-bearing #248-class diagnostic,
+but expensive (≥1 TRACE line per TCP connection); use for debugging only.
+
+### Plugin diagnostics
+
+The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
+
+- **Plugin tap** — enabled by `AppConfig.diagnostic_plugin_tap` (persists to
+  service-mode bridges) or `HOLE_BRIDGE_PLUGIN_TAP=1` (dev shell only).
+  [`garter::TapPlugin`](crates/garter/src/tap.rs) logs per-connection
+  `bytes_to/from_plugin`, `ttfb_ms` (`None` = closed without an upstream byte —
+  the #248 diagnostic), `close_kind`, and `tap_conn_id`. On self-test failure the
+  bridge emits a breadcrumb to the tap lines (#388). Costs a loopback round-trip
+  per byte + a line per connection — not for default operation under load.
+- **Plugin debug logging (always on)** — `inject_plugin_debug_logging` appends
+  `loglevel=debug` to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`; stderr is
+  captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`.
+
+## CLI (dev/admin commands)
+
+User-facing commands are in [README.md](README.md#commands). The rest:
+
+```
+hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
+hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
+hole bridge install | uninstall | status                             register/start | stop/remove | status (elevation)
+hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log
+hole bridge grant-access [--then-send B64 | --then-send-file PATH]    create hole group, add user, write SID file
+hole bridge ipc-send (--base64 B64 | --request-file PATH)            proxy a single IPC command (elevation)
+hole proxy start --config-file PATH [--local-port PORT] [--local-port-http PORT] [--no-socks5] [--http] [--tunnel-mode MODE]
+hole proxy stop                                                       stop the proxy
+hole proxy test-server --config-file PATH                            one-shot connectivity test
+```
+
+## Commit messages — Conventional Commits
+
+The repo squash-merges every PR, so the PR title becomes the `main` commit
+subject. PR titles MUST follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>)?: <description>
+```
+
+`type` ∈ `feat fix docs style refactor perf test build ci chore revert`; `scope`
+is optional; a trailing `!` flags a breaking change. A CI check
+([semantic-pr.yaml](.github/workflows/semantic-pr.yaml)) validates the title;
+rename via `gh pr edit <N> --title "…"`. The type prefix drives per-track release
+notes (`scripts/generate-release-notes.py` groups squash-commits by type;
+unrecognized → "Other").
+
+## Releases
+
+Four independent tracks, each tagged `releases/<product>/v<X.Y.Z>` with its own
+draft+publish workflow pair. The **draft** workflow does all reversible prep
+(build, test, hash, upload to a draft release); the **publish** workflow does the
+irreversible public actions (tag, `cargo publish`, latest-flip). The split exists
+for every track to keep one sanity gate before irreversible work.
+
+| Product    | Artifacts                                     | Signed   | crates.io |
+| ---------- | --------------------------------------------- | -------- | --------- |
+| `hole`     | MSI + DMG (amd64+arm64) + `SHA256SUMS`        | minisign | No        |
+| `galoshes` | 6-platform binaries + `SHA256SUMS`            | No       | No        |
+| `garter`   | crates.io lib + 6-platform CLI + `SHA256SUMS` | No       | `garter`  |
+| `ex-ray`   | 6-platform binaries + `SHA256SUMS`            | No       | No        |
+
+Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
+
+- **Only `hole` is signed** — it auto-updates, so supply-chain integrity matters.
+  The others are embedded into hole (covered by its signature) or built from
+  source by consumers who pin SHA256 against `SHA256SUMS`.
+- **`/releases/latest` pinning** — each draft pins `--latest` at
+  `gh release create` (`hole=true`, others `false`); without it GitHub's legacy
+  semver+date heuristic can promote the wrong track (#308).
+- **garter publish is idempotent** — it queries crates.io and skips `cargo publish` if the version exists; a `dry_run` input runs `--dry-run` only.
+- **Versions** live in each crate's `[package.metadata.hole-release].group`
+  (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
+  `v0.1.0` tag predates the scheme and is ignored.
+
+Rollback, minisign key rotation, and the crates.io dry-run TOCTOU note are in
+[docs/RELEASE-OPS.md](docs/RELEASE-OPS.md).
+
+## Icons
+
+Source icons under `crates/hole/icons/` are per-platform SVGs
+(`icon-{windows,macos}.svg`, `tray-windows-{light,dark}.svg`, `tray-macos.svg`),
+converted to raster by `build.rs` (cached in `.cache/icons/`) — **do not commit
+generated raster icons**. `TrayState::Disabled` currently aliases `Enabled` (the
+enum is preserved for a future variant). `.cache/icons/icon.ico` is bound by the
+MSI as `ARPPRODUCTICON` so Add/Remove Programs matches the app icon (#359).
+
+## Emergency network reset
+
+If routing gets into a bad state during development:
+
+```sh
+sudo python scripts/network-reset.py    # macOS
+python scripts/network-reset.py         # Windows (run as Administrator)
+```
+
+It reads the bridge's route-state file and tears down the exact leaked routes
+(reaping plugins by name and stopping ETW sessions as a last resort).
