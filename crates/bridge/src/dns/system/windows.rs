@@ -52,8 +52,8 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid, FreeInterfaceDnsSettings, GetInterfaceDnsSettings,
-    SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION3, DNS_SETTING_IPV6,
-    DNS_SETTING_NAMESERVER,
+    SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS3, DNS_INTERFACE_SETTINGS_VERSION1,
+    DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
 };
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
@@ -242,16 +242,42 @@ fn alias_to_guid(alias: &str) -> io::Result<Option<GUID>> {
     Ok(Some(guid))
 }
 
+/// The `Version` stamped into every `DNS_INTERFACE_SETTINGS` this module
+/// hands to the OS. **Must be `VERSION1`.** windows-rs models all three DNS
+/// FFIs (`GetInterfaceDnsSettings` / `SetInterfaceDnsSettings` /
+/// `FreeInterfaceDnsSettings`) as taking the V1 `DNS_INTERFACE_SETTINGS`
+/// (64 bytes), and Windows sizes the buffer it reads/writes **solely** from
+/// this field — there is no length parameter. Stamping any higher version
+/// makes the OS access the larger `DNS_INTERFACE_SETTINGS3` (112-byte)
+/// layout off the end of our V1 stack allocation: the 48-byte out-of-bounds
+/// FFI access of bindreams/hole#437.
+const SETTINGS_VERSION: u32 = DNS_INTERFACE_SETTINGS_VERSION1;
+
+/// Compile-time pin of the *premise* behind [`SETTINGS_VERSION`]: the V1
+/// `DNS_INTERFACE_SETTINGS` (the type the DNS FFIs accept) is strictly
+/// smaller than `DNS_INTERFACE_SETTINGS3`. Because `Version` is the only
+/// size signal, that size gap is exactly why stamping a version above V1
+/// over-reads/over-writes our V1 allocation (#437). This fails the build if
+/// a windows-rs bump ever makes the layouts equal; it does NOT guard the
+/// stamped value — the `empty_settings_always_stamps_version1` test does.
+const _: () = assert!(std::mem::size_of::<DNS_INTERFACE_SETTINGS>() < std::mem::size_of::<DNS_INTERFACE_SETTINGS3>());
+
 /// Build an empty `DNS_INTERFACE_SETTINGS` with `Version` set and
 /// `Flags` populated to indicate "the `NameServer` field is meaningful".
 /// `ipv6` controls the `DNS_SETTING_IPV6` flag (selects v6 vs v4).
+///
+/// Always the V1 layout — the only one windows-rs's DNS FFI signatures
+/// accept; see [`SETTINGS_VERSION`] for why `Version` must be `VERSION1`.
+/// Fields are listed explicitly (rather than `..Default::default()`) so a
+/// future windows-rs change to the V1 layout breaks this constructor at
+/// compile time instead of being silently absorbed.
 fn empty_settings(ipv6: bool) -> DNS_INTERFACE_SETTINGS {
     let mut flags: u64 = DNS_SETTING_NAMESERVER as u64;
     if ipv6 {
         flags |= DNS_SETTING_IPV6 as u64;
     }
     DNS_INTERFACE_SETTINGS {
-        Version: DNS_INTERFACE_SETTINGS_VERSION3,
+        Version: SETTINGS_VERSION,
         Flags: flags,
         Domain: PWSTR::null(),
         NameServer: PWSTR::null(),
@@ -276,9 +302,13 @@ fn empty_settings(ipv6: bool) -> DNS_INTERFACE_SETTINGS {
 /// on consumer setups). This is best-effort.
 fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
     let mut settings = empty_settings(ipv6);
-    // SAFETY: `settings` is an owned `DNS_INTERFACE_SETTINGS` whose
-    // address is valid for the call. The OS writes a fresh `NameServer`
-    // string we must free via `FreeInterfaceDnsSettings`.
+    // SAFETY: `settings` is an owned V1 `DNS_INTERFACE_SETTINGS` whose
+    // address is valid for the call. `empty_settings` stamps
+    // `SETTINGS_VERSION` (V1), matching the 64-byte buffer we allocate, so
+    // the OS reads/writes exactly those 64 bytes (a higher version would
+    // write the larger V3 layout off the end — bindreams/hole#437). The OS
+    // writes a fresh `NameServer` string we must free via
+    // `FreeInterfaceDnsSettings`.
     // The `disallowed_methods` ban on `GetInterfaceDnsSettings` exists
     // so that nothing outside `Win32Real` reaches around the
     // `WinDnsBackend` test seam (bindreams/hole#397). This module IS
@@ -305,9 +335,10 @@ fn get_one(guid: GUID, ipv6: bool) -> io::Result<DnsPrior> {
             }
         }
     };
-    // SAFETY: `settings` was filled by `GetInterfaceDnsSettings` above.
-    // `FreeInterfaceDnsSettings` is the documented counterpart that
-    // frees PWSTRs allocated by the get call.
+    // SAFETY: `settings` is the same 64-byte V1 buffer, populated by the V1
+    // `GetInterfaceDnsSettings` call above; the OS returns a V1-layout
+    // struct, so `FreeInterfaceDnsSettings` (also V1) frees the PWSTRs that
+    // call allocated and its walk stays inside our allocation.
     unsafe { FreeInterfaceDnsSettings(&mut settings) };
     Ok(result)
 }
@@ -336,9 +367,11 @@ fn set_one(guid: GUID, ipv6: bool, prior: &DnsPrior) -> io::Result<()> {
     };
     let mut wide: Vec<u16> = nameserver_string.encode_utf16().chain(std::iter::once(0)).collect();
     settings.NameServer = PWSTR(wide.as_mut_ptr());
-    // SAFETY: `settings` and `wide` outlive the FFI call. The OS reads
-    // `Version` first to interpret the struct; we always pass
-    // `DNS_INTERFACE_SETTINGS_VERSION3`.
+    // SAFETY: `settings` and `wide` outlive the FFI call. `empty_settings`
+    // stamps `SETTINGS_VERSION` (V1); the OS reads `Version` to size the
+    // buffer it interprets, so passing V1 — matching the 64-byte V1
+    // allocation — makes it read exactly those 64 bytes (a higher version
+    // would over-read into the larger V3 layout — bindreams/hole#437).
     // Sanctioned `disallowed_methods` site — see `get_one` for the
     // rationale; the rule exists to keep the FFI inside `Win32Real`.
     #[allow(clippy::disallowed_methods)]
