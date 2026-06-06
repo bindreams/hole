@@ -124,15 +124,26 @@ Compatibility is gated on **MAJOR**:
 There are two host models, and the "unrecognized MAJOR" rule binds only
 one of them. An implementer must know which model their host uses.
 
-- **Detection host (first-line sniffing).** A host that decides
-  *whether* a plugin speaks sitrep by reading the first stdout line and
-  inspecting `hello` is performing capability auto-detection. Such a
-  host, on encountering a MAJOR it does not recognize, **MUST** fall
-  back to its non-sitrep readiness behavior (e.g. its prior
-  connect-probe), and **MUST NOT** hard-fail. The plugin might be
-  speaking a newer protocol the host genuinely cannot interpret;
-  refusing to start it would be a regression against the pre-sitrep
-  baseline.
+- **Detection host (capability auto-detection).** A host that decides
+  *whether* a plugin speaks sitrep — by inspecting `hello` — is
+  performing capability auto-detection. Such a host, on encountering a
+  MAJOR it does not recognize, **MUST** fall back to its non-sitrep
+  readiness behavior (e.g. its prior connect-probe), and **MUST NOT**
+  hard-fail. The plugin might be speaking a newer protocol the host
+  genuinely cannot interpret; refusing to start it would be a regression
+  against the pre-sitrep baseline.
+
+  Detection can be done two ways. *First-line sniffing* reads the first
+  stdout line and classifies on it — but a non-sitrep plugin that is
+  **silent on stdout** never produces a line to classify, so a pure
+  sniffing host would hang waiting for one. The robust alternative is to
+  run the non-sitrep readiness probe **concurrently** with the sitrep
+  reader from the start (sharing a single send-once readiness slot) and
+  let a recognized `hello` *stand the probe down*; a plugin that emits no
+  `hello` (silent or not) is then readied by the probe with no timeout.
+  Because a `bind_conflict` plugin never binds its listener, the
+  concurrent connect-probe can never win that race — `bind_conflict`
+  remains the deterministic outcome.
 
 - **Preselection host (out-of-band configuration).** A host that was
   told by configuration that a specific plugin speaks sitrep is *not*
