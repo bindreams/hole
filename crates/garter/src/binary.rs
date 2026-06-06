@@ -185,16 +185,15 @@ impl ChainPlugin for BinaryPlugin {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // On Windows, create a new process group so that graceful_stop can
-        // send CTRL_BREAK_EVENT targeted at this child's group (SIP003u).
-        #[cfg(windows)]
-        cmd.creation_flags(windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP.0);
-
-        let mut child = cmd
-            .spawn()
+        // Spawn as the root of a process-tree kill-group (Windows job object /
+        // Unix process group) with stdio handle hygiene, so a force-kill reaps the
+        // plugin's whole descendant tree and an orphaned grandchild can never hold
+        // the host's pipe handles (bindreams/hole#197). CREATE_NEW_PROCESS_GROUP
+        // (for graceful_stop's CTRL_BREAK) is set inside `GroupedChild::spawn`.
+        let mut gc = crate::proc_group::GroupedChild::spawn(&mut cmd)
             .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
 
-        if let (Some(sink), Some(pid)) = (&self.pid_sink, child.id()) {
+        if let (Some(sink), Some(pid)) = (&self.pid_sink, gc.child.id()) {
             sink(pid);
         }
 
@@ -202,7 +201,7 @@ impl ChainPlugin for BinaryPlugin {
         // readiness comes from a separate self-probe task; in ExpectSitrep
         // mode it parses sitrep events and IS the readiness source. Build
         // the right one per `self.readiness`.
-        let stdout = child.stdout.take().expect("stdout was piped");
+        let stdout = gc.child.stdout.take().expect("stdout was piped");
         let stdout_task = match self.readiness {
             ReadinessMode::Probe => {
                 // Tier-2: the stdout reader is a pure log passthrough; a
@@ -250,7 +249,7 @@ impl ChainPlugin for BinaryPlugin {
         };
 
         // Capture stderr
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let stderr = gc.child.stderr.take().expect("stderr was piped");
         let plugin_name = self.name.clone();
         let stderr_task = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
@@ -281,7 +280,7 @@ impl ChainPlugin for BinaryPlugin {
         // full two-channel rationale.
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
-            status = child.wait() => {
+            status = gc.child.wait() => {
                 let status = status?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
@@ -304,7 +303,9 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                shutdown::graceful_stop(&mut child, drain_timeout).await?;
+                // Force path force-kills the direct child; `gc` dropping at the
+                // end of `run` (or on task abort) reaps the whole tree.
+                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(100),

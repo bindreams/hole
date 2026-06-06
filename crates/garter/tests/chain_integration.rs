@@ -771,6 +771,156 @@ async fn auto_surfaces_fatal() {
     let _ = chain_task.await;
 }
 
+// Process-tree reaping ================================================================================================
+
+/// Force-killing a chain must reap the plugin's WHOLE descendant tree, not just
+/// the direct child. mock-plugin (grandchild mode) spawns a long-lived grandchild
+/// that inherits its stdio (mimicking galoshes→ex-ray). After `cancel` + teardown
+/// the grandchild must be dead — otherwise it leaks (and on Windows, holding the
+/// inherited host pipe, hangs the host at runtime-drop; see bindreams/hole#197).
+#[skuld::test]
+async fn force_kill_reaps_descendant_tree() {
+    let mock_path = mock_plugin_path();
+
+    // SS_REMOTE target: mock-plugin parses it but never dials it before teardown.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    // Per-test-process-unique pidfile (nextest runs each test in its own process).
+    let pidfile = std::env::temp_dir().join(format!("garter-treekill-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", pidfile.to_str().unwrap()),
+        ))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain = tokio::spawn(async move { runner.run(env).await });
+
+    ready_rx
+        .await
+        .expect("ready_tx dropped")
+        .expect("mock-plugin should ready");
+    let grandchild_pid = read_pid_when_written(&pidfile).await;
+    assert!(
+        is_pid_alive(grandchild_pid),
+        "grandchild should be alive before teardown"
+    );
+
+    // Force-kill the chain. mock-plugin has no signal handler, so it dies on the
+    // graceful signal; its grandchild is orphaned unless garter reaps the tree.
+    cancel.cancel();
+    let _ = chain.await;
+
+    let reaped = wait_pid_dead(grandchild_pid, Duration::from_secs(10)).await;
+    // Clean up on the failing path so a leaked grandchild can't hang this test
+    // process at runtime-drop (the #197 hang) or accumulate across runs. Confirm
+    // the kill landed so the inherited pipe is released before this test's
+    // runtime drops.
+    if !reaped {
+        force_kill_pid(grandchild_pid);
+        let _ = wait_pid_dead(grandchild_pid, Duration::from_secs(5)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    drop(echo_listener);
+
+    assert!(
+        reaped,
+        "force-killing the chain must reap the whole descendant tree (grandchild pid {grandchild_pid} survived)"
+    );
+}
+
+/// Block until `pidfile` holds a parseable PID (the grandchild writes it just
+/// after the parent readies). Sanctioned CLAUDE.md class-2 wait: an external
+/// subprocess produces the file; the budget is the failure-to-human bound.
+async fn read_pid_when_written(pidfile: &std::path::Path) -> u32 {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(s) = std::fs::read_to_string(pidfile) {
+            if let Ok(pid) = s.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "grandchild pidfile not written within budget"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll until `pid` is dead or `budget` elapses. Sanctioned class-2 wait: an
+/// external process exits; the budget is the failure-to-human bound.
+async fn wait_pid_dead(pid: u32, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while is_pid_alive(pid) {
+        if start.elapsed() >= budget {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0): 0 → the process exists; ESRCH → it doesn't.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn force_kill_pid(pid: u32) {
+    unsafe {
+        let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // STILL_ACTIVE (259): the process has not exited.
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+        let _ = CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(windows)]
+fn force_kill_pid(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
 // Install the workspace test subscriber + panic hook. See
 // `crates/test-observability/` and bindreams/hole#301.
 hole_test_observability::register!();

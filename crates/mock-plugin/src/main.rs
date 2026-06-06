@@ -32,6 +32,14 @@ fn first_failure_for_sentinel() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Knob: MOCK_PLUGIN_SLEEP — "grandchild" mode (a garter process-tree-reaping
+    // test seam). Live forever, inheriting whatever stdio the parent gave us; do
+    // NOT read SIP003 env. Stands in for an inner plugin (e.g. galoshes's ex-ray)
+    // that a force-killed parent would otherwise orphan.
+    if std::env::var_os("MOCK_PLUGIN_SLEEP").is_some() {
+        std::future::pending::<()>().await;
+    }
+
     let local_host = std::env::var("SS_LOCAL_HOST")?;
     let local_port: u16 = std::env::var("SS_LOCAL_PORT")?.parse()?;
     let remote_host = std::env::var("SS_REMOTE_HOST")?;
@@ -139,6 +147,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         sitrep_enabled,
     );
+
+    // Knob: MOCK_PLUGIN_SPAWN_GRANDCHILD=<pidfile> — spawn a long-lived grandchild
+    // that INHERITS our stdio (default `Command` stdio), mimicking an inner plugin
+    // (galoshes→ex-ray) that, if orphaned, holds the host's stdout/stderr pipe.
+    // Record its PID so a test can verify a force-kill of the chain reaps the
+    // whole process tree. The grandchild gets MOCK_PLUGIN_SLEEP (so it short-
+    // circuits) and NOT this knob (so it does not recurse). std `Child` is not
+    // kill-on-drop, so letting it drop leaves the process running for the test.
+    if let Some(pidfile) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
+        let exe = std::env::current_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.env("MOCK_PLUGIN_SLEEP", "1")
+            .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
+        // Put the grandchild in its OWN process group, mimicking how garter
+        // spawns plugins (e.g. galoshes→ex-ray): the parent's graceful
+        // CTRL_BREAK/SIGTERM then does NOT reach it, so only a process-TREE kill
+        // (Windows job object / Unix pgid kill) can reap it.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let grandchild = cmd.spawn()?;
+        std::fs::write(&pidfile, grandchild.id().to_string())?;
+    }
 
     loop {
         let (inbound, peer) = listener.accept().await?;
