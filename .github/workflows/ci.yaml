@@ -479,14 +479,39 @@ jobs:
       - uses: astral-sh/setup-uv@v8.1.0
       - uses: ./.github/actions/setup-build
 
-      # `npx tauri build` (under `hole-dmg`) runs `npm install` itself via
-      # `beforeBuildCommand` in tauri.conf.json. Node.js is provided by
-      # `setup-build` above. See bindreams/hole#372.
-      - name: Build DMG
-        run: cargo xtask build hole-dmg
-
-      - name: Test DMG signing
+      # One build+test via the run-cascade (builds hole-dmg once, then the
+      # signing pytest). A separate `build hole-dmg` step would double-roll the
+      # flaky bundle_dmg.sh/hdiutil pipeline. See #446.
+      - name: Build DMG and test signing
         run: cargo xtask run hole-dmg-tests
+
+      # hdiutil DMG creation/mounting is a non-deterministic macOS
+      # DiskArbitration race; capture system state on any failure (build or the
+      # pytest mount) to diagnose the next occurrence (#446). `--last 30m` spans
+      # the job's whole lifetime (timeout-minutes: 30).
+      - name: Capture DiskArbitration/hdiutil state on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/dmg-flake-diag"
+          mkdir -p "$OUT"
+          hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
+          ls -la /Volumes > "$OUT/volumes.txt"      2>&1
+          mount           > "$OUT/mount.txt"        2>&1
+          log show --last 30m --predicate \
+            'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
+            > "$OUT/diskarb-log.txt" 2>&1
+          echo "captured DMG-flake diagnostics to $OUT"
+
+      - name: Upload DMG flake diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dmg-flake-diag/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Renovate npm safety gate: builds the Vite bundle (via `cargo xtask build
   # frontend-build`) and type-checks (via `cargo xtask run frontend-check`,
