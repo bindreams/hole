@@ -41,8 +41,7 @@ use plugin_e2e::locators::{locate_ex_ray, locate_upstream_v2ray};
 use plugin_e2e::roundtrip::{run_roundtrip, Roundtrip, RoundtripConfig};
 use plugin_e2e::sentinel::start_fake_sentinel;
 use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_PASSWORD};
-use plugin_e2e::util::{require_binary, rt, wait_for_port};
-use std::time::Duration;
+use plugin_e2e::util::{require_binary, rt};
 
 // Each skuld integration-test binary installs the observability ctor and
 // provides its own `fn main` (harness = false in Cargo.toml).
@@ -58,24 +57,20 @@ const PORT_ALLOC: skuld::Label;
 /// WS client opts mirror the server side minus the `server` flag.
 const WS_CLIENT_OPTS: &str = "host=cloudfront.com;path=/";
 
-/// The WS handshake adds latency on top of the raw TCP connect, so the
-/// generous defaults (5 s connect / 5 s read / 30 s ready) fit a cold start.
-fn ws_cfg() -> RoundtripConfig {
-    RoundtripConfig::default()
-}
-
 /// Drive one cross-implementation round-trip: a real SS server fronted by
 /// `server_plugin_path`, a client driven through `client_plugin_path`, and a
 /// fake sentinel. Asserts the `HEAD /` echoes back `HTTP/1.0 200 OK` →
 /// [`Roundtrip::Reachable`].
+///
+/// Readiness is deterministic: `start_real_ss_server_with_plugin_ws` returns
+/// only once the server plugin is live — ex-ray via its sitrep `ready`, and a
+/// non-sitrep stock plugin via `ReadinessMode::Auto`'s TCP probe (WS is TCP,
+/// so the probe observes the real public listener). There is therefore no
+/// `wait_for_port` poll before the client connects.
 fn assert_roundtrip(server_plugin_path: &str, client_plugin_path: &str) {
     rt().block_on(async {
         let (svr_addr, _svr) =
             start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, server_plugin_path).await;
-        // The SS server's plugin binds its public port asynchronously; wait for
-        // it before the client connects (sanctioned class-2 external-subprocess
-        // startup wait).
-        wait_for_port(svr_addr, Duration::from_secs(7)).await;
 
         let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
 
@@ -87,7 +82,7 @@ fn assert_roundtrip(server_plugin_path: &str, client_plugin_path: &str) {
             TEST_METHOD,
             TEST_PASSWORD,
             sentinel,
-            &ws_cfg(),
+            &RoundtripConfig::default(),
         )
         .await;
         match outcome {
@@ -159,10 +154,15 @@ fn interop_stock_client_ex_ray_server() {
 /// signed by unknown authority". Production is unaffected (real CA-signed QUIC
 /// servers verify against the OS store with no custom cert). See bindreams/hole#421.
 ///
-/// The harness differs from `assert_roundtrip` because the public endpoint is
-/// UDP-only: there is no TCP `wait_for_port` (a TCP poll can't observe a UDP
-/// listener), so readiness is established by retrying the full roundtrip on a
-/// time budget.
+/// Like `assert_roundtrip`, readiness is deterministic via the launcher's
+/// sitrep `ready`: ex-ray UDP-probes its own QUIC inbound before reporting
+/// ready (bindreams/hole#421), so `start_real_ss_server_with_plugin_quic`
+/// returns only once the server is accepting. A single roundtrip therefore
+/// suffices — no retry, no time budget, no sleep. (A TCP `wait_for_port` would
+/// not work here regardless: the public endpoint is UDP-only and a TCP poll
+/// can't observe a UDP listener.) Every *active* QUIC test below uses ex-ray as
+/// the server; the lone stock-as-QUIC-server direction is `#[ignore]`d (#428),
+/// so `ReadinessMode::Auto`'s sitrep path always drives readiness here.
 #[cfg(not(target_os = "windows"))]
 mod quic {
     use super::{require_binary, rt, start_fake_sentinel, PORT_ALLOC};
@@ -170,12 +170,6 @@ mod quic {
     use plugin_e2e::locators::{locate_ex_ray, locate_upstream_v2ray};
     use plugin_e2e::roundtrip::{run_roundtrip, Roundtrip, RoundtripConfig};
     use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_quic, TEST_METHOD, TEST_PASSWORD};
-    use std::time::{Duration, Instant};
-
-    /// Failure-to-human bound for the QUIC server's UDP listener becoming
-    /// reachable — the server plugin binds asynchronously after `build()`
-    /// returns, so the first roundtrip may race it; we retry until this elapses.
-    const QUIC_READY_BUDGET: Duration = Duration::from_secs(30);
 
     fn quic_client_opts(certs: &TestCerts) -> String {
         format!(
@@ -184,46 +178,34 @@ mod quic {
         )
     }
 
-    /// Drive one cross-implementation QUIC round-trip with a readiness retry
-    /// (sanctioned class-2 exception: out-of-process subprocess startup observed
-    /// via connect-success; `QUIC_READY_BUDGET` is the failure-to-human bound).
+    /// Drive one cross-implementation QUIC round-trip. Readiness is deterministic
+    /// (see the module doc): the launcher returns only after the server plugin's
+    /// sitrep `ready`, so a single roundtrip suffices with no readiness retry and
+    /// no sleep. A flake here would mean a real readiness gap in the launcher to
+    /// root-cause, not a reason to re-add timing.
     fn assert_quic_roundtrip(server_plugin_path: &str, client_plugin_path: &str) {
         rt().block_on(async {
             let certs = generate_test_certs();
             let (svr_addr, _svr) =
                 start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, server_plugin_path, &certs).await;
             let opts = quic_client_opts(&certs);
-            let start = Instant::now();
-            loop {
-                // Fresh single-shot sentinel each attempt (it accepts one
-                // connection then exits, so it can't be reused across retries).
-                let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
-                match run_roundtrip(
-                    client_plugin_path,
-                    Some(&opts),
-                    &svr_addr.ip().to_string(),
-                    svr_addr.port(),
-                    TEST_METHOD,
-                    TEST_PASSWORD,
-                    sentinel,
-                    &RoundtripConfig::default(),
-                )
-                .await
-                {
-                    Roundtrip::Reachable { latency_ms } => {
-                        assert!(latency_ms >= 1, "latency_ms must be clamped to >= 1");
-                        return;
-                    }
-                    other => {
-                        assert!(
-                            start.elapsed() < QUIC_READY_BUDGET,
-                            "quic roundtrip server={server_plugin_path:?} client={client_plugin_path:?} \
-                             did not become reachable within {QUIC_READY_BUDGET:?}; last outcome: {other:?}"
-                        );
-                        // Server UDP listener still binding; brief backoff then retry.
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                }
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let outcome = run_roundtrip(
+                client_plugin_path,
+                Some(&opts),
+                &svr_addr.ip().to_string(),
+                svr_addr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            match outcome {
+                Roundtrip::Reachable { latency_ms } => assert!(latency_ms >= 1, "latency_ms must be clamped to >= 1"),
+                other => panic!(
+                    "expected Reachable for quic server={server_plugin_path:?} client={client_plugin_path:?}, got {other:?}"
+                ),
             }
         });
     }
