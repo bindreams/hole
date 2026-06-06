@@ -160,20 +160,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cmd = std::process::Command::new(exe);
         cmd.env("MOCK_PLUGIN_SLEEP", "1")
             .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
-        // Put the grandchild in its OWN process group, mimicking how garter
-        // spawns plugins (e.g. galoshes→ex-ray): the parent's graceful
-        // CTRL_BREAK/SIGTERM then does NOT reach it, so only a process-TREE kill
-        // (Windows job object / Unix pgid kill) can reap it.
+        // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
+        // grandchild is reaped only by the root's process-tree kill, never by the
+        // parent's graceful stop:
+        //  - Windows: give it its OWN console group (CREATE_NEW_PROCESS_GROUP,
+        //    exactly as garter spawns every plugin) so graceful_stop's CTRL_BREAK
+        //    to the parent's group can't reach it; it still joins the root's job
+        //    object by handle inheritance and is reaped that way.
+        //  - Unix: do NOT setpgid — inherit the parent's process group like a
+        //    nested ex-ray, so the root's kill(-pgid) reaps it. graceful_stop's
+        //    SIGTERM is PID-targeted, so it can't reach the grandchild anyway.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
         }
         let grandchild = cmd.spawn()?;
         std::fs::write(&pidfile, grandchild.id().to_string())?;

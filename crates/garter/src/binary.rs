@@ -41,6 +41,11 @@ pub enum ReadinessMode {
     /// (better transports) is best-effort, not guaranteed. Prefer explicit
     /// `ExpectSitrep` when the plugin is known to speak sitrep AND authoritative
     /// transports matter (the bridge does).
+    ///
+    /// The concurrent probe is a TCP connect (as in `Probe`), so it cannot ready
+    /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep. All
+    /// first-party UDP plugins (ex-ray/galoshes QUIC) do, so this is not a
+    /// limitation in practice.
     Auto,
 }
 

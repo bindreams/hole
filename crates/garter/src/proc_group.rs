@@ -26,6 +26,11 @@
 //! group, mark the child's env); set → we are nested (spawn normally; the child
 //! joins the ancestor's group). This needs no flag or wiring at call sites and
 //! composes to arbitrary depth.
+//!
+//! **`GARTER_IN_KILL_GROUP` is load-bearing: nothing outside garter may set it.**
+//! An external value would misclassify the outermost spawn as nested, skip the
+//! kill-group, and re-introduce the orphan/hang. Root detection is logged at
+//! `debug` so a misdetection is diagnosable.
 
 use std::io;
 use tokio::process::{Child, Command};
@@ -36,7 +41,7 @@ use tokio::process::{Child, Command};
 const IN_KILL_GROUP_ENV: &str = "GARTER_IN_KILL_GROUP";
 
 /// A spawned child whose entire descendant tree is reaped together when this
-/// guard is dropped or [`GroupedChild::kill_tree`]'d. See the module docs.
+/// guard is [`Drop`]ped. See the module docs.
 pub(crate) struct GroupedChild {
     pub(crate) child: Child,
     group: imp::Group,
@@ -49,6 +54,12 @@ impl GroupedChild {
         let is_root = std::env::var_os(IN_KILL_GROUP_ENV).is_none();
         if is_root {
             cmd.env(IN_KILL_GROUP_ENV, "1");
+            // Logged so a misdetection (e.g. an external GARTER_IN_KILL_GROUP that
+            // wrongly marks the outermost spawn as nested → no kill-group → the
+            // #197 orphan/hang returns) is visible at debug level.
+            tracing::debug!("proc_group: root spawn — creating a process-tree kill-group");
+        } else {
+            tracing::debug!("proc_group: nested spawn — joining the ancestor's kill-group");
         }
         imp::spawn(cmd, is_root)
     }
@@ -148,22 +159,34 @@ mod imp {
     /// handle (held for the tree's lifetime) or `None` on failure (best-effort:
     /// tree-reaping degrades to the direct child via `kill_on_drop`).
     fn assign_to_kill_on_close_job(child: &Child) -> Option<HANDLE> {
-        let raw = child.raw_handle()?;
+        // Every failure here degrades tree-reaping to just the direct child
+        // (`kill_on_drop`), which would re-orphan grandchildren — so log loudly.
+        let Some(raw) = child.raw_handle() else {
+            tracing::warn!("proc_group: child has no raw handle; process-tree reaping disabled");
+            return None;
+        };
         unsafe {
-            let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
+            let job = match CreateJobObjectW(None, windows::core::PCWSTR::null()) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::warn!(error = %e, "proc_group: CreateJobObjectW failed; process-tree reaping disabled");
+                    return None;
+                }
+            };
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let set = SetInformationJobObject(
+            if let Err(e) = SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 std::ptr::addr_of!(info).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if set.is_err() {
+            ) {
+                tracing::warn!(error = %e, "proc_group: SetInformationJobObject failed; process-tree reaping disabled");
                 let _ = CloseHandle(job);
                 return None;
             }
-            if AssignProcessToJobObject(job, HANDLE(raw)).is_err() {
+            if let Err(e) = AssignProcessToJobObject(job, HANDLE(raw)) {
+                tracing::warn!(error = %e, "proc_group: AssignProcessToJobObject failed; process-tree reaping disabled");
                 let _ = CloseHandle(job);
                 return None;
             }
