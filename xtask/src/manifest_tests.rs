@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::manifest::*;
+use crate::orchestrate::Plan;
 
 fn parse(yaml: &str) -> anyhow::Result<Manifest> {
     Manifest::parse(yaml)
@@ -725,6 +726,33 @@ fn frontend_build_target_shape() {
     // pin both as load-bearing.
     assert_eq!(t.depends, Vec::<String>::new());
     assert!(!t.has_run());
+}
+
+#[skuld::test]
+fn hole_dmg_tests_builds_dmg_once() {
+    // CI runs `cargo xtask run hole-dmg-tests` as the single DMG build+test
+    // step; pin the shape and the resolved build order so an edit can't
+    // re-split it into a double build.
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+
+    let t = m.get("hole-dmg-tests").expect("hole-dmg-tests target missing");
+    assert_eq!(t.depends, vec!["hole-dmg".to_string()]);
+    assert!(
+        t.build.is_empty(),
+        "hole-dmg-tests builds nothing itself — the DMG comes from its hole-dmg dep"
+    );
+    assert!(t.has_run(), "hole-dmg-tests must declare the signing pytest as run:");
+
+    let plan = Plan::new(&m).expect("plan builds from production manifest");
+    let order = plan
+        .order_for(&["hole-dmg-tests"], Platform::new(Os::Darwin, Arch::Amd64))
+        .expect("hole-dmg-tests applies to darwin/amd64");
+    assert_eq!(
+        order.iter().filter(|&&n| n == "hole-dmg").count(),
+        1,
+        "run cascade must build hole-dmg exactly once, got order {order:?}"
+    );
 }
 
 #[skuld::test]
