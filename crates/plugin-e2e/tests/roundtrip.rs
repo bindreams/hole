@@ -19,6 +19,35 @@ fn main() {
     skuld::run_all();
 }
 
+/// Focused launcher smoke check (all platforms): the garter-based fixture
+/// returns a LIVE, bound loopback public TCP address for a galoshes WS server —
+/// no `PluginConfig`, no `wait_for_port`. Isolates "did the launcher come up"
+/// from the full client roundtrip below.
+mod launcher_smoke {
+    use plugin_e2e::locators::locate_built_galoshes;
+    use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_PASSWORD};
+    use plugin_e2e::util::{require_binary, rt};
+    use tokio::net::TcpStream;
+
+    #[skuld::test]
+    fn galoshes_ws_server_launcher_returns_live_public_addr() {
+        let g = locate_built_galoshes();
+        require_binary(&g, "run `cargo xtask galoshes`");
+        let g = g.to_str().expect("galoshes path is valid utf-8").to_string();
+        rt().block_on(async {
+            let (public, _server) = start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, &g).await;
+            assert!(public.ip().is_loopback(), "public addr must be loopback: {public}");
+            assert_ne!(public.port(), 0, "public port must be concrete");
+            // The returned addr must be the REAL bound public port: a TCP connect
+            // to it must succeed (WS is TCP). Proves the launcher returned the
+            // plugin's actual listener, not a stale/garbage addr.
+            TcpStream::connect(public)
+                .await
+                .expect("public WS port must accept connections");
+        });
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use plugin_e2e::certs::{generate_test_certs, path_for_plugin_opts};
