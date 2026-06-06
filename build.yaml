@@ -111,7 +111,8 @@ targets:
     # exists before `npx tauri build` runs — see the frontend-build note.
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
-    build: npx tauri build
+    # `-v` surfaces the hdiutil stderr tauri-bundler otherwise swallows (#446).
+    build: npx tauri build -v
 
   hole-dmg-tests:
     # Pytest harness that asserts the produced .app's code signature is
