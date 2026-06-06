@@ -465,6 +465,14 @@ fn spawn_sitrep_stdout_reader(
 /// Forward all remaining stdout lines to tracing as ordinary logs. Used
 /// after a `FallBackToTier2` handoff so the child's stdout pipe never
 /// blocks while the self-probe owns readiness.
+///
+/// The loop is unbounded by design and terminates on the **child's** stdout
+/// EOF — guaranteed when the child (and its tree) is reaped via `GroupedChild`
+/// / `kill_on_drop`, which closes the write end. This reads the child's pipe,
+/// not the host's, so it cannot reproduce the #197 runtime-drop hang (that was
+/// an orphan holding the *host's* stdio); and because it runs inside a detached
+/// `tokio::spawn`, runtime drop aborts it at the await point rather than
+/// blocking on it.
 async fn drain_remaining_logs(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>, plugin_name: &str) {
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::info!(plugin = %plugin_name, "{line}");
