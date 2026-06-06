@@ -71,10 +71,16 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security",          # SECURITY_ATTRIBUTES param of CreateJobObjectW
     "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
+# Win32_Networking_WinSock: chain_tests.rs binds 0.0.0.0:port with
+# SO_EXCLUSIVEADDRUSE to exercise the Winsock wildcard-exclusion race. It is the
+# only test-only feature — Foundation / Threading used by other tests come from
+# the regular `windows` dep above (Cargo unions features across the two tables
+# for the test build).
 windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }

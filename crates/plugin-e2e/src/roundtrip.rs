@@ -36,9 +36,23 @@ pub enum Roundtrip {
     NotReachable(String),
 }
 
-/// Tunable timeouts. WS/QUIC cold-start needs generous values; the budgets are
-/// failure-to-human bounds for wedged subprocesses (CLAUDE.md sync-exception
-/// class 2), not intra-process synchronization.
+/// Tunable timeouts. Every budget here is a failure-to-human bound for a wedged
+/// *subprocess* (CLAUDE.md sync-exception class 2), NOT intra-process
+/// synchronization — so each must be generous enough to never fire on a
+/// legitimate-but-slow operation, only on a genuine hang.
+///
+/// The defaults are deliberately large because the data path crosses a plugin
+/// chain that extracts and execs a freshly-built `ex-ray` on first run. With
+/// **galoshes** on both ends, the server and client each extract their own
+/// embedded `ex-ray` concurrently, and a cold host scanning those binaries
+/// (Windows Defender on a just-built `ex-ray.exe`) can push the first
+/// roundtrip past a single-digit-second bound — the observed flake was a
+/// "read timed out" at ~5.9 s against a former 5 s `read_timeout`. These bounds
+/// are not a timing assumption: on a healthy host the roundtrip completes in
+/// milliseconds and the budget is never approached; on a true wedge the test
+/// still fails in bounded time. Do NOT tighten them to "make the suite faster"
+/// — a tight class-2 bound that flakes on cold-start is exactly the degenerate
+/// timing-assumption the invariant forbids.
 pub struct RoundtripConfig {
     pub ss_connect_timeout: Duration,
     pub read_timeout: Duration,
@@ -48,8 +62,8 @@ pub struct RoundtripConfig {
 impl Default for RoundtripConfig {
     fn default() -> Self {
         Self {
-            ss_connect_timeout: Duration::from_secs(5),
-            read_timeout: Duration::from_secs(5),
+            ss_connect_timeout: Duration::from_secs(20),
+            read_timeout: Duration::from_secs(20),
             ready_timeout: Duration::from_secs(30),
         }
     }

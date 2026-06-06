@@ -83,6 +83,12 @@ fn readiness_mode_defaults_to_probe() {
     assert_eq!(p.readiness_mode_for_test(), crate::binary::ReadinessMode::Probe);
 }
 
+#[skuld::test]
+fn readiness_mode_auto_is_selectable() {
+    let p = crate::BinaryPlugin::new("/nonexistent", None).readiness(crate::binary::ReadinessMode::Auto);
+    assert_eq!(p.readiness_mode_for_test(), crate::binary::ReadinessMode::Auto);
+}
+
 // GOTRACEBACK env test ================================================================================================
 
 #[skuld::test]

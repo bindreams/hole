@@ -568,6 +568,300 @@ async fn version_skew_falls_back_to_probe() {
     let _ = chain_task.await;
 }
 
+// ReadinessMode::Auto tests ===========================================================================================
+
+/// `Auto` readiness with a NON-sitrep, STDOUT-SILENT plugin: `MOCK_PLUGIN_NO_SITREP`
+/// prints nothing on stdout and loops on accept() (stdout never closes). `Auto`
+/// must ready it via the unconditional concurrent self-probe. (`ExpectSitrep`
+/// would hang; a "classify on first stdout line" design would also hang — this
+/// is the case that proves the probe is concurrent, not line-gated.)
+#[skuld::test]
+async fn auto_readies_silent_non_sitrep_plugin_via_probe() {
+    let mock_path = mock_plugin_path();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::Auto)
+                .env("MOCK_PLUGIN_NO_SITREP", "1"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("Auto must ready a silent non-sitrep plugin via the probe");
+    // The probe is TCP-connect only.
+    assert_eq!(chain_ready.transports, garter::Transports::TCP);
+    let mut client = TcpStream::connect(chain_ready.listen).await.expect("connect");
+    client.write_all(b"hello auto probe").await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read");
+    assert_eq!(&buf[..n], b"hello auto probe");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// `Auto` readiness with a sitrep plugin: the chain readies and relays. (Does
+/// not assert WHICH path won — sitrep vs probe on success is a best-effort
+/// race; both report the same listen address.)
+#[skuld::test]
+async fn auto_readies_sitrep_plugin() {
+    let mock_path = mock_plugin_path();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None).readiness(garter::binary::ReadinessMode::Auto),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let chain_ready = ready_rx
+        .await
+        .expect("chain never signaled ready")
+        .expect("Auto should ready a sitrep plugin");
+    let mut client = TcpStream::connect(chain_ready.listen).await.expect("connect");
+    client.write_all(b"hello auto sitrep").await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = client.read(&mut buf).await.expect("read");
+    assert_eq!(&buf[..n], b"hello auto sitrep");
+
+    drop(client);
+    echo_task.abort();
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// `Auto` surfaces a typed `BindConflict` (the launcher's retry signal). This
+/// is DETERMINISTIC under Auto: on a bind conflict the port never binds, so the
+/// concurrent probe can never connect — only the sitrep `bind_conflict` fires.
+#[skuld::test]
+async fn auto_surfaces_bind_conflict() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::Auto)
+                .env("MOCK_PLUGIN_FAIL", "bind_conflict"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::BindConflict { .. })),
+        "Auto must surface BindConflict, got {outcome:?}"
+    );
+
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+/// `Auto` surfaces a typed `Fatal` (a plugin that emits `fatal` then exits).
+/// Deterministic: the plugin exits before binding, so the probe can never connect.
+#[skuld::test]
+async fn auto_surfaces_fatal() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::Auto)
+                .env("MOCK_PLUGIN_FAIL", "fatal"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::Fatal { .. })),
+        "Auto must surface Fatal, got {outcome:?}"
+    );
+
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
+// Process-tree reaping ================================================================================================
+
+/// Force-killing a chain must reap the plugin's WHOLE descendant tree, not just
+/// the direct child. mock-plugin (grandchild mode) spawns a long-lived grandchild
+/// that inherits its stdio (mimicking galoshes→ex-ray). After `cancel` + teardown
+/// the grandchild must be dead — otherwise it leaks (and on Windows, holding the
+/// inherited host pipe, hangs the host at runtime-drop; see bindreams/hole#197).
+#[skuld::test]
+async fn force_kill_reaps_descendant_tree() {
+    let mock_path = mock_plugin_path();
+
+    // SS_REMOTE target: mock-plugin parses it but never dials it before teardown.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    // Control channel: the grandchild dials back here on startup and holds the
+    // connection open. `accept()` => the grandchild is alive (deterministic
+    // readiness — no PID, no poll); a later read => EOF/reset the instant the
+    // grandchild is reaped (reuse-immune: a recycled PID cannot resurrect this
+    // specific TCP connection; and sleep-free: a broken tree-kill leaves the read
+    // blocked until the nextest per-test timeout — the sanctioned class-2
+    // failure-to-human bound for an external event that might never arrive).
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = control_listener.local_addr().unwrap();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr.to_string()),
+        ))
+        .on_ready(ready_tx)
+        .cancel_token(cancel.clone())
+        .drain_timeout(Duration::from_secs(3));
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain = tokio::spawn(async move { runner.run(env).await });
+
+    ready_rx
+        .await
+        .expect("ready_tx dropped")
+        .expect("mock-plugin should ready");
+
+    // The grandchild dials back on startup; accepting proves it is alive without
+    // a PID or a poll.
+    let (mut grandchild_conn, _) = control_listener
+        .accept()
+        .await
+        .expect("grandchild should dial the control channel");
+
+    // Force-kill the chain. mock-plugin has no signal handler, so it dies on the
+    // graceful signal; its grandchild is orphaned unless garter reaps the tree.
+    cancel.cancel();
+    let _ = chain.await;
+
+    // The grandchild's connection closes the instant it is reaped. A clean exit
+    // EOFs (read => Ok(0)); a hard kill may RST the socket (ConnectionReset /
+    // ConnectionAborted). Either proves the grandchild died — reuse-immune,
+    // because only the grandchild's own process can hold this connection, and a
+    // recycled PID gets a different socket. The grandchild never writes, so any
+    // bytes read are a bug. If the tree-kill fails, the grandchild keeps the
+    // connection open and this read blocks until the nextest per-test timeout
+    // (the sanctioned class-2 bound) — at which point the inherited host pipe is
+    // still held, exactly the #197 leak this test guards against.
+    let mut buf = [0u8; 1];
+    match grandchild_conn.read(&mut buf).await {
+        Ok(0) => {} // clean EOF: the grandchild's socket closed on death.
+        Ok(n) => panic!("grandchild sent {n} unexpected byte(s); it must only hold the connection open"),
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "force-killing the chain must reap the descendant tree; got unexpected control-conn error: {e:?}"
+        ),
+    }
+
+    drop(echo_listener);
+}
+
 // Install the workspace test subscriber + panic hook. See
 // `crates/test-observability/` and bindreams/hole#301.
 hole_test_observability::register!();

@@ -23,6 +23,30 @@ pub enum ReadinessMode {
     /// The conservative default for arbitrary / legacy plugins.
     #[default]
     Probe,
+    /// Infer the strategy from the plugin's own sitrep `hello`, with NO timeout.
+    /// Runs the sitrep stdout reader AND an unconditional concurrent self-probe
+    /// (like [`ReadinessMode::Probe`]) sharing one send-once sender. A SUPPORTED
+    /// `hello` stands the probe down (cancels a `probe_standdown` child token) so
+    /// the plugin's richer `ready` (authoritative transports + the `bind_conflict`
+    /// retry signal) is the readiness source; a plugin that emits no `hello` (a
+    /// non-sitrep plugin, including one that is silent on stdout) is readied by
+    /// the probe. `probe_standdown` is a child of `shutdown`, so chain shutdown
+    /// also stops the probe.
+    ///
+    /// Use for harnesses that mix sitrep and non-sitrep plugins (the plugin-e2e
+    /// server fixture: ex-ray/galoshes speak sitrep, stock v2ray-plugin does not).
+    /// On a bind conflict the port never binds, so the probe can never win —
+    /// `BindConflict` always comes from sitrep (deterministic). On success either
+    /// path may win; both report the same listen address, so the sitrep-preference
+    /// (better transports) is best-effort, not guaranteed. Prefer explicit
+    /// `ExpectSitrep` when the plugin is known to speak sitrep AND authoritative
+    /// transports matter (the bridge does).
+    ///
+    /// The concurrent probe is a TCP connect (as in `Probe`), so it cannot ready
+    /// a UDP-only listener; a UDP-only plugin must therefore speak sitrep. All
+    /// first-party UDP plugins (ex-ray/galoshes QUIC) do, so this is not a
+    /// limitation in practice.
+    Auto,
 }
 
 /// Resolved SIP003 environment-variable mapping for a `BinaryPlugin`'s
@@ -166,16 +190,15 @@ impl ChainPlugin for BinaryPlugin {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // On Windows, create a new process group so that graceful_stop can
-        // send CTRL_BREAK_EVENT targeted at this child's group (SIP003u).
-        #[cfg(windows)]
-        cmd.creation_flags(windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP.0);
-
-        let mut child = cmd
-            .spawn()
+        // Spawn as the root of a process-tree kill-group (Windows job object /
+        // Unix process group) with stdio handle hygiene, so a force-kill reaps the
+        // plugin's whole descendant tree and an orphaned grandchild can never hold
+        // the host's pipe handles (bindreams/hole#197). CREATE_NEW_PROCESS_GROUP
+        // (for graceful_stop's CTRL_BREAK) is set inside `GroupedChild::spawn`.
+        let mut gc = crate::proc_group::GroupedChild::spawn(&mut cmd)
             .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
 
-        if let (Some(sink), Some(pid)) = (&self.pid_sink, child.id()) {
+        if let (Some(sink), Some(pid)) = (&self.pid_sink, gc.child.id()) {
             sink(pid);
         }
 
@@ -183,7 +206,7 @@ impl ChainPlugin for BinaryPlugin {
         // readiness comes from a separate self-probe task; in ExpectSitrep
         // mode it parses sitrep events and IS the readiness source. Build
         // the right one per `self.readiness`.
-        let stdout = child.stdout.take().expect("stdout was piped");
+        let stdout = gc.child.stdout.take().expect("stdout was piped");
         let stdout_task = match self.readiness {
             ReadinessMode::Probe => {
                 // Tier-2: the stdout reader is a pure log passthrough; a
@@ -223,12 +246,15 @@ impl ChainPlugin for BinaryPlugin {
                 log_task
             }
             ReadinessMode::ExpectSitrep => {
-                spawn_sitrep_stdout_reader(stdout, self.name.clone(), local, shutdown.clone(), ready)
+                spawn_sitrep_stdout_reader(stdout, self.name.clone(), local, shutdown.clone(), ready, false)
+            }
+            ReadinessMode::Auto => {
+                spawn_sitrep_stdout_reader(stdout, self.name.clone(), local, shutdown.clone(), ready, true)
             }
         };
 
         // Capture stderr
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let stderr = gc.child.stderr.take().expect("stderr was piped");
         let plugin_name = self.name.clone();
         let stderr_task = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
@@ -259,7 +285,7 @@ impl ChainPlugin for BinaryPlugin {
         // full two-channel rationale.
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
-            status = child.wait() => {
+            status = gc.child.wait() => {
                 let status = status?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
@@ -282,7 +308,9 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                shutdown::graceful_stop(&mut child, drain_timeout).await?;
+                // Force path force-kills the direct child; `gc` dropping at the
+                // end of `run` (or on task abort) reaps the whole tree.
+                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(100),
@@ -304,27 +332,56 @@ impl ChainPlugin for BinaryPlugin {
 /// [`ProtocolSupport::FallBackToTier2`]: crate::sitrep::ProtocolSupport::FallBackToTier2
 type SharedReady = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<PluginReady, StartError>>>>>;
 
-/// Spawn the ExpectSitrep stdout reader.
+/// Spawn a tier-2 self-probe that, on a successful TCP connect to `local`,
+/// reports `PluginReady` (TCP-only) through the shared send-once sender.
+/// Shared by `ExpectSitrep`'s unknown-major fallback and `Auto`'s concurrent
+/// probe. `standdown` ends the probe early (without sending) when cancelled.
+fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: SharedReady) {
+    tokio::spawn(async move {
+        if let Some(addr) = crate::chain::poll_ready(local, standdown).await {
+            if let Some(tx) = shared.lock().await.take() {
+                let _ = tx.send(Ok(PluginReady {
+                    listen: addr,
+                    transports: crate::sitrep::Transports::TCP,
+                }));
+            }
+        }
+    });
+}
+
+/// Spawn the sitrep stdout reader.
 ///
-/// The reader is the readiness source: it parses `@sitrep` events and
-/// sends exactly one readiness result. On an unknown protocol major
-/// (`FallBackToTier2`) it hands readiness ownership to a self-probe task
-/// (the tier-2 strategy), sharing the single sender via [`SharedReady`]
-/// so at most one send ever happens. Non-event lines pass through to
-/// tracing as ordinary logs. On stdout EOF without ever sending, the
-/// sender drops unsent → the chain aggregator synthesizes a process-exit
-/// failure (the intended backstop).
+/// The reader parses `@sitrep` events and sends exactly one readiness result.
+/// On an unknown protocol major (`FallBackToTier2`) it hands readiness to a
+/// self-probe, sharing the single sender via [`SharedReady`] so at most one send
+/// ever happens. When `auto` is true ([`ReadinessMode::Auto`]) a concurrent
+/// self-probe is ALSO started up front and stood down on a supported `hello`, so
+/// a non-sitrep plugin (including one silent on stdout) is still readied by the
+/// probe. Non-event lines pass through to tracing as logs. On stdout EOF without
+/// ever sending, the sender drops unsent → the chain aggregator synthesizes a
+/// process-exit failure (the intended backstop).
 fn spawn_sitrep_stdout_reader(
     stdout: tokio::process::ChildStdout,
     plugin_name: String,
     local: SocketAddr,
     shutdown: CancellationToken,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
+    auto: bool,
 ) -> tokio::task::JoinHandle<()> {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
     let shared: SharedReady = Arc::new(tokio::sync::Mutex::new(Some(ready)));
     tokio::spawn(async move {
+        // Auto: run the self-probe concurrently from the start (mirrors the
+        // default `Probe` mode), sharing the send-once sender. A SUPPORTED
+        // `hello` cancels `probe_standdown` so the probe defers to sitrep;
+        // otherwise the probe readies the plugin (handles a non-sitrep plugin
+        // that is silent on stdout — there is no first line to classify on).
+        // `probe_standdown` is a child of `shutdown`, so chain shutdown stops it.
+        let probe_standdown = shutdown.child_token();
+        if auto {
+            spawn_shared_probe(local, probe_standdown.clone(), shared.clone());
+        }
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut handshake_ok = false;
@@ -335,6 +392,10 @@ fn spawn_sitrep_stdout_reader(
                         match crate::sitrep::protocol_support(&protocol) {
                             ProtocolSupport::Supported => {
                                 handshake_ok = true;
+                                // Auto: a real sitrep plugin — stand the probe
+                                // down so its richer `ready` wins. (No-op when
+                                // !auto: no probe was started with this token.)
+                                probe_standdown.cancel();
                                 tracing::debug!(plugin = %plugin_name, %protocol, "sitrep handshake");
                             }
                             ProtocolSupport::FallBackToTier2 => {
@@ -343,23 +404,15 @@ fn spawn_sitrep_stdout_reader(
                                     %protocol,
                                     "unknown sitrep protocol major; readiness falls back to probe"
                                 );
-                                // Hand readiness to a tier-2 self-probe,
-                                // sharing the single sender. The reader
-                                // continues only as a log passthrough (it
-                                // never sends readiness again).
-                                let probe_shared = shared.clone();
-                                let probe_local = local;
-                                let probe_shutdown = shutdown.clone();
-                                tokio::spawn(async move {
-                                    if let Some(addr) = crate::chain::poll_ready(probe_local, probe_shutdown).await {
-                                        if let Some(tx) = probe_shared.lock().await.take() {
-                                            let _ = tx.send(Ok(PluginReady {
-                                                listen: addr,
-                                                transports: crate::sitrep::Transports::TCP,
-                                            }));
-                                        }
-                                    }
-                                });
+                                // Hand readiness to a tier-2 self-probe, sharing
+                                // the single sender. In Auto the probe is already
+                                // running (do NOT cancel its standdown — unknown
+                                // major means the probe drives); in ExpectSitrep
+                                // start it now. The reader continues only as a log
+                                // passthrough (it never sends readiness again).
+                                if !auto {
+                                    spawn_shared_probe(local, shutdown.clone(), shared.clone());
+                                }
                                 // Drain the rest of stdout as logs so the
                                 // child's pipe never blocks; the probe task
                                 // owns readiness from here on.
@@ -412,6 +465,14 @@ fn spawn_sitrep_stdout_reader(
 /// Forward all remaining stdout lines to tracing as ordinary logs. Used
 /// after a `FallBackToTier2` handoff so the child's stdout pipe never
 /// blocks while the self-probe owns readiness.
+///
+/// The loop is unbounded by design and terminates on the **child's** stdout
+/// EOF — guaranteed when the child (and its tree) is reaped via `GroupedChild`
+/// / `kill_on_drop`, which closes the write end. This reads the child's pipe,
+/// not the host's, so it cannot reproduce the #197 runtime-drop hang (that was
+/// an orphan holding the *host's* stdio); and because it runs inside a detached
+/// `tokio::spawn`, runtime drop aborts it at the await point rather than
+/// blocking on it.
 async fn drain_remaining_logs(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>, plugin_name: &str) {
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::info!(plugin = %plugin_name, "{line}");
