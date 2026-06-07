@@ -1,11 +1,14 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
 
 fn sample_windows_state() -> DnsState {
     DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: SocketAddr::from(([127, 0, 0, 1], 53)),
+        advertised: vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        ],
         adapters: vec![
             DnsPriorAdapter {
                 id: AdapterId::WindowsAlias {
@@ -37,7 +40,7 @@ fn sample_windows_state() -> DnsState {
 fn sample_macos_state() -> DnsState {
     DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: SocketAddr::from(([127, 53, 0, 1], 53)),
+        advertised: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
         adapters: vec![DnsPriorAdapter {
             id: AdapterId::MacosServiceName { value: "Wi-Fi".into() },
             name_at_capture: "Wi-Fi".into(),
@@ -66,11 +69,11 @@ fn save_then_load_roundtrip_macos() {
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_fallback_loopback() {
+fn save_then_load_roundtrip_empty_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: SocketAddr::from(([127, 53, 0, 254], 53)),
+        advertised: vec![],
         adapters: vec![],
     };
     save(dir.path(), &state).unwrap();
@@ -96,7 +99,7 @@ fn load_wrong_version_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": 99,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [],
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
@@ -104,16 +107,20 @@ fn load_wrong_version_returns_none() {
 }
 
 #[skuld::test]
-fn load_unknown_top_level_field_returns_none() {
+fn load_tolerates_unknown_top_level_field() {
+    // DnsState dropped `deny_unknown_fields` so a v1 file's obsolete
+    // `chosen_loopback` key (and any future stray top-level key) is
+    // ignored rather than failing recovery.
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        "chosen_loopback": "127.0.0.1:53",
+        "chosen_loopback": "127.0.0.1:53", // obsolete v1 key — ignored
         "adapters": [],
-        "extra_field": "should be rejected",
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
-    assert!(load(dir.path()).is_none());
+    let loaded = load(dir.path()).expect("v1 file with obsolete key must still load");
+    assert!(loaded.advertised.is_empty(), "advertised defaults to empty when absent");
+    assert!(loaded.adapters.is_empty());
 }
 
 #[skuld::test]
@@ -121,7 +128,7 @@ fn load_unknown_adapter_field_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
@@ -139,7 +146,7 @@ fn load_unknown_dns_prior_variant_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
@@ -186,7 +193,7 @@ fn load_rejects_unknown_field_in_static_variant() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "windows_alias", "value": "Ethernet" },
             "name_at_capture": "Ethernet",
@@ -203,7 +210,7 @@ fn load_rejects_unknown_field_in_macos_service_name() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [{
             "id": { "kind": "macos_service_name", "value": "abc", "extra": 1 },
             "name_at_capture": "Wi-Fi",
@@ -220,19 +227,19 @@ fn load_rejects_missing_required_field() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
-        // chosen_loopback missing
-        "adapters": [],
+        "advertised": ["1.1.1.1"],
+        // adapters missing — still required (no serde default)
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
     assert!(load(dir.path()).is_none());
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_ipv6_loopback() {
+fn save_then_load_roundtrip_ipv6_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: SocketAddr::from((Ipv6Addr::LOCALHOST, 53)),
+        advertised: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
         adapters: vec![],
     };
     save(dir.path(), &state).unwrap();

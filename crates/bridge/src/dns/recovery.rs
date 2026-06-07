@@ -26,7 +26,7 @@ pub fn recover_dns_config(state_dir: &Path) {
     };
 
     tracing::info!(
-        loopback = %state.chosen_loopback,
+        advertised = ?state.advertised,
         adapter_count = state.adapters.len(),
         "dns_recovery: restoring prior DNS for leaked state"
     );

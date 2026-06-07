@@ -104,11 +104,11 @@ pub enum ProxyState {
 /// `None` fields for SocksOnly mode where routing / dispatcher / DNS are
 /// skipped, or when no plugin is configured.
 struct RunningState<P: Proxy, R: Routing, D: Dns> {
-    /// DNS interception guard: holds the captured prior DNS state and
-    /// the `LocalDnsServer`. `stop()` awaits
-    /// [`DnsApplied::shutdown`] on this BEFORE dropping anything else so
-    /// the OS sees its restored resolvers while routes are still live.
-    /// `None` when DNS forwarder is disabled or in SocksOnly mode.
+    /// DNS interception guard: holds the captured prior DNS state.
+    /// `stop()` awaits [`DnsApplied::shutdown`] on this BEFORE dropping
+    /// anything else so the OS sees its restored resolvers while routes
+    /// are still live. `None` when DNS forwarder is disabled or in
+    /// SocksOnly mode.
     #[allow(dead_code)]
     dns: Option<D::Applied>,
     /// TCP dispatcher — owns TUN device, smoltcp, and per-connection
@@ -384,9 +384,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///   `proxy.start(ss_config)`. Drop-on-cancel is sound — Proxy
     ///   implementations own no async cleanup obligations on an
     ///   in-flight start.
-    /// - **Phase 3 (build_local_dns / bind_ladder)**: cancel is passed
-    ///   to `bind_ladder` for per-candidate observation. Outer
-    ///   `tokio::select!` against cancel re-emits Cancelled canonically.
+    /// - **Phase 3 (build_local_dns)**: builds the in-TUN endpoint +
+    ///   forwarder synchronously; the outer `tokio::select!` against
+    ///   cancel re-emits Cancelled canonically.
     /// - **Phase 4 (forwarder self-test)**: cooperative — the token is
     ///   threaded into `run_forwarder_self_test` which checks it
     ///   between retry attempts and races the per-attempt forward.
@@ -547,18 +547,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         //      Drop SIGTERMs it on unwind) but the user sees the
         //      plugin process briefly.
         //   1. proxy.start  — binds local SS listener
-        //   2. build_local_dns  — binds loopback DNS server (Err on no
-        //      listen capacity, or on degenerate dns.enabled + empty
-        //      servers config)
+        //   2. build_local_dns  — builds the in-TUN LocalDnsEndpoint +
+        //      forwarder (Err on degenerate dns.enabled + empty servers)
         //   3. GATE: run_forwarder_self_test  — Err here means the plugin
         //      chain cannot reach upstream. RAII unwind drops
         //      running_proxy + plugin_chain locally. NO system state
         //      (routes / system DNS / TUN adapter) is mutated.
         //   4. Dispatcher::new  — only NOW does LocalDnsEndpoint become
         //      reachable through the cascade
-        //   5. routing.install  — TUN routes go live, intercept_udp53
-        //      activates
-        //   6. Dns::apply  — system DNS pointed at our loopback
+        //   5. routing.install  — TUN routes go live; OS DNS to the
+        //      advertised resolver IPs starts routing into the TUN
+        //   6. Dns::apply  — OS adapter DNS pointed at the resolver IPs
         //
         // Reordering steps 3..=6 re-introduces a dead-tunnel DNS hijack
         // with the GUI reporting "Running". The
@@ -575,12 +574,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             r = proxy.start(ss_config) => r?,
         };
 
-        // Phase 3: build local DNS forwarder + server. Now Err on bind failure
-        // (was silent-degrade pre-#388). Returns the forwarder Arc so
-        // the gate can drive it without re-plumbing. `bind_ladder`
-        // observes the cancel token between candidates; the outer
-        // `tokio::select!` here catches cancel even mid-attempt.
-        let (local_dns_server, local_dns_endpoint, forwarder) = tokio::select! {
+        // Phase 3: build the in-TUN DNS endpoint + forwarder. Err on the
+        // degenerate `dns.enabled && servers.is_empty()` config. Returns the
+        // forwarder Arc so the gate can drive it without re-plumbing. The
+        // outer `tokio::select!` re-emits Cancelled canonically.
+        let (local_dns_endpoint, forwarder) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
             r = build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available, cancel.clone()) => r?,
@@ -642,26 +640,27 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
         // Phase 7: apply system DNS AFTER routes install so the OS
-        // "best-route to DNS server" lookup resolves through the TUN
-        // (its DNS setting is our loopback IP). Persist + apply are
-        // cancel-aware inside `Dns::apply`; cancel observed between
-        // FFIs runs the inline-restore on partially-applied adapters
-        // and returns `DnsError::Cancelled`, which we map back to
-        // `ProxyError::Cancelled`. Non-cancel failures (Io) downgrade
-        // to a `warn!` + `None`: best-effort apply, so a single adapter
-        // failure doesn't tank an otherwise-working start.
-        let dns_applied = if let Some(srv) = local_dns_server {
+        // "best-route to DNS server" lookup resolves through the TUN.
+        // We advertise the configured upstream resolver IPs — OS UDP/53 to
+        // them routes into hole-tun and is intercepted by the in-TUN
+        // LocalDnsEndpoint; OS TCP/53 falls through the proxy cascade to the
+        // real resolver over the tunnel. (No loopback :53 server.)
+        // Pass the FULL list, not a v4 filter: `set_servers` advertises both
+        // the v4 and v6 families from their own entries (an unconfigured
+        // family is left untouched), so a mixed or v6 resolver list is carried
+        // end-to-end on both platforms. Persist + apply are cancel-aware inside
+        // `Dns::apply`. Non-cancel Io failures → warn! + None.
+        let dns_applied = if forwarder.is_some() {
+            let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
             // Capture runs on upstream only; the TUN was created by
             // `routing.install` above so its prior is definitionally
-            // "defaults" (capturing it is nonsensical).
-            // Apply runs on both: TUN needs loopback DNS so the OS's
-            // best-route-to-DNS lookup lands on our forwarder when the
-            // TUN becomes the primary interface.
+            // "defaults". Apply runs on both so the OS's best-route-to-DNS
+            // lookup lands on a TUN-routed resolver IP.
             let capture_aliases = vec![gw_info.interface_name.clone()];
             let apply_aliases = vec![TUN_DEVICE_NAME.into(), gw_info.interface_name.clone()];
             match dns
                 .apply(
-                    srv,
+                    advertise_ips,
                     capture_aliases,
                     apply_aliases,
                     state_dir.map(std::path::Path::to_path_buf),
@@ -672,7 +671,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
                 Err(DnsError::Io(e)) => {
-                    warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
+                    warn!(error = %e, "system DNS apply failed; in-tunnel DNS unreachable by OS clients");
                     None
                 }
             }
@@ -767,8 +766,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // appear here; otherwise toggling e.g. `proxy_http` on a running
         // bridge would take the hot-swap fast path and silently leave
         // the HTTP listener unbound. DnsConfig is included for the same
-        // reason — a DnsConfig edit must force a full stop + start so
-        // the LocalDnsServer rebinds with the new transport/servers.
+        // reason — a DnsConfig edit must force a full stop + start so the
+        // DnsForwarder + in-TUN LocalDnsEndpoint are rebuilt with the new
+        // transport/servers and the OS is re-advertised the new resolver IPs.
         let structural_same = active.server == config.server
             && active.local_port == config.local_port
             && active.tunnel_mode == config.tunnel_mode
@@ -887,42 +887,38 @@ mod proxy_manager_listener_e2e_tests;
 
 // DNS wiring helpers ==================================================================================================
 
-/// Build the local DNS server + endpoint + forwarder, if the config enables
-/// it. The forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
+/// Build the in-TUN DNS endpoint + forwarder, if the config enables it. The
+/// forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
 /// targeting the just-started SS SOCKS5 listener, so user filter rules
 /// cannot strand our own queries.
 ///
-/// Returns the `forwarder` Arc alongside the server + endpoint so the
-/// blocking self-test gate in `start_inner` can call `forwarder.forward(...)`
-/// without re-plumbing.
+/// Returns the `forwarder` Arc alongside the endpoint so the blocking
+/// self-test gate in `start_inner` can call `forwarder.forward(...)` without
+/// re-plumbing.
 ///
-/// **#388 change**: previously returned `(None, None)` silently when
-/// `bind_ladder` failed; now returns `Err(ProxyError::Runtime(io::Error))`.
-/// Also rejects the `dns.enabled && servers.is_empty()` config combination
-/// with `ForwarderSelfTestFailed { reason: "no DNS servers configured" }`
-/// because that combination would otherwise produce a degenerate runtime
-/// (TUN routes go live but forwarder has nothing to forward to).
+/// Rejects the `dns.enabled && servers.is_empty()` config combination with
+/// `ForwarderSelfTestFailed { reason: "no DNS servers configured" }` because
+/// that combination would otherwise produce a degenerate runtime (TUN routes
+/// go live but the forwarder has nothing to forward to).
 async fn build_local_dns(
     dns_cfg: &hole_common::config::DnsConfig,
     local_ss_port: u16,
     ipv6_bypass_available: bool,
-    cancel: CancellationToken,
+    _cancel: CancellationToken,
 ) -> Result<
     (
-        Option<crate::dns::server::LocalDnsServer>,
         Option<crate::endpoint::LocalDnsEndpoint>,
         Option<std::sync::Arc<crate::dns::forwarder::DnsForwarder>>,
     ),
     ProxyError,
 > {
     if !dns_cfg.enabled {
-        return Ok((None, None, None));
+        return Ok((None, None));
     }
     if dns_cfg.servers.is_empty() {
         // Hard error: the only sensible recovery is to disable the forwarder.
-        // Pre-#388 this silently returned (None, None) which left TUN routes
-        // live with intercept_udp53 hijacking UDP/53 into a forwarder that
-        // had no upstream — a worse failure mode than failing loud here.
+        // A live TUN with no upstream would strand every in-tunnel UDP/53
+        // flow at the LocalDnsEndpoint with nothing to forward to.
         return Err(ProxyError::ForwarderSelfTestFailed {
             reason: "no DNS servers configured".into(),
             attempts: 0,
@@ -942,16 +938,13 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    let server = crate::dns::server::LocalDnsServer::bind_ladder(Arc::clone(&forwarder), cancel).await?;
-    info!(addr = %server.addr(), "LocalDnsServer bound");
+    // The in-TUN endpoint is the sole OS DNS path: OS DNS now routes
+    // into hole-tun and is intercepted here, not via a loopback :53 server.
+    // It is built whenever DNS is enabled, independent of `intercept_udp53`
+    // (legacy flag — the in-TUN forwarder is now the mechanism).
+    let endpoint = crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder));
 
-    let endpoint = if dns_cfg.intercept_udp53 {
-        Some(crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder)))
-    } else {
-        None
-    };
-
-    Ok((Some(server), endpoint, Some(forwarder)))
+    Ok((Some(endpoint), Some(forwarder)))
 }
 
 /// Hint logged on self-test failure when the plugin tap IS enabled.

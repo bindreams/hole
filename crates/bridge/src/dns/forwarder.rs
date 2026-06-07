@@ -1,7 +1,6 @@
 //! `DnsForwarder` — pure-bytes DNS forwarding over one of four upstream
 //! transports. Preserves the client's transaction ID so it can serve as a
-//! drop-in forwarder for both `LocalDnsServer` (OS-facing loopback:53) and
-//! `LocalDnsEndpoint` (in-tunnel UDP/53 intercept).
+//! drop-in forwarder for the in-tunnel `LocalDnsEndpoint` (UDP/53 intercept).
 //!
 //! Serving strategy: walk `DnsConfig.servers` in order, try each with the
 //! configured `DnsProtocol`, return the first successful reply. Return a

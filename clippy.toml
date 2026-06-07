@@ -96,7 +96,7 @@ reason = "Use hole_test_observability::register!() at lib.rs level for tests. Se
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::IpHelper::SetInterfaceDnsSettings"
-reason = "Must go through `WinDnsBackend::set_loopback` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
+reason = "Must go through `WinDnsBackend::set_servers` / `restore` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
 allow-invalid = true  # only `hole-bridge` has the `Win32_NetworkManagement_IpHelper` feature wired in; other workspace crates can't resolve the path.
 
 [[disallowed-methods]]

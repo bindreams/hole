@@ -1,16 +1,15 @@
 //! `LocalDnsEndpoint` — the router's sink for in-tunnel UDP/53 flows.
 //!
-//! When the HoleRouter cascade matches `proto == Udp && dst.port() == 53
-//! && dns.intercept_udp53`, it dispatches to this endpoint instead of the
-//! [`Socks5Endpoint`](super::Socks5Endpoint). This catches apps that hard-
-//! code DNS destinations (Chrome DoH to 8.8.8.8, systemd-resolved stub)
-//! so they never hit the UDP-drop privacy invariant.
+//! When the HoleRouter cascade matches `proto == Udp && dst.port() == 53`
+//! and a `local_dns` endpoint is present, it dispatches to this endpoint
+//! instead of the [`Socks5Endpoint`](super::Socks5Endpoint). This catches
+//! apps that hard-code DNS destinations (Chrome DoH to 8.8.8.8,
+//! systemd-resolved stub) so they never hit the UDP-drop privacy invariant.
 //!
 //! The endpoint owns an `Arc<DnsForwarder>` and runs each incoming UDP
-//! datagram through `forward()` directly — no OS-loopback hop, no
-//! `LocalDnsServer` detour. That's the point: the flow arrived via the
-//! TUN, we resolve in-process, and we write the reply back into the same
-//! flow.
+//! datagram through `forward()` directly — no OS-loopback hop. That's the
+//! point: the flow arrived via the TUN, we resolve in-process, and we write
+//! the reply back into the same flow.
 //!
 //! TCP is not served: DNS-over-TCP to external IPs bypasses this endpoint
 //! — those flows take the normal proxy cascade. Serving TCP here would

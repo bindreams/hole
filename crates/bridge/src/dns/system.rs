@@ -1,8 +1,10 @@
 //! System DNS capture/apply/restore.
 //!
-//! The bridge re-points OS DNS clients at the `LocalDnsServer` loopback IP
-//! while a proxy is running, then restores the prior per-adapter / per-
+//! The bridge re-points OS DNS clients at the configured upstream resolver
+//! IPs while a proxy is running, then restores the prior per-adapter / per-
 //! address-family DNS configuration on clean shutdown or crash recovery.
+//! OS DNS to those resolver IPs routes into `hole-tun` and is intercepted by
+//! the in-TUN `LocalDnsEndpoint` (there is no loopback `:53` server).
 //!
 //! ## Per-adapter, per-family, three prior kinds
 //!
@@ -15,7 +17,7 @@
 //! ## Which adapters?
 //!
 //! Capture targets one adapter: the upstream physical adapter. Apply sets
-//! the loopback on both the TUN adapter (which we want the best-route
+//! the resolver IPs on both the TUN adapter (which we want the best-route
 //! resolver lookup to land on) and the upstream. The TUN is recreated per
 //! connect so its prior state is "defaults"; nothing to capture.
 //! Restore replays the captured state per adapter.
@@ -59,9 +61,8 @@ use crate::dns_state::{AdapterId, DnsPriorAdapter};
 /// unit tests, with catastrophic consequences for test reliability and
 /// CI health. See bindreams/hole#397.
 pub trait Dns: Send + Sync + 'static {
-    /// RAII guard returned by [`apply`](Self::apply). Owns the
-    /// `LocalDnsServer`, the captured `DnsPriorAdapter`s, and any
-    /// platform-specific state needed for restore.
+    /// RAII guard returned by [`apply`](Self::apply). Owns the captured
+    /// `DnsPriorAdapter`s and any platform-specific state needed for restore.
     ///
     /// **Two teardown paths**:
     ///
@@ -75,7 +76,15 @@ pub trait Dns: Send + Sync + 'static {
 
     /// Capture the prior DNS state of `capture_aliases`, persist it to
     /// `bridge-dns.json` (if `state_dir` is set), then point the OS at
-    /// `local_dns_server.addr().ip()` on each adapter in `apply_aliases`.
+    /// `advertise_ips` (the configured upstream resolver IPs) on each
+    /// adapter in `apply_aliases`.
+    ///
+    /// On Windows, `set_servers` splits `advertise_ips` per address family
+    /// and sets the v4 and v6 families separately; a family with no entries
+    /// is left untouched, never cleared. macOS sets the mixed list in one
+    /// call. OS UDP/53 to these IPs routes into `hole-tun` and is intercepted
+    /// by the in-TUN `LocalDnsEndpoint`; OS TCP/53 falls through the proxy
+    /// cascade to the real resolver over the tunnel.
     ///
     /// **Cancellation.** The implementation MUST check `cancel.cancelled()`
     /// between per-adapter I/O operations and inline-restore any
@@ -84,7 +93,7 @@ pub trait Dns: Send + Sync + 'static {
     /// not mid-call (an in-flight FFI write cannot be safely interrupted).
     fn apply(
         &self,
-        local_dns_server: crate::dns::server::LocalDnsServer,
+        advertise_ips: Vec<std::net::IpAddr>,
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
@@ -95,9 +104,8 @@ pub trait Dns: Send + Sync + 'static {
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
 /// shutdown contract.
 pub trait DnsApplied: Send + 'static {
-    /// Restore the captured prior DNS state and release the
-    /// `LocalDnsServer`. Async so the platform I/O can use
-    /// `tokio::task::spawn_blocking` and never stall the runtime worker.
+    /// Restore the captured prior DNS state. Async so the platform I/O can
+    /// use `tokio::task::spawn_blocking` and never stall the runtime worker.
     /// Idempotent: calling twice is a no-op the second time.
     fn shutdown(&mut self) -> impl std::future::Future<Output = ()> + Send + '_;
 }
@@ -184,7 +192,7 @@ impl Dns for SystemDns {
     #[cfg(target_os = "windows")]
     async fn apply(
         &self,
-        local_dns_server: crate::dns::server::LocalDnsServer,
+        advertise_ips: Vec<std::net::IpAddr>,
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
@@ -192,7 +200,7 @@ impl Dns for SystemDns {
     ) -> Result<Self::Applied, DnsError> {
         apply_windows(
             &self.backend,
-            local_dns_server,
+            advertise_ips,
             capture_aliases,
             apply_aliases,
             state_dir,
@@ -204,7 +212,7 @@ impl Dns for SystemDns {
     #[cfg(target_os = "macos")]
     async fn apply(
         &self,
-        local_dns_server: crate::dns::server::LocalDnsServer,
+        advertise_ips: Vec<std::net::IpAddr>,
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
@@ -212,7 +220,7 @@ impl Dns for SystemDns {
     ) -> Result<Self::Applied, DnsError> {
         apply_macos(
             &self.backend,
-            local_dns_server,
+            advertise_ips,
             capture_aliases,
             apply_aliases,
             state_dir,
@@ -224,7 +232,7 @@ impl Dns for SystemDns {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     async fn apply(
         &self,
-        local_dns_server: crate::dns::server::LocalDnsServer,
+        _advertise_ips: Vec<std::net::IpAddr>,
         _capture_aliases: Vec<String>,
         _apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
@@ -233,8 +241,8 @@ impl Dns for SystemDns {
         Ok(SystemDnsApplied {
             applied_prior: Vec::new(),
             state_dir,
-            local_dns_server: Some(local_dns_server),
             bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
+            shutdown_completed: false,
         })
     }
 }
@@ -249,15 +257,16 @@ const BOMB_MSG: &str = "SystemDnsApplied dropped without awaiting shutdown()";
 #[cfg(target_os = "windows")]
 async fn apply_windows(
     backend: &Arc<dyn windows::WinDnsBackend>,
-    local_dns_server: crate::dns::server::LocalDnsServer,
+    advertise_ips: Vec<std::net::IpAddr>,
     capture_aliases: Vec<String>,
     apply_aliases: Vec<String>,
     state_dir: Option<PathBuf>,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
-    let chosen_loopback = local_dns_server.addr();
-    let loopback_ip = chosen_loopback.ip();
+    // `set_servers` advertises both families, splitting `advertise_ips` per
+    // family internally and leaving a family with no configured resolver
+    // untouched. Pass the full list through unchanged.
     let mut captured: Vec<DnsPriorAdapter> = Vec::new();
 
     // Capture phase. Cancel checked between FFIs; capture is read-only,
@@ -291,7 +300,7 @@ async fn apply_windows(
     if let Some(dir) = state_dir.as_deref() {
         let state = crate::dns_state::DnsState {
             version: crate::dns_state::SCHEMA_VERSION,
-            chosen_loopback,
+            advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
         if let Err(e) = crate::dns_state::save(dir, &state) {
@@ -319,7 +328,8 @@ async fn apply_windows(
         }
         let b = Arc::clone(backend);
         let alias_owned = alias.clone();
-        let res = tokio::task::spawn_blocking(move || b.set_loopback(&alias_owned, loopback_ip))
+        let ips = advertise_ips.clone();
+        let res = tokio::task::spawn_blocking(move || b.set_servers(&alias_owned, &ips))
             .await
             .map_err(|e| DnsError::Io(io::Error::other(e)))?;
         if let Err(e) = res {
@@ -341,7 +351,6 @@ async fn apply_windows(
         backend: Arc::clone(backend),
         applied_prior: captured,
         state_dir,
-        local_dns_server: Some(local_dns_server),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
         shutdown_completed: false,
     })
@@ -384,15 +393,13 @@ async fn inline_restore(
 #[cfg(target_os = "macos")]
 async fn apply_macos(
     backend: &Arc<dyn macos::MacDnsBackend>,
-    local_dns_server: crate::dns::server::LocalDnsServer,
+    advertise_ips: Vec<std::net::IpAddr>,
     capture_aliases: Vec<String>,
     apply_aliases: Vec<String>,
     state_dir: Option<PathBuf>,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
-    let chosen_loopback = local_dns_server.addr();
-    let loopback_ip = chosen_loopback.ip();
     let mut captured: Vec<DnsPriorAdapter> = Vec::new();
 
     // Capture phase. Cancel checked between subprocesses; capture is
@@ -422,7 +429,7 @@ async fn apply_macos(
     if let Some(dir) = state_dir.as_deref() {
         let state = crate::dns_state::DnsState {
             version: crate::dns_state::SCHEMA_VERSION,
-            chosen_loopback,
+            advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
         if let Err(e) = crate::dns_state::save(dir, &state) {
@@ -443,7 +450,8 @@ async fn apply_macos(
         }
         let b = Arc::clone(backend);
         let svc_owned = service.clone();
-        let res = tokio::task::spawn_blocking(move || b.set_loopback(&svc_owned, loopback_ip))
+        let ips = advertise_ips.clone();
+        let res = tokio::task::spawn_blocking(move || b.set_servers(&svc_owned, &ips))
             .await
             .map_err(|e| DnsError::Io(io::Error::other(e)))?;
         if let Err(e) = res {
@@ -465,7 +473,6 @@ async fn apply_macos(
         backend: Arc::clone(backend),
         applied_prior: captured,
         state_dir,
-        local_dns_server: Some(local_dns_server),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
         shutdown_completed: false,
     })
@@ -522,9 +529,6 @@ pub struct SystemDnsApplied {
     backend: Arc<dyn macos::MacDnsBackend>,
     applied_prior: Vec<DnsPriorAdapter>,
     state_dir: Option<PathBuf>,
-    /// Held to keep the loopback `<ip>:53` bound and to keep the
-    /// forwarder tasks running. Released AFTER system DNS is restored.
-    local_dns_server: Option<crate::dns::server::LocalDnsServer>,
     /// Runtime safeguard: panics in debug builds on drop if `shutdown`
     /// wasn't awaited. No-op in release.
     ///
@@ -578,11 +582,6 @@ impl DnsApplied for SystemDnsApplied {
             }
         })
         .await;
-
-        // Drop the LocalDnsServer AFTER restore so the OS still has the
-        // loopback resolver bound during the window between restore
-        // start and finish.
-        let _ = self.local_dns_server.take();
     }
 }
 
@@ -623,7 +622,6 @@ impl Drop for SystemDnsApplied {
                 );
             }
         }
-        // LocalDnsServer drops via the field's own Drop on this struct's drop.
     }
 }
 

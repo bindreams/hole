@@ -55,10 +55,10 @@ The three drop reasons (rule block, UDP-proxy-unavailable, IPv6-bypass-unreachab
 each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs)
 methods.
 
-**UDP/53 exception.** When `DnsConfig.intercept_udp53` is enabled (default),
-UDP/53 is diverted to [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs)
-*before* the cascade reads the filter decision, so DNS works even on a TCP-only
-plugin. See [DNS forwarder](#dns-forwarder).
+**UDP/53 exception.** When DNS is enabled, UDP/53 is diverted to
+[`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) *before* the
+cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
+[DNS forwarder](#dns-forwarder).
 
 ### DNS forwarder
 
@@ -67,25 +67,26 @@ privacy). The bridge carries DNS over the TCP tunnel:
 
 - [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs) — bytes-in/out forwarder;
   PlainUdp / PlainTcp / DoT / DoH; preserves the client's transaction ID.
-- [`LocalDnsServer`](crates/bridge/src/dns/server.rs) — binds loopback `:53`
-  UDP+TCP via a ladder `127.0.0.1:53` → `127.53.0.1..254:53` → fail. Two gates
-  advance it: the bind syscall (Windows `SO_EXCLUSIVEADDRUSE`, so a later
-  `SO_REUSEADDR` binder can't steal traffic) and a 600 ms post-bind UDP self-test
-  (`SelfTestProbe`; production `DefaultProbe`). The self-test catches a wildcard
-  `0.0.0.0:53` `SO_REUSEADDR` holder (ICS, Pi-hole, dnscrypt-proxy) that hijacks
-  loopback UDP even though `bind(127.0.0.1:53)` returns `Ok` (#398).
+- [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) — the in-TUN
+  UDP/53 interceptor; the sole OS DNS path. OS adapter DNS is pointed at the
+  configured resolver IPs (default `[1.1.1.1, 1.0.0.1]`), which route into
+  `hole-tun` via the `0.0.0.0/1` split route and are diverted to this endpoint
+  → `DnsForwarder` over the tunnel. OS TCP/53 to those IPs falls through the
+  proxy cascade to the real resolver's `:53` over the tunnel.
 - [`Socks5Connector`](crates/bridge/src/dns/socks5_connector.rs) — routes the
   forwarder's upstream through the SS SOCKS5 listener so user `Block` rules can't
   strand the resolver (TCP via `tokio-socks`; UDP via hand-rolled UDP ASSOCIATE,
   RFC 1928).
 - [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — Windows `netsh`, macOS
-  `networksetup`. Apply runs on the TUN **and** upstream adapters; capture runs
-  on the upstream only (the TUN is freshly created). Prior config persists to
-  `bridge-dns.json`; the post-apply cache flush is fire-and-forget.
+  `networksetup`. Apply advertises the resolver IPs to the TUN **and** upstream
+  adapters (on Windows both v4 and v6 families, each set from its own configured
+  resolvers; a family with none is left untouched); capture runs on the upstream
+  only (the TUN is freshly created). Prior config persists to `bridge-dns.json`;
+  the post-apply cache flush is fire-and-forget.
 
-`DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]`,
-`intercept_udp53: true` — and `AppConfig` is `#[serde(default)]`, so the
-forwarder enables silently on upgrade.
+`DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]` — and
+`AppConfig` is `#[serde(default)]`, so the forwarder enables silently on
+upgrade.
 
 **Start-time gate (load-bearing).** A forwarder self-test runs inside
 [`start_inner`](crates/bridge/src/proxy_manager.rs) **before**
@@ -94,9 +95,7 @@ returns `ProxyError::ForwarderSelfTestFailed` and the RAII guards unwind without
 touching routes, system DNS, or the wintun adapter. Guarded by
 `start_blocks_on_forwarder_self_test_failure`.
 
-**Hard errors:** `dns.enabled = true` with `servers = []` is a config error;
-`bind_ladder` exhaustion (all 255 loopback candidates blocked) is a start error
-(a single conflict like Pi-hole on `127.0.0.1:53` still succeeds via the ladder).
+**Hard errors:** `dns.enabled = true` with `servers = []` is a config error.
 
 ### Listener selection invariants
 

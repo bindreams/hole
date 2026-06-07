@@ -37,11 +37,11 @@
 //! The DNS configuration on a Windows adapter is split per address
 //! family. `SetInterfaceDnsSettings` configures one family per call —
 //! select v4 vs v6 via the `DNS_SETTING_IPV6` flag in
-//! [`DNS_INTERFACE_SETTINGS::Flags`]. The apply path **only configures
-//! v4** because the loopback resolver from
-//! [`crate::dns::server::LocalDnsServer`] is always IPv4. v6 is left
-//! untouched on apply and replayed verbatim from the captured prior on
-//! restore.
+//! [`DNS_INTERFACE_SETTINGS::Flags`]. The apply path **configures both the
+//! v4 and v6 DNS families**, advertising the configured resolver IPs of
+//! each family; a family with no configured resolver is left untouched
+//! (never cleared — clearing would revert it to DHCP and leak) and replayed
+//! verbatim from the captured prior on restore.
 
 use std::io;
 use std::net::IpAddr;
@@ -88,9 +88,11 @@ pub trait WinDnsBackend: Send + Sync + 'static {
     /// yet); returns `Err` only on unexpected Win32 failures.
     fn get_settings(&self, alias: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
-    /// Point the v4 DNS resolver on `alias` at `loopback`. v6 is left
-    /// untouched (`loopback` is always IPv4 from `LocalDnsServer`).
-    fn set_loopback(&self, alias: &str, loopback: IpAddr) -> io::Result<()>;
+    /// Set the DNS resolvers on `alias`, advertising the v4 and v6 families
+    /// separately from the matching entries in `servers`. A family with no
+    /// entries is left untouched (never cleared — clearing would revert it
+    /// to DHCP and leak).
+    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore the captured prior DNS state for `adapter`. Replays both
     /// v4 and v6 from [`DnsPriorAdapter::v4`] / [`DnsPriorAdapter::v6`].
@@ -139,29 +141,37 @@ impl WinDnsBackend for Win32Real {
         }))
     }
 
-    fn set_loopback(&self, alias: &str, loopback: IpAddr) -> io::Result<()> {
+    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()> {
         let started = Instant::now();
         let guid = match alias_to_guid(alias)? {
             Some(g) => g,
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("Win32Real::set_loopback: adapter not found: {alias}"),
+                    format!("Win32Real::set_servers: adapter not found: {alias}"),
                 ));
             }
         };
-        // Loopback from LocalDnsServer is always IPv4; v6 is untouched.
-        set_one(
-            guid,
-            false,
-            &DnsPrior::Static {
-                servers: vec![loopback],
-            },
-        )?;
+        // Advertise per family. Set a family ONLY when `servers` carries at
+        // least one address of that family: setting a family to an empty list
+        // clears it and lets Windows revert to the DHCP-assigned resolver (an
+        // on-link router = a DNS leak outside the tunnel). A family with no
+        // configured resolver is left untouched and its captured prior is
+        // replayed on restore. `set_one`'s `ip.is_ipv6() == ipv6` filter
+        // selects the matching family.
+        let v4: Vec<IpAddr> = servers.iter().copied().filter(|ip| ip.is_ipv4()).collect();
+        let v6: Vec<IpAddr> = servers.iter().copied().filter(|ip| ip.is_ipv6()).collect();
+        if !v4.is_empty() {
+            set_one(guid, false, &DnsPrior::Static { servers: v4 })?;
+        }
+        if !v6.is_empty() {
+            set_one(guid, true, &DnsPrior::Static { servers: v6 })?;
+        }
         tracing::debug!(
             %alias,
+            servers = ?servers,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "Win32Real::set_loopback"
+            "Win32Real::set_servers"
         );
         Ok(())
     }

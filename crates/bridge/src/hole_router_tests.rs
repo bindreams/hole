@@ -329,7 +329,7 @@ fn udp53_v6_destination_also_intercepted() {
 
 #[skuld::test]
 fn udp53_without_local_dns_keeps_existing_behavior() {
-    // When local_dns is None (intercept_udp53 disabled), UDP/53 follows
+    // When local_dns is None (DNS disabled or SocksOnly), UDP/53 follows
     // the normal cascade: Proxy + UDP + !proxy_udp drops via the privacy
     // invariant.
     let r = router_with(false, true);

@@ -13,7 +13,7 @@ fn recover_clears_state_file_after_restore() {
     let dir = tempfile::tempdir().unwrap();
     let state = dns_state::DnsState {
         version: dns_state::SCHEMA_VERSION,
-        chosen_loopback: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
+        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
         // Empty adapters list — restore_all is a no-op so no platform
         // commands get invoked (safe in CI).
         adapters: Vec::new(),
@@ -29,7 +29,7 @@ fn recover_wrong_version_leaves_state_file_alone() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": 99,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [],
     });
     std::fs::write(dir.path().join(dns_state::STATE_FILE_NAME), json.to_string()).unwrap();
@@ -66,7 +66,7 @@ fn recover_tolerates_legacy_state_file_with_tun_entry() {
 
     let legacy_state = DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
+        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
         adapters: vec![DnsPriorAdapter {
             id: tun_id,
             name_at_capture: "hole-tun".into(),
@@ -84,5 +84,57 @@ fn recover_tolerates_legacy_state_file_with_tun_entry() {
     assert!(
         !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
         "state file should be cleared even when TUN restore fails"
+    );
+}
+
+/// crash+upgrade recovery: a `bridge-dns.json` left by a crashed older
+/// binary uses the OLD shape (`version: 1`, scalar `chosen_loopback`,
+/// no `advertised`). The new binary MUST still load it and restore
+/// the user's OS DNS from `adapters` — otherwise the user is stranded with
+/// OS DNS stuck at a dead `127.0.0.1`. This pins that `DnsState` stays
+/// version 1 + tolerant (no `deny_unknown_fields`, `advertised` defaults),
+/// so a naive version bump that rejects the v1 file is caught here.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test]
+fn recover_v1_state_file_restores_adapters_after_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Platform-shaped adapter id, mirroring
+    // `recover_tolerates_legacy_state_file_with_tun_entry`. The adapter
+    // won't exist on the CI host, so `restore_all` log-and-continues — the
+    // test exercises "load v1 file + iterate adapters + clear file", not a
+    // real OS restore payload.
+    #[cfg(target_os = "windows")]
+    let id = serde_json::json!({ "kind": "windows_alias", "value": "hole-recover-test-xyz" });
+    #[cfg(target_os = "macos")]
+    let id = serde_json::json!({ "kind": "macos_service_name", "value": "hole-recover-test-xyz" });
+
+    // OLD v1 on-disk shape — what an older binary wrote.
+    let v1_json = serde_json::json!({
+        "version": 1,
+        "chosen_loopback": "127.0.0.1:53",
+        "adapters": [{
+            "id": id,
+            "name_at_capture": "hole-recover-test-xyz",
+            "v4": { "kind": "dhcp" },
+            "v6": { "kind": "none" },
+        }],
+    });
+    std::fs::write(dir.path().join(dns_state::STATE_FILE_NAME), v1_json.to_string()).unwrap();
+
+    // Sanity: the v1 file loads despite the obsolete `chosen_loopback` key
+    // and missing `advertised`, with `adapters` intact (recovery's input).
+    let loaded = dns_state::load(dir.path()).expect("v1 file must load post-upgrade");
+    assert!(
+        loaded.advertised.is_empty(),
+        "advertised defaults to empty for a v1 file"
+    );
+    assert_eq!(loaded.adapters.len(), 1, "the adapter to restore must survive the load");
+
+    // Recovery restores from `adapters` and clears the file on success.
+    recover_dns_config(dir.path());
+    assert!(
+        !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
+        "v1 leaked state must be recovered (loaded + restored + cleared), not discarded"
     );
 }

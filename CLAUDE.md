@@ -24,9 +24,10 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
-- **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; binds
-  loopback `:53` via a ladder guarded by a UDP self-test; a start-time self-test
-  gates the whole connection. →
+- **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
+  adapter DNS is advertised the configured resolver IPs, which route into
+  `hole-tun` and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
+  forwarder self-test gates the whole connection. →
   [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
 - **Listener selection invariants.** `build_ss_config` rejects
   `TunnelRequiresSocks5` / `NoListenersEnabled` / `DuplicateListenerPort`

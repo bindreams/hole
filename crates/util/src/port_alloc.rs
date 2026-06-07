@@ -15,8 +15,6 @@
 //!
 //! Consumers across the workspace route through `bind_ephemeral`:
 //!
-//! * `hole-bridge`'s `LocalDnsServer::bind` — UDP+TCP on the same ephemeral
-//!   loopback port.
 //! * `hole-bridge`'s `proxy::plugin::start_plugin_chain` — SIP003 plugin port
 //!   (TCP or TCP+UDP per the plugin binary's
 //!   `hole_common::plugin::plugin_alloc_protocols`).
