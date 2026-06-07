@@ -1473,7 +1473,6 @@ mod self_test {
     /// fails with ECONNREFUSED on every attempt (the 3×1500ms loop closes
     /// fast on each refused connect, well under the 5s outer budget).
     #[skuld::test]
-    #[cfg(target_os = "windows")]
     fn start_blocks_on_forwarder_self_test_failure() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();

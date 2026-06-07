@@ -81,10 +81,11 @@ pub enum DnsProtocol {
 
 /// Built-in DNS forwarder configuration.
 ///
-/// The bridge binds a loopback DNS server when `enabled`, reconfigures the
-/// OS resolver to point at it, and forwards queries upstream via
-/// [`DnsProtocol`]. Queries travel through the shadowsocks SOCKS5 listener,
-/// so they're carried over the TCP tunnel even when the plugin is TCP-only.
+/// When `enabled`, the bridge points the OS adapters' DNS at the configured
+/// `servers` resolver IPs. Those queries route into `hole-tun`, where the
+/// in-TUN DNS endpoint intercepts them and forwards upstream via
+/// [`DnsProtocol`] through the shadowsocks SOCKS5 listener — carried over the
+/// TCP tunnel even when the plugin is TCP-only. There is no loopback server.
 ///
 /// `servers` is ordered: the first entry is primary, subsequent entries are
 /// tried on failure. The UI currently renders exactly two rows
@@ -94,10 +95,10 @@ pub struct DnsConfig {
     pub enabled: bool,
     pub servers: Vec<IpAddr>,
     pub protocol: DnsProtocol,
-    /// When `true`, the HoleRouter redirects any in-tunnel UDP/53 flow to
-    /// the loopback forwarder (not only queries to the OS-configured
-    /// resolver). Catches apps that hardcode DNS destinations like
-    /// Chrome's Secure DNS to `8.8.8.8`.
+    /// Legacy field, retained for config back-compat. It no longer gates the
+    /// in-TUN UDP/53 divert: the DNS endpoint is always active when DNS is
+    /// enabled, so every in-tunnel UDP/53 flow is intercepted regardless of
+    /// this value.
     pub intercept_udp53: bool,
 }
 

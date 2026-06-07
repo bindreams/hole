@@ -46,8 +46,7 @@ impl Dispatcher {
     /// - `rules`: compiled filter rules.
     /// - `local_dns_endpoint`: optional in-tunnel DNS interceptor. When
     ///   `Some`, the router diverts UDP/53 flows to it. Callers pass
-    ///   `Some` when the `DnsConfig.intercept_udp53` flag is set and the
-    ///   forwarder has bound successfully.
+    ///   `Some` whenever DNS is enabled (and not SocksOnly mode).
     pub fn new(
         local_port: u16,
         iface_index: u32,

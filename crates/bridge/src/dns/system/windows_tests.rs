@@ -282,8 +282,8 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
 
 /// `SystemDnsApplied::Drop` MUST invoke the sync-fallback restore (and
 /// flush) in **both** debug and release when `shutdown().await` was
-/// skipped, so the user's DNS isn't left pointed at the loopback
-/// forwarder. The gate is `shutdown_completed`, not `bomb.is_defused()`
+/// skipped, so the user's DNS isn't left pointed at the advertised resolver
+/// IPs. The gate is `shutdown_completed`, not `bomb.is_defused()`
 /// (the latter is `true` unconditionally in release, which would make the
 /// fallback dead code there).
 ///

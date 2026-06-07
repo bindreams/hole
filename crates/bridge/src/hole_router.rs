@@ -68,10 +68,9 @@ pub struct HoleRouter {
     proxy: Socks5Endpoint,
     bypass: InterfaceEndpoint,
     block: BlockEndpoint,
-    /// Optional in-tunnel DNS interceptor. When present *and*
-    /// `DnsConfig.intercept_udp53 == true`, the cascade diverts UDP/53
-    /// flows to this endpoint instead of the proxy. `None` disables
-    /// interception (user config or SocksOnly mode).
+    /// Optional in-tunnel DNS interceptor. When `Some`, the cascade diverts
+    /// UDP/53 flows to this endpoint instead of the proxy; `is_some()` is the
+    /// sole gate. `None` disables interception (DNS disabled or SocksOnly mode).
     local_dns: Option<LocalDnsEndpoint>,
     rules: Arc<ArcSwap<RuleSet>>,
 }
