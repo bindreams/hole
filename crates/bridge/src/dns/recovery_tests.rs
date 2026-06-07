@@ -13,7 +13,7 @@ fn recover_clears_state_file_after_restore() {
     let dir = tempfile::tempdir().unwrap();
     let state = dns_state::DnsState {
         version: dns_state::SCHEMA_VERSION,
-        chosen_loopback: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
+        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
         // Empty adapters list — restore_all is a no-op so no platform
         // commands get invoked (safe in CI).
         adapters: Vec::new(),
@@ -29,7 +29,7 @@ fn recover_wrong_version_leaves_state_file_alone() {
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": 99,
-        "chosen_loopback": "127.0.0.1:53",
+        "advertised": ["1.1.1.1"],
         "adapters": [],
     });
     std::fs::write(dir.path().join(dns_state::STATE_FILE_NAME), json.to_string()).unwrap();
@@ -66,7 +66,7 @@ fn recover_tolerates_legacy_state_file_with_tun_entry() {
 
     let legacy_state = DnsState {
         version: SCHEMA_VERSION,
-        chosen_loopback: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
+        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
         adapters: vec![DnsPriorAdapter {
             id: tun_id,
             name_at_capture: "hole-tun".into(),

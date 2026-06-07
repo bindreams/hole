@@ -580,7 +580,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the gate can drive it without re-plumbing. `bind_ladder`
         // observes the cancel token between candidates; the outer
         // `tokio::select!` here catches cancel even mid-attempt.
-        let (local_dns_server, local_dns_endpoint, forwarder) = tokio::select! {
+        let (_local_dns_server, local_dns_endpoint, forwarder) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
             r = build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available, cancel.clone()) => r?,
@@ -642,26 +642,27 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
         // Phase 7: apply system DNS AFTER routes install so the OS
-        // "best-route to DNS server" lookup resolves through the TUN
-        // (its DNS setting is our loopback IP). Persist + apply are
-        // cancel-aware inside `Dns::apply`; cancel observed between
-        // FFIs runs the inline-restore on partially-applied adapters
-        // and returns `DnsError::Cancelled`, which we map back to
-        // `ProxyError::Cancelled`. Non-cancel failures (Io) downgrade
-        // to a `warn!` + `None`: best-effort apply, so a single adapter
-        // failure doesn't tank an otherwise-working start.
-        let dns_applied = if let Some(srv) = local_dns_server {
+        // "best-route to DNS server" lookup resolves through the TUN.
+        // We advertise the configured upstream resolver IPs — OS UDP/53 to
+        // them routes into hole-tun and is intercepted by the in-TUN
+        // LocalDnsEndpoint; OS TCP/53 falls through the proxy cascade to the
+        // real resolver over the tunnel. (No loopback :53 server — see #248.)
+        // Pass the FULL list, not a v4 filter: `set_servers` advertises both
+        // the v4 and v6 families from their own entries (an unconfigured
+        // family is left untouched), so a mixed or v6 resolver list is carried
+        // end-to-end on both platforms. Persist + apply are cancel-aware inside
+        // `Dns::apply`. Non-cancel Io failures → warn! + None.
+        let dns_applied = if forwarder.is_some() {
+            let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
             // Capture runs on upstream only; the TUN was created by
             // `routing.install` above so its prior is definitionally
-            // "defaults" (capturing it is nonsensical).
-            // Apply runs on both: TUN needs loopback DNS so the OS's
-            // best-route-to-DNS lookup lands on our forwarder when the
-            // TUN becomes the primary interface.
+            // "defaults". Apply runs on both so the OS's best-route-to-DNS
+            // lookup lands on a TUN-routed resolver IP.
             let capture_aliases = vec![gw_info.interface_name.clone()];
             let apply_aliases = vec![TUN_DEVICE_NAME.into(), gw_info.interface_name.clone()];
             match dns
                 .apply(
-                    srv,
+                    advertise_ips,
                     capture_aliases,
                     apply_aliases,
                     state_dir.map(std::path::Path::to_path_buf),
@@ -672,7 +673,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
                 Err(DnsError::Io(e)) => {
-                    warn!(error = %e, "system DNS apply failed; DNS forwarder unreachable by OS clients");
+                    warn!(error = %e, "system DNS apply failed; in-tunnel DNS unreachable by OS clients");
                     None
                 }
             }

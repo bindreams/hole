@@ -1,7 +1,7 @@
 //! Persisted DNS state for crash recovery.
 //!
-//! The bridge writes the chosen loopback bind address and prior system-DNS
-//! settings to a JSON file when the DNS forwarder starts, clears it on clean
+//! The bridge writes the advertised resolver IPs and prior system-DNS
+//! settings to a JSON file when DNS apply starts, clears it on clean
 //! shutdown, and reads it on startup to restore DNS leaked by a previous
 //! crashed run. Mirrors the `tun_engine::routing::state`
 //! (crates/tun-engine/src/routing/state.rs) / `plugin_state` crash-recovery
@@ -12,7 +12,7 @@
 //! enforces single-instance). Concurrent `save` calls are not supported.
 
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -30,10 +30,19 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// NOTE: NO `deny_unknown_fields` — a v1 file from a pre-#248 crashed run
+// carries the obsolete `chosen_loopback` key. Tolerating it (ignore the
+// unknown key, default `advertised` to empty) keeps crash+upgrade recovery
+// working: `load` still returns the state and recovery restores from
+// `adapters`. See bindreams/hole#248.
 pub struct DnsState {
     pub version: u32,
-    pub chosen_loopback: SocketAddr,
+    /// The upstream resolver IPs advertised to the OS adapters this run.
+    /// Diagnostic only — recovery restores from `adapters`, not this field.
+    /// `#[serde(default)]` so a v1 file (which has no `advertised` key)
+    /// still loads, defaulting to empty.
+    #[serde(default)]
+    pub advertised: Vec<IpAddr>,
     pub adapters: Vec<DnsPriorAdapter>,
 }
 

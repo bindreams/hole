@@ -48,9 +48,9 @@ pub trait MacDnsBackend: Send + Sync + 'static {
     /// `networksetup` failures.
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
-    /// Point the DNS resolver on `service` at `loopback`. `networksetup`
+    /// Set the DNS resolvers on `service` to `servers`. `networksetup`
     /// accepts mixed v4/v6 lists in one call.
-    fn set_loopback(&self, service: &str, loopback: IpAddr) -> io::Result<()>;
+    fn set_servers(&self, service: &str, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore the captured prior DNS state for `adapter`. Replays both
     /// v4 and v6 in a single `networksetup -setdnsservers` invocation.
@@ -94,8 +94,8 @@ impl MacDnsBackend for Networksetup {
         }))
     }
 
-    fn set_loopback(&self, service: &str, loopback: IpAddr) -> io::Result<()> {
-        set_dnsservers(service, &[loopback])
+    fn set_servers(&self, service: &str, servers: &[IpAddr]) -> io::Result<()> {
+        set_dnsservers(service, servers)
     }
 
     fn restore(&self, adapter: &DnsPriorAdapter) -> io::Result<()> {

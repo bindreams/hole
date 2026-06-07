@@ -7,10 +7,9 @@
 //! so they never hit the UDP-drop privacy invariant.
 //!
 //! The endpoint owns an `Arc<DnsForwarder>` and runs each incoming UDP
-//! datagram through `forward()` directly — no OS-loopback hop, no
-//! `LocalDnsServer` detour. That's the point: the flow arrived via the
-//! TUN, we resolve in-process, and we write the reply back into the same
-//! flow.
+//! datagram through `forward()` directly — no OS-loopback hop. That's the
+//! point: the flow arrived via the TUN, we resolve in-process, and we write
+//! the reply back into the same flow.
 //!
 //! TCP is not served: DNS-over-TCP to external IPs bypasses this endpoint
 //! — those flows take the normal proxy cascade. Serving TCP here would

@@ -901,13 +901,9 @@ fn reload_when_not_running_starts() {
 /// instrumentation still emits the diagnostic.
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
-    use crate::dns::connector::DirectConnector;
-    use crate::dns::forwarder::DnsForwarder;
-    use crate::dns::server::LocalDnsServer;
     use crate::dns::system::{Dns, SystemDns};
     use crate::test_support::log_capture::VecWriter;
-    use hole_common::config::DnsConfig;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
@@ -929,23 +925,13 @@ fn dns_apply_emits_done_info_log() {
             );
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-            // Bind LocalDnsServer to an ephemeral loopback port so the test
-            // doesn't fight with anything else on :53.
-            let forwarder = Arc::new(DnsForwarder::new(
-                DnsConfig::default(),
-                Arc::new(DirectConnector),
-                false,
-            ));
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
-
             let dns = SystemDns::default();
             // Adapter doesn't exist — `Win32Real::get_settings` returns
             // `Ok(None)` so nothing is captured and apply also no-ops, but
             // the surrounding `apply_dns_settings done` INFO log still fires.
             let mut applied = dns
                 .apply(
-                    srv,
+                    vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
                     vec!["hole-test-nonexistent-iface-xyz".into()],
                     vec![],
                     None,
@@ -983,14 +969,10 @@ fn dns_apply_emits_done_info_log() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
-    use crate::dns::connector::DirectConnector;
-    use crate::dns::forwarder::DnsForwarder;
-    use crate::dns::server::LocalDnsServer;
     use crate::dns::system::{Dns, SystemDns};
     use crate::proxy::TUN_DEVICE_NAME;
     use crate::test_support::log_capture::VecWriter;
-    use hole_common::config::DnsConfig;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
@@ -1012,14 +994,6 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
             );
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-            let forwarder = Arc::new(DnsForwarder::new(
-                DnsConfig::default(),
-                Arc::new(DirectConnector),
-                false,
-            ));
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let srv = LocalDnsServer::bind(addr, forwarder).await.expect("bind ephemeral");
-
             // Upstream alias uses a distinctive name so we can grep for it.
             // Mirrors `start_inner`'s phase 7 wiring: capture_aliases=
             // [upstream] (TUN skipped), apply_aliases=
@@ -1027,7 +1001,7 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
             let dns = SystemDns::default();
             let mut applied = dns
                 .apply(
-                    srv,
+                    vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
                     vec!["hole-p4-test-upstream-xyz".into()],
                     vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
                     None,
