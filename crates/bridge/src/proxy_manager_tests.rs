@@ -1335,10 +1335,8 @@ mod self_test {
     }
 
     /// `build_local_dns` rejects the degenerate `enabled=true, servers=[]`
-    /// config combination as `ForwarderSelfTestFailed`. Pre-#388 this
-    /// silently returned `(None, None)` and left TUN routes live with
-    /// `intercept_udp53` hijacking UDP/53 into a forwarder with no
-    /// upstream.
+    /// config: a live TUN would strand every in-tunnel UDP/53 flow at the
+    /// LocalDnsEndpoint with no upstream to forward to.
     #[skuld::test]
     fn build_local_dns_returns_err_for_empty_servers() {
         tokio::runtime::Builder::new_current_thread()
@@ -1416,7 +1414,7 @@ mod self_test {
     }
 
     /// `dns.enabled = false` → `build_local_dns` returns
-    /// `(None, None, None)` → gate is skipped entirely in `start_inner`.
+    /// `(None, None)` → gate is skipped entirely in `start_inner`.
     #[skuld::test]
     fn build_local_dns_returns_none_when_disabled() {
         tokio::runtime::Builder::new_current_thread()
@@ -1431,13 +1429,37 @@ mod self_test {
                     intercept_udp53: true,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
-                let (srv, ep, fwd) = match res {
+                let (ep, fwd) = match res {
                     Ok(t) => t,
-                    Err(e) => panic!("expected Ok((None, None, None)) for disabled DNS, got {e:?}"),
+                    Err(e) => panic!("expected Ok((None, None)) for disabled DNS, got {e:?}"),
                 };
-                assert!(srv.is_none());
                 assert!(ep.is_none());
                 assert!(fwd.is_none());
+            });
+    }
+
+    /// #248: the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
+    /// must be constructed whenever DNS is enabled with servers — even if
+    /// `intercept_udp53` is false. `build_local_dns` returns a 2-tuple
+    /// `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
+    #[skuld::test]
+    fn build_local_dns_builds_endpoint_when_enabled() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cfg = DnsConfig {
+                    enabled: true,
+                    servers: vec!["1.1.1.1".parse().unwrap()],
+                    protocol: DnsProtocol::PlainTcp,
+                    intercept_udp53: false, // legacy flag — endpoint built anyway
+                };
+                let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
+                    .await
+                    .expect("build_local_dns ok when enabled");
+                assert!(ep.is_some(), "endpoint must exist (sole DNS path)");
+                assert!(fwd.is_some(), "forwarder must exist for the self-test gate");
             });
     }
 
@@ -1450,15 +1472,6 @@ mod self_test {
     /// on `127.0.0.1:1080`, so the forwarder's `Socks5Connector` connection
     /// fails with ECONNREFUSED on every attempt (the 3×1500ms loop closes
     /// fast on each refused connect, well under the 5s outer budget).
-    /// `bind_ladder` succeeds because the test process can bind one of the
-    /// `127.53.0.X:53` loopback alternates.
-    ///
-    /// **Windows-only**: macOS / Linux require root to bind port 53, so
-    /// `bind_ladder` returns Err on every candidate → `build_local_dns`
-    /// returns `ProxyError::Runtime(io::Error)`, not the
-    /// `ForwarderSelfTestFailed` variant under test. The gate IS still
-    /// exercised on those platforms via the DistHarness e2e tests
-    /// (bridge runs elevated).
     #[skuld::test]
     #[cfg(target_os = "windows")]
     fn start_blocks_on_forwarder_self_test_failure() {
