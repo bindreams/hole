@@ -1438,7 +1438,7 @@ mod self_test {
             });
     }
 
-    /// #248: the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
+    /// the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
     /// must be constructed whenever DNS is enabled with servers — even if
     /// `intercept_udp53` is false. `build_local_dns` returns a 2-tuple
     /// `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.

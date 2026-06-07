@@ -330,7 +330,7 @@ async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
     );
 }
 
-/// #248: `Dns::apply` advertises the configured upstream resolver IPs
+/// `Dns::apply` advertises the configured upstream resolver IPs
 /// (NOT 127.0.0.1) to every apply alias, so OS UDP/53 routes into hole-tun
 /// and is intercepted by the in-TUN LocalDnsEndpoint.
 #[skuld::test]
@@ -360,13 +360,13 @@ async fn apply_advertises_resolver_ips_not_loopback() {
         assert_eq!(ips, &resolvers, "must advertise resolver IPs, got {ips:?}");
         assert!(
             !ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            "must NOT advertise 127.0.0.1 (the #248 bug)"
+            "must NOT advertise 127.0.0.1"
         );
     }
     applied.shutdown().await;
 }
 
-/// #248: `Dns::apply` forwards the full configured resolver list — both v4
+/// `Dns::apply` forwards the full configured resolver list — both v4
 /// and v6 — to `set_servers` on every apply alias. `set_servers` splits the
 /// list per family internally (v4 entries to the v4 family, v6 to v6),
 /// leaving an unconfigured family untouched. This pins that v6 resolvers are

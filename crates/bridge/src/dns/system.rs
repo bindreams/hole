@@ -4,7 +4,7 @@
 //! IPs while a proxy is running, then restores the prior per-adapter / per-
 //! address-family DNS configuration on clean shutdown or crash recovery.
 //! OS DNS to those resolver IPs routes into `hole-tun` and is intercepted by
-//! the in-TUN `LocalDnsEndpoint` (there is no loopback `:53` server — #248).
+//! the in-TUN `LocalDnsEndpoint` (there is no loopback `:53` server).
 //!
 //! ## Per-adapter, per-family, three prior kinds
 //!

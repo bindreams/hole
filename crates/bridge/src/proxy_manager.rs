@@ -644,7 +644,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // We advertise the configured upstream resolver IPs — OS UDP/53 to
         // them routes into hole-tun and is intercepted by the in-TUN
         // LocalDnsEndpoint; OS TCP/53 falls through the proxy cascade to the
-        // real resolver over the tunnel. (No loopback :53 server — see #248.)
+        // real resolver over the tunnel. (No loopback :53 server.)
         // Pass the FULL list, not a v4 filter: `set_servers` advertises both
         // the v4 and v6 families from their own entries (an unconfigured
         // family is left untouched), so a mixed or v6 resolver list is carried
@@ -938,7 +938,7 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    // The in-TUN endpoint is the sole OS DNS path (#248): OS DNS now routes
+    // The in-TUN endpoint is the sole OS DNS path: OS DNS now routes
     // into hole-tun and is intercepted here, not via a loopback :53 server.
     // It is built whenever DNS is enabled, independent of `intercept_udp53`
     // (legacy flag — the in-TUN forwarder is now the mechanism).

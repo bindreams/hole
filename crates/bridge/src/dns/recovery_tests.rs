@@ -87,9 +87,9 @@ fn recover_tolerates_legacy_state_file_with_tun_entry() {
     );
 }
 
-/// #248 crash+upgrade recovery: a `bridge-dns.json` left by a pre-#248
-/// crashed run uses the OLD shape (`version: 1`, scalar `chosen_loopback`,
-/// no `advertised`). The post-#248 binary MUST still load it and restore
+/// crash+upgrade recovery: a `bridge-dns.json` left by a crashed older
+/// binary uses the OLD shape (`version: 1`, scalar `chosen_loopback`,
+/// no `advertised`). The new binary MUST still load it and restore
 /// the user's OS DNS from `adapters` — otherwise the user is stranded with
 /// OS DNS stuck at a dead `127.0.0.1`. This pins that `DnsState` stays
 /// version 1 + tolerant (no `deny_unknown_fields`, `advertised` defaults),
@@ -109,7 +109,7 @@ fn recover_v1_state_file_restores_adapters_after_upgrade() {
     #[cfg(target_os = "macos")]
     let id = serde_json::json!({ "kind": "macos_service_name", "value": "hole-recover-test-xyz" });
 
-    // OLD v1 on-disk shape — exactly what a pre-#248 binary wrote.
+    // OLD v1 on-disk shape — what an older binary wrote.
     let v1_json = serde_json::json!({
         "version": 1,
         "chosen_loopback": "127.0.0.1:53",

@@ -30,11 +30,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// NOTE: NO `deny_unknown_fields` — a v1 file from a pre-#248 crashed run
+// NOTE: NO `deny_unknown_fields` — a v1 file from an older crashed run
 // carries the obsolete `chosen_loopback` key. Tolerating it (ignore the
 // unknown key, default `advertised` to empty) keeps crash+upgrade recovery
 // working: `load` still returns the state and recovery restores from
-// `adapters`. See bindreams/hole#248.
+// `adapters`.
 pub struct DnsState {
     pub version: u32,
     /// The upstream resolver IPs advertised to the OS adapters this run.

@@ -110,7 +110,7 @@ fn load_wrong_version_returns_none() {
 fn load_tolerates_unknown_top_level_field() {
     // DnsState dropped `deny_unknown_fields` so a v1 file's obsolete
     // `chosen_loopback` key (and any future stray top-level key) is
-    // ignored rather than failing recovery. See bindreams/hole#248.
+    // ignored rather than failing recovery.
     let dir = tempfile::tempdir().unwrap();
     let json = serde_json::json!({
         "version": SCHEMA_VERSION,
