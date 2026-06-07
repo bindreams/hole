@@ -79,11 +79,12 @@ pub trait Dns: Send + Sync + 'static {
     /// `advertise_ips` (the configured upstream resolver IPs) on each
     /// adapter in `apply_aliases`.
     ///
-    /// `advertise_ips` is filtered to IPv4 on Windows (the v4 family is the
-    /// only one apply touches); macOS accepts a mixed list. OS UDP/53 to
-    /// these IPs routes into `hole-tun` and is intercepted by the in-TUN
-    /// `LocalDnsEndpoint`; OS TCP/53 falls through the proxy cascade to the
-    /// real resolver over the tunnel.
+    /// On Windows, `set_servers` splits `advertise_ips` per address family
+    /// and sets the v4 and v6 families separately; a family with no entries
+    /// is left untouched, never cleared. macOS sets the mixed list in one
+    /// call. OS UDP/53 to these IPs routes into `hole-tun` and is intercepted
+    /// by the in-TUN `LocalDnsEndpoint`; OS TCP/53 falls through the proxy
+    /// cascade to the real resolver over the tunnel.
     ///
     /// **Cancellation.** The implementation MUST check `cancel.cancelled()`
     /// between per-adapter I/O operations and inline-restore any
