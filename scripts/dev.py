@@ -50,7 +50,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # `grp` is POSIX-only. dev.py is also invoked on Windows from an elevated
 # PowerShell, where `_lib.sudo_target_user()` returns None and `drop_kwargs`
@@ -344,7 +344,68 @@ def shutdown(
             t.join(timeout=5)
 
 
-# Privilege drop =======================================================================================================
+# Privilege model ======================================================================================================
+
+# Env vars worth preserving across the sudo boundary into the elevated bridge:
+# log filtering + backtraces. sudo scrubs the environment otherwise, silently
+# changing dev logging behavior. RUST_LOG/RUST_BACKTRACE/HOLE_BRIDGE_LOG are
+# not on sudo's default env blacklist, so `--preserve-env=<list>` passes them.
+SUDO_PRESERVE_ENV = ["RUST_LOG", "RUST_BACKTRACE", "HOLE_BRIDGE_LOG"]
+
+
+def elevation_action(system: str, euid: int | None) -> Literal["windows-require-admin", "posix-error-root", "posix-ok"]:
+    """How dev mode handles privilege on this host.
+
+    "windows-require-admin": Windows — require an already-elevated shell (UAC
+    token-based; nothing is dropped). "posix-error-root": POSIX as root —
+    refuse; dev mode runs unprivileged and elevates only the bridge, and
+    running as root re-poisons target/ (bindreams/hole#452). "posix-ok":
+    POSIX as a normal user — the supported path. `euid` is unused on Windows.
+    """
+    if system == "Windows":
+        return "windows-require-admin"
+    if euid == 0:
+        return "posix-error-root"
+    return "posix-ok"
+
+
+def sudo_prefix(system: str) -> list[str]:
+    """`["sudo"]` on POSIX, `[]` on Windows (already elevated; no sudo)."""
+    return [] if system == "Windows" else ["sudo"]
+
+
+def _elevated(elevate: list[str]) -> list[str]:
+    """sudo prefix with env preservation, or [] when not elevating."""
+    return [*elevate, f"--preserve-env={','.join(SUDO_PRESERVE_ENV)}"] if elevate else []
+
+
+def grant_access_argv(elevate: list[str], bridge_bin: str | os.PathLike[str]) -> list[str]:
+    """argv for `bridge grant-access`, sudo-prefixed on POSIX."""
+    return [*_elevated(elevate), str(bridge_bin), "bridge", "grant-access"]
+
+
+def bridge_argv(
+    elevate: list[str], bridge_bin: str | os.PathLike[str], socket_path: str | os.PathLike[str],
+    state_dir: str | os.PathLike[str]
+) -> list[str]:
+    """argv for `bridge run`, sudo-prefixed on POSIX."""
+    return [
+        *_elevated(elevate),
+        str(bridge_bin), "bridge", "run", "--socket-path",
+        str(socket_path), "--state-dir",
+        str(state_dir)
+    ]
+
+
+def missing_hole_group(hole_gid: int | None, current_gids: set[int]) -> bool:
+    """True if `hole` exists but the current process is not a member.
+
+    Pass `set(os.getgroups()) | {os.getgid(), os.getegid()}` as `current_gids`
+    — `os.getgroups()` omits the primary/effective gid on some systems, which
+    would falsely report a user whose primary group is `hole` as missing.
+    `hole_gid is None` means the group does not exist yet (nothing to check).
+    """
+    return hole_gid is not None and hole_gid not in current_gids
 
 
 def drop_kwargs(target: tuple[int, int, str, str] | None) -> dict:
