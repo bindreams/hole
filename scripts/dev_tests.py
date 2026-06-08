@@ -8,6 +8,7 @@
 Covers:
 - privilege-model helpers (elevation policy + sudo argv builders)
 - `prefix_stream` log multiplexing (platform-agnostic)
+- `shutdown()` teardown (bridge not killed on timeout / graceful exit)
 
 Run with: `uv run scripts/dev_tests.py`
 """

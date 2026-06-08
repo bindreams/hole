@@ -322,6 +322,19 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
+  # Unit tests for the dev/admin Python scripts (scripts/dev_tests.py). Runs
+  # `uv run` DIRECTLY (not via `cargo xtask run scripts-tests`) to avoid
+  # provisioning a Rust toolchain + compiling xtask just to shell out to
+  # Python. The tests are platform-agnostic, so one ubuntu runner suffices.
+  test-scripts:
+    name: Test scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+      - name: Run script tests
+        run: uv run scripts/dev_tests.py
 
   test-installer:
     name: Test installer (windows/amd64)
