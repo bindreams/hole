@@ -8,7 +8,7 @@ Builds the workspace, then runs three processes:
 
 USAGE:
   Windows: from an elevated PowerShell — `cargo xtask run hole`
-  macOS / Linux: `cargo xtask run hole`  (NO sudo)
+  macOS: `cargo xtask run hole`  (NO sudo)
 
 On POSIX dev.py runs as your user and elevates only the bridge
 (`bridge grant-access` + `bridge run`) via sudo, so target/ stays owned by
@@ -16,9 +16,8 @@ you. Do NOT run it under sudo — it refuses, and a sudo'd `cargo xtask run
 hole` leaves root-owned files in target/ — its outer build cascade runs as
 root before dev.py can refuse (bindreams/hole#452). Closing that
 sudo-invocation path structurally is tracked in #453. The dev GUI needs the
-`hole` group for the IPC
-socket; the first run after grant-access creates the group, so a one-time
-log-out/in may be required. On Windows, UAC is token-based so all three
+`hole` group for the IPC socket; the first run after grant-access creates the
+group, so a one-time log-out/in may be required. On Windows, UAC is token-based so all three
 inherit the elevated token without an identity change.
 
 The bridge binary and its sidecars (ex-ray, galoshes) are staged in a
