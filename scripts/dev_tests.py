@@ -33,10 +33,9 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 # than `SimpleNamespace` so `sys.modules["_lib"]` matches its declared type.
 _lib_stub = types.ModuleType("_lib")
 # `setattr` bypasses ty's static attribute check (ModuleType has no
-# declared `require_elevation` / `sudo_target_user`); the attrs are
-# created dynamically and read from `dev.py` at module-load time.
+# declared `require_elevation`); the attr is created dynamically and read
+# from `dev.py` at module-load time.
 setattr(_lib_stub, "require_elevation", lambda: None)
-setattr(_lib_stub, "sudo_target_user", lambda: None)
 sys.modules.setdefault("_lib", _lib_stub)
 
 _spec = importlib.util.spec_from_file_location("dev", str(_SCRIPTS_DIR / "dev.py"))
@@ -108,6 +107,55 @@ def test_bridge_argv_posix_prefixes_sudo_and_passes_paths():
 def test_bridge_argv_windows_no_sudo():
     argv = dev.bridge_argv([], "C:/hole/hole.exe", "P", "S")
     assert argv == ["C:/hole/hole.exe", "bridge", "run", "--socket-path", "P", "--state-dir", "S"]
+
+
+def test_shutdown_does_not_kill_bridge_on_timeout(capsys):
+    import subprocess as _sp
+    killed = []
+
+    class _FakeProc:
+
+        def __init__(self, name):
+            self.name = name
+            self.pid = 4321
+
+        def wait(self, timeout: float | None = None):
+            raise _sp.TimeoutExpired(cmd=self.name, timeout=timeout or 0)
+
+        def kill(self):
+            killed.append(self.name)
+
+    bridge = _FakeProc("bridge")
+    vite = _FakeProc("vite")
+    with mock.patch.object(dev, "terminate_tree"):
+        dev.shutdown([vite, bridge], bridge_proc=bridge)
+    # Non-bridge procs are force-killed; the root bridge is NOT (SIGKILL to the
+    # sudo wrapper wouldn't reach it), and the user is told how to recover.
+    assert killed == ["vite"]
+    assert "network-reset.py" in capsys.readouterr().err
+
+
+def test_shutdown_graceful_exit_kills_nothing(capsys):
+    killed = []
+
+    class _FakeProc:
+
+        def __init__(self, name):
+            self.name = name
+            self.pid = 4321
+
+        def wait(self, timeout: float | None = None):
+            return 0
+
+        def kill(self):
+            killed.append(self.name)
+
+    bridge = _FakeProc("bridge")
+    vite = _FakeProc("vite")
+    with mock.patch.object(dev, "terminate_tree"):
+        dev.shutdown([vite, bridge], bridge_proc=bridge)
+    assert killed == []
+    assert "network-reset.py" not in capsys.readouterr().err
 
 
 # prefix_stream tests (platform-agnostic) ==============================================================================
