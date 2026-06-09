@@ -32,6 +32,12 @@ pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), B
 /// (not lazily on first poll), so a caller that raises SIGTERM immediately
 /// after still observes it. Must be called within a Tokio runtime — it is,
 /// from `run_inner` and the test's `block_on`.
+// On non-unix the `#[cfg(unix)] let sigterm = …` line below is cfg'd out,
+// leaving a bare `async move` body, so clippy's `manual_async_fn` suggests
+// `async fn`. But on unix the function MUST stay `fn -> impl Future` so the
+// SIGTERM handler installs eagerly (before the future is first polled). Keep
+// one shape across platforms and silence the lint only where it misfires.
+#[cfg_attr(not(unix), allow(clippy::manual_async_fn))]
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
