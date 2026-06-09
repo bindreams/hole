@@ -22,7 +22,7 @@ mod posix;
 pub(crate) mod win_quote;
 #[cfg(windows)]
 #[path = "privilege/windows.rs"]
-mod windows;
+pub(crate) mod windows;
 
 /// The privilege a step is *declared* to run at — independent of the ambient.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
