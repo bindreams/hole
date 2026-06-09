@@ -13,6 +13,18 @@
 # `process: [...]` for direct subprocess spawn (no shell). Per-step
 # `environment:` appends to inherited env. CWD is repo root.
 #
+# `elevated:` selects the privilege a step runs at. Two forms: per-step
+# (`bash: ...` + `elevated: true`) or a block default `{ elevated: true, steps:
+# [...] }` that every step inherits (a per-step `elevated:` still wins). Legal on
+# `run:` only — `elevated:` on a `build:` step (per-step or block default) is a
+# parse error: builds must never write `target/` or `~/.cargo` as root. At
+# execution each step is normalized to its declared privilege: an unelevated
+# invocation self-elevates `elevated: true` steps (passwordless `sudo` on POSIX;
+# the inherited elevated token on Windows), and an elevated invocation drops
+# `elevated: false` steps back to the invoking user — so `sudo cargo xtask run X`
+# leaves no root-owned build output. Semantics and the cross-platform mechanism
+# live in xtask/src/privilege.rs; user-facing summary in CONTRIBUTING.md.
+#
 # Two phases per target:
 #   build:  produce the artifact this target is named after. May depend on
 #           other targets' builds (`depends:` chains them).
@@ -243,6 +255,30 @@ targets:
     build: cargo nextest run --no-run -p mock-plugin
     run: cargo nextest run -p mock-plugin
 
+  xtask-tests:
+    # Orchestrator tests incl. the privilege EFFECT tests (labels root / windows_elevated).
+    # Build (unprivileged) ARCHIVES the test binaries; run (elevated) executes the archive —
+    # no recompile-as-root, no ~/.cargo writes. POSIX self-elevates via passwordless sudo;
+    # Windows runs as-is (runner already elevated) and de-elevates elevated:false steps.
+    # pre-create target/debug (skuld writes its coordination DB at
+    # <ws>/target/debug/.skuld.db, mirroring ci.yaml test-garter's mkdir) and
+    # target/nextest (nextest does not create the --archive-file parent dir). NO
+    # --workspace-remap: build and run happen on the SAME machine at the SAME
+    # path (repo root — run_step sets CWD to repo_root, and sudo_wrap preserves
+    # it), so the archive's recorded workspace path resolves as-is. (The CI
+    # archive jobs remap only because they download the artifact onto a fresh
+    # checkout; here there is no relocation, and a Git-Bash `$PWD` would be a
+    # `/c/...` path nextest rejects on Windows.)
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build:
+      - mkdir -p target/debug target/nextest
+      - cargo nextest archive --package xtask --archive-file target/nextest/xtask-tests.tar.zst
+    run:
+      elevated: true
+      steps:
+        - cargo nextest run --archive-file target/nextest/xtask-tests.tar.zst
+
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a
   # first-class runnable invoked via `cargo xtask run <name>`, replacing the
@@ -291,3 +327,18 @@ targets:
       - npm ci --no-audit --no-fund
       - npm run check
       - npm test
+
+  # ===== Admin / maintenance targets =======================================
+  # Privileged maintenance runnables. Their `run:` block carries `elevated:
+  # true`, so `cargo xtask run <name>` self-elevates (see the `elevated:` note
+  # in the header).
+
+  network-reset:
+    # Tears down stray hole network state (TUN adapter, routes, DNS) left by a
+    # crashed bridge. Explicit platforms — windows is amd64-only repo-wide;
+    # network-reset.py is arch-agnostic.
+    platforms: [windows/amd64, darwin/amd64, darwin/arm64]
+    run:
+      elevated: true
+      steps:
+        - uv run scripts/network-reset.py

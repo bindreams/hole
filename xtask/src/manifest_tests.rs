@@ -949,3 +949,39 @@ fn block_form_run_equals_list_form_when_unelevated() {
     let list = parse("targets:\n  foo:\n    platforms: windows/amd64\n    run:\n      - \"echo hi\"\n").unwrap();
     assert_eq!(block.get("foo").unwrap().run, list.get("foo").unwrap().run);
 }
+
+#[skuld::test]
+fn network_reset_target_is_elevated() {
+    let m = Manifest::parse(include_str!("../../build.yaml")).unwrap();
+    let t = m.get("network-reset").expect("network-reset missing");
+    assert_eq!(t.run.len(), 1);
+    assert!(t.run[0].is_elevated());
+    assert!(t.build.is_empty());
+}
+#[skuld::test]
+fn hole_run_and_build_stay_unprivileged() {
+    // #452 (PR #455) merged: dev.py runs UNPRIVILEGED and self-sudoes only the
+    // bridge. So `hole` stays fully unprivileged — #453's contribution to the
+    // sudo-invocation path is the build-step DROP normalization (a `sudo cargo
+    // xtask run hole` drops every step back to the invoking user), NOT elevating
+    // the run step. Pin that we do NOT re-elevate hole (dev.py refuses to run as
+    // root; elevating it would be a regression).
+    let m = Manifest::parse(include_str!("../../build.yaml")).unwrap();
+    let h = m.get("hole").unwrap();
+    assert!(
+        h.run.iter().all(|s| !s.is_elevated()),
+        "hole run (dev.py) must stay unprivileged post-#452"
+    );
+    assert!(
+        h.build.iter().all(|s| !s.is_elevated()),
+        "hole build must stay unprivileged"
+    );
+}
+#[skuld::test]
+fn xtask_tests_target_runs_elevated_via_archive() {
+    let m = Manifest::parse(include_str!("../../build.yaml")).unwrap();
+    let t = m.get("xtask-tests").unwrap();
+    assert!(t.run.iter().all(Step::is_elevated));
+    assert!(t.build.iter().all(|s| !s.is_elevated()));
+    assert!(t.has_run());
+}
