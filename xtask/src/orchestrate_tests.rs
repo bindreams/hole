@@ -292,6 +292,7 @@ fn run_step_bash_succeeds_on_zero_exit() {
     let step = Step::Bash {
         command: "true".to_string(),
         environment: Default::default(),
+        elevated: false,
     };
     run_step(&step, dir.path()).unwrap();
 }
@@ -302,6 +303,7 @@ fn run_step_bash_fails_on_nonzero_exit() {
     let step = Step::Bash {
         command: "exit 7".to_string(),
         environment: Default::default(),
+        elevated: false,
     };
     let err = run_step(&step, dir.path()).unwrap_err();
     let msg = format!("{err:#}");
@@ -318,6 +320,7 @@ fn run_step_bash_environment_overrides_inherited() {
     let step = Step::Bash {
         command: r#"[ "$HOLE_TEST_VAR" = "set-from-step" ]"#.to_string(),
         environment: env,
+        elevated: false,
     };
     run_step(&step, dir.path()).unwrap();
 }
@@ -331,6 +334,7 @@ fn run_step_process_fails_on_nonzero_exit() {
     let step = Step::Process {
         args: vec!["cargo".to_string(), "this-subcommand-does-not-exist".to_string()],
         environment: Default::default(),
+        elevated: false,
     };
     let err = run_step(&step, dir.path()).unwrap_err();
     let msg = format!("{err:#}");
@@ -343,6 +347,7 @@ fn run_step_process_empty_args_errors() {
     let step = Step::Process {
         args: vec![],
         environment: Default::default(),
+        elevated: false,
     };
     let err = run_step(&step, dir.path()).unwrap_err();
     let msg = format!("{err:#}");

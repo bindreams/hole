@@ -28,6 +28,7 @@ targets:
         vec![Step::Bash {
             command: "echo hi".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }]
     );
 }
@@ -117,6 +118,7 @@ targets:
         vec![Step::Bash {
             command: "echo hi".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }]
     );
 }
@@ -151,6 +153,7 @@ targets:
         Step::Bash {
             command: "echo a".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }
     );
     assert_eq!(
@@ -158,6 +161,7 @@ targets:
         Step::Bash {
             command: "echo b".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }
     );
     let mut env_kv = HashMap::new();
@@ -167,6 +171,7 @@ targets:
         Step::Bash {
             command: "echo c".to_string(),
             environment: env_kv,
+            elevated: false,
         }
     );
 
@@ -176,6 +181,7 @@ targets:
         Step::Process {
             args: vec!["cargo".to_string(), "build".to_string()],
             environment: HashMap::new(),
+            elevated: false,
         }
     );
     let mut env_goos = HashMap::new();
@@ -185,6 +191,7 @@ targets:
         Step::Process {
             args: vec!["go".to_string(), "build".to_string()],
             environment: env_goos,
+            elevated: false,
         }
     );
 }
@@ -404,6 +411,7 @@ targets:
         Step::Bash {
             command: "echo a".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }
     );
     let mut env_kv = HashMap::new();
@@ -413,6 +421,7 @@ targets:
         Step::Bash {
             command: "echo c".to_string(),
             environment: env_kv,
+            elevated: false,
         }
     );
     let mut env_goos = HashMap::new();
@@ -422,6 +431,7 @@ targets:
         Step::Process {
             args: vec!["go".to_string(), "build".to_string()],
             environment: env_goos,
+            elevated: false,
         }
     );
 }
@@ -630,6 +640,7 @@ fn clippy_hole_target_shape() {
         vec![Step::Bash {
             command: "cargo clippy --workspace --all-targets --no-default-features -- -D warnings".to_string(),
             environment: HashMap::new(),
+            elevated: false,
         }]
     );
     assert_eq!(t.depends, Vec::<String>::new());
@@ -654,6 +665,7 @@ fn prek_target_shape() {
         vec![Step::Bash {
             command: "prek run --all-files --show-diff-on-failure".to_string(),
             environment: env,
+            elevated: false,
         }]
     );
 }
@@ -672,14 +684,17 @@ fn frontend_check_target_shape() {
             Step::Bash {
                 command: "npm ci --no-audit --no-fund".to_string(),
                 environment: HashMap::new(),
+                elevated: false,
             },
             Step::Bash {
                 command: "npm run check".to_string(),
                 environment: HashMap::new(),
+                elevated: false,
             },
             Step::Bash {
                 command: "npm test".to_string(),
                 environment: HashMap::new(),
+                elevated: false,
             },
         ]
     );
@@ -712,10 +727,12 @@ fn frontend_build_target_shape() {
             Step::Bash {
                 command: "npm ci --no-audit --no-fund".to_string(),
                 environment: HashMap::new(),
+                elevated: false,
             },
             Step::Bash {
                 command: "npm run build".to_string(),
                 environment: HashMap::new(),
+                elevated: false,
             },
         ],
     );
@@ -806,4 +823,129 @@ fn tests_targets_run_matches_build_minus_no_run() {
         assert!(build_cmd.contains("--no-run"), "{name:?} build must contain --no-run");
         assert!(!run_cmd.contains("--no-run"), "{name:?} run must not contain --no-run");
     }
+}
+
+#[skuld::test]
+fn step_elevated_defaults_false() {
+    let m = parse("targets:\n  foo:\n    platforms: windows/amd64\n    run: echo hi\n").unwrap();
+    assert!(matches!(
+        m.get("foo").unwrap().run[0],
+        Step::Bash { elevated: false, .. }
+    ));
+}
+
+#[skuld::test]
+fn per_step_elevated_override() {
+    let m = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    run:
+      - "plain"
+      - bash: "rooty"
+        elevated: true
+"#,
+    )
+    .unwrap();
+    let r = &m.get("foo").unwrap().run;
+    assert!(matches!(r[0], Step::Bash { elevated: false, .. }));
+    assert!(matches!(r[1], Step::Bash { elevated: true, .. }));
+}
+
+#[skuld::test]
+fn block_default_elevated_applies_to_all_steps() {
+    let m = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    run:
+      elevated: true
+      steps:
+        - "a"
+        - process: ["b"]
+"#,
+    )
+    .unwrap();
+    let r = &m.get("foo").unwrap().run;
+    assert!(matches!(r[0], Step::Bash { elevated: true, .. }));
+    assert!(matches!(r[1], Step::Process { elevated: true, .. }));
+}
+
+#[skuld::test]
+fn per_step_override_beats_block_default() {
+    let m = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    run:
+      elevated: true
+      steps:
+        - bash: "still-root"
+        - bash: "explicitly-not"
+          elevated: false
+"#,
+    )
+    .unwrap();
+    let r = &m.get("foo").unwrap().run;
+    assert!(matches!(r[0], Step::Bash { elevated: true, .. }));
+    assert!(matches!(r[1], Step::Bash { elevated: false, .. }));
+}
+
+#[skuld::test]
+fn elevated_true_on_build_step_is_rejected() {
+    let err = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    build:
+      - bash: "compile"
+        elevated: true
+"#,
+    )
+    .unwrap_err();
+    let m = format!("{err:#}");
+    assert!(
+        m.contains("foo") && m.contains("build") && m.contains("elevated"),
+        "got: {m}"
+    );
+}
+
+#[skuld::test]
+fn elevated_true_build_block_default_is_rejected() {
+    let err = parse("targets:\n  foo:\n    platforms: windows/amd64\n    build:\n      elevated: true\n      steps:\n        - \"compile\"\n").unwrap_err();
+    assert!(format!("{err:#}").contains("elevated"));
+}
+
+#[skuld::test]
+fn elevated_true_per_step_override_in_build_block_is_rejected() {
+    // Block default false, but a per-step override flips it true → the guard
+    // (which checks resolved `is_elevated()`) must still reject it. Pins the
+    // resolution-order → guard interaction against a future refactor.
+    let err = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    build:
+      elevated: false
+      steps:
+        - bash: "compile"
+          elevated: true
+"#,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("elevated"));
+}
+
+#[skuld::test]
+fn block_form_run_equals_list_form_when_unelevated() {
+    let block =
+        parse("targets:\n  foo:\n    platforms: windows/amd64\n    run:\n      steps:\n        - \"echo hi\"\n")
+            .unwrap();
+    let list = parse("targets:\n  foo:\n    platforms: windows/amd64\n    run:\n      - \"echo hi\"\n").unwrap();
+    assert_eq!(block.get("foo").unwrap().run, list.get("foo").unwrap().run);
 }

@@ -13,6 +13,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use indexmap::IndexMap;
+use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
@@ -172,10 +173,12 @@ pub enum Step {
     Bash {
         command: String,
         environment: HashMap<String, String>,
+        elevated: bool,
     },
     Process {
         args: Vec<String>,
         environment: HashMap<String, String>,
+        elevated: bool,
     },
 }
 
@@ -185,24 +188,6 @@ pub enum Step {
 //   - bare string         ↔ { bash: <string> }
 //   - { bash: <string> }  ↔ { bash: { command: <string> } }
 // Symmetric collapse for `process:` (bare list ↔ { process: { args: [...] } }).
-
-// `deny_unknown_fields` only applies to struct-shaped variants and structs;
-// it's a no-op on untagged enums themselves.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StepRaw {
-    Bare(String),
-    Tagged(TaggedStepRaw),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-enum TaggedStepRaw {
-    #[serde(rename = "bash")]
-    Bash(BashRaw),
-    #[serde(rename = "process")]
-    Process(ProcessRaw),
-}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -226,34 +211,100 @@ enum ProcessRaw {
     },
 }
 
-impl From<StepRaw> for Step {
-    fn from(raw: StepRaw) -> Self {
-        match raw {
-            StepRaw::Bare(command) => Step::Bash {
-                command,
-                environment: HashMap::new(),
-            },
-            StepRaw::Tagged(TaggedStepRaw::Bash(BashRaw::Short(command))) => Step::Bash {
-                command,
-                environment: HashMap::new(),
-            },
-            StepRaw::Tagged(TaggedStepRaw::Bash(BashRaw::Full { command, environment })) => {
-                Step::Bash { command, environment }
+// A raw step is a `bash:` or `process:` kind, optionally carrying an `elevated:`
+// sibling key. Hand-rolled `Deserialize` (rather than untagged enum) so the
+// `elevated:` flag can ride alongside `bash:`/`process:` in the same mapping and
+// produce clear "both keys"/"unknown field" errors.
+struct StepRaw {
+    kind: StepKindRaw,
+    elevated: Option<bool>,
+}
+enum StepKindRaw {
+    Bash(BashRaw),
+    Process(ProcessRaw),
+}
+
+impl<'de> Deserialize<'de> for StepRaw {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = StepRaw;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a bash string, or a `{ bash|process: ..., elevated?: <bool> }` mapping")
             }
-            StepRaw::Tagged(TaggedStepRaw::Process(ProcessRaw::Args(args))) => Step::Process {
-                args,
-                environment: HashMap::new(),
-            },
-            StepRaw::Tagged(TaggedStepRaw::Process(ProcessRaw::Full { args, environment })) => {
-                Step::Process { args, environment }
+            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Self::Value, E> {
+                Ok(StepRaw {
+                    kind: StepKindRaw::Bash(BashRaw::Short(s.to_owned())),
+                    elevated: None,
+                })
+            }
+            fn visit_string<E: de::Error>(self, s: String) -> std::result::Result<Self::Value, E> {
+                self.visit_str(&s)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut kind: Option<StepKindRaw> = None;
+                let mut elevated: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "bash" => {
+                            if kind.is_some() {
+                                return Err(de::Error::custom("step has both `bash:` and `process:`"));
+                            }
+                            kind = Some(StepKindRaw::Bash(map.next_value()?));
+                        }
+                        "process" => {
+                            if kind.is_some() {
+                                return Err(de::Error::custom("step has both `bash:` and `process:`"));
+                            }
+                            kind = Some(StepKindRaw::Process(map.next_value()?));
+                        }
+                        "elevated" => {
+                            if elevated.is_some() {
+                                return Err(de::Error::duplicate_field("elevated"));
+                            }
+                            elevated = Some(map.next_value()?);
+                        }
+                        other => return Err(de::Error::unknown_field(other, &["bash", "process", "elevated"])),
+                    }
+                }
+                let kind = kind.ok_or_else(|| de::Error::custom("step needs a `bash:` or `process:` key"))?;
+                Ok(StepRaw { kind, elevated })
             }
         }
+        d.deserialize_any(V)
     }
 }
 
-impl<'de> Deserialize<'de> for Step {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        StepRaw::deserialize(d).map(Step::from)
+impl Step {
+    fn from_raw(kind: StepKindRaw, elevated: bool) -> Self {
+        match kind {
+            StepKindRaw::Bash(BashRaw::Short(command)) => Step::Bash {
+                command,
+                environment: HashMap::new(),
+                elevated,
+            },
+            StepKindRaw::Bash(BashRaw::Full { command, environment }) => Step::Bash {
+                command,
+                environment,
+                elevated,
+            },
+            StepKindRaw::Process(ProcessRaw::Args(args)) => Step::Process {
+                args,
+                environment: HashMap::new(),
+                elevated,
+            },
+            StepKindRaw::Process(ProcessRaw::Full { args, environment }) => Step::Process {
+                args,
+                environment,
+                elevated,
+            },
+        }
+    }
+    /// Whether this step runs elevated after `elevated:` resolution.
+    pub fn is_elevated(&self) -> bool {
+        match self {
+            Step::Bash { elevated, .. } | Step::Process { elevated, .. } => *elevated,
+        }
     }
 }
 
@@ -317,19 +368,88 @@ impl DependsRaw {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
+// `build:`/`run:` accept a single step, a list of steps, or a
+// `{ elevated: <bool>, steps: [...] }` block carrying a per-block `elevated`
+// default. The block form shares its mapping shape with a tagged single step
+// (`{ bash: ... }`), so a clean untagged enum can't disambiguate; we hand-roll
+// a Visitor and branch on the presence of a `steps:` key.
 enum BuildRaw {
-    One(StepRaw),
-    Many(Vec<StepRaw>),
+    Steps {
+        block_elevated: Option<bool>,
+        steps: Vec<StepRaw>,
+    },
 }
 
 impl BuildRaw {
     fn into_steps(self) -> Vec<Step> {
-        match self {
-            BuildRaw::One(s) => vec![Step::from(s)],
-            BuildRaw::Many(v) => v.into_iter().map(Step::from).collect(),
+        let BuildRaw::Steps { block_elevated, steps } = self;
+        steps
+            .into_iter()
+            .map(|r| {
+                let elevated = r.elevated.or(block_elevated).unwrap_or(false);
+                Step::from_raw(r.kind, elevated)
+            })
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for BuildRaw {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = BuildRaw;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a step, a list of steps, or a `{ elevated: <bool>, steps: [...] }` block")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Self::Value, E> {
+                Ok(BuildRaw::Steps {
+                    block_elevated: None,
+                    steps: vec![StepRaw {
+                        kind: StepKindRaw::Bash(BashRaw::Short(s.to_owned())),
+                        elevated: None,
+                    }],
+                })
+            }
+            fn visit_string<E: de::Error>(self, s: String) -> std::result::Result<Self::Value, E> {
+                self.visit_str(&s)
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut steps = Vec::new();
+                while let Some(s) = seq.next_element::<StepRaw>()? {
+                    steps.push(s);
+                }
+                Ok(BuildRaw::Steps {
+                    block_elevated: None,
+                    steps,
+                })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> std::result::Result<Self::Value, A::Error> {
+                // Buffer the map so we can branch on a `steps:` key, then re-deserialize.
+                let value = serde_yml::Value::deserialize(MapAccessDeserializer::new(map))?;
+                let is_block = value.as_mapping().map(|m| m.contains_key("steps")).unwrap_or(false);
+                if is_block {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct BlockRaw {
+                        #[serde(default)]
+                        elevated: Option<bool>,
+                        steps: Vec<StepRaw>,
+                    }
+                    let b = BlockRaw::deserialize(value).map_err(de::Error::custom)?;
+                    Ok(BuildRaw::Steps {
+                        block_elevated: b.elevated,
+                        steps: b.steps,
+                    })
+                } else {
+                    let step = StepRaw::deserialize(value).map_err(de::Error::custom)?;
+                    Ok(BuildRaw::Steps {
+                        block_elevated: None,
+                        steps: vec![step],
+                    })
+                }
+            }
         }
+        d.deserialize_any(V)
     }
 }
 
@@ -455,6 +575,14 @@ impl Manifest {
             let platforms = t.platforms.into_vec().with_context(|| format!("in target {name:?}"))?;
             let build = t.build.map(BuildRaw::into_steps).unwrap_or_default();
             let run = t.run.map(BuildRaw::into_steps).unwrap_or_default();
+
+            if let Some(i) = build.iter().position(Step::is_elevated) {
+                return Err(anyhow!(
+                    "target {name:?}: build step #{} is `elevated: true`; build steps cannot be \
+                     elevated (build artifacts must stay unprivileged)",
+                    i + 1
+                ));
+            }
 
             // Reject platform duplicates inside one target — silent dedup would
             // hide a real authoring mistake.

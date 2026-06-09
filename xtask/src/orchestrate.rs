@@ -291,7 +291,9 @@ fn relocate_self_windows() -> Result<()> {
 /// (the build driver) propagates that via fail-fast.
 pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
     match step {
-        Step::Bash { command, environment } => {
+        Step::Bash {
+            command, environment, ..
+        } => {
             let mut cmd = Command::new(resolve_bash()?);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
@@ -301,7 +303,7 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
             }
             run(cmd, &format!("bash step: {command}"))
         }
-        Step::Process { args, environment } => {
+        Step::Process { args, environment, .. } => {
             let (program, rest) = args
                 .split_first()
                 .ok_or_else(|| anyhow!("process step has empty args list"))?;
