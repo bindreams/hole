@@ -131,3 +131,42 @@ fn drop_actually_changes_uid() {
     let got: u32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
     assert_eq!(got, uid, "child did not drop to the invoking user's uid");
 }
+
+// ===== Windows quoter ================================================================================================
+
+// The CommandLineToArgvW quoter must round-trip exactly: every arg we quote and
+// join must parse back to the identical argv. Verified against the real Win32
+// parser (runs on Windows only).
+#[cfg(windows)]
+#[skuld::test]
+fn quoter_roundtrips_through_commandlinetoargvw() {
+    use crate::privilege::win_quote::{cmdline_roundtrips, join_command_line};
+
+    let cases: Vec<Vec<String>> = vec![
+        vec![],
+        vec!["plain".into()],
+        vec!["a".into(), "b".into(), "c".into()],
+        vec!["has spaces".into()],
+        vec!["a\ttab".into()],
+        vec!["embedded\"quote".into()],
+        vec!["trailing\\".into()],
+        vec!["two\\\\".into()],
+        vec!["C:\\Program Files\\x\\".into()],
+        vec!["quote\\\"and\\back".into()],
+        vec![
+            "build".into(),
+            "--target".into(),
+            "C:\\Program Files\\hole\\".into(),
+            "with space".into(),
+        ],
+        vec!["".into(), "after-empty".into()],
+    ];
+
+    for argv in &cases {
+        let cmdline = join_command_line(argv);
+        assert!(
+            cmdline_roundtrips(&cmdline, argv),
+            "argv {argv:?} did not round-trip; produced cmdline {cmdline:?}"
+        );
+    }
+}

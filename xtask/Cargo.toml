@@ -60,6 +60,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
+    # ShellExecuteExW + SHELLEXECUTEINFOW (UAC self-elevation) are gated behind
+    # Win32_System_Registry (the struct carries an HKEY); SystemServices supplies
+    # SECURITY_MANDATORY_HIGH_RID for the de-elevated child's integrity check.
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

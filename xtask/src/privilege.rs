@@ -19,7 +19,7 @@ use anyhow::Result;
 mod posix;
 #[cfg(windows)]
 #[path = "privilege/win_quote.rs"]
-mod win_quote;
+pub(crate) mod win_quote;
 #[cfg(windows)]
 #[path = "privilege/windows.rs"]
 mod windows;
