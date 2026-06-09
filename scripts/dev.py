@@ -6,14 +6,19 @@ Builds the workspace, then runs three processes:
   2. Bridge in foreground mode (REAL TUN + routing) — elevated
   3. GUI (Tauri webview loading from Vite) — unelevated on macOS
 
-REQUIRES ELEVATION:
-  Windows: run from an elevated PowerShell (`uv run scripts/dev.py`)
-  macOS:   `sudo uv run scripts/dev.py`
+USAGE:
+  Windows: from an elevated PowerShell — `cargo xtask run hole`
+  macOS: `cargo xtask run hole`  (NO sudo)
 
-On macOS, this script detects `SUDO_USER` and drops privileges for Vite
-and the GUI so they read your real ~/Library config, while the bridge
-inherits root. On Windows, UAC is token-based so all three inherit the
-elevated token without an identity change.
+On POSIX dev.py runs as your user and elevates only the bridge
+(`bridge grant-access` + `bridge run`) via sudo, so target/ stays owned by
+you. Do NOT run it under sudo — it refuses, and a sudo'd `cargo xtask run
+hole` leaves root-owned files in target/ — its outer build cascade runs as
+root before dev.py can refuse (bindreams/hole#452). Closing that
+sudo-invocation path structurally is tracked in #453. The dev GUI needs the
+`hole` group for the IPC socket; the first run after grant-access creates the
+group, so a one-time log-out/in may be required. On Windows, UAC is token-based so all three
+inherit the elevated token without an identity change.
 
 The bridge binary and its sidecars (ex-ray, galoshes) are staged in a
 per-pid subdirectory under the system temp dir (`$TMPDIR/hole-dev-<pid>/` or
@@ -41,6 +46,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import platform
 import re
 import shutil
 import socket
@@ -50,12 +56,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-# `grp` is POSIX-only. dev.py is also invoked on Windows from an elevated
-# PowerShell, where `_lib.sudo_target_user()` returns None and `drop_kwargs`
-# short-circuits before touching `grp`. Gate the import so module load
-# succeeds on Windows.
+# `grp` is POSIX-only. dev.py is also invoked on Windows, where the hole-group
+# gate in main() is skipped (guarded by `system != "Windows"`). Gate the import
+# so module load succeeds on Windows.
 if sys.platform != "win32":
     import grp
 
@@ -91,9 +96,9 @@ def resolve_tool(name: str) -> str:
     return path
 
 
-def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None) -> None:
+def ensure_node_modules(npm: str) -> None:
     """Run `npm install` unconditionally to keep `node_modules/` in sync with
-    `package-lock.json`.
+    `package-lock.json`. Runs as the invoking user — dev.py is unprivileged.
 
     Unconditional install is deliberate: a conditional skip-on-exists would
     silently miss dependency additions pulled from a new commit and leave Vite
@@ -101,27 +106,25 @@ def ensure_node_modules(npm: str, target_user: tuple[int, int, str, str] | None)
     dominated by cargo below; `--no-audit --no-fund` trims the output to a
     single line so dev.py's startup stays quiet on the happy path."""
     print(f"{BOLD}Syncing npm dependencies...{RESET}")
-    # Run as the invoking user so `node_modules/` is not owned by root.
     result = subprocess.run(
         [npm, "install", "--no-audit", "--no-fund"],
         stdout=sys.stdout,
         stderr=sys.stderr,
-        env=drop_env({**os.environ}, target_user),
-        **drop_kwargs(target_user),
     )
     if result.returncode != 0:
         sys.exit(result.returncode)
 
 
-def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> None:
-    """Build the `hole` target via the orchestrator.
+def cargo_build(cargo: str) -> None:
+    """Build the `hole` target via the orchestrator, as the invoking user.
 
     `cargo xtask build hole` walks the build.yaml DAG: ex-ray → galoshes
     + wintun → cargo build (debug) → stage. The per-pid stage that follows in
     main() is dev.py-specific and stays separate.
 
-    Runs as the invoking user so `target/` and `.cache/` are not owned by root
-    on macOS-under-sudo.
+    The outer `cargo xtask run hole` cascade just ran this as this same user
+    (dev.py refuses to run as root upstream), so this is an incremental no-op
+    with consistent ownership — no root-owned artifacts.
     """
     print(f"{BOLD}Building hole (cargo xtask build hole)...{RESET}")
     result = subprocess.run(
@@ -131,8 +134,7 @@ def cargo_build(cargo: str, target_user: tuple[int, int, str, str] | None) -> No
         # HOLE_CRASH_DUMPS opts galoshes' xtask build into the dev-only
         # minidump feature (bindreams/hole#438), matching the hole target's
         # --features tombstone/crash-dumps. Never set in release/MSI builds.
-        env=drop_env({**os.environ, "HOLE_CRASH_DUMPS": "1"}, target_user),
-        **drop_kwargs(target_user),
+        env={**os.environ, "HOLE_CRASH_DUMPS": "1"},
     )
     if result.returncode != 0:
         sys.exit(result.returncode)
@@ -320,77 +322,100 @@ def terminate_tree(proc: subprocess.Popen) -> None:
 def shutdown(
     procs: list[subprocess.Popen],
     prefix_threads: list[threading.Thread] | None = None,
+    *,
+    bridge_proc: subprocess.Popen | None = None
 ) -> None:
     print(f"\n{BOLD}Shutting down...{RESET}")
+    # SIGTERM via killpg; sudo relays SIGTERM to the bridge, whose handler
+    # runs the graceful route/DNS teardown.
     for proc in procs:
         terminate_tree(proc)
     for proc in procs:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            # Tree-kill already used SIGKILL on Windows; on POSIX fall
-            # back to per-process SIGKILL for any stragglers.
-            proc.kill()
-
-    # Drain the prefix_stream readers so any entry buffered in-flight
-    # (the bridge's panic before exit, in particular) gets flushed to the
-    # console. Each thread's natural exit happens quickly after its
-    # subprocess's stdout closes; the 5 s budget is the graceful-failure
-    # bound for the external readline returning (CLAUDE.md "external event
-    # with graceful failure bound" — the exception class for sync against
-    # an out-of-process I/O event).
+            if proc is bridge_proc:
+                # The bridge runs as root behind sudo (pty/monitor mode on
+                # sudo >= 1.9.14 puts it in its own session), so an
+                # unprivileged parent cannot reliably force-kill it: SIGKILL
+                # to the sudo wrapper does not reach the bridge and sudo
+                # cannot relay SIGKILL. The graceful SIGTERM above is the
+                # supported stop; if it didn't take, point at the recovery tool.
+                print(
+                    f"{YELLOW}The bridge did not exit within 10s and may still be running "
+                    f"as root with routing changes in place.\nRun `sudo scripts/network-reset.py` "
+                    f"to restore connectivity.{RESET}",
+                    file=sys.stderr,
+                )
+            else:
+                proc.kill()
     if prefix_threads is not None:
         for t in prefix_threads:
             t.join(timeout=5)
 
 
-# Privilege drop =======================================================================================================
+# Privilege model ======================================================================================================
+
+# Env vars worth preserving across the sudo boundary into the elevated bridge:
+# log filtering + backtraces. sudo scrubs the environment otherwise, silently
+# changing dev logging behavior. RUST_LOG/RUST_BACKTRACE/HOLE_BRIDGE_LOG are
+# not on sudo's default env blacklist, so `--preserve-env=<list>` passes them.
+SUDO_PRESERVE_ENV = ["RUST_LOG", "RUST_BACKTRACE", "HOLE_BRIDGE_LOG"]
 
 
-def drop_kwargs(target: tuple[int, int, str, str] | None) -> dict:
-    """Return Popen kwargs that drop privileges to `target` on POSIX.
+def elevation_action(system: str, euid: int | None) -> Literal["windows-require-admin", "posix-error-root", "posix-ok"]:
+    """How dev mode handles privilege on this host.
 
-    `extra_groups` contains only the `hole` group when it exists, not the
-    target user's full supplementary group list. The GUI needs `hole`
-    membership to open the production IPC socket (root:hole 0660 — see
-    `apply_socket_permissions` in `crates/bridge/src/ipc.rs`); no other
-    supplementary group gates anything dev.py's children touch. Passing
-    the full `os.getgrouplist` would also exceed macOS's NGROUPS_MAX
-    (16) on directory-managed accounts and crash subprocess with
-    `ValueError: too many groups`.
-
-    dev.py runs as root, so `setgroups([hole_gid])` succeeds even if the
-    target user is not yet listed in the `hole` group's member list —
-    the kernel honors root's setgroups regardless of on-disk
-    membership. This gives the GUI `hole` permissions on first launch
-    after `bridge grant-access` with no logout/login cycle.
-
-    The literal `"hole"` matches `crates/bridge/src/group.rs::GROUP_NAME`.
+    "windows-require-admin": Windows — require an already-elevated shell (UAC
+    token-based; nothing is dropped). "posix-error-root": POSIX as root —
+    refuse; dev mode runs unprivileged and elevates only the bridge, and
+    running as root re-poisons target/ (bindreams/hole#452). "posix-ok":
+    POSIX as a normal user — the supported path. `euid` is unused on Windows.
     """
-    if target is None:
-        return {}
-    uid, gid, _user, _ = target
-    extra_groups: list[int] = []
-    try:
-        extra_groups.append(grp.getgrnam("hole").gr_gid)
-    except KeyError:
-        # Group not yet created (the first three privilege-drop calls
-        # happen before `bridge grant-access` creates the group).
-        pass
-    except OSError as e:
-        # macOS Directory Services unreachable — corporate machines can
-        # transiently lose LDAP. Drop the group rather than crash; the
-        # GUI will fall back to root-only IPC and surface its own error.
-        print(f"{YELLOW}warning: failed to look up 'hole' group: {e}{RESET}", file=sys.stderr)
-    return {"user": uid, "group": gid, "extra_groups": extra_groups}
+    if system == "Windows":
+        return "windows-require-admin"
+    if euid == 0:
+        return "posix-error-root"
+    return "posix-ok"
 
 
-def drop_env(env: dict, target: tuple[int, int, str, str] | None) -> dict:
-    """Reset HOME/USER/LOGNAME in `env` to the target user."""
-    if target is None:
-        return env
-    _, _, user, home = target
-    return {**env, "HOME": home, "USER": user, "LOGNAME": user}
+def sudo_prefix(system: str) -> list[str]:
+    """`["sudo"]` on POSIX, `[]` on Windows (already elevated; no sudo)."""
+    return [] if system == "Windows" else ["sudo"]
+
+
+def _elevated(elevate: list[str]) -> list[str]:
+    """sudo prefix with env preservation, or [] when not elevating."""
+    return [*elevate, f"--preserve-env={','.join(SUDO_PRESERVE_ENV)}"] if elevate else []
+
+
+def grant_access_argv(elevate: list[str], bridge_bin: str | os.PathLike[str]) -> list[str]:
+    """argv for `bridge grant-access`, sudo-prefixed on POSIX."""
+    return [*_elevated(elevate), str(bridge_bin), "bridge", "grant-access"]
+
+
+def bridge_argv(
+    elevate: list[str], bridge_bin: str | os.PathLike[str], socket_path: str | os.PathLike[str],
+    state_dir: str | os.PathLike[str]
+) -> list[str]:
+    """argv for `bridge run`, sudo-prefixed on POSIX."""
+    return [
+        *_elevated(elevate),
+        str(bridge_bin), "bridge", "run", "--socket-path",
+        str(socket_path), "--state-dir",
+        str(state_dir)
+    ]
+
+
+def missing_hole_group(hole_gid: int | None, current_gids: set[int]) -> bool:
+    """True if `hole` exists but the current process is not a member.
+
+    Pass `set(os.getgroups()) | {os.getgid(), os.getegid()}` as `current_gids`
+    — `os.getgroups()` omits the primary/effective gid on some systems, which
+    would falsely report a user whose primary group is `hole` as missing.
+    `hole_gid is None` means the group does not exist yet (nothing to check).
+    """
+    return hole_gid is not None and hole_gid not in current_gids
 
 
 # Main =================================================================================================================
@@ -402,14 +427,26 @@ def main() -> None:
         sys.exit(1)
     project_root = Path.cwd().resolve()
 
-    _lib.require_elevation()
-    target_user = _lib.sudo_target_user()  # (uid, gid, user, home) or None
+    system = platform.system()
+    euid = None if system == "Windows" else os.geteuid()
+    action = elevation_action(system, euid)
+    if action == "windows-require-admin":
+        _lib.require_elevation()  # elevated PowerShell (unchanged)
+    elif action == "posix-error-root":
+        print(
+            "ERROR: do not run dev mode as root / under sudo.\n"
+            "Run `cargo xtask run hole` (no sudo) — dev.py elevates only the\n"
+            "bridge itself. Running as root leaves root-owned files in target/.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # else "posix-ok": proceed unprivileged.
 
     cargo = resolve_tool("cargo")
     npm = resolve_tool("npm")
 
-    ensure_node_modules(npm, target_user)
-    cargo_build(cargo, target_user)
+    ensure_node_modules(npm)
+    cargo_build(cargo)
 
     # Stage the runnable BINDIR (hole.exe + ex-ray.exe + wintun.dll on
     # Windows) in a per-pid subdir under TEMP. The contents and naming are
@@ -425,8 +462,6 @@ def main() -> None:
         [cargo, "xtask", "stage", "--profile", "debug", "--out-dir",
          str(dev_bin_dir)],
         cwd=project_root,
-        env=drop_env({**os.environ}, target_user),
-        **drop_kwargs(target_user),
     )
     if stage_result.returncode != 0:
         print(f"{YELLOW}cargo xtask stage failed (exit {stage_result.returncode}){RESET}")
@@ -440,12 +475,26 @@ def main() -> None:
     bridge_state_dir = Path(tempfile.gettempdir()) / "hole-dev" / "state"
     bridge_state_dir.mkdir(parents=True, exist_ok=True)
 
+    # Dev mode runs unprivileged; only the bridge needs root. Cache sudo
+    # credentials up-front so the back-to-back grant-access + bridge run calls
+    # don't each prompt (and so Vite's readiness wait can't straddle the cache).
+    elevate = sudo_prefix(system)
+    if elevate:
+        print(f"{BOLD}Dev mode needs root for the bridge — caching sudo credentials...{RESET}")
+        try:
+            if subprocess.run([*elevate, "-v"]).returncode != 0:
+                print(f"{YELLOW}sudo authentication failed{RESET}", file=sys.stderr)
+                sys.exit(1)
+        except FileNotFoundError:
+            print(f"{YELLOW}sudo not found on PATH; cannot elevate the bridge{RESET}", file=sys.stderr)
+            sys.exit(1)
+
     # Set up IPC access via the production path BEFORE starting the bridge
     # so that apply_socket_permissions picks up the hole group + user SID
     # from the very first socket bind.
     print(f"{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}")
     grant_result = subprocess.run(
-        [str(bridge_bin), "bridge", "grant-access"],
+        grant_access_argv(elevate, bridge_bin),
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
@@ -453,16 +502,35 @@ def main() -> None:
         print(f"{YELLOW}bridge grant-access failed (exit {grant_result.returncode}){RESET}")
         sys.exit(grant_result.returncode)
 
+    # The GUI must be in `hole` to open the IPC socket. If the group was just
+    # created (or the user hasn't re-logged in since), the running session
+    # lacks it. Check effective+real+supplementary gids.
+    if system != "Windows":
+        try:
+            hole_gid = grp.getgrnam("hole").gr_gid
+        except KeyError:
+            hole_gid = None
+        except OSError as e:  # macOS Directory Services transient failure
+            print(f"{YELLOW}warning: could not look up 'hole' group: {e}{RESET}", file=sys.stderr)
+            hole_gid = None
+        current_gids = set(os.getgroups()) | {os.getgid(), os.getegid()}
+        if missing_hole_group(hole_gid, current_gids):
+            print(
+                f"\n{YELLOW}Added you to the 'hole' group, but your current login session "
+                f"predates it,\nso the dashboard can't reach the bridge yet. Log out and back "
+                f"in (or reboot),\nthen run `cargo xtask run hole` again. One-time per machine. "
+                f"(`newgrp hole` may also work.){RESET}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     print(f"\n{BOLD}Starting dev environment...{RESET}")
     print(f"  Socket:    {socket_path}")
     print(f"  State dir: {bridge_state_dir}")
-    print(f"  {CYAN}[bridge]{RESET} {bridge_bin} → real TUN + routing (elevated)")
-    if target_user is not None:
-        print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI) → dropped to user '{target_user[2]}'")
-        print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420 (dropped to user '{target_user[2]}')")
-    else:
-        print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI)")
-        print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420")
+    sudo_note = "" if system == "Windows" else "sudo "
+    print(f"  {CYAN}[bridge]{RESET} {sudo_note}{bridge_bin} → real TUN + routing (elevated)")
+    print(f"  {MAGENTA}[client]{RESET} {built_bin} (GUI, as you)")
+    print(f"  {YELLOW}[  vite]{RESET} npm run dev → port 1420 (as you)")
     print(f"  Frontend changes hot-reload. Rust changes need Ctrl+C and re-run.")
     print()
 
@@ -471,53 +539,18 @@ def main() -> None:
     print_lock = threading.Lock()
     done = threading.Event()
 
+    # Initialized after the bridge Popen; declared here so the finally block is
+    # safe even if startup fails before the bridge starts.
+    bridge_proc: subprocess.Popen | None = None
+
     try:
-        # Start Vite first — GUI needs it listening before the webview opens.
-        # stdin=DEVNULL prevents child processes from accessing the parent console's stdin.
-        # Without this, Vite (via readline) puts the TTY into raw mode for keyboard shortcuts
-        # and doesn't restore it when terminated, leaving arrow keys broken.
-        vite_proc = subprocess.Popen(
-            [npm, "run", "dev"],
-            env=drop_env({**os.environ}, target_user),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            **drop_kwargs(target_user),
-            **new_process_group_kwargs(),
-        )
-        procs.append(vite_proc)
-        # Vite's output has no ISO timestamps; per-line emit avoids the
-        # buffer-never-flushes failure mode (see prefix_stream docstring).
-        t_vite = threading.Thread(
-            target=prefix_stream,
-            args=(vite_proc.stdout, "  vite", YELLOW, print_lock),
-            kwargs={"buffer_entries": False},
-            daemon=True,
-        )
-        t_vite.start()
-        prefix_threads.append(t_vite)
-        threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
-
-        if not wait_for_port(VITE_PORT, VITE_READY_TIMEOUT, vite_proc):
-            if vite_proc.poll() is not None:
-                print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
-            else:
-                print(f"{YELLOW}Vite did not start on port {VITE_PORT} within {VITE_READY_TIMEOUT}s{RESET}")
-            sys.exit(1)  # finally block handles shutdown
-
-        # Start bridge (inherits elevated credentials).
+        # Start the bridge first so all sudo calls are back-to-back after the
+        # `sudo -v` preflight — Vite's readiness wait no longer straddles the
+        # credential cache. stdin=DEVNULL means an expired sudo timestamp gets
+        # EOF and exits non-zero (wait_for_socket then reports a clean failure)
+        # rather than hanging on a prompt.
         bridge_proc = subprocess.Popen(
-            [
-                str(bridge_bin),
-                "bridge",
-                "run",
-                "--socket-path",
-                str(socket_path),
-                "--state-dir",
-                str(bridge_state_dir),
-            ],
+            bridge_argv(elevate, bridge_bin, socket_path, bridge_state_dir),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -543,13 +576,51 @@ def main() -> None:
         # and can see a socket without the correct DACL/group yet.
         if not wait_for_socket(socket_path, bridge_proc, SOCKET_READY_TIMEOUT):
             if bridge_proc.poll() is not None:
-                print(f"{YELLOW}Bridge exited with code {bridge_proc.returncode}{RESET}")
+                print(
+                    f"{YELLOW}Bridge exited with code {bridge_proc.returncode} "
+                    f"(sudo credentials may have expired, or a restrictive sudoers "
+                    f"env_check/env_delete rejected --preserve-env){RESET}"
+                )
             else:
                 print(f"{YELLOW}Bridge did not bind socket within {SOCKET_READY_TIMEOUT}s{RESET}")
             sys.exit(1)
 
-        # Start GUI (dropped to target user on macOS under sudo).
-        gui_env = drop_env({**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}, target_user)
+        # Start Vite (after the bridge). GUI needs it listening before the
+        # webview opens. stdin=DEVNULL prevents child processes from accessing
+        # the parent console's stdin. Without this, Vite (via readline) puts the
+        # TTY into raw mode for keyboard shortcuts and doesn't restore it when
+        # terminated, leaving arrow keys broken.
+        vite_proc = subprocess.Popen(
+            [npm, "run", "dev"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            **new_process_group_kwargs(),
+        )
+        procs.append(vite_proc)
+        # Vite's output has no ISO timestamps; per-line emit avoids the
+        # buffer-never-flushes failure mode (see prefix_stream docstring).
+        t_vite = threading.Thread(
+            target=prefix_stream,
+            args=(vite_proc.stdout, "  vite", YELLOW, print_lock),
+            kwargs={"buffer_entries": False},
+            daemon=True,
+        )
+        t_vite.start()
+        prefix_threads.append(t_vite)
+        threading.Thread(target=wait_for_exit, args=(vite_proc, done), daemon=True).start()
+
+        if not wait_for_port(VITE_PORT, VITE_READY_TIMEOUT, vite_proc):
+            if vite_proc.poll() is not None:
+                print(f"{YELLOW}Vite exited with code {vite_proc.returncode}{RESET}")
+            else:
+                print(f"{YELLOW}Vite did not start on port {VITE_PORT} within {VITE_READY_TIMEOUT}s{RESET}")
+            sys.exit(1)  # finally block handles shutdown
+
+        # Start GUI (as the invoking user).
+        gui_env = {**os.environ, "HOLE_BRIDGE_SOCKET": str(socket_path)}
 
         # Enable remote inspection of the dashboard webview. The env var only
         # affects WebView2 (Windows) — WKWebView on macOS ignores it — but
@@ -578,7 +649,6 @@ def main() -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            **drop_kwargs(target_user),
             **new_process_group_kwargs(),
         )
         procs.append(gui_proc)
@@ -613,7 +683,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        shutdown(procs, prefix_threads)
+        shutdown(procs, prefix_threads, bridge_proc=bridge_proc)
 
 
 if __name__ == "__main__":

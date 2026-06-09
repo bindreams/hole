@@ -6,8 +6,9 @@
 """Unit tests for helpers in `dev.py`.
 
 Covers:
-- `drop_kwargs` (POSIX-only; skipped on Windows)
+- privilege-model helpers (elevation policy + sudo argv builders)
 - `prefix_stream` log multiplexing (platform-agnostic)
+- `shutdown()` teardown (bridge not killed on timeout / graceful exit)
 
 Run with: `uv run scripts/dev_tests.py`
 """
@@ -33,10 +34,9 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 # than `SimpleNamespace` so `sys.modules["_lib"]` matches its declared type.
 _lib_stub = types.ModuleType("_lib")
 # `setattr` bypasses ty's static attribute check (ModuleType has no
-# declared `require_elevation` / `sudo_target_user`); the attrs are
-# created dynamically and read from `dev.py` at module-load time.
+# declared `require_elevation`); the attr is created dynamically and read
+# from `dev.py` at module-load time.
 setattr(_lib_stub, "require_elevation", lambda: None)
-setattr(_lib_stub, "sudo_target_user", lambda: None)
 sys.modules.setdefault("_lib", _lib_stub)
 
 _spec = importlib.util.spec_from_file_location("dev", str(_SCRIPTS_DIR / "dev.py"))
@@ -44,39 +44,119 @@ assert _spec and _spec.loader, "failed to locate scripts/dev.py"
 dev = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dev)
 
-# drop_kwargs tests (POSIX-only) =======================================================================================
-
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="drop_kwargs is POSIX-only")
+# privilege-model helpers ==============================================================================================
 
 
-@posix_only
-def test_target_none_returns_empty():
-    assert dev.drop_kwargs(None) == {}
+def test_elevation_action_windows_requires_admin():
+    assert dev.elevation_action("Windows", None) == "windows-require-admin"
 
 
-@posix_only
-def test_hole_present_includes_hole_gid():
-    fake = types.SimpleNamespace(gr_gid=4242)
-    with mock.patch.object(dev.grp, "getgrnam", return_value=fake):
-        kw = dev.drop_kwargs((501, 20, "alice", "/Users/alice"))
-    assert kw == {"user": 501, "group": 20, "extra_groups": [4242]}
+def test_elevation_action_windows_ignores_euid():
+    assert dev.elevation_action("Windows", 0) == "windows-require-admin"
 
 
-@posix_only
-def test_hole_absent_returns_empty_list():
-    with mock.patch.object(dev.grp, "getgrnam", side_effect=KeyError("hole")):
-        kw = dev.drop_kwargs((501, 20, "alice", "/Users/alice"))
-    assert kw == {"user": 501, "group": 20, "extra_groups": []}
+def test_elevation_action_posix_root_is_error():
+    assert dev.elevation_action("Darwin", 0) == "posix-error-root"
+    assert dev.elevation_action("Linux", 0) == "posix-error-root"
 
 
-@posix_only
-def test_directory_services_failure_returns_empty_list(capsys):
-    with mock.patch.object(dev.grp, "getgrnam", side_effect=OSError("DS unreachable")):
-        kw = dev.drop_kwargs((501, 20, "alice", "/Users/alice"))
-    assert kw == {"user": 501, "group": 20, "extra_groups": []}
-    # Surface the failure to the user — silently dropping `hole` would
-    # leave the GUI confused without any breadcrumb.
-    assert "DS unreachable" in capsys.readouterr().err
+def test_elevation_action_posix_user_ok():
+    assert dev.elevation_action("Darwin", 501) == "posix-ok"
+
+
+def test_sudo_prefix_posix_is_sudo():
+    assert dev.sudo_prefix("Darwin") == ["sudo"]
+
+
+def test_sudo_prefix_windows_is_empty():
+    assert dev.sudo_prefix("Windows") == []
+
+
+def test_missing_hole_group_true_when_absent():
+    assert dev.missing_hole_group(4242, {20, 12, 80}) is True
+
+
+def test_missing_hole_group_false_when_present_as_supplementary():
+    assert dev.missing_hole_group(4242, {20, 4242, 80}) is False
+
+
+def test_missing_hole_group_false_when_group_absent():
+    assert dev.missing_hole_group(None, {20, 12}) is False
+
+
+def test_grant_access_argv_posix_prefixes_sudo_with_preserve_env():
+    argv = dev.grant_access_argv(["sudo"], "/tmp/hole-dev-1/hole")
+    assert argv == [
+        "sudo", "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG", "/tmp/hole-dev-1/hole", "bridge",
+        "grant-access"
+    ]
+
+
+def test_grant_access_argv_windows_no_sudo():
+    argv = dev.grant_access_argv([], "C:/hole/hole.exe")
+    assert argv == ["C:/hole/hole.exe", "bridge", "grant-access"]
+
+
+def test_bridge_argv_posix_prefixes_sudo_and_passes_paths():
+    argv = dev.bridge_argv(["sudo"], "/tmp/hole-dev-1/hole", "/tmp/x.sock", "/tmp/state")
+    assert argv == [
+        "sudo", "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG", "/tmp/hole-dev-1/hole", "bridge", "run",
+        "--socket-path", "/tmp/x.sock", "--state-dir", "/tmp/state"
+    ]
+
+
+def test_bridge_argv_windows_no_sudo():
+    argv = dev.bridge_argv([], "C:/hole/hole.exe", "P", "S")
+    assert argv == ["C:/hole/hole.exe", "bridge", "run", "--socket-path", "P", "--state-dir", "S"]
+
+
+def test_shutdown_does_not_kill_bridge_on_timeout(capsys):
+    import subprocess as _sp
+    killed = []
+
+    class _FakeProc:
+
+        def __init__(self, name):
+            self.name = name
+            self.pid = 4321
+
+        def wait(self, timeout: float | None = None):
+            raise _sp.TimeoutExpired(cmd=self.name, timeout=timeout or 0)
+
+        def kill(self):
+            killed.append(self.name)
+
+    bridge = _FakeProc("bridge")
+    vite = _FakeProc("vite")
+    with mock.patch.object(dev, "terminate_tree"):
+        dev.shutdown([vite, bridge], bridge_proc=bridge)
+    # Non-bridge procs are force-killed; the root bridge is NOT (SIGKILL to the
+    # sudo wrapper wouldn't reach it), and the user is told how to recover.
+    assert killed == ["vite"]
+    assert "network-reset.py" in capsys.readouterr().err
+
+
+def test_shutdown_graceful_exit_kills_nothing(capsys):
+    killed = []
+
+    class _FakeProc:
+
+        def __init__(self, name):
+            self.name = name
+            self.pid = 4321
+
+        def wait(self, timeout: float | None = None):
+            return 0
+
+        def kill(self):
+            killed.append(self.name)
+
+    bridge = _FakeProc("bridge")
+    vite = _FakeProc("vite")
+    with mock.patch.object(dev, "terminate_tree"):
+        dev.shutdown([vite, bridge], bridge_proc=bridge)
+    assert killed == []
+    assert "network-reset.py" not in capsys.readouterr().err
 
 
 # prefix_stream tests (platform-agnostic) ==============================================================================

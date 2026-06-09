@@ -23,6 +23,47 @@ pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), B
     rt.block_on(run_inner(socket_path, state_dir, log_dir))
 }
 
+/// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere, or
+/// SIGTERM on Unix. dev.py terminates the bridge with SIGTERM (relayed
+/// through sudo); without a SIGTERM handler the bridge would die on the
+/// default disposition and leak routes/DNS (bindreams/hole#452).
+///
+/// Returns a future but installs the SIGTERM handler EAGERLY when called
+/// (not lazily on first poll), so a caller that raises SIGTERM immediately
+/// after still observes it. Must be called within a Tokio runtime — it is,
+/// from `run_inner` and the test's `block_on`.
+// On non-unix the `#[cfg(unix)] let sigterm = …` line below is cfg'd out,
+// leaving a bare `async move` body, so clippy's `manual_async_fn` suggests
+// `async fn`. But on unix the function MUST stay `fn -> impl Future` so the
+// SIGTERM handler installs eagerly (before the future is first polled). Keep
+// one shape across platforms and silence the lint only where it misfires.
+#[cfg_attr(not(unix), allow(clippy::manual_async_fn))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    #[cfg(unix)]
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    async move {
+        #[cfg(unix)]
+        match sigterm {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal (SIGINT) received"),
+                    _ = sigterm.recv() => tracing::info!("shutdown signal (SIGTERM) received"),
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutdown signal (SIGINT) received");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutdown signal (Ctrl+C) received");
+        }
+    }
+}
+
 async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
@@ -101,9 +142,7 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
                 tracing::error!(error = %e, "IPC server error");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received");
-        }
+        _ = shutdown_signal() => {}
     }
 
     let mut pm = proxy_shutdown.lock().await;

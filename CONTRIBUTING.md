@@ -366,38 +366,44 @@ cargo xtask run hole-dmg-tests   # mount + assert .app code signature is intact
 ### Running in dev mode
 
 Dev mode creates a **real TUN interface** and edits the routing table (the
-production bridge path), so it needs elevation:
+production bridge path), so the bridge needs elevation — but you run the command
+unprivileged:
 
 ```sh
-# Windows: from an elevated PowerShell
+# macOS: NO sudo
 cargo xtask run hole
 
-# macOS: build as your user first, then elevate to run
-cargo xtask build hole
-sudo cargo xtask run hole
+# Windows: from an elevated PowerShell
+cargo xtask run hole
 ```
+
+> **Do NOT `sudo cargo xtask run hole`.** dev.py refuses to run as root, but the
+> outer xtask build cascade runs first — so a sudo'd invocation leaves
+> root-owned files in `target/` before dev.py can bail (bindreams/hole#452).
+> Closing this sudo-invocation path structurally is tracked in #453.
 
 `cargo xtask run hole` launches `scripts/dev.py`, which builds the workspace,
 starts Vite, and launches bridge + GUI with multiplexed color-coded logs.
 Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and re-run.
 
-- **Why build first on macOS:** `run` invokes the build cascade before `run:`
-  steps; under `sudo` that would leave `target/` root-owned. Building unprivileged
-  first warms the cache so the elevated cascade is a no-op. (Windows UAC is
-  token-based — unaffected.)
-- On macOS `dev.py` detects `SUDO_USER` and drops privileges (setuid/setgid +
-  `extra_groups`) for the GUI/Vite so they read your real `~/Library`, while the
-  bridge inherits root.
+- **dev.py runs unprivileged and elevates only the bridge.** On macOS it
+  prompts for your sudo password once, then `sudo`s just `bridge grant-access` +
+  `bridge run`. Vite and the GUI run as you, reading your real `~/Library`. On
+  Windows everything inherits the already-elevated UAC token (token-based; no
+  identity change).
 - `dev.py` runs `hole bridge grant-access` (creates the `hole` group, adds your
   user) so the bridge exercises the production DACL/group path on every run. The
-  group is **not** removed on exit (same as production).
+  group is **not** removed on exit (same as production). The GUI needs the `hole`
+  group to open the IPC socket; the first run after `grant-access` creates the
+  group, so a one-time log out / log back in (or reboot) may be required.
 
 ### Manual workflow
 
-Separate terminals, more control. **Terminal 1 — bridge (elevated):**
+Separate terminals, more control. **Terminal 1 — bridge:** build and stage as
+your normal user; only `bridge grant-access` + `bridge run` need elevation.
 
 ```powershell
-# Windows (elevated PowerShell)
+# Windows (elevated PowerShell — UAC token-based, everything inherits it)
 cargo xtask build hole
 cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"
 & "$env:TEMP\hole-dev-manual\hole.exe" bridge grant-access
@@ -406,11 +412,11 @@ cargo xtask stage --profile debug --out-dir "$env:TEMP\hole-dev-manual"
 ```
 
 ```sh
-# macOS (under sudo)
+# macOS — run as yourself; sudo only the two bridge commands
 cargo xtask build hole
 cargo xtask stage --profile debug --out-dir "$TMPDIR/hole-dev-manual"
-"$TMPDIR/hole-dev-manual/hole" bridge grant-access
-"$TMPDIR/hole-dev-manual/hole" bridge run \
+sudo "$TMPDIR/hole-dev-manual/hole" bridge grant-access
+sudo "$TMPDIR/hole-dev-manual/hole" bridge run \
     --socket-path "$TMPDIR/hole-dev.sock" --state-dir "$TMPDIR/hole-dev-state"
 ```
 
@@ -444,6 +450,8 @@ it. The canonical file list is [xtask/src/bindir.rs](xtask/src/bindir.rs).
 
 ### Notes
 
+- The unelevated GUI needs the `hole` group to open the IPC socket; `bridge grant-access` creates it and adds your user, so on a fresh machine a one-time
+  log out / log back in (or reboot) may be required before the GUI can connect.
 - Use absolute paths (e.g. `$TEMP`) for `--socket-path` to avoid Windows AF_UNIX
   path-length limits.
 - The dev binary shares `com.hole.app` with the installed build, so if an

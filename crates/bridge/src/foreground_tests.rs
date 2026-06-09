@@ -207,3 +207,28 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
         server_handle.await.expect("server task panicked");
     });
 }
+
+// dev.py's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
+// instead of an ungraceful default-disposition kill that leaks routes/DNS
+// (bindreams/hole#452). `shutdown_signal()` installs the SIGTERM handler
+// SYNCHRONOUSLY when called (Step 3), so raising the signal immediately
+// after is non-fatal and is observed by the returned future — deterministic,
+// no spawn/poll race (a prior spawn+yield_now form raced and killed the test
+// process with SIGTERM's default disposition on iteration 0). macOS-gated to
+// match libc's dependency gating; test-hole's only POSIX hosts are macOS, and
+// nextest isolates each test in its own process so the raise can't disturb
+// siblings.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn sigterm_resolves_shutdown_signal() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Installs the SIGTERM handler NOW (eager, not on first poll).
+        let fut = super::shutdown_signal();
+        // SAFETY: raising a signal to our own process is sound.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        // Resolves on the delivered SIGTERM; bounded by the framework timeout
+        // (allowed external-event failure-bound), not a self-chosen sleep.
+        fut.await;
+    });
+}
