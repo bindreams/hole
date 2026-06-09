@@ -186,9 +186,6 @@ pub fn run_command(host: &Host, target: Privilege, cmd: Command, groups: &Groups
 /// Spawn `cmd` inheriting stdio and map a non-zero exit to an error. Shared by
 /// both effect layers for the run-as-is / drop / elevate-child paths
 /// (cross-platform — the name carries no POSIX semantics).
-// Effect-layer callers (posix/windows `run_command`) land in Tasks 4/5; until
-// then this is unused but must compile (mirrors `win_quote.rs`'s allow).
-#[allow(dead_code)]
 pub(crate) fn run_inherit(mut cmd: Command, label: &str) -> Result<()> {
     use std::process::Stdio;
     cmd.stdin(Stdio::null())

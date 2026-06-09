@@ -89,3 +89,45 @@ fn ci_tripwire_requires_all_three_conditions() {
         Transition::WarnVacuous(_)
     ));
 }
+
+// Effect test: actually drop and read back the child uid. Needs root; labeled
+// `root`, runs by default (CI supplies root via the elevated xtask-tests
+// target). Opt out locally with SKULD_LABELS="!root". Does NOT use skuld's
+// `requires` (that marks the trial ignored — a green-build skip); asserts root
+// and fails LOUDLY instead.
+#[cfg(unix)]
+#[skuld::label]
+const ROOT: skuld::Label;
+
+#[cfg(unix)]
+#[skuld::test(labels = [ROOT])]
+fn drop_actually_changes_uid() {
+    use crate::privilege::{Groups, Host, InvokingUser, Privilege, Transition};
+    use std::process::Command;
+
+    // SAFETY: geteuid is always safe.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "this test requires root. Run the elevated `xtask-tests` target (CI does this), \
+         or opt out locally with SKULD_LABELS=\"!root\"."
+    );
+
+    let host = Host::detect();
+    let uid = match &host.invoking_user {
+        Some(InvokingUser::Posix { uid, .. }) => *uid,
+        _ => panic!(
+            "no invoking user resolved: set SUDO_USER or HOLE_BUILD_USER (the elevated \
+             xtask-tests target runs under sudo, which sets SUDO_USER)"
+        ),
+    };
+    assert!(matches!(host.plan(Privilege::Unprivileged), Transition::DropTo(_)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("uid.txt");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(format!("id -u > {}", out.display()));
+    crate::privilege::run_command(&host, Privilege::Unprivileged, cmd, &Groups::Full, "id -u").unwrap();
+    let got: u32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
+    assert_eq!(got, uid, "child did not drop to the invoking user's uid");
+}
