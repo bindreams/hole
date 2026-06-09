@@ -334,6 +334,16 @@ cargo xtask run hole         # dev mode (= build hole + scripts/dev.py)
 cargo xtask run hole-tests   # canonical local nextest invocation
 ```
 
+### The `elevated:` flag
+
+Any `build.yaml` step may declare `elevated: <bool>` (default `false`), per-step
+or as a `run:`/`build:` block default (`{ elevated: <bool>, steps: [...] }`). The
+orchestrator normalizes each step to its declared privilege — dropping root for
+`false` (so `sudo cargo xtask …` never leaves root-owned artifacts), obtaining it
+for `true` (sudo on macOS/Linux, a one-time UAC prompt on Windows). `elevated: true` is rejected on `build:` steps. When running as root with no invoking user
+(a container / root shell), set `HOLE_BUILD_USER=<user>` to designate the drop
+target; under `CI` with root and no such user, the step hard-fails.
+
 ### Tauri dev/prod feature toggle
 
 The `hole` crate defaults to `tauri/custom-protocol` (**production mode**:
@@ -377,10 +387,13 @@ cargo xtask run hole
 cargo xtask run hole
 ```
 
-> **Do NOT `sudo cargo xtask run hole`.** dev.py refuses to run as root, but the
-> outer xtask build cascade runs first — so a sudo'd invocation leaves
-> root-owned files in `target/` before dev.py can bail (bindreams/hole#452).
-> Closing this sudo-invocation path structurally is tracked in #453.
+> **You can now `sudo cargo xtask run hole` safely** (though it's unnecessary):
+> the `elevated:` flag normalizes every build/run step back to your user when
+> invoked as root, so the cascade leaves no root-owned files in `target/` and
+> dev.py runs as you (it self-sudoes only the bridge). This structurally closes
+> the sudo-invocation path that used to strand root-owned artifacts
+> (bindreams/hole#452, #453). Plain `cargo xtask run hole` remains the
+> recommended form.
 
 `cargo xtask run hole` launches `scripts/dev.py`, which builds the workspace,
 starts Vite, and launches bridge + GUI with multiplexed color-coded logs.
@@ -457,7 +470,8 @@ it. The canonical file list is [xtask/src/bindir.rs](xtask/src/bindir.rs).
 - The dev binary shares `com.hole.app` with the installed build, so if an
   installed `hole.exe` is running, dev launches forward to it and the dev GUI
   won't appear — quit the installed Hole first.
-- If a dev crash breaks routing, run `scripts/network-reset.py` (elevated).
+- If a dev crash breaks routing, run `cargo xtask run network-reset` (it obtains
+  root itself — no manual `sudo` / elevated PowerShell).
 - First `cargo xtask deps` is slow (compiles ex-ray, downloads wintun);
   subsequent runs are near-instant (Go build cache + sha256-sentineled download).
 
@@ -682,8 +696,7 @@ MSI as `ARPPRODUCTICON` so Add/Remove Programs matches the app icon (#359).
 If routing gets into a bad state during development:
 
 ```sh
-sudo python scripts/network-reset.py    # macOS
-python scripts/network-reset.py         # Windows (run as Administrator)
+cargo xtask run network-reset    # obtains root itself (sudo / UAC); all platforms
 ```
 
 It reads the bridge's route-state file and tears down the exact leaked routes
