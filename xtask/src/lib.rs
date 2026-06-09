@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
+use crate::privilege::Readiness;
 
 pub mod bindir;
 pub mod ex_ray;
@@ -277,12 +278,13 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
     relocate_self_if_windows()?;
 
     let (manifest, repo_root) = load_manifest()?;
-    let host = Platform::host().ok_or_else(|| {
+    let host_platform = Platform::host().ok_or_else(|| {
         anyhow!(
             "host platform not in the known set (windows/darwin/linux × amd64/arm64); \
              cannot orchestrate"
         )
     })?;
+    let host = privilege::Host::detect();
     let plan = Plan::new(&manifest)?;
 
     let roots: Vec<&str> = match (target, all) {
@@ -293,7 +295,7 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
         (None, true) => plan
             .target_names()
             .into_iter()
-            .filter(|name| manifest.get(name).map(|t| t.applies_to(host)).unwrap_or(false))
+            .filter(|name| manifest.get(name).map(|t| t.applies_to(host_platform)).unwrap_or(false))
             .collect(),
         (Some(_), true) => unreachable!("clap rejects --all with a positional target"),
         (None, false) => {
@@ -302,12 +304,17 @@ pub fn run_build(target: Option<String>, all: bool) -> Result<()> {
     };
 
     if roots.is_empty() {
-        println!("xtask: no targets apply to host platform {host}");
+        println!("xtask: no targets apply to host platform {host_platform}");
         return Ok(());
     }
 
-    let order = plan.order_for(&roots, host)?;
-    execute(&plan, &order, &repo_root)
+    let order = plan.order_for(&roots, host_platform)?;
+    // Build steps can never be elevated (the manifest parse guard rejects
+    // `elevated: true` on `build:`), so `any_elevated_ahead` is false.
+    if let Readiness::ElevatedChildExited(code) = privilege::ensure_can_elevate(&host, false)? {
+        std::process::exit(code);
+    }
+    execute(&plan, &order, &repo_root, &host)
 }
 
 pub fn run_run(target: String) -> Result<()> {
@@ -317,14 +324,27 @@ pub fn run_run(target: String) -> Result<()> {
     relocate_self_if_windows()?;
 
     let (manifest, repo_root) = load_manifest()?;
-    let host = Platform::host().ok_or_else(|| {
+    let host_platform = Platform::host().ok_or_else(|| {
         anyhow!(
             "host platform not in the known set (windows/darwin/linux × amd64/arm64); \
              cannot orchestrate"
         )
     })?;
+    let host = privilege::Host::detect();
     let plan = Plan::new(&manifest)?;
-    execute_run(&plan, &target, host, &repo_root)
+    // Only the target's OWN run steps can be elevated. Build steps are
+    // structurally never elevated (the parse guard), so scanning the dependency
+    // cascade would be dead computation — and recomputing `order_for` here would
+    // move validation ahead of `execute_run`'s pinned error messages. Compute
+    // solely from the target's run steps; if the target is unknown, `execute_run`
+    // emits the canonical "unknown target" error.
+    let any_elevated = manifest
+        .get(&target)
+        .is_some_and(|t| t.run.iter().any(crate::manifest::Step::is_elevated));
+    if let Readiness::ElevatedChildExited(code) = privilege::ensure_can_elevate(&host, any_elevated)? {
+        std::process::exit(code);
+    }
+    execute_run(&plan, &target, host_platform, &repo_root, &host)
 }
 
 pub fn run_list() -> Result<()> {

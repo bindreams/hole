@@ -294,7 +294,7 @@ fn run_step_bash_succeeds_on_zero_exit() {
         environment: Default::default(),
         elevated: false,
     };
-    run_step(&step, dir.path()).unwrap();
+    run_step(&step, dir.path(), &unprivileged_host()).unwrap();
 }
 
 #[skuld::test]
@@ -305,7 +305,7 @@ fn run_step_bash_fails_on_nonzero_exit() {
         environment: Default::default(),
         elevated: false,
     };
-    let err = run_step(&step, dir.path()).unwrap_err();
+    let err = run_step(&step, dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("exit"), "expected exit-status error, got: {msg}");
 }
@@ -322,7 +322,7 @@ fn run_step_bash_environment_overrides_inherited() {
         environment: env,
         elevated: false,
     };
-    run_step(&step, dir.path()).unwrap();
+    run_step(&step, dir.path(), &unprivileged_host()).unwrap();
 }
 
 #[skuld::test]
@@ -336,7 +336,7 @@ fn run_step_process_fails_on_nonzero_exit() {
         environment: Default::default(),
         elevated: false,
     };
-    let err = run_step(&step, dir.path()).unwrap_err();
+    let err = run_step(&step, dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("exit"), "expected exit-status error, got: {msg}");
 }
@@ -349,7 +349,7 @@ fn run_step_process_empty_args_errors() {
         environment: Default::default(),
         elevated: false,
     };
-    let err = run_step(&step, dir.path()).unwrap_err();
+    let err = run_step(&step, dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("empty"), "expected empty-args error, got: {msg}");
 }
@@ -366,6 +366,35 @@ fn host_platform() -> Platform {
     // the real host so we don't accidentally encode the test host into the
     // manifest's platform set.
     Platform::host().expect("test host must be in the known platform set")
+}
+
+/// A non-elevated `Host` constructed directly so step-execution tests never
+/// touch real privilege state. `Posix` strategy keeps `plan` on the run-as-is
+/// branch for unelevated steps; tests here never declare `elevated: true`.
+fn unprivileged_host() -> crate::privilege::Host {
+    crate::privilege::Host {
+        elevated: false,
+        invoking_user: None,
+        is_ci: false,
+        has_tty: false,
+        strategy: crate::privilege::ElevateStrategy::Posix,
+    }
+}
+
+#[skuld::test]
+fn unelevated_run_executes_normally_through_privilege_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let marker_str = marker.to_string_lossy().replace('\\', "/");
+    let yaml = format!(
+        "targets:\n  foo:\n    platforms: {host}\n    run:\n      - bash: 'touch \"{m}\"'\n",
+        host = host_yaml(),
+        m = marker_str
+    );
+    let m = Manifest::parse(&yaml).unwrap();
+    let plan = Plan::new(&m).unwrap();
+    execute_run(&plan, "foo", host_platform(), dir.path(), &unprivileged_host()).unwrap();
+    assert!(marker.exists());
 }
 
 fn host_yaml() -> String {
@@ -398,7 +427,7 @@ targets:
     );
     let m = Manifest::parse(&yaml).unwrap();
     let plan = Plan::new(&m).unwrap();
-    execute_run(&plan, "foo", host_platform(), dir.path()).unwrap();
+    execute_run(&plan, "foo", host_platform(), dir.path(), &unprivileged_host()).unwrap();
     // Sentinel must be on disk after run_run returns.
     assert!(sentinel.exists(), "expected build to have created sentinel");
 }
@@ -440,7 +469,7 @@ targets:
     );
     let m = Manifest::parse(&yaml).unwrap();
     let plan = Plan::new(&m).unwrap();
-    execute_run(&plan, "child", host_platform(), dir.path()).unwrap();
+    execute_run(&plan, "child", host_platform(), dir.path(), &unprivileged_host()).unwrap();
 
     assert!(child_marker.exists(), "child's run: must have executed");
     assert!(
@@ -464,7 +493,7 @@ targets:
     ));
     let plan = Plan::new(&m).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let err = execute_run(&plan, "build-only", host_platform(), dir.path()).unwrap_err();
+    let err = execute_run(&plan, "build-only", host_platform(), dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains(r#"target "build-only" has no run steps defined"#),
@@ -484,7 +513,7 @@ targets:
     ));
     let plan = Plan::new(&m).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let err = execute_run(&plan, "nonexistent", host_platform(), dir.path()).unwrap_err();
+    let err = execute_run(&plan, "nonexistent", host_platform(), dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains(r#"unknown target: "nonexistent""#),
@@ -515,7 +544,7 @@ targets:
     let m = Manifest::parse(&yaml).unwrap();
     let plan = Plan::new(&m).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let err = execute_run(&plan, "off-host", host, dir.path()).unwrap_err();
+    let err = execute_run(&plan, "off-host", host, dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("does not apply to host platform") && msg.contains("off-host"),
@@ -547,7 +576,7 @@ targets:
     );
     let m = Manifest::parse(&yaml).unwrap();
     let plan = Plan::new(&m).unwrap();
-    let err = execute_run(&plan, "foo", host_platform(), dir.path()).unwrap_err();
+    let err = execute_run(&plan, "foo", host_platform(), dir.path(), &unprivileged_host()).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("building target") && msg.contains("foo"),

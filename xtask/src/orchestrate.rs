@@ -19,7 +19,7 @@ use std::io;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use petgraph::algo::{tarjan_scc, toposort};
@@ -28,6 +28,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
 use crate::manifest::{Manifest, Platform, Step};
+use crate::privilege::{self, Groups, Host, Privilege};
 
 // ===== Plan ==========================================================================================================
 
@@ -284,13 +285,21 @@ fn relocate_self_windows() -> Result<()> {
 
 // ===== Step execution ================================================================================================
 
-/// Execute one [`Step`] from the given working directory.
+/// Execute one [`Step`] from the given working directory, normalized to its
+/// declared privilege relative to `host`.
 ///
-/// CWD is always `repo_root`. The step inherits stdio. On non-zero exit this
-/// returns `Err` with a message naming the step and exit code; the caller
-/// (the build driver) propagates that via fail-fast.
-pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
-    match step {
+/// CWD is always `repo_root`. The step inherits stdio. Spawning, privilege
+/// drop/elevate, and exit-status mapping all live in the privilege layer
+/// ([`privilege::run_command`]); on non-zero exit it returns `Err` naming the
+/// step and exit code, which the caller (the build driver) propagates via
+/// fail-fast.
+pub fn run_step(step: &Step, repo_root: &Path, host: &Host) -> Result<()> {
+    let target = if step.is_elevated() {
+        Privilege::Elevated
+    } else {
+        Privilege::Unprivileged
+    };
+    let (cmd, label) = match step {
         Step::Bash {
             command, environment, ..
         } => {
@@ -301,7 +310,7 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
             for (k, v) in environment {
                 cmd.env(k, v);
             }
-            run(cmd, &format!("bash step: {command}"))
+            (cmd, format!("bash step: {command}"))
         }
         Step::Process { args, environment, .. } => {
             let (program, rest) = args
@@ -312,9 +321,10 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
             for (k, v) in environment {
                 cmd.env(k, v);
             }
-            run(cmd, &format!("process step: {}", args.join(" ")))
+            (cmd, format!("process step: {}", args.join(" ")))
         }
-    }
+    };
+    privilege::run_command(host, target, cmd, &Groups::Full, &label)
 }
 
 /// Pick the bash interpreter to invoke for `bash:` steps.
@@ -362,23 +372,18 @@ fn resolve_bash() -> Result<OsString> {
     }
 }
 
-fn run(mut cmd: Command, label: &str) -> Result<()> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = cmd.status().with_context(|| format!("spawning {label}"))?;
-    if !status.success() {
-        return Err(anyhow!("{label} failed: exit status {status}"));
-    }
-    Ok(())
-}
-
 // ===== Build driver ==================================================================================================
 
 /// Execute every target in `order` (already toposorted). Each target's
 /// `build:` steps run in declaration order; first failure aborts the whole
-/// invocation.
-pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path) -> Result<()> {
+/// invocation. Steps run at their declared privilege relative to `host`.
+pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path, host: &Host) -> Result<()> {
+    run_build_cascade(plan, order, repo_root, host)
+}
+
+/// Run the `build:` steps of every target in `order` (already toposorted), in
+/// declaration order, fail-fast. Shared by [`execute`] and [`execute_run`].
+fn run_build_cascade(plan: &Plan<'_>, order: &[&str], repo_root: &Path, host: &Host) -> Result<()> {
     for name in order {
         let target = plan
             .manifest
@@ -391,7 +396,7 @@ pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path) -> Result<()> 
         }
         println!("xtask: ==== building target {name} ====");
         for step in &target.build {
-            run_step(step, repo_root).with_context(|| format!("while building target {name}"))?;
+            run_step(step, repo_root, host).with_context(|| format!("while building target {name}"))?;
         }
     }
     Ok(())
@@ -400,8 +405,9 @@ pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path) -> Result<()> 
 /// Run a target's `run:` steps after the full build cascade for that target.
 ///
 /// The cascade order matches `cargo xtask build <target>`: every transitive
-/// build dep applicable to `host`, in topological order, then the target's
-/// own `build:` steps. Once that succeeds, the target's `run:` steps execute.
+/// build dep applicable to `host_platform`, in topological order, then the
+/// target's own `build:` steps. Once that succeeds, the target's `run:` steps
+/// execute. Every step runs at its declared privilege relative to `host`.
 ///
 /// Errors:
 /// - `unknown target: {name:?}` if `target_name` isn't declared.
@@ -409,10 +415,16 @@ pub fn execute(plan: &Plan<'_>, order: &[&str], repo_root: &Path) -> Result<()> 
 ///   empty. Checked before any platform-applicability work — running a
 ///   target without `run:` is a manifest error, not a host-specific issue.
 /// - The platform-applicability message from [`Plan::order_for`] if the
-///   target doesn't apply to `host`.
+///   target doesn't apply to `host_platform`.
 /// - Any step's failure aborts the cascade with `while building target X` or
 ///   `while running target X` context.
-pub fn execute_run(plan: &Plan<'_>, target_name: &str, host: Platform, repo_root: &Path) -> Result<()> {
+pub fn execute_run(
+    plan: &Plan<'_>,
+    target_name: &str,
+    host_platform: Platform,
+    repo_root: &Path,
+    host: &Host,
+) -> Result<()> {
     let target = plan
         .manifest
         .get(target_name)
@@ -420,12 +432,12 @@ pub fn execute_run(plan: &Plan<'_>, target_name: &str, host: Platform, repo_root
     if target.run.is_empty() {
         bail!("target {target_name:?} has no run steps defined");
     }
-    let order = plan.order_for(&[target_name], host)?;
-    execute(plan, &order, repo_root)?;
+    let order = plan.order_for(&[target_name], host_platform)?;
+    run_build_cascade(plan, &order, repo_root, host)?;
 
     println!("xtask: ==== running target {target_name} ====");
     for step in &target.run {
-        run_step(step, repo_root).with_context(|| format!("while running target {target_name}"))?;
+        run_step(step, repo_root, host).with_context(|| format!("while running target {target_name}"))?;
     }
     Ok(())
 }
