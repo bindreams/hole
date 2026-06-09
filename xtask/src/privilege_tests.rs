@@ -123,12 +123,29 @@ fn drop_actually_changes_uid() {
     };
     assert!(matches!(host.plan(Privilege::Unprivileged), Transition::DropTo(_)));
 
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("uid.txt");
+    // The DROPPED (unprivileged) child must be able to write the output. A
+    // `tempfile::tempdir()` is created by this root process at 0700 — and under
+    // sudo the platform temp dir can be root-owned 0700 (macOS `/var/folders`),
+    // untraversable by the dropped user. Use a pre-created world-writable file
+    // in `/tmp` (1777 + sticky on both Linux and macOS): the dropped child can
+    // truncate+write an existing 0666 file there with only directory traversal.
+    use std::os::unix::fs::PermissionsExt;
+    let out = std::path::PathBuf::from(format!("/tmp/hole-xtask-drop-{}.txt", std::process::id()));
+    std::fs::write(&out, "").unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o666)).unwrap();
+
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(format!("id -u > {}", out.display()));
-    crate::privilege::run_command(&host, Privilege::Unprivileged, cmd, &Groups::Full, "id -u").unwrap();
-    let got: u32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
+    let result = crate::privilege::run_command(&host, Privilege::Unprivileged, cmd, &Groups::Full, "id -u");
+    let contents = std::fs::read_to_string(&out).ok();
+    let _ = std::fs::remove_file(&out);
+
+    result.unwrap();
+    let got: u32 = contents
+        .expect("dropped child produced no output")
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(got, uid, "child did not drop to the invoking user's uid");
 }
 
