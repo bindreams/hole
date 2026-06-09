@@ -170,3 +170,94 @@ fn quoter_roundtrips_through_commandlinetoargvw() {
         );
     }
 }
+
+// ===== Windows de-elevation effect tests =============================================================================
+
+// These EFFECT tests need an ELEVATED process to exercise linked-token
+// de-elevation. Labeled `windows_elevated`, they run by default (the elevated
+// CI runner / `xtask-tests` target supplies elevation). Opt out locally with
+// SKULD_LABELS="!windows_elevated". They do NOT use skuld's `requires` (which
+// would mark the trial ignored — a green-build skip); they assert elevation and
+// fail LOUDLY otherwise.
+#[cfg(windows)]
+#[skuld::label]
+const WINDOWS_ELEVATED: skuld::Label;
+
+#[cfg(windows)]
+fn require_elevated() {
+    let host = crate::privilege::Host::detect();
+    assert!(
+        host.elevated,
+        "this test requires an elevated process (to obtain the linked token for de-elevation). \
+         Run via the elevated `xtask-tests` target / the elevated CI runner, or opt out locally \
+         with SKULD_LABELS=\"!windows_elevated\"."
+    );
+    assert!(
+        host.invoking_user.is_some(),
+        "elevated but no linked token available — cannot de-elevate. The runner must have \
+         EnableLUA=1 with a linked (limited) token."
+    );
+}
+
+// Drop effect: a child launched via the Unprivileged transition must land at
+// Medium integrity, not High. We assert on the locale-independent integrity SID
+// in `whoami /groups`: S-1-16-8192 (Medium) present, S-1-16-12288 (High) absent.
+#[cfg(windows)]
+#[skuld::test(labels = [WINDOWS_ELEVATED])]
+fn de_elevate_drops_child_integrity_below_high() {
+    use crate::privilege::{Groups, Host, Privilege};
+    use std::process::Command;
+
+    require_elevated();
+    let host = Host::detect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("groups.txt");
+    // cmd's `>` redirect writes the file directly (not through our relay pipes),
+    // proving the child ran AND letting us inspect its integrity SID.
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(format!("whoami /groups > \"{}\"", out.display()));
+    crate::privilege::run_command(&host, Privilege::Unprivileged, cmd, &Groups::Full, "whoami /groups").unwrap();
+
+    let groups = std::fs::read_to_string(&out).expect("child did not write its groups file");
+    assert!(
+        groups.contains("S-1-16-8192"),
+        "de-elevated child is not at Medium integrity (no S-1-16-8192 in whoami /groups):\n{groups}"
+    );
+    assert!(
+        !groups.contains("S-1-16-12288"),
+        "de-elevated child is still at High integrity (S-1-16-12288 present):\n{groups}"
+    );
+}
+
+// Suspend rendezvous: prove CREATE_SUSPENDED survives the seclogon round-trip.
+// The proof is race-free — `ResumeThread` returns the thread's PREVIOUS suspend
+// count, which is 1 for a CREATE_SUSPENDED thread and 0 if the flag was ignored.
+// There is no byte-peek and no timing. We additionally confirm stdio works by
+// reading a post-resume sentinel the child wrote to a file.
+#[cfg(windows)]
+#[skuld::test(labels = [WINDOWS_ELEVATED])]
+fn de_elevate_creates_child_suspended() {
+    use std::process::Command;
+
+    require_elevated();
+
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("ran.txt");
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(format!("echo resumed > \"{}\"", sentinel.display()));
+
+    let resume_count = crate::privilege::windows::de_elevate_for_test(&mut cmd, "suspend-proof").unwrap();
+    assert_eq!(
+        resume_count, 1,
+        "ResumeThread returned previous suspend count {resume_count}, expected 1; \
+         CREATE_SUSPENDED was not honored through seclogon"
+    );
+
+    // Stdio/exec actually worked: the child ran to completion past the resume.
+    let body = std::fs::read_to_string(&sentinel).expect("child did not write its sentinel file");
+    assert!(
+        body.contains("resumed"),
+        "sentinel file had unexpected content: {body:?}"
+    );
+}
