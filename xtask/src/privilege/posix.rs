@@ -106,13 +106,24 @@ fn drop_to(mut cmd: Command, user: &InvokingUser, groups: &Groups) -> Result<Com
         bail!("internal: non-POSIX InvokingUser");
     };
     let (uid, gid) = (*uid, *gid);
-    let group_gids: Vec<libc::gid_t> = match groups {
+    let mut group_gids: Vec<libc::gid_t> = match groups {
         Groups::Full => getgrouplist(name, gid)?,
         Groups::Only(names) => names
             .iter()
             .map(|g| group_gid(g).ok_or_else(|| anyhow!("group {g:?} not found (getgrnam)")))
             .collect::<Result<_>>()?,
     };
+    // macOS enforces NGROUPS_MAX (16) in setgroups(2): a longer list fails with
+    // EINVAL (os error 22) — which is exactly how a many-group user's drop blew
+    // up on the macOS CI runner. Cap to the OS limit (a no-op under Linux's much
+    // larger limit). The primary gid is set separately via setgid below, and
+    // supplementary membership beyond the cap is resolved dynamically by the OS
+    // (opendirectoryd on macOS) the same way it is for a normal interactive login.
+    let ngroups_max = match unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) } {
+        n if n > 0 => n as usize,
+        _ => 16,
+    };
+    group_gids.truncate(ngroups_max);
     cmd.env("HOME", home).env("USER", name).env("LOGNAME", name);
     // SAFETY: runs in the forked child pre-exec; no allocation (group_gids moved
     // in, read-only), only async-signal-safe syscalls in setgroups→setgid→setuid order.
