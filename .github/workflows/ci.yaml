@@ -322,6 +322,33 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
+  # Orchestrator (xtask) tests, incl. the privilege EFFECT tests (labels root /
+  # windows_elevated). `cargo xtask run xtask-tests` builds the nextest archive
+  # unprivileged, then runs it elevated (the target's `run:` block is `elevated:
+  # true`): POSIX self-elevates via passwordless `sudo -n`; the Windows runner is
+  # already elevated. Running for real is the point — the drop/de-elevate effect
+  # tests fail loudly here if privilege normalization is broken.
+  test-xtask:
+    name: Test xtask (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: windows, arch: amd64, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Run xtask tests (elevated)
+        run: cargo xtask run xtask-tests
+
   # Unit tests for the dev/admin Python scripts (scripts/dev_tests.py). Runs
   # `uv run` DIRECTLY (not via `cargo xtask run scripts-tests`) to avoid
   # provisioning a Rust toolchain + compiling xtask just to shell out to
