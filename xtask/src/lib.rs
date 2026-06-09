@@ -17,6 +17,7 @@ pub mod galoshes;
 pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
+pub mod privilege;
 pub mod stage;
 pub mod test_binaries;
 pub mod upstream_v2ray;
@@ -31,6 +32,9 @@ mod manifest_tests;
 #[cfg(test)]
 #[path = "orchestrate_tests.rs"]
 mod orchestrate_tests;
+#[cfg(test)]
+#[path = "privilege_tests.rs"]
+mod privilege_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;

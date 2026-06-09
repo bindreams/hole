@@ -40,6 +40,30 @@ serde_yml = "0.0.12"
 indexmap = { version = "2", features = ["serde"] }
 petgraph = "0.8"
 
+# Privilege normalization (`elevated:` flag, bindreams/hole#453). POSIX uses nix
+# for typed User/Uid/Gid (feature `user`) and libc for the actual syscalls
+# (setgroups/getgrouplist absent from nix on apple_targets, so libc is uniform
+# across linux + macos).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }
+libc = "0.2"
+
+# Windows privilege control: elevation detection + UAC self-elevation
+# (ShellExecuteEx runas) + linked-token de-elevation (CreateProcessWithTokenW)
+# + Job-Object reaping + pipe stdio. Version matches the workspace (0.62).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 skuld = { workspace = true }
 tempfile = "3"
