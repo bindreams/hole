@@ -2,9 +2,10 @@
 //! implementation in `crates/hole/src/setup.rs::quote_arg`).
 //!
 //! Used to build the `lpParameters` string for `ShellExecuteExW` and the
-//! `lpCommandLine` for `CreateProcessWithTokenW`. In debug builds,
-//! [`join_command_line`] round-trips every result through the real
-//! `CommandLineToArgvW` API to verify correctness.
+//! `lpCommandLine` for `CreateProcessWithTokenW`. A unit test in
+//! `privilege_tests.rs` verifies round-trip correctness by feeding
+//! [`join_command_line`]'s output back through the real `CommandLineToArgvW`
+//! API.
 
 /// Quote a single argument per the MSDN `CommandLineToArgvW` specification:
 /// backslashes are doubled only when they immediately precede a `"`, trailing

@@ -22,11 +22,10 @@ pub(super) fn detect(is_ci: bool) -> Host {
     }
 }
 
-/// The drop target: HOLE_BUILD_USER (explicit override) else SUDO_USER.
-/// Extends `scripts/_lib.py::sudo_target_user` (which reads only SUDO_USER) with
-/// the HOLE_BUILD_USER escape hatch; the `=="root"` / unresolvable → none rules
-/// match it. Note `HOLE_BUILD_USER=root` resolves to None (no drop) — intended:
-/// it's the documented way to assert "no unprivileged user to honor."
+/// The drop target: HOLE_BUILD_USER (explicit override) else SUDO_USER. A value
+/// of `"root"` or one that does not resolve (a `getpwnam` miss, warned) yields
+/// None — no drop. Note `HOLE_BUILD_USER=root` resolves to None (no drop) —
+/// intended: it's the documented way to assert "no unprivileged user to honor."
 fn resolve_invoking_user() -> Option<InvokingUser> {
     let name = std::env::var("HOLE_BUILD_USER")
         .ok()
@@ -157,7 +156,7 @@ fn getgrouplist(name: &str, gid: u32) -> Result<Vec<libc::gid_t>> {
     }
 }
 
-fn group_gid(name: &str) -> Option<libc::gid_t> {
+pub(crate) fn group_gid(name: &str) -> Option<libc::gid_t> {
     let c = CString::new(name).ok()?;
     // SAFETY: getgrnam returns a pointer into static storage or null.
     let p = unsafe { libc::getgrnam(c.as_ptr()) };

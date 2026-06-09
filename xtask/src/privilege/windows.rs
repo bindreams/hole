@@ -259,18 +259,38 @@ fn assert_child_is_64bit(exe: &std::path::Path) -> Result<()> {
     const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
     const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
 
+    // Read a too-short file as a hard error rather than reading garbage: a
+    // truncated/non-PE file would otherwise yield an arbitrary `Machine` value.
+    let short = |what: &str| format!("child exe {} is too short to be a PE image ({what})", exe.display());
+
     let mut f = std::fs::File::open(exe).with_context(|| format!("opening child exe {}", exe.display()))?;
-    // DOS header: e_lfanew (offset of the PE header) lives at 0x3C.
+    // DOS header: "MZ" magic at offset 0, then e_lfanew (PE header offset) at 0x3C.
+    let mut dos = [0u8; 2];
+    f.read_exact(&mut dos).map_err(|_| anyhow!(short("no DOS header")))?;
+    if &dos != b"MZ" {
+        bail!(
+            "child exe {} is not a PE image (missing \"MZ\" DOS signature)",
+            exe.display()
+        );
+    }
     f.seek(SeekFrom::Start(0x3C)).context("seeking to e_lfanew")?;
     let mut lfanew = [0u8; 4];
-    f.read_exact(&mut lfanew).context("reading e_lfanew")?;
+    f.read_exact(&mut lfanew).map_err(|_| anyhow!(short("no e_lfanew")))?;
     let pe_off = u32::from_le_bytes(lfanew) as u64;
     // PE header: 4-byte "PE\0\0" signature, then the COFF header whose first
     // field (2 bytes) is Machine.
-    f.seek(SeekFrom::Start(pe_off + 4))
-        .context("seeking to the COFF Machine field")?;
+    f.seek(SeekFrom::Start(pe_off)).context("seeking to the PE signature")?;
+    let mut sig = [0u8; 4];
+    f.read_exact(&mut sig).map_err(|_| anyhow!(short("no PE signature")))?;
+    if &sig != b"PE\0\0" {
+        bail!(
+            "child exe {} is not a PE image (missing \"PE\\0\\0\" signature at e_lfanew)",
+            exe.display()
+        );
+    }
     let mut machine = [0u8; 2];
-    f.read_exact(&mut machine).context("reading the PE Machine field")?;
+    f.read_exact(&mut machine)
+        .map_err(|_| anyhow!(short("no COFF Machine field")))?;
     let machine = u16::from_le_bytes(machine);
     match machine {
         IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64 => Ok(()),

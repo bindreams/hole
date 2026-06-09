@@ -132,6 +132,49 @@ fn drop_actually_changes_uid() {
     assert_eq!(got, uid, "child did not drop to the invoking user's uid");
 }
 
+// Unit test for the getgrnam-backed `group_gid` (the resolution path used by
+// `Groups::Only`). Portable and root-free: resolve our own real primary gid,
+// look up its group name via getgrgid, then assert group_gid(name) round-trips
+// back to that gid. The negative lookup runs unconditionally.
+#[cfg(unix)]
+#[skuld::test]
+fn group_gid_resolves_own_primary_group_and_misses_unknown() {
+    use crate::privilege::posix::group_gid;
+    use std::ffi::CStr;
+
+    // SAFETY: getgid never fails and has no preconditions.
+    let gid = unsafe { libc::getgid() };
+    // SAFETY: getgrgid returns a pointer into static storage or null; we read
+    // gr_name only while the (non-null) record is valid, before any other libc
+    // call that could clobber the static buffer.
+    let name: Option<String> = unsafe {
+        let grp = libc::getgrgid(gid);
+        if grp.is_null() {
+            None
+        } else {
+            CStr::from_ptr((*grp).gr_name).to_str().ok().map(str::to_owned)
+        }
+    };
+
+    // If the environment can resolve our primary group's name, the getgrnam
+    // path must agree on the gid. (Some minimal containers lack a name for the
+    // primary gid; tolerate that — it is not the unit under test.)
+    if let Some(name) = name {
+        assert_eq!(
+            group_gid(&name),
+            Some(gid),
+            "group_gid({name:?}) must round-trip to the primary gid {gid}"
+        );
+    }
+
+    // The not-found path is unconditional.
+    assert_eq!(
+        group_gid("hole-no-such-group-zzzzz"),
+        None,
+        "a nonexistent group name must resolve to None"
+    );
+}
+
 // ===== Windows quoter ================================================================================================
 
 // The CommandLineToArgvW quoter must round-trip exactly: every arg we quote and

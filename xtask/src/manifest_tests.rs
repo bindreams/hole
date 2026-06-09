@@ -915,6 +915,24 @@ targets:
 }
 
 #[skuld::test]
+fn elevated_true_on_single_mapping_build_step_is_rejected() {
+    // The single-mapping build form (one tagged step as the value, not a list)
+    // must hit the same guard as the list and `{elevated, steps}` block forms.
+    let err = parse(
+        r#"
+targets:
+  foo:
+    platforms: windows/amd64
+    build:
+      bash: "compile"
+      elevated: true
+"#,
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("elevated"));
+}
+
+#[skuld::test]
 fn elevated_true_build_block_default_is_rejected() {
     let err = parse("targets:\n  foo:\n    platforms: windows/amd64\n    build:\n      elevated: true\n      steps:\n        - \"compile\"\n").unwrap_err();
     assert!(format!("{err:#}").contains("elevated"));
