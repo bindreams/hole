@@ -346,6 +346,16 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # Hosted Windows runners are elevated but expose no UAC-split linked token,
+      # so the linked-token de-elevation effect tests (label `windows_elevated`)
+      # have nothing to de-elevate to and can't run here — exclude them (they're
+      # validated on an interactive elevated Windows session). The quoter and the
+      # pure decision tests still run natively. POSIX legs run everything,
+      # including the `root` drop test (the elevated run supplies root + SUDO_USER).
+      - name: Exclude linked-token effect tests on hosted Windows
+        if: matrix.os == 'windows'
+        shell: bash
+        run: echo "SKULD_LABELS=!windows_elevated" >> "$GITHUB_ENV"
       - name: Run xtask tests (elevated)
         run: cargo xtask run xtask-tests
 

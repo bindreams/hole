@@ -90,6 +90,16 @@ fn ci_tripwire_requires_all_three_conditions() {
     ));
 }
 
+#[skuld::test]
+fn windows_elevated_no_linked_token_warns_not_hard_fails_even_under_ci() {
+    // GitHub-hosted Windows runners are elevated but expose no UAC-split linked
+    // token, so there is nothing to de-elevate to. Windows has no root-owned-file
+    // hazard, so this must NOT trip the (POSIX-only) CI hard-fail — it warns and
+    // runs the step as-is. Regression guard for the Windows-CI breakage.
+    let h = host(true, None, true, false, ElevateStrategy::Windows);
+    assert!(matches!(h.plan(Privilege::Unprivileged), Transition::WarnVacuous(_)));
+}
+
 // Effect test: actually drop and read back the child uid. Needs root; labeled
 // `root`, runs by default (CI supplies root via the elevated xtask-tests
 // target). Opt out locally with SKULD_LABELS="!root". Does NOT use skuld's

@@ -120,16 +120,29 @@ impl Host {
     pub fn plan(&self, target: Privilege) -> Transition {
         match (target, self.elevated) {
             (Privilege::Unprivileged, false) => Transition::RunAsIs,
-            (Privilege::Unprivileged, true) => match &self.invoking_user {
-                Some(user) => Transition::DropTo(user.clone()),
-                None if self.is_ci => Transition::HardFail(
+            (Privilege::Unprivileged, true) => match (&self.invoking_user, self.strategy) {
+                (Some(user), _) => Transition::DropTo(user.clone()),
+                // POSIX root with no drop target. The CI hard-fail is a dormant
+                // tripwire: a root *container* job in CI would leave root-owned
+                // artifacts, so refuse. Off-CI, warn and proceed.
+                (None, ElevateStrategy::Posix) if self.is_ci => Transition::HardFail(
                     "running elevated under CI with no invoking user to drop to \
                      (set HOLE_BUILD_USER=<user> to designate a drop target)"
                         .into(),
                 ),
-                None => Transition::WarnVacuous(
+                (None, ElevateStrategy::Posix) => Transition::WarnVacuous(
                     "running elevated with no unprivileged user to honor; proceeding \
                      as-is (set HOLE_BUILD_USER=<user> to drop)"
+                        .into(),
+                ),
+                // Windows with no UAC-split linked token to de-elevate to (e.g. a
+                // hosted CI runner whose elevated token has no linked sibling).
+                // Windows has no root-owned-file hazard, so de-elevation is
+                // best-effort — proceed as-is. Deliberately NOT a CI hard-fail:
+                // the tripwire is POSIX-only.
+                (None, ElevateStrategy::Windows) => Transition::WarnVacuous(
+                    "elevated with no linked token to de-elevate to; running the step \
+                     as-is (best-effort de-elevation)"
                         .into(),
                 ),
             },
