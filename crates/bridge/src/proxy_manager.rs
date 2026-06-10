@@ -460,7 +460,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
         let plugin_local = plugin_chain.as_ref().map(|c| c.local_addr());
-        let ss_config = build_ss_config(config, plugin_local)?;
+        let ss_config = build_ss_config(config, plugin_local, None)?;
 
         // SocksOnly mode: skip everything routing-related (wintun preload,
         // DNS resolution, gateway detection, route installation). Just start
