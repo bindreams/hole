@@ -36,6 +36,7 @@ function toggleSection(hdr: HTMLElement) {
     body.style.transform = "translateY(0)";
     body.style.opacity = "1";
     tri?.classList.remove("collapsed");
+    hdr.setAttribute("aria-expanded", "true");
 
     const cleanup = (e: Event) => {
       // Only react to the max-height transition (not child transitions).
@@ -63,6 +64,7 @@ function toggleSection(hdr: HTMLElement) {
     body.style.transform = "translateY(-100%)";
     body.style.opacity = "0";
     tri?.classList.add("collapsed");
+    hdr.setAttribute("aria-expanded", "false");
 
     const cleanup = (e: Event) => {
       if (e.target !== clip) return;
