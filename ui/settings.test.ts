@@ -161,3 +161,108 @@ describe("settings toggles", () => {
     expect(intercept.getAttribute("aria-checked")).toBe("false");
   });
 });
+
+function pressOn(el: Element, key: string) {
+  el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+}
+
+describe("settings dropdowns", () => {
+  it("trigger click opens the menu, sets aria-expanded, focuses the selected option", async () => {
+    await setup();
+    const btn = document.getElementById("select-theme")!;
+    const menu = document.getElementById("menu-theme")!;
+    btn.click();
+    expect(menu.classList.contains("open")).toBe(true);
+    expect(btn.getAttribute("aria-expanded")).toBe("true");
+    expect(document.activeElement).toBe(menu.querySelector('[data-value="dark"]'));
+  });
+
+  it("ArrowDown on the closed trigger opens and focuses the selected option", async () => {
+    await setup();
+    const btn = document.getElementById("select-theme")!;
+    const menu = document.getElementById("menu-theme")!;
+    pressOn(btn, "ArrowDown");
+    expect(menu.classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(menu.querySelector('[data-value="dark"]'));
+  });
+
+  it("arrows move focus between options; Escape closes and refocuses the trigger", async () => {
+    await setup();
+    const btn = document.getElementById("select-theme")!;
+    const menu = document.getElementById("menu-theme")!;
+    btn.click();
+    pressOn(document.activeElement!, "ArrowDown");
+    expect(document.activeElement).toBe(menu.querySelector('[data-value="system"]'));
+    pressOn(document.activeElement!, "ArrowUp");
+    pressOn(document.activeElement!, "ArrowUp");
+    expect(document.activeElement).toBe(menu.querySelector('[data-value="light"]'));
+    pressOn(document.activeElement!, "Escape");
+    expect(menu.classList.contains("open")).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(btn);
+  });
+
+  it("option click selects: classes, aria-selected, button text, config, focus return", async () => {
+    await setup();
+    const btn = document.getElementById("select-theme")!;
+    const menu = document.getElementById("menu-theme")!;
+    btn.click();
+    (menu.querySelector('[data-value="light"]') as HTMLElement).click();
+    expect(mainMock.config!.theme).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light"); // applyTheme onChange ran
+    expect(btn.textContent).toBe("Light");
+    expect(menu.classList.contains("open")).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    const light = menu.querySelector('[data-value="light"]')!;
+    const dark = menu.querySelector('[data-value="dark"]')!;
+    expect(light.classList.contains("selected")).toBe(true);
+    expect(light.getAttribute("aria-selected")).toBe("true");
+    expect(dark.getAttribute("aria-selected")).toBe("false");
+    expect(document.activeElement).toBe(btn);
+    expect(mainMock.saveConfig).toHaveBeenCalled();
+  });
+
+  it("DNS protocol dropdown goes through the same path and patches config.dns", async () => {
+    await setup();
+    const btn = document.getElementById("select-dns-protocol")!;
+    const menu = document.getElementById("menu-dns-protocol")!;
+    btn.click();
+    expect(document.activeElement).toBe(menu.querySelector('[data-value="https"]'));
+    (menu.querySelector('[data-value="plain-udp"]') as HTMLElement).click();
+    expect((mainMock.config!.dns as { protocol: string }).protocol).toBe("plain_udp");
+    expect(btn.textContent).toBe("Plain UDP");
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("opening one menu closes others and resets their trigger's aria-expanded", async () => {
+    await setup();
+    const themeBtn = document.getElementById("select-theme")!;
+    const themeMenu = document.getElementById("menu-theme")!;
+    const startBtn = document.getElementById("select-on-startup")!;
+    themeBtn.click();
+    startBtn.click();
+    expect(themeMenu.classList.contains("open")).toBe(false);
+    expect(themeBtn.getAttribute("aria-expanded")).toBe("false");
+    expect(document.getElementById("menu-on-startup")!.classList.contains("open")).toBe(true);
+  });
+
+  it("outside click closes menus without stealing focus", async () => {
+    await setup();
+    const btn = document.getElementById("select-theme")!;
+    const menu = document.getElementById("menu-theme")!;
+    btn.click();
+    document.body.click();
+    expect(menu.classList.contains("open")).toBe(false);
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).not.toBe(btn);
+  });
+
+  it("renderSettings syncs aria-selected from config", async () => {
+    mainMock.config!.theme = "system";
+    await setup();
+    const menu = document.getElementById("menu-theme")!;
+    expect(menu.querySelector('[data-value="system"]')!.getAttribute("aria-selected")).toBe("true");
+    expect(menu.querySelector('[data-value="dark"]')!.getAttribute("aria-selected")).toBe("false");
+    expect(document.getElementById("select-theme")!.textContent).toBe("System");
+  });
+});
