@@ -17,12 +17,12 @@ group = "garter"
 workspace = true
 
 [features]
-# Exposes the `test_utils` public module. Off by default — enabled
-# only when running garter's own tests (set on the [[test]] entries
-# below via `required-features`) or by external consumers that want
-# to use `WaitableWriter` in their own tests. Production builds of
-# downstream crates (e.g. `hole`) do NOT enable this and therefore
-# do NOT pull in `tracing-subscriber`.
+# Exposes the `test_utils` public module and builds the `mock-plugin`
+# fixture bin. Off by default — enabled only when running garter's own
+# tests or by external consumers that want `WaitableWriter` in their own
+# tests. Production builds of downstream crates (e.g. `hole`) do NOT
+# enable this and therefore do NOT pull in `tracing-subscriber` or build
+# the fixture.
 test-utils = ["dep:tracing-subscriber"]
 
 [dependencies]
@@ -42,6 +42,16 @@ async-trait = { workspace = true }
 
 [lib]
 harness = false
+
+# SIP003u echo fixture for the integration tests below. A [[bin]] of THIS
+# package so cargo sets `CARGO_BIN_EXE_mock-plugin` for tests/*.rs and
+# nextest ships it inside archives (tests must never build it themselves;
+# see tests/common/mod.rs). Same shape as tombstone's `crash_child`.
+[[bin]]
+name = "mock-plugin"
+path = "src/bin/mock_plugin.rs"
+test = false
+required-features = ["test-utils"]
 
 [dev-dependencies]
 skuld = { workspace = true }

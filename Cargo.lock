@@ -4065,15 +4065,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-plugin"
-version = "0.1.0"
-dependencies = [
- "garter",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

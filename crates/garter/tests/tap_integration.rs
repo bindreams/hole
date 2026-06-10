@@ -11,8 +11,6 @@
 // sanctioned-test-file exception.
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -21,26 +19,8 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 use garter::{BinaryPlugin, ChainPlugin, TapPlugin};
 
-fn mock_plugin_path() -> PathBuf {
-    let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "mock-plugin"])
-        .status()
-        .expect("failed to build mock-plugin");
-    assert!(status.success(), "mock-plugin build failed");
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/garter -> crates/
-    path.pop(); // crates/ -> workspace root
-    path.push("target");
-    path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-    path.push(if cfg!(windows) {
-        "mock-plugin.exe"
-    } else {
-        "mock-plugin"
-    });
-    assert!(path.exists(), "mock-plugin not found at {}", path.display());
-    path
-}
+mod common;
+use common::mock_plugin_path;
 
 #[skuld::test]
 async fn tap_relays_data_through_binary_plugin_to_echo_server() {
