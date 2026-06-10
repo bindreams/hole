@@ -28,7 +28,9 @@ name = "cargo clippy"
 # `ui/dist/` because `tauri/custom-protocol` triggers `tauri-codegen`'s
 # embed step. Production lint coverage runs under `clippy-hole` in CI
 # (which uses the same flag). See bindreams/hole#372.
-entry = "cargo clippy --all-targets --no-default-features -- -D warnings"
+# `--features garter/test-utils`: garter's fixture bin + feature-gated
+# tests are otherwise silently excluded from `--all-targets`.
+entry = "cargo clippy --all-targets --no-default-features --features garter/test-utils -- -D warnings"
 language = "system"
 types = ["rust"]
 pass_filenames = false
