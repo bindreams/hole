@@ -440,7 +440,7 @@ def test_path_spec_workspace_engineering_patterns():
         # under raw gitignore — the boy-scout fix for the migration bug.
         ("crates/galoshes/Cargo.toml", False),
         ("crates/garter/Cargo.toml", False),
-        ("crates/mock-plugin/Cargo.toml", False),
+        ("crates/garter-bin/Cargo.toml", False),
         ("crates/galoshes/prek.toml", False),
         # crates/ex-ray/go.mod IS matched, but via the
         # `crates/ex-ray/**` pattern (not via root-anchored `Cargo.toml`).
