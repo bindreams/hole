@@ -13,7 +13,7 @@ pub enum ConfigError {
     Read { source: std::io::Error },
     // Carries only content-safe scalars (category + position), NOT the
     // `serde_json::Error`: its `Display` echoes a fragment of the input near the
-    // error, which for a config can include a password (see commands_tests.rs).
+    // error, which for a config can include a password (see config_tests.rs).
     // Dropping the source makes a content leak structurally impossible (even via
     // `Debug`), while classify() + line/column keep the message actionable.
     #[error("failed to parse config file: {kind} (line {line}, column {column})")]

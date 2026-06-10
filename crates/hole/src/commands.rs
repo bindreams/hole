@@ -217,9 +217,9 @@ fn auto_select_first_server(config: &mut AppConfig) {
 ///
 /// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
 /// emits `warn!` on validate/parse failure and on config-save failure. The
-/// save-failure path returns `ImportFailure::SaveFailed` (no detail in
-/// the wire form) because the underlying `io::Error` includes the
-/// config-file path (PII on Windows); the full detail still lands in
+/// save-failure path returns `ImportFailure::SaveFailed` (no detail in the
+/// wire form) — the structured wire variant is deliberately detail-free; the
+/// full `ConfigError` (path- and content-free) plus the config path land in
 /// `gui.log` via `warn!`.
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, ImportFailure> {
