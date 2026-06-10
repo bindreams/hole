@@ -611,6 +611,10 @@ order. (0,2,0) > (0,1,0). */
 
 .section-clip.collapsed {
   max-height: 0;
+  /* Belt-and-braces with the inert attribute set by toggleSection:
+   * visibility removes descendants from the tab order on engines too old
+   * for inert. Set only once fully collapsed, so the slide-out animates. */
+  visibility: hidden;
 }
 
 .section-body {
@@ -1164,6 +1168,9 @@ td.del-cell {
 
 /* Settings: toggle switch -----  */
 .toggle {
+  /* Block like the div it replaced: an empty inline-block button adds the
+   * line-box strut below its baseline, growing every settings row. */
+  display: block;
   width: 36px;
   height: 20px;
   background: var(--toggle-track);
