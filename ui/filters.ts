@@ -120,6 +120,7 @@ export function renderFilters() {
     const handle = document.createElement("span");
     handle.className = "drag-handle";
     handle.textContent = "\u283F"; // ⠿ braille pattern dots-123456
+    handle.setAttribute("aria-hidden", "true"); // decorative; drag is pointer-only
     divAddr.appendChild(handle);
 
     // The address is a button on editable rows (activation starts the
@@ -157,6 +158,7 @@ export function renderFilters() {
       const chev = document.createElement("span");
       chev.className = "chev";
       chev.textContent = "\u25BE";
+      chev.setAttribute("aria-hidden", "true"); // decorative; keeps it out of the button's name
       divMatch.appendChild(chev);
     }
 
@@ -182,6 +184,7 @@ export function renderFilters() {
       const chev = document.createElement("span");
       chev.className = "chev";
       chev.textContent = "\u25BE";
+      chev.setAttribute("aria-hidden", "true"); // decorative; keeps it out of the button's name
       divAction.appendChild(chev);
     }
 
@@ -197,7 +200,7 @@ export function renderFilters() {
       delBtn.type = "button";
       delBtn.className = "filter-del";
       delBtn.textContent = "\u2715";
-      delBtn.setAttribute("aria-label", "Delete rule");
+      delBtn.setAttribute("aria-label", rule.address ? `Delete rule for ${rule.address}` : "Delete rule");
       tdDel.appendChild(delBtn);
     } else {
       // Default wildcard rule — show a lock icon to indicate it cannot be deleted.
@@ -217,7 +220,9 @@ export function renderFilters() {
     tbody.appendChild(tr);
   }
 
-  if (restoreSelector) tbody.querySelector<HTMLElement>(restoreSelector)?.focus();
+  // preventScroll: restoration preserves tab position invisibly — a
+  // background re-render must not yank the viewport to the element.
+  if (restoreSelector) tbody.querySelector<HTMLElement>(restoreSelector)?.focus({ preventScroll: true });
 
   // Re-evaluate test filtering after render.
   evaluateTestFilter();
@@ -251,6 +256,10 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
 
   function commit() {
     if (editingIndex !== index) return; // Already committed or cancelled.
+    // Refocus eligibility is decided BEFORE the re-render: only an edit
+    // ending with the input still focused (Enter/Escape) may move focus
+    // afterwards — a blur-commit from clicking elsewhere must not.
+    const shouldRefocus = document.activeElement === input;
     editingIndex = -1;
 
     const newValue = input.value.trim();
@@ -263,18 +272,19 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
       saveConfig();
     }
     renderFilters();
-    refocusAddrAfterEdit(index);
+    refocusAddrAfterEdit(index, shouldRefocus);
   }
 
   function cancel() {
     if (editingIndex !== index) return;
+    const shouldRefocus = document.activeElement === input;
     editingIndex = -1;
     // If the original address was empty (new rule), remove it.
     if (!original && config?.filters[index]) {
       config.filters.splice(index, 1);
     }
     renderFilters();
-    refocusAddrAfterEdit(index);
+    refocusAddrAfterEdit(index, shouldRefocus);
   }
 
   input.addEventListener("keydown", (e) => {
@@ -329,11 +339,16 @@ function focusCellButton(index: number, field: string) {
 }
 
 /**
- * Refocus an address button after an edit-triggered re-render — but only
- * when the re-render actually dropped focus to <body>. Blur-commits caused
- * by clicking another control must not steal focus back.
+ * Refocus an address button after an edit-triggered re-render.
+ * @param {number} index - The edited rule's index.
+ * @param {boolean} shouldRefocus - Whether the input held focus when the
+ *   edit ended (captured before the re-render). False for blur-commits,
+ *   which must never steal focus from wherever the user clicked.
  */
-function refocusAddrAfterEdit(index: number) {
+function refocusAddrAfterEdit(index: number, shouldRefocus: boolean) {
+  if (!shouldRefocus) return;
+  // renderFilters' own focus capture usually restores the address button
+  // already; this fallback covers a removed row (cancelled new rule).
   if (document.activeElement !== document.body) return;
   const addr = tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] .filter-addr`);
   (addr ?? addBtn).focus();
@@ -365,6 +380,7 @@ function toggleDropdown(td: HTMLTableCellElement, index: number) {
   const dropdown = document.createElement("div") as HTMLDivElement & { _td?: HTMLTableCellElement };
   dropdown.className = "inline-dropdown open";
   dropdown.setAttribute("role", "listbox");
+  dropdown.setAttribute("aria-label", field === "matching" ? "Matching" : "Action");
   dropdown._td = td; // Tag so we can detect toggle clicks.
 
   const cellBtn = td.querySelector<HTMLElement>(".cp");

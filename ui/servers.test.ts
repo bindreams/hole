@@ -8,8 +8,9 @@ const mainMock: {
   saveConfig: vi.fn().mockResolvedValue(undefined),
 };
 const updateDiagnostics = vi.fn();
+const invokeMock = vi.fn<(...args: unknown[]) => Promise<unknown>>();
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ message: vi.fn(), open: vi.fn() }));
 vi.mock("./main", () => ({
   get config() {
@@ -30,6 +31,8 @@ function server(id: string, name: string) {
 beforeEach(() => {
   mainMock.saveConfig.mockClear();
   updateDiagnostics.mockClear();
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
   mainMock.config = {
     servers: [server("a", "Alpha"), server("b", "Beta"), server("c", "Gamma")],
     selected_server: "a",
@@ -102,6 +105,74 @@ describe("server delete control", () => {
     outside.focus();
     document.querySelectorAll<HTMLElement>(".srv-del")[1].click();
     expect(document.activeElement).toBe(outside);
+  });
+});
+
+describe("server test button focus", () => {
+  // Disabling the focused button drops focus to <body> in real browsers
+  // (HTML focus-fixup rule). jsdom implements neither that nor blur() on a
+  // disabled element, so the tests emulate the drop by parking focus on a
+  // temporary input and removing it (removal does reset focus to <body>).
+  function emulateFocusFixupDrop() {
+    const park = document.createElement("input");
+    document.body.appendChild(park);
+    park.focus();
+    park.remove();
+    expect(document.activeElement).toBe(document.body);
+  }
+
+  function pendingTest(): (v: unknown) => void {
+    let resolve!: (v: unknown) => void;
+    invokeMock.mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+    return resolve;
+  }
+
+  it("returns focus to the Test button when the focus-fixup dropped it to body", async () => {
+    const resolveTest = pendingTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+    const btn = document.querySelectorAll<HTMLElement>(".srv-test")[1];
+    btn.focus();
+    btn.click();
+    emulateFocusFixupDrop();
+    resolveTest(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(document.querySelectorAll<HTMLElement>(".srv-test")[1]);
+  });
+
+  it("refocuses the rebuilt Test button when the list re-renders mid-test", async () => {
+    const resolveTest = pendingTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+    const btn = document.querySelectorAll<HTMLElement>(".srv-test")[1];
+    btn.focus();
+    btn.click();
+    emulateFocusFixupDrop();
+    renderServers(); // validation-changed re-render destroys the old button
+    resolveTest(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(document.querySelectorAll<HTMLElement>(".srv-test")[1]);
+  });
+
+  it("does not steal focus if the user moved on during the test", async () => {
+    const resolveTest = pendingTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+    const btn = document.querySelectorAll<HTMLElement>(".srv-test")[1];
+    btn.focus();
+    btn.click();
+    const elsewhere = document.getElementById("import-zone")!;
+    elsewhere.focus();
+    resolveTest(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(elsewhere);
   });
 });
 

@@ -65,6 +65,9 @@ export function statusTooltipFor(v: ValidationState | null | undefined): string 
 }
 
 async function runServerTest(id: string, btn: HTMLButtonElement, status: HTMLElement) {
+  // Disabling the focused button drops focus to <body> (HTML focus-fixup
+  // rule); remember so focus can be restored once the test settles.
+  const hadFocus = document.activeElement === btn;
   btn.disabled = true;
   btn.classList.add("loading");
   status.className = "srv-status testing";
@@ -76,7 +79,24 @@ async function runServerTest(id: string, btn: HTMLButtonElement, status: HTMLEle
   } finally {
     btn.disabled = false;
     btn.classList.remove("loading");
+    // Restore only if focus is still orphaned — if the user moved on
+    // mid-test, leave them be. The validation-changed re-render may have
+    // replaced the card, so fall back to the rebuilt button.
+    if (hadFocus && (document.activeElement === document.body || document.activeElement === btn)) {
+      const target = btn.isConnected ? btn : findServerControl(id, ".srv-test");
+      target?.focus({ preventScroll: true });
+    }
   }
+}
+
+/** Find a control inside the rendered card of a given server, if any. */
+function findServerControl(serverId: string, selector: string): HTMLElement | null {
+  // Match by dataset rather than an interpolated attribute selector so
+  // the server id needs no CSS escaping.
+  for (const card of serverList.querySelectorAll<HTMLElement>(".srv")) {
+    if (card.dataset.serverId === serverId) return card.querySelector<HTMLElement>(selector);
+  }
+  return null;
 }
 
 // Rendering ===========================================================================================================
@@ -151,8 +171,7 @@ export function renderServers() {
       testBtn.type = "button";
       testBtn.className = "srv-test";
       testBtn.textContent = "Test";
-      testBtn.addEventListener("click", (e) => {
-        e.stopPropagation(); // do not trigger card selection
+      testBtn.addEventListener("click", () => {
         runServerTest(server.id, testBtn, statusDot);
       });
       card.appendChild(testBtn);
@@ -164,19 +183,17 @@ export function renderServers() {
       del.setAttribute("aria-label", `Delete ${server.name}`);
       card.appendChild(del);
 
-      // Selection: click on the card. The Test and delete buttons stop
-      // propagation themselves; the status dot is inert but must not
-      // select either.
+      // Selection: click on the card, ignoring its own controls and the
+      // inert status dot. Clicks bubble (no stopPropagation) so the
+      // document-level dropdown closers still see them.
       card.addEventListener("click", (e) => {
-        if (e.target === statusDot) return;
+        if ((e.target as HTMLElement | null)?.closest(".srv-test, .srv-del, .srv-status")) return;
         selectServer(server.id);
       });
 
-      // Deletion: click on the X button. Stop propagation so the card's
-      // selection handler never races the delete (keyboard activation
-      // synthesizes a bubbling click).
-      del.addEventListener("click", (e) => {
-        e.stopPropagation();
+      // Deletion: click on the X button (keyboard activation synthesizes a
+      // bubbling click; the card handler above ignores it via closest).
+      del.addEventListener("click", () => {
         deleteServer(server.id);
       });
 
@@ -185,14 +202,9 @@ export function renderServers() {
   }
 
   if (restore) {
-    // Match by dataset rather than an interpolated attribute selector so
-    // the server id needs no CSS escaping.
-    for (const card of serverList.querySelectorAll<HTMLElement>(".srv")) {
-      if (card.dataset.serverId === restore.serverId) {
-        card.querySelector<HTMLElement>(restore.selector)?.focus();
-        break;
-      }
-    }
+    // preventScroll: restoration preserves tab position invisibly — a
+    // background re-render must not yank the viewport to the element.
+    findServerControl(restore.serverId, restore.selector)?.focus({ preventScroll: true });
   }
 }
 

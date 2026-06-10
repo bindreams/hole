@@ -53,9 +53,18 @@ describe("filter row controls", () => {
     const del = row(1).querySelector(".filter-del")!;
     expect(del.tagName).toBe("BUTTON");
     expect((del as HTMLButtonElement).type).toBe("button");
-    expect(del.getAttribute("aria-label")).toBe("Delete rule");
+    // Each delete names its rule — N identical "Delete rule" entries are
+    // indistinguishable when browsing by button.
+    expect(del.getAttribute("aria-label")).toBe("Delete rule for example.com");
     expect(row(0).querySelector(".filter-del")).toBeNull();
     expect(row(0).querySelector(".filter-lock")).toBeTruthy();
+  });
+
+  it("decorative glyphs are hidden from the accessibility tree", async () => {
+    await setup();
+    expect(row(1).querySelector(".drag-handle")!.getAttribute("aria-hidden")).toBe("true");
+    expect(row(1).querySelector('td[data-field="matching"] .chev')!.getAttribute("aria-hidden")).toBe("true");
+    expect(row(1).querySelector('td[data-field="action"] .chev')!.getAttribute("aria-hidden")).toBe("true");
   });
 
   it("matching/action cells contain expandable buttons on non-default rows only", async () => {
@@ -109,6 +118,7 @@ describe("filter dropdowns", () => {
     expect(cp.getAttribute("aria-expanded")).toBe("true");
     const dropdown = row(1).querySelector(".inline-dropdown.open")!;
     expect(dropdown.getAttribute("role")).toBe("listbox");
+    expect(dropdown.getAttribute("aria-label")).toBe("Action");
     const opts = [...dropdown.querySelectorAll(".inline-dropdown-opt")];
     expect(opts).toHaveLength(3);
     for (const opt of opts) {
@@ -174,6 +184,25 @@ describe("address editing", () => {
     expect((mainMock.config!.filters as unknown[]).length).toBe(4);
     const input = document.querySelector<HTMLInputElement>(".inline-input")!;
     expect(document.activeElement).toBe(input);
+  });
+
+  it("blur-commit after clicking a non-focusable area does not steal focus", async () => {
+    // Click-away dismissal: focus drops to <body> before the deferred
+    // commit runs. The edit must be saved, but focus must stay where the
+    // user put it — not jump back into the table.
+    vi.useFakeTimers();
+    try {
+      await setup();
+      row(1).querySelector<HTMLElement>(".filter-addr")!.click();
+      const input = row(1).querySelector<HTMLInputElement>(".inline-input")!;
+      input.value = "kept.example.com";
+      input.blur(); // fires the blur event and moves focus to <body>
+      vi.runAllTimers();
+      expect((mainMock.config!.filters as { address: string }[])[1].address).toBe("kept.example.com");
+      expect(document.activeElement).toBe(document.body);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("blur-commit does not steal focus from a control the user clicked", async () => {
