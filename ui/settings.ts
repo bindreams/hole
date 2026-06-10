@@ -321,9 +321,12 @@ export function initSettings() {
 }
 
 /**
- * Wire the DNS forwarder UI. The sub-setting group (`#dns-nested`) mirrors
- * the proxy-server muting pattern: when the enable toggle is off, the
- * nested controls are visually greyed.
+ * Wire the DNS forwarder controls (enable + intercept toggles and the
+ * protocol dropdown). All three persist through `patchDns` because they
+ * live in the nested `config.dns` object, not top-level config keys. The
+ * sub-setting group (`#dns-nested`) mirrors the proxy-server muting
+ * pattern: when the enable toggle is off, the nested controls are
+ * visually greyed.
  */
 function wireDnsControls() {
   wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));

@@ -72,7 +72,6 @@ const SETTINGS_DOM = `
   <span class="setting-label" id="lbl-dns-enabled">DNS forwarder</span>
   <button type="button" class="toggle" id="toggle-dns-enabled" role="switch" aria-checked="false" aria-labelledby="lbl-dns-enabled"></button>
   <div class="setting-nested" id="dns-nested">
-      <span class="setting-label" id="lbl-dns-intercept">Intercept UDP/53 to other servers</span>
     <span class="setting-label" id="lbl-dns-protocol">Protocol</span>
     <div class="custom-select-wrap">
       <button type="button" class="custom-select-btn" id="select-dns-protocol" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-dns-protocol select-dns-protocol">DNS over HTTPS</button>
@@ -83,6 +82,7 @@ const SETTINGS_DOM = `
         <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="https">DNS over HTTPS</button>
       </div>
     </div>
+    <span class="setting-label" id="lbl-dns-intercept">Intercept UDP/53 to other servers</span>
     <button type="button" class="toggle" id="toggle-dns-intercept" role="switch" aria-checked="false" aria-labelledby="lbl-dns-intercept"></button>
   </div>
 `;
