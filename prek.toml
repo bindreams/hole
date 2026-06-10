@@ -13,6 +13,18 @@ language = "pygrep"
 types = ["rust"]
 
 [[repos.hooks]]
+id = "no-cargo-in-tests"
+name = "no runtime cargo invocations in test code"
+# Test code must locate prebuilt fixture binaries (CARGO_BIN_EXE_* /
+# xtask-derived locators), never build them: a concurrent `cargo build`'s
+# uplift deletes+recreates `target/<profile>/<bin>` (always, on macOS),
+# racing sibling tests' spawns. See bindreams/hole#496.
+entry = 'Command::new\("cargo"\)'
+language = "pygrep"
+types = ["rust"]
+files = '(^|/)tests/|/test_support/|_tests\.rs$'
+
+[[repos.hooks]]
 id = "cargo-fmt"
 name = "cargo fmt"
 entry = "cargo fmt"
