@@ -577,10 +577,16 @@ not show toasts** (toasts are per-call-site so a tight loop can't flood the UI).
 user-visible failures with `showToast(message, kind)` from
 [`ui/toast.ts`](ui/toast.ts) (caps at 5 visible). **Errors containing filesystem
 paths or other PII must be redacted before reaching a toast** — the detail still
-lands in `gui.log`. The `config.save` path in
-[`commands.rs`](crates/hole/src/commands.rs) is canonical: the raw `io::Error`
-holds the config-file path (PII on Windows), so the toast string is generic and
-the path is recorded only in `gui.log`.
+lands in `gui.log`. Two mechanisms are sanctioned. **(1) A PII/content-free error
+type + `warn!` with the path to `gui.log`:** `ConfigError`
+([`config.rs`](crates/common/src/config.rs)) carries the failing operation and the
+OS error, never the path, and its `Parse` variant surfaces only a category plus
+line/column — never the raw `serde_json` message (which can echo a password).
+`save_config` ([`commands.rs`](crates/hole/src/commands.rs)) logs the path via
+`warn!` and shows the path-free message in the toast. **(2) A detail-free
+structured wire variant + `warn!`** when the detail itself could carry
+content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
+`CorruptedJson` (no fields) and logs the full error.
 
 ### Logging directives (HOLE_BRIDGE_LOG)
 
