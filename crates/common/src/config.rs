@@ -13,6 +13,8 @@ pub enum ConfigError {
     Read(#[from] std::io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("config saving is disabled: the corrupt config file could not be backed up at startup")]
+    SaveBlocked,
 }
 
 // Types ===============================================================================================================

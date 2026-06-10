@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_store;
 pub mod import;
 pub mod logging;
 pub mod paths;
