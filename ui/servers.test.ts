@@ -22,7 +22,8 @@ vi.mock("./main", () => ({
   TEST_CONCURRENCY: 3,
 }));
 vi.mock("./sidebar", () => ({ updateDiagnostics: (...args: unknown[]) => updateDiagnostics(...args) }));
-vi.mock("./toast", () => ({ showToast: vi.fn() }));
+const showToastMock = vi.fn();
+vi.mock("./toast", () => ({ showToast: (...args: unknown[]) => showToastMock(...args) }));
 
 function server(id: string, name: string) {
   return { id, name, server: `${id}.example.com`, server_port: 8388, validation: null };
@@ -33,6 +34,7 @@ beforeEach(() => {
   updateDiagnostics.mockClear();
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
+  showToastMock.mockReset();
   mainMock.config = {
     servers: [server("a", "Alpha"), server("b", "Beta"), server("c", "Gamma")],
     selected_server: "a",
@@ -203,5 +205,92 @@ describe("external re-renders", () => {
     outside.focus();
     renderServers();
     expect(document.activeElement).toBe(outside);
+  });
+});
+
+// Merged from main's servers.test.ts (#482) — in-flight test repaint and
+// failure handling, adapted to this file's fixture and mock names.
+describe("server test failure handling", () => {
+  function pendingRejectableTest(): (reason: unknown) => void {
+    let reject!: (reason: unknown) => void;
+    invokeMock.mockReturnValueOnce(
+      new Promise((_, r) => {
+        reject = r;
+      }),
+    );
+    return reject;
+  }
+
+  it("resets the dot and toasts when test_server rejects", async () => {
+    const rejectTest = pendingRejectableTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+
+    const btn = document.querySelector<HTMLButtonElement>(".srv-test")!;
+    btn.click();
+    await Promise.resolve();
+    // In flight: dot pulses, button disabled.
+    expect(document.querySelector(".srv-status")!.className).toContain("testing");
+    expect(btn.disabled).toBe(true);
+
+    rejectTest("bridge unreachable");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Dot restored from persisted state (null validation -> untested), error surfaced.
+    expect(document.querySelector(".srv-status")!.className).toContain("untested");
+    expect(document.querySelector(".srv-status")!.className).not.toContain("testing");
+    expect(document.querySelector<HTMLButtonElement>(".srv-test")!.disabled).toBe(false);
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
+  });
+
+  it("a test settling after config lost its servers list does not throw", async () => {
+    const rejectTest = pendingRejectableTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelector<HTMLButtonElement>(".srv-test")!.click();
+    await Promise.resolve();
+
+    // Config reloaded without a servers key while the card is still live.
+    mainMock.config = {};
+    rejectTest("bridge unreachable");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The finally repaint falls back to "untested" instead of throwing.
+    expect(document.querySelector(".srv-status")!.className).toContain("untested");
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
+  });
+
+  it("a test settling after its server was removed is a no-op repaint", async () => {
+    const rejectTest = pendingRejectableTest();
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelector<HTMLButtonElement>(".srv-test")!.click();
+    await Promise.resolve();
+
+    // Server deleted + re-render while the test is in flight.
+    (mainMock.config as { servers: unknown[] }).servers = [];
+    renderServers();
+
+    rejectTest("bridge unreachable");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No card to repaint — must not throw; the error still surfaces.
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
+  });
+
+  it("re-render during an in-flight test repaints the testing state", async () => {
+    invokeMock.mockReturnValueOnce(new Promise(() => {}));
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelector<HTMLButtonElement>(".srv-test")!.click();
+    await Promise.resolve();
+
+    renderServers(); // e.g. another server's validation-changed landed
+
+    expect(document.querySelector(".srv-status")!.className).toContain("testing");
+    expect(document.querySelector<HTMLButtonElement>(".srv-test")!.disabled).toBe(true);
   });
 });

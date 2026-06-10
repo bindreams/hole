@@ -7,6 +7,10 @@ const mainMock: {
   config: null,
   saveConfig: vi.fn<(...args: unknown[]) => void>(),
 };
+const invokeMock = vi.fn<(...args: unknown[]) => Promise<unknown>>();
+const showToastMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("./toast", () => ({ showToast: (...args: unknown[]) => showToastMock(...args) }));
 vi.mock("./main", () => ({
   get config() {
     return mainMock.config;
@@ -14,12 +18,27 @@ vi.mock("./main", () => ({
   saveConfig: (...args: unknown[]) => mainMock.saveConfig(...args),
 }));
 
+/** The typed view of the mock's filter rules. */
+function rules(): { address: string; matching: string; action: string }[] {
+  return mainMock.config!.filters as { address: string; matching: string; action: string }[];
+}
+
+/// Drain the persist chain: each persist is save (1 await) + reload
+/// (1 await); a fixed number of microtask turns covers N chained pairs
+/// because every mocked promise is already settled.
+async function flushPersist(turns = 8) {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
 function pressOn(el: Element, key: string) {
   el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
 }
 
 beforeEach(() => {
-  mainMock.saveConfig.mockClear();
+  mainMock.saveConfig.mockReset();
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
+  showToastMock.mockReset();
   mainMock.config = {
     filters: [
       { address: "*", matching: "wildcard", action: "proxy" },
@@ -148,6 +167,7 @@ describe("filter dropdowns", () => {
     cp.click();
     (document.querySelector('.inline-dropdown-opt[data-value="block"]') as HTMLElement).click();
     expect((mainMock.config!.filters as { action: string }[])[1].action).toBe("block");
+    await flushPersist(); // persistence is chained, not synchronous
     expect(mainMock.saveConfig).toHaveBeenCalled();
     const rebuilt = row(1).querySelector<HTMLElement>('td[data-field="action"] .cp')!;
     expect(document.activeElement).toBe(rebuilt);
@@ -257,5 +277,131 @@ describe("external re-renders", () => {
     outside.focus();
     mod.renderFilters();
     expect(document.activeElement).toBe(outside);
+  });
+});
+
+// Merged from main's filters.test.ts (#482) — persist-chain, edit-switching,
+// drag-cancel, and abandoned-rule coverage, adapted to this file's fixture
+// (3 rules: *, example.com, 10.0.0.0/8) and mock names.
+
+describe("reload_proxy_filters on mutation", () => {
+  it("deleting a rule saves and reloads the live proxy", async () => {
+    await setup();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click(); // deletes rule index 1
+    await flushPersist();
+    expect(rules()).toHaveLength(2);
+    expect(mainMock.saveConfig).toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("reload_proxy_filters");
+  });
+
+  it("a reload failure is surfaced as a toast", async () => {
+    invokeMock.mockRejectedValueOnce("bridge gone");
+    await setup();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click();
+    await flushPersist();
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge gone"), "error");
+  });
+
+  it("two rapid mutations serialize: save,reload,save,reload in order", async () => {
+    await setup();
+    const order: string[] = [];
+    mainMock.saveConfig.mockImplementation(async () => {
+      order.push("save");
+    });
+    invokeMock.mockImplementation(async (cmd: unknown) => {
+      order.push(String(cmd));
+    });
+
+    // Two synchronous back-to-back deletes (indices shift after the first).
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click();
+    await flushPersist(16);
+
+    expect(order).toEqual(["save", "reload_proxy_filters", "save", "reload_proxy_filters"]);
+    expect(rules()).toHaveLength(1);
+  });
+});
+
+describe("switching inline edits between cells", () => {
+  it("editing rule B while rule A is open commits A and opens a live editor on B", async () => {
+    await setup();
+
+    // Open edit on rule index 1 (first non-default), type a new address.
+    const cellA = document.querySelectorAll<HTMLElement>(".editable-addr")[0]!;
+    cellA.click();
+    const inputA = document.querySelector<HTMLInputElement>(".inline-input")!;
+    inputA.value = "a2.example.com";
+
+    // Click rule index 2's address cell.
+    document.querySelectorAll<HTMLElement>(".editable-addr")[1]!.click();
+
+    // A committed; B has a live (attached) editor.
+    expect(rules()[1].address).toBe("a2.example.com");
+    const inputB = document.querySelector<HTMLInputElement>(".inline-input");
+    expect(inputB).not.toBeNull();
+    expect(inputB!.isConnected).toBe(true);
+    expect(inputB!.closest("tr")!.dataset.index).toBe("2");
+  });
+});
+
+describe("background re-render during drag", () => {
+  it("cancels the drag, restores document state, and never saves a corrupted list", async () => {
+    const mod = await setup();
+    const before = rules().map((r) => r.address);
+
+    // Begin a drag on the first non-default rule's handle. bubbles: true is
+    // required — the handler is delegated on the tbody. jsdom has no
+    // PointerEvent constructor; the handler only reads target/clientY,
+    // which MouseEvent provides.
+    const handle = document.querySelectorAll<HTMLElement>(".drag-handle")[1]!;
+    handle.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientY: 10 }));
+    expect(document.body.style.userSelect).toBe("none");
+
+    // A validation-changed style background reload re-renders mid-drag.
+    mod.renderFilters();
+
+    // Drag state must be fully cancelled: userSelect restored…
+    expect(document.body.style.userSelect).toBe("");
+    // …no placeholder or lifted row left behind…
+    expect(document.querySelector(".drag-placeholder")).toBeNull();
+    // …and a later pointerup must not throw, reorder, or persist anything.
+    mainMock.saveConfig.mockClear();
+    document.dispatchEvent(new MouseEvent("pointerup"));
+    await flushPersist();
+    expect(rules().map((r) => r.address)).toEqual(before);
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("abandoning a new rule", () => {
+  it("clicking another cell while a new rule's address is empty removes the rule", async () => {
+    await setup();
+    const count = rules().length;
+
+    document.getElementById("filter-add-btn")!.click(); // adds empty rule + opens editor
+    expect(rules().length).toBe(count + 1);
+
+    // Abandon it by clicking an existing rule's address cell (sync commit path).
+    document.querySelectorAll<HTMLElement>(".editable-addr")[0]!.click();
+
+    expect(rules().length).toBe(count);
+    expect(rules().every((r) => r.address !== "")).toBe(true);
+  });
+
+  it("the editor opens on the correct rule even when the splice shifts indices", async () => {
+    await setup();
+
+    document.getElementById("filter-add-btn")!.click(); // empty rule appended, editor open on it
+    // Click rule 2's address cell ("10.0.0.0/8") — the empty rule is
+    // spliced out; index 2 stays valid (the splice removed a LATER row),
+    // and the editor must land on 10.0.0.0/8's live row.
+    document.querySelectorAll<HTMLElement>(".editable-addr")[1]!.click();
+
+    const input = document.querySelector<HTMLInputElement>(".inline-input")!;
+    expect(input.isConnected).toBe(true);
+    const row = input.closest("tr")!;
+    expect(row.dataset.index).toBe("2");
+    expect(rules()[2].address).toBe("10.0.0.0/8");
+    expect(rules().every((r) => r.address !== "")).toBe(true);
   });
 });

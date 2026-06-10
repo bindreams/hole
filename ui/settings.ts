@@ -214,9 +214,13 @@ const rowPortHttp = document.getElementById("row-port-http")!;
 function wirePortInput() {
   portInput.addEventListener("change", () => {
     if (!config) return;
-    const parsed = parseInt(portInput.value, 10);
+    const raw = portInput.value.trim();
+    // Strict digits-only: parseInt would silently accept "8080abc" while
+    // the field keeps showing the unparsed text.
+    const parsed = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
     if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
       config.local_port = parsed;
+      portInput.value = String(parsed);
       saveConfig();
     } else {
       // Revert to current config value on invalid input.
@@ -229,9 +233,11 @@ function wirePortInput() {
 function wireHttpPortInput() {
   portHttpInput.addEventListener("change", () => {
     if (!config) return;
-    const parsed = parseInt(portHttpInput.value, 10);
+    const raw = portHttpInput.value.trim();
+    const parsed = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
     if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
       config.local_port_http = parsed;
+      portHttpInput.value = String(parsed);
       saveConfig();
     } else {
       portHttpInput.value = String(config.local_port_http ?? "");
@@ -329,6 +335,8 @@ export function initSettings() {
  * visually greyed.
  */
 function wireDnsControls() {
+  // wireToggle/wireDropdown guard `config` before any visual change,
+  // covering the guards the hand-wired versions carried.
   wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));
   wireToggle("toggle-dns-intercept", (on) => patchDns({ intercept_udp53: on }));
 

@@ -101,9 +101,15 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
   if (goingToConnect && outcome === "running" && config?.selected_server) {
     try {
       await deps.invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
-      await deps.loadConfig();
     } catch (err) {
       console.error("mark_validated_by_proxy_start failed:", err);
+      // The connection itself succeeded — explain why the dot stays grey
+      // instead of leaving a silently unvalidated server. Scoped to the
+      // mark alone: loadConfig below never rejects (it catches and
+      // toasts internally), and this message would misdescribe it.
+      deps.showToast(`Connected, but couldn't record server validation: ${err}`, "error");
+      return;
     }
+    await deps.loadConfig();
   }
 }

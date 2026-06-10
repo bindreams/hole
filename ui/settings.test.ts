@@ -266,3 +266,71 @@ describe("settings dropdowns", () => {
     expect(document.getElementById("select-theme")!.textContent).toBe("System");
   });
 });
+
+// Merged from main's settings.test.ts (#482) — port validation and
+// null-config guards, adapted to this file's fixture and mock names.
+
+function changePort(id: string, value: string) {
+  const input = document.getElementById(id) as HTMLInputElement;
+  input.value = value;
+  input.dispatchEvent(new Event("change"));
+}
+
+describe("port input validation", () => {
+  it("rejects trailing garbage and reverts the field", async () => {
+    const { initSettings } = await import("./settings");
+    initSettings();
+    changePort("input-port", "8080abc");
+    expect(mainMock.config!.local_port).toBe(4073);
+    expect((document.getElementById("input-port") as HTMLInputElement).value).toBe("4073");
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("normalizes accepted input back into the field", async () => {
+    const { initSettings } = await import("./settings");
+    initSettings();
+    changePort("input-port", "0080");
+    expect(mainMock.config!.local_port).toBe(80);
+    expect((document.getElementById("input-port") as HTMLInputElement).value).toBe("80");
+  });
+
+  it("rejects trailing garbage on the HTTP port and reverts", async () => {
+    const { initSettings } = await import("./settings");
+    initSettings();
+    changePort("input-port-http", "9090xy");
+    expect(mainMock.config!.local_port_http).toBe(4074);
+    expect((document.getElementById("input-port-http") as HTMLInputElement).value).toBe("4074");
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("DNS controls with no config loaded", () => {
+  it("dns-enabled toggle does not flip its visual state when config is null", async () => {
+    mainMock.config = null;
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const el = document.getElementById("toggle-dns-enabled")!;
+    el.click();
+    expect(el.classList.contains("on")).toBe(false);
+    expect(el.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("dns-intercept toggle does not flip its visual state when config is null", async () => {
+    mainMock.config = null;
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const el = document.getElementById("toggle-dns-intercept")!;
+    el.click();
+    expect(el.classList.contains("on")).toBe(false);
+    expect(el.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("dns protocol option does not flip selection when config is null", async () => {
+    mainMock.config = null;
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const opt = document.querySelector<HTMLElement>("#menu-dns-protocol .custom-select-opt")!;
+    opt.click();
+    expect(opt.classList.contains("selected")).toBe(false);
+  });
+});

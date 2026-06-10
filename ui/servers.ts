@@ -64,26 +64,66 @@ export function statusTooltipFor(v: ValidationState | null | undefined): string 
   return `${userMessageFor(v.outcome)} Tested ${formatRelativeTime(v.tested_at)}.`;
 }
 
-async function runServerTest(id: string, btn: HTMLButtonElement, status: HTMLElement) {
+/// Entry IDs with a test_server invoke in flight. renderServers consults
+/// this so a mid-test rebuild repaints the in-flight state instead of
+/// silently reverting the card to its persisted dot.
+/// Entry IDs with a test_server invoke in flight. renderServers consults
+/// this so a mid-test rebuild repaints the in-flight state instead of
+/// silently reverting the card to its persisted dot.
+const testsInFlight = new Set<string>();
+
+/// Repaint one card's test button + status dot from the live DOM.
+/// Re-resolves by data-server-id because any re-render detaches the
+/// nodes a click handler captured.
+function setCardTesting(id: string, testing: boolean) {
+  // dataset comparison instead of an attribute selector: no dependency on
+  // CSS.escape (absent in the jsdom test environment) and no quoting rules.
+  let card: HTMLElement | null = null;
+  for (const child of serverList.children) {
+    if (child instanceof HTMLElement && child.dataset.serverId === id) {
+      card = child;
+      break;
+    }
+  }
+  if (!card) return;
+  const btn = card.querySelector<HTMLButtonElement>(".srv-test");
+  const dot = card.querySelector<HTMLElement>(".srv-status");
+  if (btn) {
+    btn.disabled = testing;
+    btn.classList.toggle("loading", testing);
+  }
+  if (dot) {
+    if (testing) {
+      dot.className = "srv-status testing";
+    } else {
+      const server = config?.servers?.find((s) => s.id === id);
+      dot.className = `srv-status ${statusClassFor(server?.validation)}`;
+      dot.title = statusTooltipFor(server?.validation);
+    }
+  }
+}
+
+async function runServerTest(id: string) {
   // Disabling the focused button drops focus to <body> (HTML focus-fixup
   // rule); remember so focus can be restored once the test settles.
-  const hadFocus = document.activeElement === btn;
-  btn.disabled = true;
-  btn.classList.add("loading");
-  status.className = "srv-status testing";
+  const btn = findServerControl(id, ".srv-test");
+  const hadFocus = btn !== null && document.activeElement === btn;
+  testsInFlight.add(id);
+  setCardTesting(id, true);
   try {
     await invoke("test_server", { entryId: id });
     // The validation-changed listener will rerender via loadConfig().
   } catch (err) {
     console.error("test_server failed:", err);
+    showToast(`Server test failed: ${err}`, "error");
   } finally {
-    btn.disabled = false;
-    btn.classList.remove("loading");
+    testsInFlight.delete(id);
+    setCardTesting(id, false);
     // Restore only if focus is still orphaned — if the user moved on
     // mid-test, leave them be. The validation-changed re-render may have
     // replaced the card, so fall back to the rebuilt button.
     if (hadFocus && (document.activeElement === document.body || document.activeElement === btn)) {
-      const target = btn.isConnected ? btn : findServerControl(id, ".srv-test");
+      const target = btn?.isConnected ? btn : findServerControl(id, ".srv-test");
       target?.focus({ preventScroll: true });
     }
   }
@@ -172,7 +212,7 @@ export function renderServers() {
       testBtn.className = "srv-test";
       testBtn.textContent = "Test";
       testBtn.addEventListener("click", () => {
-        runServerTest(server.id, testBtn, statusDot);
+        void runServerTest(server.id);
       });
       card.appendChild(testBtn);
 
@@ -198,6 +238,8 @@ export function renderServers() {
       });
 
       serverList.appendChild(card);
+
+      if (testsInFlight.has(server.id)) setCardTesting(server.id, true);
     }
   }
 

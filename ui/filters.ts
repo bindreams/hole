@@ -1,8 +1,10 @@
 // Filters section: filter rules table with in-place editing, drag reorder,
 // test filtering, add/delete rules.
 
+import { invoke } from "@tauri-apps/api/core";
 import { config, saveConfig } from "./main";
 import { menuKeydown } from "./menu-keys";
+import { showToast } from "./toast";
 import type { FilterRule } from "./types";
 
 // Constants ===========================================================================================================
@@ -46,6 +48,34 @@ let openDropdown: (HTMLDivElement & { _td?: HTMLTableCellElement }) | null = nul
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
 
+// Persistence =========================================================================================================
+
+/// Persist the rule list, then push it to the running proxy.
+/// reload_proxy_filters is a no-op on the Rust side when disconnected;
+/// when connected, skipping it would leave live traffic on the old rules
+/// until the next reconnect with no indication in the UI.
+///
+/// Serialized through `persistChain`: callers fire-and-forget, and two
+/// rapid mutations must not interleave their save/reload pairs — the
+/// proxy must never be reloaded with an older snapshot than the last
+/// save. A reload that follows a FAILED save is harmless: save_config
+/// only replaces the Rust-side config on a successful disk write, so
+/// the reload pushes the unchanged old rules.
+let persistChain: Promise<void> = Promise.resolve();
+
+function persistFilters(): Promise<void> {
+  persistChain = persistChain.then(async () => {
+    await saveConfig();
+    try {
+      await invoke("reload_proxy_filters");
+    } catch (err) {
+      console.error("reload_proxy_filters failed:", err);
+      showToast(`Filters saved, but not applied to the running proxy: ${err}`, "error");
+    }
+  });
+  return persistChain;
+}
+
 // Rendering ===========================================================================================================
 
 /** Ensure config.filters has the default wildcard rule at index 0. */
@@ -78,28 +108,38 @@ export function renderFilters() {
   ensureDefaultRule();
 
   // External re-renders (e.g. config reloads) destroy the focused control
-  // with the rest of the table; remember row + control so the rebuild can
-  // put focus back. A focused inline edit input or dropdown option maps
-  // back to the control that opened it. Captured before closeDropdown()
-  // below removes a focused option.
+  // with the rest of the table; remember which rule + control held focus
+  // so the rebuild can put it back. A focused inline edit input or
+  // dropdown option maps back to the control that opened it. The rule is
+  // remembered both by identity (commitPendingEdit below may splice,
+  // shifting indices) and by index (a config reload replaces the rule
+  // objects but keeps the structure). Captured before closeDropdown()
+  // removes a focused option.
   const active = document.activeElement;
-  let restoreSelector: string | null = null;
+  let restoreRule: FilterRule | null = null;
+  let restoreIndex = -1;
+  let restoreControl: string | null = null;
   if (active instanceof HTMLElement && tbody.contains(active)) {
-    const index = active.closest("tr")?.dataset.index;
-    if (index !== undefined) {
-      if (active.closest(".filter-del")) {
-        restoreSelector = `tr[data-index="${index}"] .filter-del`;
-      } else if (active.closest(".editable-addr")) {
-        restoreSelector = `tr[data-index="${index}"] .filter-addr`;
-      } else {
-        const field = (active.closest("td") as HTMLTableCellElement | null)?.dataset.field;
-        if (field) restoreSelector = `tr[data-index="${index}"] td[data-field="${field}"] .cp`;
-      }
+    restoreIndex = parseInt(active.closest("tr")?.dataset.index ?? "", 10);
+    restoreRule = Number.isNaN(restoreIndex) ? null : (config.filters[restoreIndex] ?? null);
+    if (active.closest(".filter-del")) {
+      restoreControl = ".filter-del";
+    } else if (active.closest(".editable-addr")) {
+      restoreControl = ".filter-addr";
+    } else {
+      const field = (active.closest("td") as HTMLTableCellElement | null)?.dataset.field;
+      restoreControl = field ? `td[data-field="${field}"] .cp` : null;
     }
   }
 
+  // Flush a pending edit before wiping the tbody. This writes the open
+  // editor's value into the CURRENT config by row index — sound because
+  // every loadConfig caller today reloads a structurally identical
+  // filters array; a reload that reshapes the rules would need an
+  // identity-based commit instead.
+  commitPendingEdit();
+  cancelDrag();
   closeDropdown();
-  editingIndex = -1;
   tbody.innerHTML = "";
 
   for (let i = 0; i < config.filters.length; i++) {
@@ -222,7 +262,11 @@ export function renderFilters() {
 
   // preventScroll: restoration preserves tab position invisibly — a
   // background re-render must not yank the viewport to the element.
-  if (restoreSelector) tbody.querySelector<HTMLElement>(restoreSelector)?.focus({ preventScroll: true });
+  if (restoreControl !== null && !Number.isNaN(restoreIndex)) {
+    const byIdentity = restoreRule ? config.filters.indexOf(restoreRule) : -1;
+    const index = byIdentity >= 0 ? byIdentity : restoreIndex;
+    tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] ${restoreControl}`)?.focus({ preventScroll: true });
+  }
 
   // Re-evaluate test filtering after render.
   evaluateTestFilter();
@@ -237,13 +281,27 @@ export function renderFilters() {
  */
 function startAddressEdit(td: HTMLTableCellElement, index: number) {
   if (editingIndex === index) return; // Already editing this cell.
+
+  // Committing the previous edit re-renders the table, detaching `td`
+  // and possibly shifting `index` (an abandoned empty rule is spliced
+  // out). Capture the rule's identity, commit, then re-resolve both.
+  // Safe: this whole path is synchronous, so `config` cannot be
+  // reassigned between capture and re-resolution.
+  const rule = config?.filters[index];
   commitOrCancelEditing(); // Close any other active edit.
+  if (!rule || !config) return;
+  const liveIndex = config.filters.indexOf(rule);
+  if (liveIndex < 0) return; // rule was removed by the commit
+  const liveTd = tbody.querySelector<HTMLTableCellElement>(`tr[data-index="${liveIndex}"] .editable-addr`);
+  if (!liveTd) return;
+  td = liveTd;
+  index = liveIndex;
 
   editingIndex = index;
   const addrSpan = td.querySelector(".filter-addr");
   if (!addrSpan) return;
 
-  const original = addrSpan.textContent;
+  const original = addrSpan.textContent ?? "";
 
   const input = document.createElement("input");
   input.className = "inline-input";
@@ -266,10 +324,10 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
     if (!newValue) {
       // Empty address — remove the rule (it was never valid).
       config?.filters.splice(index, 1);
-      saveConfig();
+      void persistFilters();
     } else if (newValue !== original) {
       if (config) config.filters[index].address = newValue;
-      saveConfig();
+      void persistFilters();
     }
     renderFilters();
     refocusAddrAfterEdit(index, shouldRefocus);
@@ -306,19 +364,31 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
   });
 }
 
-/** If there's an active address edit, commit it synchronously. */
-function commitOrCancelEditing() {
+/// Commit a pending inline address edit WITHOUT re-rendering. Lets
+/// renderFilters() flush the edit before it wipes the tbody (calling the
+/// rendering variant from there would recurse).
+function commitPendingEdit() {
   if (editingIndex < 0) return;
   const index = editingIndex;
   const input = tbody.querySelector<HTMLInputElement>(".inline-input");
   editingIndex = -1; // Clear first so the blur handler becomes a no-op.
   if (input && config?.filters[index]) {
     const value = input.value.trim();
-    if (value && value !== config.filters[index].address) {
+    if (!value) {
+      // Empty address — the rule was never valid; drop it like commit() does.
+      config.filters.splice(index, 1);
+      void persistFilters();
+    } else if (value !== config.filters[index].address) {
       config.filters[index].address = value;
-      saveConfig();
+      void persistFilters();
     }
   }
+}
+
+/** If there's an active address edit, commit it synchronously. */
+function commitOrCancelEditing() {
+  if (editingIndex < 0) return;
+  commitPendingEdit();
   renderFilters();
 }
 
@@ -403,7 +473,7 @@ function toggleDropdown(td: HTMLTableCellElement, index: number) {
       } else {
         config.filters[index].action = opt.value as FilterRule["action"];
       }
-      saveConfig();
+      void persistFilters();
       closeDropdown();
       renderFilters();
       // The re-render rebuilt the row; keep keyboard users on the cell.
@@ -457,6 +527,21 @@ interface DragState {
 /** Active drag state, or null. */
 let dragState: DragState | null = null;
 
+/// Abandon an in-progress drag without applying a reorder. Called by
+/// renderFilters() when a background reload wipes the tbody mid-drag:
+/// finishing the drag against detached rows would throw before listener
+/// cleanup and then save a corrupted rule list on the next click. The
+/// lifted row's inline styles are not restored here — every caller wipes
+/// the tbody immediately after, discarding the row.
+function cancelDrag() {
+  if (!dragState) return;
+  dragState.placeholder.remove();
+  document.removeEventListener("pointermove", onDragMove);
+  document.removeEventListener("pointerup", onDragEnd);
+  document.body.style.userSelect = "";
+  dragState = null;
+}
+
 /**
  * Start dragging a row.
  * @param {PointerEvent} e - The pointerdown event on the drag handle.
@@ -466,7 +551,8 @@ let dragState: DragState | null = null;
 function startDrag(e: PointerEvent, row: HTMLTableRowElement, index: number) {
   e.preventDefault();
   closeDropdown();
-  commitOrCancelEditing();
+  // Any open edit was already committed by onTbodyPointerDown, which
+  // re-resolved `row`/`index` against the post-commit DOM.
 
   const rect = row.getBoundingClientRect();
   const tbodyRect = tbody.getBoundingClientRect();
@@ -630,7 +716,7 @@ function onDragEnd() {
       }
     }
     config.filters = newFilters;
-    saveConfig();
+    void persistFilters();
   }
 
   document.removeEventListener("pointermove", onDragMove);
@@ -681,7 +767,7 @@ function deleteRule(index: number) {
   // focus was inside the table so keyboard users stay in place.
   const hadFocusInTable = tbody.contains(document.activeElement);
   config.filters.splice(index, 1);
-  saveConfig();
+  void persistFilters();
   renderFilters();
   if (hadFocusInTable) {
     const dels = tbody.querySelectorAll<HTMLElement>(".filter-del");
@@ -874,7 +960,17 @@ function onTbodyPointerDown(e: PointerEvent) {
   const index = parseInt(tr.dataset.index ?? "", 10);
   if (Number.isNaN(index) || index <= 0) return; // Cannot drag default rule.
 
-  startDrag(e, tr, index);
+  // Commit any open edit FIRST (it re-renders), then re-resolve the row —
+  // same detached-node hazard as startAddressEdit.
+  const rule = config?.filters[index];
+  commitOrCancelEditing();
+  if (!rule || !config) return;
+  const liveIndex = config.filters.indexOf(rule);
+  if (liveIndex <= 0) return;
+  const liveRow = tbody.querySelector<HTMLTableRowElement>(`tr[data-index="${liveIndex}"]`);
+  if (!liveRow) return;
+
+  startDrag(e, liveRow, liveIndex);
 }
 
 /** Close dropdown when clicking outside. */
