@@ -514,3 +514,32 @@ fn plugin_name_shell_metacharacters_rejected() {
     assert!(!is_valid_plugin_name("evil(1)"));
     assert!(!is_valid_plugin_name("evil{1}"));
 }
+
+#[skuld::test]
+fn save_replaces_existing_file_and_leaves_no_temp(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config.json");
+    AppConfig::default().save(&path).unwrap();
+    let changed = AppConfig {
+        local_port: 7777,
+        ..Default::default()
+    };
+    changed.save(&path).unwrap();
+
+    // Exactly one file in the dir: no .tmp leftovers.
+    let entries: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let on_disk: AppConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk, changed);
+}
+
+/// The temp file becomes config.json via rename, so it must carry the final
+/// 0600 mode from the moment it has contents (plaintext passwords).
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_writes_with_owner_only_permissions(#[fixture(temp_dir)] dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("config.json");
+    AppConfig::default().save(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

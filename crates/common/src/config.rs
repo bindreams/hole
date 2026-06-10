@@ -274,8 +274,15 @@ impl AppConfig {
         }
     }
 
+    /// Serialize and write atomically: write a sibling temp file, then rename
+    /// it over `path`. A crash mid-write leaves the old config intact — a
+    /// truncate-in-place write here is how #467 corruption happened.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let json = serde_json::to_string_pretty(self)?;
+        // Dot-prefixed so it can't collide with the `config.json.*.bak`
+        // quarantine namespace; a stale one (crash between write and rename)
+        // is overwritten by the next save and never loaded.
+        let tmp = path.with_file_name(".config.json.tmp");
 
         #[cfg(target_os = "macos")]
         {
@@ -291,30 +298,37 @@ impl AppConfig {
             }
             // Restrict config file permissions on macOS — the config contains plaintext
             // passwords and must not be world-readable (default umask 0022 yields 0644).
+            // The temp file carries the mode; rename preserves it.
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(path)?;
+                .open(&tmp)?;
             file.set_permissions(Permissions::from_mode(0o600))?;
             file.write_all(json.as_bytes())?;
+            file.sync_all()?;
         }
 
         #[cfg(target_os = "windows")]
         {
+            use std::io::Write;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, json)?;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = json;
+            let _ = (json, &tmp);
             compile_error!("save() is not implemented for this platform");
         }
 
+        // Atomic replace on both platforms (Windows: MOVEFILE_REPLACE_EXISTING).
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
