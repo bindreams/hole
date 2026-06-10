@@ -12,7 +12,6 @@ initial_release: |
 include_paths:
   - crates/garter/**
   - crates/garter-bin/**
-  - crates/mock-plugin/**
   - .github/workflows/draft-release-garter.yaml
   - .github/workflows/publish-release-garter.yaml
   - .github/release-garter.yaml
