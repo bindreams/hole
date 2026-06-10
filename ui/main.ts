@@ -4,7 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { attachConsole, error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
+import { error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
@@ -155,9 +155,9 @@ export async function runTestsBounded(ids: string[], maxInFlight: number) {
 
 // Event listeners =====================================================================================================
 
-function setupEventListeners() {
+function setupEventListeners(): Promise<unknown> {
   // File > Import menu action (tray emits () as payload — open dialog).
-  listen("import-requested", () => importFromDialog());
+  const importReady = listen("import-requested", () => importFromDialog());
 
   // WebView2 (Windows) shows the OS "forbidden" cursor on file drags
   // unless JS calls `preventDefault()` on the `dragover` event — even
@@ -174,7 +174,7 @@ function setupEventListeners() {
   // the user must acknowledge each), and aggregate any successes into
   // a single end-of-loop toast. Per-failure errors use blocking dialogs
   // (not auto-dismiss toasts) so they can't be missed.
-  listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
+  const dropReady = listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
     // A successful drop may not fire `dragleave` on the import zone —
     // remove the visual highlight unconditionally before processing
     // (the no-op case where the zone wasn't highlighted is harmless).
@@ -220,9 +220,15 @@ function setupEventListeners() {
 
   // Persisted validation changed (from `test_server` or
   // `mark_validated_by_proxy_start`). Pull fresh config and rerender.
-  listen<string>("validation-changed", async () => {
+  const validationReady = listen<string>("validation-changed", async () => {
     await loadConfig();
   });
+
+  // Joined so init() can await registration before the UI becomes
+  // interactive — an emit landing before listen() resolves is silently
+  // lost. Rejection is deliberately fatal to init: a dashboard without
+  // its listeners is broken in exactly the silent way this guards.
+  return Promise.all([importReady, dropReady, validationReady]);
 }
 
 // Initialization ======================================================================================================
@@ -283,17 +289,10 @@ async function init() {
 
   let result: { ok: boolean; error: string | null };
   try {
-    // Mirror Rust log events into the JS console (the OPPOSITE direction
-    // from the relay above). Wrapped in try/catch so a future capability
-    // misconfiguration on `tauri-plugin-log` doesn't silently break the
-    // whole dashboard. The plugin is registered on the Rust side in
-    // main.rs with `.skip_logger()` so JS log events flow through
-    // `log` → `tracing-log::LogTracer` → `gui.log`.
-    try {
-      await attachConsole();
-    } catch (e) {
-      console.warn("attachConsole failed:", e);
-    }
+    // Rust→JS console mirroring is deliberately absent: main.rs registers
+    // tauri-plugin-log with .skip_logger(), which never constructs the
+    // Webview target that emits log://log events — attachConsole() would
+    // resolve and then receive nothing. Backend logs live in gui.log.
 
     window.addEventListener("error", (e) => {
       console.error(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
@@ -309,6 +308,11 @@ async function init() {
     initFilters();
     initSettings();
     initSidebar();
+
+    // Register Rust→JS event listeners BEFORE the first paint-driving
+    // fetches: the menu and drop targets are live from the first frame,
+    // and an emit before listen() resolves is dropped with no error.
+    await setupEventListeners();
 
     // Replace native scrollbars with fade-in/out overlay scrollbars.
     const main = document.querySelector<HTMLElement>(".main");
@@ -334,9 +338,6 @@ async function init() {
     setInterval(pollProxyStatus, 5000);
     setInterval(pollMetrics, 1000);
     setInterval(pollDiagnostics, 5000);
-
-    // Wire up event listeners.
-    setupEventListeners();
 
     result = { ok: true, error: null };
   } catch (err) {
@@ -375,4 +376,7 @@ async function init() {
   }
 }
 
-init();
+// Test seam: init() never rejects (its body is fully try/caught and the
+// trailing signal_ui_ready failure is logged, not thrown), so awaiting
+// this is a plain rendezvous on startup completion.
+export const initDone = init();

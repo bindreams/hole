@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
+const showToastMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+vi.mock("./toast", () => ({ showToast: (...args: unknown[]) => showToastMock(...args) }));
 
 beforeEach(() => {
   invokeMock.mockReset();
+  showToastMock.mockReset();
   document.body.innerHTML = `
     <span id="ip-text"><span class="country-flag fi fis fi-xx" id="country-flag" title="Unknown"></span></span>
     <button id="copy-ip-btn"></button>
@@ -66,5 +69,36 @@ describe("copy button", () => {
     await updatePublicIp();
     document.getElementById("copy-ip-btn")!.click();
     expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("toasts success after a clipboard write", async () => {
+    invokeMock.mockResolvedValue({ ip: "203.0.113.7", country_code: "NL" });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { initIpDisplay, updatePublicIp } = await import("./ip-display");
+    initIpDisplay();
+    await updatePublicIp();
+
+    document.getElementById("copy-ip-btn")!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(writeText).toHaveBeenCalledWith("203.0.113.7");
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("copied"), "success");
+  });
+
+  it("toasts an error when the clipboard write fails", async () => {
+    invokeMock.mockResolvedValue({ ip: "203.0.113.7", country_code: "NL" });
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.assign(navigator, { clipboard: { writeText } });
+    const { initIpDisplay, updatePublicIp } = await import("./ip-display");
+    initIpDisplay();
+    await updatePublicIp();
+
+    document.getElementById("copy-ip-btn")!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("denied"), "error");
   });
 });

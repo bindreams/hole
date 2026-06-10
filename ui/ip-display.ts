@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { setCountryFlag } from "./country-flag";
+import { showToast } from "./toast";
 import type { PublicIpData } from "./types";
 
 let ipText: HTMLElement | null = null;
@@ -38,7 +39,11 @@ export async function updatePublicIp(): Promise<void> {
 
 function handleCopyIp(): void {
   if (!currentIp) return;
-  navigator.clipboard.writeText(currentIp).catch((err) => {
-    console.error("clipboard write failed:", err);
-  });
+  navigator.clipboard.writeText(currentIp).then(
+    () => showToast("IP address copied.", "success"),
+    (err) => {
+      console.error("clipboard write failed:", err);
+      showToast(`Copy failed: ${err}`, "error");
+    },
+  );
 }

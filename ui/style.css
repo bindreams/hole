@@ -1092,9 +1092,23 @@ td.del-cell {
   padding: 0.3rem 0;
 }
 
+/* .setting-row's display:flex (author origin) overrides the UA's
+[hidden] { display: none } regardless of specificity — origin beats
+specificity. The attribute selector outspecifies the class, scoped to
+the rows that actually toggle `hidden`. */
+.setting-row[hidden] {
+  display: none;
+}
+
 .setting-label {
   color: var(--text-secondary);
   white-space: nowrap;
+}
+
+.setting-note .setting-label {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: normal;
 }
 
 .setting-control {

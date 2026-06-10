@@ -167,9 +167,13 @@ const rowPortHttp = document.getElementById("row-port-http")!;
 function wirePortInput() {
   portInput.addEventListener("change", () => {
     if (!config) return;
-    const parsed = parseInt(portInput.value, 10);
+    const raw = portInput.value.trim();
+    // Strict digits-only: parseInt would silently accept "8080abc" while
+    // the field keeps showing the unparsed text.
+    const parsed = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
     if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
       config.local_port = parsed;
+      portInput.value = String(parsed);
       saveConfig();
     } else {
       // Revert to current config value on invalid input.
@@ -182,9 +186,11 @@ function wirePortInput() {
 function wireHttpPortInput() {
   portHttpInput.addEventListener("change", () => {
     if (!config) return;
-    const parsed = parseInt(portHttpInput.value, 10);
+    const raw = portHttpInput.value.trim();
+    const parsed = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
     if (!Number.isNaN(parsed) && parsed > 0 && parsed <= 65535) {
       config.local_port_http = parsed;
+      portHttpInput.value = String(parsed);
       saveConfig();
     } else {
       portHttpInput.value = String(config.local_port_http ?? "");
@@ -271,6 +277,7 @@ export function initSettings() {
 function wireDnsControls() {
   const enabledEl = document.getElementById("toggle-dns-enabled")!;
   enabledEl.addEventListener("click", () => {
+    if (!config) return; // guard BEFORE the visual flip, like wireToggle
     const on = !enabledEl.classList.contains("on");
     enabledEl.classList.toggle("on", on);
     patchDns({ enabled: on });
@@ -278,6 +285,7 @@ function wireDnsControls() {
 
   const interceptEl = document.getElementById("toggle-dns-intercept")!;
   interceptEl.addEventListener("click", () => {
+    if (!config) return;
     const on = !interceptEl.classList.contains("on");
     interceptEl.classList.toggle("on", on);
     patchDns({ intercept_udp53: on });
@@ -297,6 +305,7 @@ function wireDnsControls() {
   for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
     opt.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (!config) return;
       for (const o of menu.querySelectorAll(".custom-select-opt")) o.classList.remove("selected");
       opt.classList.add("selected");
       btn.textContent = opt.textContent;
