@@ -120,8 +120,17 @@ pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
     if let Some(item) = menu.get(ID_AUTOSTART) {
         if let Some(check) = item.as_check_menuitem() {
             use tauri_plugin_autostart::ManagerExt;
-            let is_enabled = app.autolaunch().is_enabled().unwrap_or(false);
-            check.set_checked(is_enabled).ok();
+            let is_enabled = match app.autolaunch().is_enabled() {
+                Ok(enabled) => enabled,
+                Err(e) => {
+                    // Unreadable state renders as unchecked; detail to gui.log.
+                    warn!(error = %e, "failed to check autostart state during menu sync");
+                    false
+                }
+            };
+            if let Err(e) = check.set_checked(is_enabled) {
+                warn!(error = %e, "failed to sync autostart checkmark");
+            }
         }
     }
 }
@@ -169,18 +178,34 @@ pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
 /// Rebuild the tray menu to sync state with the current config.
 ///
 /// Preserves the "Install Update" item if an update is available.
+///
+/// The whole rebuild (state reads included) is dispatched to the main
+/// thread: worker-thread callers would otherwise read autostart/config
+/// state on one thread and commit the menu later via a queued
+/// `set_menu`, letting a stale menu overwrite a newer one (#473).
+/// `run_on_main_thread` executes inline when already on the main thread.
 pub fn rebuild_tray_menu(app: &AppHandle) {
-    if let Some(tray) = app.tray_by_id("main") {
-        let update_state = app.state::<hole::update::UpdateState>();
+    let handle = app.clone();
+    let dispatched = app.run_on_main_thread(move || {
+        let Some(tray) = handle.tray_by_id("main") else {
+            warn!("tray not found, skipping menu rebuild");
+            return;
+        };
+        let update_state = handle.state::<hole::update::UpdateState>();
         let update_info = update_state.rx.borrow().clone();
-        let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
-        match build_tray_menu(app, update_info.as_ref(), enabled) {
+        let enabled = handle.state::<AppState>().config.lock().unwrap().enabled;
+        match build_tray_menu(&handle, update_info.as_ref(), enabled) {
             Ok(menu) => {
-                sync_menu_state(app, &menu);
-                tray.set_menu(Some(menu)).ok();
+                sync_menu_state(&handle, &menu);
+                if let Err(e) = tray.set_menu(Some(menu)) {
+                    warn!(error = %e, "failed to set tray menu");
+                }
             }
             Err(e) => warn!(error = %e, "failed to rebuild tray menu"),
         }
+    });
+    if let Err(e) = dispatched {
+        warn!(error = %e, "failed to dispatch tray menu rebuild");
     }
 }
 
@@ -378,19 +403,26 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
         ID_AUTOSTART => {
             info!("tray: autostart toggled");
             use tauri_plugin_autostart::ManagerExt;
-            let autostart = app.autolaunch();
-            match autostart.is_enabled() {
-                Ok(true) => {
-                    if let Err(e) = autostart.disable() {
-                        error!("failed to disable autostart: {e}");
-                    }
+            let result = crate::autostart::toggle(&*app.autolaunch());
+            // muda flipped the checkmark before this handler ran; rebuilding
+            // re-syncs it from the real autostart state — required on failure,
+            // and on success too when the menu was stale.
+            rebuild_tray_menu(app);
+            match result {
+                Ok(enabled) => info!("autostart {}", if enabled { "enabled" } else { "disabled" }),
+                Err(e) => {
+                    // Full detail (may embed the executable path) goes to
+                    // gui.log; the dialog gets the PII-free summary.
+                    error!("{e}");
+                    let message = e.user_message();
+                    let app_handle = app.clone();
+                    // spawn_blocking: blocking_show must not run on the main
+                    // thread and would park a core async worker if spawned.
+                    tauri::async_runtime::spawn_blocking(move || {
+                        use tauri_plugin_dialog::DialogExt;
+                        app_handle.dialog().message(message).title("Error").blocking_show();
+                    });
                 }
-                Ok(false) => {
-                    if let Err(e) = autostart.enable() {
-                        error!("failed to enable autostart: {e}");
-                    }
-                }
-                Err(e) => error!("failed to check autostart: {e}"),
             }
         }
         ID_SETTINGS => {

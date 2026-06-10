@@ -4,6 +4,7 @@
 // the regular GUI functions appear unused to clippy.
 #![cfg_attr(test, allow(dead_code))]
 
+mod autostart;
 mod bridge_client;
 #[macro_use]
 mod cli_log;
@@ -46,6 +47,12 @@ fn main() {
         None => launch_gui(cli.show_dashboard),
     }
 }
+
+// Install the workspace test subscriber + panic hook. The dev-dep
+// is gated on cfg(test) because it isn't linked in non-test builds.
+// See `crates/test-observability/` and bindreams/hole#301.
+#[cfg(test)]
+hole_test_observability::register!();
 
 #[cfg(test)]
 fn main() {
