@@ -265,6 +265,19 @@ the original message. Registration is RAII (`register` → guard). The dispatche
 is installed at ctor time, so consumers just `register()`. Current consumer:
 `BridgeChildLogSource` dumps each live `DistHarness` child's `bridge.log` (#303).
 
+### Tray menu rebuild contract
+
+All tray menu commits go through `tray::rebuild_tray_menu`, which dispatches
+the whole rebuild — state reads included — to the main thread
+(`run_on_main_thread` executes inline when already there). A raw `set_menu`
+from a worker thread reads state early and commits the menu later through the
+event-loop queue, so a stale menu can overwrite a newer one (the #473 desync).
+Enforcement is in [`clippy.toml`](clippy.toml) (`TrayIcon::set_menu` is
+disallowed; the one commit point inside `rebuild_tray_menu` carries a per-site
+`#[allow]`). Corollary: `sync_menu_state` is main-thread-only — menu-item
+setters dispatch-and-block from any other thread, so calling it from a worker
+while holding a lock deadlocks the app.
+
 ## Workspace layout
 
 Each publishable member declares a release group in

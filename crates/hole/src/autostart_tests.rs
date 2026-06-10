@@ -81,12 +81,16 @@ fn check_failure_skips_toggle() {
 fn enable_failure_is_reported() {
     let fake = FakeAutostart::new(Ok(false), Some(Err(Error::Anyhow("plist write failed".into()))), None);
     assert!(matches!(toggle(&fake), Err(ToggleError::Enable(_))));
+    assert_eq!(fake.enable_calls.get(), 1);
+    assert_eq!(fake.disable_calls.get(), 0);
 }
 
 #[skuld::test]
 fn disable_failure_is_reported() {
     let fake = FakeAutostart::new(Ok(true), None, Some(Err(Error::Anyhow("plist remove failed".into()))));
     assert!(matches!(toggle(&fake), Err(ToggleError::Disable(_))));
+    assert_eq!(fake.enable_calls.get(), 0);
+    assert_eq!(fake.disable_calls.get(), 1);
 }
 
 #[skuld::test]

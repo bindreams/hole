@@ -1,3 +1,3 @@
-//! Tray tests require a full Tauri app context.
-//! The Start-at-Login toggle logic is unit-tested in autostart_tests.rs;
-//! see E2E tests in tests/webdriver/ for the rest of the tray behavior.
+//! The tray handler glue (menu events, rebuilds, dialogs) requires a full
+//! Tauri app context and has no automated coverage at any level; the
+//! Start-at-Login toggle logic is unit-tested in autostart_tests.rs.

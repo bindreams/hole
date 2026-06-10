@@ -51,7 +51,7 @@ const ID_COLLECT_LOGS: &str = "window_collect_logs";
 // Tray creation =======================================================================================================
 
 /// Build the tray menu, optionally including an "Install Update" item.
-pub fn build_tray_menu(
+fn build_tray_menu(
     app: &AppHandle,
     update: Option<&hole::update::UpdateInfo>,
     enabled: bool,
@@ -95,15 +95,17 @@ pub fn build_tray_menu(
     }
 }
 
-/// Sync tray menu item text and checkbox states from the current config.
-pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
-    let state = app.state::<AppState>();
-    let config = state.config.lock().unwrap();
-
+/// Sync tray menu item text and checkbox states from the given proxy state
+/// and the OS autostart registration.
+///
+/// Must run on the main thread: the menu-item setters dispatch to the main
+/// thread and block when called from anywhere else, so a caller holding a
+/// lock here can deadlock the app.
+fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>, enabled: bool) {
     // Sync status text
     if let Some(item) = menu.get(ID_STATUS) {
         if let Some(menu_item) = item.as_menuitem() {
-            let text = if config.enabled { "Connected" } else { "Disconnected" };
+            let text = if enabled { "Connected" } else { "Disconnected" };
             menu_item.set_text(text).ok();
         }
     }
@@ -111,7 +113,7 @@ pub fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
     // Sync connect/disconnect text
     if let Some(item) = menu.get(ID_CONNECT) {
         if let Some(menu_item) = item.as_menuitem() {
-            let text = if config.enabled { "Disconnect" } else { "Connect" };
+            let text = if enabled { "Disconnect" } else { "Connect" };
             menu_item.set_text(text).ok();
         }
     }
@@ -157,7 +159,7 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
 
     let tray = builder.build(app)?;
 
-    sync_menu_state(app.handle(), &menu);
+    sync_menu_state(app.handle(), &menu, enabled);
 
     Ok(tray)
 }
@@ -196,7 +198,10 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
         let enabled = handle.state::<AppState>().config.lock().unwrap().enabled;
         match build_tray_menu(&handle, update_info.as_ref(), enabled) {
             Ok(menu) => {
-                sync_menu_state(&handle, &menu);
+                sync_menu_state(&handle, &menu, enabled);
+                // Sanctioned `set_menu` site: the one ordered commit point
+                // (clippy.toml bans it everywhere else).
+                #[allow(clippy::disallowed_methods)]
                 if let Err(e) = tray.set_menu(Some(menu)) {
                     warn!(error = %e, "failed to set tray menu");
                 }
@@ -394,8 +399,12 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
                         info!("tray: start was cancelled externally");
                     }
                     Err(msg) => {
-                        use tauri_plugin_dialog::DialogExt;
-                        app_handle.dialog().message(msg).title("Error").blocking_show();
+                        // blocking_show would park a core async worker here;
+                        // use the blocking pool.
+                        tauri::async_runtime::spawn_blocking(move || {
+                            use tauri_plugin_dialog::DialogExt;
+                            app_handle.dialog().message(msg).title("Error").blocking_show();
+                        });
                     }
                 }
             });
