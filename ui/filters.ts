@@ -106,6 +106,8 @@ export function renderFilters() {
   if (!config) return;
   ensureDefaultRule();
 
+  commitPendingEdit();
+  cancelDrag();
   closeDropdown();
   editingIndex = -1;
   tbody.innerHTML = "";
@@ -296,8 +298,10 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
   });
 }
 
-/** If there's an active address edit, commit it synchronously. */
-function commitOrCancelEditing() {
+/// Commit a pending inline address edit WITHOUT re-rendering. Lets
+/// renderFilters() flush the edit before it wipes the tbody (calling the
+/// rendering variant from there would recurse).
+function commitPendingEdit() {
   if (editingIndex < 0) return;
   const index = editingIndex;
   const input = tbody.querySelector<HTMLInputElement>(".inline-input");
@@ -309,6 +313,12 @@ function commitOrCancelEditing() {
       void persistFilters();
     }
   }
+}
+
+/** If there's an active address edit, commit it synchronously. */
+function commitOrCancelEditing() {
+  if (editingIndex < 0) return;
+  commitPendingEdit();
   renderFilters();
 }
 
@@ -388,6 +398,21 @@ interface DragState {
 
 /** Active drag state, or null. */
 let dragState: DragState | null = null;
+
+/// Abandon an in-progress drag without applying a reorder. Called by
+/// renderFilters() when a background reload wipes the tbody mid-drag:
+/// finishing the drag against detached rows would throw before listener
+/// cleanup and then save a corrupted rule list on the next click. The
+/// lifted row's inline styles are not restored here — every caller wipes
+/// the tbody immediately after, discarding the row.
+function cancelDrag() {
+  if (!dragState) return;
+  dragState.placeholder.remove();
+  document.removeEventListener("pointermove", onDragMove);
+  document.removeEventListener("pointerup", onDragEnd);
+  document.body.style.userSelect = "";
+  dragState = null;
+}
 
 /**
  * Start dragging a row.

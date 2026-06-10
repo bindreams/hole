@@ -118,3 +118,37 @@ describe("switching inline edits between cells", () => {
     expect(inputB!.closest("tr")!.dataset.index).toBe("2");
   });
 });
+
+describe("background re-render during drag", () => {
+  it("cancels the drag, restores document state, and never saves a corrupted list", async () => {
+    const { initFilters, renderFilters } = await import("./filters");
+    initFilters();
+    renderFilters();
+    const before = mockConfig!.filters.map((r) => r.address);
+
+    // Begin a drag on the first non-default rule's handle. bubbles: true is
+    // required — the handler is delegated on the tbody. jsdom has no
+    // PointerEvent constructor; the handler only reads target/clientY,
+    // which MouseEvent provides.
+    const handle = document.querySelectorAll<HTMLElement>(".drag-handle")[1]!;
+    handle.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, clientY: 10 }));
+    expect(document.body.style.userSelect).toBe("none");
+
+    // A validation-changed style background reload re-renders mid-drag.
+    renderFilters();
+
+    // Drag state must be fully cancelled: userSelect restored…
+    expect(document.body.style.userSelect).toBe("");
+    // …no placeholder or lifted row left behind…
+    expect(document.querySelector(".drag-placeholder")).toBeNull();
+    // …and a later pointerup must not throw, reorder, or persist anything.
+    // (This asserts the *outcome* — whether the listener was removed or
+    // onDragEnd early-returns on null dragState, the corruption vector is
+    // closed either way.)
+    saveConfigMock.mockClear();
+    document.dispatchEvent(new MouseEvent("pointerup"));
+    await flushPersist();
+    expect(mockConfig!.filters.map((r) => r.address)).toEqual(before);
+    expect(saveConfigMock).not.toHaveBeenCalled();
+  });
+});
