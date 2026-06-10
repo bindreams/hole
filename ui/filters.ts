@@ -1,7 +1,9 @@
 // Filters section: filter rules table with in-place editing, drag reorder,
 // test filtering, add/delete rules.
 
+import { invoke } from "@tauri-apps/api/core";
 import { config, saveConfig } from "./main";
+import { showToast } from "./toast";
 import type { FilterRule } from "./types";
 
 // Constants ===========================================================================================================
@@ -44,6 +46,34 @@ let openDropdown: (HTMLDivElement & { _td?: HTMLTableCellElement }) | null = nul
 
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
+
+// Persistence =========================================================================================================
+
+/// Persist the rule list, then push it to the running proxy.
+/// reload_proxy_filters is a no-op on the Rust side when disconnected;
+/// when connected, skipping it would leave live traffic on the old rules
+/// until the next reconnect with no indication in the UI.
+///
+/// Serialized through `persistChain`: callers fire-and-forget, and two
+/// rapid mutations must not interleave their save/reload pairs — the
+/// proxy must never be reloaded with an older snapshot than the last
+/// save. A reload that follows a FAILED save is harmless: save_config
+/// only replaces the Rust-side config on a successful disk write, so
+/// the reload pushes the unchanged old rules.
+let persistChain: Promise<void> = Promise.resolve();
+
+function persistFilters(): Promise<void> {
+  persistChain = persistChain.then(async () => {
+    await saveConfig();
+    try {
+      await invoke("reload_proxy_filters");
+    } catch (err) {
+      console.error("reload_proxy_filters failed:", err);
+      showToast(`Filters saved, but not applied to the running proxy: ${err}`, "error");
+    }
+  });
+  return persistChain;
+}
 
 // Rendering ===========================================================================================================
 
@@ -215,10 +245,10 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
     if (!newValue) {
       // Empty address — remove the rule (it was never valid).
       config?.filters.splice(index, 1);
-      saveConfig();
+      void persistFilters();
     } else if (newValue !== original) {
       if (config) config.filters[index].address = newValue;
-      saveConfig();
+      void persistFilters();
     }
     renderFilters();
   }
@@ -262,7 +292,7 @@ function commitOrCancelEditing() {
     const value = input.value.trim();
     if (value && value !== config.filters[index].address) {
       config.filters[index].address = value;
-      saveConfig();
+      void persistFilters();
     }
   }
   renderFilters();
@@ -319,7 +349,7 @@ function toggleDropdown(td: HTMLTableCellElement, index: number) {
       } else {
         config.filters[index].action = opt.value as FilterRule["action"];
       }
-      saveConfig();
+      void persistFilters();
       closeDropdown();
       renderFilters();
     });
@@ -518,7 +548,7 @@ function onDragEnd() {
       }
     }
     config.filters = newFilters;
-    saveConfig();
+    void persistFilters();
   }
 
   document.removeEventListener("pointermove", onDragMove);
@@ -566,7 +596,7 @@ function addRule() {
 function deleteRule(index: number) {
   if (index <= 0 || !config?.filters) return; // Cannot delete default rule.
   config.filters.splice(index, 1);
-  saveConfig();
+  void persistFilters();
   renderFilters();
 }
 
