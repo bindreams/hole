@@ -911,10 +911,9 @@ fn pure_vpn_start_cancellable_during_proxy_start() {
         let err = pm.start_cancellable(&config, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
-
-        // The gate is still held — release it so the spawned mock task
-        // can drop cleanly.
-        gate.notify_one();
+        // No gate release needed: the cancel drops the parked
+        // `proxy.start` future before it passes the gate, so the mock's
+        // sleeper task is never spawned.
     });
 }
 
@@ -1579,6 +1578,45 @@ mod self_test {
                 "last_error should mention the self-test failure; got {:?}",
                 pm.last_error()
             );
+        });
+    }
+
+    /// Pure-VPN (#459): the resolved ephemeral port — not
+    /// `config.local_port` — must be what `build_local_dns` (and
+    /// `Dispatcher::new`) receive. The regression mode is a swap back to
+    /// `config.local_port` at a consumer call site, which would make the
+    /// forwarder's `Socks5Connector` dial the configured port. Detect it
+    /// by listening on `config.local_port` for the duration of a pure-VPN
+    /// start with the forwarder enabled and asserting zero connection
+    /// attempts. (The start itself fails at the self-test gate either
+    /// way — MockProxy binds nothing — which also guarantees every
+    /// connector dial has completed before the assertion runs.)
+    #[skuld::test]
+    fn pure_vpn_start_never_dials_the_configured_port() {
+        rt().block_on(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let configured_port = listener.local_addr().unwrap().port();
+
+            let (mut pm, _dir) = new_manager(MockProxy::new());
+            let mut cfg = test_config();
+            cfg.proxy_socks5 = false;
+            cfg.proxy_http = false;
+            cfg.local_port = configured_port;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            assert!(
+                matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
+                "expected ForwarderSelfTestFailed, got {err:?}"
+            );
+
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing dialed local_port
+                Ok((_, peer)) => panic!("pure-VPN start dialed the configured local_port (from {peer})"),
+                Err(e) => panic!("unexpected accept error: {e}"),
+            }
         });
     }
 
