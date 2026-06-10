@@ -13,27 +13,27 @@
 
       <!-- Servers section -->
       <div>
-        <div class="section-hdr" id="section-servers-hdr">
+        <button type="button" class="section-hdr" id="section-servers-hdr" aria-expanded="true" aria-controls="section-servers-clip">
           <span class="tri">&#x25BC;</span>
           <span class="section-label">Servers</span>
-        </div>
-        <div class="section-clip">
+        </button>
+        <div class="section-clip" id="section-servers-clip">
           <div class="section-body">
             <div class="server-list" id="server-list">
               <!-- Server cards rendered by JS -->
             </div>
-            <div class="add-zone" id="import-zone">+ Import servers from file</div>
+            <button type="button" class="add-zone" id="import-zone">+ Import servers from file</button>
           </div>
         </div>
       </div>
 
       <!-- Filters section -->
       <div>
-        <div class="section-hdr" id="section-filters-hdr">
+        <button type="button" class="section-hdr" id="section-filters-hdr" aria-expanded="true" aria-controls="section-filters-clip">
           <span class="tri">&#x25BC;</span>
           <span class="section-label">Filters</span>
-        </div>
-        <div class="section-clip">
+        </button>
+        <div class="section-clip" id="section-filters-clip">
           <div class="section-body">
             <table class="filters-tbl">
               <colgroup>
@@ -54,7 +54,7 @@
                 <!-- Filter rows rendered by JS -->
               </tbody>
             </table>
-            <div class="filter-add-row" id="filter-add-btn">+ Add rule</div>
+            <button type="button" class="filter-add-row" id="filter-add-btn">+ Add rule</button>
             <div class="test-filter">
               <div class="test-filter-label">Test filtering</div>
               <div class="test-filter-row">
@@ -69,63 +69,63 @@
 
       <!-- Settings section -->
       <div>
-        <div class="section-hdr" id="section-settings-hdr">
+        <button type="button" class="section-hdr" id="section-settings-hdr" aria-expanded="true" aria-controls="section-settings-clip">
           <span class="tri">&#x25BC;</span>
           <span class="section-label">Settings</span>
-        </div>
-        <div class="section-clip">
+        </button>
+        <div class="section-clip" id="section-settings-clip">
           <div class="section-body">
             <div class="settings-group">
               <div class="setting-row">
-                <span class="setting-label">Start Hole on login</span>
+                <span class="setting-label" id="lbl-start-on-login">Start Hole on login</span>
                 <div class="setting-control">
-                  <div class="toggle" id="toggle-start-on-login"></div>
+                  <button type="button" class="toggle" id="toggle-start-on-login" role="switch" aria-checked="false" aria-labelledby="lbl-start-on-login"></button>
                 </div>
               </div>
               <div class="setting-row">
-                <span class="setting-label">On startup</span>
+                <span class="setting-label" id="lbl-on-startup">On startup</span>
                 <div class="setting-control">
                   <div class="custom-select-wrap">
-                    <div class="custom-select-btn" id="select-on-startup">Do not connect</div>
-                    <div class="custom-select-menu" id="menu-on-startup">
-                      <div class="custom-select-opt selected" data-value="do-not-connect">Do not connect</div>
-                      <div class="custom-select-opt" data-value="restore-last-state">Restore last state</div>
-                      <div class="custom-select-opt" data-value="always-connect">Always connect</div>
+                    <button type="button" class="custom-select-btn" id="select-on-startup" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-on-startup select-on-startup">Do not connect</button>
+                    <div class="custom-select-menu" id="menu-on-startup" role="listbox" aria-labelledby="lbl-on-startup">
+                      <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="do-not-connect">Do not connect</button>
+                      <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="restore-last-state">Restore last state</button>
+                      <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="always-connect">Always connect</button>
                     </div>
                   </div>
                 </div>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Theme</span>
+                <span class="setting-label" id="lbl-theme">Theme</span>
                 <div class="setting-control">
                   <div class="custom-select-wrap">
-                    <div class="custom-select-btn" id="select-theme">Dark</div>
-                    <div class="custom-select-menu" id="menu-theme">
-                      <div class="custom-select-opt" data-value="light">Light</div>
-                      <div class="custom-select-opt selected" data-value="dark">Dark</div>
-                      <div class="custom-select-opt" data-value="system">System</div>
+                    <button type="button" class="custom-select-btn" id="select-theme" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-theme select-theme">Dark</button>
+                    <div class="custom-select-menu" id="menu-theme" role="listbox" aria-labelledby="lbl-theme">
+                      <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="light">Light</button>
+                      <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="dark">Dark</button>
+                      <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="system">System</button>
                     </div>
                   </div>
                 </div>
               </div>
               <hr class="setting-divider">
               <div class="setting-row">
-                <span class="setting-label">Local proxy server</span>
+                <span class="setting-label" id="lbl-proxy-server">Local proxy server</span>
                 <div class="setting-control">
-                  <div class="toggle" id="toggle-proxy-server"></div>
+                  <button type="button" class="toggle" id="toggle-proxy-server" role="switch" aria-checked="false" aria-labelledby="lbl-proxy-server"></button>
                 </div>
               </div>
               <div class="setting-nested" id="proxy-nested">
                 <div class="setting-row">
-                  <span class="setting-label">SOCKS5</span>
+                  <span class="setting-label" id="lbl-socks5">SOCKS5</span>
                   <div class="setting-control">
-                    <div class="toggle" id="toggle-socks5"></div>
+                    <button type="button" class="toggle" id="toggle-socks5" role="switch" aria-checked="false" aria-labelledby="lbl-socks5"></button>
                   </div>
                 </div>
                 <div class="setting-row">
-                  <span class="setting-label">HTTP</span>
+                  <span class="setting-label" id="lbl-http">HTTP</span>
                   <div class="setting-control">
-                    <div class="toggle" id="toggle-http"></div>
+                    <button type="button" class="toggle" id="toggle-http" role="switch" aria-checked="false" aria-labelledby="lbl-http"></button>
                   </div>
                 </div>
                 <div class="setting-row">
@@ -143,30 +143,30 @@
               </div>
               <hr class="setting-divider">
               <div class="setting-row">
-                <span class="setting-label">DNS forwarder</span>
+                <span class="setting-label" id="lbl-dns-enabled">DNS forwarder</span>
                 <div class="setting-control">
-                  <div class="toggle" id="toggle-dns-enabled"></div>
+                  <button type="button" class="toggle" id="toggle-dns-enabled" role="switch" aria-checked="false" aria-labelledby="lbl-dns-enabled"></button>
                 </div>
               </div>
               <div class="setting-nested" id="dns-nested">
                 <div class="setting-row">
-                  <span class="setting-label">Protocol</span>
+                  <span class="setting-label" id="lbl-dns-protocol">Protocol</span>
                   <div class="setting-control">
                     <div class="custom-select-wrap">
-                      <div class="custom-select-btn" id="select-dns-protocol">DNS over HTTPS</div>
-                      <div class="custom-select-menu" id="menu-dns-protocol">
-                        <div class="custom-select-opt" data-value="plain-udp">Plain UDP</div>
-                        <div class="custom-select-opt" data-value="plain-tcp">Plain TCP</div>
-                        <div class="custom-select-opt" data-value="tls">DNS over TLS</div>
-                        <div class="custom-select-opt selected" data-value="https">DNS over HTTPS</div>
+                      <button type="button" class="custom-select-btn" id="select-dns-protocol" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-dns-protocol select-dns-protocol">DNS over HTTPS</button>
+                      <div class="custom-select-menu" id="menu-dns-protocol" role="listbox" aria-labelledby="lbl-dns-protocol">
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="plain-udp">Plain UDP</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="plain-tcp">Plain TCP</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="tls">DNS over TLS</button>
+                        <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="https">DNS over HTTPS</button>
                       </div>
                     </div>
                   </div>
                 </div>
                 <div class="setting-row">
-                  <span class="setting-label">Intercept UDP/53 to other servers</span>
+                  <span class="setting-label" id="lbl-dns-intercept">Intercept UDP/53 to other servers</span>
                   <div class="setting-control">
-                    <div class="toggle" id="toggle-dns-intercept"></div>
+                    <button type="button" class="toggle" id="toggle-dns-intercept" role="switch" aria-checked="false" aria-labelledby="lbl-dns-intercept"></button>
                   </div>
                 </div>
                 <div class="setting-row setting-note">
@@ -194,7 +194,7 @@
           <div class="sb-status">You are <strong class="off" id="status-word">Disconnected</strong></div>
           <div class="sb-ip">
             <span class="ip-text" id="ip-text"><span class="country-flag fi fis fi-xx" id="country-flag" title="Unknown"></span> --</span>
-            <span class="copy-btn" id="copy-ip-btn" title="Copy to clipboard">&#x2398;</span>
+            <button type="button" class="copy-btn" id="copy-ip-btn" title="Copy to clipboard" aria-label="Copy IP address to clipboard">&#x2398;</button>
           </div>
         </div>
       </div>
