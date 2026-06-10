@@ -76,6 +76,17 @@ describe("port input validation", () => {
     expect(mockConfig!.local_port).toBe(80);
     expect((document.getElementById("input-port") as HTMLInputElement).value).toBe("80");
   });
+
+  it("rejects trailing garbage on the HTTP port and reverts", async () => {
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const input = document.getElementById("input-port-http") as HTMLInputElement;
+    input.value = "9090xy";
+    input.dispatchEvent(new Event("change"));
+    expect(mockConfig!.local_port_http).toBe(4074);
+    expect(input.value).toBe("4074");
+    expect(saveConfigMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("DNS controls with no config loaded", () => {
@@ -95,5 +106,14 @@ describe("DNS controls with no config loaded", () => {
     const el = document.getElementById("toggle-dns-intercept")!;
     el.click();
     expect(el.classList.contains("on")).toBe(false);
+  });
+
+  it("dns protocol option does not flip selection when config is null", async () => {
+    mockConfig = null;
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const opt = document.querySelector<HTMLElement>("#menu-dns-protocol .custom-select-opt")!;
+    opt.click();
+    expect(opt.classList.contains("selected")).toBe(false);
   });
 });

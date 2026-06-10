@@ -58,6 +58,53 @@ describe("server test failure handling", () => {
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
   });
 
+  it("a test settling after config lost its servers list does not throw", async () => {
+    let rejectTest!: (reason: unknown) => void;
+    invokeMock.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectTest = reject;
+      }),
+    );
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelector<HTMLButtonElement>(".srv-test")!.click();
+    await Promise.resolve();
+
+    // Config reloaded without a servers key while the card is still live.
+    mockConfig = {};
+    rejectTest("bridge unreachable");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The finally repaint falls back to "untested" instead of throwing.
+    expect(document.querySelector(".srv-status")!.className).toContain("untested");
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
+  });
+
+  it("a test settling after its server was removed is a no-op repaint", async () => {
+    let rejectTest!: (reason: unknown) => void;
+    invokeMock.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectTest = reject;
+      }),
+    );
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelector<HTMLButtonElement>(".srv-test")!.click();
+    await Promise.resolve();
+
+    // Server deleted + re-render while the test is in flight.
+    (mockConfig as { servers: unknown[] }).servers = [];
+    renderServers();
+
+    rejectTest("bridge unreachable");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No card to repaint — must not throw; the error still surfaces.
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("bridge unreachable"), "error");
+  });
+
   it("re-render during an in-flight test repaints the testing state", async () => {
     invokeMock.mockReturnValueOnce(new Promise(() => {}));
     const { renderServers } = await import("./servers");

@@ -106,10 +106,14 @@ export function renderFilters() {
   if (!config) return;
   ensureDefaultRule();
 
+  // Flush a pending edit before wiping the tbody. This writes the open
+  // editor's value into the CURRENT config by row index — sound because
+  // every loadConfig caller today reloads a structurally identical
+  // filters array; a reload that reshapes the rules would need an
+  // identity-based commit instead.
   commitPendingEdit();
   cancelDrag();
   closeDropdown();
-  editingIndex = -1;
   tbody.innerHTML = "";
 
   for (let i = 0; i < config.filters.length; i++) {
@@ -242,7 +246,7 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
   const addrSpan = td.querySelector(".filter-addr");
   if (!addrSpan) return;
 
-  const original = addrSpan.textContent;
+  const original = addrSpan.textContent ?? "";
 
   const input = document.createElement("input");
   input.className = "inline-input";

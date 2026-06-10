@@ -208,5 +208,8 @@ describe("mark_validated_by_proxy_start failure surfacing", () => {
     expect(h.showToast).toHaveBeenCalledWith(expect.stringContaining("config save failed"), "error");
     // The connect itself still settled into `connected`.
     expect(h.state).toBe("connected");
+    // The reload is scoped OUT of the mark's try: a failed mark must not
+    // trigger loadConfig (there is no new validation state to pick up).
+    expect(h.loadConfig).not.toHaveBeenCalled();
   });
 });

@@ -93,7 +93,7 @@ function setCardTesting(id: string, testing: boolean) {
     if (testing) {
       dot.className = "srv-status testing";
     } else {
-      const server = config?.servers.find((s) => s.id === id);
+      const server = config?.servers?.find((s) => s.id === id);
       dot.className = `srv-status ${statusClassFor(server?.validation)}`;
       dot.title = statusTooltipFor(server?.validation);
     }
@@ -174,7 +174,7 @@ export function renderServers() {
       testBtn.textContent = "Test";
       testBtn.addEventListener("click", (e) => {
         e.stopPropagation(); // do not trigger card selection
-        runServerTest(server.id);
+        void runServerTest(server.id);
       });
       card.appendChild(testBtn);
 

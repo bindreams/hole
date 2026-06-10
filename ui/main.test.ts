@@ -50,6 +50,13 @@ vi.mock("./toast", () => ({ showToast: vi.fn() }));
 
 beforeEach(() => {
   callOrder.length = 0;
+  // Clear call logs (not implementations) so per-test assertions don't
+  // match a previous test's invocations.
+  invokeMock.mockClear();
+  listenMock.mockClear();
+  // init() starts real polling intervals; stub so they don't keep
+  // firing in the worker after the test completes.
+  vi.stubGlobal("setInterval", vi.fn());
   vi.resetModules();
 });
 
@@ -65,5 +72,21 @@ describe("init ordering", () => {
       expect(idx, `listener ${ev} must be registered before get_config`).toBeGreaterThan(-1);
       expect(idx).toBeLessThan(firstConfig);
     }
+  });
+
+  it("a listener registration failure fails init loudly", async () => {
+    listenMock.mockImplementationOnce((event: string) => {
+      callOrder.push(`listen:${event}`);
+      return Promise.reject(new Error("capability missing"));
+    });
+    const { initDone } = await import("./main");
+    await initDone;
+
+    // init reported the failure through the ui-ready handshake…
+    const signal = invokeMock.mock.calls.find(([cmd]) => cmd === "signal_ui_ready");
+    expect(signal).toBeDefined();
+    expect((signal![1] as { result: { ok: boolean } }).result.ok).toBe(false);
+    // …and never proceeded to the config fetch.
+    expect(callOrder).not.toContain("invoke:get_config");
   });
 });
