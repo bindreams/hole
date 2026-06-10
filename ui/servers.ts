@@ -142,19 +142,26 @@ export function renderServers() {
       });
       card.appendChild(testBtn);
 
-      const del = document.createElement("span");
+      const del = document.createElement("button");
+      del.type = "button";
       del.className = "srv-del";
       del.textContent = "\u2715";
+      del.setAttribute("aria-label", `Delete ${server.name}`);
       card.appendChild(del);
 
-      // Selection: click on card (but not the delete or test controls).
+      // Selection: click on the card. The Test and delete buttons stop
+      // propagation themselves; the status dot is inert but must not
+      // select either.
       card.addEventListener("click", (e) => {
-        if (e.target === del || e.target === testBtn || e.target === statusDot) return;
+        if (e.target === statusDot) return;
         selectServer(server.id);
       });
 
-      // Deletion: click on the X button.
-      del.addEventListener("click", () => {
+      // Deletion: click on the X button. Stop propagation so the card's
+      // selection handler never races the delete (keyboard activation
+      // synthesizes a bubbling click).
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
         deleteServer(server.id);
       });
 
@@ -179,12 +186,20 @@ async function selectServer(id: string) {
 /** Delete a server by ID — removes it from config, clears selection if needed, re-renders, saves. */
 async function deleteServer(id: string) {
   if (!config) return;
+  const idx = config.servers.findIndex((s) => s.id === id);
+  // The re-render destroys the focused delete button; remember whether
+  // focus was inside the list so we can keep a keyboard user in place.
+  const hadFocusInList = serverList.contains(document.activeElement);
   config.servers = config.servers.filter((s) => s.id !== id);
   if (config.selected_server === id) {
     // Auto-select the first remaining server, or null if none left.
     config.selected_server = config.servers.length > 0 ? config.servers[0].id : null;
   }
   renderServers();
+  if (hadFocusInList) {
+    const dels = serverList.querySelectorAll<HTMLElement>(".srv-del");
+    (dels[Math.min(idx, dels.length - 1)] ?? importZone).focus();
+  }
   await saveConfig();
 }
 
