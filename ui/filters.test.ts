@@ -94,3 +94,27 @@ describe("reload_proxy_filters on mutation", () => {
     expect(mockConfig!.filters).toHaveLength(1);
   });
 });
+
+describe("switching inline edits between cells", () => {
+  it("editing rule B while rule A is open commits A and opens a live editor on B", async () => {
+    const { initFilters, renderFilters } = await import("./filters");
+    initFilters();
+    renderFilters();
+
+    // Open edit on rule index 1 (first non-default), type a new address.
+    const cellA = document.querySelectorAll<HTMLElement>(".editable-addr")[0]!;
+    cellA.click();
+    const inputA = document.querySelector<HTMLInputElement>(".inline-input")!;
+    inputA.value = "a2.example.com";
+
+    // Click rule index 2's address cell.
+    document.querySelectorAll<HTMLElement>(".editable-addr")[1]!.click();
+
+    // A committed; B has a live (attached) editor.
+    expect(mockConfig!.filters[1].address).toBe("a2.example.com");
+    const inputB = document.querySelector<HTMLInputElement>(".inline-input");
+    expect(inputB).not.toBeNull();
+    expect(inputB!.isConnected).toBe(true);
+    expect(inputB!.closest("tr")!.dataset.index).toBe("2");
+  });
+});

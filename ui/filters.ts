@@ -220,7 +220,21 @@ export function renderFilters() {
  */
 function startAddressEdit(td: HTMLTableCellElement, index: number) {
   if (editingIndex === index) return; // Already editing this cell.
+
+  // Committing the previous edit re-renders the table, detaching `td`
+  // and possibly shifting `index` (an abandoned empty rule is spliced
+  // out). Capture the rule's identity, commit, then re-resolve both.
+  // Safe: this whole path is synchronous, so `config` cannot be
+  // reassigned between capture and re-resolution.
+  const rule = config?.filters[index];
   commitOrCancelEditing(); // Close any other active edit.
+  if (!rule || !config) return;
+  const liveIndex = config.filters.indexOf(rule);
+  if (liveIndex < 0) return; // rule was removed by the commit
+  const liveTd = tbody.querySelector<HTMLTableCellElement>(`tr[data-index="${liveIndex}"] .editable-addr`);
+  if (!liveTd) return;
+  td = liveTd;
+  index = liveIndex;
 
   editingIndex = index;
   const addrSpan = td.querySelector(".filter-addr");
@@ -384,7 +398,8 @@ let dragState: DragState | null = null;
 function startDrag(e: PointerEvent, row: HTMLTableRowElement, index: number) {
   e.preventDefault();
   closeDropdown();
-  commitOrCancelEditing();
+  // Any open edit was already committed by onTbodyPointerDown, which
+  // re-resolved `row`/`index` against the post-commit DOM.
 
   const rect = row.getBoundingClientRect();
   const tbodyRect = tbody.getBoundingClientRect();
@@ -783,7 +798,17 @@ function onTbodyPointerDown(e: PointerEvent) {
   const index = parseInt(tr.dataset.index ?? "", 10);
   if (Number.isNaN(index) || index <= 0) return; // Cannot drag default rule.
 
-  startDrag(e, tr, index);
+  // Commit any open edit FIRST (it re-renders), then re-resolve the row —
+  // same detached-node hazard as startAddressEdit.
+  const rule = config?.filters[index];
+  commitOrCancelEditing();
+  if (!rule || !config) return;
+  const liveIndex = config.filters.indexOf(rule);
+  if (liveIndex <= 0) return;
+  const liveRow = tbody.querySelector<HTMLTableRowElement>(`tr[data-index="${liveIndex}"]`);
+  if (!liveRow) return;
+
+  startDrag(e, liveRow, liveIndex);
 }
 
 /** Close dropdown when clicking outside. */
