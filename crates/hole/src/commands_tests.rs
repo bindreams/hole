@@ -59,6 +59,38 @@ fn build_proxy_config_invalid_selection() {
     assert!(build_proxy_config(&config).is_none());
 }
 
+#[skuld::test]
+fn build_proxy_config_master_toggle_off_disables_listeners() {
+    let config = AppConfig {
+        servers: vec![test_entry("a")],
+        selected_server: Some("a".to_string()),
+        proxy_server_enabled: false,
+        proxy_socks5: true,
+        proxy_http: true,
+        ..Default::default()
+    };
+
+    let pc = build_proxy_config(&config).expect("should return Some");
+    assert!(!pc.proxy_socks5, "master toggle off must disable the SOCKS5 listener");
+    assert!(!pc.proxy_http, "master toggle off must disable the HTTP listener");
+}
+
+#[skuld::test]
+fn build_proxy_config_master_toggle_on_passes_listener_flags() {
+    let config = AppConfig {
+        servers: vec![test_entry("a")],
+        selected_server: Some("a".to_string()),
+        proxy_server_enabled: true,
+        proxy_socks5: true,
+        proxy_http: true,
+        ..Default::default()
+    };
+
+    let pc = build_proxy_config(&config).expect("should return Some");
+    assert!(pc.proxy_socks5);
+    assert!(pc.proxy_http);
+}
+
 // save_config preservation tests ======================================================================================
 
 /// Verify that merging a frontend config (elevation_prompt_shown=false) with
