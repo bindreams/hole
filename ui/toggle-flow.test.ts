@@ -192,3 +192,21 @@ describe("toggleFromIdle: outcome handling", () => {
     expect(h.state).toBe("disconnected");
   });
 });
+
+describe("mark_validated_by_proxy_start failure surfacing", () => {
+  it("toasts when the validation mark fails after a successful connect", async () => {
+    const h = makeHarness();
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "toggle_proxy") return Promise.resolve("running");
+      if (cmd === "mark_validated_by_proxy_start") return Promise.reject(new Error("config save failed"));
+      return Promise.resolve();
+    });
+    h.deps.getConfig = () => ({ selected_server: "srv-1" }) as never;
+
+    await toggleFromIdle(true, h.deps);
+
+    expect(h.showToast).toHaveBeenCalledWith(expect.stringContaining("config save failed"), "error");
+    // The connect itself still settled into `connected`.
+    expect(h.state).toBe("connected");
+  });
+});
