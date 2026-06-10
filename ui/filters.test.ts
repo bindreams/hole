@@ -152,3 +152,40 @@ describe("background re-render during drag", () => {
     expect(saveConfigMock).not.toHaveBeenCalled();
   });
 });
+
+describe("abandoning a new rule", () => {
+  it("clicking another cell while a new rule's address is empty removes the rule", async () => {
+    const { initFilters, renderFilters } = await import("./filters");
+    initFilters();
+    renderFilters();
+    const count = mockConfig!.filters.length;
+
+    document.getElementById("filter-add-btn")!.click(); // adds empty rule + opens editor
+    expect(mockConfig!.filters.length).toBe(count + 1);
+
+    // Abandon it by clicking an existing rule's address cell (sync commit path).
+    document.querySelectorAll<HTMLElement>(".editable-addr")[0]!.click();
+
+    expect(mockConfig!.filters.length).toBe(count);
+    expect(mockConfig!.filters.every((r) => r.address !== "")).toBe(true);
+  });
+
+  it("the editor opens on the correct rule even when the splice shifts indices", async () => {
+    const { initFilters, renderFilters } = await import("./filters");
+    initFilters();
+    renderFilters();
+
+    document.getElementById("filter-add-btn")!.click(); // empty rule appended, editor open on it
+    // Click rule 2's address cell ("b.example.com") — the empty rule is
+    // spliced out; index 2 stays valid (the splice removed a LATER row),
+    // and the editor must land on b.example.com's live row.
+    document.querySelectorAll<HTMLElement>(".editable-addr")[1]!.click();
+
+    const input = document.querySelector<HTMLInputElement>(".inline-input")!;
+    expect(input.isConnected).toBe(true);
+    const row = input.closest("tr")!;
+    expect(row.dataset.index).toBe("2");
+    expect(mockConfig!.filters[2].address).toBe("b.example.com");
+    expect(mockConfig!.filters.every((r) => r.address !== "")).toBe(true);
+  });
+});

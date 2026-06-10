@@ -308,7 +308,11 @@ function commitPendingEdit() {
   editingIndex = -1; // Clear first so the blur handler becomes a no-op.
   if (input && config?.filters[index]) {
     const value = input.value.trim();
-    if (value && value !== config.filters[index].address) {
+    if (!value) {
+      // Empty address — the rule was never valid; drop it like commit() does.
+      config.filters.splice(index, 1);
+      void persistFilters();
+    } else if (value !== config.filters[index].address) {
       config.filters[index].address = value;
       void persistFilters();
     }
