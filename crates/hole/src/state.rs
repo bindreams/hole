@@ -2,6 +2,7 @@
 
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
+use hole_common::config_store::ConfigStore;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use tracing::warn;
 
 /// Shared application state managed by Tauri.
 pub struct AppState {
-    pub config_path: PathBuf,
+    pub config_store: ConfigStore,
     pub config: Mutex<AppConfig>,
     /// Tauri app handle, used by commands that need to emit events
     /// (currently `test_server` → `validation-changed`).
@@ -23,10 +24,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config_path: PathBuf, app_handle: tauri::AppHandle) -> Self {
-        let config = AppConfig::load(&config_path).unwrap_or_default();
+    pub fn new(config_store: ConfigStore, config: AppConfig, app_handle: tauri::AppHandle) -> Self {
         Self {
-            config_path,
+            config_store,
             config: Mutex::new(config),
             app_handle,
             bridge: tokio::sync::Mutex::new(None),

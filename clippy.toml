@@ -169,3 +169,15 @@ reason = "Non-atomic: pairing with `set_icon` flickers (per tauri docs) and `(fa
 [[disallowed-methods]]
 path = "tray_icon::TrayIcon::set_icon_as_template"
 reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tauri-level form. Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+
+# Config persistence — enforce the ConfigStore seam --------------------------------------------------------------------
+#
+# `ConfigStore` (crates/common/src/config_store.rs) quarantines a corrupt
+# config.json at load and blocks saves for the session when quarantine
+# fails. A direct `AppConfig::save` bypasses the `save_blocked` gate and
+# can overwrite the very file #467 preserves. `ConfigStore::save` and the
+# `AppConfig::save` unit tests carry sanctioned `#[allow]`s.
+
+[[disallowed-methods]]
+path = "hole_common::config::AppConfig::save"
+reason = "Go through `ConfigStore::save` — direct saves bypass the #467 save_blocked gate and can destroy a quarantine-pending config.json. See bindreams/hole#467."

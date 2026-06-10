@@ -6,6 +6,8 @@ use time::macros::datetime;
 
 const NOW: time::OffsetDateTime = datetime!(2026-06-10 14:23:05 UTC);
 
+// Direct `AppConfig::save` for test setup — sanctioned; see clippy.toml.
+#[allow(clippy::disallowed_methods)]
 #[skuld::test]
 fn load_valid_file_returns_config_and_no_recovery(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("config.json");
@@ -116,6 +118,8 @@ fn save_works_after_successful_quarantine(#[fixture(temp_dir)] dir: &Path) {
 
 /// rename(2) preserves the inode, so the 0600 mode `save()` sets on macOS
 /// must survive quarantine — the backup holds plaintext passwords.
+// Direct `AppConfig::save` for test setup — sanctioned; see clippy.toml.
+#[allow(clippy::disallowed_methods)]
 #[cfg(unix)]
 #[skuld::test]
 fn quarantine_preserves_file_permissions(#[fixture(temp_dir)] dir: &Path) {

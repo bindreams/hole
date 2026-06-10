@@ -197,7 +197,7 @@ fn revert_proxy_state(app: &AppHandle, enabled: bool) {
     {
         let mut config = state.config.lock().unwrap();
         config.enabled = enabled;
-        config.save(&state.config_path).ok();
+        state.config_store.save(&config).ok();
     }
     set_tray_icon(app, enabled);
     rebuild_tray_menu(app);
@@ -237,7 +237,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleO
             });
         }
         config.enabled = enabled;
-        config.save(&state.config_path).ok();
+        state.config_store.save(&config).ok();
         build_proxy_config(&config)
     };
 

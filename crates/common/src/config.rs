@@ -266,13 +266,8 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 // Methods =============================================================================================================
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => Ok(serde_json::from_str(&contents)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(ConfigError::Read(e)),
-        }
-    }
+    // Loading lives in `ConfigStore::load` (crate::config_store) — it
+    // quarantines corrupt files instead of returning an error to discard.
 
     /// Serialize and write atomically: write a sibling temp file, then rename
     /// it over `path`. A crash mid-write leaves the old config intact — a

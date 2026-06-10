@@ -97,6 +97,8 @@ impl ConfigStore {
         if self.save_blocked {
             return Err(ConfigError::SaveBlocked);
         }
+        // The clippy ban routes everyone else here; this is the seam itself.
+        #[allow(clippy::disallowed_methods)]
         config.save(&self.path)
     }
 }
