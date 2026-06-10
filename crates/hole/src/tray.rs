@@ -156,7 +156,9 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
 /// Update the tray icon to reflect the given enabled/disabled state.
 pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
     if let Some(tray) = app.tray_by_id("main") {
-        if let Err(e) = tray.set_icon(Some(tray_icons::tray_image(enabled.into()))) {
+        // `true` mirrors the build-time `icon_as_template(true)`; on
+        // non-macOS this falls back to plain `set_icon` (see #469).
+        if let Err(e) = tray.set_icon_with_as_template(Some(tray_icons::tray_image(enabled.into())), true) {
             warn!(error = %e, "failed to set tray icon");
         }
     }

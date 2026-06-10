@@ -136,3 +136,36 @@ allow-invalid = true
 [[disallowed-methods]]
 path = "tokio_util::sync::CancellationToken::new"
 reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy_manager.rs::ProxyManager::start`, `server_test.rs`. Test files use module-level `#![allow]`. See bindreams/hole#397."
+
+# macOS tray template flag ---------------------------------------------------------------------------------------------
+#
+# On macOS, `TrayIcon::set_icon` applies the NSImage with
+# `icon_is_template=false` hardcoded (tray-icon 0.23.1), silently dropping
+# the template flag set at tray build time. Hole's tray icon bytes are
+# RGB=0 with an alpha-only shape (crates/hole/build.rs), so a non-template
+# icon renders solid black — invisible on a dark menu bar and frozen on
+# highlight. Icon updates must go through `set_icon_with_as_template(icon,
+# true)`; its non-macOS fallback calls `set_icon` inside the tauri crate,
+# which clippy does not lint, so the ban cannot misfire there. The
+# underlying `tray_icon::TrayIcon` methods are banned too: they are
+# reachable via `with_inner_tray_icon` without naming any banned tauri
+# path. `set_icon_as_template` (both layers) is the non-atomic sibling —
+# tauri's own docs call the `set_icon` + `set_icon_as_template` sequence
+# out for visible flicker, and `(false)` clears the live flag outright.
+# See bindreams/hole#469.
+
+[[disallowed-methods]]
+path = "tauri::tray::TrayIcon::set_icon"
+reason = "On macOS this resets the NSImage template flag, rendering the alpha-only tray icon solid black. Use `set_icon_with_as_template(icon, true)` — atomic on macOS, falls back to `set_icon` elsewhere. See bindreams/hole#469."
+
+[[disallowed-methods]]
+path = "tray_icon::TrayIcon::set_icon"
+reason = "Reached via `with_inner_tray_icon`; hardcodes icon_is_template=false on macOS (tray-icon 0.23.1). Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+
+[[disallowed-methods]]
+path = "tauri::tray::TrayIcon::set_icon_as_template"
+reason = "Non-atomic: pairing with `set_icon` flickers (per tauri docs) and `(false)` clears the template flag live. Use `set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
+
+[[disallowed-methods]]
+path = "tray_icon::TrayIcon::set_icon_as_template"
+reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tauri-level form. Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
