@@ -62,7 +62,7 @@ pub async fn prompt_elevation(app: &AppHandle, request: BridgeRequest) -> bool {
         let mut config = state.config.lock().unwrap();
         config.elevation_prompt_shown = true;
         if let Err(e) = config.save(&state.config_path) {
-            warn!(error = %e, "failed to persist elevation_prompt_shown");
+            warn!(error = %e, path = %state.config_path.display(), "failed to persist elevation_prompt_shown");
         }
     }
 
