@@ -94,11 +94,11 @@ jobs:
       # via test-garter and test-galoshes on all platforms. Hole crates'
       # compileability is already covered by `Clippy (Hole workspace)`
       # above; test-hole runs in its own build+test job below.
-      # `--features garter/test-utils` builds garter's integration tests +
-      # the mock-plugin fixture bin into the archive (do not rely on a
-      # sibling's dev-dep edge to unify it in). Omitting it is a COMPILE
-      # error (see crates/garter/tests/common/mod.rs), never a silent
-      # shrink.
+      # `--features garter/test-utils` builds garter's feature-gated
+      # test-utils targets (tap_integration) into the archive — do not
+      # rely on a sibling's dev-dep edge to unify the feature in. The
+      # mock-plugin fixture bin is ungated and always archived (see
+      # crates/garter/tests/common/mod.rs).
       - name: Build test archive (ex-Galoshes crates)
         shell: bash
         run: |
