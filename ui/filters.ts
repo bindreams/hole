@@ -77,6 +77,27 @@ export function renderFilters() {
   if (!config) return;
   ensureDefaultRule();
 
+  // External re-renders (e.g. config reloads) destroy the focused control
+  // with the rest of the table; remember row + control so the rebuild can
+  // put focus back. A focused inline edit input or dropdown option maps
+  // back to the control that opened it. Captured before closeDropdown()
+  // below removes a focused option.
+  const active = document.activeElement;
+  let restoreSelector: string | null = null;
+  if (active instanceof HTMLElement && tbody.contains(active)) {
+    const index = active.closest("tr")?.dataset.index;
+    if (index !== undefined) {
+      if (active.closest(".filter-del")) {
+        restoreSelector = `tr[data-index="${index}"] .filter-del`;
+      } else if (active.closest(".editable-addr")) {
+        restoreSelector = `tr[data-index="${index}"] .filter-addr`;
+      } else {
+        const field = (active.closest("td") as HTMLTableCellElement | null)?.dataset.field;
+        if (field) restoreSelector = `tr[data-index="${index}"] td[data-field="${field}"] .cp`;
+      }
+    }
+  }
+
   closeDropdown();
   editingIndex = -1;
   tbody.innerHTML = "";
@@ -195,6 +216,8 @@ export function renderFilters() {
     tr.appendChild(tdDel);
     tbody.appendChild(tr);
   }
+
+  if (restoreSelector) tbody.querySelector<HTMLElement>(restoreSelector)?.focus();
 
   // Re-evaluate test filtering after render.
   evaluateTestFilter();

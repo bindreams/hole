@@ -88,6 +88,21 @@ async function runServerTest(id: string, btn: HTMLButtonElement, status: HTMLEle
 export function renderServers() {
   if (!config) return;
 
+  // External re-renders (e.g. validation-changed -> loadConfig) destroy the
+  // focused control with the rest of the list; remember which server's
+  // button had focus so the rebuild can put it back.
+  const active = document.activeElement;
+  let restore: { serverId: string; selector: string } | null = null;
+  if (active instanceof HTMLElement && serverList.contains(active)) {
+    const serverId = (active.closest(".srv") as HTMLElement | null)?.dataset.serverId;
+    const selector = active.classList.contains("srv-test")
+      ? ".srv-test"
+      : active.classList.contains("srv-del")
+        ? ".srv-del"
+        : null;
+    if (serverId && selector) restore = { serverId, selector };
+  }
+
   serverList.innerHTML = "";
 
   const servers = config.servers || [];
@@ -166,6 +181,17 @@ export function renderServers() {
       });
 
       serverList.appendChild(card);
+    }
+  }
+
+  if (restore) {
+    // Match by dataset rather than an interpolated attribute selector so
+    // the server id needs no CSS escaping.
+    for (const card of serverList.querySelectorAll<HTMLElement>(".srv")) {
+      if (card.dataset.serverId === restore.serverId) {
+        card.querySelector<HTMLElement>(restore.selector)?.focus();
+        break;
+      }
     }
   }
 }

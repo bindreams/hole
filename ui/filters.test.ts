@@ -175,4 +175,58 @@ describe("address editing", () => {
     const input = document.querySelector<HTMLInputElement>(".inline-input")!;
     expect(document.activeElement).toBe(input);
   });
+
+  it("blur-commit does not steal focus from a control the user clicked", async () => {
+    // Mid-edit on row 1, the user clicks row 2's action cell: the click
+    // opens that cell's dropdown (focusing an option), then the deferred
+    // blur-commit fires and re-renders. Focus must stay with the user's
+    // target, not jump back to row 1's address button.
+    vi.useFakeTimers();
+    try {
+      await setup();
+      row(1).querySelector<HTMLElement>(".filter-addr")!.click();
+      const input = row(1).querySelector<HTMLInputElement>(".inline-input")!;
+      input.value = "edited.example.com";
+      input.dispatchEvent(new Event("blur"));
+      row(2).querySelector<HTMLElement>('td[data-field="action"] .cp')!.click();
+      vi.runAllTimers(); // deferred blur-commit: saves + re-renders
+      expect((mainMock.config!.filters as { address: string }[])[1].address).toBe("edited.example.com");
+      expect(document.activeElement).toBe(row(2).querySelector('td[data-field="action"] .cp'));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("external re-renders", () => {
+  // Config reloads re-render the table at any moment; the focused control
+  // must survive the rebuild.
+  it("keeps focus on the same cell button across a re-render", async () => {
+    const mod = await setup();
+    row(1).querySelector<HTMLElement>('td[data-field="matching"] .cp')!.focus();
+    mod.renderFilters();
+    expect(document.activeElement).toBe(row(1).querySelector('td[data-field="matching"] .cp'));
+  });
+
+  it("keeps focus on the same delete button across a re-render", async () => {
+    const mod = await setup();
+    row(2).querySelector<HTMLElement>(".filter-del")!.focus();
+    mod.renderFilters();
+    expect(document.activeElement).toBe(row(2).querySelector(".filter-del"));
+  });
+
+  it("maps a focused address button back to the rebuilt address button", async () => {
+    const mod = await setup();
+    row(1).querySelector<HTMLElement>(".filter-addr")!.focus();
+    mod.renderFilters();
+    expect(document.activeElement).toBe(row(1).querySelector(".filter-addr"));
+  });
+
+  it("does not touch focus when it is outside the table", async () => {
+    const mod = await setup();
+    const outside = document.getElementById("filter-add-btn")!;
+    outside.focus();
+    mod.renderFilters();
+    expect(document.activeElement).toBe(outside);
+  });
 });

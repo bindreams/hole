@@ -104,3 +104,33 @@ describe("server delete control", () => {
     expect(document.activeElement).toBe(outside);
   });
 });
+
+describe("external re-renders", () => {
+  // validation-changed -> loadConfig -> renderServers rebuilds the list at
+  // any moment (e.g. a background server test finishing); the focused
+  // control must survive the rebuild.
+  it("keeps focus on the same server's Test button across a re-render", async () => {
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelectorAll<HTMLElement>(".srv-test")[1].focus();
+    renderServers();
+    expect(document.activeElement).toBe(document.querySelectorAll<HTMLElement>(".srv-test")[1]);
+  });
+
+  it("keeps focus on the same server's delete button across a re-render", async () => {
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelectorAll<HTMLElement>(".srv-del")[2].focus();
+    renderServers();
+    expect(document.activeElement).toBe(document.querySelectorAll<HTMLElement>(".srv-del")[2]);
+  });
+
+  it("does not touch focus when it is outside the list", async () => {
+    const { renderServers } = await import("./servers");
+    renderServers();
+    const outside = document.getElementById("import-zone")!;
+    outside.focus();
+    renderServers();
+    expect(document.activeElement).toBe(outside);
+  });
+});
