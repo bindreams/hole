@@ -38,4 +38,19 @@ describe("section headers", () => {
     expect(hdr.querySelector(".tri")!.classList.contains("collapsed")).toBe(false);
     expect(clip.classList.contains("collapsed")).toBe(false);
   });
+
+  it("collapse makes the clip inert so its controls leave the tab order; expand restores them", async () => {
+    // A collapsed clip is hidden via max-height: 0 + overflow: hidden only —
+    // without inert, the now-focusable buttons inside would remain tab stops
+    // while invisible.
+    const { initSections } = await import("./sections");
+    initSections();
+    const hdr = document.getElementById("hdr")!;
+    const clip = document.getElementById("clip")!;
+    hdr.click();
+    expect(clip.hasAttribute("inert")).toBe(true);
+    clip.dispatchEvent(new Event("transitionend"));
+    hdr.click();
+    expect(clip.hasAttribute("inert")).toBe(false);
+  });
 });
