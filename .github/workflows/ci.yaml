@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
 
       - uses: ./.github/actions/setup-build
 
@@ -332,7 +332,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
       - name: Run script tests
         run: uv run scripts/dev_tests.py
 
@@ -345,7 +345,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
       - uses: ./.github/actions/setup-build
 
       - name: Test
@@ -489,7 +489,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
       - uses: ./.github/actions/setup-build
 
       # One build+test via the run-cascade (builds hole-dmg once, then the
