@@ -4,7 +4,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { attachConsole, error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
+import { error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
@@ -289,17 +289,10 @@ async function init() {
 
   let result: { ok: boolean; error: string | null };
   try {
-    // Mirror Rust log events into the JS console (the OPPOSITE direction
-    // from the relay above). Wrapped in try/catch so a future capability
-    // misconfiguration on `tauri-plugin-log` doesn't silently break the
-    // whole dashboard. The plugin is registered on the Rust side in
-    // main.rs with `.skip_logger()` so JS log events flow through
-    // `log` → `tracing-log::LogTracer` → `gui.log`.
-    try {
-      await attachConsole();
-    } catch (e) {
-      console.warn("attachConsole failed:", e);
-    }
+    // Rust→JS console mirroring is deliberately absent: main.rs registers
+    // tauri-plugin-log with .skip_logger(), which never constructs the
+    // Webview target that emits log://log events — attachConsole() would
+    // resolve and then receive nothing. Backend logs live in gui.log.
 
     window.addEventListener("error", (e) => {
       console.error(`window.error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`);
