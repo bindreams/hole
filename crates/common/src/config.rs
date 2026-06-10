@@ -135,6 +135,13 @@ pub struct AppConfig {
     pub start_on_login: bool,
     pub on_startup: StartupBehavior,
     pub theme: Theme,
+    /// Master switch for the user-facing local proxy listeners
+    /// ("Local proxy server" in settings). When false,
+    /// `build_proxy_config` zeroes `proxy_socks5` / `proxy_http` in the
+    /// outgoing `ProxyConfig` and the bridge runs a pure-VPN start: the
+    /// TUN data plane binds an internal ephemeral SOCKS5 instance and
+    /// nothing listens on `local_port` / `local_port_http`. The nested
+    /// toggles keep their persisted values for re-enable.
     pub proxy_server_enabled: bool,
     pub proxy_socks5: bool,
     pub proxy_http: bool,
