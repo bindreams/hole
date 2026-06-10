@@ -1,0 +1,4 @@
+# Floor for runtime CARGO_BIN_EXE_* injection (remapped under --archive-file),
+# which garter's tests use to locate the mock-plugin fixture bin. See
+# bindreams/hole#496 and crates/garter/tests/common/mod.rs.
+nextest-version = "0.9.130"
