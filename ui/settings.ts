@@ -76,21 +76,24 @@ function patchDns(partial: Partial<DnsConfig>) {
 
 // Toggle component ====================================================================================================
 
+/** Apply toggle visual + ARIA state in one place. */
+function setToggleState(el: HTMLElement, on: boolean) {
+  el.classList.toggle("on", on);
+  el.setAttribute("aria-checked", String(on));
+}
+
 /**
- * Wire a toggle switch element.
- * @param {string} id        - Element ID of the `.toggle` div.
- * @param {string} configKey - Key in `config` to read/write (boolean).
- * @param {Function} [onToggle] - Optional callback after state changes.
+ * Wire a toggle switch button.
+ * @param {string} id - Element ID of the `.toggle` button.
+ * @param {Function} apply - Persists the new state (writes config and saves).
  */
-function wireToggle(id: string, configKey: string, onToggle?: (on: boolean) => void) {
+function wireToggle(id: string, apply: (on: boolean) => void) {
   const el = document.getElementById(id)!;
   el.addEventListener("click", () => {
     if (!config) return;
     const on = !el.classList.contains("on");
-    el.classList.toggle("on", on);
-    config[configKey] = on;
-    if (onToggle) onToggle(on);
-    saveConfig();
+    setToggleState(el, on);
+    apply(on);
   });
 }
 
@@ -234,16 +237,25 @@ function handleClickOutside() {
  */
 export function initSettings() {
   // Toggles.
-  wireToggle("toggle-start-on-login", "start_on_login");
-  wireToggle("toggle-proxy-server", "proxy_server_enabled", () => {
+  wireToggle("toggle-start-on-login", (on) => {
+    config!.start_on_login = on;
+    saveConfig();
+  });
+  wireToggle("toggle-proxy-server", (on) => {
+    config!.proxy_server_enabled = on;
     updateProxyMuting();
+    saveConfig();
   });
-  wireToggle("toggle-socks5", "proxy_socks5", () => {
+  wireToggle("toggle-socks5", (on) => {
+    config!.proxy_socks5 = on;
     updatePortConflictMarkers();
+    saveConfig();
   });
-  wireToggle("toggle-http", "proxy_http", () => {
+  wireToggle("toggle-http", (on) => {
+    config!.proxy_http = on;
     updateHttpPortVisibility();
     updatePortConflictMarkers();
+    saveConfig();
   });
 
   // Dropdowns.
@@ -269,19 +281,8 @@ export function initSettings() {
  * nested controls are visually greyed.
  */
 function wireDnsControls() {
-  const enabledEl = document.getElementById("toggle-dns-enabled")!;
-  enabledEl.addEventListener("click", () => {
-    const on = !enabledEl.classList.contains("on");
-    enabledEl.classList.toggle("on", on);
-    patchDns({ enabled: on });
-  });
-
-  const interceptEl = document.getElementById("toggle-dns-intercept")!;
-  interceptEl.addEventListener("click", () => {
-    const on = !interceptEl.classList.contains("on");
-    interceptEl.classList.toggle("on", on);
-    patchDns({ intercept_udp53: on });
-  });
+  wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));
+  wireToggle("toggle-dns-intercept", (on) => patchDns({ intercept_udp53: on }));
 
   // DNS protocol dropdown — hand-wired (not via wireDropdown) because it
   // patches config.dns, not a top-level config key.
@@ -314,10 +315,10 @@ export function renderSettings() {
   if (!config) return;
 
   // Toggles.
-  document.getElementById("toggle-start-on-login")!.classList.toggle("on", !!config.start_on_login);
-  document.getElementById("toggle-proxy-server")!.classList.toggle("on", !!config.proxy_server_enabled);
-  document.getElementById("toggle-socks5")!.classList.toggle("on", !!config.proxy_socks5);
-  document.getElementById("toggle-http")!.classList.toggle("on", !!config.proxy_http);
+  setToggleState(document.getElementById("toggle-start-on-login")!, !!config.start_on_login);
+  setToggleState(document.getElementById("toggle-proxy-server")!, !!config.proxy_server_enabled);
+  setToggleState(document.getElementById("toggle-socks5")!, !!config.proxy_socks5);
+  setToggleState(document.getElementById("toggle-http")!, !!config.proxy_http);
 
   // Dropdowns.
   syncDropdown("select-on-startup", "menu-on-startup", config.on_startup ?? "do_not_connect");
@@ -334,8 +335,8 @@ export function renderSettings() {
 
   // DNS forwarder state.
   const dns = currentDns();
-  document.getElementById("toggle-dns-enabled")!.classList.toggle("on", dns.enabled);
-  document.getElementById("toggle-dns-intercept")!.classList.toggle("on", dns.intercept_udp53);
+  setToggleState(document.getElementById("toggle-dns-enabled")!, dns.enabled);
+  setToggleState(document.getElementById("toggle-dns-intercept")!, dns.intercept_udp53);
   syncDropdown("select-dns-protocol", "menu-dns-protocol", dns.protocol);
   updateDnsMuting();
 
