@@ -45,12 +45,13 @@ describe("custom select dropdowns", () => {
     { btn: "select-theme", menu: "menu-theme" },
     { btn: "select-dns-protocol", menu: "menu-dns-protocol" },
   ];
-  it.each(families)("$btn trigger is a labelled listbox button", ({ btn }) => {
+  it.each(families)("$btn trigger is a labelled listbox button", ({ btn, menu }) => {
     const el = byId(btn);
     expect(el.tagName).toBe("BUTTON");
     expect(el.getAttribute("type")).toBe("button");
     expect(el.getAttribute("aria-haspopup")).toBe("listbox");
     expect(el.getAttribute("aria-expanded")).toBe("false");
+    expect(el.getAttribute("aria-controls")).toBe(menu);
     assertLabelledBy(el);
   });
   it.each(families)("$menu options are focusable option buttons", ({ menu }) => {
@@ -83,6 +84,12 @@ describe("section headers", () => {
     // toggleSection finds the clip via nextElementSibling — pin the structure.
     expect(el.nextElementSibling).toBe(clip);
   });
+
+  it.each(ids)("%s hides its decorative triangle from the accessibility tree", (id) => {
+    // Without aria-hidden the ▼ glyph pollutes the button's accessible
+    // name ("▼ Servers").
+    expect(byId(id).querySelector(".tri")!.getAttribute("aria-hidden")).toBe("true");
+  });
 });
 
 describe("remaining controls", () => {
@@ -101,5 +108,8 @@ describe("remaining controls", () => {
     expect(el.tagName).toBe("BUTTON");
     expect(el.getAttribute("type")).toBe("button");
     expect(el.getAttribute("aria-label")).toBeTruthy();
+  });
+  it("power button has an accessible name (icon-only, SVG is aria-hidden)", () => {
+    expect(byId("power-btn").getAttribute("aria-label")).toBeTruthy();
   });
 });

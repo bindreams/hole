@@ -14,7 +14,7 @@
       <!-- Servers section -->
       <div>
         <button type="button" class="section-hdr" id="section-servers-hdr" aria-expanded="true" aria-controls="section-servers-clip">
-          <span class="tri">&#x25BC;</span>
+          <span class="tri" aria-hidden="true">&#x25BC;</span>
           <span class="section-label">Servers</span>
         </button>
         <div class="section-clip" id="section-servers-clip">
@@ -30,7 +30,7 @@
       <!-- Filters section -->
       <div>
         <button type="button" class="section-hdr" id="section-filters-hdr" aria-expanded="true" aria-controls="section-filters-clip">
-          <span class="tri">&#x25BC;</span>
+          <span class="tri" aria-hidden="true">&#x25BC;</span>
           <span class="section-label">Filters</span>
         </button>
         <div class="section-clip" id="section-filters-clip">
@@ -70,7 +70,7 @@
       <!-- Settings section -->
       <div>
         <button type="button" class="section-hdr" id="section-settings-hdr" aria-expanded="true" aria-controls="section-settings-clip">
-          <span class="tri">&#x25BC;</span>
+          <span class="tri" aria-hidden="true">&#x25BC;</span>
           <span class="section-label">Settings</span>
         </button>
         <div class="section-clip" id="section-settings-clip">
@@ -86,7 +86,7 @@
                 <span class="setting-label" id="lbl-on-startup">On startup</span>
                 <div class="setting-control">
                   <div class="custom-select-wrap">
-                    <button type="button" class="custom-select-btn" id="select-on-startup" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-on-startup select-on-startup">Do not connect</button>
+                    <button type="button" class="custom-select-btn" id="select-on-startup" aria-haspopup="listbox" aria-controls="menu-on-startup" aria-expanded="false" aria-labelledby="lbl-on-startup select-on-startup">Do not connect</button>
                     <div class="custom-select-menu" id="menu-on-startup" role="listbox" aria-labelledby="lbl-on-startup">
                       <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="do-not-connect">Do not connect</button>
                       <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="restore-last-state">Restore last state</button>
@@ -99,7 +99,7 @@
                 <span class="setting-label" id="lbl-theme">Theme</span>
                 <div class="setting-control">
                   <div class="custom-select-wrap">
-                    <button type="button" class="custom-select-btn" id="select-theme" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-theme select-theme">Dark</button>
+                    <button type="button" class="custom-select-btn" id="select-theme" aria-haspopup="listbox" aria-controls="menu-theme" aria-expanded="false" aria-labelledby="lbl-theme select-theme">Dark</button>
                     <div class="custom-select-menu" id="menu-theme" role="listbox" aria-labelledby="lbl-theme">
                       <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="light">Light</button>
                       <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="dark">Dark</button>
@@ -153,7 +153,7 @@
                   <span class="setting-label" id="lbl-dns-protocol">Protocol</span>
                   <div class="setting-control">
                     <div class="custom-select-wrap">
-                      <button type="button" class="custom-select-btn" id="select-dns-protocol" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-dns-protocol select-dns-protocol">DNS over HTTPS</button>
+                      <button type="button" class="custom-select-btn" id="select-dns-protocol" aria-haspopup="listbox" aria-controls="menu-dns-protocol" aria-expanded="false" aria-labelledby="lbl-dns-protocol select-dns-protocol">DNS over HTTPS</button>
                       <div class="custom-select-menu" id="menu-dns-protocol" role="listbox" aria-labelledby="lbl-dns-protocol">
                         <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="plain-udp">Plain UDP</button>
                         <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="plain-tcp">Plain TCP</button>
@@ -184,7 +184,7 @@
     <div class="sidebar">
       <!-- Status header -->
       <div class="sb-header">
-        <button type="button" class="power-btn off" id="power-btn">
+        <button type="button" class="power-btn off" id="power-btn" aria-label="Toggle connection">
           <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
             <path d="M12 3v8"/>
             <path d="M5.6 6.6a9 9 0 1 0 12.8 0"/>
