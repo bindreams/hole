@@ -70,10 +70,17 @@ async fn root_spawn_marks_descendants() {
         assert!(marked, "Mark spawn must set {var} on the child");
     }
     let conn = await_ready(&listener).await;
-    gc.kill_tree().await.unwrap();
+    gc.kill_tree().await;
     assert_dies(conn).await;
 }
 
+/// NOTE: nextest may occasionally flag this test `LEAK`: the death-watch
+/// fires on the grandchild's socket EOF (its death), but the OS-level
+/// process teardown (SIGKILL delivery → reparent → reap by init/launchd)
+/// can still be in flight when nextest snapshots handles. The contract —
+/// the grandchild DIES — is fully verified; there is no userspace
+/// rendezvous for "non-child process fully reaped" (kill(2) is async by
+/// design), and the default nextest profile does not fail on leaks.
 #[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
 async fn kill_tree_reaps_grandchild() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -82,10 +89,17 @@ async fn kill_tree_reaps_grandchild() {
     // The GRANDCHILD (sleep mode) dials the control listener; its conn is the
     // death-watch. The intermediate child never dials.
     let grandchild_conn = await_ready(&listener).await;
-    gc.kill_tree().await.unwrap();
+    gc.kill_tree().await;
     assert_dies(grandchild_conn).await;
 }
 
+/// NOTE: nextest may occasionally flag this test `LEAK`: the death-watch
+/// fires on the grandchild's socket EOF (its death), but the OS-level
+/// process teardown (SIGKILL delivery → reparent → reap by init/launchd)
+/// can still be in flight when nextest snapshots handles. The contract —
+/// the grandchild DIES — is fully verified; there is no userspace
+/// rendezvous for "non-child process fully reaped" (kill(2) is async by
+/// design), and the default nextest profile does not fail on leaks.
 #[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
 async fn drop_reaps_grandchild() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -114,7 +128,7 @@ async fn nested_spawn_creates_no_group() {
     let mut gc = result.unwrap();
     assert!(!gc.is_root(), "marker set => nested spawn, no new group");
     let conn = await_ready(&listener).await;
-    gc.kill_tree().await.unwrap();
+    gc.kill_tree().await;
     assert_dies(conn).await;
 }
 
@@ -134,7 +148,7 @@ async fn legacy_marker_is_honored() {
     let mut gc = result.unwrap();
     assert!(!gc.is_root(), "legacy marker set => nested spawn");
     let conn = await_ready(&listener).await;
-    gc.kill_tree().await.unwrap();
+    gc.kill_tree().await;
     assert_dies(conn).await;
 }
 
@@ -154,6 +168,6 @@ async fn opaque_root_does_not_mark_descendants() {
         assert!(!marked, "Opaque spawn must not set {var} on the child");
     }
     let conn = await_ready(&listener).await;
-    gc.kill_tree().await.unwrap();
+    gc.kill_tree().await;
     assert_dies(conn).await;
 }

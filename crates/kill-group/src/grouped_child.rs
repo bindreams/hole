@@ -80,6 +80,7 @@ pub enum Nesting {
 pub struct GroupedChild {
     pub child: Child,
     group: imp::Group,
+    root: bool,
 }
 
 impl GroupedChild {
@@ -106,17 +107,19 @@ impl GroupedChild {
     }
 
     /// True when this spawn created (or attempted) its own kill-group.
+    /// True even when group creation degraded (Windows job-object failure
+    /// arms) — the spawn was still the outermost one.
     pub fn is_root(&self) -> bool {
-        self.group.is_root()
+        self.root
     }
 
     /// Hard-kill the whole tree and reap the direct child. Safe to call after
     /// the child already exited.
-    pub async fn kill_tree(&mut self) -> io::Result<()> {
+    pub async fn kill_tree(&mut self) {
+        // Errors ignored: the child may already be gone, which is the goal state.
         self.group.kill();
         let _ = self.child.start_kill(); // degraded/nested case: direct child
         let _ = self.child.wait().await; // reap; ignore status — it was killed
-        Ok(())
     }
 }
 
@@ -153,10 +156,6 @@ mod imp {
     unsafe impl Send for Group {}
 
     impl Group {
-        pub(super) fn is_root(&self) -> bool {
-            self.job.is_some()
-        }
-
         pub(super) fn kill(&mut self) {
             if let Some(job) = self.job.take() {
                 // TerminateJobObject kills the whole tree synchronously; then we
@@ -197,7 +196,11 @@ mod imp {
         } else {
             Group { job: None }
         };
-        Ok(GroupedChild { child, group })
+        Ok(GroupedChild {
+            child,
+            group,
+            root: is_root,
+        })
     }
 
     fn clear_std_handle_inheritance() {
@@ -266,10 +269,6 @@ mod imp {
     }
 
     impl Group {
-        pub(super) fn is_root(&self) -> bool {
-            self.pgid.is_some()
-        }
-
         pub(super) fn kill(&mut self) {
             if let Some(pgid) = self.pgid.take() {
                 // Negative pid → signal the whole process group.
@@ -303,6 +302,10 @@ mod imp {
         } else {
             Group { pgid: None }
         };
-        Ok(GroupedChild { child, group })
+        Ok(GroupedChild {
+            child,
+            group,
+            root: is_root,
+        })
     }
 }
