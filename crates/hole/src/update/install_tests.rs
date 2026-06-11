@@ -9,12 +9,17 @@ use super::*;
 fn msiexec_args_quiet() {
     let path = Path::new(r"C:\tmp\hole.msi");
     let args = msiexec_args(path, true);
-    assert_eq!(args[0], "/i");
-    assert_eq!(args[1], r"C:\tmp\hole.msi");
-    assert!(args.contains(&"/quiet".to_string()));
-    assert!(args.contains(&"/norestart".to_string()));
-    // Should have a log flag
-    assert!(args.iter().any(|a| a.starts_with("/L*v")));
+    assert_eq!(
+        args,
+        [
+            r"/i",
+            r"C:\tmp\hole.msi",
+            "/quiet",
+            "/norestart",
+            "/L*v",
+            r"C:\tmp\hole.msi.log"
+        ]
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -22,9 +27,7 @@ fn msiexec_args_quiet() {
 fn msiexec_args_interactive() {
     let path = Path::new(r"C:\tmp\hole.msi");
     let args = msiexec_args(path, false);
-    assert_eq!(args[0], "/i");
-    assert_eq!(args[1], r"C:\tmp\hole.msi");
-    assert!(!args.contains(&"/quiet".to_string()));
+    assert_eq!(args, [r"/i", r"C:\tmp\hole.msi", "/L*v", r"C:\tmp\hole.msi.log"]);
 }
 
 // macOS hdiutil arg construction ======================================================================================

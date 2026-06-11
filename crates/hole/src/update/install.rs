@@ -39,10 +39,12 @@ pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
     if quiet {
         args.push("/quiet".to_string());
         args.push("/norestart".to_string());
-        // Log file for diagnostics next to the MSI.
-        let log_path = format!("{path_str}.log");
-        args.push(format!("/L*v{log_path}"));
     }
+
+    // Log next to the MSI for post-detach diagnostics. The value is its own
+    // token (documented msiexec form) so temp paths with spaces survive quoting.
+    args.push("/L*v".to_string());
+    args.push(format!("{path_str}.log"));
 
     args
 }
