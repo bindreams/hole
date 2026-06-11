@@ -3646,6 +3646,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kill-group"
+version = "0.1.0"
+dependencies = [
+ "hole-test-observability",
+ "libc",
+ "skuld",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

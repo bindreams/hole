@@ -33,13 +33,14 @@ use semver::Version;
 
 // Group ===============================================================================================================
 
-/// One of the four product release groups.
+/// One of the five product release groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Group {
     Hole,
     Garter,
     Galoshes,
     ExRay,
+    KillGroup,
 }
 
 impl Group {
@@ -49,6 +50,7 @@ impl Group {
             Self::Garter => "garter",
             Self::Galoshes => "galoshes",
             Self::ExRay => "ex-ray",
+            Self::KillGroup => "kill-group",
         }
     }
 
@@ -58,12 +60,13 @@ impl Group {
             "garter" => Ok(Self::Garter),
             "galoshes" => Ok(Self::Galoshes),
             "ex-ray" => Ok(Self::ExRay),
-            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, ex-ray)"),
+            "kill-group" => Ok(Self::KillGroup),
+            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, ex-ray, kill-group)"),
         }
     }
 
     pub fn all() -> &'static [Group] {
-        &[Self::Hole, Self::Garter, Self::Galoshes, Self::ExRay]
+        &[Self::Hole, Self::Garter, Self::Galoshes, Self::ExRay, Self::KillGroup]
     }
 
     /// `git describe --match <this>` glob for nearest-tag lookups for this
