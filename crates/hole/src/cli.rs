@@ -125,6 +125,12 @@ pub(crate) enum BridgeAction {
         /// `bridge-plugins.json`). Default: platform-specific user state dir.
         #[arg(long)]
         state_dir: Option<std::path::PathBuf>,
+        /// Dev-supervisor readiness rendezvous: `<host:port>/<token>`. After
+        /// the IPC socket is bound and its permissions applied, the bridge
+        /// connects and echoes the token. Used by dev-console; not for
+        /// service mode.
+        #[arg(long)]
+        ready_notify: Option<String>,
     },
     /// Install and start the bridge service
     Install {
@@ -341,10 +347,16 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             service,
             log_dir,
             state_dir,
+            ready_notify,
         } => {
             let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
             let _guard = hole_bridge::logging::init(&log_dir);
             tracing::info!("hole bridge starting");
+
+            if service && ready_notify.is_some() {
+                cli_log!(error, "--ready-notify is not supported with --service");
+                return 2;
+            }
 
             // Canonicalize state_dir to an absolute path. If canonicalize
             // fails (e.g. directory doesn't exist yet), fall back to
@@ -370,7 +382,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                     hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir).map_err(|e| Box::new(e) as _)
                 }
             } else {
-                hole_bridge::foreground::run(&socket_path, &state_dir, &log_dir)
+                hole_bridge::foreground::run(&socket_path, &state_dir, &log_dir, ready_notify.as_deref())
             };
 
             if let Err(e) = result {

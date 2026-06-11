@@ -18,9 +18,14 @@ use crate::proxy_manager::ProxyManager;
 /// `log_dir` is the same directory that the global tracing subscriber
 /// writes `bridge.log` into — so all bridge-owned files land in one
 /// place and the CI artifact-upload step can glob for them.
-pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    socket_path: &Path,
+    state_dir: &Path,
+    log_dir: &Path,
+    ready_notify: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir, log_dir))
+    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify))
 }
 
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere, or
@@ -64,7 +69,33 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     }
 }
 
-async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Connect to `spec` = `"<host:port>/<token>"` and write `<token>\n`.
+/// Best-effort by contract: every failure is a warn — the supervisor's
+/// bounded wait is the human-facing failure signal, and a bridge that runs
+/// fine but cannot notify should not die for it.
+async fn notify_ready(spec: &str) {
+    let Some((addr, token)) = spec.rsplit_once('/') else {
+        tracing::warn!(spec, "malformed --ready-notify (expected ADDR/TOKEN)");
+        return;
+    };
+    match tokio::net::TcpStream::connect(addr).await {
+        Ok(mut conn) => {
+            use tokio::io::AsyncWriteExt as _;
+            if let Err(e) = conn.write_all(format!("{token}\n").as_bytes()).await {
+                tracing::warn!(error = %e, "ready-notify write failed");
+            }
+            let _ = conn.shutdown().await;
+        }
+        Err(e) => tracing::warn!(error = %e, addr, "ready-notify connect failed"),
+    }
+}
+
+async fn run_inner(
+    socket_path: &Path,
+    state_dir: &Path,
+    log_dir: &Path,
+    ready_notify: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
             .with_state_dir(state_dir.to_path_buf()),
@@ -74,6 +105,16 @@ async fn run_inner(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Resu
     // Bind BEFORE recovery. If a second bridge instance tries to run, the
     // bind() fails and we exit without touching any routing state.
     let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+
+    // First-party readiness signal (#454): the dev supervisor pre-binds a
+    // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect
+    // and echo the token only now — after IpcServer::bind, which also ran
+    // apply_socket_permissions — so a waiter can never observe the socket
+    // before its permissions are final (the DACL race dev.py's socket-file
+    // poll had).
+    if let Some(spec) = ready_notify {
+        notify_ready(spec).await;
+    }
 
     // DNS recovery runs *before* route recovery. Rationale: mid-recovery
     // crash leaves the user with functional DNS + broken routes (easier
