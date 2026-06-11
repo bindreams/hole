@@ -3,7 +3,6 @@
 // sanctioned-test-file exception.
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,27 +12,8 @@ use tokio::sync::oneshot;
 
 use garter::{BinaryPlugin, ChainRunner, PluginEnv};
 
-fn mock_plugin_path() -> PathBuf {
-    // Build mock-plugin
-    let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "mock-plugin"])
-        .status()
-        .expect("failed to build mock-plugin");
-    assert!(status.success());
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/garter -> crates/
-    path.pop(); // crates/ -> workspace root
-    path.push("target");
-    path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-    path.push(if cfg!(windows) {
-        "mock-plugin.exe"
-    } else {
-        "mock-plugin"
-    });
-    assert!(path.exists(), "mock-plugin not found at {}", path.display());
-    path
-}
+mod common;
+use common::mock_plugin_path;
 
 /// Spin up an echo server and a chain of 2 mock plugins, send data through,
 /// verify it arrives.

@@ -94,11 +94,16 @@ jobs:
       # via test-garter and test-galoshes on all platforms. Hole crates'
       # compileability is already covered by `Clippy (Hole workspace)`
       # above; test-hole runs in its own build+test job below.
+      # `--features garter/test-utils` builds garter's feature-gated
+      # test-utils targets (tap_integration) into the archive — do not
+      # rely on a sibling's dev-dep edge to unify the feature in. The
+      # mock-plugin fixture bin is ungated and always archived (see
+      # crates/garter/tests/common/mod.rs).
       - name: Build test archive (ex-Galoshes crates)
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p mock-plugin --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
 
       # The artifact is consumed by test-garter and test-galoshes only;
       # test-hole does its own build.
@@ -150,10 +155,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/debug
-          cargo nextest run \
+          cargo-nextest nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
-            -E 'package(garter) + package(garter-bin) + package(mock-plugin)'
+            -E 'package(garter) + package(garter-bin)'
 
   test-galoshes:
     name: Test galoshes (${{ matrix.os }}/${{ matrix.arch }})
@@ -187,7 +192,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/debug
-          cargo nextest run \
+          cargo-nextest nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(galoshes)'

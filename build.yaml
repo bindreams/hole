@@ -53,11 +53,6 @@ targets:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     build: cargo build --release -p garter-bin
 
-  mock-plugin:
-    platforms:
-      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo build --release -p mock-plugin
-
   wintun:
     # Restricted to windows/amd64 because xtask::wintun unconditionally
     # extracts the amd64 DLL from the upstream zip — windows/arm64 would
@@ -236,13 +231,6 @@ targets:
     build: cargo nextest run --no-run -p garter-bin
     run: cargo nextest run -p garter-bin
 
-  mock-plugin-tests:
-    depends: mock-plugin
-    platforms:
-      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    build: cargo nextest run --no-run -p mock-plugin
-    run: cargo nextest run -p mock-plugin
-
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a
   # first-class runnable invoked via `cargo xtask run <name>`, replacing the
@@ -258,7 +246,7 @@ targets:
     # the dev-mode codepaths is sufficient — the cfg(dev) gate only affects
     # Tauri-internal URL resolution, not Hole-side code. See #372.
     platforms: [windows/amd64, darwin/amd64, darwin/arm64]
-    run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+    run: cargo clippy --workspace --all-targets --no-default-features --features garter/test-utils -- -D warnings
 
   clippy-ex-galoshes:
     # Hole crates use windows/macos cfg-gates that don't compile on linux or
@@ -266,7 +254,7 @@ targets:
     # crates only via -p filters. The two clippy- targets together cover the
     # full 6-platform CI matrix without overlap.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
-    run: cargo clippy -p garter -p garter-bin -p galoshes -p mock-plugin -p plugin-e2e -p util --all-targets -- -D warnings
+    run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util --all-targets --features garter/test-utils -- -D warnings
 
   prek:
     # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in

@@ -148,7 +148,7 @@ pub fn read_workspace_versions(repo_root: &Path) -> Result<WorkspaceVersions> {
                         cargo_path.display()
                     );
                 }
-                // publish = false + no group: internal tooling (xtask, xtask-lib, mock-plugin). OK.
+                // publish = false + no group: internal tooling (xtask, xtask-lib). OK.
             }
         }
     }

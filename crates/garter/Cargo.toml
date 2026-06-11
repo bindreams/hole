@@ -9,6 +9,10 @@ homepage = "https://github.com/bindreams/hole"
 readme = "README.md"
 keywords = ["shadowsocks", "sip003", "plugin", "proxy"]
 categories = ["network-programming"]
+# The auto-discovered src/bin/mock-plugin.rs is a test fixture (see
+# tests/common/mod.rs); excluding it (and tests/) keeps the published
+# crate lib-only — `cargo install garter` must stay bin-free.
+exclude = ["src/bin/", "tests/"]
 
 [package.metadata.hole-release]
 group = "garter"

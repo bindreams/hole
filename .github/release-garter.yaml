@@ -12,7 +12,6 @@ initial_release: |
 include_paths:
   - crates/garter/**
   - crates/garter-bin/**
-  - crates/mock-plugin/**
   - .github/workflows/draft-release-garter.yaml
   - .github/workflows/publish-release-garter.yaml
   - .github/release-garter.yaml
@@ -24,6 +23,7 @@ include_paths:
   - Cargo.lock
   - build.yaml
   - prek.toml
+  - .config/nextest.toml
   - clippy.toml
 
 # Categories live in .github/release-categories.yaml (shared across all four tracks).

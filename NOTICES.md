@@ -75,7 +75,7 @@ SOFTWARE.
   `crates/tun-engine`, `crates/tun-engine-macros`, `xtask`, `xtask-lib`)
   is licensed under GPL-3.0-or-later; see `LICENSE.md` at the repo root.
 - Ex-Galoshes code (`crates/garter`, `crates/garter-bin`,
-  `crates/galoshes`, `crates/mock-plugin`) is licensed under Apache-2.0;
+  `crates/galoshes`) is licensed under Apache-2.0;
   see `crates/galoshes/LICENSE.md`.
 - ex-ray (`crates/ex-ray`) is licensed under Apache-2.0; see
   `crates/ex-ray/LICENSE`. It is derived from `shadowsocks/v2ray-plugin`

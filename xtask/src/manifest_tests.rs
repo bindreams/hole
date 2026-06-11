@@ -595,13 +595,7 @@ fn production_build_yaml_parses() {
     // targets all carry a canonical local nextest invocation. Removing any of
     // these would re-fragment runner knowledge across CI / scripts / docs.
     assert!(m.get("hole").unwrap().has_run(), "hole must declare run: (dev mode)");
-    for tests in [
-        "hole-tests",
-        "galoshes-tests",
-        "garter-tests",
-        "garter-bin-tests",
-        "mock-plugin-tests",
-    ] {
+    for tests in ["hole-tests", "galoshes-tests", "garter-tests", "garter-bin-tests"] {
         assert!(
             m.get(tests).unwrap().has_run(),
             "{tests:?} must declare run: (canonical nextest invocation)"
@@ -628,7 +622,8 @@ fn clippy_hole_target_shape() {
     assert_eq!(
         t.run,
         vec![Step::Bash {
-            command: "cargo clippy --workspace --all-targets --no-default-features -- -D warnings".to_string(),
+            command: "cargo clippy --workspace --all-targets --no-default-features --features garter/test-utils -- -D warnings"
+                .to_string(),
             environment: HashMap::new(),
         }]
     );
@@ -767,13 +762,7 @@ fn tests_targets_run_matches_build_minus_no_run() {
     let yaml = include_str!("../../build.yaml");
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
 
-    for name in [
-        "hole-tests",
-        "galoshes-tests",
-        "garter-tests",
-        "garter-bin-tests",
-        "mock-plugin-tests",
-    ] {
+    for name in ["hole-tests", "galoshes-tests", "garter-tests", "garter-bin-tests"] {
         let t = m.get(name).unwrap_or_else(|| panic!("{name:?} target missing"));
         assert_eq!(
             t.build.len(),

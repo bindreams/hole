@@ -305,10 +305,9 @@ Each publishable member declares a release group in
 | `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                              |
 | `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                         |
 | `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                               |
-| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI                        |
+| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture  |
 | `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                     |
 | `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin) |
-| `crates/mock-plugin/`              | Apache · —                             | Minimal SIP003u echo plugin for garter tests                                    |
 | `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                            |
 | `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)       |
 | `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                 |
