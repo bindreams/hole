@@ -156,6 +156,29 @@ async fn concurrent_streams_never_split_entries() {
     }
 }
 
+/// Python text-mode parity at EOF: a trailing lone `\r` terminates a line
+/// (possibly empty) — `b"x\n\r"` is ['x', ''] in Python, and dev.py printed
+/// the empty prefixed line. A trailing chunk WITHOUT a terminator still
+/// emits its partial content; a clean terminator-final stream emits nothing
+/// extra.
+#[skuld::test]
+async fn eof_emits_cr_terminated_empty_line() {
+    let (mut w, r) = tokio::io::duplex(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Entry>(8);
+    let pump_task = tokio::spawn(pump(r, StreamMode::PerLine, "[  vite] ".into(), tx));
+    use tokio::io::AsyncWriteExt as _;
+    w.write_all(b"x\n\r").await.unwrap();
+    drop(w); // EOF with pending == b"\r"
+    assert_eq!(rx.recv().await.unwrap().lines, vec!["x".to_string()]);
+    assert_eq!(
+        rx.recv().await.unwrap().lines,
+        vec![String::new()],
+        "the \\r-terminated empty line must be emitted"
+    );
+    assert!(rx.recv().await.is_none());
+    pump_task.await.unwrap();
+}
+
 /// Per-line mode emits without buffering (Vite has no anchors; buffering
 /// would starve forever — dev.py:182-189).
 #[skuld::test]
