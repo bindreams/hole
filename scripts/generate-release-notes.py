@@ -431,7 +431,6 @@ def test_path_spec_workspace_engineering_patterns():
         ("xtask-lib/src/version.rs", True),
         ("scripts/generate-release-notes.py", True),
         ("scripts/sign-release.py", False),
-        ("scripts/dev.py", False),
         ("prek.toml", True),
         ("clippy.toml", True),
         ("README.md", False),

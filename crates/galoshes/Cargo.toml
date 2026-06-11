@@ -14,7 +14,7 @@ workspace = true
 [features]
 # Dev-only minidump passthrough (bindreams/hole#438). NON-DEFAULT. Enabled
 # only by `cargo xtask galoshes` when HOLE_CRASH_DUMPS is set (dev path via
-# scripts/dev.py). Release / MSI / standalone galoshes builds never set it,
+# dev-console). Release / MSI / standalone galoshes builds never set it,
 # so minidump-writer is absent from the windows-arm64 galoshes matrix (where
 # it has no support). The marker→breadcrumb path still works there.
 crash-dumps = ["tombstone/crash-dumps"]

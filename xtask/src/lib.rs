@@ -43,7 +43,7 @@ mod test_binaries_tests;
     name = "xtask",
     about = "Workspace task runner for the hole project",
     long_about = "Single source of truth for build and run orchestration that would otherwise \
-                  be duplicated across build.rs, CI yaml, scripts/dev.py, and msi-installer."
+                  be duplicated across build.rs, CI yaml, dev-console, and msi-installer."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -54,7 +54,7 @@ pub struct Cli {
 pub enum Command {
     /// Stage the runnable BINDIR (hole + sidecars + native libs) into a directory.
     ///
-    /// Both `scripts/dev.py` and `msi-installer/__init__.py:stage_files()` call
+    /// Both dev-console and `msi-installer/__init__.py:stage_files()` call
     /// this. The canonical list of files lives in `xtask/src/bindir.rs`; adding
     /// a new BINDIR file is a one-line change there and both consumers pick it
     /// up automatically.

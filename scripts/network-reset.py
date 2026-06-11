@@ -148,7 +148,7 @@ def run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[s
 
 
 def candidate_state_dirs() -> list[Path]:
-    """Candidate state directories, in the order the bridge and dev.py
+    """Candidate state directories, in the order the bridge and dev-console
     might have written to them. First valid JSON wins."""
     dirs: list[Path] = []
     if platform.system() == "Windows":
@@ -160,7 +160,7 @@ def candidate_state_dirs() -> list[Path]:
     elif platform.system() == "Darwin":
         dirs.append(Path("/var/db/hole/state"))  # service
         dirs.append(Path.home() / "Library" / "Application Support" / "hole" / "state")
-    dirs.append(Path(tempfile.gettempdir()) / "hole-dev" / "state")  # dev.py
+    dirs.append(Path(tempfile.gettempdir()) / "hole-dev" / "state")  # dev-console
     return dirs
 
 
@@ -260,11 +260,11 @@ def reset_windows(state: dict | None) -> None:
         "-Command",
         'Stop-Service -Name "HoleBridge" -Force -ErrorAction SilentlyContinue',
     ])
-    # The dev bridge is staged at `%TEMP%\hole-dev-<pid>\hole.exe`, so
+    # dev-console stages the dev bridge at `%TEMP%\hole-dev-<pid>\hole.exe`, so
     # `Name = 'hole.exe'` matches both installed and dev. The `LIKE 'hole%.exe'`
-    # wildcard also catches any stale dev bridge left by an older dev.py naming
-    # scheme. Command-line filter ensures we only hit the bridge subcommand and
-    # not the GUI.
+    # wildcard also catches any stale dev bridge left by an older dev-supervisor
+    # naming scheme. Command-line filter ensures we only hit the bridge
+    # subcommand and not the GUI.
     run([
         "powershell",
         "-Command",

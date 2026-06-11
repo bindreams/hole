@@ -17,7 +17,7 @@ workspace = true
 # protocol). The Tauri CLI sets this flag automatically for
 # `npx tauri build`; plain `cargo build --release` does not. Default-on so
 # production builds (msi-installer / release CI) just work. Dev paths
-# (build.yaml's `hole` and `hole-tests` targets, scripts/dev.py) pass
+# (build.yaml's `hole` and `hole-tests` targets, dev-console) pass
 # `--no-default-features` to keep `cfg(dev) = true` for the Vite-served
 # workflow. See bindreams/hole#372 for the incident.
 default = ["tauri/custom-protocol"]

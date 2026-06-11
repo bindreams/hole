@@ -11,7 +11,7 @@ use crate::proxy_manager::ProxyManager;
 ///
 /// Bypasses the platform service manager and shuts down on Ctrl+C. Uses
 /// the production `IpcServer::bind` + `apply_socket_permissions` path, so
-/// dev exercises the real DACL/group/SDDL code — see the `dev.py` /
+/// dev exercises the real DACL/group/SDDL code — see the `dev-console` /
 /// `bridge grant-access` orchestration. Requires elevation for TUN +
 /// routing.
 ///
@@ -29,9 +29,9 @@ pub fn run(
 }
 
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
-/// SIGTERM on Unix, or CTRL_BREAK on Windows. dev.py terminates the bridge
-/// with SIGTERM (relayed through sudo); without a SIGTERM handler the bridge
-/// would die on the default disposition and leak routes/DNS
+/// SIGTERM on Unix, or CTRL_BREAK on Windows. dev-console terminates the
+/// bridge with SIGTERM (relayed through sudo); without a SIGTERM handler the
+/// bridge would die on the default disposition and leak routes/DNS
 /// (bindreams/hole#452). The dev supervisor's Windows graceful stop is
 /// CTRL_BREAK (bindreams/hole#454).
 ///
