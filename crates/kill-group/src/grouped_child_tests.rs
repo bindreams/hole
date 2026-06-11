@@ -197,6 +197,50 @@ async fn signal_group_term_lets_child_exit_cleanly() {
     assert!(status.success(), "graceful signal must produce exit 0, got {status:?}");
 }
 
+/// The nested/degraded arm: with no group of our own, the graceful signal
+/// goes to the direct child — which must still exit cleanly.
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn signal_group_term_reaches_nested_child_directly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("trap-term", listener.local_addr().unwrap());
+    // SAFETY: serialized on KILL_GROUP_ENV (see the file-head comment).
+    unsafe { std::env::set_var(NESTED_ENV, "1") };
+    let result = GroupedChild::spawn(&mut cmd, Nesting::Mark);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(NESTED_ENV) };
+    let mut gc = result.unwrap();
+    assert!(!gc.is_root());
+    let _conn = await_ready(&listener).await;
+    gc.signal_group_term().unwrap();
+    let status = gc.child.wait().await.unwrap();
+    assert!(
+        status.success(),
+        "nested graceful signal must produce exit 0, got {status:?}"
+    );
+}
+
+/// term_group on an already-dead group is success (ESRCH tolerance) — the
+/// teardown path must not error when the tree died before the graceful phase.
+/// The EPERM→leader fallback is NOT unit-testable without a privilege
+/// boundary (it needs a group member this uid may not signal); it is
+/// exercised for real by the dev-mode supervisor's sudo bridge (PR 2 smoke
+/// test) and documented on `term_group`.
+#[cfg(unix)]
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn term_group_tolerates_dead_group() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    let pgid = gc.child.id().expect("live child has a pid");
+    let conn = await_ready(&listener).await;
+    gc.kill_tree().await;
+    assert_dies(conn).await;
+    // NOTE: gc (and its reaped Child) is still alive in this scope, so the
+    // pid is not recyclable — matching term_group's hold-the-leader contract
+    // as closely as a dead-group test can.
+    crate::grouped_child::term_group(pgid).expect("dead group is ESRCH => success");
+}
+
 #[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
 async fn opaque_root_does_not_mark_descendants() {
     // Nesting::Opaque: a group IS created (is_root), but the child env must

@@ -126,8 +126,12 @@ impl GroupedChild {
     /// when this spawn is nested/degraded and has no group of its own);
     /// `CTRL_BREAK` to the child's console process group on Windows (valid
     /// because spawn() always sets CREATE_NEW_PROCESS_GROUP). Already-exited
-    /// children are not an error. Does NOT reap: wait (bounded by your own
-    /// failure policy), then [`kill_tree`](Self::kill_tree) or [`Drop`].
+    /// children are not an error on Unix (ESRCH is success); on Windows a
+    /// child exiting between the pid read and the console-event call may
+    /// surface an error (the garter `shutdown.rs` precedent — callers
+    /// treating graceful-signal errors as advisory lose nothing). Does NOT
+    /// reap: wait (bounded by your own failure policy), then
+    /// [`kill_tree`](Self::kill_tree) or [`Drop`].
     pub fn signal_group_term(&self) -> io::Result<()> {
         imp::signal_group_term(self)
     }
@@ -151,11 +155,17 @@ impl Drop for GroupedChild {
     }
 }
 
-/// Send SIGTERM to the process group `pgid` (Unix only). ESRCH (group gone)
-/// is success; EPERM (the group contains members we may not signal — e.g.
-/// root processes behind sudo) falls back to the group LEADER directly,
-/// which for a sudo wrapper is exactly right: sudo's real uid is the
-/// invoking user's, so the kill is permitted, and sudo relays SIGTERM.
+/// Send SIGTERM to the process group `pgid` (Unix only).
+///
+/// CONTRACT: `pgid` must be the group of a leader spawned with
+/// `process_group(0)` — i.e. leader pid == pgid — and the caller must still
+/// hold the leader (an un-reaped `Child`) for the duration of the call, so
+/// the pid cannot be recycled. ESRCH (group already gone) is success. EPERM
+/// (the group contains members this process may not signal) falls back to
+/// SIGTERM on the LEADER directly — valid because leader pid == pgid. The
+/// motivating example is a sudo wrapper: sudo's real uid is the invoking
+/// user's, so the direct kill is permitted, and sudo relays SIGTERM to the
+/// root command it runs.
 #[cfg(unix)]
 pub fn term_group(pgid: u32) -> io::Result<()> {
     let pgid = pgid as libc::pid_t;
