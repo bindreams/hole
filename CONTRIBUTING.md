@@ -308,28 +308,28 @@ Each publishable member declares a release group in
 `[package.metadata.hole-release].group` (enforced by `xtask-lib::version`).
 `publish = false` means not pushed to crates.io.
 
-| Directory / file                   | Crate · license · group                | Purpose                                                                         |
-| ---------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------- |
-| `crates/common/`                   | `hole-common` · GPL · hole             | Shared types: protocol, config, import, logging                                 |
-| `crates/bridge/`                   | `hole-bridge` · GPL · hole             | Bridge library (TUN/routing/SS/IPC/DNS)                                         |
-| `crates/hole/`                     | `hole` · GPL · hole                    | Tauri app + CLI + bridge entry (binary `hole`)                                  |
-| `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                        |
-| `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                   |
-| `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                              |
-| `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                         |
-| `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                               |
-| `crates/kill-group/`               | Apache · kill-group                    | Process-tree kill-groups (job object / process group); split from garter (#197) |
+| Directory / file                   | Crate · license · group                | Purpose                                                                          |
+| ---------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------- |
+| `crates/common/`                   | `hole-common` · GPL · hole             | Shared types: protocol, config, import, logging                                  |
+| `crates/bridge/`                   | `hole-bridge` · GPL · hole             | Bridge library (TUN/routing/SS/IPC/DNS)                                          |
+| `crates/hole/`                     | `hole` · GPL · hole                    | Tauri app + CLI + bridge entry (binary `hole`)                                   |
+| `crates/tun-engine[-macros]/`      | GPL · hole                             | TUN + routing + packet-loop engine (+ `#[freeze]` macro)                         |
+| `crates/dump[-macros]/`            | GPL · hole                             | YAML-shaped logging representation (+ derive)                                    |
+| `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                               |
+| `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                          |
+| `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                                |
+| `crates/kill-group/`               | Apache · kill-group                    | Process-tree kill-groups (job object / process group); split from garter (#197)  |
 | `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win) |
-| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture  |
-| `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                     |
-| `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin) |
-| `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                            |
-| `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)       |
-| `crates/dev-console/`              | GPL · —                                | Dev-mode supervisor: bridge (elevated) + Vite + GUI, multiplexed logs (#454)    |
-| `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                 |
-| `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                   |
-| `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                   |
-| `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                       |
+| `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture   |
+| `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                      |
+| `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin)  |
+| `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                             |
+| `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)        |
+| `crates/dev-console/`              | GPL · —                                | Dev-mode supervisor: bridge (elevated) + Vite + GUI, multiplexed logs (#454)     |
+| `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                  |
+| `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                    |
+| `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                    |
+| `ui/`, `scripts/`, `tests/`        | —                                      | Frontend (Vite), utility scripts, E2E specs (WebDriverIO)                        |
 
 The Apache crates are Apache-2.0 per-crate (see [NOTICES.md](NOTICES.md)); Hole's
 own crates are GPL-3.0-or-later. Combined distributions (`hole.exe`, `hole.msi`,
