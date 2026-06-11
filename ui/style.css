@@ -127,6 +127,35 @@
   padding: 0;
 }
 
+/* Buttons: interactive controls are real <button>s for keyboard access
+ * (#476). Strip the UA chrome once here at type-selector specificity;
+ * per-class rules layer their own backgrounds/borders on top. */
+button {
+  appearance: none;
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Inset the ring for controls inside clipped containers (dropdown menus,
+ * table cells) so overflow: hidden does not cut it off. */
+.custom-select-opt:focus-visible,
+.inline-dropdown-opt:focus-visible,
+.cp:focus-visible,
+.filter-addr:focus-visible,
+.filter-del:focus-visible,
+.toast-close:focus-visible {
+  outline-offset: -2px;
+}
+
 html,
 body {
   height: 100%;
@@ -355,6 +384,11 @@ order. (0,2,0) > (0,1,0). */
   color: var(--text-tertiary);
 }
 
+.sb-ip .copy-btn:focus-visible {
+  opacity: 1;
+  color: var(--text-tertiary);
+}
+
 .country-flag {
   /* Sizing (1em x 1em via .fi.fis) and background-image are owned by
    * flag-icons; only layout-affecting properties live here. */
@@ -533,6 +567,7 @@ order. (0,2,0) > (0,1,0). */
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  width: 100%;
   cursor: pointer;
   user-select: none;
   padding-bottom: 0.3rem;
@@ -554,6 +589,10 @@ order. (0,2,0) > (0,1,0). */
   color: var(--text-tertiary);
 }
 
+.section-hdr:focus-visible .tri {
+  color: var(--text-tertiary);
+}
+
 .tri.collapsed {
   transform: rotate(-90deg);
 }
@@ -572,6 +611,10 @@ order. (0,2,0) > (0,1,0). */
 
 .section-clip.collapsed {
   max-height: 0;
+  /* Belt-and-braces with the inert attribute set by toggleSection:
+   * visibility removes descendants from the tab order on engines too old
+   * for inert. Set only once fully collapsed, so the slide-out animates. */
+  visibility: hidden;
 }
 
 .section-body {
@@ -720,6 +763,7 @@ order. (0,2,0) > (0,1,0). */
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
+  width: 100%;
   color: var(--text-faint);
   font-size: 0.75rem;
   cursor: pointer;
@@ -805,6 +849,10 @@ order. (0,2,0) > (0,1,0). */
   background: var(--bg-hover);
 }
 
+.filters-tbl tbody tr:focus-within {
+  background: var(--bg-hover);
+}
+
 .filters-tbl tbody tr.drag-placeholder:hover {
   background: transparent;
 }
@@ -815,6 +863,8 @@ order. (0,2,0) > (0,1,0). */
 
 /* Filter table: cell padding -----  */
 .cp {
+  display: block;
+  width: 100%;
   padding: 0.25rem 0.5rem;
   white-space: nowrap;
   overflow: hidden;
@@ -919,6 +969,13 @@ td.del-cell {
   position: relative;
 }
 
+/* The inline dropdown is an abs-positioned child of this (relative)
+ * cell; the td-level overflow:hidden would clip it. Ellipsis on these
+ * cells is owned by the inner .cp. */
+.filters-tbl tbody td.editable-cell {
+  overflow: visible;
+}
+
 .chev {
   display: none;
   color: var(--text-ghost);
@@ -975,6 +1032,8 @@ td.del-cell {
 }
 
 .inline-dropdown-opt {
+  display: block;
+  width: 100%;
   padding: 0.3rem 0.6rem;
   font-size: 0.75rem;
   color: var(--text-primary);
@@ -983,6 +1042,10 @@ td.del-cell {
 }
 
 .inline-dropdown-opt:hover {
+  background: var(--select-option-hover);
+}
+
+.inline-dropdown-opt:focus-visible {
   background: var(--select-option-hover);
 }
 
@@ -996,6 +1059,7 @@ td.del-cell {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  width: 100%;
   color: var(--text-faint);
   font-size: 0.75rem;
   cursor: pointer;
@@ -1118,6 +1182,9 @@ the rows that actually toggle `hidden`. */
 
 /* Settings: toggle switch -----  */
 .toggle {
+  /* Block like the div it replaced: an empty inline-block button adds the
+   * line-box strut below its baseline, growing every settings row. */
+  display: block;
   width: 36px;
   height: 20px;
   background: var(--toggle-track);
@@ -1164,7 +1231,6 @@ the rows that actually toggle `hidden`. */
   font-size: 0.75rem;
   padding: 0.25rem 1.8rem 0.25rem 0.5rem;
   cursor: pointer;
-  outline: none;
   white-space: nowrap;
   user-select: none;
   position: relative;
@@ -1201,6 +1267,8 @@ the rows that actually toggle `hidden`. */
 }
 
 .custom-select-opt {
+  display: block;
+  width: 100%;
   padding: 0.3rem 0.6rem;
   font-size: 0.75rem;
   color: var(--text-primary);
@@ -1209,6 +1277,10 @@ the rows that actually toggle `hidden`. */
 }
 
 .custom-select-opt:hover {
+  background: var(--select-option-hover);
+}
+
+.custom-select-opt:focus-visible {
   background: var(--select-option-hover);
 }
 

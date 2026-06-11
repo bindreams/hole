@@ -1,6 +1,7 @@
 // Settings section: toggle switches, custom dropdowns, theme switching, proxy + DNS forwarder config.
 
 import { config, saveConfig } from "./main";
+import { menuKeydown } from "./menu-keys";
 import type { DnsConfig, DnsProtocol } from "./types";
 
 const DNS_DEFAULT: DnsConfig = {
@@ -76,21 +77,24 @@ function patchDns(partial: Partial<DnsConfig>) {
 
 // Toggle component ====================================================================================================
 
+/** Apply toggle visual + ARIA state in one place. */
+function setToggleState(el: HTMLElement, on: boolean) {
+  el.classList.toggle("on", on);
+  el.setAttribute("aria-checked", String(on));
+}
+
 /**
- * Wire a toggle switch element.
- * @param {string} id        - Element ID of the `.toggle` div.
- * @param {string} configKey - Key in `config` to read/write (boolean).
- * @param {Function} [onToggle] - Optional callback after state changes.
+ * Wire a toggle switch button.
+ * @param {string} id - Element ID of the `.toggle` button.
+ * @param {Function} apply - Persists the new state (writes config and saves).
  */
-function wireToggle(id: string, configKey: string, onToggle?: (on: boolean) => void) {
+function wireToggle(id: string, apply: (on: boolean) => void) {
   const el = document.getElementById(id)!;
   el.addEventListener("click", () => {
     if (!config) return;
     const on = !el.classList.contains("on");
-    el.classList.toggle("on", on);
-    config[configKey] = on;
-    if (onToggle) onToggle(on);
-    saveConfig();
+    setToggleState(el, on);
+    apply(on);
   });
 }
 
@@ -115,45 +119,88 @@ function snakeToKebab(snake: string): string {
 }
 
 /**
- * Wire a custom dropdown.
- * @param {string} btnId     - Element ID of `.custom-select-btn`.
- * @param {string} menuId    - Element ID of `.custom-select-menu`.
- * @param {string} configKey - Key in `config` to read/write (string).
- * @param {Function} [onChange] - Optional callback after selection changes.
+ * Close every open dropdown menu, syncing its trigger's aria-expanded.
+ * The trigger button is the menu's previous sibling inside
+ * `.custom-select-wrap`.
+ * @param {Element} [except] - Menu to leave open.
  */
-function wireDropdown(btnId: string, menuId: string, configKey: string, onChange?: (value: string) => void) {
+function closeAllMenus(except?: Element) {
+  for (const m of document.querySelectorAll(".custom-select-menu.open")) {
+    if (m === except) continue;
+    m.classList.remove("open");
+    m.previousElementSibling?.setAttribute("aria-expanded", "false");
+  }
+}
+
+/**
+ * Wire a custom dropdown (trigger button + listbox menu of option buttons).
+ * Keyboard: Enter/Space/click toggles; ArrowDown/ArrowUp on the closed
+ * trigger opens; arrows/Home/End rove focus in the menu; Enter/Space picks
+ * the focused option (native button click); Escape/Tab closes.
+ * @param {string} btnId  - Element ID of the `.custom-select-btn` button.
+ * @param {string} menuId - Element ID of the `.custom-select-menu` listbox.
+ * @param {Function} apply - Persists the snake_case value (writes config and saves).
+ */
+function wireDropdown(btnId: string, menuId: string, apply: (value: string) => void) {
   const btn = document.getElementById(btnId)!;
   const menu = document.getElementById(menuId)!;
+  const options = [...menu.querySelectorAll<HTMLElement>(".custom-select-opt")];
+
+  const setOpen = (open: boolean) => {
+    menu.classList.toggle("open", open);
+    btn.setAttribute("aria-expanded", String(open));
+  };
+
+  const openAndFocus = () => {
+    closeAllMenus(menu);
+    setOpen(true);
+    (menu.querySelector<HTMLElement>(".custom-select-opt.selected") ?? options[0])?.focus();
+  };
+
+  const close = () => {
+    setOpen(false);
+    btn.focus();
+  };
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
-    // Close any other open menus first.
-    for (const m of document.querySelectorAll(".custom-select-menu.open")) {
-      if (m !== menu) m.classList.remove("open");
+    if (menu.classList.contains("open")) {
+      // close() (not bare setOpen): focus may be on a now-hidden option.
+      close();
+    } else {
+      openAndFocus();
     }
-    menu.classList.toggle("open");
   });
 
-  for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
+  btn.addEventListener("keydown", (e) => {
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !menu.classList.contains("open")) {
+      e.preventDefault();
+      openAndFocus();
+    } else if (e.key === "Escape" && menu.classList.contains("open")) {
+      close();
+    }
+  });
+
+  menu.addEventListener("keydown", (e) => menuKeydown(e, options, close));
+
+  for (const opt of options) {
     opt.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!config) return;
 
       // Update selected state.
-      for (const o of menu.querySelectorAll(".custom-select-opt")) {
+      for (const o of options) {
         o.classList.remove("selected");
+        o.setAttribute("aria-selected", "false");
       }
       opt.classList.add("selected");
+      opt.setAttribute("aria-selected", "true");
 
-      // Update button text and close menu.
+      // Update button text, close, and return focus to the trigger.
       btn.textContent = opt.textContent;
-      menu.classList.remove("open");
+      close();
 
-      // Update config.
-      const value = kebabToSnake(opt.dataset.value ?? "");
-      config[configKey] = value;
-      if (onChange) onChange(value);
-      saveConfig();
+      apply(kebabToSnake(opt.dataset.value ?? ""));
     });
   }
 }
@@ -226,11 +273,7 @@ function updatePortConflictMarkers() {
 // Click-outside handler ===============================================================================================
 
 function handleClickOutside() {
-  document.addEventListener("click", () => {
-    for (const menu of document.querySelectorAll(".custom-select-menu.open")) {
-      menu.classList.remove("open");
-    }
-  });
+  document.addEventListener("click", () => closeAllMenus());
 }
 
 // Public API ==========================================================================================================
@@ -240,22 +283,36 @@ function handleClickOutside() {
  */
 export function initSettings() {
   // Toggles.
-  wireToggle("toggle-start-on-login", "start_on_login");
-  wireToggle("toggle-proxy-server", "proxy_server_enabled", () => {
+  wireToggle("toggle-start-on-login", (on) => {
+    config!.start_on_login = on;
+    saveConfig();
+  });
+  wireToggle("toggle-proxy-server", (on) => {
+    config!.proxy_server_enabled = on;
     updateProxyMuting();
+    saveConfig();
   });
-  wireToggle("toggle-socks5", "proxy_socks5", () => {
+  wireToggle("toggle-socks5", (on) => {
+    config!.proxy_socks5 = on;
     updatePortConflictMarkers();
+    saveConfig();
   });
-  wireToggle("toggle-http", "proxy_http", () => {
+  wireToggle("toggle-http", (on) => {
+    config!.proxy_http = on;
     updateHttpPortVisibility();
     updatePortConflictMarkers();
+    saveConfig();
   });
 
   // Dropdowns.
-  wireDropdown("select-on-startup", "menu-on-startup", "on_startup");
-  wireDropdown("select-theme", "menu-theme", "theme", (value) => {
+  wireDropdown("select-on-startup", "menu-on-startup", (value) => {
+    config!.on_startup = value;
+    saveConfig();
+  });
+  wireDropdown("select-theme", "menu-theme", (value) => {
+    config!.theme = value;
     applyTheme(value);
+    saveConfig();
   });
 
   // Port inputs.
@@ -270,49 +327,24 @@ export function initSettings() {
 }
 
 /**
- * Wire the DNS forwarder UI. The sub-setting group (`#dns-nested`) mirrors
- * the proxy-server muting pattern: when the enable toggle is off, the
- * nested controls are visually greyed.
+ * Wire the DNS forwarder controls (enable + intercept toggles and the
+ * protocol dropdown). All three persist through `patchDns` because they
+ * live in the nested `config.dns` object, not top-level config keys. The
+ * sub-setting group (`#dns-nested`) mirrors the proxy-server muting
+ * pattern: when the enable toggle is off, the nested controls are
+ * visually greyed.
  */
 function wireDnsControls() {
-  const enabledEl = document.getElementById("toggle-dns-enabled")!;
-  enabledEl.addEventListener("click", () => {
-    if (!config) return; // guard BEFORE the visual flip, like wireToggle
-    const on = !enabledEl.classList.contains("on");
-    enabledEl.classList.toggle("on", on);
-    patchDns({ enabled: on });
-  });
+  // wireToggle/wireDropdown guard `config` before any visual change,
+  // covering the guards the hand-wired versions carried.
+  wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));
+  wireToggle("toggle-dns-intercept", (on) => patchDns({ intercept_udp53: on }));
 
-  const interceptEl = document.getElementById("toggle-dns-intercept")!;
-  interceptEl.addEventListener("click", () => {
-    if (!config) return;
-    const on = !interceptEl.classList.contains("on");
-    interceptEl.classList.toggle("on", on);
-    patchDns({ intercept_udp53: on });
+  // The protocol dropdown patches config.dns rather than a top-level key;
+  // the apply callback absorbs that difference.
+  wireDropdown("select-dns-protocol", "menu-dns-protocol", (value) => {
+    patchDns({ protocol: value as DnsProtocol });
   });
-
-  // DNS protocol dropdown — hand-wired (not via wireDropdown) because it
-  // patches config.dns, not a top-level config key.
-  const btn = document.getElementById("select-dns-protocol")!;
-  const menu = document.getElementById("menu-dns-protocol")!;
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    for (const m of document.querySelectorAll(".custom-select-menu.open")) {
-      if (m !== menu) m.classList.remove("open");
-    }
-    menu.classList.toggle("open");
-  });
-  for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
-    opt.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (!config) return;
-      for (const o of menu.querySelectorAll(".custom-select-opt")) o.classList.remove("selected");
-      opt.classList.add("selected");
-      btn.textContent = opt.textContent;
-      menu.classList.remove("open");
-      patchDns({ protocol: kebabToSnake(opt.dataset.value ?? "") as DnsProtocol });
-    });
-  }
 }
 
 /**
@@ -323,10 +355,10 @@ export function renderSettings() {
   if (!config) return;
 
   // Toggles.
-  document.getElementById("toggle-start-on-login")!.classList.toggle("on", !!config.start_on_login);
-  document.getElementById("toggle-proxy-server")!.classList.toggle("on", !!config.proxy_server_enabled);
-  document.getElementById("toggle-socks5")!.classList.toggle("on", !!config.proxy_socks5);
-  document.getElementById("toggle-http")!.classList.toggle("on", !!config.proxy_http);
+  setToggleState(document.getElementById("toggle-start-on-login")!, !!config.start_on_login);
+  setToggleState(document.getElementById("toggle-proxy-server")!, !!config.proxy_server_enabled);
+  setToggleState(document.getElementById("toggle-socks5")!, !!config.proxy_socks5);
+  setToggleState(document.getElementById("toggle-http")!, !!config.proxy_http);
 
   // Dropdowns.
   syncDropdown("select-on-startup", "menu-on-startup", config.on_startup ?? "do_not_connect");
@@ -343,8 +375,8 @@ export function renderSettings() {
 
   // DNS forwarder state.
   const dns = currentDns();
-  document.getElementById("toggle-dns-enabled")!.classList.toggle("on", dns.enabled);
-  document.getElementById("toggle-dns-intercept")!.classList.toggle("on", dns.intercept_udp53);
+  setToggleState(document.getElementById("toggle-dns-enabled")!, dns.enabled);
+  setToggleState(document.getElementById("toggle-dns-intercept")!, dns.intercept_udp53);
   syncDropdown("select-dns-protocol", "menu-dns-protocol", dns.protocol);
   updateDnsMuting();
 
@@ -364,11 +396,9 @@ function syncDropdown(btnId: string, menuId: string, configVal: string) {
   const dataVal = snakeToKebab(configVal);
 
   for (const opt of menu.querySelectorAll<HTMLElement>(".custom-select-opt")) {
-    if (opt.dataset.value === dataVal) {
-      opt.classList.add("selected");
-      btn.textContent = opt.textContent;
-    } else {
-      opt.classList.remove("selected");
-    }
+    const selected = opt.dataset.value === dataVal;
+    opt.classList.toggle("selected", selected);
+    opt.setAttribute("aria-selected", String(selected));
+    if (selected) btn.textContent = opt.textContent;
   }
 }

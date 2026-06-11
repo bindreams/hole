@@ -20,6 +20,8 @@ function toggleSection(hdr: HTMLElement) {
   if (isCollapsed) {
     // Expand ----------------------------------------------------------------------------------------------------------
     clip.classList.remove("collapsed");
+    // Re-admit the section's controls to the tab order.
+    clip.removeAttribute("inert");
     clip.style.overflow = "hidden";
 
     const h = body.scrollHeight;
@@ -36,6 +38,7 @@ function toggleSection(hdr: HTMLElement) {
     body.style.transform = "translateY(0)";
     body.style.opacity = "1";
     tri?.classList.remove("collapsed");
+    hdr.setAttribute("aria-expanded", "true");
 
     const cleanup = (e: Event) => {
       // Only react to the max-height transition (not child transitions).
@@ -63,6 +66,10 @@ function toggleSection(hdr: HTMLElement) {
     body.style.transform = "translateY(-100%)";
     body.style.opacity = "0";
     tri?.classList.add("collapsed");
+    hdr.setAttribute("aria-expanded", "false");
+    // The clip is hidden via max-height: 0 + overflow: hidden, which does
+    // NOT remove its now-focusable buttons from the tab order — inert does.
+    clip.setAttribute("inert", "");
 
     const cleanup = (e: Event) => {
       if (e.target !== clip) return;

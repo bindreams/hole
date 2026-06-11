@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { config, saveConfig } from "./main";
+import { menuKeydown } from "./menu-keys";
 import { showToast } from "./toast";
 import type { FilterRule } from "./types";
 
@@ -106,6 +107,31 @@ export function renderFilters() {
   if (!config) return;
   ensureDefaultRule();
 
+  // External re-renders (e.g. config reloads) destroy the focused control
+  // with the rest of the table; remember which rule + control held focus
+  // so the rebuild can put it back. A focused inline edit input or
+  // dropdown option maps back to the control that opened it. The rule is
+  // remembered both by identity (commitPendingEdit below may splice,
+  // shifting indices) and by index (a config reload replaces the rule
+  // objects but keeps the structure). Captured before closeDropdown()
+  // removes a focused option.
+  const active = document.activeElement;
+  let restoreRule: FilterRule | null = null;
+  let restoreIndex = -1;
+  let restoreControl: string | null = null;
+  if (active instanceof HTMLElement && tbody.contains(active)) {
+    restoreIndex = parseInt(active.closest("tr")?.dataset.index ?? "", 10);
+    restoreRule = Number.isNaN(restoreIndex) ? null : (config.filters[restoreIndex] ?? null);
+    if (active.closest(".filter-del")) {
+      restoreControl = ".filter-del";
+    } else if (active.closest(".editable-addr")) {
+      restoreControl = ".filter-addr";
+    } else {
+      const field = (active.closest("td") as HTMLTableCellElement | null)?.dataset.field;
+      restoreControl = field ? `td[data-field="${field}"] .cp` : null;
+    }
+  }
+
   // Flush a pending edit before wiping the tbody. This writes the open
   // editor's value into the CURRENT config by row index — sound because
   // every loadConfig caller today reloads a structurally identical
@@ -134,12 +160,17 @@ export function renderFilters() {
     const handle = document.createElement("span");
     handle.className = "drag-handle";
     handle.textContent = "\u283F"; // ⠿ braille pattern dots-123456
+    handle.setAttribute("aria-hidden", "true"); // decorative; drag is pointer-only
     divAddr.appendChild(handle);
 
-    const addrSpan = document.createElement("span");
-    addrSpan.className = "filter-addr";
-    addrSpan.textContent = rule.address;
-    divAddr.appendChild(addrSpan);
+    // The address is a button on editable rows (activation starts the
+    // inline edit; startAddressEdit swaps exactly this node for the
+    // input, so the button must be the .filter-addr node itself).
+    const addrEl = document.createElement(isDefault ? "span" : "button");
+    if (addrEl instanceof HTMLButtonElement) addrEl.type = "button";
+    addrEl.className = "filter-addr";
+    addrEl.textContent = rule.address;
+    divAddr.appendChild(addrEl);
 
     tdAddr.appendChild(divAddr);
     tr.appendChild(tdAddr);
@@ -149,8 +180,14 @@ export function renderFilters() {
     tdMatch.className = isDefault ? "" : "editable-cell";
     tdMatch.dataset.field = "matching";
 
-    const divMatch = document.createElement("div");
+    const divMatch = document.createElement(isDefault ? "div" : "button");
     divMatch.className = "cp";
+    if (divMatch instanceof HTMLButtonElement) {
+      divMatch.type = "button";
+      divMatch.setAttribute("aria-haspopup", "listbox");
+      divMatch.setAttribute("aria-expanded", "false");
+      wireCellArrowOpen(divMatch, tdMatch, i);
+    }
 
     const matchSpan = document.createElement("span");
     matchSpan.className = "filter-match";
@@ -161,6 +198,7 @@ export function renderFilters() {
       const chev = document.createElement("span");
       chev.className = "chev";
       chev.textContent = "\u25BE";
+      chev.setAttribute("aria-hidden", "true"); // decorative; keeps it out of the button's name
       divMatch.appendChild(chev);
     }
 
@@ -172,14 +210,21 @@ export function renderFilters() {
     tdAction.className = `${isDefault ? "action-cell" : "action-cell editable-cell"} ${rule.action}`;
     tdAction.dataset.field = "action";
 
-    const divAction = document.createElement("div");
+    const divAction = document.createElement(isDefault ? "div" : "button");
     divAction.className = "cp";
     divAction.textContent = actionLabel(rule.action);
+    if (divAction instanceof HTMLButtonElement) {
+      divAction.type = "button";
+      divAction.setAttribute("aria-haspopup", "listbox");
+      divAction.setAttribute("aria-expanded", "false");
+      wireCellArrowOpen(divAction, tdAction, i);
+    }
 
     if (!isDefault) {
       const chev = document.createElement("span");
       chev.className = "chev";
       chev.textContent = "\u25BE";
+      chev.setAttribute("aria-hidden", "true"); // decorative; keeps it out of the button's name
       divAction.appendChild(chev);
     }
 
@@ -191,10 +236,12 @@ export function renderFilters() {
     tdDel.className = "del-cell";
 
     if (!isDefault) {
-      const delSpan = document.createElement("span");
-      delSpan.className = "filter-del";
-      delSpan.textContent = "\u2715";
-      tdDel.appendChild(delSpan);
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "filter-del";
+      delBtn.textContent = "\u2715";
+      delBtn.setAttribute("aria-label", rule.address ? `Delete rule for ${rule.address}` : "Delete rule");
+      tdDel.appendChild(delBtn);
     } else {
       // Default wildcard rule — show a lock icon to indicate it cannot be deleted.
       // Inline monochrome SVG to match the UI icon style. Static literal (no
@@ -211,6 +258,14 @@ export function renderFilters() {
 
     tr.appendChild(tdDel);
     tbody.appendChild(tr);
+  }
+
+  // preventScroll: restoration preserves tab position invisibly — a
+  // background re-render must not yank the viewport to the element.
+  if (restoreControl !== null && !Number.isNaN(restoreIndex)) {
+    const byIdentity = restoreRule ? config.filters.indexOf(restoreRule) : -1;
+    const index = byIdentity >= 0 ? byIdentity : restoreIndex;
+    tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] ${restoreControl}`)?.focus({ preventScroll: true });
   }
 
   // Re-evaluate test filtering after render.
@@ -259,6 +314,10 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
 
   function commit() {
     if (editingIndex !== index) return; // Already committed or cancelled.
+    // Refocus eligibility is decided BEFORE the re-render: only an edit
+    // ending with the input still focused (Enter/Escape) may move focus
+    // afterwards — a blur-commit from clicking elsewhere must not.
+    const shouldRefocus = document.activeElement === input;
     editingIndex = -1;
 
     const newValue = input.value.trim();
@@ -271,16 +330,19 @@ function startAddressEdit(td: HTMLTableCellElement, index: number) {
       void persistFilters();
     }
     renderFilters();
+    refocusAddrAfterEdit(index, shouldRefocus);
   }
 
   function cancel() {
     if (editingIndex !== index) return;
+    const shouldRefocus = document.activeElement === input;
     editingIndex = -1;
     // If the original address was empty (new rule), remove it.
     if (!original && config?.filters[index]) {
       config.filters.splice(index, 1);
     }
     renderFilters();
+    refocusAddrAfterEdit(index, shouldRefocus);
   }
 
   input.addEventListener("keydown", (e) => {
@@ -335,9 +397,31 @@ function commitOrCancelEditing() {
 /** Close the currently open dropdown. */
 function closeDropdown() {
   if (openDropdown) {
+    openDropdown._td?.querySelector(".cp")?.setAttribute("aria-expanded", "false");
     openDropdown.remove();
     openDropdown = null;
   }
+}
+
+/** Focus the dropdown-cell button of a row after a re-render. */
+function focusCellButton(index: number, field: string) {
+  tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] td[data-field="${field}"] .cp`)?.focus();
+}
+
+/**
+ * Refocus an address button after an edit-triggered re-render.
+ * @param {number} index - The edited rule's index.
+ * @param {boolean} shouldRefocus - Whether the input held focus when the
+ *   edit ended (captured before the re-render). False for blur-commits,
+ *   which must never steal focus from wherever the user clicked.
+ */
+function refocusAddrAfterEdit(index: number, shouldRefocus: boolean) {
+  if (!shouldRefocus) return;
+  // renderFilters' own focus capture usually restores the address button
+  // already; this fallback covers a removed row (cancelled new rule).
+  if (document.activeElement !== document.body) return;
+  const addr = tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] .filter-addr`);
+  (addr ?? addBtn).focus();
 }
 
 /**
@@ -365,15 +449,23 @@ function toggleDropdown(td: HTMLTableCellElement, index: number) {
 
   const dropdown = document.createElement("div") as HTMLDivElement & { _td?: HTMLTableCellElement };
   dropdown.className = "inline-dropdown open";
+  dropdown.setAttribute("role", "listbox");
+  dropdown.setAttribute("aria-label", field === "matching" ? "Matching" : "Action");
   dropdown._td = td; // Tag so we can detect toggle clicks.
 
-  for (const opt of options) {
-    const div = document.createElement("div");
-    div.className = `inline-dropdown-opt${opt.value === currentValue ? " selected" : ""}`;
-    div.textContent = opt.label;
-    div.dataset.value = opt.value;
+  const cellBtn = td.querySelector<HTMLElement>(".cp");
 
-    div.addEventListener("click", (e) => {
+  for (const opt of options) {
+    const optBtn = document.createElement("button");
+    optBtn.type = "button";
+    optBtn.className = `inline-dropdown-opt${opt.value === currentValue ? " selected" : ""}`;
+    optBtn.setAttribute("role", "option");
+    optBtn.setAttribute("aria-selected", String(opt.value === currentValue));
+    optBtn.tabIndex = -1;
+    optBtn.textContent = opt.label;
+    optBtn.dataset.value = opt.value;
+
+    optBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!config) return;
       if (field === "matching") {
@@ -384,13 +476,41 @@ function toggleDropdown(td: HTMLTableCellElement, index: number) {
       void persistFilters();
       closeDropdown();
       renderFilters();
+      // The re-render rebuilt the row; keep keyboard users on the cell.
+      focusCellButton(index, field);
     });
 
-    dropdown.appendChild(div);
+    dropdown.appendChild(optBtn);
   }
+
+  dropdown.addEventListener("keydown", (e) => {
+    const opts = [...dropdown.querySelectorAll<HTMLElement>(".inline-dropdown-opt")];
+    menuKeydown(e, opts, () => {
+      closeDropdown();
+      cellBtn?.focus();
+    });
+  });
 
   td.appendChild(dropdown);
   openDropdown = dropdown;
+  cellBtn?.setAttribute("aria-expanded", "true");
+  (
+    dropdown.querySelector<HTMLElement>(".inline-dropdown-opt.selected") ??
+    dropdown.querySelector<HTMLElement>(".inline-dropdown-opt")
+  )?.focus();
+}
+
+/**
+ * Let ArrowDown/ArrowUp on a closed cell button open its dropdown,
+ * mirroring the settings dropdowns.
+ */
+function wireCellArrowOpen(btn: HTMLButtonElement, td: HTMLTableCellElement, index: number) {
+  btn.addEventListener("keydown", (e) => {
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && openDropdown?._td !== td) {
+      e.preventDefault();
+      toggleDropdown(td, index);
+    }
+  });
 }
 
 // Drag reorder ========================================================================================================
@@ -643,9 +763,16 @@ function addRule() {
  */
 function deleteRule(index: number) {
   if (index <= 0 || !config?.filters) return; // Cannot delete default rule.
+  // The re-render destroys the focused delete button; remember whether
+  // focus was inside the table so keyboard users stay in place.
+  const hadFocusInTable = tbody.contains(document.activeElement);
   config.filters.splice(index, 1);
   void persistFilters();
   renderFilters();
+  if (hadFocusInTable) {
+    const dels = tbody.querySelectorAll<HTMLElement>(".filter-del");
+    (dels[Math.min(index - 1, dels.length - 1)] ?? addBtn).focus();
+  }
 }
 
 // Test filtering ======================================================================================================
@@ -789,9 +916,11 @@ function onTbodyClick(e: MouseEvent) {
   const target = e.target as HTMLElement | null;
   if (!target) return;
 
-  // Delete button.
-  if (target.classList.contains("filter-del")) {
-    const tr = target.closest("tr");
+  // Delete button. closest() instead of an identity check so the button
+  // can gain child nodes without breaking delegation.
+  const delBtn = target.closest(".filter-del");
+  if (delBtn) {
+    const tr = delBtn.closest("tr");
     if (tr) deleteRule(parseInt(tr.dataset.index ?? "", 10));
     return;
   }
