@@ -116,9 +116,8 @@ impl GroupedChild {
     /// Test-only probe: the root spawn's job-object handle, so a test can ask
     /// `IsProcessInJob` against OUR job (`None` would ask "in ANY job", which
     /// is always true under Windows Terminal).
-    #[cfg(windows)]
-    #[doc(hidden)]
-    pub fn test_job_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+    #[cfg(all(windows, test))]
+    pub(crate) fn test_job_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
         self.group.job_handle()
     }
 
@@ -165,6 +164,7 @@ mod imp {
     unsafe impl Send for Group {}
 
     impl Group {
+        #[cfg(test)]
         pub(super) fn job_handle(&self) -> Option<HANDLE> {
             self.job
         }
@@ -239,12 +239,15 @@ mod imp {
         })
     }
 
-    /// Resume every suspended thread of `child` (a CREATE_SUSPENDED process has
-    /// exactly its initial thread). std::process closes the thread handle from
-    /// CreateProcess, so rediscover it via a Toolhelp snapshot. PID-reuse-safe:
-    /// we hold the child's process handle for the whole walk (the `Child`), so
-    /// its PID cannot be recycled between snapshot and resume.
+    /// Resume every suspended thread of `child`. Succeeds iff at least one
+    /// thread was resumed (a CREATE_SUSPENDED process has exactly its initial
+    /// thread, suspend count 1, so a single ResumeThread fully resumes it).
+    /// std::process closes the thread handle from CreateProcess, so rediscover
+    /// it via a Toolhelp snapshot. PID-reuse-safe: we hold the child's process
+    /// handle for the whole walk (the `Child`), so its PID cannot be recycled
+    /// between snapshot and resume.
     fn resume_initial_threads(child: &Child) -> io::Result<()> {
+        use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         };
@@ -253,7 +256,12 @@ mod imp {
         let Some(pid) = child.id() else {
             return Err(io::Error::other("suspended child has no pid"));
         };
+        // Thread32First/Next signal normal end-of-enumeration with
+        // ERROR_NO_MORE_FILES; their errors round-trip GetLastError() through
+        // HRESULT::from_win32, so compare against the same mapping.
+        let end_of_walk = windows::core::HRESULT::from_win32(ERROR_NO_MORE_FILES.0);
         let mut resumed = 0u32;
+        let mut last_err: Option<io::Error> = None;
         // SAFETY: snapshot/iterate/open/resume with owned handles, closed below.
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
@@ -261,22 +269,39 @@ mod imp {
                 dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
                 ..Default::default()
             };
-            let mut more = Thread32First(snap, &mut entry).is_ok();
-            while more {
-                if entry.th32OwnerProcessID == pid {
-                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
-                        if ResumeThread(thread) != u32::MAX {
-                            resumed += 1;
-                        }
-                        let _ = CloseHandle(thread);
+            let mut step = Thread32First(snap, &mut entry);
+            loop {
+                match step {
+                    Ok(()) => {}
+                    Err(e) if e.code() == end_of_walk => break,
+                    Err(e) => {
+                        // A snapshot-API fault, not "no threads": surface the
+                        // real Win32 code instead of killing a healthy child
+                        // over a generic "nothing resumed".
+                        let _ = CloseHandle(snap);
+                        return Err(io::Error::from(e));
                     }
                 }
-                more = Thread32Next(snap, &mut entry).is_ok();
+                if entry.th32OwnerProcessID == pid {
+                    match OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+                        Ok(thread) => {
+                            // u32::MAX is ResumeThread's failure sentinel.
+                            if ResumeThread(thread) == u32::MAX {
+                                last_err = Some(io::Error::last_os_error());
+                            } else {
+                                resumed += 1;
+                            }
+                            let _ = CloseHandle(thread);
+                        }
+                        Err(e) => last_err = Some(io::Error::from(e)),
+                    }
+                }
+                step = Thread32Next(snap, &mut entry);
             }
             let _ = CloseHandle(snap);
         }
         if resumed == 0 {
-            return Err(io::Error::other("no suspended threads resumed"));
+            return Err(last_err.unwrap_or_else(|| io::Error::other("no suspended threads resumed")));
         }
         Ok(())
     }

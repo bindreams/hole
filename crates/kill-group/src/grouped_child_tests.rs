@@ -169,7 +169,7 @@ async fn root_child_is_inside_job_after_spawn() {
     let raw = gc.child.raw_handle().expect("child handle");
     let mut in_job = windows::core::BOOL::default();
     // Job=None asks "is it in ANY job" — terminals already put us in one, so
-    // ask against OUR job handle, exposed for tests via a doc(hidden) probe.
+    // ask against OUR job handle, exposed via a crate-private test probe.
     let job = gc.test_job_handle().expect("root spawn has a job");
     // SAFETY: both handles are live for the duration of the call. The job
     // parameter is Option<HANDLE> (None would ask "in ANY job", which is
