@@ -191,7 +191,7 @@ pub async fn start_plugin_chain(
 
 /// Sourced gate for the plugin tap. The IPC config flag is the primary
 /// knob (reaches service mode); the env var stays as the dev-shell
-/// fallback for `scripts/dev.py` / hand-run `hole bridge run`.
+/// fallback for dev-console / hand-run `hole bridge run`.
 #[derive(Debug, Clone, Copy)]
 enum TapSource {
     Config,

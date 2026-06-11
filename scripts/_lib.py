@@ -1,8 +1,8 @@
-"""Shared helpers for dev.py and network-reset.py — elevation detection.
+"""Shared helpers for network-reset.py — elevation detection.
 
-Imported by both scripts as a plain sibling module. Python adds each
-script's own directory to sys.path at startup, so `import _lib` works
-with both `python scripts/<script>.py` and `uv run scripts/<script>.py`.
+Imported as a plain sibling module. Python adds each script's own
+directory to sys.path at startup, so `import _lib` works with both
+`python scripts/<script>.py` and `uv run scripts/<script>.py`.
 """
 # PEP 604 union syntax (`X | None`) in runtime annotations is Python 3.10+.
 # `from __future__ import annotations` stringifies all annotations so the

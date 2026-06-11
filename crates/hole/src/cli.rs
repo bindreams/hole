@@ -601,7 +601,7 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// includes it in the socket DACL on next startup. If the bridge is
 /// already running, also updates the live socket DACL directly so the
 /// GUI can connect without re-login. Used both by the installer (to set
-/// up IPC access at install time) and by `dev.py` (to prepare IPC access
+/// up IPC access at install time) and by dev-console (to prepare IPC access
 /// before the foreground dev bridge starts).
 ///
 /// The direct-DACL-update path is a workaround for the Windows

@@ -2,7 +2,7 @@
 //!
 //! **This is the single source of truth.** Adding a new file that must sit
 //! next to `hole.exe` is one line in `bindir_files()` below — both
-//! `scripts/dev.py` and `msi-installer/src/msi_installer/__init__.py:stage_files()` call into
+//! dev-console and `msi-installer/src/msi_installer/__init__.py:stage_files()` call into
 //! this via `cargo xtask stage`, so they pick it up automatically.
 //!
 //! See issue #143 for the motivation.
@@ -79,7 +79,7 @@ pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile
     files.push(BindirFile::new(hole_src, hole_name));
 
     // 1a. Debug symbols for `hole` — staged alongside the binary so panic
-    //     backtraces in dev (`scripts/dev.py`) and production (the MSI)
+    //     backtraces in dev (dev-console) and production (the MSI)
     //     resolve frame names and line numbers. Without these, the panic
     //     hook at `crates/common/src/logging.rs::install_panic_hook` renders
     //     every frame as `<unknown>`.

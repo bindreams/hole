@@ -270,7 +270,7 @@ fn ctrl_break_resolves_shutdown_signal() {
     });
 }
 
-// dev.py's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
+// dev-console's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
 // instead of an ungraceful default-disposition kill that leaks routes/DNS
 // (bindreams/hole#452). `shutdown_signal()` installs the SIGTERM handler
 // SYNCHRONOUSLY when called (Step 3), so raising the signal immediately

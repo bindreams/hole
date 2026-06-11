@@ -95,6 +95,15 @@ extracted from garter. Licensed under the Apache License, Version 2.0.
 
 Copyright © 2026 Anna Zhukova.
 
+## stepstool (`crates/stepstool`)
+
+`crates/stepstool` is a first-party elevation-primitives crate (sudo
+credential priming and command wrapping on POSIX, elevation detection on
+Windows), extracted from the salvageable elevation half of PR #456.
+Licensed under the Apache License, Version 2.0.
+
+Copyright © 2026 Anna Zhukova.
+
 ## Native-crash observability dependencies (`crates/tombstone`)
 
 The `tombstone` crate (`crates/tombstone`) is first-party, licensed under

@@ -227,7 +227,7 @@ leaves working DNS + broken routes, not the inverse):
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;
 installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
-`scripts/dev.py` passes `$TMPDIR/hole-dev/state`.
+`dev-console` passes `$TMPDIR/hole-dev/state`.
 
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
@@ -319,11 +319,13 @@ Each publishable member declares a release group in
 | `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                         |
 | `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                               |
 | `crates/kill-group/`               | Apache · kill-group                    | Process-tree kill-groups (job object / process group); split from garter (#197) |
+| `crates/stepstool/`                | Apache · —                             | Elevation primitives: sudo priming + wrapping (POSIX), elevation detection (Win) |
 | `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture  |
 | `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                     |
 | `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin) |
 | `crates/util/`                     | Apache · —                             | `port_alloc`, `retry` (Apache so plugins can depend)                            |
 | `crates/plugin-e2e/`               | GPL · —                                | Shared ss-server/cert harness + ex-ray↔stock + galoshes roundtrips (#197)       |
+| `crates/dev-console/`              | GPL · —                                | Dev-mode supervisor: bridge (elevated) + Vite + GUI, multiplexed logs (#454)    |
 | `build.yaml`                       | —                                      | Declarative build-target DAG for `cargo xtask build\|run\|list`                 |
 | `xtask/`, `xtask-lib/`             | —                                      | Task runner + helper crate shared with `crates/hole/build.rs`                   |
 | `msi-installer/`, `dmg-installer/` | —                                      | Windows MSI (WiX) + macOS DMG signature checks (Python, #364)                   |
@@ -352,8 +354,8 @@ removed because tmpfs is commonly `noexec` (#401).
 
 ### npm dependency management
 
-`scripts/dev.py` runs `npm install`, which updates `package-lock.json` when it
-drifts from `package.json`. PR CI runs strict `npm ci` (via `frontend-build`),
+Dev mode (`dev-console`) runs `npm install`, which updates `package-lock.json`
+when it drifts from `package.json`. PR CI runs strict `npm ci` (via `frontend-build`),
 which fails on inconsistency. **If you edit `package.json`, commit the resulting
 `package-lock.json` in the same commit, or CI rejects the PR.** Renovate handles
 routine updates ([renovate.json](.github/renovate.json)).
@@ -367,7 +369,7 @@ build graph; `cargo xtask list` prints the target table.
 npm install                  # frontend deps (first time only)
 cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (cached)
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask run hole         # dev mode (= build hole + scripts/dev.py)
+cargo xtask run hole         # dev mode (= build hole + dev-console)
 cargo xtask run hole-tests   # canonical local nextest invocation
 ```
 
@@ -414,25 +416,38 @@ cargo xtask run hole
 cargo xtask run hole
 ```
 
-> **Do NOT `sudo cargo xtask run hole`.** dev.py refuses to run as root, but the
-> outer xtask build cascade runs first — so a sudo'd invocation leaves
-> root-owned files in `target/` before dev.py can bail (bindreams/hole#452).
+> **Do NOT `sudo cargo xtask run hole`.** dev-console refuses to run as root,
+> but the outer xtask build cascade runs first — so a sudo'd invocation leaves
+> root-owned files in `target/` before dev-console can bail (bindreams/hole#452).
 > Closing this sudo-invocation path structurally is tracked in #453.
 
-`cargo xtask run hole` launches `scripts/dev.py`, which builds the workspace,
-starts Vite, and launches bridge + GUI with multiplexed color-coded logs.
-Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and re-run.
+`cargo xtask run hole` launches the [`dev-console`](crates/dev-console/)
+supervisor, which builds the workspace, starts Vite, and launches bridge + GUI
+with multiplexed color-coded logs. `cargo run -p dev-console` works standalone
+too (it runs `cargo xtask build hole` itself). Frontend changes hot-reload via
+Vite HMR; Rust changes need Ctrl+C and re-run.
 
-- **dev.py runs unprivileged and elevates only the bridge.** On macOS it
+- **dev-console runs unprivileged and elevates only the bridge.** On macOS it
   prompts for your sudo password once, then `sudo`s just `bridge grant-access` +
   `bridge run`. Vite and the GUI run as you, reading your real `~/Library`. On
   Windows everything inherits the already-elevated UAC token (token-based; no
   identity change).
-- `dev.py` runs `hole bridge grant-access` (creates the `hole` group, adds your
-  user) so the bridge exercises the production DACL/group path on every run. The
-  group is **not** removed on exit (same as production). The GUI needs the `hole`
-  group to open the IPC socket; the first run after `grant-access` creates the
-  group, so a one-time log out / log back in (or reboot) may be required.
+- dev-console runs `hole bridge grant-access` (creates the `hole` group, adds
+  your user) so the bridge exercises the production DACL/group path on every
+  run. The group is **not** removed on exit (same as production). The GUI needs
+  the `hole` group to open the IPC socket; the first run after `grant-access`
+  creates the group, so a one-time log out / log back in (or reboot) may be
+  required.
+- **Bridge readiness is a rendezvous, not a poll.** dev-console pre-binds a
+  localhost TCP listener and passes `--ready-notify ADDR/TOKEN` to `bridge run`;
+  the bridge echoes the token only after the IPC socket is bound and its
+  permissions are applied. (This replaces the old socket-file wait, which raced
+  the DACL setup.)
+- **Ctrl+C stops the bridge gracefully** so it restores routes/DNS before
+  exiting: SIGTERM (relayed by sudo) on macOS, CTRL_BREAK on Windows. Children
+  that ignore the graceful signal for 10s are force-killed with their process
+  trees — except the macOS bridge, which sudo cannot force-kill; dev-console
+  prints a `network-reset.py` recovery pointer instead.
 
 ### Manual workflow
 
