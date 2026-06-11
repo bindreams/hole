@@ -35,6 +35,7 @@ time = { version = "0.3", features = ["serde-well-known", "formatting"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 yaml_serde = "0.10"
 nu-ansi-term = "0.50"
+tempfile = "3"
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
 
@@ -58,6 +59,5 @@ yaml_serde = "0.10"
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 log = "0.4"
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 garter = { path = "../garter" }

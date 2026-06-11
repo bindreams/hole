@@ -22,9 +22,24 @@ pub struct AppState {
     test_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// Load the persisted config, falling back to defaults on any error. A
+/// corrupt/unreadable config must not crash startup, but — unlike a bare
+/// `unwrap_or_default()` — the failure is recorded in `gui.log` so it is not
+/// silently masked (and overwritten on the next save). The user-facing
+/// "Failed to load settings" modal (#481) builds on this.
+fn load_config_or_default(path: &std::path::Path) -> AppConfig {
+    match AppConfig::load(path) {
+        Ok(config) => config,
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "failed to load config; starting with defaults");
+            AppConfig::default()
+        }
+    }
+}
+
 impl AppState {
     pub fn new(config_path: PathBuf, app_handle: tauri::AppHandle) -> Self {
-        let config = AppConfig::load(&config_path).unwrap_or_default();
+        let config = load_config_or_default(&config_path);
         Self {
             config_path,
             config: Mutex::new(config),
@@ -106,3 +121,7 @@ fn resolve_bridge_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(hole_common::protocol::default_bridge_socket_path)
 }
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod state_tests;
