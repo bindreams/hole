@@ -8,6 +8,7 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt as _;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::Routing;
@@ -205,6 +206,38 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
         // Await the server task directly; deterministic, the framework
         // timeout surfaces a hang as "test took too long".
         server_handle.await.expect("server task panicked");
+    });
+}
+
+#[skuld::test]
+fn ready_notify_connects_and_writes_token() {
+    // HONESTY NOTE: this pins `notify_ready`'s CONTRACT; the PLACEMENT
+    // (called in `run_inner` right after `IpcServer::bind` returns, i.e.
+    // after `apply_socket_permissions`) is verified by code review, like
+    // the sibling recovery-call placements. (`apply_socket_permissions`
+    // is `#[cfg(not(test))]` inside `IpcServer::bind`, so the
+    // after-permissions ordering cannot be asserted in a test build even
+    // in principle.)
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spec = format!("{}/sekrit-token", listener.local_addr().unwrap());
+        super::notify_ready(&spec).await;
+        let (conn, _) = listener.accept().await.unwrap();
+        let mut lines = tokio::io::BufReader::new(conn).lines();
+        let line = lines.next_line().await.unwrap();
+        assert_eq!(line.as_deref(), Some("sekrit-token"));
+    });
+}
+
+#[skuld::test]
+fn ready_notify_tolerates_malformed_spec_and_dead_listener() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Best-effort contract: neither panics nor errors — the supervisor's
+        // own deadline is the failure signal (spec §Bridge changes).
+        super::notify_ready("no-slash-here").await;
+        super::notify_ready("127.0.0.1:1/dead-listener-token").await;
     });
 }
 
