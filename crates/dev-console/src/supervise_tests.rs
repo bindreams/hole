@@ -4,7 +4,7 @@
 //! it needs a password prompt and a real network stack.
 
 use crate::policy::ChildRole;
-use crate::supervise::teardown_grouped;
+use crate::supervise::{is_reaped, teardown_grouped};
 use crate::test_child;
 
 use tokio::io::AsyncReadExt as _;
@@ -22,6 +22,27 @@ async fn fake_bridge_satisfies_ready_listener() {
     let mut child = cmd.spawn().unwrap();
     ready.wait().await.expect("fake bridge echoes the token");
     let _ = child.kill().await;
+}
+
+/// dev.py:306-307 parity: an already-reaped child must not be signalled —
+/// its pgid may have been recycled (the term_group contract requires holding
+/// an un-reaped leader). Pin the guard predicate on live vs reaped children,
+/// and that teardown on a reaped child returns without the grace wait.
+#[skuld::test]
+async fn reaped_children_are_not_signalled() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.env(test_child::MODE_ENV, "sleep");
+    cmd.env(test_child::CONTROL_ENV, listener.local_addr().unwrap().to_string());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
+    let (_conn, _) = listener.accept().await.unwrap();
+    assert!(!is_reaped(&gc.child), "live child is not reaped");
+    gc.kill_tree().await; // kills AND reaps
+    assert!(is_reaped(&gc.child), "kill_tree reaps the direct child");
+    teardown_grouped(&mut gc, ChildRole::Vite).await;
 }
 
 /// The spec's promised integration test: teardown reaps a grandchild tree.

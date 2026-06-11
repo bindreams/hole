@@ -1493,6 +1493,7 @@ name = "dev-console"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "hole-test-observability",
  "kill-group",
  "libc",

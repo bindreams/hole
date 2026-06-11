@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] } # catch_unwind for the teardown funnel
 kill-group = { version = "0.1", path = "../kill-group" }
 stepstool = { path = "../stepstool" }
 util = { path = "../util" }

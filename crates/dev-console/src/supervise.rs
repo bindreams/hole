@@ -45,6 +45,15 @@ enum BridgeChild {
     Windows(GroupedChild),
 }
 
+/// dev.py:306-307 parity (`terminate_tree`: `if proc.poll() is not None:
+/// return`): a reaped child's pid — and therefore its pgid — may already
+/// have been recycled by the OS, so signalling it can land on an unrelated
+/// process group. `term_group`'s contract requires holding an un-reaped
+/// leader. tokio's `wait()` fuses: after reaping, `id()` is `None`.
+pub(crate) fn is_reaped(child: &Child) -> bool {
+    child.id().is_none()
+}
+
 impl BridgeChild {
     fn child_mut(&mut self) -> &mut Child {
         match self {
@@ -259,9 +268,12 @@ async fn supervise_children(
     let mut vite: Option<GroupedChild> = None;
     let mut gui: Option<GroupedChild> = None;
 
+    use futures_util::FutureExt as _;
     // The startup+steady body. Early returns are FINE here — the funnel
-    // below always runs.
-    let outcome: Result<ExitCause> = startup_and_supervise(
+    // below always runs, on panics too.
+    // AssertUnwindSafe: after a panic the funnel touches only the slot
+    // Options, which are coherent at every await point.
+    let outcome: Result<ExitCause> = match std::panic::AssertUnwindSafe(startup_and_supervise(
         interrupts,
         npm,
         bridge_bin,
@@ -272,8 +284,18 @@ async fn supervise_children(
         &mut bridge,
         &mut vite,
         &mut gui,
-    )
-    .await;
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            // dev.py's `finally` ran on arbitrary exceptions: tear down the
+            // children (the root bridge above all) before resuming the panic.
+            shutdown(bridge.as_mut(), vite.as_mut(), gui.as_mut()).await;
+            std::panic::resume_unwind(panic);
+        }
+    };
 
     shutdown(bridge.as_mut(), vite.as_mut(), gui.as_mut()).await;
 
@@ -330,6 +352,9 @@ async fn startup_and_supervise(
         biased;
         status = bridge.child_mut().wait() => {
             let status = status?;
+            // Supervisor status lines print directly (not via the mux
+            // printer) — dev.py parity: its prints didn't take the print
+            // lock either; a rare interleave with a child entry is accepted.
             // dev.py:578-585 (stdout, like dev.py's print):
             println!(
                 "{YELLOW}Bridge exited with code {} (sudo credentials may have expired, or a \
@@ -435,16 +460,21 @@ async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChi
     }
     println!("\n{BOLD}Shutting down...{RESET}");
     if let Some(bridge) = bridge {
-        bridge.signal_term();
-        // Class-2 bound: an out-of-process exit that might never come (10s,
-        // dev.py parity).
-        if tokio::time::timeout(GRACE_TIMEOUT, bridge.child_mut().wait())
-            .await
-            .is_err()
-        {
-            match grace_timeout_action(ChildRole::Bridge, Os::host()) {
-                GraceTimeoutAction::WarnRecovery => eprintln!("{NETWORK_RESET_WARNING}"),
-                GraceTimeoutAction::HardKill => bridge.hard_kill().await,
+        // dev.py poll() guard (see is_reaped): a reaped bridge means a
+        // possibly-recycled pgid — never signal it, and there is nothing
+        // left to grace-wait for.
+        if !is_reaped(bridge.child_mut()) {
+            bridge.signal_term();
+            // Class-2 bound: an out-of-process exit that might never come
+            // (10s, dev.py parity).
+            if tokio::time::timeout(GRACE_TIMEOUT, bridge.child_mut().wait())
+                .await
+                .is_err()
+            {
+                match grace_timeout_action(ChildRole::Bridge, Os::host()) {
+                    GraceTimeoutAction::WarnRecovery => eprintln!("{NETWORK_RESET_WARNING}"),
+                    GraceTimeoutAction::HardKill => bridge.hard_kill().await,
+                }
             }
         }
     }
@@ -458,6 +488,13 @@ async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChi
 /// Graceful group signal → bounded wait → hard tree-kill. Shared by
 /// shutdown() and the grandchild-reap integration test.
 pub(crate) async fn teardown_grouped(gc: &mut GroupedChild, role: ChildRole) {
+    // dev.py poll() parity: a reaped leader means a possibly-recycled pgid —
+    // never signal it. Lingering group members (if any) are reaped by the
+    // Drop backstop's group kill, accepting kill-group's documented
+    // stored-pgid semantics there (garter parity).
+    if is_reaped(&gc.child) {
+        return;
+    }
     let _ = gc.signal_group_term();
     // Class-2 bound: out-of-process exit that may never come (10s).
     if tokio::time::timeout(GRACE_TIMEOUT, gc.child.wait()).await.is_err() {
@@ -475,10 +512,14 @@ fn spawn_bridge(mut cmd: Command) -> std::io::Result<BridgeChild> {
         // prompt on /dev/tty (it EOFs on the null stdin instead), and makes
         // the child a process-group leader for the graceful killpg.
         // SAFETY: setsid is async-signal-safe and the closure does nothing
-        // else; it cannot fail in a freshly-forked child (never a leader).
+        // else (last_os_error only reads errno).
         unsafe {
             cmd.as_std_mut().pre_exec(|| {
-                libc::setsid();
+                // A failed setsid would silently break the pgid==pid leader
+                // assumption killpg relies on; failing the spawn surfaces it.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
