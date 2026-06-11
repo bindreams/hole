@@ -141,11 +141,15 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
             }
         }
     }
-    // EOF: flush the trailing partial line, then the buffered entry.
-    if pending.last() == Some(&b'\r') {
+    // EOF: flush the trailing partial line, then the buffered entry. A
+    // pending `\r` was waiting for a possible `\n`; EOF makes it final, so it
+    // terminates a line — emitted even when empty (Python text-mode parity:
+    // `b"x\n\r"` is ['x', '']).
+    let terminated_by_cr = pending.last() == Some(&b'\r');
+    if terminated_by_cr {
         pending.pop();
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || terminated_by_cr {
         let line = String::from_utf8_lossy(&pending).into_owned();
         let out = match mode {
             StreamMode::PerLine => FramerOutput::Immediate(line),
