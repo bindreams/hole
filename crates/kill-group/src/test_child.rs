@@ -10,11 +10,12 @@
 //!   `force_kill_reaps_descendant_tree`).
 //! - `spawn-grandchild` — spawn this same binary in `sleep` mode as a plain
 //!   child (NOT a kill-group; it must be reaped via the tree, not directly),
-//!   then sleep forever itself.
+//!   then sleep forever itself; the intermediate parent never dials the
+//!   control listener; only the grandchild's `sleep` mode does — the accepted
+//!   connection is the GRANDCHILD's death-watch.
 //! - `trap-term` — install the platform graceful-signal handler (SIGTERM on
 //!   Unix, CTRL_BREAK on Windows), connect to the control address to signal
 //!   readiness, and exit 0 when the signal arrives.
-#![allow(clippy::disallowed_methods)] // child modes run no tracing subscriber
 
 use std::io::Write as _;
 use std::net::TcpStream;
@@ -43,16 +44,16 @@ fn control_conn() -> TcpStream {
     conn
 }
 
-fn sleep_forever() -> ! {
-    // Parking, not sync: this child only exits by being killed.
+fn park_forever() -> ! {
+    // Park forever: this child only exits by being killed.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        std::thread::park();
     }
 }
 
 fn run_sleep() -> ! {
     let _conn = control_conn();
-    sleep_forever()
+    park_forever()
 }
 
 fn run_spawn_grandchild() -> ! {
@@ -73,7 +74,7 @@ fn run_spawn_grandchild() -> ! {
     // kill; the grandchild must be reaped via the tree kill under test.
     #[allow(clippy::zombie_processes)]
     let _grandchild = cmd.spawn().expect("spawn grandchild");
-    sleep_forever()
+    park_forever()
 }
 
 #[cfg(unix)]
