@@ -1489,6 +1489,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dev-console"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "hole-test-observability",
+ "kill-group",
+ "libc",
+ "rand 0.10.1",
+ "skuld",
+ "stepstool",
+ "tempfile",
+ "tokio",
+ "util",
+ "which",
+ "windows 0.62.2",
+ "xtask-lib",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2986,6 +3006,7 @@ dependencies = [
  "hyper-util",
  "idna",
  "ipnet",
+ "kill-group",
  "libc",
  "lru",
  "plugin-e2e",
@@ -6706,6 +6727,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stepstool"
+version = "0.1.0"
+dependencies = [
+ "hole-test-observability",
+ "libc",
+ "skuld",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8620,6 +8653,15 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "which"
+version = "8.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c789537cf2f7f55be8e6192f92e464174ee55f91af622777f7f1ceb0dbccd03e"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "widestring"

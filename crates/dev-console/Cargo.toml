@@ -1,0 +1,40 @@
+[package]
+name = "dev-console"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+description = "Dev-mode supervisor: builds the workspace, then runs bridge (elevated) + Vite + GUI with multiplexed colored logs. Replaces scripts/dev.py (#454)."
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[[bin]]
+name = "dev-console"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] } # catch_unwind for the teardown funnel
+kill-group = { version = "0.1", path = "../kill-group" }
+stepstool = { path = "../stepstool" }
+util = { path = "../util" }
+xtask-lib = { path = "../../xtask-lib" }
+rand = "0.10" # match the bridge's pin (crates/bridge/Cargo.toml); already in the lockfile
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "io-std", "io-util", "net", "sync", "time"] }
+which = "8" # 8.0.3 current; performs Windows PATHEXT resolution (the npm.cmd trap)
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_System_Console"] } # console-corruption check

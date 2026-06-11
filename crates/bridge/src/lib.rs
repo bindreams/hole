@@ -45,7 +45,30 @@ fn main() {
         test_support::dist_harness_panic_hook_tests::run_child();
         std::process::exit(0);
     }
+    foreground_child_hook::maybe_run();
     skuld::run_all();
+}
+
+/// Self-reinvoke hook for the CTRL_BREAK shutdown test: in child mode, call
+/// shutdown_signal() (installs handlers eagerly), print a ready line, then
+/// block on the future and exit 0 when the signal lands.
+#[cfg(test)]
+pub(crate) mod foreground_child_hook {
+    pub const MODE_ENV: &str = "HOLE_BRIDGE_TEST_SHUTDOWN_CHILD";
+    pub fn maybe_run() {
+        if std::env::var_os(MODE_ENV).is_none() {
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let fut = crate::foreground::shutdown_signal();
+            println!("HANDLER-READY");
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            fut.await;
+        });
+        std::process::exit(0);
+    }
 }
 
 #[cfg(test)]

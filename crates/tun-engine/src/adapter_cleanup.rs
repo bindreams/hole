@@ -12,8 +12,8 @@
 //!   makes sure the next start finds a clean machine.
 //!
 //! Idempotent: no-op if the adapter is already gone. Requires admin
-//! privileges (the bridge runs elevated; in dev mode, `scripts/dev.py`
-//! requests UAC elevation). PowerShell cold-start adds ~500-2000ms to
+//! privileges (the bridge runs elevated; in dev mode, dev-console requires
+//! an already-elevated shell). PowerShell cold-start adds ~500-2000ms to
 //! teardown — acceptable tax for crash-recovery safety. On macOS the
 //! utun adapter auto-cleans on FD close (no equivalent leak), so this
 //! is a no-op there.

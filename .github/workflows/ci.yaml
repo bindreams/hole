@@ -91,8 +91,8 @@ jobs:
         run: cargo xtask run clippy-ex-galoshes
 
       # Archive the ex-Galoshes crates plus the workspace tooling crates
-      # (kill-group, xtask-lib; later: stepstool/dev-console/xtask, see #454)
-      # — consumed by test-garter / test-galoshes / test-tooling on all
+      # (kill-group, stepstool, dev-console, xtask, xtask-lib; #454) —
+      # consumed by test-garter / test-galoshes / test-tooling on all
       # platforms. Hole crates' compileability is already covered by `Clippy
       # (Hole workspace)` above; test-hole runs in its own build+test job below.
       # `--features garter/test-utils` builds garter's feature-gated
@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p xtask-lib --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p stepstool -p dev-console -p xtask -p xtask-lib --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
 
       # The artifact is consumed by test-garter, test-galoshes, and
       # test-tooling; test-hole does its own build.
@@ -230,14 +230,22 @@ jobs:
       # package set is frozen at build time. Filter by `-E package(...)`
       # instead. `target/debug/` must exist because skuld writes its
       # test-coordination SQLite DB at `<workspace>/target/debug/.skuld.db`.
+      #
+      # `!windows_console` excludes dev-console's labeled console-corruption
+      # test: it panics loudly on a non-interactive console, so it only runs
+      # manually from an interactive Windows terminal:
+      #   SKULD_LABELS=windows_console cargo nextest run -p dev-console \
+      #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
       - name: Run tests
         shell: bash
+        env:
+          SKULD_LABELS: "!windows_console"
         run: |
           mkdir -p target/debug
           cargo nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
-            -E 'package(kill-group) + package(xtask-lib)'
+            -E 'package(kill-group) + package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib)'
 
   # test-hole runs a fresh build + nextest run (no archive). Hole tests have
   # too many environmental couplings (trybuild --offline registry, dist_fixture
@@ -368,20 +376,6 @@ jobs:
       - name: Test plugin-e2e
         shell: bash
         run: cargo xtask run plugin-e2e-tests
-
-  # Unit tests for the dev/admin Python scripts (scripts/dev_tests.py). Runs
-  # `uv run` DIRECTLY (not via `cargo xtask run scripts-tests`) to avoid
-  # provisioning a Rust toolchain + compiling xtask just to shell out to
-  # Python. The tests are platform-agnostic, so one ubuntu runner suffices.
-  test-scripts:
-    name: Test scripts
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8.2.0
-      - name: Run script tests
-        run: uv run scripts/dev_tests.py
 
   test-installer:
     name: Test installer (windows/amd64)

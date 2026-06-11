@@ -60,6 +60,7 @@ fn dispatch_exempts_bridge_run_from_cli_log_guard() {
             service: false,
             log_dir: None,
             state_dir: None,
+            ready_notify: None,
         },
     };
     assert!(!should_install_cli_log_guard(&cmd));
@@ -439,6 +440,7 @@ fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
             service: false,
             log_dir: None,
             state_dir: None,
+            ready_notify: None,
         },
     })
     .is_none());
