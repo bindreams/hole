@@ -41,7 +41,7 @@ fn sample_config() -> ProxyConfig {
 fn config_with_plugin_local_overrides_server_address() {
     let cfg = sample_config();
     let plugin_local: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
-    let ss_config = build_ss_config(&cfg, Some(plugin_local)).unwrap();
+    let ss_config = build_ss_config(&cfg, Some(plugin_local), None).unwrap();
 
     // Server address should be the plugin's local address, not the original server.
     let svr = &ss_config.server[0].config;
@@ -56,7 +56,7 @@ fn config_with_plugin_local_overrides_server_address() {
 #[skuld::test]
 fn config_without_plugin_local_uses_original_server() {
     let cfg = sample_config();
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
 
     let svr = &ss_config.server[0].config;
     match svr.addr() {
@@ -73,7 +73,7 @@ fn config_with_plugin_local_has_no_plugin_config() {
     let mut cfg = sample_config();
     cfg.server.plugin = Some("v2ray-plugin".into());
     let plugin_local: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
-    let ss_config = build_ss_config(&cfg, Some(plugin_local)).unwrap();
+    let ss_config = build_ss_config(&cfg, Some(plugin_local), None).unwrap();
 
     // No PluginConfig should be set — Garter manages the plugin lifecycle.
     let svr = &ss_config.server[0].config;
@@ -85,7 +85,7 @@ fn config_with_plugin_local_has_no_plugin_config() {
 #[skuld::test]
 fn socks5_only_produces_one_socks_local() {
     let cfg = sample_config();
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
 
     assert_eq!(ss_config.local.len(), 1);
     let local = &ss_config.local[0].config;
@@ -103,7 +103,7 @@ fn http_only_produces_one_http_local() {
     cfg.proxy_socks5 = false;
     cfg.proxy_http = true;
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
 
     assert_eq!(ss_config.local.len(), 1);
     let local = &ss_config.local[0].config;
@@ -121,7 +121,7 @@ fn both_enabled_produces_two_locals() {
     let mut cfg = sample_config();
     cfg.proxy_http = true;
     cfg.local_port_http = 4074;
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
 
     assert_eq!(ss_config.local.len(), 2);
     let socks = &ss_config.local[0].config;
@@ -145,7 +145,7 @@ fn http_listener_is_tcp_only_in_full_mode() {
     let mut cfg = sample_config();
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::Full;
     cfg.proxy_http = true;
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
     let http = ss_config
         .local
         .iter()
@@ -160,7 +160,7 @@ fn socks5_full_mode_is_tcp_and_udp() {
     // use UDP ASSOCIATE.
     let cfg = sample_config();
     assert_eq!(cfg.tunnel_mode, hole_common::protocol::TunnelMode::Full);
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
     let socks = &ss_config.local[0].config;
     assert!(matches!(socks.mode, Mode::TcpAndUdp));
 }
@@ -172,7 +172,7 @@ fn socks5_socks_only_mode_is_tcp_and_udp() {
     // DNS forwarder's UDP path), so the SOCKS5 listener is TcpAndUdp.
     let mut cfg = sample_config();
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
-    let ss_config = build_ss_config(&cfg, None).unwrap();
+    let ss_config = build_ss_config(&cfg, None, None).unwrap();
     let socks = &ss_config.local[0].config;
     assert!(matches!(socks.mode, Mode::TcpAndUdp));
 }
@@ -185,7 +185,7 @@ fn full_mode_without_socks5_errors() {
     cfg.proxy_socks5 = false;
     cfg.proxy_http = true;
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::Full;
-    let err = build_ss_config(&cfg, None).unwrap_err();
+    let err = build_ss_config(&cfg, None, None).unwrap_err();
     assert!(
         matches!(err, ProxyError::TunnelRequiresSocks5),
         "expected TunnelRequiresSocks5, got {err:?}"
@@ -198,7 +198,7 @@ fn no_listeners_enabled_errors() {
     cfg.proxy_socks5 = false;
     cfg.proxy_http = false;
     cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
-    let err = build_ss_config(&cfg, None).unwrap_err();
+    let err = build_ss_config(&cfg, None, None).unwrap_err();
     assert!(
         matches!(err, ProxyError::NoListenersEnabled),
         "expected NoListenersEnabled, got {err:?}"
@@ -210,7 +210,7 @@ fn same_port_errors() {
     let mut cfg = sample_config();
     cfg.proxy_http = true;
     cfg.local_port_http = cfg.local_port;
-    let err = build_ss_config(&cfg, None).unwrap_err();
+    let err = build_ss_config(&cfg, None, None).unwrap_err();
     match err {
         ProxyError::DuplicateListenerPort { port } => assert_eq!(port, cfg.local_port),
         other => panic!("expected DuplicateListenerPort, got {other:?}"),
@@ -221,7 +221,7 @@ fn same_port_errors() {
 fn port_zero_errors_socks5() {
     let mut cfg = sample_config();
     cfg.local_port = 0;
-    let err = build_ss_config(&cfg, None).unwrap_err();
+    let err = build_ss_config(&cfg, None, None).unwrap_err();
     match err {
         ProxyError::InvalidListenerPort { field } => assert_eq!(field, "local_port"),
         other => panic!("expected InvalidListenerPort(local_port), got {other:?}"),
@@ -233,9 +233,45 @@ fn port_zero_errors_http() {
     let mut cfg = sample_config();
     cfg.proxy_http = true;
     cfg.local_port_http = 0;
-    let err = build_ss_config(&cfg, None).unwrap_err();
+    let err = build_ss_config(&cfg, None, None).unwrap_err();
     match err {
         ProxyError::InvalidListenerPort { field } => assert_eq!(field, "local_port_http"),
         other => panic!("expected InvalidListenerPort(local_port_http), got {other:?}"),
     }
+}
+
+// Pure-VPN (#459) -----------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn full_mode_pure_vpn_binds_internal_socks5_only() {
+    let mut cfg = sample_config();
+    cfg.proxy_socks5 = false;
+    cfg.proxy_http = false;
+    let ss_config = build_ss_config(&cfg, None, Some(54321)).unwrap();
+
+    assert_eq!(ss_config.local.len(), 1, "exactly one internal SOCKS5 instance");
+    let socks = &ss_config.local[0].config;
+    assert!(matches!(socks.mode, Mode::TcpAndUdp));
+    let addr = socks.addr.as_ref().expect("local must have addr");
+    match addr {
+        ServerAddr::SocketAddr(s) => {
+            assert_eq!(s.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            assert_eq!(s.port(), 54321);
+        }
+        other => panic!("expected SocketAddr, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn full_mode_pure_vpn_ignores_configured_ports() {
+    // With both user-facing listeners off, the configured ports are inert:
+    // port checks are flag-conditioned and the internal instance uses the
+    // caller-allocated port.
+    let mut cfg = sample_config();
+    cfg.proxy_socks5 = false;
+    cfg.proxy_http = false;
+    cfg.local_port = 0;
+    cfg.local_port_http = 0;
+    let ss_config = build_ss_config(&cfg, None, Some(54321)).unwrap();
+    assert_eq!(ss_config.local.len(), 1);
 }

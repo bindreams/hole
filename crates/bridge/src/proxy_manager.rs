@@ -32,8 +32,9 @@
 // to mock state happens via `Arc` clones captured before the mock is
 // handed to `new`. A getter would recreate an encapsulation smell.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
+use util::port_alloc;
 
 use dump::{dump, DeriveDump};
 use hole_common::protocol::{ProxyConfig, TunnelMode};
@@ -459,8 +460,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Build shadowsocks config. When a plugin chain is running,
         // point ss-service at the chain's local port.
+        //
+        // Pure-VPN starts (Full mode, no user-facing listeners, #459)
+        // cannot build the config yet — the internal SOCKS5 port is
+        // allocated by bind_ephemeral in phase 2 — so run the same
+        // typed validation now to keep rejects fast and typed, before
+        // any Full-mode preamble work.
         let plugin_local = plugin_chain.as_ref().map(|c| c.local_addr());
-        let ss_config = build_ss_config(config, plugin_local)?;
+        let pure_vpn = matches!(config.tunnel_mode, TunnelMode::Full) && !config.proxy_socks5;
+        let ss_config = if pure_vpn {
+            crate::proxy::validate_proxy_config(config)?;
+            None
+        } else {
+            Some(build_ss_config(config, plugin_local, None)?)
+        };
 
         // SocksOnly mode: skip everything routing-related (wintun preload,
         // DNS resolution, gateway detection, route installation). Just start
@@ -468,6 +481,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // local instance, so `shadowsocks-service::local::Server::new` will
         // only bind the SOCKS5 listener.
         if matches!(config.tunnel_mode, TunnelMode::SocksOnly) {
+            let ss_config = ss_config.expect("SocksOnly start always has a prebuilt ss_config");
             debug!(local_count = ss_config.local.len(), "calling proxy.start");
             // Phase 2 (SocksOnly): race proxy.start against cancel.
             let running_proxy = tokio::select! {
@@ -568,10 +582,38 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Phase 2 (Full mode): start the SS SOCKS5 proxy, racing the
         // start future against cancel. Drop on Running aborts the SS
         // task on cancel via P::Running::drop.
-        let running_proxy = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
-            r = proxy.start(ss_config) => r?,
+        //
+        // The TUN data plane rides the user-facing SOCKS5 listener when
+        // it is enabled. On a pure-VPN start (no user-facing listeners,
+        // #459) the internal SOCKS5 instance binds an ephemeral loopback
+        // port instead, so nothing is bound on the user-configured
+        // ports. TCP+UDP: the SOCKS5 instance is always TcpAndUdp.
+        let (socks5_port, running_proxy) = if let Some(ss_config) = ss_config {
+            let running = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
+                r = proxy.start(ss_config) => r?,
+            };
+            (config.local_port, running)
+        } else {
+            let bind = port_alloc::bind_ephemeral(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port_alloc::Protocols::TCP | port_alloc::Protocols::UDP,
+                |port| async move {
+                    let ss_config =
+                        build_ss_config(config, plugin_local, Some(port)).map_err(proxy_start_err_to_io_err)?;
+                    proxy.start(ss_config).await.map_err(proxy_start_err_to_io_err)
+                },
+            );
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
+                r = bind => match r {
+                    Ok((port, running)) => (port, running),
+                    Err(_) if cancel.is_cancelled() => return Err(ProxyError::Cancelled),
+                    Err(e) => return Err(ProxyError::Runtime(e)),
+                },
+            }
         };
 
         // Phase 3: build the in-TUN DNS endpoint + forwarder. Err on the
@@ -581,7 +623,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let (local_dns_endpoint, forwarder) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ProxyError::Cancelled),
-            r = build_local_dns(&config.dns, config.local_port, gw_info.ipv6_available, cancel.clone()) => r?,
+            r = build_local_dns(&config.dns, socks5_port, gw_info.ipv6_available, cancel.clone()) => r?,
         };
 
         // Phase 4: blocking forwarder self-test gate. Runs synchronously
@@ -613,7 +655,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(not(test))]
         let dispatcher = {
             let d = crate::dispatcher::Dispatcher::new(
-                config.local_port,
+                socks5_port,
                 gw_info.interface_index,
                 gw_info.ipv6_available,
                 config.server.plugin.clone(),
@@ -819,6 +861,25 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.ipv6_bypass_available = true;
             }
         }
+    }
+}
+
+// Pure-VPN ephemeral bind =============================================================================================
+
+/// Map errors from a pure-VPN ephemeral bind attempt into `io::Error`
+/// for [`port_alloc::bind_ephemeral`]'s retry classification.
+/// `Runtime` unwraps to its `io::Error` so a genuine listener bind race
+/// (`AddrInUse` from shadowsocks-service's in-process bind) is
+/// classified by `is_bind_race` and retried on a fresh port; every
+/// other variant is deterministic for a given config (validation,
+/// cipher, plugin name) and becomes a non-retryable
+/// `io::Error::other`. The IPC layer surfaces `ProxyError` to clients
+/// as a message string, so wrapping the round-trip in
+/// `ProxyError::Runtime` preserves the user-visible text.
+fn proxy_start_err_to_io_err(e: ProxyError) -> std::io::Error {
+    match e {
+        ProxyError::Runtime(io) => io,
+        other => std::io::Error::other(other.to_string()),
     }
 }
 

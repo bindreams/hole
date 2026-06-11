@@ -105,11 +105,22 @@ touching routes, system DNS, or the wintun adapter. Guarded by
 `LocalInstanceConfig`s and rejects three combinations up-front (surfaced as
 `BridgeResponse::Error`):
 
-1. `Full && !proxy_socks5` → `TunnelRequiresSocks5` (the TUN dispatcher hands
-   captured traffic to the SOCKS5 listener; without it Full-mode flows vanish).
-1. `!proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
+1. `Full && !proxy_socks5 && proxy_http` → `TunnelRequiresSocks5` (the TUN
+   data plane either rides the user-facing SOCKS5 listener, or — pure-VPN —
+   an internal one on an ephemeral port; a mixed user-facing-HTTP +
+   internal-SOCKS5 split is rejected so the fixed HTTP port never sits
+   inside `bind_ephemeral`'s unbounded retry loop).
+1. `SocksOnly && !proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
 1. `proxy_socks5 && proxy_http && local_port == local_port_http` →
    `DuplicateListenerPort`.
+
+`Full && !proxy_socks5 && !proxy_http` is the **pure-VPN** configuration —
+what the GUI sends when the "Local proxy server" master toggle is off
+(`build_proxy_config` gates both flags on `proxy_server_enabled`, #459):
+`build_ss_config` emits a single SOCKS5 instance on a caller-supplied
+ephemeral loopback port (`proxy_manager::start_inner` allocates it via
+`port_alloc::bind_ephemeral`), the TUN dispatcher and DNS forwarder dial
+that port, and nothing is bound on `local_port` / `local_port_http`.
 
 The HTTP listener's `Mode` is always `TcpOnly` (HTTP CONNECT is TCP-only,
 RFC 7231 §4.3.6); the SOCKS5 listener's is always `TcpAndUdp`.

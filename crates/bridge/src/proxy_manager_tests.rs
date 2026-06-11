@@ -32,6 +32,10 @@ struct MockProxyState {
     /// If true, `MockRunning::is_alive` returns false — used to simulate
     /// a crashed ss task for `check_health_detects_crashed_task`.
     crashed: AtomicBool,
+    /// Last shadowsocks Config passed to `start` — lets tests assert
+    /// which local instances a start produced (e.g. the pure-VPN
+    /// internal ephemeral SOCKS5 instance, #459).
+    last_config: std::sync::Mutex<Option<shadowsocks_service::config::Config>>,
 }
 
 struct MockProxy {
@@ -81,7 +85,8 @@ impl MockProxy {
 impl Proxy for MockProxy {
     type Running = MockRunning;
 
-    async fn start(&self, _config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+    async fn start(&self, config: shadowsocks_service::config::Config) -> Result<MockRunning, ProxyError> {
+        *self.state.last_config.lock().unwrap() = Some(config);
         // Fire entered signal BEFORE awaiting the gate.
         if let Some(tx) = self.start_entered.lock().unwrap().take() {
             let _ = tx.send(());
@@ -849,6 +854,69 @@ fn start_cancellable_dropped_future_runs_guards() {
     });
 }
 
+// Pure-VPN (#459) =====================================================================================================
+
+#[skuld::test]
+fn pure_vpn_start_binds_internal_ephemeral_socks5() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.start_calls_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        let mut config = test_config();
+        config.proxy_socks5 = false;
+        config.proxy_http = false;
+
+        pm.start(&config).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        {
+            let guard = state.last_config.lock().unwrap();
+            let ss_config = guard.as_ref().expect("proxy.start captured a config");
+            assert_eq!(ss_config.local.len(), 1, "exactly one internal SOCKS5 instance");
+            let addr = ss_config.local[0].config.addr.as_ref().expect("local must have addr");
+            let sock = match addr {
+                shadowsocks::config::ServerAddr::SocketAddr(s) => *s,
+                other => panic!("expected SocketAddr, got {other:?}"),
+            };
+            assert_eq!(sock.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            assert_ne!(sock.port(), 0, "ephemeral port must be resolved, not 0");
+            assert_ne!(sock.port(), config.local_port, "configured port must stay unused");
+        }
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn pure_vpn_start_cancellable_during_proxy_start() {
+    rt().block_on(async {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
+        let (mut pm, _dir) = new_manager(proxy);
+        let mut config = test_config();
+        config.proxy_socks5 = false;
+        config.proxy_http = false;
+        let token = CancellationToken::new();
+
+        // Fire the cancel once `proxy.start(...)` is *known* to be parked
+        // on the gate (inside the bind_ephemeral op). Deterministic — no
+        // sleep.
+        let cancel_clone = token.clone();
+        tokio::spawn(async move {
+            entered_rx.await.expect("MockProxy::start never entered");
+            cancel_clone.cancel();
+        });
+
+        let err = pm.start_cancellable(&config, token).await.unwrap_err();
+        assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        // No gate release needed: the cancel drops the parked
+        // `proxy.start` future before it passes the gate, so the mock's
+        // sleeper task is never spawned.
+    });
+}
+
 #[skuld::test]
 fn reload_creates_fresh_uncancellable_token() {
     // reload() with a different server internally calls start_cancellable
@@ -1510,6 +1578,45 @@ mod self_test {
                 "last_error should mention the self-test failure; got {:?}",
                 pm.last_error()
             );
+        });
+    }
+
+    /// Pure-VPN (#459): the resolved ephemeral port — not
+    /// `config.local_port` — must be what `build_local_dns` (and
+    /// `Dispatcher::new`) receive. The regression mode is a swap back to
+    /// `config.local_port` at a consumer call site, which would make the
+    /// forwarder's `Socks5Connector` dial the configured port. Detect it
+    /// by listening on `config.local_port` for the duration of a pure-VPN
+    /// start with the forwarder enabled and asserting zero connection
+    /// attempts. (The start itself fails at the self-test gate either
+    /// way — MockProxy binds nothing — which also guarantees every
+    /// connector dial has completed before the assertion runs.)
+    #[skuld::test]
+    fn pure_vpn_start_never_dials_the_configured_port() {
+        rt().block_on(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let configured_port = listener.local_addr().unwrap().port();
+
+            let (mut pm, _dir) = new_manager(MockProxy::new());
+            let mut cfg = test_config();
+            cfg.proxy_socks5 = false;
+            cfg.proxy_http = false;
+            cfg.local_port = configured_port;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            assert!(
+                matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
+                "expected ForwarderSelfTestFailed, got {err:?}"
+            );
+
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing dialed local_port
+                Ok((_, peer)) => panic!("pure-VPN start dialed the configured local_port (from {peer})"),
+                Err(e) => panic!("unexpected accept error: {e}"),
+            }
         });
     }
 

@@ -504,6 +504,13 @@ pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Val
 ///
 /// Always requests [`TunnelMode::Full`]; `TunnelMode::SocksOnly` is reachable
 /// via `hole proxy start --tunnel-mode socks-only` and direct IPC.
+///
+/// The "Local proxy server" master toggle (`proxy_server_enabled`) gates
+/// both listener flags: with it off, the bridge receives
+/// `proxy_socks5 = proxy_http = false` and runs a pure-VPN start — the
+/// TUN data plane binds an internal ephemeral SOCKS5 instance and
+/// nothing listens on `local_port` / `local_port_http` (#459). The
+/// nested toggles keep their persisted values for re-enable.
 pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     let selected_id = config.selected_server.as_ref()?;
     let entry = config.servers.iter().find(|s| &s.id == selected_id)?;
@@ -513,8 +520,8 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: config.filters.clone(),
         dns: config.dns.clone(),
-        proxy_socks5: config.proxy_socks5,
-        proxy_http: config.proxy_http,
+        proxy_socks5: config.proxy_socks5 && config.proxy_server_enabled,
+        proxy_http: config.proxy_http && config.proxy_server_enabled,
         local_port_http: config.local_port_http,
         diagnostic_plugin_tap: config.diagnostic_plugin_tap,
     })

@@ -30,8 +30,10 @@ before editing; the sections linked below are the authoritative source.
   forwarder self-test gates the whole connection. →
   [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
 - **Listener selection invariants.** `build_ss_config` rejects
-  `TunnelRequiresSocks5` / `NoListenersEnabled` / `DuplicateListenerPort`
-  up-front. →
+  `TunnelRequiresSocks5` (full + HTTP-only) / `NoListenersEnabled`
+  (socks-only + none) / `DuplicateListenerPort` up-front; full mode with
+  no listeners is the pure-VPN start (internal SOCKS5 data plane on an
+  ephemeral port). →
   [CONTRIBUTING.md#listener-selection-invariants](CONTRIBUTING.md#listener-selection-invariants)
 - **Bridge trait seam.** All OS-mutating bridge I/O routes through the `Proxy`,
   `Routing`, and `Dns` traits so tests can mock it. →
