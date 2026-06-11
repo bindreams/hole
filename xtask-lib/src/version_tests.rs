@@ -92,6 +92,7 @@ fn group_tag_glob() {
 fn group_tag_prefix() {
     assert_eq!(Group::Hole.tag_prefix(), "releases/hole/v");
     assert_eq!(Group::ExRay.tag_prefix(), "releases/ex-ray/v");
+    assert_eq!(Group::KillGroup.tag_prefix(), "releases/kill-group/v");
 }
 
 #[skuld::test]
