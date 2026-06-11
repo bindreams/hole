@@ -6,7 +6,7 @@
 import { initDiagnostics, updateDiagnostics } from "./diagnostics";
 import { initGraph, pushGraphData, renderGraph } from "./graph";
 import { initIpDisplay, updatePublicIp } from "./ip-display";
-import { getConnectionState, initPowerButton, updateProxyStatus } from "./power-button";
+import { applyProxyStateObservation, getConnectionState, initPowerButton, updateProxyStatus } from "./power-button";
 import { initStats, updateStats } from "./stats";
 import type { Metrics } from "./types";
 import { initVersion } from "./version";
@@ -29,4 +29,4 @@ export function initSidebar(): void {
 }
 
 // Public re-exports for main.ts and other consumers.
-export { getConnectionState, updateDiagnostics, updatePublicIp, updateProxyStatus };
+export { applyProxyStateObservation, getConnectionState, updateDiagnostics, updatePublicIp, updateProxyStatus };

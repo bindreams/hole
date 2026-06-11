@@ -19,7 +19,14 @@ import {
   showImportFailureDialog,
 } from "./servers";
 import { initSettings, renderSettings } from "./settings";
-import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
+import {
+  applyProxyStateObservation,
+  initSidebar,
+  updateDiagnostics,
+  updateMetrics,
+  updateProxyStatus,
+  updatePublicIp,
+} from "./sidebar";
 import { showToast } from "./toast";
 import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server, UiSettings } from "./types";
 
@@ -254,11 +261,21 @@ function setupEventListeners(): Promise<unknown> {
     await loadConfig();
   });
 
+  // Tray- or backend-initiated proxy state changes reach the power
+  // button immediately instead of waiting for the 5s poll (#462). Routed
+  // through the same seq-monotone, IDLE-guarded application as the poll.
+  const proxyStateReady = listen<{ seq: number; running: boolean }>("proxy-state-changed", (event) => {
+    const result = applyProxyStateObservation(event.payload.seq, event.payload.running);
+    if (result.changed) {
+      updatePublicIp();
+    }
+  });
+
   // Joined so init() can await registration before the UI becomes
   // interactive — an emit landing before listen() resolves is silently
   // lost. Rejection is deliberately fatal to init: a dashboard without
   // its listeners is broken in exactly the silent way this guards.
-  return Promise.all([importReady, dropReady, validationReady]);
+  return Promise.all([importReady, dropReady, validationReady, proxyStateReady]);
 }
 
 // Initialization ======================================================================================================

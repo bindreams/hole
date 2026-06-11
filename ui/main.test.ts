@@ -41,6 +41,7 @@ vi.mock("./servers", () => ({
 }));
 vi.mock("./settings", () => ({ initSettings: vi.fn(), renderSettings: vi.fn() }));
 vi.mock("./sidebar", () => ({
+  applyProxyStateObservation: vi.fn().mockReturnValue({ state: "disconnected", changed: false }),
   initSidebar: vi.fn(),
   updateDiagnostics: vi.fn(),
   updateMetrics: vi.fn(),
@@ -70,7 +71,7 @@ describe("init ordering", () => {
 
     const firstConfig = callOrder.indexOf("invoke:get_config");
     expect(firstConfig).toBeGreaterThan(-1);
-    for (const ev of ["import-requested", "tauri://drag-drop", "validation-changed"]) {
+    for (const ev of ["import-requested", "tauri://drag-drop", "validation-changed", "proxy-state-changed"]) {
       const idx = callOrder.indexOf(`listen:${ev}`);
       expect(idx, `listener ${ev} must be registered before get_config`).toBeGreaterThan(-1);
       expect(idx).toBeLessThan(firstConfig);

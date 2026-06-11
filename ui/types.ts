@@ -105,6 +105,10 @@ export interface UiSettings {
 
 export interface ProxyStatus {
   running: boolean;
+  /// Commit seq of the backend's ProxyStateCell at response time. The
+  /// frontend applies observations monotonically by this value; see
+  /// `applyProxyStateObservation` in `ui/power-button.ts` (#462).
+  state_seq: number;
 }
 
 export interface Metrics {

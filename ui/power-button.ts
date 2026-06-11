@@ -41,7 +41,7 @@ async function handlePowerClick(): Promise<void> {
     return;
   }
 
-  // Click during connecting → fire cancel. The original toggle_proxy
+  // Click during connecting → fire cancel. The original start_proxy
   // promise is still pending in toggleFromIdle(); `cancel_proxy`
   // races it on a fresh bridge connection so it does not block behind
   // the in-flight start.
@@ -75,32 +75,55 @@ export function initPowerButton(): void {
   powerBtn?.addEventListener("click", handlePowerClick);
 }
 
+/// The seq of the newest applied observation. Observations arrive on two
+/// unordered channels (the 5s poll and `proxy-state-changed` events);
+/// applying them monotonically by the backend's commit seq means an
+/// out-of-order arrival can never render an older state (#462).
+let lastAppliedSeq = -1;
+
 /**
- * Update the connection state from a periodic proxy status poll.
+ * Apply a `(seq, running)` observation from either the periodic status
+ * poll or a `proxy-state-changed` event.
+ *
+ * An observation whose seq is not newer than the last applied one is
+ * dropped — including a re-observation of the unchanged truth, which
+ * keeps a `connection-failed`/`disconnection-failed` cue visible until
+ * the state actually changes instead of repainting it on the next poll.
  *
  * Only overwrites `currentState` when the current state is IDLE.
  * Transition states (`connecting`/`cancelling`/`disconnecting`) are
  * short-lived, carry their own owning IPC promise in `handlePowerClick`,
- * and must not be clobbered by a poll landing mid-transition. A poll
- * that arrives during a transition is a no-op for state purposes.
+ * and must not be clobbered by an observation landing mid-transition.
  *
- * Returns `{ state, changed }` where `changed` is true iff this poll
- * itself caused a state change (not including click-driven transitions
- * that were applied between polls). `main.ts` uses this to know when to
- * refresh the public IP. The click handler owns the `connecting →
- * connected` emission of `mark_validated_by_proxy_start`, so the poll
- * does not need to track previous state.
+ * Returns `{ state, changed }` where `changed` is true iff this
+ * observation itself caused a state change (not including click-driven
+ * transitions applied between observations). `main.ts` uses this to know
+ * when to refresh the public IP. The click handler owns the `connecting
+ * → connected` emission of `mark_validated_by_proxy_start`, so
+ * observations do not need to track previous state.
  */
-export function updateProxyStatus(status: ProxyStatus): { state: ConnectionState; changed: boolean } {
+export function applyProxyStateObservation(
+  seq: number,
+  running: boolean,
+): { state: ConnectionState; changed: boolean } {
+  if (seq <= lastAppliedSeq) {
+    return { state: currentState, changed: false };
+  }
+  lastAppliedSeq = seq;
   if (!IDLE_STATES.has(currentState)) {
     return { state: currentState, changed: false };
   }
-  const polled = stateForPolledRunning(!!status.running);
+  const polled = stateForPolledRunning(running);
   if (polled === currentState) {
     return { state: currentState, changed: false };
   }
   setState(polled);
   return { state: currentState, changed: true };
+}
+
+/** Update the connection state from a periodic proxy status poll. */
+export function updateProxyStatus(status: ProxyStatus): { state: ConnectionState; changed: boolean } {
+  return applyProxyStateObservation(status.state_seq, !!status.running);
 }
 
 /** Returns the current connection state. */

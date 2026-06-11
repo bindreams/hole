@@ -239,55 +239,67 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
     Ok(appended)
 }
 
+/// Poll the proxy's status. The exchange itself commits the observation
+/// to the `ProxyStateCell` (inside `BridgeLink::send`); the returned
+/// `running` + `state_seq` come from the committed cell so the frontend
+/// can apply observations monotonically (#462). The remaining fields are
+/// cosmetics from the raw response.
+///
+/// On `PermissionDenied` the cell is NOT committed (a DACL-gated Status
+/// says nothing about the tunnel), so `running` reports the last
+/// committed value while `error` carries the failure — stale truth beats
+/// flapping to false. Every other error arm commits false, so cell and
+/// cosmetics agree.
 #[tauri::command]
 pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    match state.bridge_send(BridgeRequest::Status).await {
+    let result = state.bridge_send(BridgeRequest::Status).await;
+    let snap = state.proxy_snapshot();
+    let mut json = match result {
         Ok(BridgeResponse::Status {
-            running,
+            running: _,
             uptime_secs,
             error,
             invalid_filters,
             udp_proxy_available,
             ipv6_bypass_available,
-        }) => Ok(serde_json::json!({
-            "running": running,
+        }) => serde_json::json!({
             "uptime_secs": uptime_secs,
             "error": error,
             "invalid_filters": invalid_filters,
             "udp_proxy_available": udp_proxy_available,
             "ipv6_bypass_available": ipv6_bypass_available,
-        })),
+        }),
         Ok(BridgeResponse::Error { message }) => {
             warn!(error = %message, "bridge returned error for status");
-            Ok(serde_json::json!({
-                "running": false,
+            serde_json::json!({
                 "uptime_secs": 0,
                 "error": message,
                 "invalid_filters": [],
                 "udp_proxy_available": true,
                 "ipv6_bypass_available": true,
-            }))
+            })
         }
-        Ok(_) => Ok(serde_json::json!({
-            "running": false,
+        Ok(_) => serde_json::json!({
             "uptime_secs": 0,
             "error": "unexpected response from bridge",
             "invalid_filters": [],
             "udp_proxy_available": true,
             "ipv6_bypass_available": true,
-        })),
+        }),
         Err(e) => {
             // Bridge not running or unreachable — not an error for the frontend
-            Ok(serde_json::json!({
-                "running": false,
+            serde_json::json!({
                 "uptime_secs": 0,
                 "error": format!("bridge unreachable: {e}"),
                 "invalid_filters": [],
                 "udp_proxy_available": true,
                 "ipv6_bypass_available": true,
-            }))
+            })
         }
-    }
+    };
+    json["running"] = serde_json::json!(snap.running);
+    json["state_seq"] = serde_json::json!(snap.seq);
+    Ok(json)
 }
 
 // Response mappers (extracted for testability) ========================================================================
@@ -529,13 +541,16 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
 
 /// Reload the proxy's filter rules from the current config. If the proxy
 /// is not running, this is a no-op (changes apply on next start).
+///
+/// The running check rides the same client-lock acquisition as the
+/// Reload (`BridgeLink::reload_if_running`), so it cannot go stale
+/// against a concurrent Start/Stop: a reload landing during an in-flight
+/// Start queues behind it and applies iff that Start succeeded, and a
+/// stopped proxy is never reloaded — bridge-side `reload` would START it.
 #[tauri::command]
 pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), String> {
     let config = {
         let app_config = state.config.lock().unwrap();
-        if !app_config.enabled {
-            return Ok(()); // Not running, changes apply on next start.
-        }
         build_proxy_config(&app_config)
     };
 
@@ -543,11 +558,7 @@ pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), Stri
         return Ok(()); // No server selected.
     };
 
-    state
-        .bridge_send(BridgeRequest::Reload { config: proxy_config })
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    state.link.reload_if_running(proxy_config).await.map(|_| ())
 }
 
 #[cfg(test)]
