@@ -15,8 +15,9 @@
 //!   then sleep forever itself; the intermediate parent never dials the
 //!   control listener; only the grandchild's `sleep` mode does — the accepted
 //!   connection is the GRANDCHILD's death-watch.
-//! - `fake-bridge` — stand-in bridge for supervisor tests (lands in Task 12
-//!   of #454).
+//! - `fake-bridge` — stand-in bridge for supervisor tests: speaks the
+//!   `--ready-notify` protocol (read `DEV_CONSOLE_READY_SPEC` as
+//!   `ADDR/TOKEN`, dial, echo the token) and then parks forever.
 
 use std::io::Write as _;
 use std::net::TcpStream;
@@ -29,7 +30,7 @@ pub fn maybe_run() {
     match mode.as_str() {
         "sleep" => run_sleep(),
         "spawn-grandchild" => run_spawn_grandchild(),
-        "fake-bridge" => panic!("fake-bridge lands in Task 12"),
+        "fake-bridge" => run_fake_bridge(),
         other => {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
@@ -54,6 +55,14 @@ fn park_forever() -> ! {
 
 fn run_sleep() -> ! {
     let _conn = control_conn();
+    park_forever()
+}
+
+fn run_fake_bridge() -> ! {
+    let spec = std::env::var("DEV_CONSOLE_READY_SPEC").expect("ready spec");
+    let (addr, token) = spec.rsplit_once('/').expect("ADDR/TOKEN");
+    let mut conn = TcpStream::connect(addr).expect("dial ready listener");
+    conn.write_all(format!("{token}\n").as_bytes()).expect("token");
     park_forever()
 }
 

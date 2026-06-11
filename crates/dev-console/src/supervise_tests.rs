@@ -1,0 +1,58 @@
+//! Integration seams: ready-rendezvous against a fake bridge child, and the
+//! teardown helper against a real grandchild tree. The REAL end-to-end
+//! (sudo, TUN, Vite, webview) is the manual smoke test in the PR checklist —
+//! it needs a password prompt and a real network stack.
+
+use crate::policy::ChildRole;
+use crate::supervise::teardown_grouped;
+use crate::test_child;
+
+use tokio::io::AsyncReadExt as _;
+use tokio::net::TcpListener;
+
+#[skuld::test]
+async fn fake_bridge_satisfies_ready_listener() {
+    let ready = crate::ready::ReadyListener::bind().await.unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.env(test_child::MODE_ENV, "fake-bridge");
+    cmd.env("DEV_CONSOLE_READY_SPEC", ready.notify_arg());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().unwrap();
+    ready.wait().await.expect("fake bridge echoes the token");
+    let _ = child.kill().await;
+}
+
+/// The spec's promised integration test: teardown reaps a grandchild tree.
+/// Control-channel death-watch pattern (see kill-group's tests): the
+/// GRANDCHILD holds the conn; EOF/RST proves the tree died.
+#[skuld::test]
+async fn teardown_reaps_grandchild_tree() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.env(test_child::MODE_ENV, "spawn-grandchild");
+    cmd.env(test_child::CONTROL_ENV, listener.local_addr().unwrap().to_string());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
+    let (mut conn, _) = listener.accept().await.unwrap();
+    let mut byte = [0u8; 1];
+    conn.read_exact(&mut byte).await.unwrap(); // grandchild readiness
+
+    teardown_grouped(&mut gc, ChildRole::Vite).await;
+
+    let mut buf = [0u8; 1];
+    match conn.read(&mut buf).await {
+        Ok(0) => {}
+        Ok(n) => panic!("grandchild sent {n} unexpected byte(s)"),
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "teardown must reap the grandchild tree; got: {e:?}"
+        ),
+    }
+}
