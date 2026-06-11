@@ -59,7 +59,7 @@ jobs:
       - name: Create local tag for build
         run: git tag "releases/hole/v${{ needs.validate.outputs.version }}"
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
         if: matrix.os == 'windows'
 
       - uses: ./.github/actions/setup-build
@@ -128,7 +128,7 @@ jobs:
           # `path: source` so we don't clobber the downloaded artifacts in $GITHUB_WORKSPACE.
           path: source
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v8.2.0
 
       - name: Generate per-track release notes
         run: |

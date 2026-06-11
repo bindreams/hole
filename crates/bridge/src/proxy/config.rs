@@ -57,12 +57,16 @@ pub enum ProxyError {
     /// unknown), preserved for `bridge.log` diagnostics.
     #[error("plugin bind conflict on {addr} (errno {errno})")]
     BindRace { errno: i32, addr: SocketAddr },
-    /// `tunnel_mode == Full` requires the SOCKS5 listener, because the
-    /// TUN dispatcher hands captured traffic to it on `local_port`.
-    #[error("tunnel_mode=full requires the SOCKS5 listener; enable proxy_socks5 or switch to tunnel_mode=socks-only")]
+    /// `tunnel_mode == Full` with the HTTP listener enabled requires the
+    /// user-facing SOCKS5 listener: the TUN data plane either rides the
+    /// user-facing SOCKS5 listener on `local_port`, or — when no
+    /// user-facing listener is requested at all (pure-VPN, #459) — an
+    /// internal one on an ephemeral port. A mixed user-facing-HTTP +
+    /// internal-SOCKS5 split is rejected.
+    #[error("tunnel_mode=full with proxy_http requires the SOCKS5 listener; enable proxy_socks5, or disable proxy_http for a pure-VPN start, or switch to tunnel_mode=socks-only")]
     TunnelRequiresSocks5,
-    /// Both `proxy_socks5` and `proxy_http` are false — there is
-    /// nothing to listen on.
+    /// SocksOnly mode with both `proxy_socks5` and `proxy_http` false —
+    /// there is nothing to listen on and no TUN to serve.
     #[error("no local listeners enabled: at least one of proxy_socks5 / proxy_http must be true")]
     NoListenersEnabled,
     /// Both listeners enabled with identical ports. Each listener needs
@@ -134,15 +138,28 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 /// * **HTTP CONNECT** (`proxy_http`): `127.0.0.1:{local_port_http}`,
 ///   always `TcpOnly` (HTTP CONNECT is TCP-only by RFC 7231 §4.3.6).
 ///
+/// # Pure-VPN starts (#459)
+///
+/// `Full && !proxy_socks5 && !proxy_http` is the pure-VPN configuration
+/// (the GUI's "Local proxy server" master toggle off): no user-facing
+/// listeners, but the TUN data plane still rides an SS SOCKS5 instance.
+/// The caller allocates an ephemeral loopback port (via
+/// `port_alloc::bind_ephemeral`) and passes it as `internal_socks5_port`;
+/// a single SOCKS5 instance is emitted there instead of `local_port`,
+/// so nothing is bound on the user-configured ports.
+/// `internal_socks5_port` must be `Some` exactly on that path — see the
+/// `debug_assert!`s.
+///
 /// # Validation
 ///
-/// Rejected configurations (returns `ProxyError`):
+/// Rejected configurations (returns `ProxyError`, see
+/// [`validate_proxy_config`]):
 ///
-/// 1. `tunnel_mode == Full && !proxy_socks5` — the TUN dispatcher needs
-///    the SOCKS5 listener to exist on `local_port`
+/// 1. `tunnel_mode == Full && !proxy_socks5 && proxy_http` — a mixed
+///    user-facing-HTTP + internal-SOCKS5 split
 ///    (`TunnelRequiresSocks5`).
-/// 2. `!proxy_socks5 && !proxy_http` — nothing to listen on
-///    (`NoListenersEnabled`).
+/// 2. `tunnel_mode == SocksOnly && !proxy_socks5 && !proxy_http` —
+///    nothing to listen on and no TUN to serve (`NoListenersEnabled`).
 /// 3. `proxy_socks5 && proxy_http && local_port == local_port_http` —
 ///    each listener needs its own port (`DuplicateListenerPort`).
 /// 4. Port `0` on an enabled listener (`InvalidListenerPort`).
@@ -157,19 +174,30 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 ///
 /// When `plugin_local` is `None`, the original server address is used as-is
 /// (no plugin, or plugin management is handled elsewhere).
-pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -> Result<Config, ProxyError> {
-    validate_listeners(config)?;
+pub fn build_ss_config(
+    config: &ProxyConfig,
+    plugin_local: Option<SocketAddr>,
+    internal_socks5_port: Option<u16>,
+) -> Result<Config, ProxyError> {
+    validate_proxy_config(config)?;
+
+    let full = config.tunnel_mode == hole_common::protocol::TunnelMode::Full;
+    // Contract with proxy_manager::start_inner: the internal port exists
+    // exactly when this is a Full-mode pure-VPN start. Production code
+    // structurally upholds this (start_inner's pure-VPN branch always
+    // passes Some); the asserts document the contract for future callers.
+    debug_assert!(
+        internal_socks5_port.is_none() || (full && !config.proxy_socks5),
+        "internal_socks5_port is only meaningful for a Full-mode pure-VPN start"
+    );
+    debug_assert!(
+        !full || config.proxy_socks5 || internal_socks5_port.is_some(),
+        "a Full-mode pure-VPN start must supply internal_socks5_port"
+    );
 
     let entry = &config.server;
 
-    // Validate plugin name (format check, not known-plugin check).
-    if let Some(ref p) = entry.plugin {
-        if !is_valid_plugin_name(p) {
-            return Err(ProxyError::InvalidPluginName(p.clone()));
-        }
-    }
-
-    // Parse cipher method
+    // Parse cipher method (validated by `validate_proxy_config` above).
     let method = entry
         .method
         .parse()
@@ -192,10 +220,17 @@ pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -
         .server
         .push(ServerInstanceConfig::with_server_config(server_config));
 
-    if config.proxy_socks5 {
+    // User-facing SOCKS5 listener, or — on a Full-mode pure-VPN start —
+    // the internal data-plane instance on the caller-allocated port.
+    let socks5_port = if config.proxy_socks5 {
+        Some(config.local_port)
+    } else {
+        internal_socks5_port
+    };
+    if let Some(port) = socks5_port {
         ss_config.local.push(build_local_instance(
             ProtocolType::Socks,
-            loopback(config.local_port),
+            loopback(port),
             Mode::TcpAndUdp,
         ));
     }
@@ -212,11 +247,40 @@ pub fn build_ss_config(config: &ProxyConfig, plugin_local: Option<SocketAddr>) -
     Ok(ss_config)
 }
 
+/// Typed, side-effect-free validation of everything [`build_ss_config`]
+/// checks: listener invariants, plugin-name format, cipher method.
+/// `proxy_manager::start_inner` runs this before the Full-mode preamble
+/// when the config can only be built later (pure-VPN: the internal
+/// SOCKS5 port arrives from `bind_ephemeral`), so rejects stay fast and
+/// typed.
+pub fn validate_proxy_config(config: &ProxyConfig) -> Result<(), ProxyError> {
+    validate_listeners(config)?;
+    if let Some(ref p) = config.server.plugin {
+        if !is_valid_plugin_name(p) {
+            return Err(ProxyError::InvalidPluginName(p.clone()));
+        }
+    }
+    config
+        .server
+        .method
+        .parse::<shadowsocks::crypto::CipherKind>()
+        .map_err(|_| ProxyError::InvalidMethod(config.server.method.clone()))?;
+    Ok(())
+}
+
 fn validate_listeners(config: &ProxyConfig) -> Result<(), ProxyError> {
-    if config.tunnel_mode == hole_common::protocol::TunnelMode::Full && !config.proxy_socks5 {
+    let full = config.tunnel_mode == hole_common::protocol::TunnelMode::Full;
+    // Full mode with NO user-facing listeners is the pure-VPN
+    // configuration (GUI "Local proxy server" master toggle off): the
+    // TUN data plane binds an internal SOCKS5 instance on an ephemeral
+    // port instead (proxy_manager::start_inner). The mixed split —
+    // user-facing HTTP with an internal SOCKS5 — is rejected: the fixed
+    // HTTP port must not live inside bind_ephemeral's unbounded retry
+    // loop (a genuine conflict on a fixed port must surface, not spin).
+    if full && !config.proxy_socks5 && config.proxy_http {
         return Err(ProxyError::TunnelRequiresSocks5);
     }
-    if !config.proxy_socks5 && !config.proxy_http {
+    if !full && !config.proxy_socks5 && !config.proxy_http {
         return Err(ProxyError::NoListenersEnabled);
     }
     if config.proxy_socks5 && config.local_port == 0 {

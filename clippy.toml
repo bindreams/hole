@@ -170,6 +170,19 @@ reason = "Non-atomic: pairing with `set_icon` flickers (per tauri docs) and `(fa
 path = "tray_icon::TrayIcon::set_icon_as_template"
 reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tauri-level form. Use `tauri::tray::TrayIcon::set_icon_with_as_template(icon, true)`. See bindreams/hole#469."
 
+# Tray menu rebuild ordering -------------------------------------------------------------------------------------------
+#
+# All tray menu commits must go through `tray::rebuild_tray_menu`, which
+# dispatches the whole rebuild (state reads included) to the main thread.
+# A raw `set_menu` from a worker thread reads state early and commits the
+# menu later through the event-loop queue, so a stale menu can overwrite a
+# newer one — the bindreams/hole#473 desync. The sanctioned commit point
+# inside `rebuild_tray_menu` carries a per-site `#[allow]`.
+
+[[disallowed-methods]]
+path = "tauri::tray::TrayIcon::set_menu"
+reason = "Menu commits must go through `tray::rebuild_tray_menu` so rebuilds stay ordered on the main thread and cannot commit stale state. The sanctioned commit site inside `rebuild_tray_menu` carries a per-site `#[allow]`. See bindreams/hole#473."
+
 # Config persistence — enforce the ConfigStore seam --------------------------------------------------------------------
 #
 # `ConfigStore` (crates/common/src/config_store.rs) quarantines a corrupt

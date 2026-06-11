@@ -4,6 +4,7 @@
 // the regular GUI functions appear unused to clippy.
 #![cfg_attr(test, allow(dead_code))]
 
+mod autostart;
 mod bridge_client;
 #[macro_use]
 mod cli_log;
@@ -46,6 +47,12 @@ fn main() {
         None => launch_gui(cli.show_dashboard),
     }
 }
+
+// Install the workspace test subscriber + panic hook. The dev-dep
+// is gated on cfg(test) because it isn't linked in non-test builds.
+// See `crates/test-observability/` and bindreams/hole#301.
+#[cfg(test)]
+hole_test_observability::register!();
 
 #[cfg(test)]
 fn main() {
@@ -153,21 +160,11 @@ fn launch_gui(show_dashboard: bool) {
             // support; this cleans those up after a few days). Non-
             // blocking; failures are logged at `warn` only.
             orphan_sweep::spawn_default();
-            hole::update::start_update_checker(app.handle().clone(), |app, info| {
-                // Rebuild tray menu to include the "Install Update" item.
-                if let Some(tray_icon) = app.tray_by_id("main") {
-                    let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
-                    match tray::build_tray_menu(app, Some(info), enabled) {
-                        Ok(menu) => {
-                            // Re-sync checkbox state from config before applying new menu.
-                            tray::sync_menu_state(app, &menu);
-                            tray_icon.set_menu(Some(menu)).ok();
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to rebuild tray menu with update");
-                        }
-                    }
-                }
+            hole::update::start_update_checker(app.handle().clone(), |app, _info| {
+                // Rebuild the tray menu to include the "Install Update" item.
+                // `UpdateState` is already populated when this fires; the
+                // rebuild reads the info from it on the main thread.
+                tray::rebuild_tray_menu(app);
             });
             Ok(())
         })

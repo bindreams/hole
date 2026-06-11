@@ -105,11 +105,22 @@ touching routes, system DNS, or the wintun adapter. Guarded by
 `LocalInstanceConfig`s and rejects three combinations up-front (surfaced as
 `BridgeResponse::Error`):
 
-1. `Full && !proxy_socks5` → `TunnelRequiresSocks5` (the TUN dispatcher hands
-   captured traffic to the SOCKS5 listener; without it Full-mode flows vanish).
-1. `!proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
+1. `Full && !proxy_socks5 && proxy_http` → `TunnelRequiresSocks5` (the TUN
+   data plane either rides the user-facing SOCKS5 listener, or — pure-VPN —
+   an internal one on an ephemeral port; a mixed user-facing-HTTP +
+   internal-SOCKS5 split is rejected so the fixed HTTP port never sits
+   inside `bind_ephemeral`'s unbounded retry loop).
+1. `SocksOnly && !proxy_socks5 && !proxy_http` → `NoListenersEnabled`.
 1. `proxy_socks5 && proxy_http && local_port == local_port_http` →
    `DuplicateListenerPort`.
+
+`Full && !proxy_socks5 && !proxy_http` is the **pure-VPN** configuration —
+what the GUI sends when the "Local proxy server" master toggle is off
+(`build_proxy_config` gates both flags on `proxy_server_enabled`, #459):
+`build_ss_config` emits a single SOCKS5 instance on a caller-supplied
+ephemeral loopback port (`proxy_manager::start_inner` allocates it via
+`port_alloc::bind_ephemeral`), the TUN dispatcher and DNS forwarder dial
+that port, and nothing is bound on `local_port` / `local_port_http`.
 
 The HTTP listener's `Mode` is always `TcpOnly` (HTTP CONNECT is TCP-only,
 RFC 7231 §4.3.6); the SOCKS5 listener's is always `TcpAndUdp`.
@@ -277,6 +288,19 @@ iterates registered `PanicDumpSource`s, then chains to the previous hook.
 the original message. Registration is RAII (`register` → guard). The dispatcher
 is installed at ctor time, so consumers just `register()`. Current consumer:
 `BridgeChildLogSource` dumps each live `DistHarness` child's `bridge.log` (#303).
+
+### Tray menu rebuild contract
+
+All tray menu commits go through `tray::rebuild_tray_menu`, which dispatches
+the whole rebuild — state reads included — to the main thread
+(`run_on_main_thread` executes inline when already there). A raw `set_menu`
+from a worker thread reads state early and commits the menu later through the
+event-loop queue, so a stale menu can overwrite a newer one (the #473 desync).
+Enforcement is in [`clippy.toml`](clippy.toml) (`TrayIcon::set_menu` is
+disallowed; the one commit point inside `rebuild_tray_menu` carries a per-site
+`#[allow]`). Corollary: `sync_menu_state` is main-thread-only — menu-item
+setters dispatch-and-block from any other thread, so calling it from a worker
+while holding a lock deadlocks the app.
 
 ## Workspace layout
 
@@ -590,10 +614,16 @@ not show toasts** (toasts are per-call-site so a tight loop can't flood the UI).
 user-visible failures with `showToast(message, kind)` from
 [`ui/toast.ts`](ui/toast.ts) (caps at 5 visible). **Errors containing filesystem
 paths or other PII must be redacted before reaching a toast** — the detail still
-lands in `gui.log`. The `config.save` path in
-[`commands.rs`](crates/hole/src/commands.rs) is canonical: the raw `io::Error`
-holds the config-file path (PII on Windows), so the toast string is generic and
-the path is recorded only in `gui.log`.
+lands in `gui.log`. Two mechanisms are sanctioned. **(1) A PII/content-free error
+type + `warn!` with the path to `gui.log`:** `ConfigError`
+([`config.rs`](crates/common/src/config.rs)) carries the failing operation and the
+OS error, never the path, and its `Parse` variant surfaces only a category plus
+line/column — never the raw `serde_json` message (which can echo a password).
+`save_config` ([`commands.rs`](crates/hole/src/commands.rs)) logs the path via
+`warn!` and shows the path-free message in the toast. **(2) A detail-free
+structured wire variant + `warn!`** when the detail itself could carry
+content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
+`CorruptedJson` (no fields) and logs the full error.
 
 ### Logging directives (HOLE_BRIDGE_LOG)
 

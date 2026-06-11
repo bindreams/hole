@@ -23,6 +23,9 @@ pub struct AppState {
     test_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+// Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
+// lives in `ConfigStore::load`; main.rs calls it and hands the results here.
+
 impl AppState {
     pub fn new(config_store: ConfigStore, config: AppConfig, app_handle: tauri::AppHandle) -> Self {
         Self {

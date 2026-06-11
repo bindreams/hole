@@ -9,12 +9,39 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("failed to read config: {0}")]
-    Read(#[from] std::io::Error),
-    #[error("failed to parse config: {0}")]
-    Parse(#[from] serde_json::Error),
+    #[error("failed to read config file: {source}")]
+    Read { source: std::io::Error },
+    // Carries only content-safe scalars (category + position), NOT the
+    // `serde_json::Error`: its `Display` echoes a fragment of the input near the
+    // error, which for a config can include a password (see config_tests.rs).
+    // Dropping the source makes a content leak structurally impossible (even via
+    // `Debug`), while classify() + line/column keep the message actionable.
+    #[error("failed to parse config file: {kind} (line {line}, column {column})")]
+    Parse {
+        kind: &'static str,
+        line: usize,
+        column: usize,
+    },
+    #[error("failed to serialize config: {source}")]
+    Serialize { source: serde_json::Error },
+    #[error("failed to create config directory: {source}")]
+    CreateDir { source: std::io::Error },
+    #[error("failed to write config file: {source}")]
+    Write { source: std::io::Error },
     #[error("config saving is disabled: the corrupt config file could not be backed up at startup")]
     SaveBlocked,
+}
+
+/// Content-safe label for a `serde_json` parse failure (never echoes the input).
+/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant.
+pub(crate) fn parse_kind(e: &serde_json::Error) -> &'static str {
+    use serde_json::error::Category;
+    match e.classify() {
+        Category::Io => "I/O error",
+        Category::Syntax => "syntax error",
+        Category::Data => "data error",
+        Category::Eof => "unexpected end of input",
+    }
 }
 
 // Types ===============================================================================================================
@@ -137,6 +164,13 @@ pub struct AppConfig {
     pub start_on_login: bool,
     pub on_startup: StartupBehavior,
     pub theme: Theme,
+    /// Master switch for the user-facing local proxy listeners
+    /// ("Local proxy server" in settings). When false,
+    /// `build_proxy_config` zeroes `proxy_socks5` / `proxy_http` in the
+    /// outgoing `ProxyConfig` and the bridge runs a pure-VPN start: the
+    /// TUN data plane binds an internal ephemeral SOCKS5 instance and
+    /// nothing listens on `local_port` / `local_port_http`. The nested
+    /// toggles keep their persisted values for re-enable.
     pub proxy_server_enabled: bool,
     pub proxy_socks5: bool,
     pub proxy_http: bool,
@@ -269,61 +303,54 @@ impl AppConfig {
     // Loading lives in `ConfigStore::load` (crate::config_store) — it
     // quarantines corrupt files instead of returning an error to discard.
 
-    /// Serialize and write atomically: write a sibling temp file, then rename
-    /// it over `path`. A crash mid-write leaves the old config intact — a
-    /// truncate-in-place write here is how #467 corruption happened.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        let json = serde_json::to_string_pretty(self)?;
-        // Dot-prefixed so it can't collide with the `config.json.*.bak`
-        // quarantine namespace; a stale one (crash between write and rename)
-        // is overwritten by the next save and never loaded.
-        let tmp = path.with_file_name(".config.json.tmp");
+        use std::io::Write;
 
-        #[cfg(target_os = "macos")]
-        {
-            use std::fs::{DirBuilder, OpenOptions, Permissions};
-            use std::io::Write;
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let json = serde_json::to_string_pretty(self).map_err(|source| ConfigError::Serialize { source })?;
 
-            // Only the leaf directory (e.g. `hole/`) is created by us — ancestor directories
-            // like `~/Library/Application Support/` are system-managed and already exist.
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
-                std::fs::set_permissions(parent, Permissions::from_mode(0o700))?;
+        // The directory that will hold the config — and the atomic-rename temp.
+        // The rename is only atomic within one filesystem, so the temp must be
+        // created in this same directory.
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = dir {
+            ensure_config_dir(parent)?;
+        }
+        let temp_dir = dir.unwrap_or_else(|| Path::new("."));
+
+        // Atomic write: a fresh temp file in the target directory, fully written
+        // and synced, then renamed over the target. A crash or partial write can
+        // never leave a truncated/corrupt config in place.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".config")
+            .suffix(".tmp")
+            .tempfile_in(temp_dir)
+            .map_err(|source| ConfigError::Write { source })?;
+        tmp.write_all(json.as_bytes())
+            .map_err(|source| ConfigError::Write { source })?;
+        // tempfile creates the temp 0600 on unix (O_EXCL + restrictive mode), and
+        // rename preserves the mode — so the persisted config keeps its plaintext
+        // passwords at 0600, never the umask-default 0644. The 0600 invariant is
+        // guarded by `save_creates_file_with_owner_only_permissions`.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|source| ConfigError::Write { source })?;
+        // persist() renames the temp over `path`. rename does NOT follow a target
+        // symlink (it replaces the link itself), so there is no target-symlink
+        // TOCTOU; the temp's random O_EXCL name in the 0700 dir is unguessable.
+        tmp.persist(path).map_err(|e| ConfigError::Write { source: e.error })?;
+
+        // Best-effort: fsync the directory so the rename is durable across power
+        // loss. The atomic property (no truncated/partial config is ever visible)
+        // already holds without this; only crash-durability of the *rename* needs
+        // it, and a failure here must not fail an otherwise-successful save. Unix
+        // only — Windows has no portable directory fsync.
+        #[cfg(unix)]
+        if let Some(parent) = dir {
+            if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
+                tracing::warn!(error = %e, "could not fsync config directory; rename may not survive power loss");
             }
-            // Restrict config file permissions on macOS — the config contains plaintext
-            // passwords and must not be world-readable (default umask 0022 yields 0644).
-            // The temp file carries the mode; rename preserves it.
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.set_permissions(Permissions::from_mode(0o600))?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
         }
 
-        #[cfg(target_os = "windows")]
-        {
-            use std::io::Write;
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = (json, &tmp);
-            compile_error!("save() is not implemented for this platform");
-        }
-
-        // Atomic replace on both platforms (Windows: MOVEFILE_REPLACE_EXISTING).
-        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -331,6 +358,41 @@ impl AppConfig {
         let id = self.selected_server.as_ref()?;
         self.servers.iter().find(|s| &s.id == id)
     }
+}
+
+/// Create the config's leaf directory (e.g. `hole/`). Ancestors like
+/// `~/Library/Application Support/` are system-managed and already exist.
+#[cfg(target_os = "macos")]
+fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
+    use std::fs::{DirBuilder, Permissions};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|source| ConfigError::CreateDir { source })?;
+    // Best-effort hardening of a *pre-existing* directory. The 0600 config file
+    // is the load-bearing protection for its plaintext passwords; a directory we
+    // don't own (e.g. left root-owned by an earlier privileged run) can't be
+    // chmod'd by us, but that must not abort the save — if the directory is
+    // genuinely unwritable the temp-file create fails with an accurate write
+    // error instead of a spurious permission error here.
+    if let Err(source) = std::fs::set_permissions(parent, Permissions::from_mode(0o700)) {
+        tracing::warn!(error = %source, dir = %parent.display(),
+            "could not tighten config directory permissions; continuing");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
+    std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir { source })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn ensure_config_dir(_parent: &Path) -> Result<(), ConfigError> {
+    compile_error!("save() is not implemented for this platform");
 }
 
 #[cfg(test)]

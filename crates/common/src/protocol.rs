@@ -140,11 +140,14 @@ pub struct ProxyConfig {
     /// the forwarder on upgrade.
     #[serde(default)]
     pub dns: crate::config::DnsConfig,
-    /// Whether to bind a SOCKS5 listener on `127.0.0.1:{local_port}`.
-    /// Defaults to `true` so older clients that omit the field keep their
-    /// existing behaviour. Required when `tunnel_mode == Full` (the TUN
-    /// dispatcher in `hole_bridge::dispatcher` hands captured traffic to
-    /// this listener).
+    /// Whether to bind a user-facing SOCKS5 listener on
+    /// `127.0.0.1:{local_port}`. Defaults to `true` so older clients that
+    /// omit the field keep their existing behaviour. In
+    /// `tunnel_mode == Full`, `false` is only valid together with
+    /// `proxy_http == false` — the pure-VPN start (#459), where the TUN
+    /// data plane binds an internal SOCKS5 instance on an ephemeral
+    /// loopback port and nothing listens on `local_port`; `false` with
+    /// `proxy_http == true` is rejected (`TunnelRequiresSocks5`).
     #[serde(default = "proxy_config_defaults::proxy_socks5")]
     pub proxy_socks5: bool,
     /// Whether to bind an HTTP CONNECT listener on

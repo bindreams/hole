@@ -49,7 +49,13 @@ impl ConfigStore {
                     let backup = quarantine(&path, Some(&contents), now);
                     let recovery = ConfigRecovery {
                         path: path.clone(),
-                        error: e.into(),
+                        // Same leak-safe shape as `parse_kind`'s rationale: never
+                        // carry the serde error (its Display echoes config content).
+                        error: ConfigError::Parse {
+                            kind: crate::config::parse_kind(&e),
+                            line: e.line(),
+                            column: e.column(),
+                        },
                         backup,
                     };
                     (AppConfig::default(), Some(recovery))
@@ -60,7 +66,7 @@ impl ConfigStore {
                 let backup = quarantine(&path, None, now);
                 let recovery = ConfigRecovery {
                     path: path.clone(),
-                    error: ConfigError::Read(e),
+                    error: ConfigError::Read { source: e },
                     backup,
                 };
                 (AppConfig::default(), Some(recovery))

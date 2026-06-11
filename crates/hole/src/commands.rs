@@ -49,9 +49,10 @@ pub enum ImportFailure {
     /// show — it never echoes file content (covered by tests in
     /// `import_tests.rs` and `commands_tests.rs`).
     InvalidValue { detail: String },
-    /// Config save to disk failed. No detail — the underlying
-    /// `io::Error` Display includes the config-file path (PII on
-    /// Windows). The full detail lands in `gui.log` via `warn!`.
+    /// Config save to disk failed. The wire form stays detail-free on
+    /// purpose; the full `ConfigError` (whose Display is path- and
+    /// content-free) plus the config path is recorded in `gui.log` via
+    /// `warn!`.
     SaveFailed,
 }
 
@@ -95,7 +96,10 @@ pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), 
     // The frontend doesn't know about elevation_prompt_shown — preserve the
     // in-memory value so a save from the Settings UI doesn't reset it.
     config.elevation_prompt_shown = current.elevation_prompt_shown;
-    state.config_store.save(&config).map_err(|e| e.to_string())?;
+    state.config_store.save(&config).map_err(|e| {
+        warn!(error = %e, path = %state.config_store.path().display(), "save_config: config save failed");
+        e.to_string()
+    })?;
     *current = config;
     Ok(())
 }
@@ -213,9 +217,9 @@ fn auto_select_first_server(config: &mut AppConfig) {
 ///
 /// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
 /// emits `warn!` on validate/parse failure and on config-save failure. The
-/// save-failure path returns `ImportFailure::SaveFailed` (no detail in
-/// the wire form) because the underlying `io::Error` includes the
-/// config-file path (PII on Windows); the full detail still lands in
+/// save-failure path returns `ImportFailure::SaveFailed` (no detail in the
+/// wire form) — the structured wire variant is deliberately detail-free; the
+/// full `ConfigError` (path- and content-free) plus the config path land in
 /// `gui.log` via `warn!`.
 #[tauri::command]
 pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, ImportFailure> {
@@ -228,7 +232,7 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
     let (appended, _deduped) = apply_import(&mut config, parsed);
 
     state.config_store.save(&config).map_err(|e| {
-        warn!(error = %e, "import_servers_from_file: config save failed");
+        warn!(error = %e, path = %state.config_store.path().display(), "import_servers_from_file: config save failed");
         ImportFailure::SaveFailed
     })?;
 
@@ -408,7 +412,10 @@ pub async fn test_server(state: State<'_, AppState>, entry_id: String) -> Result
                 tested_at: OffsetDateTime::now_utc(),
                 outcome: outcome.clone(),
             });
-            state.config_store.save(&cfg).map_err(|e| e.to_string())?;
+            state.config_store.save(&cfg).map_err(|e| {
+                warn!(error = %e, path = %state.config_store.path().display(), "test_server: persist validation failed");
+                e.to_string()
+            })?;
         }
     }
 
@@ -456,7 +463,10 @@ pub fn mark_validated_by_proxy_start(state: State<AppState>, entry_id: String) -
                 },
             });
         }
-        state.config_store.save(&cfg).map_err(|e| e.to_string())?;
+        state.config_store.save(&cfg).map_err(|e| {
+            warn!(error = %e, path = %state.config_store.path().display(), "mark_validated_by_proxy_start: persist failed");
+            e.to_string()
+        })?;
     }
     Ok(())
 }
@@ -494,6 +504,13 @@ pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Val
 ///
 /// Always requests [`TunnelMode::Full`]; `TunnelMode::SocksOnly` is reachable
 /// via `hole proxy start --tunnel-mode socks-only` and direct IPC.
+///
+/// The "Local proxy server" master toggle (`proxy_server_enabled`) gates
+/// both listener flags: with it off, the bridge receives
+/// `proxy_socks5 = proxy_http = false` and runs a pure-VPN start — the
+/// TUN data plane binds an internal ephemeral SOCKS5 instance and
+/// nothing listens on `local_port` / `local_port_http` (#459). The
+/// nested toggles keep their persisted values for re-enable.
 pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
     let selected_id = config.selected_server.as_ref()?;
     let entry = config.servers.iter().find(|s| &s.id == selected_id)?;
@@ -503,8 +520,8 @@ pub fn build_proxy_config(config: &AppConfig) -> Option<ProxyConfig> {
         tunnel_mode: hole_common::protocol::TunnelMode::Full,
         filters: config.filters.clone(),
         dns: config.dns.clone(),
-        proxy_socks5: config.proxy_socks5,
-        proxy_http: config.proxy_http,
+        proxy_socks5: config.proxy_socks5 && config.proxy_server_enabled,
+        proxy_http: config.proxy_http && config.proxy_server_enabled,
         local_port_http: config.local_port_http,
         diagnostic_plugin_tap: config.diagnostic_plugin_tap,
     })

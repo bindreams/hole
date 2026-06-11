@@ -353,12 +353,15 @@ components:
       description: |
         Hand-written in protocol.rs — included here for spec completeness.
 
-        At least one of `proxy_socks5` / `proxy_http` must be true. When
-        `tunnel_mode == full`, `proxy_socks5` must be true (the TUN
-        dispatcher hands captured traffic to the SOCKS5 listener on
-        `local_port`). If both listeners are enabled, `local_port` and
-        `local_port_http` must differ. Any violation makes the bridge
-        reject `BridgeRequest::Start` with `BridgeResponse::Error`.
+        Listener rules: in `tunnel_mode == full`, disabling `proxy_socks5`
+        requires `proxy_http` to be disabled too — that combination is a
+        valid "pure-VPN" start where the bridge binds its internal SOCKS5
+        data plane on an ephemeral loopback port and nothing listens on
+        `local_port` / `local_port_http`. In `tunnel_mode == socks-only`,
+        at least one of `proxy_socks5` / `proxy_http` must be true. If
+        both listeners are enabled, `local_port` and `local_port_http`
+        must differ. Any violation makes the bridge reject
+        `BridgeRequest::Start` with `BridgeResponse::Error`.
       required:
         - server
         - local_port
@@ -378,8 +381,9 @@ components:
           type: boolean
           default: true
           description: |
-            Whether to bind a SOCKS5 listener on 127.0.0.1:{local_port}.
-            Must be true when tunnel_mode == full.
+            Whether to bind a user-facing SOCKS5 listener on
+            127.0.0.1:{local_port}. In tunnel_mode == full, false is only
+            valid together with proxy_http == false (pure-VPN start).
         proxy_http:
           type: boolean
           default: false

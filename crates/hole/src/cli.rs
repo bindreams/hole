@@ -61,9 +61,11 @@ pub(crate) enum ProxyAction {
         /// `--local-port` when both listeners are enabled.
         #[arg(long, default_value_t = 4074)]
         local_port_http: u16,
-        /// Disable the SOCKS5 listener (default: enabled). Incompatible
-        /// with `--tunnel-mode full`, since the TUN dispatcher hands
-        /// captured traffic to the SOCKS5 listener.
+        /// Disable the user-facing SOCKS5 listener (default: enabled).
+        /// With `--tunnel-mode full` this requires `--http` to be off
+        /// too (a pure-VPN start: the TUN data plane binds an internal
+        /// SOCKS5 listener on an ephemeral port; nothing listens on
+        /// `--local-port`).
         #[arg(long)]
         no_socks5: bool,
         /// Enable the HTTP CONNECT listener (default: disabled). HTTP

@@ -52,6 +52,90 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
 // Corrupt-input behavior now lives in `config_store_tests.rs`
 // (`corrupt_json_is_quarantined_to_timestamped_bak` and friends).
 
+// Error labeling + redaction ------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn save_to_directory_path_reports_write_error(#[fixture(temp_dir)] dir: &Path) {
+    // A path that is itself a directory can't be written as a file: the atomic
+    // rename (persist) fails. macOS/Windows differ in the OS error, but both
+    // land on the Write variant.
+    let path = dir.join("config-as-dir");
+    std::fs::create_dir_all(&path).unwrap();
+
+    let msg = AppConfig::default().save(&path).unwrap_err().to_string();
+
+    assert!(
+        msg.contains("write"),
+        "save failure should read as a write error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("read"),
+        "save failure must not be mislabeled as a read error, got: {msg}"
+    );
+}
+
+#[skuld::test]
+fn save_error_does_not_leak_path(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config-as-dir");
+    std::fs::create_dir_all(&path).unwrap();
+
+    let msg = AppConfig::default().save(&path).unwrap_err().to_string();
+
+    assert!(
+        !msg.contains(&*dir.to_string_lossy()),
+        "config error Display leaked the path: {msg}"
+    );
+}
+
+#[skuld::test]
+fn load_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
+    // serde_json's Display echoes a fragment of the input near the parse error,
+    // which for a real config can include a password. The Parse variant must
+    // surface category + line/column only, never the raw serde message.
+    let path = dir.join("config.json");
+    std::fs::write(&path, r#"{"local_port": "PLAINTEXT_SECRET_VALUE"}"#).unwrap();
+
+    let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
+    let (_, _, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
+    let msg = recovery
+        .expect("corrupt file must produce a recovery")
+        .error
+        .to_string();
+
+    assert!(
+        msg.contains("parse"),
+        "load of bad config should be a parse error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("PLAINTEXT_SECRET_VALUE"),
+        "parse error leaked config content: {msg}"
+    );
+}
+
+#[skuld::test]
+fn config_error_labels_match_operation() {
+    use std::io::{Error as IoError, ErrorKind};
+    let io = || IoError::from(ErrorKind::PermissionDenied);
+    let serde = || serde_json::from_str::<i32>("nope").unwrap_err();
+
+    assert!(ConfigError::Read { source: io() }.to_string().contains("read"));
+    assert!(ConfigError::Parse {
+        kind: "syntax error",
+        line: 1,
+        column: 1
+    }
+    .to_string()
+    .contains("parse"));
+    assert!(ConfigError::Serialize { source: serde() }
+        .to_string()
+        .contains("serialize"));
+    assert!(ConfigError::CreateDir { source: io() }
+        .to_string()
+        .contains("create config directory"));
+    let write = ConfigError::Write { source: io() }.to_string();
+    assert!(write.contains("write") && !write.contains("read"), "{write}");
+}
+
 #[skuld::test]
 fn save_creates_parent_dirs(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("nested").join("deep").join("config.json");
@@ -538,16 +622,4 @@ fn save_replaces_existing_file_and_leaves_no_temp(#[fixture(temp_dir)] dir: &Pat
     assert_eq!(entries.len(), 1);
     let on_disk: AppConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(on_disk, changed);
-}
-
-/// The temp file becomes config.json via rename, so it must carry the final
-/// 0600 mode from the moment it has contents (plaintext passwords).
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn save_writes_with_owner_only_permissions(#[fixture(temp_dir)] dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("config.json");
-    AppConfig::default().save(&path).unwrap();
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
 }

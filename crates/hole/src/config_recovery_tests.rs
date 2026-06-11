@@ -5,7 +5,9 @@ use std::path::PathBuf;
 fn recovery(backup: Result<PathBuf, std::io::Error>) -> ConfigRecovery {
     ConfigRecovery {
         path: PathBuf::from("/cfg/config.json"),
-        error: ConfigError::Read(std::io::Error::other("boom")),
+        error: ConfigError::Read {
+            source: std::io::Error::other("boom"),
+        },
         backup,
     }
 }

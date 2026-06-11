@@ -63,7 +63,7 @@ fn corrupt_json_is_quarantined_to_timestamped_bak(#[fixture(temp_dir)] dir: &Pat
 
     assert_eq!(config, AppConfig::default());
     let recovery = recovery.expect("corrupt file must produce a recovery");
-    assert!(matches!(recovery.error, ConfigError::Parse(_)));
+    assert!(matches!(recovery.error, ConfigError::Parse { .. }));
     assert_eq!(recovery.path, path);
 
     let bak = recovery.backup.expect("backup must succeed");
@@ -83,7 +83,7 @@ fn empty_file_is_quarantined(#[fixture(temp_dir)] dir: &Path) {
 
     assert_eq!(config, AppConfig::default());
     let recovery = recovery.expect("empty file must produce a recovery");
-    assert!(matches!(recovery.error, ConfigError::Parse(_)));
+    assert!(matches!(recovery.error, ConfigError::Parse { .. }));
     assert!(recovery.backup.is_ok());
     assert!(!path.exists());
 }
@@ -167,7 +167,7 @@ fn unreadable_file_is_quarantined_via_rename(#[fixture(temp_dir)] dir: &Path) {
 
     assert_eq!(config, AppConfig::default());
     let recovery = recovery.expect("unreadable file must produce a recovery");
-    assert!(matches!(recovery.error, ConfigError::Read(_)));
+    assert!(matches!(recovery.error, ConfigError::Read { .. }));
     let bak = recovery.backup.expect("rename does not need read permission");
     assert!(!path.exists());
 
@@ -213,9 +213,12 @@ fn rename_refused_falls_back_to_copying_contents(#[fixture(temp_dir)] dir: &Path
     // on next start — safe, the contents are already backed up).
     assert!(path.exists());
 
-    // Backup succeeded → the store allows saving; the OS then refuses to open
-    // the uchg file for write, deterministically (EPERM → ConfigError::Read).
-    assert!(matches!(store.save(&AppConfig::default()), Err(ConfigError::Read(_))));
+    // Backup succeeded → the store allows saving; the OS then refuses the
+    // atomic rename onto the uchg file, deterministically (EPERM → Write).
+    assert!(matches!(
+        store.save(&AppConfig::default()),
+        Err(ConfigError::Write { .. })
+    ));
 }
 
 /// Windows shape of the same fallback: a file held open without
