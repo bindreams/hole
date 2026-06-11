@@ -100,6 +100,14 @@ pass_filenames = false
 files = "^(Cargo\\.toml|crates/galoshes/Cargo\\.toml)$"
 
 [[repos.hooks]]
+id = "check-version-kill-group"
+name = "check kill-group group Cargo.toml version vs git tag"
+entry = "cargo xtask version --check --group kill-group"
+language = "system"
+pass_filenames = false
+files = "^(Cargo\\.toml|crates/kill-group/Cargo\\.toml)$"
+
+[[repos.hooks]]
 id = "check-version-ex-ray"
 name = "check ex-ray version vs git tag"
 entry = "cargo xtask version --check --group ex-ray"
