@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 /// so the test can assert listeners are registered before the first
 /// config fetch (the point where the UI becomes interactive).
 const callOrder: string[] = [];
-const invokeMock = vi.fn((cmd: string, _args?: unknown) => {
+const defaultInvokeImpl = (cmd: string, _args?: unknown) => {
   callOrder.push(`invoke:${cmd}`);
   if (cmd === "get_config") return Promise.resolve({ servers: [], filters: [] });
   if (cmd === "get_proxy_status") return Promise.resolve({ running: false });
@@ -12,7 +12,8 @@ const invokeMock = vi.fn((cmd: string, _args?: unknown) => {
     return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
   if (cmd === "get_diagnostics") return Promise.resolve({});
   return Promise.resolve(null);
-});
+};
+const invokeMock = vi.fn(defaultInvokeImpl);
 const listenMock = vi.fn((event: string, _handler?: unknown) => {
   callOrder.push(`listen:${event}`);
   return Promise.resolve(() => {});
@@ -50,9 +51,11 @@ vi.mock("./toast", () => ({ showToast: vi.fn() }));
 
 beforeEach(() => {
   callOrder.length = 0;
-  // Clear call logs (not implementations) so per-test assertions don't
-  // match a previous test's invocations.
-  invokeMock.mockClear();
+  // Reset to the default implementation (a test may substitute its own)
+  // and clear call logs so per-test assertions don't match a previous
+  // test's invocations.
+  invokeMock.mockReset();
+  invokeMock.mockImplementation(defaultInvokeImpl);
   listenMock.mockClear();
   // init() starts real polling intervals; stub so they don't keep
   // firing in the worker after the test completes.
@@ -71,6 +74,71 @@ describe("init ordering", () => {
       const idx = callOrder.indexOf(`listen:${ev}`);
       expect(idx, `listener ${ev} must be registered before get_config`).toBeGreaterThan(-1);
       expect(idx).toBeLessThan(firstConfig);
+    }
+  });
+
+  it("sends only UI-owned keys and strips server validation on save", async () => {
+    invokeMock.mockImplementation((cmd: string, _args?: unknown) => {
+      callOrder.push(`invoke:${cmd}`);
+      if (cmd === "get_config")
+        return Promise.resolve({
+          servers: [
+            {
+              id: "a",
+              name: "A",
+              server: "1.2.3.4",
+              server_port: 8388,
+              method: "aes-256-gcm",
+              password: "pw",
+              validation: { tested_at: "2026-01-01T00:00:00Z", outcome: { kind: "reachable", latency_ms: 5 } },
+            },
+          ],
+          selected_server: "a",
+          filters: [],
+          local_port: 4073,
+          local_port_http: 4074,
+          start_on_login: false,
+          proxy_server_enabled: true,
+          proxy_socks5: true,
+          proxy_http: false,
+          on_startup: "restore_last_state",
+          theme: "dark",
+          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+          diagnostic_plugin_tap: false,
+          // Backend-owned fields present in the snapshot — must NOT round-trip.
+          enabled: true,
+          elevation_prompt_shown: true,
+        });
+      if (cmd === "get_proxy_status") return Promise.resolve({ running: false });
+      if (cmd === "get_metrics")
+        return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
+      if (cmd === "get_diagnostics") return Promise.resolve({});
+      return Promise.resolve(null);
+    });
+    const { initDone, saveConfig } = await import("./main");
+    await initDone;
+    await saveConfig();
+
+    const call = invokeMock.mock.calls.find(([cmd]) => cmd === "save_config");
+    expect(call).toBeDefined();
+    const { settings } = call![1] as { settings: Record<string, unknown> };
+    expect(Object.keys(settings).sort()).toEqual([
+      "diagnostic_plugin_tap",
+      "dns",
+      "filters",
+      "local_port",
+      "local_port_http",
+      "on_startup",
+      "proxy_http",
+      "proxy_server_enabled",
+      "proxy_socks5",
+      "selected_server",
+      "servers",
+      "start_on_login",
+      "theme",
+    ]);
+    for (const s of settings.servers as Record<string, unknown>[]) {
+      expect(s).not.toHaveProperty("validation");
     }
   });
 

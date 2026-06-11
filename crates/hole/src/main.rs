@@ -20,6 +20,7 @@ mod setup;
 mod state;
 mod tray;
 mod ui_ready;
+mod ui_settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

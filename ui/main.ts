@@ -21,7 +21,7 @@ import {
 import { initSettings, renderSettings } from "./settings";
 import { initSidebar, updateDiagnostics, updateMetrics, updateProxyStatus, updatePublicIp } from "./sidebar";
 import { showToast } from "./toast";
-import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server } from "./types";
+import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server, UiSettings } from "./types";
 
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
 /// after a JSON import). 50 concurrent plugin processes is non-trivial
@@ -68,11 +68,41 @@ export async function loadConfig() {
   }
 }
 
-/** Save the current config to the backend. */
+/// Strip backend-owned fields before persisting: the wire type rejects
+/// unknown keys, so sending `validation` (or any future backend-owned
+/// field) fails loudly instead of silently clobbering. See #462.
+function toUiSettings(c: Config): UiSettings {
+  return {
+    servers: c.servers.map(({ id, name, server, server_port, method, password, plugin, plugin_opts }) => ({
+      id,
+      name,
+      server,
+      server_port,
+      method,
+      password,
+      plugin,
+      plugin_opts,
+    })),
+    selected_server: c.selected_server,
+    local_port: c.local_port,
+    filters: c.filters,
+    start_on_login: c.start_on_login,
+    on_startup: c.on_startup,
+    theme: c.theme,
+    proxy_server_enabled: c.proxy_server_enabled,
+    proxy_socks5: c.proxy_socks5,
+    proxy_http: c.proxy_http,
+    dns: c.dns,
+    local_port_http: c.local_port_http,
+    diagnostic_plugin_tap: c.diagnostic_plugin_tap,
+  };
+}
+
+/** Save the current config's UI-owned settings to the backend. */
 export async function saveConfig() {
   if (!config) return;
   try {
-    await invoke("save_config", { config });
+    await invoke("save_config", { settings: toUiSettings(config) });
     dirty = false;
   } catch (err) {
     console.error("saveConfig failed:", err);
