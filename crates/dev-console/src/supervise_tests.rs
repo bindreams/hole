@@ -43,6 +43,15 @@ async fn teardown_reaps_grandchild_tree() {
 
     teardown_grouped(&mut gc, ChildRole::Vite).await;
 
+    // Production parity: the supervise funnel drops the child slots right
+    // after shutdown, and GroupedChild::Drop's tree reap (job kill / group
+    // SIGKILL) is the backstop for tree members the graceful phase cannot
+    // reach — on Windows CTRL_BREAK stops at console-group boundaries, so a
+    // grandchild in its own console group (this harness's deliberate #197
+    // mirror) dies only here. The contract under test is "teardown + drop
+    // leaves no survivors", matching the real funnel order.
+    drop(gc);
+
     let mut buf = [0u8; 1];
     match conn.read(&mut buf).await {
         Ok(0) => {}
