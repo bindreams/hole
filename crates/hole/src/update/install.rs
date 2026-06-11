@@ -103,31 +103,6 @@ pub(crate) fn msiexec_argv(path: &Path, quiet: bool) -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn run_installer(path: &Path, quiet: bool) -> Result<(), UpdateError> {
-    let args = msiexec_args(path, quiet);
-    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    if quiet {
-        // Quiet mode skips UAC, so we must elevate explicitly.
-        match crate::setup::run_elevated(Path::new("msiexec"), &args_ref) {
-            Ok(()) => {}
-            Err(crate::setup::SetupError::ExitCode { code, .. }) => {
-                return Err(UpdateError::InstallerFailed(code));
-            }
-            Err(e) => return Err(UpdateError::Io(std::io::Error::other(e.to_string()))),
-        }
-    } else {
-        // Interactive mode: msiexec shows its own UAC prompt.
-        let status = std::process::Command::new("msiexec").args(&args_ref).status()?;
-        if !status.success() {
-            return Err(UpdateError::InstallerFailed(status.code().unwrap_or(-1)));
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
 pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
     let path_str = path.to_string_lossy().to_string();
     let mut args = vec!["/i".to_string(), path_str.clone()];
@@ -156,13 +131,13 @@ pub fn install_for_exit(
     dmg_path: &Path,
     _mode: InstallMode,
 ) -> Result<(), UpdateError> {
-    let result = run_installer(dmg_path, false);
+    let result = run_installer(dmg_path);
     drop(download_dir);
     result
 }
 
 #[cfg(target_os = "macos")]
-pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {
+pub(crate) fn run_installer(path: &Path) -> Result<(), UpdateError> {
     let mount_dir = tempfile::TempDir::with_prefix("hole-dmg-mount-")?;
 
     // Mount the DMG. Use `.output()` (not `.status()`) so a mount failure's

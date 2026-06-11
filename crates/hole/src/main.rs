@@ -13,6 +13,8 @@ mod commands;
 mod elevation;
 mod log_collector;
 mod logging;
+#[cfg(target_os = "windows")]
+mod markers;
 mod orphan_sweep;
 mod path_management;
 mod platform;
@@ -72,6 +74,19 @@ fn launch_gui(show_dashboard: bool) {
     // GUI startup is synchronous and pre-event-loop, so sweep inline (no
     // spawn_blocking — there is no runtime worker to protect yet).
     tombstone::sweep(&log_dir);
+
+    // Hold the gui-alive marker so `hole upgrade` refuses while we run
+    // (#468). Held until process exit; the kernel releases it even on a
+    // crash. Standard users can create Global mutexes, so failure here is
+    // resource exhaustion — launching degraded beats not launching.
+    #[cfg(target_os = "windows")]
+    let _gui_alive = match markers::hold(markers::GUI_ALIVE) {
+        Ok((m, _)) => Some(m),
+        Err(e) => {
+            tracing::error!("could not create gui-alive marker: {e}");
+            None
+        }
+    };
 
     tauri::Builder::default()
         // `UiReady` is registered on the builder (not in `.setup`) so

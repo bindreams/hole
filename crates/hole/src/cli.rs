@@ -283,6 +283,32 @@ pub(crate) fn dispatch(command: Command) -> ! {
 }
 
 fn handle_upgrade() -> i32 {
+    // A second upgrade or a running GUI would re-trigger the FilesInUse
+    // defect (#468): the MSI can stop the bridge service via the Restart
+    // Manager, but not a windowless tray app. Refuse up front. The mutex
+    // hold is atomic; the actual msiexec run is serialized system-wide by
+    // Windows Installer itself (_MSIExecute -> 1618).
+    #[cfg(target_os = "windows")]
+    let _upgrade_gate = match crate::markers::hold(crate::markers::UPGRADE_IN_PROGRESS) {
+        Ok((gate, false)) => gate,
+        Ok((_, true)) => {
+            cli_log!(error, "another `hole upgrade` is already running");
+            return 1;
+        }
+        Err(e) => {
+            cli_log!(error, "could not create the upgrade gate: {e}");
+            return 1;
+        }
+    };
+    #[cfg(target_os = "windows")]
+    if crate::markers::exists(crate::markers::GUI_ALIVE) {
+        cli_log!(
+            error,
+            "Hole is running (possibly in another user's session); exit it from the tray menu before upgrading"
+        );
+        return 1;
+    }
+
     cli_log!(info, "checking for updates...");
     match hole::update::check_for_update() {
         Ok(Some(info)) => {
@@ -314,14 +340,34 @@ fn handle_upgrade() -> i32 {
                 return 1;
             }
 
-            cli_log!(info, "installing...");
-            if let Err(e) = hole::update::run_installer(&dest, true) {
-                cli_log!(error, "installation failed: {e}");
-                return 1;
+            #[cfg(target_os = "windows")]
+            {
+                // Hand the MSI to a detached elevated helper: UAC consent
+                // happens now; the quiet install runs after this process
+                // exits (#468).
+                let log_path = format!("{}.log", dest.display());
+                if let Err(e) = hole::update::install_for_exit(download_dir, &dest, hole::update::InstallMode::Quiet) {
+                    cli_log!(error, "installation handoff failed: {e}");
+                    return 1;
+                }
+                cli_log!(
+                    info,
+                    "v{} installs after this process exits. On failure the log is kept at {}",
+                    info.version,
+                    log_path,
+                );
+                0
             }
-
-            cli_log!(info, "updated to v{}", info.version);
-            0
+            #[cfg(target_os = "macos")]
+            {
+                cli_log!(info, "installing...");
+                if let Err(e) = hole::update::install_for_exit(download_dir, &dest, hole::update::InstallMode::Quiet) {
+                    cli_log!(error, "installation failed: {e}");
+                    return 1;
+                }
+                cli_log!(info, "updated to v{}", info.version);
+                0
+            }
         }
         Ok(None) => {
             cli_log!(info, "already up to date ({})", hole::version::VERSION);
