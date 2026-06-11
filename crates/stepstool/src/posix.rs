@@ -64,6 +64,11 @@ pub fn prime_sudo_with(sudo: &Path, has_tty: bool) -> Result<(), PrimeSudoError>
 /// Set `stdin(Stdio::null())` on the result before spawning: with a null
 /// stdin an expired sudo timestamp gets EOF and exits non-zero instead of
 /// hanging on an invisible password prompt (pair with [`prime_sudo`]).
+///
+/// Library surface: no in-repo consumer exercises this yet (dev-console
+/// builds its argv via its own policy layer for exact-pin testability);
+/// it exists for external consumers and the planned `elevated:`-flag
+/// revival (bindreams/hole#453).
 pub fn sudo_command(program: impl AsRef<OsStr>, preserve_env: &[&str]) -> Command {
     let mut cmd = Command::new("sudo");
     cmd.arg(crate::preserve_env_arg(preserve_env));
