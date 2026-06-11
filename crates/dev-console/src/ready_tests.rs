@@ -32,6 +32,30 @@ async fn ready_listener_ignores_wrong_token_and_keeps_waiting() {
     client.await.unwrap();
 }
 
+/// THE load-bearing JoinSet property: an open-but-silent connection must not
+/// wedge the wait. A serial accept→read design hangs here (the mute conn is
+/// queued first and never sends); the per-connection-task design resolves on
+/// the real token regardless. Bounded by the per-test timeout (class-2).
+#[skuld::test]
+async fn ready_listener_survives_a_mute_connection() {
+    let listener = ReadyListener::bind().await.unwrap();
+    let spec = listener.notify_arg();
+    let (addr, token) = spec.rsplit_once('/').unwrap();
+    let addr = addr.to_string();
+    let token = token.to_string();
+    // Mute conn FIRST (queued ahead in the backlog), held open for the whole
+    // test — never writes a byte.
+    let mute = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let mut good = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        good.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+    });
+    listener.wait().await.expect("token must win despite the mute conn");
+    drop(mute);
+    client.await.unwrap();
+}
+
 #[skuld::test]
 async fn port_probe_finds_v4_listener() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
