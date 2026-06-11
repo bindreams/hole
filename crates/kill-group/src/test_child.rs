@@ -61,10 +61,10 @@ fn run_spawn_grandchild() -> ! {
     // Plain spawn — the grandchild must be reachable only via the tree kill.
     let mut cmd = std::process::Command::new(exe);
     cmd.env(MODE_ENV, "sleep");
-    // Windows: give the grandchild its OWN console group (mirrors
-    // mock-plugin's grandchild, crates/mock-plugin/src/main.rs:196-201) so a
-    // CTRL_BREAK to the root can't reach it — it dies ONLY via the job, the
-    // actual #197 production scenario.
+    // Windows: give the grandchild its OWN console group (mirrors the
+    // mock-plugin fixture's grandchild, crates/garter/src/bin/mock-plugin.rs)
+    // so a CTRL_BREAK to the root can't reach it — it dies ONLY via the job,
+    // the actual #197 production scenario.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
