@@ -102,6 +102,9 @@ async fn recv_or_pending(signal: Option<&mut tokio::signal::unix::Signal>) {
     }
 }
 
-#[cfg(test)]
+// all(test, unix): both tests raise POSIX signals at the process; on Windows
+// the module would compile empty and its top-level import would trip
+// -D unused-imports (caught by the windows/arm64 clippy CI leg).
+#[cfg(all(test, unix))]
 #[path = "interrupts_tests.rs"]
 mod interrupts_tests;
