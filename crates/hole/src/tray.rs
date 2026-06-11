@@ -5,6 +5,7 @@ use crate::state::AppState;
 use hole::tray_icons;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -560,8 +561,36 @@ async fn handle_uninstall_helper(app: AppHandle) {
     }
 }
 
+// Install gating ======================================================================================================
+
+/// Set while an Install Update flow runs, so a second menu click cannot
+/// start a parallel download or arm a second detached helper.
+static INSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`INSTALL_IN_PROGRESS`] on drop; `mem::forget` it on the exit
+/// path so the gate stays closed while the app tears down.
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_begin_install() -> Option<InstallGuard> {
+    INSTALL_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| InstallGuard)
+}
+
 async fn handle_install_update_from_tray(app: AppHandle) {
     use tauri_plugin_dialog::DialogExt;
+
+    let Some(guard) = try_begin_install() else {
+        info!("install update already in progress; ignoring");
+        return;
+    };
 
     // Get update info from update state.
     let update_state = app.state::<hole::update::UpdateState>();
@@ -629,18 +658,24 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Run installer (interactive mode).
+    // Arm the installer. Windows: a detached helper runs msiexec only after
+    // this process exits, so the MSI never sees a running Hole (#468).
+    // macOS: blocking .app copy. Ok on either platform means "exit now".
     let dest_clone = dest.clone();
-    let install_result = tokio::task::spawn_blocking(move || hole::update::run_installer(&dest_clone, false)).await;
+    let install_result = tokio::task::spawn_blocking(move || {
+        hole::update::install_for_exit(download_dir, &dest_clone, hole::update::InstallMode::Interactive)
+    })
+    .await;
 
     match install_result {
         Ok(Ok(())) => {
-            // On Windows, exit app to let MSI complete.
-            // On macOS, the installer already copied the app.
-            drop(download_dir);
+            // Keep the install gate closed during teardown.
+            std::mem::forget(guard);
             app.exit(0);
         }
         Ok(Err(e)) => {
+            // Full detail to gui.log; the dialog only carries the path-free
+            // UpdateError display text (PII rule).
             error!("installation failed: {e}");
             app.dialog()
                 .message(format!("Installation failed: {e}"))
