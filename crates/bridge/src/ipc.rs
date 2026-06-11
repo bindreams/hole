@@ -358,7 +358,8 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     } else {
         None
     };
-    // Stopped → None → all four traffic fields zero.
+    // Stopped or crashed (check_health cleared `running`) → None → all
+    // four traffic fields zero.
     let traffic = pm.sample_traffic().unwrap_or_default();
     Json(MetricsResponse {
         bytes_in: traffic.totals.bytes_in,

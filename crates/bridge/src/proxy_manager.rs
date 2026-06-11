@@ -294,6 +294,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         })
     }
 
+    /// Test seam: rewind the traffic window's `sampled_at` by `by`, making
+    /// the next sample's `elapsed > 0` a structural guarantee instead of a
+    /// bet on clock granularity. Callers rewind by a tiny duration (1ms) —
+    /// large rewinds can underflow past the `Instant` epoch (system boot).
+    /// No-op when not running or before the first sample.
+    #[cfg(test)]
+    pub fn shift_traffic_window_for_test(&mut self, by: std::time::Duration) {
+        if let Some(w) = self.running.as_mut().and_then(|r| r.traffic_window.as_mut()) {
+            w.sampled_at = w
+                .sampled_at
+                .checked_sub(by)
+                .expect("shift_traffic_window_for_test: rewound past the Instant epoch");
+        }
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }

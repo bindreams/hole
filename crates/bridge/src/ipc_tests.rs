@@ -804,6 +804,8 @@ fn metrics_reports_traffic_totals_when_running() {
         let metrics = get_metrics(&mut client).await;
         assert_eq!(metrics.bytes_in, 0, "stopped bridge reports zero totals");
         assert_eq!(metrics.bytes_out, 0);
+        assert_eq!(metrics.speed_in_bps, 0, "stopped bridge reports zero speeds");
+        assert_eq!(metrics.speed_out_bps, 0);
 
         drop(client);
         handle.abort();
@@ -816,6 +818,7 @@ fn metrics_reports_speed_over_window() {
     rt().block_on(async {
         let path = test_socket_path("metrics-speed");
         let (pm, traffic) = mock_proxy_with_traffic();
+        let pm_for_shift = Arc::clone(&pm);
         let server = IpcServer::bind(&path, pm).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -830,8 +833,15 @@ fn metrics_reports_speed_over_window() {
 
         // Plumbing-only assertion: bytes arriving between two polls must
         // surface as a nonzero speed. The exact rate math is unit-tested
-        // under a paused clock in proxy_manager_tests.rs.
+        // under a paused clock in proxy_manager_tests.rs. The 1ms rewind
+        // makes the second poll's `elapsed > 0` structural — without it,
+        // both polls landing on the same clock tick would hit the
+        // `elapsed.is_zero()` branch and return the previous (zero) speed.
         traffic.bytes_in.fetch_add(1_000_000_000, Ordering::SeqCst);
+        pm_for_shift
+            .lock()
+            .await
+            .shift_traffic_window_for_test(std::time::Duration::from_millis(1));
 
         let metrics = get_metrics(&mut client).await;
         assert!(metrics.speed_in_bps > 0, "speed_in_bps must reflect the byte delta");
