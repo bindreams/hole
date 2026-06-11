@@ -137,6 +137,86 @@ fn e2e_none_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
+/// Metrics report tunnel traffic (#461): after a SOCKS5 roundtrip through
+/// a real ss-server, the FlowStat-backed metrics must show nonzero
+/// cumulative totals in both directions (wire bytes through the tunnel).
+/// A restart on a fresh port must reset the totals — a new `Server` means
+/// a new `FlowStat`.
+#[skuld::test(labels = [DIST_BIN])]
+fn e2e_metrics_report_tunnel_traffic(
+    #[fixture(dist_dir)] dist: &Path,
+    #[fixture(ssserver_none)] ss: &SsServerHandle,
+    #[fixture(http_target_ipv4)] http: &HttpTarget,
+) {
+    rt().block_on(async {
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let config_template = ProxyConfig {
+            server: entry_from(ss),
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
+            dns: hole_common::config::DnsConfig {
+                enabled: false,
+                ..hole_common::config::DnsConfig::default()
+            },
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4074,
+            diagnostic_plugin_tap: false,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config: config_template.clone(),
+            })
+            .await
+            .expect("send Start");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+        assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
+
+        let resp = harness.send(BridgeRequest::Metrics).await.expect("send Metrics");
+        let BridgeResponse::Metrics {
+            bytes_in, bytes_out, ..
+        } = resp
+        else {
+            panic!("expected Metrics response, got {resp:?}");
+        };
+        assert!(bytes_in > 0, "roundtrip response must register as download, got 0");
+        assert!(bytes_out > 0, "roundtrip request must register as upload, got 0");
+
+        let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+        // Restart on a fresh port: totals must reset (dns.enabled = false,
+        // so no forwarder self-test bytes — exactly zero before traffic).
+        let local_port2 = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let config2 = ProxyConfig {
+            local_port: local_port2,
+            ..config_template
+        };
+        let resp = harness
+            .send(BridgeRequest::Start { config: config2 })
+            .await
+            .expect("send Start 2");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+        let resp = harness.send(BridgeRequest::Metrics).await.expect("send Metrics 2");
+        let BridgeResponse::Metrics {
+            bytes_in, bytes_out, ..
+        } = resp
+        else {
+            panic!("expected Metrics response, got {resp:?}");
+        };
+        assert_eq!(bytes_in, 0, "fresh session must start from zero totals");
+        assert_eq!(bytes_out, 0, "fresh session must start from zero totals");
+
+        let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop 2");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+    });
+}
+
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
 /// Linux-only: the galoshes *server* hits the #197 `PluginConfig` port race on
