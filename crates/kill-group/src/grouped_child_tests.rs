@@ -152,6 +152,35 @@ async fn legacy_marker_is_honored() {
     assert_dies(conn).await;
 }
 
+/// The root child must already be inside the job before its first
+/// instruction runs. With suspended-spawn→assign→resume this holds by
+/// construction; IsProcessInJob right after spawn() returns is the
+/// observable pin (spawn() resumes before returning, but membership is
+/// irrevocable — a process cannot leave a job).
+#[cfg(windows)]
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn root_child_is_inside_job_after_spawn() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::IsProcessInJob;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    let raw = gc.child.raw_handle().expect("child handle");
+    let mut in_job = windows::core::BOOL::default();
+    // Job=None asks "is it in ANY job" — terminals already put us in one, so
+    // ask against OUR job handle, exposed for tests via a doc(hidden) probe.
+    let job = gc.test_job_handle().expect("root spawn has a job");
+    // SAFETY: both handles are live for the duration of the call. The job
+    // parameter is Option<HANDLE> (None would ask "in ANY job", which is
+    // always true under Windows Terminal) — verified against windows 0.62.
+    unsafe { IsProcessInJob(HANDLE(raw), Some(job), &mut in_job).unwrap() };
+    assert!(in_job.as_bool(), "child must be assigned before resume");
+    let conn = await_ready(&listener).await; // also proves resume happened
+    gc.kill_tree().await;
+    assert_dies(conn).await;
+}
+
 #[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
 async fn opaque_root_does_not_mark_descendants() {
     // Nesting::Opaque: a group IS created (is_root), but the child env must

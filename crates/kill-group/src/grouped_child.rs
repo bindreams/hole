@@ -113,6 +113,15 @@ impl GroupedChild {
         self.root
     }
 
+    /// Test-only probe: the root spawn's job-object handle, so a test can ask
+    /// `IsProcessInJob` against OUR job (`None` would ask "in ANY job", which
+    /// is always true under Windows Terminal).
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn test_job_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        self.group.job_handle()
+    }
+
     /// Hard-kill the whole tree and reap the direct child. Safe to call after
     /// the child already exited.
     pub async fn kill_tree(&mut self) {
@@ -141,7 +150,7 @@ mod imp {
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
 
     /// Owns the Job Object handle (root only). Dropping/killing it terminates
     /// every process in the job (galoshes + ex-ray, which joined by inheritance).
@@ -156,6 +165,10 @@ mod imp {
     unsafe impl Send for Group {}
 
     impl Group {
+        pub(super) fn job_handle(&self) -> Option<HANDLE> {
+            self.job
+        }
+
         pub(super) fn kill(&mut self) {
             if let Some(job) = self.job.take() {
                 // TerminateJobObject kills the whole tree synchronously; then we
@@ -182,17 +195,40 @@ mod imp {
         // handle just means there's nothing to clear.
         clear_std_handle_inheritance();
 
-        // CREATE_NEW_PROCESS_GROUP makes the child its own console group leader so
-        // graceful_stop's CTRL_BREAK targets it (unchanged behavior, both root and
-        // nested).
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP.0);
+        // CREATE_NEW_PROCESS_GROUP: the child leads its own console group so
+        // graceful CTRL_BREAK can target it (root and nested alike).
+        // CREATE_SUSPENDED (root only): the child must not run a single
+        // instruction before it is inside the kill-on-close job — otherwise a
+        // fast-forking child can place a grandchild outside the job (the
+        // spawn-then-assign race this order closes).
+        let mut flags = CREATE_NEW_PROCESS_GROUP.0;
+        if is_root {
+            flags |= CREATE_SUSPENDED.0;
+        }
+        cmd.creation_flags(flags);
 
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
 
         let group = if is_root {
-            Group {
-                job: assign_to_kill_on_close_job(&child),
+            // Job assignment stays warn-and-degrade; resume REGARDLESS of job
+            // success — a frozen child is strictly worse than an ungrouped one
+            // (degrade parity with job failures).
+            let job = assign_to_kill_on_close_job(&child);
+            if let Err(e) = resume_initial_threads(&child) {
+                // A child we cannot resume is unrecoverable: kill it and fail
+                // the spawn loudly rather than leak a frozen process.
+                tracing::warn!(error = %e, "kill-group: ResumeThread failed; killing the suspended child");
+                if let Some(job) = job {
+                    // Job kill also covers any thread the walk missed.
+                    unsafe {
+                        let _ = TerminateJobObject(job, 1);
+                        let _ = CloseHandle(job);
+                    }
+                }
+                let _ = child.start_kill();
+                return Err(e);
             }
+            Group { job }
         } else {
             Group { job: None }
         };
@@ -201,6 +237,48 @@ mod imp {
             group,
             root: is_root,
         })
+    }
+
+    /// Resume every suspended thread of `child` (a CREATE_SUSPENDED process has
+    /// exactly its initial thread). std::process closes the thread handle from
+    /// CreateProcess, so rediscover it via a Toolhelp snapshot. PID-reuse-safe:
+    /// we hold the child's process handle for the whole walk (the `Child`), so
+    /// its PID cannot be recycled between snapshot and resume.
+    fn resume_initial_threads(child: &Child) -> io::Result<()> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+        let Some(pid) = child.id() else {
+            return Err(io::Error::other("suspended child has no pid"));
+        };
+        let mut resumed = 0u32;
+        // SAFETY: snapshot/iterate/open/resume with owned handles, closed below.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(io::Error::from)?;
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut more = Thread32First(snap, &mut entry).is_ok();
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+                        if ResumeThread(thread) != u32::MAX {
+                            resumed += 1;
+                        }
+                        let _ = CloseHandle(thread);
+                    }
+                }
+                more = Thread32Next(snap, &mut entry).is_ok();
+            }
+            let _ = CloseHandle(snap);
+        }
+        if resumed == 0 {
+            return Err(io::Error::other("no suspended threads resumed"));
+        }
+        Ok(())
     }
 
     fn clear_std_handle_inheritance() {
