@@ -41,3 +41,7 @@ fn main() {
 
 #[cfg(test)]
 pub mod test_child;
+
+#[cfg(all(test, windows))]
+#[path = "console_corruption_tests.rs"]
+mod console_corruption_tests;
