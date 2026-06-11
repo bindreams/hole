@@ -9,6 +9,7 @@
 //! stays testable in one place.
 
 pub mod ex_ray_version;
+pub mod repo_root;
 pub mod version;
 
 #[cfg(test)]
@@ -21,6 +22,10 @@ mod version_tests;
 #[cfg(test)]
 #[path = "ex_ray_version_tests.rs"]
 mod ex_ray_version_tests;
+
+#[cfg(test)]
+#[path = "repo_root_tests.rs"]
+mod repo_root_tests;
 
 #[cfg(test)]
 fn main() {

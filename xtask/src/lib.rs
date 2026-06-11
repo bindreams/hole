@@ -362,38 +362,7 @@ pub fn run_version(group: Option<xtask_lib::version::Group>, check: bool, exact:
     Ok(())
 }
 
-/// Locate the workspace root by walking up from the xtask binary's manifest
-/// dir until we find a directory containing a `Cargo.toml` with `[workspace]`.
-///
-/// We deliberately do not call `git rev-parse --show-toplevel` — xtask must
-/// work in environments where git is unavailable (CI minimal images, source
-/// tarballs, etc.). `CARGO_MANIFEST_DIR` is set by cargo when building xtask
-/// itself; its parent is the workspace root. The current_exe walk-up is a
-/// fallback for environments where the env var is not present.
-pub fn repo_root() -> Result<PathBuf> {
-    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
-        let manifest_dir = PathBuf::from(manifest_dir);
-        if let Some(parent) = manifest_dir.parent() {
-            if parent.join("Cargo.toml").is_file() {
-                return Ok(parent.to_path_buf());
-            }
-        }
-    }
-    let mut dir = std::env::current_exe()?;
-    while dir.pop() {
-        let candidate = dir.join("Cargo.toml");
-        if candidate.is_file() {
-            // Naive [workspace] substring check; the alternative would pull
-            // in `toml` just for one read.
-            if let Ok(s) = std::fs::read_to_string(&candidate) {
-                if s.contains("[workspace]") {
-                    return Ok(dir);
-                }
-            }
-        }
-    }
-    anyhow::bail!("could not locate workspace root from CARGO_MANIFEST_DIR or current_exe walk-up")
-}
+pub use xtask_lib::repo_root::repo_root;
 
 #[cfg(test)]
 fn main() {
