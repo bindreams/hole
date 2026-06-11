@@ -60,6 +60,10 @@ pub fn prime_sudo_with(sudo: &Path, has_tty: bool) -> Result<(), PrimeSudoError>
 /// preserved across sudo's scrub. The caller appends program args and stdio
 /// config. `program` should be an absolute path (sudoers `secure_path`
 /// ignores the caller's PATH).
+///
+/// Set `stdin(Stdio::null())` on the result before spawning: with a null
+/// stdin an expired sudo timestamp gets EOF and exits non-zero instead of
+/// hanging on an invisible password prompt (pair with [`prime_sudo`]).
 pub fn sudo_command(program: impl AsRef<OsStr>, preserve_env: &[&str]) -> Command {
     let mut cmd = Command::new("sudo");
     cmd.arg(crate::preserve_env_arg(preserve_env));
