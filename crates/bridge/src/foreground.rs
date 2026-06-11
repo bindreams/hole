@@ -28,24 +28,27 @@ pub fn run(
     rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify))
 }
 
-/// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere, or
-/// SIGTERM on Unix. dev.py terminates the bridge with SIGTERM (relayed
-/// through sudo); without a SIGTERM handler the bridge would die on the
-/// default disposition and leak routes/DNS (bindreams/hole#452).
+/// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
+/// SIGTERM on Unix, or CTRL_BREAK on Windows. dev.py terminates the bridge
+/// with SIGTERM (relayed through sudo); without a SIGTERM handler the bridge
+/// would die on the default disposition and leak routes/DNS
+/// (bindreams/hole#452). The dev supervisor's Windows graceful stop is
+/// CTRL_BREAK (bindreams/hole#454).
 ///
-/// Returns a future but installs the SIGTERM handler EAGERLY when called
-/// (not lazily on first poll), so a caller that raises SIGTERM immediately
-/// after still observes it. Must be called within a Tokio runtime — it is,
-/// from `run_inner` and the test's `block_on`.
-// On non-unix the `#[cfg(unix)] let sigterm = …` line below is cfg'd out,
-// leaving a bare `async move` body, so clippy's `manual_async_fn` suggests
-// `async fn`. But on unix the function MUST stay `fn -> impl Future` so the
-// SIGTERM handler installs eagerly (before the future is first polled). Keep
-// one shape across platforms and silence the lint only where it misfires.
-#[cfg_attr(not(unix), allow(clippy::manual_async_fn))]
-fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+/// Returns a future but installs the SIGTERM/CTRL_BREAK handlers EAGERLY
+/// when called (not lazily on first poll), so a caller that raises the
+/// signal immediately after still observes it. Must be called within a
+/// Tokio runtime — it is, from `run_inner`, the `lib.rs` test child hook,
+/// and the test's `block_on`.
+pub(crate) fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    // Windows: Ctrl+C (interactive) or CTRL_BREAK (the dev supervisor's
+    // graceful stop — taskkill /F gave the bridge no chance to tear down
+    // routes; CTRL_BREAK + this handler is the SIGTERM equivalent, #454).
+    // ctrl_break() registers eagerly here, matching the unix SIGTERM arm.
+    #[cfg(not(unix))]
+    let ctrl_break = tokio::signal::windows::ctrl_break();
     async move {
         #[cfg(unix)]
         match sigterm {
@@ -62,9 +65,18 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             }
         }
         #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutdown signal (Ctrl+C) received");
+        match ctrl_break {
+            Ok(mut ctrl_break) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal (Ctrl+C) received"),
+                    _ = ctrl_break.recv() => tracing::info!("shutdown signal (CTRL_BREAK) received"),
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install CTRL_BREAK handler; Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutdown signal (Ctrl+C) received");
+            }
         }
     }
 }
