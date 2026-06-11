@@ -11,9 +11,13 @@ pub mod grouped_child;
 pub use grouped_child::{GroupedChild, Nesting};
 
 #[cfg(test)]
+pub mod test_child;
+
+#[cfg(test)]
 hole_test_observability::register!();
 
 #[cfg(test)]
 fn main() {
+    test_child::maybe_run(); // takes over (never returns) in child mode
     skuld::run_all();
 }
