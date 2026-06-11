@@ -2260,6 +2260,7 @@ dependencies = [
  "bitflags 2.11.1",
  "contracts",
  "hole-test-observability",
+ "kill-group",
  "libc",
  "semver",
  "serde",
@@ -3643,6 +3644,18 @@ dependencies = [
  "bitflags 2.11.1",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "kill-group"
+version = "0.1.0"
+dependencies = [
+ "hole-test-observability",
+ "libc",
+ "skuld",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

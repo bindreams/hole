@@ -3,7 +3,6 @@ pub mod chain;
 pub mod counting;
 pub mod error;
 pub mod plugin;
-pub(crate) mod proc_group;
 pub mod shutdown;
 pub mod sip003;
 pub mod sitrep;

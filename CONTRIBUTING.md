@@ -318,6 +318,7 @@ Each publishable member declares a release group in
 | `crates/handle-holders/`           | GPL · hole                             | File-handle introspection (Win NtQuery / mac lsof)                              |
 | `crates/test-observability/`       | `hole-test-observability` · GPL · hole | Dev-dep: pre-main ctor installs subscriber + panic hook                         |
 | `crates/tombstone/`                | Apache · —                             | Native-crash handler (marker + optional minidump)                               |
+| `crates/kill-group/`               | Apache · kill-group                    | Process-tree kill-groups (job object / process group); split from garter (#197) |
 | `crates/garter[-bin]/`             | Apache · garter                        | SIP003u plugin-chain runner lib (**on crates.io**) + CLI + mock-plugin fixture  |
 | `crates/galoshes/`                 | Apache · galoshes                      | Bundled+standalone SIP003u plugin (YAMUX + embedded ex-ray)                     |
 | `crates/ex-ray/`                   | Apache · ex-ray                        | First-party Go SIP003u plugin on v2ray-core (wire-compatible with v2ray-plugin) |
@@ -681,18 +682,21 @@ unrecognized → "Other").
 
 ## Releases
 
-Four independent tracks, each tagged `releases/<product>/v<X.Y.Z>` with its own
-draft+publish workflow pair. The **draft** workflow does all reversible prep
-(build, test, hash, upload to a draft release); the **publish** workflow does the
-irreversible public actions (tag, `cargo publish`, latest-flip). The split exists
-for every track to keep one sanity gate before irreversible work.
+Five independent tracks, each tagged `releases/<product>/v<X.Y.Z>`. All but
+`kill-group` have a draft+publish workflow pair: the **draft** workflow does all
+reversible prep (build, test, hash, upload to a draft release); the **publish**
+workflow does the irreversible public actions (tag, `cargo publish`,
+latest-flip). The split exists to keep one sanity gate before irreversible work.
+`kill-group` has no binary artifacts, so it is published manually — see
+[docs/RELEASE-OPS.md](docs/RELEASE-OPS.md#kill-group-manual-publish).
 
-| Product    | Artifacts                                     | Signed   | crates.io |
-| ---------- | --------------------------------------------- | -------- | --------- |
-| `hole`     | MSI + DMG (amd64+arm64) + `SHA256SUMS`        | minisign | No        |
-| `galoshes` | 6-platform binaries + `SHA256SUMS`            | No       | No        |
-| `garter`   | crates.io lib + 6-platform CLI + `SHA256SUMS` | No       | `garter`  |
-| `ex-ray`   | 6-platform binaries + `SHA256SUMS`            | No       | No        |
+| Product      | Artifacts                                     | Signed   | crates.io    |
+| ------------ | --------------------------------------------- | -------- | ------------ |
+| `hole`       | MSI + DMG (amd64+arm64) + `SHA256SUMS`        | minisign | No           |
+| `galoshes`   | 6-platform binaries + `SHA256SUMS`            | No       | No           |
+| `garter`     | crates.io lib + 6-platform CLI + `SHA256SUMS` | No       | `garter`     |
+| `kill-group` | crates.io lib                                 | No       | `kill-group` |
+| `ex-ray`     | 6-platform binaries + `SHA256SUMS`            | No       | No           |
 
 Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
 
@@ -703,6 +707,8 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `gh release create` (`hole=true`, others `false`); without it GitHub's legacy
   semver+date heuristic can promote the wrong track (#308).
 - **garter publish is idempotent** — it queries crates.io and skips `cargo publish` if the version exists; a `dry_run` input runs `--dry-run` only.
+- **garter depends on kill-group** — publish kill-group to crates.io before (or
+  with) any garter release that bumps the dependency.
 - **Versions** live in each crate's `[package.metadata.hole-release].group`
   (ex-ray in `crates/ex-ray/version.toml`); validate with `cargo xtask version [--check --group <name> [--exact]]` (release CI uses `--exact`). The legacy
   `v0.1.0` tag predates the scheme and is ignored.
