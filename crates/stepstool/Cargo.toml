@@ -1,0 +1,31 @@
+[package]
+name = "stepstool"
+version = "0.1.0"
+edition.workspace = true
+publish = false # standalone-worthy; publish when extracted (skuld trajectory)
+license = "Apache-2.0"
+description = "Elevation primitives for an unprivileged parent that elevates one child: sudo credential priming and command wrapping on POSIX, elevation detection on Windows."
+
+[lints]
+workspace = true
+
+[lib]
+harness = false
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading", # OpenProcessToken/GetCurrentProcess
+] }
+
+[dev-dependencies]
+skuld = { workspace = true }
+hole-test-observability = { path = "../test-observability" }
+tempfile = "3"
