@@ -10,6 +10,9 @@ pub mod grouped_child;
 
 pub use grouped_child::{GroupedChild, Nesting};
 
+#[cfg(unix)]
+pub use grouped_child::term_group;
+
 #[cfg(test)]
 #[path = "grouped_child_tests.rs"]
 mod grouped_child_tests;

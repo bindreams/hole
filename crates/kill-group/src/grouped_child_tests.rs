@@ -181,6 +181,22 @@ async fn root_child_is_inside_job_after_spawn() {
     assert_dies(conn).await;
 }
 
+/// Graceful phase: the group signal must reach a child that handles it
+/// (SIGTERM on Unix / CTRL_BREAK on Windows) and let it exit CLEANLY (0) —
+/// distinct from kill_tree's hard kill.
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn signal_group_term_lets_child_exit_cleanly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("trap-term", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    // Readiness byte arrives only after the child installed its handler —
+    // no race between install and signal.
+    let _conn = await_ready(&listener).await;
+    gc.signal_group_term().unwrap();
+    let status = gc.child.wait().await.unwrap();
+    assert!(status.success(), "graceful signal must produce exit 0, got {status:?}");
+}
+
 #[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
 async fn opaque_root_does_not_mark_descendants() {
     // Nesting::Opaque: a group IS created (is_root), but the child env must

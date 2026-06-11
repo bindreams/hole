@@ -121,6 +121,17 @@ impl GroupedChild {
         self.group.job_handle()
     }
 
+    /// Send the platform graceful-termination signal to the whole group:
+    /// `SIGTERM` via `kill(-pgid)` on Unix (falling back to the direct child
+    /// when this spawn is nested/degraded and has no group of its own);
+    /// `CTRL_BREAK` to the child's console process group on Windows (valid
+    /// because spawn() always sets CREATE_NEW_PROCESS_GROUP). Already-exited
+    /// children are not an error. Does NOT reap: wait (bounded by your own
+    /// failure policy), then [`kill_tree`](Self::kill_tree) or [`Drop`].
+    pub fn signal_group_term(&self) -> io::Result<()> {
+        imp::signal_group_term(self)
+    }
+
     /// Hard-kill the whole tree and reap the direct child. Safe to call after
     /// the child already exited.
     pub async fn kill_tree(&mut self) {
@@ -137,6 +148,38 @@ impl Drop for GroupedChild {
         // runtime drop, where graceful stop never ran) BEFORE `self.child`'s
         // `kill_on_drop` runs — so an orphan can never linger holding a pipe.
         self.group.kill();
+    }
+}
+
+/// Send SIGTERM to the process group `pgid` (Unix only). ESRCH (group gone)
+/// is success; EPERM (the group contains members we may not signal — e.g.
+/// root processes behind sudo) falls back to the group LEADER directly,
+/// which for a sudo wrapper is exactly right: sudo's real uid is the
+/// invoking user's, so the kill is permitted, and sudo relays SIGTERM.
+#[cfg(unix)]
+pub fn term_group(pgid: u32) -> io::Result<()> {
+    let pgid = pgid as libc::pid_t;
+    // SAFETY: plain kill(2); negative pid signals the process group.
+    let rc = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) => term_direct(pgid), // group leader == pgid (process_group(0))
+        _ => Err(err),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn term_direct(pid: libc::pid_t) -> io::Result<()> {
+    // SAFETY: plain kill(2).
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -237,6 +280,17 @@ mod imp {
             group,
             root: is_root,
         })
+    }
+
+    pub(super) fn signal_group_term(gc: &GroupedChild) -> io::Result<()> {
+        use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+        let Some(pid) = gc.child.id() else { return Ok(()) };
+        // The child is its own console-group leader (CREATE_NEW_PROCESS_GROUP at
+        // spawn), so targeting its pid reaches its whole console group. Only
+        // CTRL_BREAK can be group-targeted; CTRL_C cannot (GenerateConsoleCtrlEvent
+        // docs) — and CREATE_NEW_PROCESS_GROUP disabled Ctrl+C in it anyway.
+        // SAFETY: plain Win32 call.
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }.map_err(io::Error::from)
     }
 
     /// Resume every suspended thread of `child`. Succeeds iff at least one
@@ -372,6 +426,10 @@ mod imp {
     }
 
     impl Group {
+        pub(super) fn pgid(&self) -> Option<libc::pid_t> {
+            self.pgid
+        }
+
         pub(super) fn kill(&mut self) {
             if let Some(pgid) = self.pgid.take() {
                 // Negative pid → signal the whole process group.
@@ -386,6 +444,15 @@ mod imp {
         fn drop(&mut self) {
             self.kill();
         }
+    }
+
+    pub(super) fn signal_group_term(gc: &GroupedChild) -> io::Result<()> {
+        if let Some(pgid) = gc.group.pgid() {
+            return crate::grouped_child::term_group(pgid as u32);
+        }
+        // Nested/degraded: no group of our own — direct child, if still running.
+        let Some(pid) = gc.child.id() else { return Ok(()) };
+        crate::grouped_child::term_direct(pid as libc::pid_t)
     }
 
     pub(super) fn spawn(cmd: &mut Command, is_root: bool) -> io::Result<GroupedChild> {
