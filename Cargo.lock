@@ -2986,6 +2986,7 @@ dependencies = [
  "hyper-util",
  "idna",
  "ipnet",
+ "kill-group",
  "libc",
  "lru",
  "plugin-e2e",

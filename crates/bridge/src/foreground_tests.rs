@@ -241,6 +241,35 @@ fn ready_notify_tolerates_malformed_spec_and_dead_listener() {
     });
 }
 
+/// CTRL_BREAK must resolve shutdown_signal (the Windows analog of the
+/// sigterm_resolves_shutdown_signal test below it). Runs the bridge test
+/// binary as a kill-group child (=> CREATE_NEW_PROCESS_GROUP) and delivers
+/// the real console signal.
+#[cfg(windows)]
+#[skuld::test]
+fn ctrl_break_resolves_shutdown_signal() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.env(crate::foreground_child_hook::MODE_ENV, "1");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
+        let stdout = gc.child.stdout.take().unwrap();
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        // Rendezvous: the child prints only after handlers are installed.
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("HANDLER-READY"));
+        gc.signal_group_term().unwrap();
+        let status = gc.child.wait().await.unwrap();
+        assert!(
+            status.success(),
+            "CTRL_BREAK must resolve shutdown_signal; got {status:?}"
+        );
+    });
+}
+
 // dev.py's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
 // instead of an ungraceful default-disposition kill that leaks routes/DNS
 // (bindreams/hole#452). `shutdown_signal()` installs the SIGTERM handler
