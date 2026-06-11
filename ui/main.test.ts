@@ -7,7 +7,7 @@ const callOrder: string[] = [];
 const defaultInvokeImpl = (cmd: string, _args?: unknown) => {
   callOrder.push(`invoke:${cmd}`);
   if (cmd === "get_config") return Promise.resolve({ servers: [], filters: [] });
-  if (cmd === "get_proxy_status") return Promise.resolve({ running: false });
+  if (cmd === "get_proxy_status") return Promise.resolve({ running: false, state_seq: 0 });
   if (cmd === "get_metrics")
     return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
   if (cmd === "get_diagnostics") return Promise.resolve({});
@@ -110,7 +110,7 @@ describe("init ordering", () => {
           enabled: true,
           elevation_prompt_shown: true,
         });
-      if (cmd === "get_proxy_status") return Promise.resolve({ running: false });
+      if (cmd === "get_proxy_status") return Promise.resolve({ running: false, state_seq: 0 });
       if (cmd === "get_metrics")
         return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
       if (cmd === "get_diagnostics") return Promise.resolve({});

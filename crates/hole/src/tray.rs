@@ -351,15 +351,19 @@ impl Drop for TransitionGuard {
 
 /// Elevation bypasses the pooled bridge channel, so on success confirm
 /// the actual state via a tracked Status instead of assuming: the commit
-/// (inside `BridgeLink::send`) is what updates the tray and the webview.
-async fn elevate_and_confirm(
-    app: &AppHandle,
-    request: BridgeRequest,
-    assumed: ToggleOutcome,
-) -> Result<ToggleOutcome, String> {
+/// (inside `BridgeLink::send`) updates the tray and the webview, and the
+/// returned outcome — which the caller persists as the last honored
+/// intent — is derived from that confirmed snapshot, never from the
+/// elevated helper's claim of success.
+async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<ToggleOutcome, String> {
     if crate::elevation::prompt_elevation(app, request).await {
-        let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
-        Ok(assumed)
+        let state = app.state::<AppState>();
+        let _ = state.bridge_send(BridgeRequest::Status).await;
+        Ok(if state.proxy_snapshot().running {
+            ToggleOutcome::Running
+        } else {
+            ToggleOutcome::Stopped
+        })
     } else {
         Err("Elevation was denied or failed".into())
     }
@@ -391,27 +395,36 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOu
         return Err("The Hole bridge must be installed to connect.".into());
     }
 
+    // Resolve the start payload BEFORE claiming the transition slot — a
+    // request that cannot proceed must not flash "Connecting..." in the
+    // tray.
+    let proxy_config = if enable {
+        let config = state.config.lock().unwrap();
+        match build_proxy_config(&config) {
+            Some(pc) => Some(pc),
+            None => {
+                return Err("No server is selected. Open the Dashboard and select a server before connecting.".into())
+            }
+        }
+    } else {
+        None
+    };
+
     let Some(_transition) = TransitionGuard::begin(app, enable) else {
         return Err("Another connect or disconnect is already in progress.".into());
     };
 
     let result: Result<ToggleOutcome, String> = if enable {
-        let proxy_config = {
-            let config = state.config.lock().unwrap();
-            build_proxy_config(&config)
+        let request = BridgeRequest::Start {
+            config: proxy_config.expect("built above for the enable path"),
         };
-        let Some(proxy_config) = proxy_config else {
-            return Err("No server is selected. Open the Dashboard and select a server before connecting.".into());
-        };
-
-        let request = BridgeRequest::Start { config: proxy_config };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {
             StartDecision::Outcome(outcome) => {
                 info!(?outcome, "proxy start settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => elevate_and_confirm(app, request, ToggleOutcome::Running).await,
+            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
             StartDecision::Fail(msg) => {
                 error!("proxy start failed: {msg}");
                 Err(msg)
@@ -425,7 +438,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOu
                 info!(?outcome, "proxy stop settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => elevate_and_confirm(app, request, ToggleOutcome::Stopped).await,
+            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
             StartDecision::Fail(msg) => {
                 error!("proxy stop failed: {msg}");
                 Err(msg)
