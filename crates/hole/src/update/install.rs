@@ -4,7 +4,103 @@ use std::path::Path;
 
 use super::error::UpdateError;
 
+/// How the update installer runs after this process exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// Full installer UI; the installer handles its own elevation (tray).
+    Interactive,
+    /// No installer UI; the helper itself is spawned elevated (CLI).
+    Quiet,
+}
+
 // Windows =============================================================================================================
+
+#[cfg(target_os = "windows")]
+pub(crate) mod intermediary;
+
+/// Arm the update and transfer ownership of the download dir.
+///
+/// Spawns a detached helper that waits (kernel wait, no timeout) for this
+/// process to exit and only then runs msiexec, so the MSI never sees a
+/// running Hole (#468). On Ok the caller must exit promptly. The dir is
+/// persisted: the helper removes it on success; the orphan sweep collects
+/// it otherwise. On Err nothing was armed and the dir is already cleaned.
+///
+/// `Interactive`: helper spawned non-elevated with a stdout-pipe handshake;
+/// msiexec shows its own UI and UAC. `Quiet`: helper spawned elevated up
+/// front (UAC consent happens HERE, while we are alive; decline =>
+/// `ElevationDeclined`) with a named-event handshake, then runs msiexec
+/// /quiet directly.
+#[cfg(target_os = "windows")]
+pub fn install_for_exit(
+    download_dir: tempfile::TempDir,
+    msi_path: &Path,
+    mode: InstallMode,
+) -> Result<(), UpdateError> {
+    let kept_dir = download_dir.keep();
+    tracing::info!(msi = %msi_path.display(), ?mode, "arming detached MSI install");
+    let result = arm_installer(&kept_dir, msi_path, mode);
+    if result.is_err() {
+        // Helper not armed (or killed): nothing will run the MSI or clean up.
+        let _ = std::fs::remove_dir_all(&kept_dir);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> Result<(), UpdateError> {
+    match mode {
+        InstallMode::Interactive => {
+            let spec = intermediary::IntermediarySpec {
+                wait_pid: std::process::id(),
+                installer_argv: msiexec_argv(msi_path, false),
+                rendezvous: intermediary::Rendezvous::Stdout,
+                cleanup_dir: kept_dir.to_path_buf(),
+            };
+            intermediary::launch(&spec)
+        }
+        InstallMode::Quiet => {
+            let event_name = format!("Global\\com.hole.app-upgrade-ready-{}", std::process::id());
+            let event = intermediary::create_ready_event(&event_name)?;
+            let spec = intermediary::IntermediarySpec {
+                wait_pid: std::process::id(),
+                installer_argv: msiexec_argv(msi_path, true),
+                rendezvous: intermediary::Rendezvous::Event { name: event_name },
+                cleanup_dir: kept_dir.to_path_buf(),
+            };
+            let encoded = intermediary::encode_command(&intermediary::build_script(&spec));
+            let ps = intermediary::powershell_path();
+            let args = [
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &encoded,
+            ];
+            let helper = match crate::setup::spawn_elevated(&ps, &args) {
+                Ok(h) => h,
+                Err(crate::setup::SetupError::Cancelled) => return Err(UpdateError::ElevationDeclined),
+                Err(e) => return Err(UpdateError::Io(std::io::Error::other(e.to_string()))),
+            };
+            match intermediary::wait_ready_event_handle(&event, helper.handle())? {
+                intermediary::ReadyOutcome::Ready => Ok(()),
+                intermediary::ReadyOutcome::HelperExited => Err(UpdateError::HelperNotReady),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn msiexec_argv(path: &Path, quiet: bool) -> Vec<String> {
+    let exe = match std::env::var("SystemRoot") {
+        Ok(root) => format!(r"{root}\System32\msiexec.exe"),
+        Err(_) => "msiexec.exe".to_string(),
+    };
+    let mut argv = vec![exe];
+    argv.extend(msiexec_args(path, quiet));
+    argv
+}
 
 #[cfg(target_os = "windows")]
 pub fn run_installer(path: &Path, quiet: bool) -> Result<(), UpdateError> {
@@ -50,6 +146,20 @@ pub(crate) fn msiexec_args(path: &Path, quiet: bool) -> Vec<String> {
 }
 
 // macOS ===============================================================================================================
+
+/// Blocking install of the .app bundle, then release of the download dir.
+/// Ok means the copy completed; the caller must then exit. `mode` does not
+/// apply: the DMG copy has no UI and elevates via run_elevated.
+#[cfg(target_os = "macos")]
+pub fn install_for_exit(
+    download_dir: tempfile::TempDir,
+    dmg_path: &Path,
+    _mode: InstallMode,
+) -> Result<(), UpdateError> {
+    let result = run_installer(dmg_path, false);
+    drop(download_dir);
+    result
+}
 
 #[cfg(target_os = "macos")]
 pub fn run_installer(path: &Path, _quiet: bool) -> Result<(), UpdateError> {

@@ -12,6 +12,10 @@ pub enum UpdateError {
     Io(#[from] std::io::Error),
     #[error("installer failed with exit code {0}")]
     InstallerFailed(i32),
+    #[error("update helper did not signal readiness")]
+    HelperNotReady,
+    #[error("elevation declined")]
+    ElevationDeclined,
     #[error("SHA-256 hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
     #[error("signature verification failed: {0}")]

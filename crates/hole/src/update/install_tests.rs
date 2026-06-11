@@ -30,6 +30,30 @@ fn msiexec_args_interactive() {
     assert_eq!(args, [r"/i", r"C:\tmp\hole.msi", "/L*v", r"C:\tmp\hole.msi.log"]);
 }
 
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn msiexec_argv_targets_system32_msiexec() {
+    let argv = msiexec_argv(Path::new(r"C:\tmp\hole.msi"), false);
+    assert!(
+        argv[0].to_ascii_lowercase().ends_with(r"\system32\msiexec.exe"),
+        "{argv:?}"
+    );
+    assert_eq!(&argv[1..], [r"/i", r"C:\tmp\hole.msi", "/L*v", r"C:\tmp\hole.msi.log"]);
+
+    let quiet = msiexec_argv(Path::new(r"C:\tmp\hole.msi"), true);
+    assert_eq!(
+        &quiet[1..],
+        [
+            r"/i",
+            r"C:\tmp\hole.msi",
+            "/quiet",
+            "/norestart",
+            "/L*v",
+            r"C:\tmp\hole.msi.log"
+        ]
+    );
+}
+
 // macOS hdiutil arg construction ======================================================================================
 
 #[cfg(target_os = "macos")]
