@@ -44,7 +44,9 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::{Routing, SystemRouting};
 
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
-use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TUN_DEVICE_NAME};
+use crate::proxy::{
+    build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
+};
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
 /// YAML-shaped logging via `dump!`. Deliberately excludes password /
@@ -133,6 +135,33 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     udp_proxy_available: bool,
     /// Whether IPv6 bypass is available (from gateway info).
     ipv6_bypass_available: bool,
+    /// Rate window for [`ProxyManager::sample_traffic`]. `None` until the
+    /// first sample after start. Lives here so it structurally cannot
+    /// survive a stop/start cycle — the counters it derives deltas from
+    /// reset with the `Server`.
+    traffic_window: Option<TrafficWindow>,
+}
+
+/// Previous [`ProxyManager::sample_traffic`] observation.
+///
+/// `sampled_at` is a `tokio::time::Instant` (not std) so speed tests can
+/// drive the window deterministically with `tokio::time::pause`/`advance`
+/// instead of sleeping; outside a paused runtime it is the same monotonic
+/// clock.
+struct TrafficWindow {
+    sampled_at: tokio::time::Instant,
+    totals: TrafficTotals,
+    speed_in_bps: u64,
+    speed_out_bps: u64,
+}
+
+/// One traffic sample: cumulative totals plus speeds over the window
+/// since the previous sample.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficMetrics {
+    pub totals: TrafficTotals,
+    pub speed_in_bps: u64,
+    pub speed_out_bps: u64,
 }
 
 // ProxyManager ========================================================================================================
@@ -216,6 +245,53 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 .checked_sub(by)
                 .expect("shift_started_at_for_test: arithmetic underflow");
         }
+    }
+
+    /// Sample cumulative tunnel-traffic totals and compute speeds over
+    /// the window since the previous sample. Each call advances the
+    /// window — the IPC metrics poll is the sampling event. `None` when
+    /// stopped; the first sample after a start reports 0 bps.
+    pub fn sample_traffic(&mut self) -> Option<TrafficMetrics> {
+        let running = self.running.as_mut()?;
+        let totals = running.proxy.traffic_totals();
+        let now = tokio::time::Instant::now();
+        let (speed_in_bps, speed_out_bps) = match &running.traffic_window {
+            None => (0, 0),
+            Some(w) => {
+                let elapsed = now.duration_since(w.sampled_at);
+                if elapsed.is_zero() {
+                    // Same-instant resample: nothing to divide by. Reuse
+                    // the previous speeds and keep the window so the next
+                    // real sample still has a usable base.
+                    return Some(TrafficMetrics {
+                        totals,
+                        speed_in_bps: w.speed_in_bps,
+                        speed_out_bps: w.speed_out_bps,
+                    });
+                }
+                // Counters are monotonic within one RunningState: same
+                // handle, fetch_add only, and the window dies with the state.
+                debug_assert!(
+                    totals.bytes_in >= w.totals.bytes_in && totals.bytes_out >= w.totals.bytes_out,
+                    "traffic counters must be monotonic within a running session"
+                );
+                (
+                    speed_bps(totals.bytes_in - w.totals.bytes_in, elapsed),
+                    speed_bps(totals.bytes_out - w.totals.bytes_out, elapsed),
+                )
+            }
+        };
+        running.traffic_window = Some(TrafficWindow {
+            sampled_at: now,
+            totals,
+            speed_in_bps,
+            speed_out_bps,
+        });
+        Some(TrafficMetrics {
+            totals,
+            speed_in_bps,
+            speed_out_bps,
+        })
     }
 
     pub fn last_error(&self) -> Option<&str> {
@@ -537,6 +613,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 started_at: Instant::now(),
                 udp_proxy_available,
                 ipv6_bypass_available: false,
+                traffic_window: None,
             });
         }
 
@@ -731,6 +808,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             started_at: Instant::now(),
             udp_proxy_available,
             ipv6_bypass_available: gw_info.ipv6_available,
+            traffic_window: None,
         })
     }
 
@@ -748,6 +826,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             started_at: _,
             udp_proxy_available: _,
             ipv6_bypass_available: _,
+            traffic_window: _,
         } = state;
 
         // 0. Restore system DNS FIRST (while routes + SS are still live
@@ -881,6 +960,16 @@ fn proxy_start_err_to_io_err(e: ProxyError) -> std::io::Error {
         ProxyError::Runtime(io) => io,
         other => std::io::Error::other(other.to_string()),
     }
+}
+
+// Traffic rate ========================================================================================================
+
+/// `bytes` over `elapsed` as bits per second. u128 intermediate so the
+/// multiply cannot overflow; saturates at u64::MAX.
+fn speed_bps(bytes: u64, elapsed: std::time::Duration) -> u64 {
+    let bits = bytes as u128 * 8 * 1_000_000_000;
+    let nanos = elapsed.as_nanos().max(1);
+    u64::try_from(bits / nanos).unwrap_or(u64::MAX)
 }
 
 // DNS resolution ======================================================================================================

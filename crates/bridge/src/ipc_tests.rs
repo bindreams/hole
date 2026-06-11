@@ -1,5 +1,5 @@
 use super::*;
-use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use crate::proxy_manager::ProxyManager;
 use crate::socket::LocalStream;
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
@@ -20,8 +20,20 @@ use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
 
+/// Cumulative traffic counters shared between `MockProxy` and the
+/// `MockRunning` handles it issues. Tests clone the `Arc` out before
+/// handing the mock to `ProxyManager::new` and `fetch_add` to simulate
+/// tunnel traffic. Zeroed on every successful `start`, mirroring the
+/// fresh `FlowStat` a new shadowsocks `Server` creates.
+#[derive(Default)]
+struct MockTraffic {
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
 struct MockProxy {
     fail_start: AtomicBool,
+    traffic: Arc<MockTraffic>,
     /// If Some, `start` awaits this gate before returning. Used to
     /// simulate a slow start so tests can race `POST /v1/cancel` against
     /// an in-flight `POST /v1/start`.
@@ -39,6 +51,7 @@ impl MockProxy {
     fn new() -> Self {
         Self {
             fail_start: AtomicBool::new(false),
+            traffic: Arc::new(MockTraffic::default()),
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
         }
@@ -47,16 +60,14 @@ impl MockProxy {
     fn failing() -> Self {
         Self {
             fail_start: AtomicBool::new(true),
-            start_gate: None,
-            start_entered: std::sync::Mutex::new(None),
+            ..Self::new()
         }
     }
 
     fn gated(gate: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            fail_start: AtomicBool::new(false),
             start_gate: Some(gate),
-            start_entered: std::sync::Mutex::new(None),
+            ..Self::new()
         }
     }
 
@@ -81,16 +92,24 @@ impl Proxy for MockProxy {
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(ProxyError::Runtime(io::Error::other("mock failure")));
         }
+        // Fresh session ⇒ fresh counters (production: a new Server
+        // creates a new FlowStat).
+        self.traffic.bytes_in.store(0, Ordering::SeqCst);
+        self.traffic.bytes_out.store(0, Ordering::SeqCst);
         let handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             Ok(())
         });
-        Ok(MockRunning { handle: Some(handle) })
+        Ok(MockRunning {
+            handle: Some(handle),
+            traffic: Arc::clone(&self.traffic),
+        })
     }
 }
 
 struct MockRunning {
     handle: Option<JoinHandle<io::Result<()>>>,
+    traffic: Arc<MockTraffic>,
 }
 
 impl RunningProxy for MockRunning {
@@ -102,6 +121,12 @@ impl RunningProxy for MockRunning {
             h.abort();
         }
         Ok(())
+    }
+    fn traffic_totals(&self) -> TrafficTotals {
+        TrafficTotals {
+            bytes_in: self.traffic.bytes_in.load(Ordering::SeqCst),
+            bytes_out: self.traffic.bytes_out.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -197,6 +222,16 @@ fn mock_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::new(state_dir);
     Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
+}
+
+/// `mock_proxy` variant that also hands back the mock's traffic counters
+/// so tests can simulate tunnel bytes.
+fn mock_proxy_with_traffic() -> (Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>, Arc<MockTraffic>) {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir);
+    let mock = MockProxy::new();
+    let traffic = Arc::clone(&mock.traffic);
+    (Arc::new(Mutex::new(ProxyManager::new(mock, routing))), traffic)
 }
 
 fn failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
@@ -730,7 +765,7 @@ fn metrics_returns_uptime_when_running() {
         assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
 
         let metrics = get_metrics(&mut client).await;
-        // Traffic fields are still zero (not yet integrated)
+        // Running but idle: no traffic injected into the mock, so totals are 0.
         assert_eq!(metrics.bytes_in, 0);
         assert_eq!(metrics.bytes_out, 0);
         // uptime_secs should be >= 0 (may be 0 if < 1s elapsed, which is fine)
@@ -739,6 +774,69 @@ fn metrics_returns_uptime_when_running() {
         // Cleanup
         consume(post_stop(&mut client).await).await;
 
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn metrics_reports_traffic_totals_when_running() {
+    rt().block_on(async {
+        let path = test_socket_path("metrics-traffic");
+        let (pm, traffic) = mock_proxy_with_traffic();
+        let server = IpcServer::bind(&path, pm).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        traffic.bytes_in.fetch_add(1_048_576, Ordering::SeqCst);
+        traffic.bytes_out.fetch_add(65_536, Ordering::SeqCst);
+
+        let metrics = get_metrics(&mut client).await;
+        assert_eq!(metrics.bytes_in, 1_048_576);
+        assert_eq!(metrics.bytes_out, 65_536);
+
+        consume(post_stop(&mut client).await).await;
+        let metrics = get_metrics(&mut client).await;
+        assert_eq!(metrics.bytes_in, 0, "stopped bridge reports zero totals");
+        assert_eq!(metrics.bytes_out, 0);
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn metrics_reports_speed_over_window() {
+    rt().block_on(async {
+        let path = test_socket_path("metrics-speed");
+        let (pm, traffic) = mock_proxy_with_traffic();
+        let server = IpcServer::bind(&path, pm).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+
+        // First poll establishes the rate window.
+        let first = get_metrics(&mut client).await;
+        assert_eq!(first.speed_in_bps, 0, "no window exists before the first poll");
+
+        // Plumbing-only assertion: bytes arriving between two polls must
+        // surface as a nonzero speed. The exact rate math is unit-tested
+        // under a paused clock in proxy_manager_tests.rs.
+        traffic.bytes_in.fetch_add(1_000_000_000, Ordering::SeqCst);
+
+        let metrics = get_metrics(&mut client).await;
+        assert!(metrics.speed_in_bps > 0, "speed_in_bps must reflect the byte delta");
+
+        consume(post_stop(&mut client).await).await;
         drop(client);
         handle.abort();
         let _ = handle.await;

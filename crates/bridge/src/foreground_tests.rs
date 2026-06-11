@@ -1,4 +1,4 @@
-use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use crate::proxy_manager::ProxyManager;
 use bytes::Bytes;
 use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
@@ -80,6 +80,9 @@ impl RunningProxy for StubRunning {
             h.abort();
         }
         Ok(())
+    }
+    fn traffic_totals(&self) -> TrafficTotals {
+        TrafficTotals::default()
     }
 }
 
