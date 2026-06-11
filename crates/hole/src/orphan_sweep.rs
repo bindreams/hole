@@ -1,21 +1,24 @@
-// Best-effort sweep of `hole-install-*` temp directories left over from
-// failed elevated installs.
+// Best-effort sweep of `hole-install-*` / `hole-update-*` temp directories
+// left over from failed installs.
 //
 // `crate::setup::run_elevated` allocates a per-invocation `TempDir` and,
 // when the elevation fails, detaches it from auto-cleanup so the user can
-// attach the contained `gui-cli.log` to a support email. macOS's `/tmp`
-// is cleaned on reboot, but Windows `%TEMP%` is not — without an explicit
-// sweep, repeated failed installs leak forever.
+// attach the contained `gui-cli.log` to a support email. `hole-update-*`
+// dirs are MSI downloads persisted past process exit for the detached
+// installer (#468); the install helper deletes them on success, and this
+// sweep collects failed and cancelled installs. macOS's `/tmp` is cleaned
+// on reboot, but Windows `%TEMP%` is not — without an explicit sweep,
+// repeated failures leak forever.
 //
 // This module enumerates `std::env::temp_dir()` at GUI startup, looks for
-// entries named `hole-install-*`, and deletes any whose mtime is older
+// entries matching [`PREFIXES`], and deletes any whose mtime is older
 // than [`MAX_AGE`]. Bounded to [`MAX_DELETE_PER_SWEEP`] entries per call
 // so a misbehaving filesystem can't stall startup.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-const PREFIX: &str = "hole-install-";
+const PREFIXES: [&str; 2] = ["hole-install-", "hole-update-"];
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
 const MAX_DELETE_PER_SWEEP: usize = 100;
 
@@ -34,7 +37,7 @@ pub(crate) fn spawn_default() {
 }
 
 /// Walk `dir` and delete child entries that:
-///   1. have a file name beginning with [`PREFIX`], AND
+///   1. have a file name beginning with one of [`PREFIXES`], AND
 ///   2. have an mtime older than `max_age` ago.
 ///
 /// Deletes at most `max_delete` entries before returning (so a directory
@@ -62,7 +65,7 @@ pub(crate) fn sweep(dir: &Path, max_age: Duration, max_delete: usize) -> usize {
         }
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else { continue };
-        if !name_str.starts_with(PREFIX) {
+        if !PREFIXES.iter().any(|p| name_str.starts_with(p)) {
             continue;
         }
         // symlink_metadata so a symlink whose target is fresh doesn't

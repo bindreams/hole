@@ -51,9 +51,26 @@ fn sweep_respects_max_delete_cap() {
     let remaining: usize = fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(PREFIX))
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            PREFIXES.iter().any(|p| name.starts_with(p))
+        })
         .count();
     assert_eq!(remaining, 3, "remaining old dirs survive for next sweep");
+}
+
+#[skuld::test]
+fn sweep_deletes_old_hole_update_dirs() {
+    let tmp = tempfile::TempDir::with_prefix("orphan-sweep-test-").unwrap();
+    let old_update = tmp.path().join("hole-update-cccc");
+    fs::create_dir_all(&old_update).unwrap();
+    fs::write(old_update.join("Hole-1.0.0.msi"), b"msi bytes").unwrap();
+    backdate(&old_update, Duration::from_secs(30 * 24 * 60 * 60));
+
+    let deleted = sweep(tmp.path(), Duration::from_secs(7 * 24 * 60 * 60), 100);
+
+    assert_eq!(deleted, 1);
+    assert!(!old_update.exists(), "old hole-update dir should be deleted");
 }
 
 #[skuld::test]

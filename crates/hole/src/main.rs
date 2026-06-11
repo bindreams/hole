@@ -169,11 +169,12 @@ fn launch_gui(show_dashboard: bool) {
             if show_dashboard {
                 tray::open_settings_window(app.handle());
             }
-            // Best-effort sweep of `hole-install-*` temp directories left
-            // behind by failed elevated installs (`run_elevated` detaches
-            // its TempDir on failure so the user can attach the log to
-            // support; this cleans those up after a few days). Non-
-            // blocking; failures are logged at `warn` only.
+            // Best-effort sweep of `hole-install-*` / `hole-update-*` temp
+            // directories left behind by failed elevated installs and
+            // failed/cancelled detached updates (both persist their TempDir
+            // so the user can attach the log to support; this cleans those
+            // up after a few days). Non-blocking; failures are logged at
+            // `warn` only.
             orphan_sweep::spawn_default();
             hole::update::start_update_checker(app.handle().clone(), |app, _info| {
                 // Rebuild the tray menu to include the "Install Update" item.
