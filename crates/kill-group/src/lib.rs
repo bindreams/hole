@@ -11,6 +11,10 @@ pub mod grouped_child;
 pub use grouped_child::{GroupedChild, Nesting};
 
 #[cfg(test)]
+#[path = "grouped_child_tests.rs"]
+mod grouped_child_tests;
+
+#[cfg(test)]
 pub mod test_child;
 
 #[cfg(test)]

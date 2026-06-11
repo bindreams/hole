@@ -1,0 +1,159 @@
+use std::process::Stdio;
+
+use crate::grouped_child::{GroupedChild, Nesting, NESTED_ENV, NESTED_ENV_LEGACY};
+use crate::test_child;
+
+use tokio::io::AsyncReadExt as _;
+use tokio::net::TcpListener;
+
+// Serialization: `GroupedChild::spawn` READS the process env (root detection)
+// in every test and two tests WRITE it; skuld runs all tests in one process.
+// Serial filters match against running tests' LABELS, so every test here must
+// both carry the label and serialize on it (precedent:
+// crates/plugin-e2e/tests/interop.rs).
+#[skuld::label]
+const KILL_GROUP_ENV: skuld::Label;
+
+/// Build a `tokio::process::Command` re-invoking this test binary in `mode`,
+/// pointed at `control` for the liveness dial-back.
+fn child_cmd(mode: &str, control: std::net::SocketAddr) -> tokio::process::Command {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.env(test_child::MODE_ENV, mode);
+    cmd.env(test_child::CONTROL_ENV, control.to_string());
+    cmd.env_remove(NESTED_ENV); // tests control root/nested explicitly
+    cmd.env_remove(NESTED_ENV_LEGACY);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// Read the one readiness byte, then return the conn for the death-watch.
+async fn await_ready(listener: &TcpListener) -> tokio::net::TcpStream {
+    let (mut conn, _) = listener.accept().await.expect("child dials control");
+    let mut byte = [0u8; 1];
+    conn.read_exact(&mut byte).await.expect("readiness byte");
+    assert_eq!(&byte, b"+");
+    conn
+}
+
+/// EOF or RST on the control conn proves the process holding it died.
+/// (Reuse-immune; sleep-free; bounded by the nextest per-test timeout —
+/// the sanctioned class-2 failure-to-human bound.)
+async fn assert_dies(mut conn: tokio::net::TcpStream) {
+    let mut buf = [0u8; 1];
+    match conn.read(&mut buf).await {
+        Ok(0) => {}
+        Ok(n) => panic!("child sent {n} unexpected byte(s)"),
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "unexpected control-conn error: {e:?}"
+        ),
+    }
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn root_spawn_marks_descendants() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    // Structural pin: Mark must have injected BOTH marker names into the
+    // child env (the legacy name is the published-binary compat contract).
+    for var in [NESTED_ENV, NESTED_ENV_LEGACY] {
+        let marked = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new(var) && v.is_some());
+        assert!(marked, "Mark spawn must set {var} on the child");
+    }
+    let conn = await_ready(&listener).await;
+    gc.kill_tree().await.unwrap();
+    assert_dies(conn).await;
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn kill_tree_reaps_grandchild() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("spawn-grandchild", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    // The GRANDCHILD (sleep mode) dials the control listener; its conn is the
+    // death-watch. The intermediate child never dials.
+    let grandchild_conn = await_ready(&listener).await;
+    gc.kill_tree().await.unwrap();
+    assert_dies(grandchild_conn).await;
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn drop_reaps_grandchild() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("spawn-grandchild", listener.local_addr().unwrap());
+    let gc = GroupedChild::spawn(&mut cmd, Nesting::Mark).unwrap();
+    let grandchild_conn = await_ready(&listener).await;
+    drop(gc); // Drop = synchronous tree reap
+    assert_dies(grandchild_conn).await;
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn nested_spawn_creates_no_group() {
+    // Simulate being inside an ancestor's kill-group: with the marker set in
+    // OUR process env (that is what root detection reads; in real nesting it
+    // arrived by inheritance), spawn() must not create a new group (Unix
+    // pgids don't nest — a fresh group would ESCAPE the ancestor's kill).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    // SAFETY: serialized on KILL_GROUP_ENV — no other test reads or writes
+    // the process environment concurrently (precedent:
+    // crates/hole/src/logging_tests.rs:12-30).
+    unsafe { std::env::set_var(NESTED_ENV, "1") };
+    let result = GroupedChild::spawn(&mut cmd, Nesting::Mark);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(NESTED_ENV) };
+    let mut gc = result.unwrap();
+    assert!(!gc.is_root(), "marker set => nested spawn, no new group");
+    let conn = await_ready(&listener).await;
+    gc.kill_tree().await.unwrap();
+    assert_dies(conn).await;
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn legacy_marker_is_honored() {
+    // Cross-version compat: a PUBLISHED old garter/garter-bin still sets
+    // GARTER_IN_KILL_GROUP; a new kill-group nested under it must join, not
+    // escape (the standalone garter-bin + new-galoshes skew — see the module
+    // docs). Same env-serialization rules as above.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    // SAFETY: serialized on KILL_GROUP_ENV.
+    unsafe { std::env::set_var(NESTED_ENV_LEGACY, "1") };
+    let result = GroupedChild::spawn(&mut cmd, Nesting::Mark);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(NESTED_ENV_LEGACY) };
+    let mut gc = result.unwrap();
+    assert!(!gc.is_root(), "legacy marker set => nested spawn");
+    let conn = await_ready(&listener).await;
+    gc.kill_tree().await.unwrap();
+    assert_dies(conn).await;
+}
+
+#[skuld::test(labels = [KILL_GROUP_ENV], serial = KILL_GROUP_ENV)]
+async fn opaque_root_does_not_mark_descendants() {
+    // Nesting::Opaque: a group IS created (is_root), but the child env must
+    // NOT carry either marker — its own kill-group spawns become roots again.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = child_cmd("sleep", listener.local_addr().unwrap());
+    let mut gc = GroupedChild::spawn(&mut cmd, Nesting::Opaque).unwrap();
+    assert!(gc.is_root());
+    for var in [NESTED_ENV, NESTED_ENV_LEGACY] {
+        let marked = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new(var) && v.is_some());
+        assert!(!marked, "Opaque spawn must not set {var} on the child");
+    }
+    let conn = await_ready(&listener).await;
+    gc.kill_tree().await.unwrap();
+    assert_dies(conn).await;
+}
