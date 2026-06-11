@@ -232,6 +232,19 @@ installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
 
+### Config corruption recovery
+
+`ConfigStore` ([crates/common/src/config_store.rs](crates/common/src/config_store.rs))
+is the only door to `config.json` — `AppConfig::save` is clippy-disallowed
+elsewhere, and there is no other loader. On load, a corrupt or unreadable file
+is quarantined to a timestamped sibling (`config.json.<ts>Z.bak`) before
+defaults are used, and the user gets a native dialog naming the backup. If
+quarantine fails (e.g. unwritable directory), saving is blocked for the whole
+session (`ConfigError::SaveBlocked`) so the corrupt file is never overwritten —
+the original data-loss bug (#467) was a save clobbering a file that had failed
+to parse. Saves are atomic (sibling temp file + rename) so a crash mid-save
+cannot produce a corrupt config.
+
 ### Native-crash observability (tombstone)
 
 Native faults (SIGSEGV/access-violation, stack overflow, SIGABRT/`abort()`,

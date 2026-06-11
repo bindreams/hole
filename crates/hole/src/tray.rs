@@ -227,8 +227,8 @@ fn revert_proxy_state(app: &AppHandle, enabled: bool) {
     {
         let mut config = state.config.lock().unwrap();
         config.enabled = enabled;
-        if let Err(e) = config.save(&state.config_path) {
-            warn!(error = %e, path = %state.config_path.display(), "revert_proxy_state: persist failed");
+        if let Err(e) = state.config_store.save(&config) {
+            warn!(error = %e, path = %state.config_store.path().display(), "revert_proxy_state: persist failed");
         }
     }
     set_tray_icon(app, enabled);
@@ -269,8 +269,8 @@ pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleO
             });
         }
         config.enabled = enabled;
-        if let Err(e) = config.save(&state.config_path) {
-            warn!(error = %e, path = %state.config_path.display(), "set_proxy_enabled: persist failed");
+        if let Err(e) = state.config_store.save(&config) {
+            warn!(error = %e, path = %state.config_store.path().display(), "set_proxy_enabled: persist failed");
         }
         build_proxy_config(&config)
     };

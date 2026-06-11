@@ -1,10 +1,23 @@
+// This module tests `AppConfig::save` itself — the clippy ban exists to route
+// production callers through `ConfigStore::save`.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use skuld::temp_dir;
 use std::path::Path;
 
+/// Load via the production loader (`ConfigStore`), asserting a clean load —
+/// `AppConfig::load` was removed in #467 (quarantine made it production-dead).
+fn load(path: &Path) -> AppConfig {
+    let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
+    let (_, config, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
+    assert!(recovery.is_none(), "unexpected recovery: {recovery:?}");
+    config
+}
+
 #[skuld::test]
 fn load_nonexistent_returns_defaults(#[fixture(temp_dir)] dir: &Path) {
-    let config = AppConfig::load(&dir.join("nonexistent.json")).unwrap();
+    let config = load(&dir.join("nonexistent.json"));
     assert_eq!(config.local_port, 4073);
     assert!(config.servers.is_empty());
     assert!(!config.enabled);
@@ -32,17 +45,12 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
         ..Default::default()
     };
     original.save(&path).unwrap();
-    let loaded = AppConfig::load(&path).unwrap();
+    let loaded = load(&path);
     assert_eq!(original, loaded);
 }
 
-#[skuld::test]
-fn load_corrupt_json_returns_error(#[fixture(temp_dir)] dir: &Path) {
-    let path = dir.join("bad.json");
-    std::fs::write(&path, "not json at all {{{").unwrap();
-    let err = AppConfig::load(&path).unwrap_err();
-    assert!(err.to_string().contains("parse"));
-}
+// Corrupt-input behavior now lives in `config_store_tests.rs`
+// (`corrupt_json_is_quarantined_to_timestamped_bak` and friends).
 
 // Error labeling + redaction ------------------------------------------------------------------------------------------
 
@@ -87,7 +95,12 @@ fn load_error_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("config.json");
     std::fs::write(&path, r#"{"local_port": "PLAINTEXT_SECRET_VALUE"}"#).unwrap();
 
-    let msg = AppConfig::load(&path).unwrap_err().to_string();
+    let now = time::macros::datetime!(2026-06-10 14:23:05 UTC);
+    let (_, _, recovery) = crate::config_store::ConfigStore::load(path.to_path_buf(), now);
+    let msg = recovery
+        .expect("corrupt file must produce a recovery")
+        .error
+        .to_string();
 
     assert!(
         msg.contains("parse"),
@@ -135,7 +148,7 @@ fn save_then_load_is_identity(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("config.json");
     let config = AppConfig::default();
     config.save(&path).unwrap();
-    let loaded = AppConfig::load(&path).unwrap();
+    let loaded = load(&path);
     assert_eq!(config, loaded);
 }
 
@@ -233,7 +246,7 @@ fn elevation_prompt_shown_roundtrips(#[fixture(temp_dir)] dir: &Path) {
     };
     config.save(&path).unwrap();
 
-    let loaded = AppConfig::load(&path).unwrap();
+    let loaded = load(&path);
     assert!(loaded.elevation_prompt_shown);
 }
 
@@ -427,7 +440,7 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
         ..Default::default()
     };
     config.save(&path).unwrap();
-    let loaded = AppConfig::load(&path).unwrap();
+    let loaded = load(&path);
     assert_eq!(config.filters, loaded.filters);
     assert_eq!(config.start_on_login, loaded.start_on_login);
     assert_eq!(config.on_startup, loaded.on_startup);
@@ -498,7 +511,7 @@ fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
         ..Default::default()
     };
     config.save(&path).unwrap();
-    let loaded = AppConfig::load(&path).unwrap();
+    let loaded = load(&path);
     assert_eq!(config.dns, loaded.dns);
 }
 
@@ -592,4 +605,21 @@ fn plugin_name_shell_metacharacters_rejected() {
     assert!(!is_valid_plugin_name("evil`id`"));
     assert!(!is_valid_plugin_name("evil(1)"));
     assert!(!is_valid_plugin_name("evil{1}"));
+}
+
+#[skuld::test]
+fn save_replaces_existing_file_and_leaves_no_temp(#[fixture(temp_dir)] dir: &Path) {
+    let path = dir.join("config.json");
+    AppConfig::default().save(&path).unwrap();
+    let changed = AppConfig {
+        local_port: 7777,
+        ..Default::default()
+    };
+    changed.save(&path).unwrap();
+
+    // Exactly one file in the dir: no .tmp leftovers.
+    let entries: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let on_disk: AppConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk, changed);
 }

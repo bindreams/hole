@@ -2,6 +2,7 @@
 
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
+use hole_common::config_store::ConfigStore;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use tracing::warn;
 
 /// Shared application state managed by Tauri.
 pub struct AppState {
-    pub config_path: PathBuf,
+    pub config_store: ConfigStore,
     pub config: Mutex<AppConfig>,
     /// Tauri app handle, used by commands that need to emit events
     /// (currently `test_server` → `validation-changed`).
@@ -22,26 +23,13 @@ pub struct AppState {
     test_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-/// Load the persisted config, falling back to defaults on any error. A
-/// corrupt/unreadable config must not crash startup, but — unlike a bare
-/// `unwrap_or_default()` — the failure is recorded in `gui.log` so it is not
-/// silently masked (and overwritten on the next save). The user-facing
-/// "Failed to load settings" modal (#481) builds on this.
-fn load_config_or_default(path: &std::path::Path) -> AppConfig {
-    match AppConfig::load(path) {
-        Ok(config) => config,
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "failed to load config; starting with defaults");
-            AppConfig::default()
-        }
-    }
-}
+// Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
+// lives in `ConfigStore::load`; main.rs calls it and hands the results here.
 
 impl AppState {
-    pub fn new(config_path: PathBuf, app_handle: tauri::AppHandle) -> Self {
-        let config = load_config_or_default(&config_path);
+    pub fn new(config_store: ConfigStore, config: AppConfig, app_handle: tauri::AppHandle) -> Self {
         Self {
-            config_path,
+            config_store,
             config: Mutex::new(config),
             app_handle,
             bridge: tokio::sync::Mutex::new(None),
@@ -121,7 +109,3 @@ fn resolve_bridge_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(hole_common::protocol::default_bridge_socket_path)
 }
-
-#[cfg(test)]
-#[path = "state_tests.rs"]
-mod state_tests;

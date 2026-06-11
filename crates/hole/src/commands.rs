@@ -96,8 +96,8 @@ pub fn save_config(state: State<AppState>, mut config: AppConfig) -> Result<(), 
     // The frontend doesn't know about elevation_prompt_shown — preserve the
     // in-memory value so a save from the Settings UI doesn't reset it.
     config.elevation_prompt_shown = current.elevation_prompt_shown;
-    config.save(&state.config_path).map_err(|e| {
-        warn!(error = %e, path = %state.config_path.display(), "save_config: config save failed");
+    state.config_store.save(&config).map_err(|e| {
+        warn!(error = %e, path = %state.config_store.path().display(), "save_config: config save failed");
         e.to_string()
     })?;
     *current = config;
@@ -231,8 +231,8 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
     let mut config = state.config.lock().unwrap();
     let (appended, _deduped) = apply_import(&mut config, parsed);
 
-    config.save(&state.config_path).map_err(|e| {
-        warn!(error = %e, path = %state.config_path.display(), "import_servers_from_file: config save failed");
+    state.config_store.save(&config).map_err(|e| {
+        warn!(error = %e, path = %state.config_store.path().display(), "import_servers_from_file: config save failed");
         ImportFailure::SaveFailed
     })?;
 
@@ -412,8 +412,8 @@ pub async fn test_server(state: State<'_, AppState>, entry_id: String) -> Result
                 tested_at: OffsetDateTime::now_utc(),
                 outcome: outcome.clone(),
             });
-            cfg.save(&state.config_path).map_err(|e| {
-                warn!(error = %e, path = %state.config_path.display(), "test_server: persist validation failed");
+            state.config_store.save(&cfg).map_err(|e| {
+                warn!(error = %e, path = %state.config_store.path().display(), "test_server: persist validation failed");
                 e.to_string()
             })?;
         }
@@ -463,8 +463,8 @@ pub fn mark_validated_by_proxy_start(state: State<AppState>, entry_id: String) -
                 },
             });
         }
-        cfg.save(&state.config_path).map_err(|e| {
-            warn!(error = %e, path = %state.config_path.display(), "mark_validated_by_proxy_start: persist failed");
+        state.config_store.save(&cfg).map_err(|e| {
+            warn!(error = %e, path = %state.config_store.path().display(), "mark_validated_by_proxy_start: persist failed");
             e.to_string()
         })?;
     }

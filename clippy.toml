@@ -182,3 +182,15 @@ reason = "Reached via `with_inner_tray_icon`; same non-atomic footgun as the tau
 [[disallowed-methods]]
 path = "tauri::tray::TrayIcon::set_menu"
 reason = "Menu commits must go through `tray::rebuild_tray_menu` so rebuilds stay ordered on the main thread and cannot commit stale state. The sanctioned commit site inside `rebuild_tray_menu` carries a per-site `#[allow]`. See bindreams/hole#473."
+
+# Config persistence — enforce the ConfigStore seam --------------------------------------------------------------------
+#
+# `ConfigStore` (crates/common/src/config_store.rs) quarantines a corrupt
+# config.json at load and blocks saves for the session when quarantine
+# fails. A direct `AppConfig::save` bypasses the `save_blocked` gate and
+# can overwrite the very file #467 preserves. `ConfigStore::save` and the
+# `AppConfig::save` unit tests carry sanctioned `#[allow]`s.
+
+[[disallowed-methods]]
+path = "hole_common::config::AppConfig::save"
+reason = "Go through `ConfigStore::save` — direct saves bypass the #467 save_blocked gate and can destroy a quarantine-pending config.json. See bindreams/hole#467."

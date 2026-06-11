@@ -135,7 +135,19 @@ fn launch_gui(show_dashboard: bool) {
             // Manage shared state here (instead of pre-`.setup()`) so that
             // `AppState` has access to a real `tauri::AppHandle` for emitting
             // events from commands like `test_server`.
-            app.manage(AppState::new(config_path.clone(), app.handle().clone()));
+            let (config_store, config, recovery) =
+                hole_common::config_store::ConfigStore::load(config_path.clone(), time::OffsetDateTime::now_utc());
+            app.manage(AppState::new(config_store, config, app.handle().clone()));
+            if let Some(recovery) = recovery {
+                // Non-blocking: `blocking_show` must not run on the main
+                // thread, and setup must not stall the event loop.
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                app.dialog()
+                    .message(hole::config_recovery::recovery_dialog_message(&recovery))
+                    .title(hole::config_recovery::RECOVERY_DIALOG_TITLE)
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| {});
+            }
             app.manage(hole::update::UpdateState::default());
             tray::create_tray(app)?;
             platform::on_setup(app)?;

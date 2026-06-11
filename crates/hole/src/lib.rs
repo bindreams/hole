@@ -2,6 +2,7 @@ pub mod bridge_client;
 #[macro_use]
 pub mod cli_log;
 pub mod commands;
+pub mod config_recovery;
 pub mod elevation;
 pub mod logging;
 pub mod path_management;

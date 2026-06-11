@@ -28,10 +28,13 @@ pub enum ConfigError {
     CreateDir { source: std::io::Error },
     #[error("failed to write config file: {source}")]
     Write { source: std::io::Error },
+    #[error("config saving is disabled: the corrupt config file could not be backed up at startup")]
+    SaveBlocked,
 }
 
 /// Content-safe label for a `serde_json` parse failure (never echoes the input).
-fn parse_kind(e: &serde_json::Error) -> &'static str {
+/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant.
+pub(crate) fn parse_kind(e: &serde_json::Error) -> &'static str {
     use serde_json::error::Category;
     match e.classify() {
         Category::Io => "I/O error",
@@ -297,17 +300,8 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 // Methods =============================================================================================================
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|e| ConfigError::Parse {
-                kind: parse_kind(&e),
-                line: e.line(),
-                column: e.column(),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(ConfigError::Read { source }),
-        }
-    }
+    // Loading lives in `ConfigStore::load` (crate::config_store) — it
+    // quarantines corrupt files instead of returning an error to discard.
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         use std::io::Write;
