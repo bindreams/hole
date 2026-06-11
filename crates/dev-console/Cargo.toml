@@ -23,7 +23,7 @@ stepstool = { path = "../stepstool" }
 util = { path = "../util" }
 xtask-lib = { path = "../../xtask-lib" }
 rand = "0.10" # match the bridge's pin (crates/bridge/Cargo.toml); already in the lockfile
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "io-util", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "io-std", "io-util", "net", "sync", "time"] }
 which = "8" # 8.0.3 current; performs Windows PATHEXT resolution (the npm.cmd trap)
 
 [target.'cfg(unix)'.dependencies]
