@@ -564,14 +564,14 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
 // Window event handler ================================================================================================
 
 /// Handle events from the settings window menu bar. See `handle_tray_event` for why this is separate.
-fn handle_window_menu_event(app: &AppHandle, event: MenuEvent) {
+fn handle_window_menu_event(window: &tauri::Window, event: MenuEvent) {
+    let app = window.app_handle();
     match event.id().as_ref() {
         ID_WINDOW_IMPORT => {
             info!("menu: import requested");
             use tauri::Emitter;
-            if let Some(w) = app.get_webview_window("settings") {
-                w.emit("import-requested", ()).ok();
-            }
+            // Emit to the menu's own window — no label lookup needed.
+            window.emit("import-requested", ()).ok();
         }
         ID_WINDOW_EXIT => {
             info!("menu: exit requested");
@@ -842,20 +842,38 @@ async fn handle_check_for_updates(app: AppHandle) {
     }
 }
 
+/// Reveal the dashboard if one is open, otherwise build a fresh one. Called
+/// by the tray click, the tray "Dashboard…" item, `--show-dashboard`, and the
+/// single-instance callback.
 pub(crate) fn open_settings_window(app: &AppHandle) {
-    // Always rebuild the dashboard fresh rather than reusing an open window:
-    // with windows destroyed (not hidden) on close, a
-    // `get_webview_window()`/`show()` reuse path can race the window teardown
-    // (the wry runtime clears the window inner before Tauri's manager removes
-    // the entry, so `get_webview_window` returns `Some` but `show()` silently
-    // no-ops) and the user sees nothing happen. Cold-start (~200–500 ms) is
-    // acceptable for an infrequently-opened panel.
-    //
-    // The per-window menu listener registered below is stored in a
-    // `HashMap<String, ...>` keyed by window label inside Tauri's
-    // `MenuManager`, so rebuilding with the same label "settings" replaces
-    // the prior entry — no menu handler leaks across rebuilds.
-    let mut builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::default())
+    let dashboard = app.state::<crate::dashboard::DashboardWindow>();
+    if let Some(label) = dashboard.current_label() {
+        if let Some(window) = app.get_webview_window(&label) {
+            reveal(&window);
+            #[cfg(target_os = "macos")]
+            crate::platform::show_dock_icon(app);
+            return;
+        }
+        // `current` named a window that no longer exists; build a fresh one.
+        // `allocate` below overwrites the stale generation.
+    }
+    build_dashboard(app, &dashboard);
+}
+
+/// Bring an existing dashboard to the foreground. Best-effort: the window is
+/// known to exist and these calls are cosmetic.
+fn reveal(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// Build a fresh dashboard window with a unique label and wire its close
+/// handler.
+fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindow) {
+    let (generation, label) = dashboard.allocate();
+
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::default())
         .title("Hole Dashboard")
         .inner_size(800.0, 600.0)
         .min_inner_size(800.0, 200.0)
@@ -908,17 +926,29 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
         };
 
         builder = builder.menu(menu).on_menu_event(|window, event| {
-            handle_window_menu_event(window.app_handle(), event);
+            handle_window_menu_event(window, event);
         });
     }
 
     match builder.build() {
-        Ok(_window) => {
+        Ok(window) => {
+            // Stop tracking this generation on close; don't prevent the close,
+            // so the webview is destroyed and freed. The generation tag stops a
+            // late close from forgetting a newer dashboard.
+            let close_handle = app.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    close_handle
+                        .state::<crate::dashboard::DashboardWindow>()
+                        .forget(generation);
+                }
+            });
             #[cfg(target_os = "macos")]
             crate::platform::show_dock_icon(app);
         }
         Err(e) => {
             error!(error = %e, "failed to open settings window");
+            dashboard.forget(generation);
         }
     }
 }

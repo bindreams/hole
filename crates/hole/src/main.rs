@@ -10,6 +10,7 @@ mod bridge_client;
 mod cli_log;
 mod cli;
 mod commands;
+mod dashboard;
 mod elevation;
 mod log_collector;
 mod logging;
@@ -152,6 +153,7 @@ fn launch_gui(show_dashboard: bool) {
             }
             app.manage(hole::update::UpdateState::default());
             app.manage(tray::TransitionSlot::new());
+            app.manage(dashboard::DashboardWindow::new());
             tray::create_tray(app)?;
             // Tray + webview follow the ProxyStateCell; the reconciler's
             // immediate first tick is the startup resync against the

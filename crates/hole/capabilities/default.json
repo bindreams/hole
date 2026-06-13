@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "windows": ["settings"],
+  "windows": ["dashboard-*"],
   "permissions": [
     "core:default",
     "dialog:allow-open",
