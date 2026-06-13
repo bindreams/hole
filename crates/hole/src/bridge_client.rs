@@ -2,9 +2,9 @@
 
 use bytes::Bytes;
 use hole_common::protocol::{
-    BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, PublicIpResponse,
-    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
-    ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, StatusResponse,
+    TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START,
+    ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -159,20 +159,6 @@ impl BridgeClient {
                         network: diag.network,
                         vpn_server: diag.vpn_server,
                         internet: diag.internet,
-                    })
-                } else {
-                    parse_bridge_error(resp).await
-                }
-            }
-            BridgeRequest::PublicIp => {
-                let resp = self.http_get(ROUTE_PUBLIC_IP).await?;
-                if resp.status().is_success() {
-                    let body = read_body(resp).await?;
-                    let pip: PublicIpResponse =
-                        serde_json::from_slice(&body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    Ok(BridgeResponse::PublicIp {
-                        ip: pip.ip,
-                        country_code: pip.country_code,
                     })
                 } else {
                     parse_bridge_error(resp).await

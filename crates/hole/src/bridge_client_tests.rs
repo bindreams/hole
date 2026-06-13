@@ -1,8 +1,7 @@
 use super::*;
 use axum::Json;
 use hole_common::protocol::{
-    BridgeRequest, BridgeResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, PublicIpResponse,
-    StatusResponse,
+    BridgeRequest, BridgeResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, StatusResponse,
 };
 use hyper::body::Incoming;
 use std::path::PathBuf;
@@ -73,15 +72,6 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     network: "ok".to_string(),
                     vpn_server: "ok".to_string(),
                     internet: "ok".to_string(),
-                })
-            }),
-        )
-        .route(
-            hole_common::protocol::ROUTE_PUBLIC_IP,
-            axum::routing::get(|| async {
-                Json(PublicIpResponse {
-                    ip: "203.0.113.42".to_string(),
-                    country_code: "DE".to_string(),
                 })
             }),
         );
@@ -403,25 +393,6 @@ fn send_diagnostics_returns_response() {
                 network: "ok".to_string(),
                 vpn_server: "ok".to_string(),
                 internet: "ok".to_string(),
-            }
-        );
-    });
-}
-
-#[skuld::test]
-fn send_public_ip_returns_response() {
-    rt().block_on(async {
-        let path = test_socket_path("publicip");
-        let _mock = spawn_mock_bridge(&path).await;
-
-        let mut client = BridgeClient::connect(&path).await.unwrap();
-        let resp = client.send(BridgeRequest::PublicIp).await.unwrap();
-
-        assert_eq!(
-            resp,
-            BridgeResponse::PublicIp {
-                ip: "203.0.113.42".to_string(),
-                country_code: "DE".to_string(),
             }
         );
     });
