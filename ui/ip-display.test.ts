@@ -18,6 +18,10 @@ beforeEach(() => {
 afterEach(() => {
   // jsdom adds a clipboard mock to navigator that persists across tests.
   delete (navigator as { clipboard?: unknown }).clipboard;
+  // The auto-refresh test stubs setInterval/clearInterval and overrides
+  // document.hidden; vitest does not auto-unstub, so restore both here.
+  vi.unstubAllGlobals();
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
 });
 
 describe("updatePublicIp", () => {
@@ -124,5 +128,36 @@ describe("copy button", () => {
     await Promise.resolve();
 
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("denied"), "error");
+  });
+});
+
+describe("startPublicIpAutoRefresh", () => {
+  it("polls every 60s while visible, pauses when hidden, resumes on return", async () => {
+    const setIntervalMock = vi.fn().mockReturnValue(777);
+    const clearIntervalMock = vi.fn();
+    vi.stubGlobal("setInterval", setIntervalMock);
+    vi.stubGlobal("clearInterval", clearIntervalMock);
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    invokeMock.mockResolvedValue({ ip: "1.2.3.4", country_code: "DE" });
+
+    const { initIpDisplay, startPublicIpAutoRefresh } = await import("./ip-display");
+    initIpDisplay();
+    startPublicIpAutoRefresh();
+
+    // Visible at start → one 60s interval, no immediate fetch (init owns the first).
+    expect(setIntervalMock).toHaveBeenCalledTimes(1);
+    expect(setIntervalMock.mock.calls[0][1]).toBe(60000);
+
+    // Hidden → interval cleared.
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(clearIntervalMock).toHaveBeenCalledWith(777);
+
+    // Visible again → immediate refresh + a fresh interval.
+    invokeMock.mockClear();
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(invokeMock).toHaveBeenCalledWith("get_public_ip");
+    expect(setIntervalMock).toHaveBeenCalledTimes(2);
   });
 });

@@ -19,6 +19,39 @@ export function initIpDisplay(): void {
   copyIpBtn?.addEventListener("click", handleCopyIp);
 }
 
+const PUBLIC_IP_REFRESH_MS = 60_000;
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function startRefreshTimer(): void {
+  if (refreshTimer === null) refreshTimer = setInterval(updatePublicIp, PUBLIC_IP_REFRESH_MS);
+}
+
+function stopRefreshTimer(): void {
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+/**
+ * Refresh the public IP every 60s while the dashboard is visible; pause when
+ * minimized or closed to the tray so we never poll in the background (#464).
+ * The initial fetch is owned by init(); this only fetches on a hidden→visible
+ * return. Call once at startup.
+ */
+export function startPublicIpAutoRefresh(): void {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopRefreshTimer();
+    } else {
+      void updatePublicIp();
+      startRefreshTimer();
+    }
+  });
+  if (document.hidden) stopRefreshTimer();
+  else startRefreshTimer();
+}
+
 /** Refetch the public IP via Tauri and repaint the badge + address. */
 export async function updatePublicIp(): Promise<void> {
   try {
