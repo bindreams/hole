@@ -10,6 +10,17 @@ fn no_args_means_gui_mode() {
     assert!(!cli.show_dashboard);
 }
 
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn upgrade_gate_precedence() {
+    use UpgradeGate::*;
+    // A concurrent upgrade outranks a running GUI; both outrank Proceed.
+    assert_eq!(upgrade_gate_decision(true, true), AlreadyRunning);
+    assert_eq!(upgrade_gate_decision(true, false), AlreadyRunning);
+    assert_eq!(upgrade_gate_decision(false, true), GuiAlive);
+    assert_eq!(upgrade_gate_decision(false, false), Proceed);
+}
+
 #[skuld::test]
 fn show_dashboard_flag_alone() {
     let cli = Cli::try_parse_from(["hole", "--show-dashboard"]).unwrap();

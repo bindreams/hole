@@ -282,32 +282,58 @@ pub(crate) fn dispatch(command: Command) -> ! {
     std::process::exit(code)
 }
 
+/// Pre-flight outcome for `hole upgrade` (#468). A concurrent upgrade or a
+/// running GUI would re-trigger the FilesInUse defect: the MSI can stop the
+/// bridge service via the Restart Manager, but not a windowless tray app.
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum UpgradeGate {
+    Proceed,
+    AlreadyRunning,
+    GuiAlive,
+}
+
+/// A concurrent upgrade outranks a running GUI; either blocks the upgrade.
+#[cfg(target_os = "windows")]
+fn upgrade_gate_decision(upgrade_already_running: bool, gui_alive: bool) -> UpgradeGate {
+    if upgrade_already_running {
+        UpgradeGate::AlreadyRunning
+    } else if gui_alive {
+        UpgradeGate::GuiAlive
+    } else {
+        UpgradeGate::Proceed
+    }
+}
+
 fn handle_upgrade() -> i32 {
-    // A second upgrade or a running GUI would re-trigger the FilesInUse
-    // defect (#468): the MSI can stop the bridge service via the Restart
-    // Manager, but not a windowless tray app. Refuse up front. The mutex
-    // hold is atomic; the actual msiexec run is serialized system-wide by
-    // Windows Installer itself (_MSIExecute -> 1618).
+    // Hold the upgrade gate (atomic already-existed check) before probing
+    // for a running GUI. The msiexec run itself is serialized system-wide
+    // by Windows Installer's own _MSIExecute mutex (-> 1618).
     #[cfg(target_os = "windows")]
-    let _upgrade_gate = match crate::markers::hold(crate::markers::UPGRADE_IN_PROGRESS) {
-        Ok((gate, false)) => gate,
-        Ok((_, true)) => {
-            cli_log!(error, "another `hole upgrade` is already running");
-            return 1;
-        }
-        Err(e) => {
-            cli_log!(error, "could not create the upgrade gate: {e}");
-            return 1;
+    let _upgrade_gate = {
+        let (gate, already_running) = match crate::markers::hold(&crate::markers::UPGRADE_IN_PROGRESS) {
+            Ok(held) => held,
+            Err(e) => {
+                cli_log!(error, "could not create the upgrade gate: {e}");
+                return 1;
+            }
+        };
+        let gui_alive = crate::markers::exists(&crate::markers::GUI_ALIVE);
+        match upgrade_gate_decision(already_running, gui_alive) {
+            UpgradeGate::Proceed => gate,
+            UpgradeGate::AlreadyRunning => {
+                cli_log!(error, "another `hole upgrade` is already running");
+                return 1;
+            }
+            UpgradeGate::GuiAlive => {
+                cli_log!(
+                    error,
+                    "Hole is running (possibly in another user's session); exit it from the tray menu before upgrading"
+                );
+                return 1;
+            }
         }
     };
-    #[cfg(target_os = "windows")]
-    if crate::markers::exists(crate::markers::GUI_ALIVE) {
-        cli_log!(
-            error,
-            "Hole is running (possibly in another user's session); exit it from the tray menu before upgrading"
-        );
-        return 1;
-    }
 
     cli_log!(info, "checking for updates...");
     match hole::update::check_for_update() {

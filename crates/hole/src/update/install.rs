@@ -39,16 +39,39 @@ pub fn install_for_exit(
 ) -> Result<(), UpdateError> {
     let kept_dir = download_dir.keep();
     tracing::info!(msi = %msi_path.display(), ?mode, "arming detached MSI install");
-    let result = arm_installer(&kept_dir, msi_path, mode);
-    if result.is_err() {
-        // Helper not armed (or killed): nothing will run the MSI or clean up.
-        let _ = std::fs::remove_dir_all(&kept_dir);
+    cleanup_for_outcome(&kept_dir, arm_installer(&kept_dir, msi_path, mode))
+}
+
+/// Result of arming the detached helper, distinguishing who owns the
+/// persisted download dir afterwards.
+#[cfg(target_os = "windows")]
+enum ArmOutcome {
+    /// A helper is running and will run the MSI and remove the dir on success.
+    Armed,
+    /// Nothing was armed; the caller must remove the dir.
+    NotArmed(UpdateError),
+    /// A helper may be running but we lost track of it (kernel wait failed);
+    /// leave the dir for it / the orphan sweep rather than delete it from
+    /// under a live installer.
+    Uncertain(UpdateError),
+}
+
+/// Apply the dir-ownership decision from [`ArmOutcome`]: delete only when
+/// nothing was armed.
+#[cfg(target_os = "windows")]
+fn cleanup_for_outcome(kept_dir: &Path, outcome: ArmOutcome) -> Result<(), UpdateError> {
+    match outcome {
+        ArmOutcome::Armed => Ok(()),
+        ArmOutcome::NotArmed(e) => {
+            let _ = std::fs::remove_dir_all(kept_dir);
+            Err(e)
+        }
+        ArmOutcome::Uncertain(e) => Err(e),
     }
-    result
 }
 
 #[cfg(target_os = "windows")]
-fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> Result<(), UpdateError> {
+fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> ArmOutcome {
     match mode {
         InstallMode::Interactive => {
             let spec = intermediary::IntermediarySpec {
@@ -57,11 +80,23 @@ fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> Result<
                 rendezvous: intermediary::Rendezvous::Stdout,
                 cleanup_dir: kept_dir.to_path_buf(),
             };
-            intermediary::launch(&spec)
+            // launch kills the helper on handshake failure, so an Err means
+            // nothing is armed.
+            match intermediary::launch(&spec) {
+                Ok(()) => ArmOutcome::Armed,
+                Err(e) => ArmOutcome::NotArmed(e),
+            }
         }
         InstallMode::Quiet => {
-            let event_name = format!("Global\\com.hole.app-upgrade-ready-{}", std::process::id());
-            let event = intermediary::create_ready_event(&event_name)?;
+            // Same-session rendezvous: the elevated helper shares this
+            // process's session (UAC preserves the session), so a Local
+            // event needs no privilege and is visible across the integrity
+            // boundary.
+            let event_name = format!("Local\\com.hole.app-upgrade-ready-{}", std::process::id());
+            let event = match intermediary::create_ready_event(&event_name) {
+                Ok(e) => e,
+                Err(e) => return ArmOutcome::NotArmed(e),
+            };
             let spec = intermediary::IntermediarySpec {
                 wait_pid: std::process::id(),
                 installer_argv: msiexec_argv(msi_path, true),
@@ -80,12 +115,18 @@ fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> Result<
             ];
             let helper = match crate::setup::spawn_elevated(&ps, &args) {
                 Ok(h) => h,
-                Err(crate::setup::SetupError::Cancelled) => return Err(UpdateError::ElevationDeclined),
-                Err(e) => return Err(UpdateError::Io(std::io::Error::other(e.to_string()))),
+                Err(crate::setup::SetupError::Cancelled) => {
+                    return ArmOutcome::NotArmed(UpdateError::ElevationDeclined)
+                }
+                Err(e) => return ArmOutcome::NotArmed(UpdateError::Io(std::io::Error::other(e.to_string()))),
             };
-            match intermediary::wait_ready_event_handle(&event, helper.handle())? {
-                intermediary::ReadyOutcome::Ready => Ok(()),
-                intermediary::ReadyOutcome::HelperExited => Err(UpdateError::HelperNotReady),
+            match intermediary::wait_ready_event_handle(&event, helper.handle()) {
+                Ok(intermediary::ReadyOutcome::Ready) => ArmOutcome::Armed,
+                Ok(intermediary::ReadyOutcome::HelperExited) => ArmOutcome::NotArmed(UpdateError::HelperNotReady),
+                // Kernel wait failed: the helper may already hold our handle
+                // and be parked in WaitForExit. Don't delete the MSI from
+                // under it.
+                Err(e) => ArmOutcome::Uncertain(e),
             }
         }
     }

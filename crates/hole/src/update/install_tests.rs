@@ -54,6 +54,40 @@ fn msiexec_argv_targets_system32_msiexec() {
     );
 }
 
+// Download-dir ownership after arming =================================================================================
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn cleanup_removes_dir_only_when_not_armed() {
+    let dir = tempfile::TempDir::with_prefix("hole-cleanup-test-").unwrap().keep();
+
+    // Not armed: nothing will run the installer, so the dir is removed and
+    // the error propagates.
+    let r = cleanup_for_outcome(&dir, ArmOutcome::NotArmed(UpdateError::HelperNotReady));
+    assert!(matches!(r, Err(UpdateError::HelperNotReady)));
+    assert!(!dir.exists(), "not-armed must delete the dir");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn cleanup_keeps_dir_when_armed_or_uncertain() {
+    let armed = tempfile::TempDir::with_prefix("hole-cleanup-armed-").unwrap().keep();
+    assert!(cleanup_for_outcome(&armed, ArmOutcome::Armed).is_ok());
+    assert!(armed.exists(), "armed: helper owns the dir, must not delete");
+    std::fs::remove_dir_all(&armed).unwrap();
+
+    let uncertain = tempfile::TempDir::with_prefix("hole-cleanup-uncertain-")
+        .unwrap()
+        .keep();
+    let r = cleanup_for_outcome(&uncertain, ArmOutcome::Uncertain(UpdateError::HelperNotReady));
+    assert!(matches!(r, Err(UpdateError::HelperNotReady)));
+    assert!(
+        uncertain.exists(),
+        "uncertain: a live helper may need the dir, must not delete"
+    );
+    std::fs::remove_dir_all(&uncertain).unwrap();
+}
+
 // macOS hdiutil arg construction ======================================================================================
 
 #[cfg(target_os = "macos")]

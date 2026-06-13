@@ -6,26 +6,42 @@
 // GUI holds GUI_ALIVE for its lifetime; the CLI probes it. The CLI holds
 // UPGRADE_IN_PROGRESS to refuse concurrent upgrades atomically.
 //
-// Hole-owned contract — deliberately not the single-instance plugin's
-// internal per-session mutex: a GUI in ANY session holds the exe lock, so
-// the namespace is Global (standard users can create Global mutexes).
-// Kernel lifetime means a crashed holder releases automatically.
+// Each marker lives in two namespaces. The session-local `Local\` name
+// needs no privilege and covers the common case (a user upgrading while
+// their own GUI / another of their upgrades runs in the same session). The
+// `Global\` name additionally catches a different user's GUI on a
+// multi-user machine, but creating it needs SeCreateGlobalPrivilege, which
+// some standard users lack — so Global is best-effort: a creation failure
+// is logged and the marker holds Local only. Kernel lifetime means a
+// crashed holder releases automatically.
 
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE};
 use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 
-pub(crate) const GUI_ALIVE: &str = "Global\\com.hole.app-gui-alive";
-pub(crate) const UPGRADE_IN_PROGRESS: &str = "Global\\com.hole.app-upgrade-in-progress";
+/// A marker identity: the same logical marker in the session-local and
+/// global namespaces.
+pub(crate) struct MarkerName<'a> {
+    pub local: &'a str,
+    pub global: &'a str,
+}
 
-/// Owned handle to a marker mutex; the marker is visible while any holder
-/// lives.
-pub(crate) struct Marker(HANDLE);
+pub(crate) const GUI_ALIVE: MarkerName<'static> = MarkerName {
+    local: "Local\\com.hole.app-gui-alive",
+    global: "Global\\com.hole.app-gui-alive",
+};
+pub(crate) const UPGRADE_IN_PROGRESS: MarkerName<'static> = MarkerName {
+    local: "Local\\com.hole.app-upgrade-in-progress",
+    global: "Global\\com.hole.app-upgrade-in-progress",
+};
+
+/// Owned mutex handle; closed on drop.
+struct MutexHandle(HANDLE);
 
 // SAFETY: a mutex HANDLE may be used and closed on any thread.
-unsafe impl Send for Marker {}
+unsafe impl Send for MutexHandle {}
 
-impl Drop for Marker {
+impl Drop for MutexHandle {
     fn drop(&mut self) {
         // SAFETY: handle came from CreateMutexW and is closed exactly once.
         unsafe {
@@ -34,18 +50,24 @@ impl Drop for Marker {
     }
 }
 
-/// Create (or open) the named marker and hold it. The bool reports whether
-/// the marker already existed — atomic with the creation (GetLastError).
-pub(crate) fn hold(name: &str) -> windows::core::Result<(Marker, bool)> {
+/// Holds a marker in the local (mandatory) and global (best-effort)
+/// namespaces; both are released on drop.
+pub(crate) struct Marker {
+    _local: MutexHandle,
+    _global: Option<MutexHandle>,
+}
+
+/// Create and hold one named mutex, reporting whether it already existed.
+fn create_mutex(name: &str) -> windows::core::Result<(MutexHandle, bool)> {
     // SAFETY: the HSTRING outlives the call; no security attributes; the
     // mutex is never acquired, only held for existence.
     let handle = unsafe { CreateMutexW(None, false, &HSTRING::from(name)) }?;
     let already = windows::core::Error::from_thread().code() == ERROR_ALREADY_EXISTS.to_hresult();
-    Ok((Marker(handle), already))
+    Ok((MutexHandle(handle), already))
 }
 
-/// True if some process currently holds the marker.
-pub(crate) fn exists(name: &str) -> bool {
+/// True if a named mutex currently exists.
+fn open_exists(name: &str) -> bool {
     // SAFETY: probing existence; the handle is closed immediately.
     match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) } {
         Ok(handle) => {
@@ -54,10 +76,35 @@ pub(crate) fn exists(name: &str) -> bool {
             }
             true
         }
-        // Any error other than "no such object" (e.g. access denied from
-        // another user's session) means the mutex exists.
+        // Any error other than "no such object" (e.g. access denied for a
+        // marker held in another user's session) means it exists.
         Err(e) => e.code() != ERROR_FILE_NOT_FOUND.to_hresult(),
     }
+}
+
+/// Hold the marker. Returns the guard and whether it already existed in
+/// either namespace (another holder is alive). The local mutex is
+/// mandatory; if it can't be created the call errors. The global mutex is
+/// best-effort: a creation failure is logged and the guard holds local only.
+pub(crate) fn hold(name: &MarkerName) -> windows::core::Result<(Marker, bool)> {
+    let (local, local_existed) = create_mutex(name.local)?;
+    let (global, global_existed) = match create_mutex(name.global) {
+        Ok((handle, existed)) => (Some(handle), existed),
+        Err(e) => {
+            tracing::debug!(global = name.global, "global marker unavailable: {e}");
+            (None, false)
+        }
+    };
+    let marker = Marker {
+        _local: local,
+        _global: global,
+    };
+    Ok((marker, local_existed || global_existed))
+}
+
+/// True if some process holds the marker in either namespace.
+pub(crate) fn exists(name: &MarkerName) -> bool {
+    open_exists(name.local) || open_exists(name.global)
 }
 
 #[cfg(test)]

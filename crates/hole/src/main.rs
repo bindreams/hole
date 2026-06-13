@@ -77,10 +77,11 @@ fn launch_gui(show_dashboard: bool) {
 
     // Hold the gui-alive marker so `hole upgrade` refuses while we run
     // (#468). Held until process exit; the kernel releases it even on a
-    // crash. Standard users can create Global mutexes, so failure here is
-    // resource exhaustion — launching degraded beats not launching.
+    // crash. The local marker needs no privilege; only the best-effort
+    // global one can fail, so an error here means even the local hold
+    // failed (resource exhaustion) — launch degraded rather than not at all.
     #[cfg(target_os = "windows")]
-    let _gui_alive = match markers::hold(markers::GUI_ALIVE) {
+    let _gui_alive = match markers::hold(&markers::GUI_ALIVE) {
         Ok((m, _)) => Some(m),
         Err(e) => {
             tracing::error!("could not create gui-alive marker: {e}");
