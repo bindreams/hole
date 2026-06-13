@@ -67,9 +67,6 @@ export function statusTooltipFor(v: ValidationState | null | undefined): string 
 /// Entry IDs with a test_server invoke in flight. renderServers consults
 /// this so a mid-test rebuild repaints the in-flight state instead of
 /// silently reverting the card to its persisted dot.
-/// Entry IDs with a test_server invoke in flight. renderServers consults
-/// this so a mid-test rebuild repaints the in-flight state instead of
-/// silently reverting the card to its persisted dot.
 const testsInFlight = new Set<string>();
 
 /// Repaint one card's test button + status dot from the live DOM.
