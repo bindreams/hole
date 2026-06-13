@@ -224,6 +224,54 @@ fn remove_server_missing_id_is_noop() {
     assert_eq!(config.selected_server.as_deref(), Some("a"));
 }
 
+// apply_ui_settings composition: merge by id + selection heal =========================================================
+
+fn ui_server_entry(id: &str) -> crate::ui_settings::UiServerEntry {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "name": format!("Server {id}"), "server": "1.2.3.4",
+        "server_port": 8388, "method": "aes-256-gcm", "password": "pw",
+    }))
+    .unwrap()
+}
+
+fn default_ui_settings() -> crate::ui_settings::UiSettings {
+    serde_json::from_value(serde_json::json!({
+        "servers": [], "selected_server": null, "local_port": 4073,
+        "filters": [], "start_on_login": false, "on_startup": "restore_last_state",
+        "theme": "dark", "proxy_server_enabled": true, "proxy_socks5": true,
+        "proxy_http": false, "dns": AppConfig::default().dns, "local_port_http": 4074,
+        "diagnostic_plugin_tap": false
+    }))
+    .unwrap()
+}
+
+#[skuld::test]
+fn apply_ui_settings_drops_stale_selection_and_ignores_unknown() {
+    // Backend truth after a concurrent delete of "a": only "b" remains.
+    let mut current = AppConfig {
+        servers: vec![test_entry("b")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    // Stale webview snapshot still believes "a" exists and is selected.
+    let mut settings = default_ui_settings();
+    settings.servers = vec![ui_server_entry("a"), ui_server_entry("b")];
+    settings.selected_server = Some("a".to_string());
+
+    apply_ui_settings(&mut current, settings);
+
+    assert_eq!(
+        current.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["b"],
+        "the unknown stale id 'a' must not be resurrected"
+    );
+    assert_eq!(
+        current.selected_server.as_deref(),
+        Some("b"),
+        "a selection naming the concurrently-deleted server is healed"
+    );
+}
+
 // get_metrics / get_diagnostics response mapping + public-IP parsing tests ============================================
 
 /// Verify that a Metrics BridgeResponse maps to the expected JSON.

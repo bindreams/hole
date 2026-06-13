@@ -90,12 +90,21 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
+/// Apply a webview settings snapshot to `config`: merge the UI-owned portion by
+/// id (membership stays backend-owned, #504) then heal the selection so it
+/// always names a real server — a stale snapshot can name one deleted
+/// concurrently. Pure helper — `save_config` wraps it with the lock + persist.
+fn apply_ui_settings(config: &mut AppConfig, settings: crate::ui_settings::UiSettings) {
+    settings.apply(config);
+    auto_select_first_server(config);
+}
+
 #[tauri::command]
 pub fn save_config(state: State<AppState>, settings: crate::ui_settings::UiSettings) -> Result<(), String> {
     let mut current = state.config.lock().unwrap();
     // Apply to a copy so a failed save leaves in-memory state unchanged.
     let mut updated = current.clone();
-    settings.apply(&mut updated);
+    apply_ui_settings(&mut updated, settings);
     state.config_store.save(&updated).map_err(|e| {
         warn!(error = %e, path = %state.config_store.path().display(), "save_config: config save failed");
         e.to_string()
