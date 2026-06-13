@@ -274,18 +274,34 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          description: >-
+            Cumulative bytes received through the tunnel since the proxy
+            started — wire bytes on the proxied connection, including
+            cipher overhead. Includes DNS-forwarder queries carried over
+            the tunnel; bypass-routed traffic is not counted. Resets on
+            every start. 0 when stopped.
         bytes_out:
           type: integer
           format: uint64
           minimum: 0
+          description: >-
+            Cumulative bytes sent through the tunnel since the proxy
+            started. Same accounting rules as bytes_in.
         speed_in_bps:
           type: integer
           format: uint64
           minimum: 0
+          description: >-
+            Download speed in bits per second, averaged over the window
+            since the previous /v1/metrics call. 0 on the first poll
+            after a start and when stopped.
         speed_out_bps:
           type: integer
           format: uint64
           minimum: 0
+          description: >-
+            Upload speed in bits per second. Same windowing as
+            speed_in_bps.
         uptime_secs:
           type: integer
           format: uint64
