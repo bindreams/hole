@@ -123,9 +123,74 @@ pub fn bridge_binary_path() -> std::io::Result<PathBuf> {
 pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
-    use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+
+    let child = spawn_elevated(program, args)?;
+
+    // SAFETY: `child.handle()` is a valid process handle per `spawn_elevated`'s
+    // contract. WaitForSingleObject blocks until the process exits.
+    // GetExitCodeProcess reads the exit code into a stack-local u32. The
+    // handle is released by `ElevatedChild`'s Drop on all paths.
+    let exit_status: ExitStatus = unsafe {
+        let wait_result = WaitForSingleObject(child.handle(), INFINITE);
+        if wait_result != WAIT_OBJECT_0 {
+            return Err(SetupError::Io(std::io::Error::other("wait failed")));
+        }
+
+        let mut exit_code: u32 = 1;
+        GetExitCodeProcess(child.handle(), &mut exit_code)?;
+
+        ExitStatus::from_raw(exit_code)
+    };
+
+    if exit_status.success() {
+        return Ok(());
+    }
+
+    let code = exit_status.code().unwrap_or(1);
+    // ShellExecuteExW cannot redirect child stdio under UAC; no captured
+    // output available here. Callers that need diagnostics pass a path
+    // via a co-operating CLI flag (e.g. `bridge install --log-dir`) and
+    // read it back themselves — see `prompt_bridge_install`.
+    Err(SetupError::ExitCode {
+        code,
+        output: String::new(),
+        log_path: None,
+    })
+}
+
+/// Process handle returned by [`spawn_elevated`]; closed on drop.
+#[cfg(target_os = "windows")]
+pub(crate) struct ElevatedChild(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: a process HANDLE may be used and closed on any thread.
+#[cfg(target_os = "windows")]
+unsafe impl Send for ElevatedChild {}
+
+#[cfg(target_os = "windows")]
+impl ElevatedChild {
+    pub(crate) fn handle(&self) -> windows::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ElevatedChild {
+    fn drop(&mut self) {
+        // SAFETY: handle came from ShellExecuteExW(SEE_MASK_NOCLOSEPROCESS),
+        // validated non-invalid, closed exactly once.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Launch `program` elevated (UAC consent) and return without waiting.
+/// `SetupError::Cancelled` means the user declined the consent prompt.
+#[cfg(target_os = "windows")]
+pub(crate) fn spawn_elevated(program: &Path, args: &[&str]) -> Result<ElevatedChild, SetupError> {
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -146,7 +211,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     // SAFETY: `info` is fully initialized with correct `cbSize`. The HSTRING
     // values (`verb`, `file`, `params`) remain alive for the duration of the call,
     // keeping the PCWSTR pointers valid. SEE_MASK_NOCLOSEPROCESS requests a process
-    // handle in `info.hProcess` which we check and close below.
+    // handle in `info.hProcess` which we check below.
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok.is_err() {
         let err = windows::core::Error::from_thread();
@@ -164,39 +229,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
         )));
     }
 
-    // SAFETY: `handle` was obtained from a successful ShellExecuteExW call with
-    // SEE_MASK_NOCLOSEPROCESS and validated as non-invalid above, so it is a valid
-    // process handle. WaitForSingleObject blocks until the process exits.
-    // GetExitCodeProcess reads the exit code into a stack-local u32.
-    // CloseHandle is called exactly once on all paths, releasing the handle.
-    let exit_status: ExitStatus = unsafe {
-        let wait_result = WaitForSingleObject(handle, INFINITE);
-        if wait_result != WAIT_OBJECT_0 {
-            let _ = CloseHandle(handle);
-            return Err(SetupError::Io(std::io::Error::other("wait failed")));
-        }
-
-        let mut exit_code: u32 = 1;
-        GetExitCodeProcess(handle, &mut exit_code)?;
-        let _ = CloseHandle(handle);
-
-        ExitStatus::from_raw(exit_code)
-    };
-
-    if exit_status.success() {
-        return Ok(());
-    }
-
-    let code = exit_status.code().unwrap_or(1);
-    // ShellExecuteExW cannot redirect child stdio under UAC; no captured
-    // output available here. Callers that need diagnostics pass a path
-    // via a co-operating CLI flag (e.g. `bridge install --log-dir`) and
-    // read it back themselves — see `prompt_bridge_install`.
-    Err(SetupError::ExitCode {
-        code,
-        output: String::new(),
-        log_path: None,
-    })
+    Ok(ElevatedChild(handle))
 }
 
 /// Quote a single argument per the MSDN `CommandLineToArgvW` specification.

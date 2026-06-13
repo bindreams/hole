@@ -1,8 +1,8 @@
 //! Unit tests for the tray's pure decision logic (outcome mapping, the
-//! intended-enabled persist rule). The remaining handler glue (menu
-//! events, rebuilds, dialogs) requires a full Tauri app context and has
-//! no automated coverage; the Start-at-Login toggle logic is unit-tested
-//! in autostart_tests.rs.
+//! intended-enabled persist rule, the install re-entrancy gate). The
+//! remaining handler glue (menu events, rebuilds, dialogs) requires a full
+//! Tauri app context and has no automated coverage; the Start-at-Login
+//! toggle logic is unit-tested in autostart_tests.rs.
 
 use super::*;
 use crate::bridge_client::ClientError;
@@ -102,4 +102,12 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
     assert!(path.exists());
     let (_, reloaded, _) = ConfigStore::load(path, time::OffsetDateTime::UNIX_EPOCH);
     assert!(!reloaded.enabled);
+}
+
+#[skuld::test]
+fn install_guard_blocks_reentry_until_dropped() {
+    let first = try_begin_install().expect("first acquisition succeeds");
+    assert!(try_begin_install().is_none(), "concurrent acquisition is blocked");
+    drop(first);
+    assert!(try_begin_install().is_some(), "released guard can be re-acquired");
 }

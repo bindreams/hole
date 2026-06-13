@@ -288,7 +288,59 @@ pub(crate) fn dispatch(command: Command) -> ! {
     std::process::exit(code)
 }
 
+/// Pre-flight outcome for `hole upgrade` (#468). A concurrent upgrade or a
+/// running GUI would re-trigger the FilesInUse defect: the MSI can stop the
+/// bridge service via the Restart Manager, but not a windowless tray app.
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum UpgradeGate {
+    Proceed,
+    AlreadyRunning,
+    GuiAlive,
+}
+
+/// A concurrent upgrade outranks a running GUI; either blocks the upgrade.
+#[cfg(target_os = "windows")]
+fn upgrade_gate_decision(upgrade_already_running: bool, gui_alive: bool) -> UpgradeGate {
+    if upgrade_already_running {
+        UpgradeGate::AlreadyRunning
+    } else if gui_alive {
+        UpgradeGate::GuiAlive
+    } else {
+        UpgradeGate::Proceed
+    }
+}
+
 fn handle_upgrade() -> i32 {
+    // Hold the upgrade gate (atomic already-existed check) before probing
+    // for a running GUI. The msiexec run itself is serialized system-wide
+    // by Windows Installer's own _MSIExecute mutex (-> 1618).
+    #[cfg(target_os = "windows")]
+    let _upgrade_gate = {
+        let (gate, already_running) = match crate::markers::hold(&crate::markers::UPGRADE_IN_PROGRESS) {
+            Ok(held) => held,
+            Err(e) => {
+                cli_log!(error, "could not create the upgrade gate: {e}");
+                return 1;
+            }
+        };
+        let gui_alive = crate::markers::exists(&crate::markers::GUI_ALIVE);
+        match upgrade_gate_decision(already_running, gui_alive) {
+            UpgradeGate::Proceed => gate,
+            UpgradeGate::AlreadyRunning => {
+                cli_log!(error, "another `hole upgrade` is already running");
+                return 1;
+            }
+            UpgradeGate::GuiAlive => {
+                cli_log!(
+                    error,
+                    "Hole is running (possibly in another user's session); exit it from the tray menu before upgrading"
+                );
+                return 1;
+            }
+        }
+    };
+
     cli_log!(info, "checking for updates...");
     match hole::update::check_for_update() {
         Ok(Some(info)) => {
@@ -320,14 +372,34 @@ fn handle_upgrade() -> i32 {
                 return 1;
             }
 
-            cli_log!(info, "installing...");
-            if let Err(e) = hole::update::run_installer(&dest, true) {
-                cli_log!(error, "installation failed: {e}");
-                return 1;
+            #[cfg(target_os = "windows")]
+            {
+                // Hand the MSI to a detached elevated helper: UAC consent
+                // happens now; the quiet install runs after this process
+                // exits (#468).
+                let log_path = format!("{}.log", dest.display());
+                if let Err(e) = hole::update::install_for_exit(download_dir, &dest, hole::update::InstallMode::Quiet) {
+                    cli_log!(error, "installation handoff failed: {e}");
+                    return 1;
+                }
+                cli_log!(
+                    info,
+                    "v{} installs after this process exits. On failure the log is kept at {}",
+                    info.version,
+                    log_path,
+                );
+                0
             }
-
-            cli_log!(info, "updated to v{}", info.version);
-            0
+            #[cfg(target_os = "macos")]
+            {
+                cli_log!(info, "installing...");
+                if let Err(e) = hole::update::install_for_exit(download_dir, &dest, hole::update::InstallMode::Quiet) {
+                    cli_log!(error, "installation failed: {e}");
+                    return 1;
+                }
+                cli_log!(info, "updated to v{}", info.version);
+                0
+            }
         }
         Ok(None) => {
             cli_log!(info, "already up to date ({})", hole::version::VERSION);
