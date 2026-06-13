@@ -207,6 +207,20 @@ fn auto_select_first_server(config: &mut AppConfig) {
     }
 }
 
+/// Remove the server with `id` from `config` (matched by id) and heal the
+/// selection if it pointed at the removed entry. Returns whether an entry was
+/// actually removed.
+///
+/// Pure helper — no Tauri `State`, no `Mutex` — so it is unit-testable. The
+/// `#[tauri::command]` wrapper [`delete_server`] holds the lock and persists.
+fn remove_server(config: &mut AppConfig, id: &str) -> bool {
+    let before = config.servers.len();
+    config.servers.retain(|s| s.id != id);
+    let removed = config.servers.len() != before;
+    auto_select_first_server(config);
+    removed
+}
+
 /// Import servers from a config file path. Reads the file and parses it.
 ///
 /// Returns only the entries that were actually appended to the config —
@@ -237,6 +251,24 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
     })?;
 
     Ok(appended)
+}
+
+/// Delete the server with `entry_id` from the config (by id) and persist.
+///
+/// Membership is backend-owned (#504): removal is a dedicated by-id operation,
+/// like import is for addition — never a side effect of the wholesale
+/// `save_config`, which would drop servers imported concurrently. Idempotent:
+/// deleting an absent id persists the unchanged config and returns `Ok`.
+#[tauri::command]
+pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    let removed = remove_server(&mut cfg, &entry_id);
+    state.config_store.save(&cfg).map_err(|e| {
+        warn!(error = %e, path = %state.config_store.path().display(), "delete_server: config save failed");
+        e.to_string()
+    })?;
+    info!(entry_id = %entry_id, removed, remaining = cfg.servers.len(), "delete_server");
+    Ok(())
 }
 
 /// Poll the proxy's status. The exchange itself commits the observation

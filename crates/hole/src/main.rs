@@ -120,6 +120,7 @@ fn launch_gui(show_dashboard: bool) {
             commands::get_config,
             commands::save_config,
             commands::import_servers_from_file,
+            commands::delete_server,
             commands::get_proxy_status,
             commands::get_metrics,
             commands::get_diagnostics,

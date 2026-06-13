@@ -156,6 +156,74 @@ fn auto_select_noop_on_empty_servers() {
     assert!(config.selected_server.is_none());
 }
 
+// remove_server tests =================================================================================================
+
+#[skuld::test]
+fn remove_server_removes_by_id() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b"), test_entry("c")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    let removed = remove_server(&mut config, "b");
+    assert!(removed);
+    assert_eq!(
+        config.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["a", "c"]
+    );
+}
+
+#[skuld::test]
+fn remove_server_heals_selection_when_selected_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert_eq!(
+        config.selected_server.as_deref(),
+        Some("b"),
+        "selection heals to the first remaining server"
+    );
+}
+
+#[skuld::test]
+fn remove_server_keeps_selection_when_other_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert_eq!(config.selected_server.as_deref(), Some("b"));
+}
+
+#[skuld::test]
+fn remove_server_clears_selection_when_last_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert!(config.servers.is_empty());
+    assert!(config.selected_server.is_none());
+}
+
+#[skuld::test]
+fn remove_server_missing_id_is_noop() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    let removed = remove_server(&mut config, "nonexistent");
+    assert!(!removed);
+    assert_eq!(config.servers.len(), 2);
+    assert_eq!(config.selected_server.as_deref(), Some("a"));
+}
+
 // get_metrics / get_diagnostics response mapping + public-IP parsing tests ============================================
 
 /// Verify that a Metrics BridgeResponse maps to the expected JSON.
