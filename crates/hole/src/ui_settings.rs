@@ -8,6 +8,7 @@
 
 use hole_common::config::{AppConfig, DnsConfig, FilterRule, ServerEntry, StartupBehavior, Theme};
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,41 +46,52 @@ pub struct UiServerEntry {
 }
 
 impl UiSettings {
-    /// Replace the UI-owned portion of `current`, regrafting backend-owned
-    /// per-server validation by id (an entry edited under the same id keeps
-    /// its validation; a new id starts unvalidated).
+    /// Merge the UI-owned portion of the webview's snapshot into `current`.
+    ///
+    /// Membership is backend-owned (#504): additions flow through import,
+    /// removals through `delete_server`. This method therefore only updates
+    /// the UI-owned fields of servers that still exist (matched by id),
+    /// preserving backend-owned per-server `validation`. A member absent from
+    /// the payload is kept (it may have been imported after the snapshot); a
+    /// payload id absent from `current` is ignored (the UI cannot mint server
+    /// ids). `current`'s order is authoritative.
     ///
     /// Exhaustive struct literal on purpose: adding a field to `AppConfig`
     /// fails compilation here until its owner is decided.
     pub fn apply(self, current: &mut AppConfig) {
-        let servers: Vec<ServerEntry> = self
+        // Index the payload by id; first occurrence wins on duplicate ids.
+        let mut incoming: HashMap<String, UiServerEntry> = HashMap::new();
+        for s in self.servers {
+            incoming.entry(s.id.clone()).or_insert(s);
+        }
+
+        let servers: Vec<ServerEntry> = current
             .servers
-            .into_iter()
-            .map(|s| {
-                let validation = current
-                    .servers
-                    .iter()
-                    .find(|c| c.id == s.id)
-                    .and_then(|c| c.validation.clone());
-                ServerEntry {
-                    id: s.id,
-                    name: s.name,
-                    server: s.server,
-                    server_port: s.server_port,
-                    method: s.method,
-                    password: s.password,
-                    plugin: s.plugin,
-                    plugin_opts: s.plugin_opts,
-                    validation,
-                }
+            .iter()
+            .map(|c| match incoming.get(&c.id) {
+                Some(ui) => ServerEntry {
+                    id: c.id.clone(),
+                    name: ui.name.clone(),
+                    server: ui.server.clone(),
+                    server_port: ui.server_port,
+                    method: ui.method.clone(),
+                    password: ui.password.clone(),
+                    plugin: ui.plugin.clone(),
+                    plugin_opts: ui.plugin_opts.clone(),
+                    // Backend-owned — preserved.
+                    validation: c.validation.clone(),
+                },
+                None => c.clone(),
             })
             .collect();
+
         *current = AppConfig {
             // Backend-owned — preserved from in-memory state.
             enabled: current.enabled,
             elevation_prompt_shown: current.elevation_prompt_shown,
-            // UI-owned — replaced wholesale.
+            // Membership backend-owned; UI-owned fields merged by id above.
             servers,
+            // UI-owned — replaced wholesale.
             selected_server: self.selected_server,
             local_port: self.local_port,
             filters: self.filters,

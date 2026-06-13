@@ -93,29 +93,102 @@ fn apply_preserves_backend_owned_fields() {
     assert!(current.elevation_prompt_shown);
 }
 
+// Membership is backend-owned (#504): apply merges UI-owned fields by id and
+// can neither add nor drop members.
+
 #[skuld::test]
-fn apply_regrafts_validation_by_id() {
+fn apply_keeps_servers_absent_from_payload() {
+    // Backend imported "c" after the webview took its snapshot; the stale
+    // save payload only knows "a" and "b". "c" must survive (#504).
     let mut current = AppConfig {
-        servers: vec![validated("a"), entry("b")],
+        servers: vec![entry("a"), entry("b"), entry("c")],
+        selected_server: Some("a".into()),
         ..Default::default()
     };
     let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
-    // UI kept "a" (edited its name), added "c", dropped "b".
-    settings.servers = vec![
-        UiServerEntry {
-            name: "Renamed".into(),
-            ..ui_entry("a")
-        },
-        ui_entry("c"),
-    ];
+    settings.servers = vec![ui_entry("a"), ui_entry("b")];
     settings.apply(&mut current);
-    assert_eq!(current.servers.len(), 2);
-    assert_eq!(current.servers[0].name, "Renamed");
+    assert_eq!(
+        current.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["a", "b", "c"],
+        "a server absent from the stale payload must not be dropped; order preserved"
+    );
+}
+
+#[skuld::test]
+fn apply_ignores_payload_ids_absent_from_current() {
+    // The UI cannot mint server ids; a payload entry the backend never had
+    // (e.g. a server deleted concurrently) must not be resurrected.
+    let mut current = AppConfig {
+        servers: vec![entry("a")],
+        ..Default::default()
+    };
+    let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
+    settings.servers = vec![ui_entry("a"), ui_entry("ghost")];
+    settings.apply(&mut current);
+    assert_eq!(
+        current.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["a"],
+        "unknown payload id must be ignored"
+    );
+}
+
+#[skuld::test]
+fn apply_updates_ui_fields_by_id_keeping_validation() {
+    let mut current = AppConfig {
+        servers: vec![validated("a")],
+        ..Default::default()
+    };
+    let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
+    settings.servers = vec![UiServerEntry {
+        name: "Renamed".into(),
+        ..ui_entry("a")
+    }];
+    settings.apply(&mut current);
+    assert_eq!(current.servers.len(), 1);
+    assert_eq!(current.servers[0].name, "Renamed", "UI-owned field updated by id");
     assert!(
         current.servers[0].validation.is_some(),
-        "validation survives an edit under the same id"
+        "backend-owned validation preserved"
     );
-    assert!(current.servers[1].validation.is_none(), "new entry starts unvalidated");
+}
+
+#[skuld::test]
+fn apply_duplicate_incoming_ids_update_single_member() {
+    // The UI should never send duplicate ids, but if it does, membership still
+    // comes from `current` (one member) and the first payload occurrence wins
+    // for its fields.
+    let mut current = AppConfig {
+        servers: vec![validated("a")],
+        ..Default::default()
+    };
+    let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
+    settings.servers = vec![ui_entry("a"), ui_entry("a")];
+    settings.apply(&mut current);
+    assert_eq!(
+        current.servers.len(),
+        1,
+        "membership comes from current, not the payload"
+    );
+    assert!(current.servers[0].validation.is_some(), "validation preserved");
+}
+
+#[skuld::test]
+fn apply_keeps_current_order_ignoring_payload_order() {
+    // `current` order is authoritative; iterating the payload (as the old
+    // wholesale-replace did) would let a reordered snapshot reorder the list.
+    let mut current = AppConfig {
+        servers: vec![entry("a"), entry("b")],
+        ..Default::default()
+    };
+    let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
+    settings.servers = vec![ui_entry("b"), ui_entry("a")]; // reversed
+    settings.apply(&mut current);
+    assert_eq!(
+        current.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["a", "b"],
+        "payload order must not reorder the authoritative list"
+    );
 }
 
 #[skuld::test]
@@ -126,17 +199,4 @@ fn apply_replaces_ui_owned_fields() {
     let settings: UiSettings = serde_json::from_value(json).unwrap();
     settings.apply(&mut current);
     assert_eq!(current.local_port, 5555);
-}
-
-#[skuld::test]
-fn apply_first_match_wins_for_duplicate_incoming_ids() {
-    let mut current = AppConfig {
-        servers: vec![validated("a")],
-        ..Default::default()
-    };
-    let mut settings: UiSettings = serde_json::from_value(default_settings_json()).unwrap();
-    settings.servers = vec![ui_entry("a"), ui_entry("a")];
-    settings.apply(&mut current);
-    assert!(current.servers[0].validation.is_some());
-    assert!(current.servers[1].validation.is_some()); // both graft from the same current entry
 }
