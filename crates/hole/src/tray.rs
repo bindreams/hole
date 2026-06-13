@@ -563,7 +563,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
 
 // Window event handler ================================================================================================
 
-/// Handle events from the settings window menu bar. See `handle_tray_event` for why this is separate.
+/// Handle events from the dashboard window menu bar. See `handle_tray_event` for why this is separate.
 fn handle_window_menu_event(window: &tauri::Window, event: MenuEvent) {
     let app = window.app_handle();
     match event.id().as_ref() {
@@ -947,7 +947,7 @@ fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindo
             crate::platform::show_dock_icon(app);
         }
         Err(e) => {
-            error!(error = %e, "failed to open settings window");
+            error!(error = %e, "failed to open dashboard window");
             dashboard.forget(generation);
         }
     }

@@ -58,3 +58,27 @@ fn dashboard_close_then_reopen_during_teardown_keeps_new_window() {
     assert_eq!(b_label, "dashboard-1");
     assert_eq!(dash.current_label(), Some("dashboard-1".to_string()));
 }
+
+#[skuld::test]
+fn dashboard_forget_unallocated_generation_is_noop() {
+    let dash = DashboardWindow::new();
+    dash.forget(0);
+    assert_eq!(dash.current_label(), None);
+}
+
+#[skuld::test]
+fn dashboard_double_forget_current_is_idempotent() {
+    let dash = DashboardWindow::new();
+    let (g, _) = dash.allocate();
+    dash.forget(g);
+    dash.forget(g);
+    assert_eq!(dash.current_label(), None);
+}
+
+#[skuld::test]
+fn dashboard_label_matches_capability_glob_prefix() {
+    // Labels must match the `dashboard-*` glob in capabilities/default.json.
+    assert_eq!(label_for(0), "dashboard-0");
+    assert_eq!(label_for(42), "dashboard-42");
+    assert!(label_for(7).starts_with("dashboard-"));
+}
