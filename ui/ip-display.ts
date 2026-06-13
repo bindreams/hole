@@ -34,6 +34,14 @@ export async function updatePublicIp(): Promise<void> {
     }
   } catch (err) {
     console.error("get_public_ip failed:", err);
+    // Never keep a possibly pre-VPN value on failure (#464): clear the
+    // copyable IP and show a placeholder distinct from the empty-success
+    // "unknown".
+    currentIp = "";
+    if (countryFlag) setCountryFlag(countryFlag, "");
+    if (ipText && countryFlag) {
+      ipText.replaceChildren(countryFlag, document.createTextNode(" --"));
+    }
   }
 }
 

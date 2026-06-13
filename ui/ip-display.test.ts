@@ -42,6 +42,30 @@ describe("updatePublicIp", () => {
     expect(flag.title).toBe("Unknown");
     expect(document.getElementById("ip-text")!.textContent).toContain("unknown");
   });
+
+  it("replaces a stale IP with '--' and clears the copyable value when the fetch fails", async () => {
+    // A good fetch populates the badge + currentIp...
+    invokeMock.mockResolvedValueOnce({ ip: "1.2.3.4", country_code: "DE" });
+    const { initIpDisplay, updatePublicIp } = await import("./ip-display");
+    initIpDisplay();
+    await updatePublicIp();
+    expect(document.getElementById("ip-text")!.textContent).toContain("1.2.3.4");
+
+    // ...a failing fetch must NOT keep it — show the placeholder instead.
+    invokeMock.mockRejectedValueOnce(new Error("fetch failed"));
+    await updatePublicIp();
+    const flag = document.getElementById("country-flag")!;
+    expect(flag.classList.contains("fi-xx")).toBe(true);
+    const text = document.getElementById("ip-text")!.textContent!;
+    expect(text).toContain("--");
+    expect(text).not.toContain("1.2.3.4");
+
+    // currentIp was cleared → copy is a no-op.
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    document.getElementById("copy-ip-btn")!.click();
+    expect(writeText).not.toHaveBeenCalled();
+  });
 });
 
 describe("copy button", () => {
