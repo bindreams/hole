@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mainMock: {
   config: Record<string, unknown> | null;
   saveConfig: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
+  loadConfig: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<void>>>;
 } = {
   config: null,
   saveConfig: vi.fn().mockResolvedValue(undefined),
+  loadConfig: vi.fn().mockResolvedValue(undefined),
 };
 const updateDiagnostics = vi.fn();
 const invokeMock = vi.fn<(...args: unknown[]) => Promise<unknown>>();
@@ -17,7 +19,7 @@ vi.mock("./main", () => ({
     return mainMock.config;
   },
   saveConfig: (...args: unknown[]) => mainMock.saveConfig(...args),
-  loadConfig: vi.fn(),
+  loadConfig: (...args: unknown[]) => mainMock.loadConfig(...args),
   runTestsBounded: vi.fn(),
   TEST_CONCURRENCY: 3,
 }));
@@ -31,6 +33,7 @@ function server(id: string, name: string) {
 
 beforeEach(() => {
   mainMock.saveConfig.mockClear();
+  mainMock.loadConfig.mockClear();
   updateDiagnostics.mockClear();
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
@@ -107,6 +110,37 @@ describe("server delete control", () => {
     outside.focus();
     document.querySelectorAll<HTMLElement>(".srv-del")[1].click();
     expect(document.activeElement).toBe(outside);
+  });
+
+  it("persists the deletion via delete_server, not a wholesale save", async () => {
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelectorAll<HTMLElement>(".srv-del")[1].click(); // delete Beta
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("delete_server", { entryId: "b" }));
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+    expect(mainMock.loadConfig).toHaveBeenCalled();
+  });
+
+  it("restores via loadConfig and toasts when delete_server fails", async () => {
+    invokeMock.mockRejectedValueOnce("backend exploded");
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelectorAll<HTMLElement>(".srv-del")[1].click();
+    await vi.waitFor(() =>
+      expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("backend exploded"), "error"),
+    );
+    expect(mainMock.loadConfig).toHaveBeenCalled();
+  });
+
+  it("optimistically moves selection when the selected server is deleted", async () => {
+    // Fixture: "a" (Alpha) is selected; servers are [a, b, c].
+    const { renderServers } = await import("./servers");
+    renderServers();
+    document.querySelectorAll<HTMLElement>(".srv-del")[0].click(); // delete the selected "a"
+    // Synchronous (pre-await) optimistic update: selection moves to the first
+    // remaining server before the by-id delete + reload land.
+    expect(mainMock.config!.selected_server).toBe("b");
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("delete_server", { entryId: "a" }));
   });
 });
 

@@ -90,12 +90,21 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
+/// Apply a webview settings snapshot to `config`: merge the UI-owned portion by
+/// id (membership stays backend-owned, #504) then heal the selection so it
+/// always names a real server — a stale snapshot can name one deleted
+/// concurrently. Pure helper — `save_config` wraps it with the lock + persist.
+fn apply_ui_settings(config: &mut AppConfig, settings: crate::ui_settings::UiSettings) {
+    settings.apply(config);
+    auto_select_first_server(config);
+}
+
 #[tauri::command]
 pub fn save_config(state: State<AppState>, settings: crate::ui_settings::UiSettings) -> Result<(), String> {
     let mut current = state.config.lock().unwrap();
     // Apply to a copy so a failed save leaves in-memory state unchanged.
     let mut updated = current.clone();
-    settings.apply(&mut updated);
+    apply_ui_settings(&mut updated, settings);
     state.config_store.save(&updated).map_err(|e| {
         warn!(error = %e, path = %state.config_store.path().display(), "save_config: config save failed");
         e.to_string()
@@ -207,6 +216,20 @@ fn auto_select_first_server(config: &mut AppConfig) {
     }
 }
 
+/// Remove the server with `id` from `config` (matched by id) and heal the
+/// selection if it pointed at the removed entry. Returns whether an entry was
+/// actually removed.
+///
+/// Pure helper — no Tauri `State`, no `Mutex` — so it is unit-testable. The
+/// `#[tauri::command]` wrapper [`delete_server`] holds the lock and persists.
+fn remove_server(config: &mut AppConfig, id: &str) -> bool {
+    let before = config.servers.len();
+    config.servers.retain(|s| s.id != id);
+    let removed = config.servers.len() != before;
+    auto_select_first_server(config);
+    removed
+}
+
 /// Import servers from a config file path. Reads the file and parses it.
 ///
 /// Returns only the entries that were actually appended to the config —
@@ -228,15 +251,39 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
         warn!(path = %path, error = ?e, "import_servers_from_file: validate/parse failed");
     })?;
 
-    let mut config = state.config.lock().unwrap();
-    let (appended, _deduped) = apply_import(&mut config, parsed);
+    let mut current = state.config.lock().unwrap();
+    // Apply to a copy so a failed save leaves in-memory state unchanged.
+    let mut updated = current.clone();
+    let (appended, _deduped) = apply_import(&mut updated, parsed);
 
-    state.config_store.save(&config).map_err(|e| {
+    state.config_store.save(&updated).map_err(|e| {
         warn!(error = %e, path = %state.config_store.path().display(), "import_servers_from_file: config save failed");
         ImportFailure::SaveFailed
     })?;
+    *current = updated;
 
     Ok(appended)
+}
+
+/// Delete the server with `entry_id` from the config (by id) and persist.
+///
+/// Membership is backend-owned (#504): removal is a dedicated by-id operation,
+/// like import is for addition — never a side effect of the wholesale
+/// `save_config`, which would drop servers imported concurrently. Idempotent:
+/// deleting an absent id persists the unchanged config and returns `Ok`.
+#[tauri::command]
+pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), String> {
+    let mut current = state.config.lock().unwrap();
+    // Apply to a copy so a failed save leaves in-memory state unchanged.
+    let mut updated = current.clone();
+    let removed = remove_server(&mut updated, &entry_id);
+    state.config_store.save(&updated).map_err(|e| {
+        warn!(error = %e, path = %state.config_store.path().display(), "delete_server: config save failed");
+        e.to_string()
+    })?;
+    *current = updated;
+    info!(entry_id = %entry_id, removed, remaining = current.servers.len(), "delete_server");
+    Ok(())
 }
 
 /// Poll the proxy's status. The exchange itself commits the observation
