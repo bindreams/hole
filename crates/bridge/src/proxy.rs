@@ -38,6 +38,17 @@ pub(crate) use config::resolve_plugin_path_inner;
 
 // Trait surface =======================================================================================================
 
+/// Cumulative tunnel-traffic byte totals since the running proxy started.
+///
+/// Wire bytes on the proxied connection (including cipher overhead) —
+/// what the tunnel actually carried. `bytes_in` = received from the
+/// remote (download), `bytes_out` = sent to it (upload).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficTotals {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
 /// A proxy tunnel implementation.
 ///
 /// Calling [`start`](Self::start) spawns a fresh running-proxy handle
@@ -70,6 +81,10 @@ pub trait Proxy: Send + Sync {
 pub trait RunningProxy: Send + Sync {
     /// Cheap, synchronous check: is the underlying task still running?
     fn is_alive(&self) -> bool;
+
+    /// Cheap, synchronous snapshot of cumulative tunnel-traffic totals
+    /// since this proxy started.
+    fn traffic_totals(&self) -> TrafficTotals;
 
     /// Graceful shutdown: abort the task and await its result so errors
     /// can be reported to the caller. Idempotent with respect to

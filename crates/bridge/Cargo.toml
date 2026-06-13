@@ -105,7 +105,13 @@ hole-test-observability = { path = "../test-observability" }
 # sweep-wiring assertion in foreground_tests. The production dep above
 # does not enable test-utils; this override adds it for tests only.
 garter = { path = "../garter", features = ["test-utils"] }
-tokio = { version = "1", features = ["test-util"] }
+# Kill-group child spawn for the CTRL_BREAK shutdown-delivery test
+# (CREATE_NEW_PROCESS_GROUP + group signal). See foreground_tests.rs.
+kill-group = { path = "../kill-group" }
+# `process` is enabled NOWHERE in the bridge's tokio features today (main
+# dep: rt-multi-thread/macros/sync/signal/io-util/net; dev-dep: test-util) —
+# the child-process test below needs it.
+tokio = { version = "1", features = ["test-util", "process"] }
 # In-process log capture in tests — verifies diagnostic spans /
 # `elapsed_ms` debug logs (#247) and the forwarder's typed-error log
 # lines (layer=..., caused_by=...) added for #248.

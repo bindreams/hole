@@ -4,13 +4,13 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::*;
-use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -36,6 +36,12 @@ struct MockProxyState {
     /// which local instances a start produced (e.g. the pure-VPN
     /// internal ephemeral SOCKS5 instance, #459).
     last_config: std::sync::Mutex<Option<shadowsocks_service::config::Config>>,
+    /// Cumulative traffic counters surfaced via `MockRunning::traffic_totals`.
+    /// Tests `fetch_add` to simulate tunnel traffic. Zeroed on every
+    /// successful `start`, mirroring the fresh `FlowStat` a new
+    /// shadowsocks `Server` creates.
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
 }
 
 struct MockProxy {
@@ -77,7 +83,7 @@ impl MockProxy {
         self
     }
 
-    fn start_calls_handle(&self) -> Arc<MockProxyState> {
+    fn state_handle(&self) -> Arc<MockProxyState> {
         Arc::clone(&self.state)
     }
 }
@@ -98,6 +104,10 @@ impl Proxy for MockProxy {
         if self.state.fail_start.load(Ordering::SeqCst) {
             return Err(ProxyError::Runtime(io::Error::other("mock start failure")));
         }
+        // Fresh session ⇒ fresh counters (production: a new Server
+        // creates a new FlowStat).
+        self.state.bytes_in.store(0, Ordering::SeqCst);
+        self.state.bytes_out.store(0, Ordering::SeqCst);
         // Spawn a long-sleeping task to simulate a running proxy so the
         // returned handle reports `is_alive()` realistically.
         let handle = tokio::spawn(async {
@@ -129,6 +139,13 @@ impl RunningProxy for MockRunning {
             h.abort();
         }
         Ok(())
+    }
+
+    fn traffic_totals(&self) -> TrafficTotals {
+        TrafficTotals {
+            bytes_in: self.state.bytes_in.load(Ordering::SeqCst),
+            bytes_out: self.state.bytes_out.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -378,7 +395,7 @@ fn start_when_running_returns_already_running() {
 fn reload_with_same_server_hot_swaps_rules() {
     rt().block_on(async {
         let backend = MockProxy::new();
-        let state = backend.start_calls_handle();
+        let state = backend.state_handle();
 
         let (mut pm, _dir) = new_manager(backend);
         pm.start(&test_config()).await.unwrap();
@@ -405,7 +422,7 @@ fn reload_with_same_server_hot_swaps_rules() {
 fn reload_with_different_server_restarts() {
     rt().block_on(async {
         let backend = MockProxy::new();
-        let state = backend.start_calls_handle();
+        let state = backend.state_handle();
 
         let (mut pm, _dir) = new_manager(backend);
         pm.start(&test_config()).await.unwrap();
@@ -440,7 +457,7 @@ fn start_failure_stays_stopped() {
 fn route_failure_rolls_back_proxy() {
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let proxy_state = proxy.start_calls_handle();
+        let proxy_state = proxy.state_handle();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::failing_install(dir.path().to_path_buf());
         let routing_state = routing.state();
@@ -464,7 +481,7 @@ fn route_failure_rolls_back_proxy() {
 fn check_health_detects_crashed_task() {
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let state = proxy.start_calls_handle();
+        let state = proxy.state_handle();
 
         let (mut pm, _dir) = new_manager(proxy);
         pm.start(&test_config()).await.unwrap();
@@ -488,7 +505,7 @@ fn check_health_clears_active_config_so_reload_restarts() {
     // of starting a new proxy.
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let state = proxy.start_calls_handle();
+        let state = proxy.state_handle();
 
         let (mut pm, _dir) = new_manager(proxy);
         pm.start(&test_config()).await.unwrap();
@@ -541,6 +558,100 @@ fn uptime_increases_while_running() {
         pm.stop().await.unwrap();
         // After stop, uptime should be 0
         assert_eq!(pm.uptime_secs(), 0);
+    });
+}
+
+// Traffic metrics =====================================================================================================
+
+#[skuld::test]
+fn sample_traffic_is_none_when_stopped() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        assert!(pm.sample_traffic().is_none());
+    });
+}
+
+#[skuld::test]
+fn sample_traffic_reports_cumulative_totals() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.bytes_in.fetch_add(1_048_576, Ordering::SeqCst);
+        state.bytes_out.fetch_add(65_536, Ordering::SeqCst);
+
+        let m = pm.sample_traffic().expect("running");
+        assert_eq!(m.totals.bytes_in, 1_048_576);
+        assert_eq!(m.totals.bytes_out, 65_536);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn sample_traffic_speed_is_zero_on_first_sample() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+        state.bytes_in.fetch_add(10_000, Ordering::SeqCst);
+
+        let m = pm.sample_traffic().expect("running");
+        assert_eq!(m.speed_in_bps, 0, "no window exists before the first sample");
+        assert_eq!(m.speed_out_bps, 0);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+async fn sample_traffic_computes_speed_over_window() {
+    // Current-thread runtime (skuld async) + paused clock: the window's
+    // tokio::time::Instant advances exactly 1s, so the speeds are exact.
+    tokio::time::pause();
+    let proxy = MockProxy::new();
+    let state = proxy.state_handle();
+    let (mut pm, _dir) = new_manager(proxy);
+    pm.start(&test_config()).await.unwrap();
+    let _ = pm.sample_traffic().expect("running"); // establish the window at totals (0, 0)
+
+    state.bytes_in.fetch_add(1_000_000, Ordering::SeqCst);
+    state.bytes_out.fetch_add(500_000, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+
+    let m = pm.sample_traffic().expect("running");
+    assert_eq!(m.speed_in_bps, 8_000_000, "1_000_000 bytes over exactly 1s");
+    assert_eq!(m.speed_out_bps, 4_000_000);
+
+    pm.stop().await.unwrap();
+}
+
+#[skuld::test]
+fn sample_traffic_resets_on_restart() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+        let _ = pm.sample_traffic().expect("running");
+        state.bytes_in.fetch_add(1_000, Ordering::SeqCst);
+        pm.stop().await.unwrap();
+
+        // MockProxy::start zeroes the counters, mirroring the fresh
+        // FlowStat a new shadowsocks Server creates.
+        pm.start(&test_config()).await.unwrap();
+        let m = pm.sample_traffic().expect("running");
+        assert_eq!(m.totals, TrafficTotals::default(), "fresh session inherits no totals");
+        assert_eq!(
+            (m.speed_in_bps, m.speed_out_bps),
+            (0, 0),
+            "fresh session inherits no window"
+        );
+
+        pm.stop().await.unwrap();
     });
 }
 
@@ -860,7 +971,7 @@ fn start_cancellable_dropped_future_runs_guards() {
 fn pure_vpn_start_binds_internal_ephemeral_socks5() {
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let state = proxy.start_calls_handle();
+        let state = proxy.state_handle();
         let (mut pm, _dir) = new_manager(proxy);
         let mut config = test_config();
         config.proxy_socks5 = false;
@@ -924,7 +1035,7 @@ fn reload_creates_fresh_uncancellable_token() {
     // reload path still works after the cancellation refactor.
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let state = proxy.start_calls_handle();
+        let state = proxy.state_handle();
 
         let (mut pm, _dir) = new_manager(proxy);
         pm.start(&test_config()).await.unwrap();
@@ -945,7 +1056,7 @@ fn reload_creates_fresh_uncancellable_token() {
 fn reload_when_not_running_starts() {
     rt().block_on(async {
         let proxy = MockProxy::new();
-        let state = proxy.start_calls_handle();
+        let state = proxy.state_handle();
 
         let (mut pm, _dir) = new_manager(proxy);
         assert_eq!(pm.state(), ProxyState::Stopped);

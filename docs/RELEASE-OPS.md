@@ -1,6 +1,6 @@
 # Release operations runbook
 
-Per-product release procedure: see [CLAUDE.md § Releases](../CLAUDE.md#releases). This file is the runbook for the off-happy-path operations: rollback, minisign key rotation, and the crates.io dry-run staleness gap.
+Per-product release procedure: see [CONTRIBUTING.md § Releases](../CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, the crates.io dry-run staleness gap — plus the manual kill-group publish.
 
 ## Rollback procedure
 
@@ -25,12 +25,12 @@ Use when a release is published but later determined defective (broken binary, r
 
 For a **draft** release (e.g. a failed `garter` publish), `gh release delete` destroys the release AND the tag together (drafts hold tags in release metadata, not as real git refs). The `git tag -d` step will fail with "tag not found" — expected.
 
-### `garter` track only — yank from crates.io
+### crates.io tracks (`garter`, `kill-group`) — yank
 
-`garter` is the only crate published to crates.io. After completing the all-tracks steps above, yank the crates.io version:
+After completing the all-tracks steps above, yank the crates.io version:
 
 ```bash
-cargo yank --version <X.Y.Z> garter
+cargo yank --version <X.Y.Z> <crate>
 ```
 
 What yank does and doesn't do:
@@ -38,7 +38,7 @@ What yank does and doesn't do:
 - Prevents new `Cargo.toml` entries from resolving to the yanked version.
 - Does NOT delete the version. Existing `Cargo.lock` files still resolve it via sparse registry / `cargo fetch`.
 - **Permanently consumes the version number.** A subsequent `cargo publish` of the same `X.Y.Z` is rejected by crates.io; the hotfix MUST use a strictly greater version.
-- `cargo yank --version <X.Y.Z> --undo garter` un-yanks. Avoid using this after a hotfix is published — it leaves two versions installable and confuses downstream resolution.
+- `cargo yank --version <X.Y.Z> --undo <crate>` un-yanks. Avoid using this after a hotfix is published — it leaves two versions installable and confuses downstream resolution.
 
 ### `hole` track only — auto-updater consideration
 
@@ -96,6 +96,22 @@ On publish failure:
    - **Persistent issue** (yanked dep, breaking registry change): the draft is salvageable only after the underlying `Cargo.toml` is patched. Pin around the issue (e.g. `tokio = "=1.41.0"` to lock to the previous-good version), bump garter's version per the group rules, abandon the existing draft (`gh release delete` per the rollback procedure above), and cut a new draft against the patched commit.
 
 The publish workflow's idempotency check (`already_published` query) protects against **double-publishing** the same version, NOT against repeated-failure publishes — a yanked-dep failure will reproduce on every re-run until the upstream resolution lands.
+
+## kill-group (manual publish)
+
+`kill-group` has no draft/publish workflow pair: the reusable publish workflow ([reusable-publish-release.yaml](../.github/workflows/reusable-publish-release.yaml)) requires a pre-existing draft release with binary assets, and a crates.io-only lib has none. Add a workflow pair if kill-group ever grows binary artifacts.
+
+To release:
+
+```bash
+git tag releases/kill-group/v<X.Y.Z>
+git push origin releases/kill-group/v<X.Y.Z>
+cargo publish -p kill-group
+```
+
+Re-running `cargo publish` on an already-published version fails harmlessly — the same property the garter publish workflow's idempotency check relies on.
+
+**Ordering (load-bearing):** kill-group must be on crates.io at the version garter's `Cargo.toml` names **before** any garter publish — `cargo publish -p garter` fails otherwise.
 
 ## Track interactions
 

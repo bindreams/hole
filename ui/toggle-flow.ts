@@ -44,7 +44,9 @@ export interface ToggleDeps {
   loadConfig(): Promise<void>;
 }
 
-/// Issue `toggle_proxy` and apply the resulting state transition.
+/// Issue `start_proxy`/`stop_proxy` — explicit intent on the wire, so
+/// the backend never re-derives direction from its own possibly-stale
+/// state (#462) — and apply the resulting state transition.
 ///
 /// The UI stays in `connecting`/`disconnecting` until the bridge IPC
 /// returns. There is no client-side timeout: the bridge supports
@@ -56,11 +58,12 @@ export interface ToggleDeps {
 export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps): Promise<void> {
   deps.setState(goingToConnect ? "connecting" : "disconnecting");
 
+  const command = goingToConnect ? "start_proxy" : "stop_proxy";
   let outcome: ToggleOutcome;
   try {
-    outcome = await deps.invoke<ToggleOutcome>("toggle_proxy");
+    outcome = await deps.invoke<ToggleOutcome>(command);
   } catch (error) {
-    console.error("toggle_proxy failed:", error);
+    console.error(`${command} failed:`, error);
     const spec = toggleFailureToast({ error });
     deps.showToast(spec.message, spec.kind);
     deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
@@ -76,7 +79,7 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
     console.info("cancel raced with successful start — firing follow-up stop");
     deps.setState("disconnecting");
     try {
-      const stopOutcome = await deps.invoke<ToggleOutcome>("toggle_proxy");
+      const stopOutcome = await deps.invoke<ToggleOutcome>("stop_proxy");
       deps.setState(stateForToggleOutcome(stopOutcome));
     } catch (err) {
       console.error("follow-up stop failed:", err);

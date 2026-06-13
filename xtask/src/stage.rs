@@ -8,7 +8,7 @@
 //!
 //! This logic was previously duplicated in
 //! `msi-installer/src/msi_installer/__init__.py:link_or_copy()` and (via
-//! `shutil.copy2`) in `scripts/dev.py`. See issue #143.
+//! `shutil.copy2`) in the late `scripts/dev.py`. See issue #143.
 
 use std::path::Path;
 

@@ -20,7 +20,7 @@
 //! crate whose version lives in `crates/ex-ray/version.toml`. The
 //! dispatcher entry point [`cargo_toml_version_for_group`] reads that file
 //! via [`crate::ex_ray_version::read_version`]; otherwise `ex-ray` is a
-//! plain-semver group validated identically to hole/garter/galoshes
+//! plain-semver group validated identically to the Cargo.toml groups
 //! (`is_valid_next` one-bump-ahead rule, strict `releases/ex-ray/v<X.Y.Z>`
 //! tags).
 
@@ -33,13 +33,14 @@ use semver::Version;
 
 // Group ===============================================================================================================
 
-/// One of the four product release groups.
+/// One of the five product release groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Group {
     Hole,
     Garter,
     Galoshes,
     ExRay,
+    KillGroup,
 }
 
 impl Group {
@@ -49,6 +50,7 @@ impl Group {
             Self::Garter => "garter",
             Self::Galoshes => "galoshes",
             Self::ExRay => "ex-ray",
+            Self::KillGroup => "kill-group",
         }
     }
 
@@ -58,12 +60,13 @@ impl Group {
             "garter" => Ok(Self::Garter),
             "galoshes" => Ok(Self::Galoshes),
             "ex-ray" => Ok(Self::ExRay),
-            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, ex-ray)"),
+            "kill-group" => Ok(Self::KillGroup),
+            _ => bail!("unknown release group '{s}' (expected: hole, garter, galoshes, ex-ray, kill-group)"),
         }
     }
 
     pub fn all() -> &'static [Group] {
-        &[Self::Hole, Self::Garter, Self::Galoshes, Self::ExRay]
+        &[Self::Hole, Self::Garter, Self::Galoshes, Self::ExRay, Self::KillGroup]
     }
 
     /// `git describe --match <this>` glob for nearest-tag lookups for this
@@ -215,9 +218,9 @@ fn parse_strict_version(package: &toml::Table, cargo_path: &Path) -> Result<Vers
 
 /// Convenience: return the version for `group`.
 ///
-/// For Cargo.toml-based groups (Hole, Garter, Galoshes), reads workspace
-/// members via `read_workspace_versions`. For `Group::ExRay` (a Go crate
-/// with no Cargo.toml), delegates to
+/// For Cargo.toml-based groups (Hole, Garter, Galoshes, KillGroup),
+/// reads workspace members via `read_workspace_versions`. For
+/// `Group::ExRay` (a Go crate with no Cargo.toml), delegates to
 /// [`crate::ex_ray_version::read_version`] which reads
 /// `crates/ex-ray/version.toml`. Both paths return plain strict semver.
 pub fn cargo_toml_version_for_group(repo_root: &Path, group: Group) -> Result<Version> {
@@ -315,11 +318,10 @@ fn parse_tag_to_version(tag: &str, group: Group) -> Result<Version> {
 
 /// Validate the group's declared version against the relevant tag(s).
 ///
-/// Applies uniformly to all four groups (Hole, Garter, Galoshes, ExRay).
-/// The only per-group difference is the version source —
-/// [`cargo_toml_version_for_group`] reads Cargo.toml for the first three
-/// and `crates/ex-ray/version.toml` for ExRay — after which the rules are
-/// identical:
+/// Applies uniformly to all release groups. The only per-group difference
+/// is the version source — [`cargo_toml_version_for_group`] reads
+/// Cargo.toml for the Rust groups and `crates/ex-ray/version.toml` for
+/// ExRay — after which the rules are identical:
 /// - With `exact`: declared version must equal the nearest ancestor tag.
 /// - Without `exact`: equality or one-patch/minor/major-bump ahead per
 ///   [`is_valid_next`]. Bootstrap state (no tag yet) is permissive.

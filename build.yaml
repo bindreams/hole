@@ -67,13 +67,12 @@ targets:
     # via msi-installer / tauri, which run their own `cargo build --release`
     # — so `hole` itself is what you build for development and tests.
     #
-    # `cargo xtask run hole` launches dev mode via scripts/dev.py. dev.py
-    # itself runs `cargo xtask build hole` internally, but the build cascade
-    # above will have just executed it, so dev.py's own invocation no-ops via
-    # cargo's incremental cache. Cheap, no special handling needed. dev.py
-    # itself runs unprivileged and elevates only the bridge — via sudo on
-    # POSIX (prompts for your password), inheriting the elevated token on
-    # Windows (#452).
+    # `cargo xtask run hole` launches dev mode via the dev-console crate.
+    # dev-console runs `cargo xtask build hole` internally so `cargo run -p
+    # dev-console` also works standalone; after this target's build cascade
+    # that inner build is an incremental no-op. dev-console runs unprivileged
+    # and elevates only the bridge — via sudo on POSIX (prompts for your
+    # password), inheriting the elevated token on Windows (#452, #454).
     #
     # `--no-default-features` keeps Tauri's `cfg(dev) = true` so the webview
     # loads from the Vite dev server (`http://localhost:1420`) instead of
@@ -85,7 +84,7 @@ targets:
     build:
       - cargo build --workspace --no-default-features --features tombstone/crash-dumps
       - cargo xtask stage --profile debug --out-dir target/debug/dist
-    run: uv run scripts/dev.py
+    run: cargo run --package dev-console --quiet
 
   hole-msi:
     # NOT a dependent of `hole`. The msi-installer Python entry point does its
@@ -150,19 +149,6 @@ targets:
   # ===== Test targets =======================================================
   # `build:` compiles test binaries (--no-run); `run:` is the canonical local
   # nextest invocation. CI may diverge from it (see the header note above).
-
-  scripts-tests:
-    # Unit tests for the dev/admin Python scripts (scripts/dev_tests.py).
-    # Platforms wide-open (like prek/frontend-check) so a dev on ANY host can
-    # `cargo xtask run scripts-tests`; the tests are platform-agnostic
-    # (prefix_stream) or take the platform as a parameter (privilege helpers).
-    # CI pins its own runner (the test-scripts job runs `uv run` directly on
-    # ubuntu), so this `platforms:` only governs local host-applicability.
-    # Previously local-only; wiring it gives the tests CI coverage (#452).
-    # `run:`-only (no build cascade) — same shape as prek/frontend-check.
-    platforms:
-      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
-    run: uv run scripts/dev_tests.py
 
   hole-tests:
     # `--no-default-features` matches the `hole` target's debug build: tests
@@ -231,6 +217,24 @@ targets:
     build: cargo nextest run --no-run -p garter-bin
     run: cargo nextest run -p garter-bin
 
+  kill-group-tests:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p kill-group
+    run: cargo nextest run -p kill-group
+
+  stepstool-tests:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p stepstool
+    run: cargo nextest run -p stepstool
+
+  dev-console-tests:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p dev-console
+    run: cargo nextest run -p dev-console
+
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a
   # first-class runnable invoked via `cargo xtask run <name>`, replacing the
@@ -254,7 +258,7 @@ targets:
     # crates only via -p filters. The two clippy- targets together cover the
     # full 6-platform CI matrix without overlap.
     platforms: [linux/amd64, linux/arm64, windows/arm64]
-    run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util --all-targets --features garter/test-utils -- -D warnings
+    run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p kill-group -p stepstool -p dev-console --all-targets --features garter/test-utils -- -D warnings
 
   prek:
     # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in

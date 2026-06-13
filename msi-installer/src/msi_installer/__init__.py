@@ -55,9 +55,9 @@ def stage_files(root: Path, stage_dir: Path, console: Console) -> None:
     """Stage the runnable BINDIR via `cargo xtask stage`.
 
     The canonical list of files lives in `xtask/src/bindir.rs`
-    (`bindir_files()`). dev.py and this function both call into the same xtask
-    subcommand, so adding a new BINDIR file is a one-line change in xtask and
-    both consumers pick it up automatically.
+    (`bindir_files()`). dev-console and this function both call into the same
+    xtask subcommand, so adding a new BINDIR file is a one-line change in xtask
+    and both consumers pick it up automatically.
     """
     console.print(f"[bold]Staging installer files[/] to {stage_dir} (via cargo xtask stage)")
     result = subprocess.run(

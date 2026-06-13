@@ -22,6 +22,7 @@ mod setup;
 mod state;
 mod tray;
 mod ui_ready;
+mod ui_settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -142,7 +143,8 @@ fn launch_gui(show_dashboard: bool) {
             commands::test_server,
             commands::mark_validated_by_proxy_start,
             commands::reload_proxy_filters,
-            tray::toggle_proxy,
+            tray::start_proxy,
+            tray::stop_proxy,
             tray::cancel_proxy,
             ui_ready::signal_ui_ready,
             ui_ready::wait_ui_ready,
@@ -165,7 +167,13 @@ fn launch_gui(show_dashboard: bool) {
                     .show(|_| {});
             }
             app.manage(hole::update::UpdateState::default());
+            app.manage(tray::TransitionSlot::new());
             tray::create_tray(app)?;
+            // Tray + webview follow the ProxyStateCell; the reconciler's
+            // immediate first tick is the startup resync against the
+            // bridge's actual state (#462).
+            tray::spawn_proxy_state_sync(app.handle());
+            tray::spawn_status_reconciler(app.handle());
             platform::on_setup(app)?;
             if show_dashboard {
                 tray::open_settings_window(app.handle());

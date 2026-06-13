@@ -1,9 +1,9 @@
 [environment]
-# Scripts target both Windows and POSIX — `scripts/dev.py` and
-# `scripts/network-reset.py` call POSIX-only APIs (os.geteuid,
-# os.getgrouplist, pwd.getpwnam) inside platform guards. Telling ty to
-# assume all platforms makes those attributes resolve instead of failing
-# with unresolved-attribute on the Windows CI runner.
+# Scripts target both Windows and POSIX — `scripts/network-reset.py`
+# calls POSIX-only APIs (os.geteuid, os.getgrouplist, pwd.getpwnam)
+# inside platform guards. Telling ty to assume all platforms makes those
+# attributes resolve instead of failing with unresolved-attribute on the
+# Windows CI runner.
 python-platform = "all"
 
 [rules]

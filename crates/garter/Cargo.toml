@@ -31,6 +31,7 @@ test-utils = ["dep:tracing-subscriber"]
 
 [dependencies]
 bitflags = { workspace = true }
+kill-group = { version = "0.1", path = "../kill-group" }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -73,18 +74,16 @@ required-features = ["test-utils"]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# Job-object / handle-hygiene features moved to the `kill-group` crate.
 windows = { version = "0.62", features = [
-    "Win32_Foundation",
-    "Win32_Security",          # SECURITY_ATTRIBUTES param of CreateJobObjectW
-    "Win32_System_Console",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
+    "Win32_System_Console", # shutdown.rs: GenerateConsoleCtrlEvent (CTRL_BREAK)
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# Win32_Networking_WinSock: chain_tests.rs binds 0.0.0.0:port with
-# SO_EXCLUSIVEADDRUSE to exercise the Winsock wildcard-exclusion race. It is the
-# only test-only feature — Foundation / Threading used by other tests come from
-# the regular `windows` dep above (Cargo unions features across the two tables
-# for the test build).
-windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }
+# Test-only features (Cargo unions them with the regular `windows` dep above
+# for the test build):
+# - Win32_Networking_WinSock: chain_tests.rs binds 0.0.0.0:port with
+#   SO_EXCLUSIVEADDRUSE to exercise the Winsock wildcard-exclusion race.
+# - Win32_System_Threading: shutdown_tests.rs spawns with
+#   CREATE_NEW_PROCESS_GROUP to exercise graceful_stop's CTRL_BREAK.
+windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_Threading"] }

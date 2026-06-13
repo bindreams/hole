@@ -195,7 +195,10 @@ impl ChainPlugin for BinaryPlugin {
         // plugin's whole descendant tree and an orphaned grandchild can never hold
         // the host's pipe handles (bindreams/hole#197). CREATE_NEW_PROCESS_GROUP
         // (for graceful_stop's CTRL_BREAK) is set inside `GroupedChild::spawn`.
-        let mut gc = crate::proc_group::GroupedChild::spawn(&mut cmd)
+        // Nesting::Mark keeps the root-only group rule: a nested garter (e.g.
+        // galoshes inside the bridge's chain) joins this group instead of
+        // creating one Unix pgids could escape from.
+        let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark)
             .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
 
         if let (Some(sink), Some(pid)) = (&self.pid_sink, gc.child.id()) {

@@ -69,29 +69,35 @@ fn group_parse_known() {
     assert_eq!(Group::parse("garter").unwrap(), Group::Garter);
     assert_eq!(Group::parse("galoshes").unwrap(), Group::Galoshes);
     assert_eq!(Group::parse("ex-ray").unwrap(), Group::ExRay);
+    assert_eq!(Group::parse("kill-group").unwrap(), Group::KillGroup);
 }
 
 #[skuld::test]
 fn group_parse_unknown_rejected() {
     let err = Group::parse("nonsense").unwrap_err();
     assert!(err.to_string().contains("unknown release group"));
+    assert!(err
+        .to_string()
+        .contains("(expected: hole, garter, galoshes, ex-ray, kill-group)"));
 }
 
 #[skuld::test]
 fn group_tag_glob() {
     assert_eq!(Group::Hole.tag_glob(), "releases/hole/v[0-9]*.[0-9]*.[0-9]*");
     assert_eq!(Group::Garter.tag_glob(), "releases/garter/v[0-9]*.[0-9]*.[0-9]*");
+    assert_eq!(Group::KillGroup.tag_glob(), "releases/kill-group/v[0-9]*.[0-9]*.[0-9]*");
 }
 
 #[skuld::test]
 fn group_tag_prefix() {
     assert_eq!(Group::Hole.tag_prefix(), "releases/hole/v");
     assert_eq!(Group::ExRay.tag_prefix(), "releases/ex-ray/v");
+    assert_eq!(Group::KillGroup.tag_prefix(), "releases/kill-group/v");
 }
 
 #[skuld::test]
-fn group_all_lists_four() {
-    assert_eq!(Group::all().len(), 4);
+fn group_all_lists_five() {
+    assert_eq!(Group::all().len(), 5);
 }
 
 // read_workspace_versions =============================================================================================

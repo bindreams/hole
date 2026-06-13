@@ -2,11 +2,13 @@
 // `RunningProxy` traits backed by `shadowsocks_service::local::Server`.
 
 use shadowsocks_service::config::Config;
+use shadowsocks_service::net::FlowStat;
 use std::io;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
-use super::{Proxy, ProxyError, RunningProxy};
+use super::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 
 /// Production `Proxy` implementation: spawns a `shadowsocks_service::local::Server`
 /// task on `start(config)` and returns a [`ShadowsocksRunning`] handle that
@@ -34,6 +36,11 @@ impl Proxy for ShadowsocksProxy {
             .await
             .map_err(ProxyError::Runtime)?;
         debug!("shadowsocks_service Server constructed");
+        // The balancer's ServiceContext is cloned from the same template
+        // as every local instance's, so they all share one Arc<FlowStat>
+        // (every proxied TCP stream / UDP association increments it).
+        // This is the only public handle to the server's traffic counters.
+        let flow_stat = server.server_balancer().context().flow_stat();
         debug!("spawning shadowsocks server.run() task");
         let handle = tokio::spawn(async move {
             // First log inside the spawned task: a gap between the
@@ -51,7 +58,10 @@ impl Proxy for ShadowsocksProxy {
             }
             result
         });
-        Ok(ShadowsocksRunning { handle: Some(handle) })
+        Ok(ShadowsocksRunning {
+            handle: Some(handle),
+            flow_stat,
+        })
     }
 }
 
@@ -74,6 +84,9 @@ impl Proxy for ShadowsocksProxy {
 /// is the ability to observe task-internal panics.
 pub struct ShadowsocksRunning {
     handle: Option<JoinHandle<io::Result<()>>>,
+    /// Shared with every local instance inside the running `Server` —
+    /// SOCKS5/HTTP listeners and UDP associations all increment it.
+    flow_stat: Arc<FlowStat>,
 }
 
 #[cfg(test)]
@@ -83,13 +96,23 @@ impl ShadowsocksRunning {
     /// listeners. Production code never reaches `ShadowsocksRunning`
     /// except through [`ShadowsocksProxy::start`].
     pub(crate) fn from_handle(handle: JoinHandle<io::Result<()>>) -> Self {
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+            flow_stat: Arc::new(FlowStat::new()),
+        }
     }
 }
 
 impl RunningProxy for ShadowsocksRunning {
     fn is_alive(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    fn traffic_totals(&self) -> TrafficTotals {
+        TrafficTotals {
+            bytes_in: self.flow_stat.rx(),
+            bytes_out: self.flow_stat.tx(),
+        }
     }
 
     /// Graceful shutdown: aborts the task and awaits its result. Distinguishes

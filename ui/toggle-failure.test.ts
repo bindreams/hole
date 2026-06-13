@@ -1,4 +1,4 @@
-// Unit tests for the pure toggle_proxy failure-message helper.
+// Unit tests for the pure start/stop-proxy failure-message helper.
 // ToggleFailure is a single { error: unknown } interface;
 // toggleFailureToast stringifies non-string rejections defensively
 // (no [object Object]).

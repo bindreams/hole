@@ -1,4 +1,4 @@
-use crate::proxy::{Proxy, ProxyError, RunningProxy};
+use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use crate::proxy_manager::ProxyManager;
 use bytes::Bytes;
 use hole_common::protocol::{StatusResponse, ROUTE_STATUS};
@@ -8,6 +8,7 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt as _;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::Routing;
@@ -80,6 +81,9 @@ impl RunningProxy for StubRunning {
             h.abort();
         }
         Ok(())
+    }
+    fn traffic_totals(&self) -> TrafficTotals {
+        TrafficTotals::default()
     }
 }
 
@@ -208,7 +212,68 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
     });
 }
 
-// dev.py's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
+#[skuld::test]
+fn ready_notify_connects_and_writes_token() {
+    // HONESTY NOTE: this pins `notify_ready`'s CONTRACT; the PLACEMENT
+    // (called in `run_inner` right after `IpcServer::bind` returns, i.e.
+    // after `apply_socket_permissions`) is verified by code review, like
+    // the sibling recovery-call placements. (`apply_socket_permissions`
+    // is `#[cfg(not(test))]` inside `IpcServer::bind`, so the
+    // after-permissions ordering cannot be asserted in a test build even
+    // in principle.)
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spec = format!("{}/sekrit-token", listener.local_addr().unwrap());
+        super::notify_ready(&spec).await;
+        let (conn, _) = listener.accept().await.unwrap();
+        let mut lines = tokio::io::BufReader::new(conn).lines();
+        let line = lines.next_line().await.unwrap();
+        assert_eq!(line.as_deref(), Some("sekrit-token"));
+    });
+}
+
+#[skuld::test]
+fn ready_notify_tolerates_malformed_spec_and_dead_listener() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Best-effort contract: neither panics nor errors — the supervisor's
+        // own deadline is the failure signal (spec §Bridge changes).
+        super::notify_ready("no-slash-here").await;
+        super::notify_ready("127.0.0.1:1/dead-listener-token").await;
+    });
+}
+
+/// CTRL_BREAK must resolve shutdown_signal (the Windows analog of the
+/// sigterm_resolves_shutdown_signal test below it). Runs the bridge test
+/// binary as a kill-group child (=> CREATE_NEW_PROCESS_GROUP) and delivers
+/// the real console signal.
+#[cfg(windows)]
+#[skuld::test]
+fn ctrl_break_resolves_shutdown_signal() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.env(crate::foreground_child_hook::MODE_ENV, "1");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
+        let stdout = gc.child.stdout.take().unwrap();
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        // Rendezvous: the child prints only after handlers are installed.
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("HANDLER-READY"));
+        gc.signal_group_term().unwrap();
+        let status = gc.child.wait().await.unwrap();
+        assert!(
+            status.success(),
+            "CTRL_BREAK must resolve shutdown_signal; got {status:?}"
+        );
+    });
+}
+
+// dev-console's SIGTERM (relayed by sudo) must trigger graceful `pm.stop()`
 // instead of an ungraceful default-disposition kill that leaks routes/DNS
 // (bindreams/hole#452). `shutdown_signal()` installs the SIGTERM handler
 // SYNCHRONOUSLY when called (Step 3), so raising the signal immediately
