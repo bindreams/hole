@@ -983,9 +983,6 @@ fn diagnostics_bridge_error_after_failed_start() {
 // (line ~363). A thread-local `set_default` capture could be added now
 // that the global subscriber level-rejects noisy third-party events.
 
-// No public_ip handler test: it makes a live HTTP call to ipinfo.io that
-// can't be mocked without an HTTP-client seam.
-
 // Cancel tests ========================================================================================================
 
 /// Extract the `message` field from a 500 `ErrorResponse`.

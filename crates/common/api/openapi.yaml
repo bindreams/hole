@@ -125,18 +125,6 @@ paths:
               schema:
                 $ref: "#/components/schemas/DiagnosticsResponse"
 
-  /v1/public-ip:
-    get:
-      summary: Get public IP address
-      operationId: getPublicIp
-      responses:
-        "200":
-          description: Current public IP and country
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PublicIpResponse"
-
   /v1/test-server:
     post:
       summary: Run a one-shot shadowsocks client test against a server entry
@@ -351,17 +339,6 @@ components:
             Bridge always returns "unknown". The GUI computes this dot from
             the selected ServerEntry's persisted validation state and
             ignores this field.
-
-    PublicIpResponse:
-      type: object
-      required:
-        - ip
-        - country_code
-      properties:
-        ip:
-          type: string
-        country_code:
-          type: string
 
     # Documentation-only schemas (not code-generated; hand-written in Rust)
     ProxyConfig:

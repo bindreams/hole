@@ -47,7 +47,6 @@ pub enum BridgeRequest {
     },
     Metrics,
     Diagnostics,
-    PublicIp,
     TestServer {
         entry: ServerEntry,
     },
@@ -89,10 +88,6 @@ pub enum BridgeResponse {
         network: String,
         vpn_server: String,
         internet: String,
-    },
-    PublicIp {
-        ip: String,
-        country_code: String,
     },
     TestServerResult {
         outcome: ServerTestOutcome,

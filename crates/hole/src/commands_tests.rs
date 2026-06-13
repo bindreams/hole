@@ -156,7 +156,7 @@ fn auto_select_noop_on_empty_servers() {
     assert!(config.selected_server.is_none());
 }
 
-// get_metrics / get_diagnostics / get_public_ip response mapping tests ================================================
+// get_metrics / get_diagnostics response mapping + public-IP parsing tests ============================================
 
 /// Verify that a Metrics BridgeResponse maps to the expected JSON.
 #[skuld::test]
@@ -242,33 +242,37 @@ fn get_diagnostics_unexpected_response_falls_back() {
     assert_eq!(json["bridge"], "unknown");
 }
 
-/// Verify that a PublicIp BridgeResponse maps to the expected JSON.
+/// `parse_cf_trace` pulls `ip=` / `loc=` out of Cloudflare's trace body.
 #[skuld::test]
-fn get_public_ip_bridge_success_returns_json() {
-    let resp: Result<BridgeResponse, ClientError> = Ok(BridgeResponse::PublicIp {
-        ip: "203.0.113.42".into(),
-        country_code: "DE".into(),
-    });
-    let json = map_public_ip_bridge_response(resp).expect("should return Some for PublicIp");
-    assert_eq!(json["ip"], "203.0.113.42");
-    assert_eq!(json["country_code"], "DE");
+fn parse_cf_trace_extracts_ip_and_country() {
+    let body = "fl=123abc\nh=cloudflare.com\nip=203.0.113.42\nts=1700000000.1\nvisit_scheme=https\nloc=DE\ncolo=FRA\n";
+    let out = parse_cf_trace(body);
+    assert_eq!(out["ip"], "203.0.113.42");
+    assert_eq!(out["country_code"], "DE");
 }
 
-/// Verify that a failed PublicIp bridge request returns None (triggers fallback).
+/// Absent fields fall back to the display placeholders.
 #[skuld::test]
-fn get_public_ip_bridge_failure_returns_none() {
-    let err: Result<BridgeResponse, ClientError> = Err(ClientError::Connection(std::io::Error::new(
-        std::io::ErrorKind::ConnectionRefused,
-        "bridge unreachable",
-    )));
-    assert!(map_public_ip_bridge_response(err).is_none());
+fn parse_cf_trace_falls_back_when_fields_absent() {
+    let out = parse_cf_trace("fl=123abc\nh=cloudflare.com\ncolo=FRA\n");
+    assert_eq!(out["ip"], "unknown");
+    assert_eq!(out["country_code"], "??");
 }
 
-/// Verify that an unexpected BridgeResponse for PublicIp returns None.
+/// CRLF line endings: `str::lines()` strips the trailing `\r`.
 #[skuld::test]
-fn get_public_ip_unexpected_response_returns_none() {
-    let resp: Result<BridgeResponse, ClientError> = Ok(BridgeResponse::Ack);
-    assert!(map_public_ip_bridge_response(resp).is_none());
+fn parse_cf_trace_handles_crlf() {
+    let out = parse_cf_trace("ip=203.0.113.42\r\nloc=DE\r\n");
+    assert_eq!(out["ip"], "203.0.113.42");
+    assert_eq!(out["country_code"], "DE");
+}
+
+/// Present-but-empty fields stay empty; the UI renders its own placeholder.
+#[skuld::test]
+fn parse_cf_trace_present_but_empty_fields() {
+    let out = parse_cf_trace("ip=\nloc=\n");
+    assert_eq!(out["ip"], "");
+    assert_eq!(out["country_code"], "");
 }
 
 // validate_and_read_import tests ======================================================================================

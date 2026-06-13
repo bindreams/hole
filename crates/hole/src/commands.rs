@@ -357,17 +357,6 @@ fn map_diagnostics_response(result: Result<BridgeResponse, ClientError>) -> serd
     }
 }
 
-/// Try to extract a public IP response from the bridge result.
-/// Returns `Some(json)` on success, `None` if fallback is needed.
-fn map_public_ip_bridge_response(result: Result<BridgeResponse, ClientError>) -> Option<serde_json::Value> {
-    match result {
-        Ok(BridgeResponse::PublicIp { ip, country_code }) => {
-            Some(serde_json::json!({ "ip": ip, "country_code": country_code }))
-        }
-        _ => None,
-    }
-}
-
 // Tauri commands ======================================================================================================
 
 #[tauri::command]
@@ -483,33 +472,44 @@ pub fn mark_validated_by_proxy_start(state: State<AppState>, entry_id: String) -
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_public_ip(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // Try bridge first (fetches through VPN when connected)
-    if let Some(json) = map_public_ip_bridge_response(state.bridge_send(BridgeRequest::PublicIp).await) {
-        return Ok(json);
+/// Map Cloudflare's `/cdn-cgi/trace` `key=value` body to the badge's shape.
+/// `ip=` is the source IP Cloudflare's edge sees — the VPN exit when
+/// connected, the ISP otherwise; `loc=` is its 2-letter country. Absent
+/// fields fall back to display placeholders.
+fn parse_cf_trace(body: &str) -> serde_json::Value {
+    let mut ip = "unknown";
+    let mut country = "??";
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("ip=") {
+            ip = v;
+        } else if let Some(v) = line.strip_prefix("loc=") {
+            country = v;
+        }
     }
+    serde_json::json!({ "ip": ip, "country_code": country })
+}
 
-    // Bridge unreachable — fetch directly (shows ISP IP)
-    let result = tokio::task::spawn_blocking(|| {
-        // ureq v3 API: Agent-based, not free functions.
-        let agent = ureq::Agent::new_with_defaults();
-        let body: serde_json::Value = agent
-            .get("https://ipinfo.io/json")
+#[tauri::command]
+pub async fn get_public_ip() -> Result<serde_json::Value, String> {
+    // Routing is a system-wide split-default (all traffic → TUN when
+    // connected), so a direct fetch already reflects the active egress — VPN
+    // exit when connected, ISP otherwise — with no bridge round-trip.
+    // Cloudflare's trace echoes the source IP + country with no per-IP daily
+    // cap. ureq is blocking, so run it on a blocking thread.
+    tokio::task::spawn_blocking(|| {
+        // www host avoids the apex 301 → www redirect round-trip.
+        let body = ureq::get("https://www.cloudflare.com/cdn-cgi/trace")
             .call()
             .map_err(|e| format!("IP lookup failed: {e}"))?
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("parse error: {e}"))?;
-        Ok::<_, String>(serde_json::json!({
-            "ip": body["ip"].as_str().unwrap_or("unknown"),
-            "country_code": body["country"].as_str().unwrap_or("??"),
-        }))
+            .into_body()
+            .with_config()
+            .limit(64 * 1024)
+            .read_to_string()
+            .map_err(|e| format!("read error: {e}"))?;
+        Ok::<_, String>(parse_cf_trace(&body))
     })
     .await
-    .map_err(|e| format!("task join error: {e}"))?;
-
-    result
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 /// Build a `ProxyConfig` from the currently selected server in app config.

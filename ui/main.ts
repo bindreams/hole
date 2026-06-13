@@ -22,6 +22,7 @@ import { initSettings, renderSettings } from "./settings";
 import {
   applyProxyStateObservation,
   initSidebar,
+  startPublicIpAutoRefresh,
   updateDiagnostics,
   updateMetrics,
   updateProxyStatus,
@@ -385,6 +386,9 @@ async function init() {
     setInterval(pollProxyStatus, 5000);
     setInterval(pollMetrics, 1000);
     setInterval(pollDiagnostics, 5000);
+    // Public IP refreshes every 60s while the dashboard is visible, paused
+    // when minimized/hidden to the tray (#464).
+    startPublicIpAutoRefresh();
 
     result = { ok: true, error: null };
   } catch (err) {

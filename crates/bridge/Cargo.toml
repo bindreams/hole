@@ -46,7 +46,6 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
-ureq = { version = "3", features = ["json"] }
 tempfile = "3"
 # Filter engine dependencies. All except `lru` and `tls-parser` are already
 # pulled in transitively via shadowsocks-service; promoted to direct deps so
