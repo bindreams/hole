@@ -50,9 +50,9 @@ enum ArmOutcome {
     Armed,
     /// Nothing was armed; the caller must remove the dir.
     NotArmed(UpdateError),
-    /// A helper may be running but we lost track of it (kernel wait failed);
-    /// leave the dir for it / the orphan sweep rather than delete it from
-    /// under a live installer.
+    /// The kernel wait failed, so we can no longer tell whether a helper is
+    /// live; leave the dir for it / the orphan sweep rather than risk
+    /// deleting the MSI from under a running installer.
     Uncertain(UpdateError),
 }
 
@@ -123,9 +123,9 @@ fn arm_installer(kept_dir: &Path, msi_path: &Path, mode: InstallMode) -> ArmOutc
             match intermediary::wait_ready_event_handle(&event, helper.handle()) {
                 Ok(intermediary::ReadyOutcome::Ready) => ArmOutcome::Armed,
                 Ok(intermediary::ReadyOutcome::HelperExited) => ArmOutcome::NotArmed(UpdateError::HelperNotReady),
-                // Kernel wait failed: the helper may already hold our handle
-                // and be parked in WaitForExit. Don't delete the MSI from
-                // under it.
+                // Kernel wait failed; we can no longer tell whether the
+                // helper is parked in WaitForExit. Don't risk deleting the
+                // MSI from under it.
                 Err(e) => ArmOutcome::Uncertain(e),
             }
         }

@@ -22,8 +22,8 @@ use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATIO
 /// A marker identity: the same logical marker in the session-local and
 /// global namespaces.
 pub(crate) struct MarkerName<'a> {
-    pub local: &'a str,
-    pub global: &'a str,
+    pub(crate) local: &'a str,
+    pub(crate) global: &'a str,
 }
 
 pub(crate) const GUI_ALIVE: MarkerName<'static> = MarkerName {
