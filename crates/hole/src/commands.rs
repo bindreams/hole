@@ -270,13 +270,16 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
 /// deleting an absent id persists the unchanged config and returns `Ok`.
 #[tauri::command]
 pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    let removed = remove_server(&mut cfg, &entry_id);
-    state.config_store.save(&cfg).map_err(|e| {
+    let mut current = state.config.lock().unwrap();
+    // Apply to a copy so a failed save leaves in-memory state unchanged.
+    let mut updated = current.clone();
+    let removed = remove_server(&mut updated, &entry_id);
+    state.config_store.save(&updated).map_err(|e| {
         warn!(error = %e, path = %state.config_store.path().display(), "delete_server: config save failed");
         e.to_string()
     })?;
-    info!(entry_id = %entry_id, removed, remaining = cfg.servers.len(), "delete_server");
+    *current = updated;
+    info!(entry_id = %entry_id, removed, remaining = current.servers.len(), "delete_server");
     Ok(())
 }
 
