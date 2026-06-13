@@ -3,7 +3,7 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -29,11 +29,105 @@ pub enum ToggleOutcome {
     Cancelled,
 }
 
+/// Marks a connect/disconnect operation as in flight. One transition at a
+/// time: a concurrent opposite toggle is rejected instead of queuing a
+/// contradictory Start/Stop behind the bridge lock (a user's cancel must
+/// not be overtaken by a queued second Start). The target also drives the
+/// tray's Connecting…/Disconnecting… rendering. Tauri-managed state,
+/// registered in `main.rs` setup.
+pub(crate) struct TransitionSlot {
+    target: std::sync::Mutex<Option<bool>>,
+}
+
+impl TransitionSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            target: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Claim the slot for a transition toward `target`. False if another
+    /// transition is already in flight.
+    pub(crate) fn try_begin(&self, target: bool) -> bool {
+        let mut slot = self.target.lock().unwrap();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(target);
+        true
+    }
+
+    pub(crate) fn end(&self) {
+        *self.target.lock().unwrap() = None;
+    }
+
+    pub(crate) fn target(&self) -> Option<bool> {
+        *self.target.lock().unwrap()
+    }
+}
+
+/// Decision derived from a Start/Stop exchange. Pure — the dialog and
+/// elevation glue in `set_proxy_enabled` interprets `NeedsElevation`.
+pub(crate) enum StartDecision {
+    Outcome(ToggleOutcome),
+    NeedsElevation,
+    Fail(String),
+}
+
+pub(crate) fn outcome_for_start_response(
+    result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
+) -> StartDecision {
+    use crate::state::{classify_start_error, StartErrorKind};
+    match result {
+        Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Running),
+        Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
+            StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
+            StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
+            StartErrorKind::Other => StartDecision::Fail(format!("Bridge error: {message}")),
+        },
+        Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
+        Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
+        Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
+    }
+}
+
+pub(crate) fn outcome_for_stop_response(
+    result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
+) -> StartDecision {
+    match result {
+        Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Stopped),
+        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(format!("Bridge error: {message}")),
+        Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
+        Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
+        Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
+    }
+}
+
+/// Sole writer of persisted `config.enabled` (#462): records the last user
+/// intent the bridge honored, as input for a future
+/// `StartupBehavior::RestoreLastState`. Nothing reads it at runtime —
+/// display and direction come from the `ProxyStateCell`.
+pub(crate) fn persist_intended_enabled(
+    config: &std::sync::Mutex<hole_common::config::AppConfig>,
+    store: &hole_common::config_store::ConfigStore,
+    enabled: bool,
+) {
+    let mut config = config.lock().unwrap();
+    if config.enabled == enabled {
+        return;
+    }
+    config.enabled = enabled;
+    if let Err(e) = store.save(&config) {
+        warn!(error = %e, path = %store.path().display(), "failed to persist intended enabled state");
+    }
+}
+
 // Menu IDs ============================================================================================================
 
 // Tray menu -----------------------------------------------------------------------------------------------------------
 const ID_STATUS: &str = "status";
 const ID_CONNECT: &str = "connect";
+const ID_DISCONNECT: &str = "disconnect";
 const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
@@ -51,16 +145,33 @@ const ID_COLLECT_LOGS: &str = "window_collect_logs";
 // Tray creation =======================================================================================================
 
 /// Build the tray menu, optionally including an "Install Update" item.
+///
+/// `running` is the bridge's actual state (from the `ProxyStateCell`,
+/// never persisted config — #462); `transition` is an in-flight
+/// connect/disconnect target, rendered as Connecting…/Disconnecting…
+/// with the action item disabled.
 fn build_tray_menu(
     app: &AppHandle,
     update: Option<&hole::update::UpdateInfo>,
-    enabled: bool,
+    running: bool,
+    transition: Option<bool>,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
-    let status_text = if enabled { "Connected" } else { "Disconnected" };
-    let connect_text = if enabled { "Disconnect" } else { "Connect" };
+    let status_text = match (transition, running) {
+        (Some(true), _) => "Connecting...",
+        (Some(false), _) => "Disconnecting...",
+        (None, true) => "Connected",
+        (None, false) => "Disconnected",
+    };
+    // The action item carries the intent its label displays: a click
+    // dispatches on the item ID, with no state read at click time.
+    let (action_id, action_text) = if running {
+        (ID_DISCONNECT, "Disconnect")
+    } else {
+        (ID_CONNECT, "Connect")
+    };
 
     let status = MenuItem::with_id(app, ID_STATUS, status_text, false, None::<&str>)?;
-    let connect = MenuItem::with_id(app, ID_CONNECT, connect_text, true, None::<&str>)?;
+    let connect = MenuItem::with_id(app, action_id, action_text, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     let settings = MenuItem::with_id(app, ID_SETTINGS, "Dashboard...", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
@@ -95,30 +206,13 @@ fn build_tray_menu(
     }
 }
 
-/// Sync tray menu item text and checkbox states from the given proxy state
-/// and the OS autostart registration.
+/// Sync the autostart checkbox from the OS autostart registration. Status
+/// and connect/disconnect text are baked into the menu at build time.
 ///
 /// Must run on the main thread: the menu-item setters dispatch to the main
 /// thread and block when called from anywhere else, so a caller holding a
 /// lock here can deadlock the app.
-fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>, enabled: bool) {
-    // Sync status text
-    if let Some(item) = menu.get(ID_STATUS) {
-        if let Some(menu_item) = item.as_menuitem() {
-            let text = if enabled { "Connected" } else { "Disconnected" };
-            menu_item.set_text(text).ok();
-        }
-    }
-
-    // Sync connect/disconnect text
-    if let Some(item) = menu.get(ID_CONNECT) {
-        if let Some(menu_item) = item.as_menuitem() {
-            let text = if enabled { "Disconnect" } else { "Connect" };
-            menu_item.set_text(text).ok();
-        }
-    }
-
-    // Sync autostart checkbox
+fn sync_autostart_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
     if let Some(item) = menu.get(ID_AUTOSTART) {
         if let Some(check) = item.as_check_menuitem() {
             use tauri_plugin_autostart::ManagerExt;
@@ -138,10 +232,15 @@ fn sync_menu_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>, enable
 }
 
 /// Create and register the system tray icon with its menu.
+///
+/// Renders from the `ProxyStateCell` (false until the first Status lands),
+/// never from persisted config — a relaunch can no longer show "Connected"
+/// over no tunnel (#462); the status reconciler's immediate first tick
+/// corrects the genuine bridge-survived-a-GUI-crash case.
 pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
-    let enabled = app.state::<AppState>().config.lock().unwrap().enabled;
-    let menu = build_tray_menu(app.handle(), None, enabled)?;
-    let icon = tray_icons::tray_image(enabled.into());
+    let running = app.state::<AppState>().proxy_snapshot().running;
+    let menu = build_tray_menu(app.handle(), None, running, None)?;
+    let icon = tray_icons::tray_image(running.into());
 
     #[allow(unused_mut)]
     let mut builder = TrayIconBuilder::with_id("main")
@@ -159,32 +258,23 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
 
     let tray = builder.build(app)?;
 
-    sync_menu_state(app.handle(), &menu, enabled);
+    sync_autostart_state(app.handle(), &menu);
 
     Ok(tray)
 }
 
-/// Update the tray icon to reflect the given enabled/disabled state.
-pub fn set_tray_icon(app: &AppHandle, enabled: bool) {
-    if let Some(tray) = app.tray_by_id("main") {
-        // `true` mirrors the build-time `icon_as_template(true)`; on
-        // non-macOS this falls back to plain `set_icon` (see #469).
-        if let Err(e) = tray.set_icon_with_as_template(Some(tray_icons::tray_image(enabled.into())), true) {
-            warn!(error = %e, "failed to set tray icon");
-        }
-    }
-}
-
 // Proxy state management ==============================================================================================
 
-/// Rebuild the tray menu to sync state with the current config.
+/// Rebuild the tray menu and icon to sync with the actual proxy state.
 ///
 /// Preserves the "Install Update" item if an update is available.
 ///
 /// The whole rebuild (state reads included) is dispatched to the main
-/// thread: worker-thread callers would otherwise read autostart/config
-/// state on one thread and commit the menu later via a queued
-/// `set_menu`, letting a stale menu overwrite a newer one (#473).
+/// thread: worker-thread callers would otherwise read state on one
+/// thread and commit the menu later via a queued `set_menu`, letting a
+/// stale menu overwrite a newer one (#473). The icon is committed inside
+/// the same ordered closure for the same reason (#492 — a worker-thread
+/// read paired with a queued `set_icon` can commit a stale icon).
 /// `run_on_main_thread` executes inline when already on the main thread.
 pub fn rebuild_tray_menu(app: &AppHandle) {
     let handle = app.clone();
@@ -195,10 +285,11 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
         };
         let update_state = handle.state::<hole::update::UpdateState>();
         let update_info = update_state.rx.borrow().clone();
-        let enabled = handle.state::<AppState>().config.lock().unwrap().enabled;
-        match build_tray_menu(&handle, update_info.as_ref(), enabled) {
+        let snap = handle.state::<AppState>().proxy_snapshot();
+        let transition = handle.state::<TransitionSlot>().target();
+        match build_tray_menu(&handle, update_info.as_ref(), snap.running, transition) {
             Ok(menu) => {
-                sync_menu_state(&handle, &menu, enabled);
+                sync_autostart_state(&handle, &menu);
                 // Sanctioned `set_menu` site: the one ordered commit point
                 // (clippy.toml bans it everywhere else).
                 #[allow(clippy::disallowed_methods)]
@@ -208,6 +299,11 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
             }
             Err(e) => warn!(error = %e, "failed to rebuild tray menu"),
         }
+        // `true` mirrors the build-time `icon_as_template(true)`; on
+        // non-macOS this falls back to plain `set_icon` (see #469).
+        if let Err(e) = tray.set_icon_with_as_template(Some(tray_icons::tray_image(snap.running.into())), true) {
+            warn!(error = %e, "failed to set tray icon");
+        }
     });
     if let Err(e) = dispatched {
         warn!(error = %e, "failed to dispatch tray menu rebuild");
@@ -215,147 +311,154 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 }
 
 /// Send a best-effort Stop to the bridge and exit the application.
+///
+/// Persisted `config.enabled` is deliberately untouched: it is the
+/// write-only record of the last honored intent (the future
+/// `RestoreLastState` input), and the tray renders from bridge Status at
+/// the next launch, never from that flag (#462).
 async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
     app.exit(0);
 }
 
-/// Revert config.enabled and sync the tray icon + menu.
-fn revert_proxy_state(app: &AppHandle, enabled: bool) {
-    let state = app.state::<AppState>();
-    {
-        let mut config = state.config.lock().unwrap();
-        config.enabled = enabled;
-        if let Err(e) = state.config_store.save(&config) {
-            warn!(error = %e, path = %state.config_store.path().display(), "revert_proxy_state: persist failed");
+/// RAII transition marker: registers the target so the tray renders
+/// Connecting…/Disconnecting… (action item disabled), and a concurrent
+/// opposite toggle is rejected instead of queuing a contradictory
+/// Start/Stop behind the bridge lock (a user's cancel must not be
+/// overtaken by a queued second Start).
+struct TransitionGuard {
+    app: AppHandle,
+}
+
+impl TransitionGuard {
+    fn begin(app: &AppHandle, target: bool) -> Option<Self> {
+        if !app.state::<TransitionSlot>().try_begin(target) {
+            return None;
         }
+        let guard = Self { app: app.clone() };
+        rebuild_tray_menu(&guard.app);
+        Some(guard)
     }
-    set_tray_icon(app, enabled);
-    rebuild_tray_menu(app);
+}
+
+impl Drop for TransitionGuard {
+    fn drop(&mut self) {
+        self.app.state::<TransitionSlot>().end();
+        rebuild_tray_menu(&self.app);
+    }
+}
+
+/// Elevation bypasses the pooled bridge channel, so on success confirm
+/// the actual state via a tracked Status instead of assuming: the commit
+/// (inside `BridgeLink::send`) updates the tray and the webview, and the
+/// returned outcome — which the caller persists as the last honored
+/// intent — is derived from that confirmed snapshot, never from the
+/// elevated helper's claim of success.
+async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<ToggleOutcome, String> {
+    if crate::elevation::prompt_elevation(app, request).await {
+        let state = app.state::<AppState>();
+        let _ = state.bridge_send(BridgeRequest::Status).await;
+        Ok(if state.proxy_snapshot().running {
+            ToggleOutcome::Running
+        } else {
+            ToggleOutcome::Stopped
+        })
+    } else {
+        Err("Elevation was denied or failed".into())
+    }
 }
 
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
 /// describing whether the proxy ended up Running, Stopped, or the Start
-/// was Cancelled before it could complete (only when `enabled == true`).
+/// was Cancelled before it could complete (only when `enable == true`).
 ///
-/// On bridge errors that are NOT a cancellation, reverts config + tray
-/// state and returns an error message. On `Cancelled`, reverts config
-/// back to `false` — the optimistic `config.enabled = true` flip is
-/// rolled back so the persisted state matches reality.
-/// Used by both the tray Enable checkbox and the frontend toggle button.
-pub async fn set_proxy_enabled(app: &AppHandle, enabled: bool) -> Result<ToggleOutcome, String> {
+/// There is no optimistic state flip and no revert: the bridge exchange
+/// itself commits the observed truth to the `ProxyStateCell` (inside the
+/// client lock), the state-sync watcher repaints the tray and notifies
+/// the webview, and persisted `config.enabled` records only an intent
+/// the bridge actually honored. On failure, one follow-up Status commits
+/// reality — a failed Disconnect can no longer re-assert "Connected"
+/// over a stopped tunnel.
+/// Used by the tray menu items and the `start_proxy`/`stop_proxy`
+/// commands.
+pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
     // Bridge install gate: if the user is trying to enable the proxy and
     // the bridge isn't installed yet, prompt for installation BEFORE
-    // flipping any config state. Cancelling here leaves `config.enabled`
-    // untouched (no rollback needed).
-    if enabled
+    // anything else.
+    if enable
         && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled
         && !crate::setup::prompt_bridge_install(app.clone()).await
     {
         return Err("The Hole bridge must be installed to connect.".into());
     }
 
-    let proxy_config = {
-        let mut config = state.config.lock().unwrap();
-        if config.enabled == enabled {
-            // Already in the desired state (concurrent toggle).
-            return Ok(if enabled {
-                ToggleOutcome::Running
-            } else {
-                ToggleOutcome::Stopped
-            });
+    // Resolve the start payload BEFORE claiming the transition slot — a
+    // request that cannot proceed must not flash "Connecting..." in the
+    // tray.
+    let proxy_config = if enable {
+        let config = state.config.lock().unwrap();
+        match build_proxy_config(&config) {
+            Some(pc) => Some(pc),
+            None => {
+                return Err("No server is selected. Open the Dashboard and select a server before connecting.".into())
+            }
         }
-        config.enabled = enabled;
-        if let Err(e) = state.config_store.save(&config) {
-            warn!(error = %e, path = %state.config_store.path().display(), "set_proxy_enabled: persist failed");
-        }
-        build_proxy_config(&config)
+    } else {
+        None
     };
 
-    set_tray_icon(app, enabled);
+    let Some(_transition) = TransitionGuard::begin(app, enable) else {
+        return Err("Another connect or disconnect is already in progress.".into());
+    };
 
-    let result: Result<ToggleOutcome, String> = if enabled {
-        let Some(proxy_config) = proxy_config else {
-            revert_proxy_state(app, false);
-            return Err("No server is selected. Open the Dashboard and select a server before connecting.".into());
+    let result: Result<ToggleOutcome, String> = if enable {
+        let request = BridgeRequest::Start {
+            config: proxy_config.expect("built above for the enable path"),
         };
-
-        let request = BridgeRequest::Start { config: proxy_config };
-        match state.bridge_send(request.clone()).await {
-            Ok(BridgeResponse::Ack) => {
-                info!("proxy started");
-                Ok(ToggleOutcome::Running)
+        let response = state.bridge_send(request.clone()).await;
+        match outcome_for_start_response(&response) {
+            StartDecision::Outcome(outcome) => {
+                info!(?outcome, "proxy start settled");
+                Ok(outcome)
             }
-            Ok(BridgeResponse::Error { message }) if message == CANCELLED_MESSAGE => {
-                info!("proxy start cancelled");
-                Ok(ToggleOutcome::Cancelled)
-            }
-            Ok(BridgeResponse::Error { message }) if message.contains("already running") => {
-                info!("proxy already running");
-                Ok(ToggleOutcome::Running)
-            }
-            Ok(BridgeResponse::Error { message }) => {
-                error!("bridge error: {message}");
-                Err(format!("Bridge error: {message}"))
-            }
-            Ok(_) => {
-                warn!("unexpected response from bridge");
-                Err("Unexpected response from bridge".into())
-            }
-            Err(crate::bridge_client::ClientError::PermissionDenied) => {
-                if crate::elevation::prompt_elevation(app, request).await {
-                    Ok(ToggleOutcome::Running)
-                } else {
-                    Err("Elevation was denied or failed".into())
-                }
-            }
-            Err(e) => {
-                error!("failed to send start: {e}");
-                Err(format!("Failed to connect to bridge: {e}"))
+            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
+            StartDecision::Fail(msg) => {
+                error!("proxy start failed: {msg}");
+                Err(msg)
             }
         }
     } else {
         let request = BridgeRequest::Stop;
-        match state.bridge_send(request.clone()).await {
-            Ok(BridgeResponse::Ack) => {
-                info!("proxy stopped");
-                Ok(ToggleOutcome::Stopped)
+        let response = state.bridge_send(request.clone()).await;
+        match outcome_for_stop_response(&response) {
+            StartDecision::Outcome(outcome) => {
+                info!(?outcome, "proxy stop settled");
+                Ok(outcome)
             }
-            Ok(BridgeResponse::Error { message }) => {
-                error!("bridge error: {message}");
-                Err(format!("Bridge error: {message}"))
-            }
-            Ok(_) => {
-                warn!("unexpected response from bridge");
-                Err("Unexpected response from bridge".into())
-            }
-            Err(crate::bridge_client::ClientError::PermissionDenied) => {
-                if crate::elevation::prompt_elevation(app, request).await {
-                    Ok(ToggleOutcome::Stopped)
-                } else {
-                    Err("Elevation was denied or failed".into())
-                }
-            }
-            Err(e) => {
-                error!("failed to send stop: {e}");
-                Err(format!("Failed to connect to bridge: {e}"))
+            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
+            StartDecision::Fail(msg) => {
+                error!("proxy stop failed: {msg}");
+                Err(msg)
             }
         }
     };
 
     match &result {
-        Ok(ToggleOutcome::Running | ToggleOutcome::Stopped) => rebuild_tray_menu(app),
-        Ok(ToggleOutcome::Cancelled) => {
-            // The user cancelled the Start. Roll back the optimistic
-            // `config.enabled = true` flip so persisted state matches
-            // reality, and rebuild the menu with enabled=false.
-            debug_assert!(enabled, "Cancelled outcome only possible on Start");
-            revert_proxy_state(app, false);
+        Ok(outcome) => {
+            persist_intended_enabled(
+                &state.config,
+                &state.config_store,
+                matches!(outcome, ToggleOutcome::Running),
+            );
         }
-        Err(_) => revert_proxy_state(app, !enabled),
+        Err(_) => {
+            // The failed exchange may have committed nothing (Stop+Error)
+            // or a pessimistic false; one linearized Status commits truth.
+            let _ = state.bridge_send(BridgeRequest::Status).await;
+        }
     }
 
     result
@@ -386,20 +489,20 @@ fn handle_tray_icon_event(tray: &TrayIcon, event: TrayIconEvent) {
 /// also invoke the window's handler (and vice versa), causing actions to fire twice.
 fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
-        ID_CONNECT => {
-            info!("tray: connect toggled");
+        // The clicked item's ID carries the user's intent — the intent the
+        // displayed label offered, not a flip of any state read now (#462).
+        id @ (ID_CONNECT | ID_DISCONNECT) => {
+            let enable = id == ID_CONNECT;
+            info!(enable, "tray: connect/disconnect clicked");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                let state = app_handle.state::<AppState>();
-                let enabled = !state.config.lock().unwrap().enabled;
-                match set_proxy_enabled(&app_handle, enabled).await {
-                    Ok(ToggleOutcome::Running) | Ok(ToggleOutcome::Stopped) => { /* menu already rebuilt */ }
+                match set_proxy_enabled(&app_handle, enable).await {
+                    Ok(ToggleOutcome::Running) | Ok(ToggleOutcome::Stopped) => { /* watcher repaints */ }
                     Ok(ToggleOutcome::Cancelled) => {
                         // Tray never initiates Cancel itself, so this is an
                         // observer effect: the frontend cancelled while the
                         // tray-triggered Start was still in flight. The
-                        // config has already been reverted by
-                        // set_proxy_enabled. Nothing to do here.
+                        // cancelled exchange already committed not-running.
                         info!("tray: start was cancelled externally");
                     }
                     Err(msg) => {
@@ -822,17 +925,26 @@ pub(crate) fn open_settings_window(app: &AppHandle) {
 
 // Tauri commands ======================================================================================================
 
-/// Toggle the proxy on/off. Returns a `ToggleOutcome` describing the
-/// resulting state (Running / Stopped / Cancelled). The frontend
-/// distinguishes the three cases in its connection state machine.
+/// Start the proxy. The caller transmits explicit intent — direction is
+/// decided by the state the user SAW, never re-derived backend-side from
+/// possibly-stale state (#462); the bridge's idempotence ("already
+/// running" → Running) absorbs a stale view instead of inverting the
+/// user's intent. Returns a `ToggleOutcome` (Running / Stopped /
+/// Cancelled); the frontend distinguishes the three cases in its
+/// connection state machine.
 #[tauri::command]
-pub async fn toggle_proxy(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ToggleOutcome, String> {
-    let enabled = !state.config.lock().unwrap().enabled;
-    set_proxy_enabled(&app, enabled).await
+pub async fn start_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled(&app, true).await
+}
+
+/// Stop the proxy. See [`start_proxy`].
+#[tauri::command]
+pub async fn stop_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled(&app, false).await
 }
 
 /// Cancel an in-flight proxy start. Uses `bridge_send_oneshot` so the
-/// cancel can race an in-flight `toggle_proxy` on the main pooled
+/// cancel can race an in-flight `start_proxy` on the main pooled
 /// bridge connection. Always returns `Ok(())` on a successful bridge
 /// round-trip — the bridge's `/v1/cancel` route is idempotent.
 #[tauri::command]
@@ -848,6 +960,54 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), Strin
             Err(format!("Failed to cancel: {e}"))
         }
     }
+}
+
+// Proxy state sync ====================================================================================================
+
+/// Forward every committed proxy-state change to the tray and the
+/// webview. Single sequential consumer of the `ProxyStateCell` watch
+/// channel, so emit order equals commit order; the rebuild re-reads the
+/// cell inside its main-thread closure, so the last queued rebuild always
+/// renders the newest state.
+pub fn spawn_proxy_state_sync(app: &AppHandle) {
+    use tauri::Emitter;
+    let app = app.clone();
+    let mut rx = app.state::<AppState>().subscribe_proxy_state();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if rx.changed().await.is_err() {
+                return; // cell dropped — app teardown
+            }
+            let snap = *rx.borrow_and_update();
+            rebuild_tray_menu(&app);
+            if let Err(e) = app.emit("proxy-state-changed", snap) {
+                warn!(error = %e, "failed to emit proxy-state-changed");
+            }
+        }
+    });
+}
+
+/// Keep the GUI's view of the bridge honest when the dashboard is closed
+/// (no webview poll): an external stop, a bridge crash, or `hole proxy
+/// stop` must reach the tray (#462).
+///
+/// Sanctioned timing exception (CONTRIBUTING.md test-invariants, the
+/// "external process whose state changes out-of-band" class): this polls
+/// a SEPARATE PROCESS for presentation reconciliation — the same class as
+/// the webview's 5s status poll — and synchronizes nothing in-process
+/// (`BridgeLink::send` commits synchronously; no code waits on this
+/// loop). The immediate first tick doubles as the startup reconcile.
+pub fn spawn_status_reconciler(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // Result irrelevant: the commit happens inside send.
+            let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+        }
+    });
 }
 
 #[cfg(test)]

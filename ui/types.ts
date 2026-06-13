@@ -71,12 +71,44 @@ export interface Config {
   proxy_http: boolean;
   on_startup: string;
   theme: string;
-  dns?: DnsConfig;
+  // Required: `get_config` always returns it (AppConfig has no skip
+  // attribute), and `toUiSettings` must always send it — the backend
+  // rejects a missing field.
+  dns: DnsConfig;
+  diagnostic_plugin_tap: boolean;
   [key: string]: unknown;
+}
+
+/// `Server` minus the backend-owned `validation`. Mirrors the Rust
+/// `UiServerEntry` in `crates/hole/src/ui_settings.rs`.
+export type UiServer = Omit<Server, "validation">;
+
+/// The settings payload `save_config` accepts. Mirrors the Rust
+/// `UiSettings` (#462): backend-owned state (`enabled`,
+/// `elevation_prompt_shown`, `servers[].validation`) is not part of the
+/// wire type, and the backend rejects unknown keys — send exactly this.
+export interface UiSettings {
+  servers: UiServer[];
+  selected_server: string | null;
+  local_port: number;
+  filters: FilterRule[];
+  start_on_login: boolean;
+  on_startup: string;
+  theme: string;
+  proxy_server_enabled: boolean;
+  proxy_socks5: boolean;
+  proxy_http: boolean;
+  dns: DnsConfig;
+  local_port_http: number;
+  diagnostic_plugin_tap: boolean;
 }
 
 export interface ProxyStatus {
   running: boolean;
+  /// Commit seq of the backend's ProxyStateCell at response time. The
+  /// frontend applies observations monotonically by this value; see
+  /// `applyProxyStateObservation` in `ui/power-button.ts` (#462).
+  state_seq: number;
 }
 
 export interface Metrics {

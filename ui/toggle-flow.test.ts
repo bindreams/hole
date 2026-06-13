@@ -1,8 +1,9 @@
-// Unit tests for the extracted toggle-flow module. The key invariant
-// tested here is that `toggleFromIdle` schedules NO client-side timer:
-// the UI stays in `connecting`/`disconnecting` until the bridge IPC
-// returns; the user's Cancel button (`cancel_proxy`) is the only escape
-// hatch.
+// Unit tests for the extracted toggle-flow module. The key invariants
+// tested here: `toggleFromIdle` schedules NO client-side timer (the UI
+// stays in `connecting`/`disconnecting` until the bridge IPC returns;
+// the user's Cancel button (`cancel_proxy`) is the only escape hatch),
+// and the user's direction is transmitted as explicit start/stop intent
+// on the wire (#462).
 //
 // Sync-invariant note (CLAUDE.md §"Synchronization invariant"): this
 // test uses `vi.useFakeTimers()` + `vi.getTimerCount()` to assert the
@@ -61,16 +62,16 @@ afterEach(() => {
 });
 
 describe("toggleFromIdle: client-side timer absence (regression for #397 sub-bug C)", () => {
-  it("schedules NO timers and fires no cancel_proxy while toggle_proxy is pending", async () => {
-    // toggle_proxy resolves never (slow-but-working bridge start). The
+  it("schedules NO timers and fires no cancel_proxy while start_proxy is pending", async () => {
+    // start_proxy resolves never (slow-but-working bridge start). The
     // UI must stay in `connecting` and schedule no timer.
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return new Promise(() => {});
+      if (cmd === "start_proxy") return new Promise(() => {});
       return Promise.resolve();
     });
 
-    // Kick off the toggle. We deliberately don't await — toggle_proxy
+    // Kick off the toggle. We deliberately don't await — start_proxy
     // never resolves. The promise hangs in the background; we observe
     // side effects.
     void toggleFromIdle(true, h.deps);
@@ -84,7 +85,7 @@ describe("toggleFromIdle: client-side timer absence (regression for #397 sub-bug
     // this immediately.
     expect(vi.getTimerCount()).toBe(0);
 
-    // The in-flight toggle_proxy promise never resolves, so no further
+    // The in-flight start_proxy promise never resolves, so no further
     // setState/showToast/invoke side effects can fire from this code
     // path. State and toast surface should match the prelude.
     expect(h.state).toBe("connecting");
@@ -95,7 +96,7 @@ describe("toggleFromIdle: client-side timer absence (regression for #397 sub-bug
     const h = makeHarness();
     h.state = "connected";
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return new Promise(() => {});
+      if (cmd === "stop_proxy") return new Promise(() => {});
       return Promise.resolve();
     });
 
@@ -112,12 +113,15 @@ describe("toggleFromIdle: outcome handling", () => {
   it("transitions to `connected` on a Running outcome", async () => {
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return Promise.resolve("running");
+      if (cmd === "start_proxy") return Promise.resolve("running");
       return Promise.resolve();
     });
     await toggleFromIdle(true, h.deps);
     expect(h.state).toBe("connected");
     expect(h.updatePublicIp).toHaveBeenCalled();
+    // Explicit intent on the wire (#462): the direction the user chose,
+    // not a directionless toggle the backend has to re-derive.
+    expect(h.invoke).toHaveBeenCalledWith("start_proxy");
   });
 
   it("transitions to `disconnected` on a Cancelled outcome (bridge-side cancel)", async () => {
@@ -127,7 +131,7 @@ describe("toggleFromIdle: outcome handling", () => {
     // `cancelling`, but the settled idle state is Disconnected.
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return Promise.resolve("cancelled");
+      if (cmd === "start_proxy") return Promise.resolve("cancelled");
       return Promise.resolve();
     });
     await toggleFromIdle(true, h.deps);
@@ -137,7 +141,7 @@ describe("toggleFromIdle: outcome handling", () => {
   it("surfaces a bridge error via toast + transitions to `connection-failed`", async () => {
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return Promise.reject("forwarder self-test failed");
+      if (cmd === "start_proxy") return Promise.reject("forwarder self-test failed");
       return Promise.resolve();
     });
     await toggleFromIdle(true, h.deps);
@@ -149,12 +153,13 @@ describe("toggleFromIdle: outcome handling", () => {
     const h = makeHarness();
     h.state = "connected";
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return Promise.reject("teardown wedged");
+      if (cmd === "stop_proxy") return Promise.reject("teardown wedged");
       return Promise.resolve();
     });
     await toggleFromIdle(false, h.deps);
     expect(h.state).toBe("disconnection-failed");
     expect(h.showToast).toHaveBeenCalledWith("teardown wedged", "error");
+    expect(h.invoke).toHaveBeenCalledWith("stop_proxy");
   });
 
   it("fires follow-up stop when Cancel raced with a successful Start", async () => {
@@ -163,14 +168,14 @@ describe("toggleFromIdle: outcome handling", () => {
     // === "running", and fires a follow-up Stop to honor the user's
     // cancel intent.
     const h = makeHarness();
-    let toggleCalls = 0;
+    const proxyCalls: string[] = [];
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") {
-        toggleCalls++;
-        // First call (the Start) returns Running after the user
-        // clicked Cancel (test simulates this by mutating state below).
-        // Second call (the follow-up Stop) returns Stopped.
-        return Promise.resolve(toggleCalls === 1 ? "running" : "stopped");
+      if (cmd === "start_proxy" || cmd === "stop_proxy") {
+        proxyCalls.push(cmd);
+        // The Start returns Running after the user clicked Cancel (the
+        // test simulates this by mutating state below); the follow-up
+        // Stop returns Stopped.
+        return Promise.resolve(cmd === "start_proxy" ? "running" : "stopped");
       }
       return Promise.resolve();
     });
@@ -186,8 +191,9 @@ describe("toggleFromIdle: outcome handling", () => {
     h.deps.setState("cancelling");
     await togglePromise;
 
-    // The follow-up Stop was fired (two toggle_proxy calls total).
-    expect(toggleCalls).toBe(2);
+    // The follow-up carries explicit STOP intent (#462) — the backend
+    // must not be left to derive direction from its own state.
+    expect(proxyCalls).toEqual(["start_proxy", "stop_proxy"]);
     // Final state honors the user's cancel intent: Stopped → disconnected.
     expect(h.state).toBe("disconnected");
   });
@@ -197,7 +203,7 @@ describe("mark_validated_by_proxy_start failure surfacing", () => {
   it("toasts when the validation mark fails after a successful connect", async () => {
     const h = makeHarness();
     h.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "toggle_proxy") return Promise.resolve("running");
+      if (cmd === "start_proxy") return Promise.resolve("running");
       if (cmd === "mark_validated_by_proxy_start") return Promise.reject(new Error("config save failed"));
       return Promise.resolve();
     });

@@ -296,11 +296,21 @@ the whole rebuild — state reads included — to the main thread
 (`run_on_main_thread` executes inline when already there). A raw `set_menu`
 from a worker thread reads state early and commits the menu later through the
 event-loop queue, so a stale menu can overwrite a newer one (the #473 desync).
-Enforcement is in [`clippy.toml`](clippy.toml) (`TrayIcon::set_menu` is
-disallowed; the one commit point inside `rebuild_tray_menu` carries a per-site
-`#[allow]`). Corollary: `sync_menu_state` is main-thread-only — menu-item
-setters dispatch-and-block from any other thread, so calling it from a worker
-while holding a lock deadlocks the app.
+The tray **icon** is committed inside the same ordered closure for the same
+reason (the #492 stale-icon class). Enforcement is in
+[`clippy.toml`](clippy.toml) (`TrayIcon::set_menu` is disallowed; the one
+commit point inside `rebuild_tray_menu` carries a per-site `#[allow]`).
+Corollary: `sync_autostart_state` is main-thread-only — menu-item setters
+dispatch-and-block from any other thread, so calling it from a worker while
+holding a lock deadlocks the app.
+
+The rebuild renders from the runtime truth, never from persisted config
+(#462): proxy state comes from `AppState`'s `ProxyStateCell` (fed by every
+bridge exchange, inside the client lock) plus the in-flight `TransitionSlot`
+target; status/connect text is baked into the menu at build time. Persisted
+`config.enabled` is a write-only record of the last honored intent (the
+designated input for a future `StartupBehavior::RestoreLastState` consumer),
+with `tray::persist_intended_enabled` as its sole writer.
 
 ## Workspace layout
 
