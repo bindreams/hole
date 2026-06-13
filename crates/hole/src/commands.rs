@@ -251,13 +251,16 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
         warn!(path = %path, error = ?e, "import_servers_from_file: validate/parse failed");
     })?;
 
-    let mut config = state.config.lock().unwrap();
-    let (appended, _deduped) = apply_import(&mut config, parsed);
+    let mut current = state.config.lock().unwrap();
+    // Apply to a copy so a failed save leaves in-memory state unchanged.
+    let mut updated = current.clone();
+    let (appended, _deduped) = apply_import(&mut updated, parsed);
 
-    state.config_store.save(&config).map_err(|e| {
+    state.config_store.save(&updated).map_err(|e| {
         warn!(error = %e, path = %state.config_store.path().display(), "import_servers_from_file: config save failed");
         ImportFailure::SaveFailed
     })?;
+    *current = updated;
 
     Ok(appended)
 }
