@@ -259,6 +259,22 @@ fn parse_cf_trace_falls_back_when_fields_absent() {
     assert_eq!(out["country_code"], "??");
 }
 
+/// CRLF line endings: `str::lines()` strips the trailing `\r`.
+#[skuld::test]
+fn parse_cf_trace_handles_crlf() {
+    let out = parse_cf_trace("ip=203.0.113.42\r\nloc=DE\r\n");
+    assert_eq!(out["ip"], "203.0.113.42");
+    assert_eq!(out["country_code"], "DE");
+}
+
+/// Present-but-empty fields stay empty; the UI renders its own placeholder.
+#[skuld::test]
+fn parse_cf_trace_present_but_empty_fields() {
+    let out = parse_cf_trace("ip=\nloc=\n");
+    assert_eq!(out["ip"], "");
+    assert_eq!(out["country_code"], "");
+}
+
 // validate_and_read_import tests ======================================================================================
 
 const VALID_SERVER_JSON: &str = r#"{"server":"1.2.3.4","server_port":8388,"password":"pw","method":"aes-256-gcm"}"#;
