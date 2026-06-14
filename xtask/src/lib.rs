@@ -27,6 +27,9 @@ pub mod wintun;
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
 #[cfg(test)]
+#[path = "external_bin_tests.rs"]
+mod external_bin_tests;
+#[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
 #[cfg(test)]

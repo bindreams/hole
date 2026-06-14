@@ -28,7 +28,8 @@
       "signingIdentity": "-"
     },
     "externalBin": [
-      ".cache/ex-ray/ex-ray"
+      ".cache/ex-ray/ex-ray",
+      ".cache/galoshes/galoshes"
     ],
     "icon": [
       ".cache/icons/32x32.png",
