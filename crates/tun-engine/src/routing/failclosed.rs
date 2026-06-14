@@ -63,3 +63,11 @@ pub fn engage_lockdown(
         inner: platform::engage_lockdown(server_ip, tun_luid, app_ids, state_dir)?,
     })
 }
+
+/// Reconcile a possibly-present standing lockdown cover with the persisted
+/// intent at bridge startup. `Adopt` keeps the host fail-closed (removes only
+/// the dead TUN permit); `Sweep` disengages fully; `Noop` does nothing.
+#[cfg(target_os = "windows")]
+pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
+    platform::recover_lockdown(decision, state_dir);
+}

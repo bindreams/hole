@@ -183,3 +183,59 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
     assert_eq!(server.len(), 1);
     assert_eq!(server[0].layer, Layer::ConnectV6);
 }
+
+// lockdown sweep / Adopt GUID sets ====================================================================================
+
+#[skuld::test]
+fn all_swept_guids_cover_both_covers() {
+    // The lockdown sweep must iterate every fixed lockdown GUID plus the
+    // per-binary App-ID GUIDs so an intent-OFF leftover is fully cleaned.
+    let swept = swept_lockdown_guids();
+    for g in LOCKDOWN_FILTER_GUIDS {
+        assert!(swept.contains(&g), "lockdown GUID {g:?} must be swept");
+    }
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(swept.contains(&appid_filter_guid(i, false)));
+        assert!(swept.contains(&appid_filter_guid(i, true)));
+    }
+}
+
+#[skuld::test]
+fn all_swept_guids_are_mutually_distinct() {
+    // Transient six + lockdown eight + every App-ID-derived GUID must be
+    // pairwise distinct: two filters sharing a key means the second add
+    // silently clobbers the first (FwpmFilterAdd0 keys on filterKey). GUID
+    // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
+    let mut all: Vec<GUID> = FILTER_GUIDS.to_vec();
+    all.extend(swept_lockdown_guids());
+    let unique: std::collections::HashSet<GUID> = all.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "every filter GUID (transient + lockdown + App-ID) must be distinct"
+    );
+}
+
+#[skuld::test]
+fn adopt_deletes_only_the_tun_luid_pair() {
+    // Adopt keeps the host fail-closed: it removes ONLY the two stale TUN-LUID
+    // permits (their LUID is dead after teardown), never block-all / loopback /
+    // server / App-ID. The next connect re-adds the TUN permit.
+    let adopt = adopt_delete_guids();
+    assert_eq!(adopt.len(), 2);
+    for &i in &LOCKDOWN_TUN_GUID_INDICES {
+        assert!(
+            adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
+            "Adopt must delete the TUN permit at index {i}"
+        );
+    }
+    // It must NOT delete the block-all or server permits.
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[6]),
+        "Adopt must NOT delete block-all V4"
+    );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[4]),
+        "Adopt must NOT delete the server permit"
+    );
+}

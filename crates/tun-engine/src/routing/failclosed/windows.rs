@@ -50,6 +50,11 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 8] = [
     GUID::from_u128(0x20af67ac_58ec_41e6_a49d_6fd2ed55c184), // block-all V6
 ];
 
+/// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
+/// pair. Adopt recovery deletes ONLY these (the LUID is dead after teardown);
+/// the next connect's engage re-adds them with a freshly-resolved LUID.
+const LOCKDOWN_TUN_GUID_INDICES: [usize; 2] = [2, 3]; // TUN V4, TUN V6
+
 /// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
 /// re-engage over an unswept cover is idempotent and recovery can delete by
 /// key. XORs a fixed namespace keyed by the (index, is_v6) pair —
@@ -76,6 +81,16 @@ fn swept_lockdown_guids() -> Vec<GUID> {
         guids.push(appid_filter_guid(i, true));
     }
     guids
+}
+
+/// The GUIDs Adopt deletes: ONLY the two stale TUN-LUID permits. Everything
+/// else (block-all, loopback, server, App-ID) stays in force so the host
+/// remains fail-closed across the restart — the crash-leak fix.
+fn adopt_delete_guids() -> Vec<GUID> {
+    LOCKDOWN_TUN_GUID_INDICES
+        .iter()
+        .map(|&i| LOCKDOWN_FILTER_GUIDS[i])
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,6 +623,34 @@ impl Drop for Cover {
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
             let _ = FwpmEngineClose0(self.engine);
+        }
+    }
+}
+
+/// Reconcile a possibly-present standing lockdown cover with the persisted
+/// intent. Opens the engine; `Adopt` deletes ONLY the dead TUN-LUID permits
+/// (host stays fail-closed); `Sweep` deletes all lockdown + App-ID filters,
+/// then the sublayer/provider IFF the transient cover isn't also using them
+/// (they share PROVIDER_GUID/SUBLAYER_GUID, so leave them — the transient
+/// `delete_all` owns their removal, and an orphaned empty sublayer is benign).
+/// `Noop`: nothing. Idempotent — a "not found" delete is ignored.
+pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Path) {
+    use crate::routing::CoverRecovery::*;
+    let guids: Vec<GUID> = match decision {
+        Noop => return,
+        Adopt => adopt_delete_guids(),
+        Sweep => swept_lockdown_guids(),
+    };
+    unsafe {
+        let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
+            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+            for g in guids {
+                let _ = FwpmFilterDeleteByKey0(engine, &g);
+            }
+            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+            let _ = FwpmEngineClose0(engine);
         }
     }
 }
