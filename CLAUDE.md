@@ -10,6 +10,8 @@ This file is the agent-facing architecture map. Product and install live in
 every rule below in detail — lives in [CONTRIBUTING.md](CONTRIBUTING.md). Read it
 before editing; the sections linked below are the authoritative source.
 
+**IMPORTANT:** NEVER PIPE TESTS TO `tail`! ALWAYS SET A TIMEOUT FOR THE SHELL COMMAND! Tests are known to hang, you WILL get stuck and WILL not have information to debug why if you tail.
+
 ## Architecture map
 
 - **Single binary, two modes.** GUI (system tray, settings, config) and bridge
