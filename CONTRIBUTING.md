@@ -215,7 +215,13 @@ socket binds; DNS recovery runs before route recovery so a mid-recovery crash
 leaves working DNS + broken routes, not the inverse):
 
 - **`bridge-routes.json`** — TUN name, server IP, upstream interface;
-  `routing::recover_routes` tears down leaked routes.
+  `routing::recover_routes` tears down leaked routes. The same call also sweeps a
+  stale [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID,
+  macOS via `bridge-failclosed.json`).
+- **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
+  engaged fail-closed cover; `routing::failclosed::recover_cover` restores
+  `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP
+  GUIDs and needs no file. See [Fail-closed cover](#fail-closed-cover).
 - **`bridge-plugins.json`** — plugin PIDs + start times;
   `plugin_recovery::recover_plugins` kills survivors (PID-reuse-safe).
 - **`bridge-dns.json`** — prior system DNS; `dns::recovery::recover_dns_config`
@@ -231,6 +237,40 @@ installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
 
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
+
+### Fail-closed cover
+
+`Routing::install_failclosed_cover(server_ip)` engages a leak-free egress block —
+permit loopback and the SS server IP, **block everything else** — as an RAII
+guard whose `Drop` disengages it. It exists for the leak-free in-place-update
+cutover (#468): the bridge is briefly stopped and restarted onto new code, and
+without a cover the missing split routes would let traffic egress in the clear
+(Hole fails *open* — there is no kill switch). The cover holds the line during
+that window; a crash mid-cutover leaves traffic **blocked, not leaked**.
+
+It is **name-agnostic** — it does *not* permit the TUN interface. The new
+bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
+and out to the server IP, so loopback + server-IP permits suffice; app traffic
+into the (briefly absent) tunnel being blocked for the sub-second cover window is
+the accepted fail-closed cost.
+
+- **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
+  a persistent provider + sublayer + filter set installed in one FWPM
+  transaction on `ALE_AUTH_CONNECT_V4`/`_V6` (permit loopback + server IP *hard*
+  via `CLEAR_ACTION_RIGHT`, block all else). **Non-dynamic session** — a dynamic
+  session would auto-delete the filters when the engaging process exits, reopening
+  the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
+  no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
+- **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -Fa -f -`). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
+  blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
+  the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
+
+Each platform splits a pure, unit-tested rule/spec builder (`build_cover_spec` /
+`build_pf_ruleset`) from the thin engage layer — mirroring `build_setup_commands`
+vs `run_commands`. The kernel-level engage is exercised by the privileged cutover
+path, not unit tests (the [#165](#bridge-test-isolation-contract) isolation
+contract). The recovery sweep runs on every bridge start via `recover_routes`.
 
 ### Config corruption recovery
 
