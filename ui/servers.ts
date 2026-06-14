@@ -67,9 +67,6 @@ export function statusTooltipFor(v: ValidationState | null | undefined): string 
 /// Entry IDs with a test_server invoke in flight. renderServers consults
 /// this so a mid-test rebuild repaints the in-flight state instead of
 /// silently reverting the card to its persisted dot.
-/// Entry IDs with a test_server invoke in flight. renderServers consults
-/// this so a mid-test rebuild repaints the in-flight state instead of
-/// silently reverting the card to its persisted dot.
 const testsInFlight = new Set<string>();
 
 /// Repaint one card's test button + status dot from the live DOM.
@@ -263,7 +260,12 @@ async function selectServer(id: string) {
   await saveConfig();
 }
 
-/** Delete a server by ID — removes it from config, clears selection if needed, re-renders, saves. */
+/** Delete a server by ID. Removal is a dedicated by-id backend op
+ * (`delete_server`), never a wholesale `save_config` — that would drop
+ * servers imported concurrently (#504). The optimistic local removal gives
+ * instant feedback; the trailing `loadConfig` reconciles with backend truth
+ * (concurrent imports, healed selection) and, on failure, restores the server
+ * the optimistic removal hid. */
 async function deleteServer(id: string) {
   if (!config) return;
   const idx = config.servers.findIndex((s) => s.id === id);
@@ -280,7 +282,16 @@ async function deleteServer(id: string) {
     const dels = serverList.querySelectorAll<HTMLElement>(".srv-del");
     (dels[Math.min(idx, dels.length - 1)] ?? importZone).focus();
   }
-  await saveConfig();
+  try {
+    await invoke("delete_server", { entryId: id });
+  } catch (err) {
+    console.error("delete_server failed:", err);
+    showToast(`Failed to delete server: ${err}`, "error");
+  }
+  // Reconcile with backend truth on both success and failure: a successful
+  // delete pulls in any concurrent import + the healed selection; a failed
+  // delete restores the server the optimistic removal hid.
+  await loadConfig();
 }
 
 // File import =========================================================================================================

@@ -68,7 +68,7 @@ describe("setCountryFlag", () => {
     expect(el.classList.contains("fi-xx")).toBe(true);
   });
 
-  // Backend always sends a string (ipinfo.io fallback coerces to "??");
+  // Backend always sends a string (the IP fetch coerces a missing country to "??");
   // null/undefined is defense-in-depth.
   // biome-ignore lint/suspicious/noExplicitAny: cast through to test the runtime guard
   it("null / undefined: same as '??'", () => {

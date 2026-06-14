@@ -238,21 +238,9 @@ fn diagnostics_response_roundtrips() {
 }
 
 #[skuld::test]
-fn public_ip_response_roundtrips() {
-    let resp = PublicIpResponse {
-        ip: "185.0.0.42".to_string(),
-        country_code: "DE".to_string(),
-    };
-    let json = serde_json::to_string(&resp).unwrap();
-    let parsed: PublicIpResponse = serde_json::from_str(&json).unwrap();
-    assert_eq!(resp, parsed);
-}
-
-#[skuld::test]
 fn route_constants_for_new_endpoints_exist() {
     assert_eq!(ROUTE_METRICS, "/v1/metrics");
     assert_eq!(ROUTE_DIAGNOSTICS, "/v1/diagnostics");
-    assert_eq!(ROUTE_PUBLIC_IP, "/v1/public-ip");
 }
 
 // Protocol variant roundtrips -----------------------------------------------------------------------------------------
@@ -268,14 +256,6 @@ fn bridge_request_metrics_roundtrips() {
 #[skuld::test]
 fn bridge_request_diagnostics_roundtrips() {
     let req = BridgeRequest::Diagnostics;
-    let json = serde_json::to_string(&req).unwrap();
-    let parsed: BridgeRequest = serde_json::from_str(&json).unwrap();
-    assert_eq!(req, parsed);
-}
-
-#[skuld::test]
-fn bridge_request_public_ip_roundtrips() {
-    let req = BridgeRequest::PublicIp;
     let json = serde_json::to_string(&req).unwrap();
     let parsed: BridgeRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(req, parsed);
@@ -304,17 +284,6 @@ fn bridge_response_diagnostics_roundtrips() {
         network: "error".to_string(),
         vpn_server: "unknown".to_string(),
         internet: "unknown".to_string(),
-    };
-    let json = serde_json::to_string(&resp).unwrap();
-    let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();
-    assert_eq!(resp, parsed);
-}
-
-#[skuld::test]
-fn bridge_response_public_ip_roundtrips() {
-    let resp = BridgeResponse::PublicIp {
-        ip: "1.2.3.4".to_string(),
-        country_code: "US".to_string(),
     };
     let json = serde_json::to_string(&resp).unwrap();
     let parsed: BridgeResponse = serde_json::from_str(&json).unwrap();

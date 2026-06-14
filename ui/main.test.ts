@@ -47,6 +47,7 @@ vi.mock("./sidebar", () => ({
   updateMetrics: vi.fn(),
   updateProxyStatus: vi.fn().mockReturnValue({ state: "disconnected", changed: false }),
   updatePublicIp: vi.fn().mockResolvedValue(undefined),
+  startPublicIpAutoRefresh: vi.fn(),
 }));
 vi.mock("./toast", () => ({ showToast: vi.fn() }));
 
@@ -76,6 +77,16 @@ describe("init ordering", () => {
       expect(idx, `listener ${ev} must be registered before get_config`).toBeGreaterThan(-1);
       expect(idx).toBeLessThan(firstConfig);
     }
+  });
+
+  it("starts the visibility-gated public-IP refresh during init", async () => {
+    const sidebar = await import("./sidebar");
+    // The mock persists across tests; clear prior tests' init calls so the
+    // count reflects this init only.
+    vi.mocked(sidebar.startPublicIpAutoRefresh).mockClear();
+    const { initDone } = await import("./main");
+    await initDone;
+    expect(sidebar.startPublicIpAutoRefresh).toHaveBeenCalledTimes(1);
   });
 
   it("sends only UI-owned keys and strips server validation on save", async () => {

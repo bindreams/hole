@@ -699,7 +699,6 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
         Ok(BridgeResponse::Status { .. }) => 0,
         Ok(BridgeResponse::Metrics { .. }) => 0,
         Ok(BridgeResponse::Diagnostics { .. }) => 0,
-        Ok(BridgeResponse::PublicIp { .. }) => 0,
         Ok(BridgeResponse::TestServerResult { .. }) => 0,
         Ok(BridgeResponse::Error { message }) => {
             cli_log!(error, "bridge error: {message}");

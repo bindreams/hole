@@ -10,16 +10,15 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
-    DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, PublicIpResponse, StatusResponse,
-    TestServerRequest, TestServerResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
-    ROUTE_PUBLIC_IP, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, StatusResponse, TestServerRequest,
+    TestServerResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START,
+    ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -46,17 +45,13 @@ pub struct StartCancelState {
     pub pending: bool,
 }
 
-/// Shared state for IPC handlers, holding the proxy manager, IP cache, and
-/// the start-cancellation handoff struct.
+/// Shared state for IPC handlers, holding the proxy manager and the
+/// start-cancellation handoff struct.
 pub struct IpcState<P: Proxy, R: Routing> {
     pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
-    pub ip_cache: Arc<tokio::sync::Mutex<Option<(PublicIpResponse, Instant)>>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
 }
-
-/// IP cache time-to-live.
-const IP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Server ==============================================================================================================
 
@@ -90,7 +85,6 @@ impl IpcServer {
 
         let state = Arc::new(IpcState {
             proxy,
-            ip_cache: Arc::new(tokio::sync::Mutex::new(None)),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         });
         let router = build_router(state);
@@ -198,7 +192,6 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_RELOAD, axum::routing::post(handle_reload::<P, R>))
         .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<P, R>))
         .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<P, R>))
-        .route(ROUTE_PUBLIC_IP, axum::routing::get(handle_public_ip::<P, R>))
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
@@ -425,62 +418,6 @@ async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
     let cfg = TestConfig::production();
     let outcome = run_server_test(&req.entry, &cfg).await;
     Json(TestServerResponse { outcome })
-}
-
-async fn handle_public_ip<P: Proxy + 'static, R: Routing + 'static>(
-    State(state): State<Arc<IpcState<P, R>>>,
-) -> Result<Json<PublicIpResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Check cache first.
-    {
-        let cache = state.ip_cache.lock().await;
-        if let Some((ref cached, instant)) = *cache {
-            if instant.elapsed() < IP_CACHE_TTL {
-                return Ok(Json(cached.clone()));
-            }
-        }
-    }
-
-    // Cache miss or expired — fetch from external service.
-    // ureq is blocking, so run in a blocking thread.
-    let result = tokio::task::spawn_blocking(|| -> Result<PublicIpResponse, String> {
-        let agent = ureq::Agent::new_with_defaults();
-        let body: serde_json::Value = agent
-            .get("https://ipinfo.io/json")
-            .call()
-            .map_err(|e| format!("IP lookup failed: {e}"))?
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("parse error: {e}"))?;
-
-        let ip = body["ip"]
-            .as_str()
-            .ok_or_else(|| "missing 'ip' field".to_string())?
-            .to_string();
-        let country_code = body["country"]
-            .as_str()
-            .ok_or_else(|| "missing 'country' field".to_string())?
-            .to_string();
-
-        Ok(PublicIpResponse { ip, country_code })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: format!("task join error: {e}"),
-            }),
-        )
-    })?
-    .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ErrorResponse { message: e })))?;
-
-    // Update cache.
-    {
-        let mut cache = state.ip_cache.lock().await;
-        *cache = Some((result.clone(), Instant::now()));
-    }
-
-    Ok(Json(result))
 }
 
 // Security ============================================================================================================

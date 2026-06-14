@@ -156,7 +156,123 @@ fn auto_select_noop_on_empty_servers() {
     assert!(config.selected_server.is_none());
 }
 
-// get_metrics / get_diagnostics / get_public_ip response mapping tests ================================================
+// remove_server tests =================================================================================================
+
+#[skuld::test]
+fn remove_server_removes_by_id() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b"), test_entry("c")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    let removed = remove_server(&mut config, "b");
+    assert!(removed);
+    assert_eq!(
+        config.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["a", "c"]
+    );
+}
+
+#[skuld::test]
+fn remove_server_heals_selection_when_selected_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert_eq!(
+        config.selected_server.as_deref(),
+        Some("b"),
+        "selection heals to the first remaining server"
+    );
+}
+
+#[skuld::test]
+fn remove_server_keeps_selection_when_other_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert_eq!(config.selected_server.as_deref(), Some("b"));
+}
+
+#[skuld::test]
+fn remove_server_clears_selection_when_last_removed() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    remove_server(&mut config, "a");
+    assert!(config.servers.is_empty());
+    assert!(config.selected_server.is_none());
+}
+
+#[skuld::test]
+fn remove_server_missing_id_is_noop() {
+    let mut config = AppConfig {
+        servers: vec![test_entry("a"), test_entry("b")],
+        selected_server: Some("a".to_string()),
+        ..Default::default()
+    };
+    let removed = remove_server(&mut config, "nonexistent");
+    assert!(!removed);
+    assert_eq!(config.servers.len(), 2);
+    assert_eq!(config.selected_server.as_deref(), Some("a"));
+}
+
+// apply_ui_settings composition: merge by id + selection heal =========================================================
+
+fn ui_server_entry(id: &str) -> crate::ui_settings::UiServerEntry {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "name": format!("Server {id}"), "server": "1.2.3.4",
+        "server_port": 8388, "method": "aes-256-gcm", "password": "pw",
+    }))
+    .unwrap()
+}
+
+fn default_ui_settings() -> crate::ui_settings::UiSettings {
+    serde_json::from_value(serde_json::json!({
+        "servers": [], "selected_server": null, "local_port": 4073,
+        "filters": [], "start_on_login": false, "on_startup": "restore_last_state",
+        "theme": "dark", "proxy_server_enabled": true, "proxy_socks5": true,
+        "proxy_http": false, "dns": AppConfig::default().dns, "local_port_http": 4074,
+        "diagnostic_plugin_tap": false
+    }))
+    .unwrap()
+}
+
+#[skuld::test]
+fn apply_ui_settings_drops_stale_selection_and_ignores_unknown() {
+    // Backend truth after a concurrent delete of "a": only "b" remains.
+    let mut current = AppConfig {
+        servers: vec![test_entry("b")],
+        selected_server: Some("b".to_string()),
+        ..Default::default()
+    };
+    // Stale webview snapshot still believes "a" exists and is selected.
+    let mut settings = default_ui_settings();
+    settings.servers = vec![ui_server_entry("a"), ui_server_entry("b")];
+    settings.selected_server = Some("a".to_string());
+
+    apply_ui_settings(&mut current, settings);
+
+    assert_eq!(
+        current.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["b"],
+        "the unknown stale id 'a' must not be resurrected"
+    );
+    assert_eq!(
+        current.selected_server.as_deref(),
+        Some("b"),
+        "a selection naming the concurrently-deleted server is healed"
+    );
+}
+
+// get_metrics / get_diagnostics response mapping + public-IP parsing tests ============================================
 
 /// Verify that a Metrics BridgeResponse maps to the expected JSON.
 #[skuld::test]
@@ -242,33 +358,37 @@ fn get_diagnostics_unexpected_response_falls_back() {
     assert_eq!(json["bridge"], "unknown");
 }
 
-/// Verify that a PublicIp BridgeResponse maps to the expected JSON.
+/// `parse_cf_trace` pulls `ip=` / `loc=` out of Cloudflare's trace body.
 #[skuld::test]
-fn get_public_ip_bridge_success_returns_json() {
-    let resp: Result<BridgeResponse, ClientError> = Ok(BridgeResponse::PublicIp {
-        ip: "203.0.113.42".into(),
-        country_code: "DE".into(),
-    });
-    let json = map_public_ip_bridge_response(resp).expect("should return Some for PublicIp");
-    assert_eq!(json["ip"], "203.0.113.42");
-    assert_eq!(json["country_code"], "DE");
+fn parse_cf_trace_extracts_ip_and_country() {
+    let body = "fl=123abc\nh=cloudflare.com\nip=203.0.113.42\nts=1700000000.1\nvisit_scheme=https\nloc=DE\ncolo=FRA\n";
+    let out = parse_cf_trace(body);
+    assert_eq!(out["ip"], "203.0.113.42");
+    assert_eq!(out["country_code"], "DE");
 }
 
-/// Verify that a failed PublicIp bridge request returns None (triggers fallback).
+/// Absent fields fall back to the display placeholders.
 #[skuld::test]
-fn get_public_ip_bridge_failure_returns_none() {
-    let err: Result<BridgeResponse, ClientError> = Err(ClientError::Connection(std::io::Error::new(
-        std::io::ErrorKind::ConnectionRefused,
-        "bridge unreachable",
-    )));
-    assert!(map_public_ip_bridge_response(err).is_none());
+fn parse_cf_trace_falls_back_when_fields_absent() {
+    let out = parse_cf_trace("fl=123abc\nh=cloudflare.com\ncolo=FRA\n");
+    assert_eq!(out["ip"], "unknown");
+    assert_eq!(out["country_code"], "??");
 }
 
-/// Verify that an unexpected BridgeResponse for PublicIp returns None.
+/// CRLF line endings: `str::lines()` strips the trailing `\r`.
 #[skuld::test]
-fn get_public_ip_unexpected_response_returns_none() {
-    let resp: Result<BridgeResponse, ClientError> = Ok(BridgeResponse::Ack);
-    assert!(map_public_ip_bridge_response(resp).is_none());
+fn parse_cf_trace_handles_crlf() {
+    let out = parse_cf_trace("ip=203.0.113.42\r\nloc=DE\r\n");
+    assert_eq!(out["ip"], "203.0.113.42");
+    assert_eq!(out["country_code"], "DE");
+}
+
+/// Present-but-empty fields stay empty; the UI renders its own placeholder.
+#[skuld::test]
+fn parse_cf_trace_present_but_empty_fields() {
+    let out = parse_cf_trace("ip=\nloc=\n");
+    assert_eq!(out["ip"], "");
+    assert_eq!(out["country_code"], "");
 }
 
 // validate_and_read_import tests ======================================================================================
