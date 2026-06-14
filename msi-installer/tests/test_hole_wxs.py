@@ -6,7 +6,7 @@ Parse the WiX source (hole.wxs) and verify structural correctness without buildi
 import re
 import xml.etree.ElementTree as ET
 
-from conftest import NS
+from conftest import NS, canonical_windows_bindir
 
 # Known bind path variables passed via `-bindpath` to `wix build`.
 KNOWN_BINDPATHS = {"BinDir", "IconDir", "LicenseDir"}
@@ -615,6 +615,51 @@ def test_notices_md_component_exists(package: ET.Element) -> None:
     assert file_elem is not None, "NoticesMd component must contain <File Id='NOTICES.md'>"
     source = file_elem.get("Source", "")
     assert "!(bindpath.BinDir)" in source, (f"NOTICES.md File Source must resolve via BinDir bindpath; got '{source}'")
+
+
+# BINDIR conformance tests =============================================================================================
+#
+# Guards the staging->packaging boundary: every file `cargo xtask stage` puts
+# in BINDIR must have a <File> in hole.wxs, or WiX silently drops it from the
+# MSI. This is exactly how galoshes went missing (#512).
+
+
+def _wxs_bindir_file_basenames(package: ET.Element) -> set[str]:
+    """Basenames of every <File> sourced from the BinDir bindpath.
+
+    Captures only the last path segment so a future nested Source
+    (`...BinDir)\\sub\\x.exe`) still compares against the flat
+    bindir_dest_names. The staged BINDIR is flat (stage.rs rejects
+    separators in dest_name), so today every match is already a basename.
+    """
+    names: set[str] = set()
+    for f in package.iter(f"{{{NS['wix']}}}File"):
+        m = re.search(r"!\(bindpath\.BinDir\)\\([^\\]+)$", f.get("Source", ""))
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def test_wxs_files_match_canonical_bindir(package: ET.Element) -> None:
+    """hole.wxs <File> set must equal the canonical Windows bindir_files()."""
+    expected = canonical_windows_bindir()
+    actual = _wxs_bindir_file_basenames(package)
+    assert actual == expected, (
+        "hole.wxs <File> set diverges from bindir_files(): "
+        f"missing={expected - actual}, extra={actual - expected}"
+    )
+
+
+def test_galoshes_component_exists(package: ET.Element) -> None:
+    """galoshes.exe must ship in the MSI (#512)."""
+    comp = _find_component(package, "Galoshes")
+    assert comp is not None, "Component 'Galoshes' is required to ship the galoshes plugin"
+    file_elem = next(
+        (f for f in comp.iter(f"{{{NS['wix']}}}File") if f.get("Id") == "galoshes.exe"),
+        None,
+    )
+    assert file_elem is not None, "Galoshes component must contain <File Id='galoshes.exe'>"
+    assert "!(bindpath.BinDir)" in file_elem.get("Source", "")
 
 
 # Sticky-preference tests ==============================================================================================

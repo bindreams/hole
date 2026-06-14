@@ -496,11 +496,14 @@ npm run dev &                                     # Vite on port 1420
 HOLE_BRIDGE_SOCKET=$TMPDIR/hole-dev.sock target/debug/hole
 ```
 
-`cargo xtask stage` populates a BINDIR (`hole` + `ex-ray` sidecar + `wintun.dll`
-on Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
+`cargo xtask stage` populates a BINDIR (`hole` + the `ex-ray` and `galoshes`
+plugin sidecars + `NOTICES.md` + per-platform debug symbols + `wintun.dll` on
+Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
-exe; the `ex-ray` sidecar must be a sibling so `resolve_plugin_path_inner` finds
-it. The canonical file list is [xtask/src/bindir.rs](xtask/src/bindir.rs).
+exe; the plugin sidecars must be siblings so `resolve_plugin_path_inner` finds
+them. The canonical file list (the single source of truth, per-OS) is
+[`bindir_dest_names`](xtask/src/bindir.rs); the installer manifests are checked
+against it by conformance tests (`cargo xtask bindir-names`).
 
 ### Flags
 

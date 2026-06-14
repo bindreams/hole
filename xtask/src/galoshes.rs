@@ -3,7 +3,8 @@
 //! (written to `<repo>/.cache/ex-ray/`, where galoshes's `build.rs` picks
 //! it up).
 //!
-//! Output: `<repo>/target/release/galoshes{.exe}`.
+//! Output: `<repo>/target/release/galoshes{.exe}`, plus a Tauri-sidecar copy
+//! at `<repo>/.cache/galoshes/galoshes-<triple>{.exe}` for the macOS DMG.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,5 +47,22 @@ pub fn build(repo_root: &Path) -> Result<PathBuf> {
         return Err(anyhow!("galoshes binary not found at {} after build", binary.display()));
     }
 
+    // Also stage a Tauri-sidecar copy at `.cache/galoshes/galoshes-<triple>`.
+    // `npx tauri build` (the macOS DMG path) bundles `externalBin` entries by
+    // appending the host triple, mirroring how ex-ray lands in `.cache/ex-ray/`.
+    let cache_dir = repo_root.join(".cache").join("galoshes");
+    std::fs::create_dir_all(&cache_dir).with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let sidecar = cache_dir.join(cache_sidecar_name());
+    std::fs::copy(&binary, &sidecar)
+        .with_context(|| format!("failed to stage galoshes sidecar to {}", sidecar.display()))?;
+
     Ok(binary)
+}
+
+/// Tauri-sidecar filename: `galoshes-<triple>{.exe}`. Tauri's bundler appends
+/// the host triple to each `externalBin` path, so the macOS DMG needs galoshes
+/// at `.cache/galoshes/galoshes-<triple>` to bundle it into `Contents/MacOS/`.
+pub fn cache_sidecar_name() -> String {
+    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
+    format!("galoshes-{}{exe}", crate::target::host_target_triple())
 }

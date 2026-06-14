@@ -18,6 +18,7 @@ pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
+pub mod target;
 pub mod test_binaries;
 pub mod upstream_v2ray;
 pub mod wintun;
@@ -25,6 +26,12 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "external_bin_tests.rs"]
+mod external_bin_tests;
+#[cfg(test)]
+#[path = "galoshes_tests.rs"]
+mod galoshes_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
@@ -159,6 +166,16 @@ pub enum Command {
     /// List every target declared in `build.yaml` with its platforms,
     /// host-platform applicability, and a `*` marker for runnables.
     List,
+    /// Print the canonical BINDIR filenames for an OS as a JSON array.
+    ///
+    /// The installer conformance tests consume this so the WiX / Tauri
+    /// manifests are checked against the single source of truth
+    /// (`bindir::bindir_dest_names`) rather than a hand-restated copy.
+    BindirNames {
+        /// Target OS (defaults to the host).
+        #[arg(long)]
+        os: Option<manifest::Os>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -209,7 +226,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Build { target, all } => run_build(target, all),
         Command::Run { target } => run_run(target),
         Command::List => run_list(),
+        Command::BindirNames { os } => {
+            let os = os
+                .or_else(manifest::Os::host)
+                .ok_or_else(|| anyhow!("unknown host OS"))?;
+            println!("{}", render_bindir_names(os));
+            Ok(())
+        }
     }
+}
+
+/// Serialize the canonical BINDIR filenames for `os` as a JSON array. Consumed
+/// by `cargo xtask bindir-names` and the installer conformance tests.
+pub fn render_bindir_names(os: manifest::Os) -> String {
+    serde_json::to_string(&bindir::bindir_dest_names(os)).expect("Vec<String> serializes")
 }
 
 pub fn run_stage(profile: Profile, out_dir: &Path) -> Result<()> {

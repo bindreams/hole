@@ -68,3 +68,20 @@ def test_sidecar_has_real_signature(installed_app: Path) -> None:
     assert "linker-signed" not in output, (
         f"ex-ray sidecar still carries the linker-applied ad-hoc signature:\n{output}"
     )
+
+
+def test_galoshes_sidecar_present_and_signed(installed_app: Path) -> None:
+    """galoshes must ship inside Hole.app and be re-signed by Tauri (#512)."""
+    galoshes = installed_app / "Contents" / "MacOS" / "galoshes"
+    assert galoshes.exists(), "galoshes sidecar missing from the .app bundle (externalBin not bundled?)"
+    output = _codesign_dv(galoshes)
+    assert "linker-signed" not in output, (
+        f"galoshes sidecar still carries the linker-applied ad-hoc signature "
+        f"— Tauri's codesign step did not re-sign it:\n{output}"
+    )
+
+
+def test_notices_present_in_bundle(installed_app: Path) -> None:
+    """Apache-2.0 §4(d): the NOTICE file must ship with the bundle (#512)."""
+    notices = installed_app / "Contents" / "Resources" / "NOTICES.md"
+    assert notices.exists(), "NOTICES.md missing from the .app bundle"

@@ -9581,6 +9581,7 @@ dependencies = [
  "indexmap 2.14.0",
  "petgraph",
  "serde",
+ "serde_json",
  "serde_yml",
  "sha2 0.11.0",
  "skuld",

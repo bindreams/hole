@@ -1,9 +1,11 @@
 //! The canonical list of files that comprise a runnable hole BINDIR.
 //!
-//! **This is the single source of truth.** Adding a new file that must sit
-//! next to `hole.exe` is one line in `bindir_files()` below — both
-//! dev-console and `msi-installer/src/msi_installer/__init__.py:stage_files()` call into
-//! this via `cargo xtask stage`, so they pick it up automatically.
+//! **This is the single source of truth.** The *set* of files lives in
+//! [`bindir_dest_names`]; [`bindir_files`] resolves each to its host source
+//! path. dev-console and `msi-installer/src/msi_installer/__init__.py:stage_files()`
+//! stage via `cargo xtask stage`, and the installer-manifest conformance
+//! tests (WiX, Tauri) derive their expected payload from `bindir_dest_names`
+//! (via `cargo xtask bindir-names`) so the manifests cannot silently drift.
 //!
 //! See issue #143 for the motivation.
 
@@ -11,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::manifest::Os;
 use crate::Profile;
 
 /// Source kind for a BINDIR entry. Files use hard-link-then-copy;
@@ -63,80 +66,88 @@ impl BindirFile {
     }
 }
 
-/// Return the canonical BINDIR file list for the host platform and given profile.
+/// On-disk filenames that must sit next to the bridge binary on `os`, in
+/// staging order. **Single source of truth for the BINDIR payload.** Pure:
+/// no disk access, callable for any `os` from any host — so the installer
+/// conformance tests (`cargo xtask bindir-names`) and [`bindir_files`] share
+/// one definition of what ships.
 ///
-/// **Edit this function to add or remove BINDIR files.** The accompanying
-/// regression test in `bindir_tests.rs` asserts the exact filenames per
-/// platform — it will fail loudly if this list changes, forcing the change
-/// to be acknowledged.
+/// Add or remove a BINDIR file here. `bindir_tests.rs` asserts the exact set
+/// per OS, and the WiX / Tauri conformance tests fail loudly if a manifest
+/// stops covering it.
+pub fn bindir_dest_names(os: Os) -> Vec<String> {
+    let exe = if os == Os::Windows { ".exe" } else { "" };
+    let mut names = vec![format!("hole{exe}")];
+    // Debug symbols, staged alongside the binary so panic backtraces resolve
+    // frame names + line numbers (else `<unknown>`; see #393). The workspace
+    // `[profile.release] debug = "limited"` + `split-debuginfo = "packed"`
+    // produce a portable PDB/dSYM for this purpose.
+    match os {
+        Os::Windows => names.push("hole.pdb".to_string()),
+        Os::Darwin => names.push("hole.dSYM".to_string()),
+        Os::Linux => {}
+    }
+    names.push(format!("ex-ray{exe}"));
+    names.push(format!("galoshes{exe}"));
+    // wintun.dll — Windows-only DLL loaded by the bridge's TUN path.
+    if os == Os::Windows {
+        names.push("wintun.dll".to_string());
+    }
+    // NOTICES.md — Apache-2.0 §4(d) attribution for the bundled galoshes/garter
+    // components; the installer license dialog shows only GPL-3.0 text, so the
+    // NOTICE file must accompany the binaries on disk.
+    names.push("NOTICES.md".to_string());
+    names
+}
+
+/// SIP003 plugin sidecar binaries (no extension) that every installer must
+/// ship next to the bridge so `resolve_plugin_path` finds them. Subset of
+/// [`bindir_dest_names`]; drives the macOS `externalBin` conformance check.
+pub fn plugin_sidecar_names() -> &'static [&'static str] {
+    &["ex-ray", "galoshes"]
+}
+
+/// The host OS as a manifest [`Os`], or an error on a host outside the
+/// supported set (windows/darwin/linux) — the same platforms `bindir_files`
+/// already supports.
+fn host_os() -> Result<Os> {
+    Os::host().ok_or_else(|| anyhow!("host OS is not one of windows/darwin/linux; cannot resolve BINDIR"))
+}
+
+/// Resolve the canonical BINDIR file list for the host platform and given
+/// profile. The *set* and order come from [`bindir_dest_names`]; this fn maps
+/// each name to its host source path.
 pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile>> {
-    let mut files = Vec::new();
-    let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
+    let host = host_os()?;
+    let target_dir = repo_root.join("target").join(profile.dir_name());
 
-    // 1. hole binary — this IS the bridge + GUI executable. Built by `cargo build`.
-    let hole_name = format!("hole{exe_suffix}");
-    let hole_src = repo_root.join("target").join(profile.dir_name()).join(&hole_name);
-    files.push(BindirFile::new(hole_src, hole_name));
-
-    // 1a. Debug symbols for `hole` — staged alongside the binary so panic
-    //     backtraces in dev (dev-console) and production (the MSI)
-    //     resolve frame names and line numbers. Without these, the panic
-    //     hook at `crates/common/src/logging.rs::install_panic_hook` renders
-    //     every frame as `<unknown>`.
-    //
-    //     The workspace `[profile.release].debug = "limited"` guarantees the
-    //     PDB/dSYM exists for release builds (cargo's default is `false`).
-    //     Debug builds already emit full debug info.
-    #[cfg(target_os = "windows")]
-    {
-        // MSVC emits the binary's PDB next to the .exe.
-        let pdb_src = repo_root.join("target").join(profile.dir_name()).join("hole.pdb");
-        files.push(BindirFile::new(pdb_src, "hole.pdb".to_string()));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Cargo's macOS `split-debuginfo = "unpacked"` (release default)
-        // emits a `.dSYM` bundle at the same level as the binary.
-        let dsym_src = repo_root.join("target").join(profile.dir_name()).join("hole.dSYM");
-        files.push(BindirFile::directory(dsym_src, "hole.dSYM".to_string()));
-    }
-
-    // 2. ex-ray sidecar. Built by `cargo xtask ex-ray` into
-    //    `.cache/ex-ray/ex-ray-<target-triple>{.exe}`. The
-    //    target-triple varies (`x86_64-pc-windows-msvc`, `aarch64-apple-darwin`,
-    //    etc.) so we glob and assert exactly one match.
-    let ex_ray_glob_pattern = if cfg!(windows) {
+    // ex-ray is built per-target-triple into `.cache/ex-ray/ex-ray-<triple>{.exe}`;
+    // the triple varies, so glob + assert exactly one match.
+    let ex_ray_glob = if host == Os::Windows {
         ".cache/ex-ray/ex-ray-*.exe"
     } else {
         ".cache/ex-ray/ex-ray-*"
     };
-    let ex_ray_src = unique_glob_match(repo_root, ex_ray_glob_pattern)?;
-    let ex_ray_dest = format!("ex-ray{exe_suffix}");
-    files.push(BindirFile::new(ex_ray_src, ex_ray_dest));
 
-    // 3. galoshes sidecar. Built by `cargo xtask galoshes` into
-    //    `target/release/galoshes{.exe}` (the unified workspace target dir
-    //    now that galoshes is a regular workspace member at `crates/galoshes/`).
-    let galoshes_name = format!("galoshes{exe_suffix}");
-    let galoshes_src = repo_root.join("target").join("release").join(&galoshes_name);
-    files.push(BindirFile::new(galoshes_src, galoshes_name));
-
-    // 4. wintun.dll — Windows-only. Downloaded by `cargo xtask wintun` into
-    //    `.cache/wintun/wintun.dll`. Not a sidecar binary; loaded as a DLL by
-    //    the bridge's TUN code path. See crates/bridge/src/wintun.rs.
-    #[cfg(target_os = "windows")]
-    {
-        let wintun_src = repo_root.join(".cache").join("wintun").join("wintun.dll");
-        files.push(BindirFile::new(wintun_src, "wintun.dll".to_string()));
+    let mut files = Vec::new();
+    for name in bindir_dest_names(host) {
+        let file = match name.as_str() {
+            // hole binary — the bridge + GUI executable, built by `cargo build`.
+            "hole" | "hole.exe" => BindirFile::new(target_dir.join(&name), name),
+            // MSVC emits the PDB next to the .exe.
+            "hole.pdb" => BindirFile::new(target_dir.join("hole.pdb"), name),
+            // macOS `split-debuginfo = "packed"` emits a self-contained `.dSYM` bundle.
+            "hole.dSYM" => BindirFile::directory(target_dir.join("hole.dSYM"), name),
+            "ex-ray" | "ex-ray.exe" => BindirFile::new(unique_glob_match(repo_root, ex_ray_glob)?, name),
+            // galoshes is a workspace member, built into the unified `target/release/`.
+            "galoshes" | "galoshes.exe" => BindirFile::new(repo_root.join("target").join("release").join(&name), name),
+            // wintun.dll — downloaded by `cargo xtask wintun` into `.cache/wintun/`.
+            "wintun.dll" => BindirFile::new(repo_root.join(".cache").join("wintun").join("wintun.dll"), name),
+            "NOTICES.md" => BindirFile::new(repo_root.join("NOTICES.md"), name),
+            other => return Err(anyhow!("BINDIR name {other:?} has no source mapping in bindir_files")),
+        };
+        files.push(file);
     }
-
-    // 5. NOTICES.md — Apache-2.0 attribution for galoshes/garter components
-    //    that the GPL-3.0 binary distribution bundles. Apache-2.0 §4(d)
-    //    requires the NOTICE file to be preserved in derivative works; since
-    //    the installer's license dialog only shows GPL-3.0 text, the file
-    //    must accompany the binaries on disk.
-    let notices_src = repo_root.join("NOTICES.md");
-    files.push(BindirFile::new(notices_src, "NOTICES.md".to_string()));
 
     Ok(files)
 }

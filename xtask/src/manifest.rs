@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer};
 /// Docker / GOOS-style identifiers: matches the project's release-artifact
 /// naming convention (`hole-<version>-windows-amd64.msi`) and the `matrix.os`
 /// dimension already used in `.github/workflows/ci.yaml`.
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Deserialize)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Os {
     Windows,

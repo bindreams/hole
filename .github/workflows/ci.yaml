@@ -413,7 +413,7 @@ jobs:
         shell: pwsh
         run: |
           $binDir = "C:\Program Files\hole\bin"
-          foreach ($f in @("hole.exe", "ex-ray.exe", "wintun.dll")) {
+          foreach ($f in @("hole.exe", "ex-ray.exe", "galoshes.exe", "wintun.dll")) {
             if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
           }
           $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
