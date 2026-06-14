@@ -32,6 +32,10 @@ use crate::manifest::{Manifest, Step};
 /// (nextest filter expressions, possibly several in one `-E '...'`) and
 /// `-p <name>` (space-separated). A valid name is `[A-Za-z0-9_-]+`; tokens that
 /// don't fully match (e.g. a `tombstone/crash-dumps` feature path) are ignored.
+///
+/// Assumes additive filters — every `package(...)` names something the command
+/// RUNS. An exclusion expression (`not(package(x))`, `all() - package(x)`) would
+/// be mis-credited; ci.yaml uses only `+` unions today, so revisit if that changes.
 pub fn package_tokens(cmd: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
 

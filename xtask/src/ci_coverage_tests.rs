@@ -139,7 +139,7 @@ fn ci_run_packages_does_not_credit_clippy_p_flags() {
     // `cargo xtask run lint-only` resolves to a `cargo clippy -p linted-pkg`
     // command. Clippy compiles, it does not run tests — `linted-pkg` must not
     // be credited. Counting it would let a merely-linted crate masquerade as
-    // test-covered (the #513 self-fulfilling-filter trap).
+    // test-covered (a self-fulfilling pass that hides a real orphan).
     let ci = r"
 jobs:
   lint:
@@ -187,8 +187,8 @@ jobs:
 ///
 /// HYGIENE (enforced below): every entry must be a real workspace member AND
 /// must NOT already be covered. If a crate gains CI coverage, delete its entry —
-/// a stale allowlist would mask a future regression (the #513 "no
-/// self-fulfilling filter" rule).
+/// a stale allowlist entry that still matched a now-covered crate would mask a
+/// future regression.
 const UNTESTED_IN_CI: &[(&str, &str)] = &[];
 
 #[skuld::test]
