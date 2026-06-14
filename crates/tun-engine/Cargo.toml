@@ -51,7 +51,13 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
+    # FWPM filter/value/condition structs (FWPM_FILTER0, FWP_VALUE0,
+    # FWP_CONDITION_VALUE0) and FwpmFilterAdd0 are gated behind Win32_Security.
+    "Win32_Security",
+    # RPC_C_AUTHN_WINNT for FwpmEngineOpen0's session auth.
+    "Win32_System_Rpc",
 ] }
 # Pinned to the same minor version that shadowsocks-service 1.24 uses
 # transitively (via tun-0.8.6) so cargo deduplicates the crate.

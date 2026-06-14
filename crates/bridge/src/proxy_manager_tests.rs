@@ -166,6 +166,8 @@ struct MockRoutingState {
     teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
+    cover_engage_calls: AtomicU32,
+    cover_disengage_calls: AtomicU32,
 }
 
 impl Default for MockRoutingState {
@@ -175,6 +177,8 @@ impl Default for MockRoutingState {
             teardown_calls: AtomicU32::new(0),
             fail_install: AtomicBool::new(false),
             fail_gateway: AtomicBool::new(false),
+            cover_engage_calls: AtomicU32::new(0),
+            cover_disengage_calls: AtomicU32::new(0),
         }
     }
 }
@@ -264,6 +268,15 @@ impl Routing for MockRouting {
             ipv6_available: false,
         })
     }
+
+    type Cover = MockCover;
+
+    fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+        self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(MockCover {
+            state: Arc::clone(&self.state),
+        })
+    }
 }
 
 struct MockRoutes {
@@ -275,6 +288,16 @@ impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
         let _ = route_state::clear(&self.state_dir);
+    }
+}
+
+struct MockCover {
+    state: Arc<MockRoutingState>,
+}
+
+impl Drop for MockCover {
+    fn drop(&mut self) {
+        self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -707,6 +730,27 @@ fn proxy_manager_tests_never_spawn_routing_subprocess() {
         count, 0,
         "proxy_manager tests must not spawn routing subprocesses (regression of #165)"
     );
+}
+
+/// The fail-closed cover path must also never spawn a real routing subprocess
+/// from a mock — the #165 isolation contract extends to the cover. Engage +
+/// drop N covers through the mock and assert zero spawns and balanced
+/// engage/disengage counts.
+#[skuld::test(serial)]
+fn mock_cover_engage_disengage_never_spawns() {
+    routing::ROUTING_SUBPROCESS_SPAWN_COUNT.store(0, Ordering::SeqCst);
+
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let st = routing.state();
+    for _ in 0..10 {
+        let cover = routing.install_failclosed_cover("1.2.3.4".parse().unwrap()).unwrap();
+        drop(cover);
+    }
+
+    assert_eq!(routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 10);
+    assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 10);
 }
 
 // last_error coverage for early-failure paths =========================================================================

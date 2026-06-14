@@ -47,6 +47,11 @@ before editing; the sections linked below are the authoritative source.
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
+- **Fail-closed cover.** `Routing::install_failclosed_cover` engages a leak-free
+  egress block (permit loopback + server IP only) for the update cutover;
+  persistent WFP filters (Win) / self-contained pf ruleset (mac), swept by
+  `recover_routes` on next start. →
+  [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)

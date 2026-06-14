@@ -275,6 +275,19 @@ fn setup_phase_is_not_recovery() {
     assert!(!is_recovery_phase(PHASE_SETUP));
 }
 
+#[skuld::test]
+fn recover_cover_phase_is_classified_as_expected_failures() {
+    assert!(is_recovery_phase(PHASE_RECOVER_COVER));
+}
+
+// `PHASE_COVER` is macOS-only (the engage subprocess phase), so this
+// assertion is too. Engage failures are real anomalies that abort the cutover.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn cover_engage_phase_is_not_recovery() {
+    assert!(!is_recovery_phase(PHASE_COVER));
+}
+
 // recover_routes_with tests ===========================================================================================
 //
 // These use an injectable command runner so the test doesn't shell out.
@@ -298,7 +311,7 @@ fn recover_without_state_file_is_a_noop() {
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log));
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {});
 
     let log = log.into_inner();
     assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
@@ -317,7 +330,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     state::save(tmp.path(), &persisted_state).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log));
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {});
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
@@ -342,10 +355,23 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing);
+    recover_routes_with(tmp.path(), failing, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
         "state file should be cleared even when runner returns Err"
     );
+}
+
+#[skuld::test]
+fn recover_invokes_cover_sweep_even_without_route_state() {
+    // A crashed cutover can leave a cover engaged with the routes already torn
+    // down (no route-state file). The cover sweep must run regardless.
+    let tmp = tempfile::tempdir().unwrap();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    let swept = std::cell::Cell::new(false);
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_| swept.set(true));
+
+    assert!(log.into_inner().is_empty(), "no route-state file => no route commands");
+    assert!(swept.get(), "recover_routes_with must invoke the cover sweep");
 }

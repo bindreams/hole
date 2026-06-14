@@ -198,6 +198,18 @@ impl Routing for MockRouting {
             ipv6_available: false,
         })
     }
+
+    type Cover = MockCover;
+
+    fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+        Ok(MockCover)
+    }
+}
+
+struct MockCover;
+
+impl Drop for MockCover {
+    fn drop(&mut self) {}
 }
 
 struct MockRoutes {
