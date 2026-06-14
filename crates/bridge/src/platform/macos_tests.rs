@@ -39,6 +39,21 @@ fn helper_path_is_stable() {
 }
 
 #[skuld::test]
+async fn serve_until_signal_returns_when_signal_fires() {
+    // A server future that never completes, and a shutdown future we control.
+    // Firing the shutdown must return control so the daemon's pm.stop()
+    // teardown runs — the SIGTERM-graceful behavior under test.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = std::future::pending::<std::io::Result<()>>();
+    let shutdown = async move {
+        let _ = rx.await;
+    };
+    let join = tokio::spawn(serve_until_signal(server, shutdown));
+    tx.send(()).unwrap();
+    join.await.unwrap();
+}
+
+#[skuld::test]
 fn plist_does_not_set_standard_paths() {
     // The FD-level stdio redirect in hole_common::logging::init captures
     // stdout/stderr into bridge.log; a launchd-side capture would only

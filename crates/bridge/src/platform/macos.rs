@@ -256,16 +256,10 @@ pub fn run(
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
 
-        tokio::select! {
-            result = server.run() => {
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "IPC server error");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("received shutdown signal");
-            }
-        }
+        // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
+        // here would skip the pm.stop() teardown below and leak routes/DNS.
+        // `shutdown_signal()` handles SIGINT *and* SIGTERM (foreground.rs).
+        serve_until_signal(server.run(), crate::foreground::shutdown_signal()).await;
 
         // Clean shutdown: stop proxy before exiting
         let mut pm = proxy_shutdown.lock().await;
@@ -276,6 +270,25 @@ pub fn run(
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
+}
+
+/// Drive the IPC server until it finishes or a shutdown signal arrives,
+/// whichever comes first. Extracted from `run` so the select can be
+/// unit-tested without delivering real OS signals.
+pub(crate) async fn serve_until_signal(
+    server: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "IPC server error");
+            }
+        }
+        _ = shutdown => {
+            info!("received shutdown signal");
+        }
+    }
 }
 
 #[cfg(test)]
