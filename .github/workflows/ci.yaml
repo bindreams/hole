@@ -339,7 +339,7 @@ jobs:
 
   # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray<->stock interop on
   # all 6 platforms (QUIC not(windows)) + galoshes server<->client roundtrips
-  # (cfg(linux), #197). A fresh build (NOT the archive lane that test-garter /
+  # (WS all platforms; WS-TLS/QUIC not(windows)). A fresh build (NOT the archive lane that test-garter /
   # test-galoshes use) because these spawn plugin BINARIES and need on-disk
   # artifacts: ex-ray + galoshes (from setup-build's `cargo xtask deps`) and the
   # pinned stock v2ray-plugin (provisioned by the `plugin-e2e-tests` build.yaml
@@ -377,7 +377,7 @@ jobs:
       # (provision-upstream-v2ray + the `--no-run` compile; ex-ray + galoshes via
       # the `depends: galoshes` chain) and then the nextest run. setup-build's
       # `cargo xtask deps` has already built ex-ray + galoshes. Interop runs on
-      # all 6 platforms (QUIC not(windows)); galoshes roundtrips are cfg(linux).
+      # all 6 platforms (QUIC not(windows)); galoshes roundtrips run on all (WS-TLS/QUIC not(windows)).
       - name: Test plugin-e2e
         shell: bash
         run: cargo xtask run plugin-e2e-tests

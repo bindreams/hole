@@ -1030,18 +1030,18 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
 
-// E2E test platform policy (#435):
+// E2E test platform policy:
 //
 // - **Non-galoshes** DistHarness e2e (`e2e_none`, lifecycle, cipher, and the
-//   listener-selection tests) run on every Hole platform (Win+mac). The
-//   modules are no longer macOS-gated.
-// - **galoshes-fronted** tests need a galoshes *server*, which hits the #197
-//   `PluginConfig` port race on Win+mac, so each is individually
-//   `#[cfg(not(any(target_os = "windows", target_os = "macos")))]`-gated
-//   (Linux-only) with the skip reason co-located. There is no Linux hole-bridge
-//   CI job, so the bridge→galoshes e2e tests are orphaned until #197 lands a
-//   custom server-side launcher; the galoshes server↔client transport coverage
-//   proper now lives in the `plugin-e2e` crate's Linux CI lane (#435).
+//   listener-selection tests) run on every Hole platform (Win+mac).
+// - **galoshes-fronted** tests front a galoshes *server* via the garter
+//   `ChainRunner` launcher (`plugin_e2e::ssserver`). They are all `#[ignore]`d:
+//   galoshes plugin data delivery is flaky on CI — the roundtrips truncate
+//   intermittently across every transport (#518; the bridge itself is correct).
+//   They compile on their real platforms (WS on Win+mac, WS-TLS and QUIC on
+//   macOS only for the Windows custom-cert limit, the full-tunnel test on the
+//   Windows TUN lane) and run again once #518 is fixed. galoshes transport
+//   coverage proper lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;

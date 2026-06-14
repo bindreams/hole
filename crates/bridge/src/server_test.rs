@@ -325,9 +325,10 @@ async fn try_sentinel(
 #[path = "server_test_tests.rs"]
 mod server_test_tests;
 
-// `server_endpoint_is_udp` is a pure function with no I/O, so its tests are
-// NOT subject to the #197/#200 platform gate above — they must run everywhere
-// (the QUIC interop tests that depend on the preflight skip run on Windows).
+// `server_endpoint_is_udp` is a pure function with no I/O, so unlike
+// `server_test_tests` (which does connectivity I/O) its tests carry no platform
+// caveat — they must run everywhere (the QUIC interop tests that depend on the
+// preflight skip run on Windows too).
 #[cfg(test)]
 #[path = "server_test_preflight_tests.rs"]
 mod server_test_preflight_tests;
