@@ -33,14 +33,12 @@ mod platform;
 /// cover (Windows: delete the WFP filters by GUID; macOS: restore
 /// `/etc/pf.conf` and drop the pf enable refcount). `Send` so the PR3 cutover
 /// coordinator can hold it across `.await`.
-//
-// `platform::Cover` carries its own `Drop`; the field-drop runs it. No
-// explicit `Drop for Cover` needed.
+///
+/// Opaque wrapper over the private `platform::Cover` (the platform module can't
+/// be named by `#[cfg]`-free callers). `_inner` is held only for its `Drop`,
+/// which does the disengage — no explicit `Drop for Cover` needed.
 pub struct Cover {
-    // Read via field-drop; the first production caller (`install_lockdown`,
-    // Task 9) lands the read path. Drop until then.
-    #[allow(dead_code)]
-    inner: platform::Cover,
+    _inner: platform::Cover,
 }
 
 /// Engage the cover blocking all egress except loopback and `server_ip`.
@@ -48,7 +46,7 @@ pub struct Cover {
 /// (unused on Windows). On failure the host is left uncovered.
 pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError> {
     Ok(Cover {
-        inner: platform::engage(server_ip, state_dir)?,
+        _inner: platform::engage(server_ip, state_dir)?,
     })
 }
 
@@ -76,14 +74,14 @@ pub fn engage_lockdown(
     {
         let luid = resolver.resolve(tun_name)?;
         Ok(Cover {
-            inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
         })
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (resolver, app_ids);
         Ok(Cover {
-            inner: platform::engage_lockdown(server_ip, tun_name, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir)?,
         })
     }
 }
@@ -94,6 +92,24 @@ pub fn engage_lockdown(
 /// `Noop` does nothing. cfg-free for `routing::recover_routes`.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     platform::recover_lockdown(decision, state_dir);
+}
+
+/// Whether a standing lockdown cover from a prior run is present — the recovery
+/// decision's `prior_present` signal, keyed on the cover's OWN evidence (NOT
+/// `bridge-routes.json`). macOS: the `bridge-lockdown-pf.json` state file
+/// exists. Windows: always `true` — delete-by-GUID reconciliation is idempotent
+/// (a no-op when no filters exist), so probing would only add a redundant WFP
+/// enumeration; a `Sweep`/`Adopt` on a clean host does nothing.
+pub fn lockdown_cover_present(state_dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        lockdown_pf_state::load(state_dir).is_some()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = state_dir;
+        true
+    }
 }
 
 /// Windows-only test helper: resolve the LUID then build the spec, exercising

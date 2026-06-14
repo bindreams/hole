@@ -204,6 +204,15 @@ impl Routing for MockRouting {
     fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
     }
+
+    fn install_lockdown(
+        &self,
+        _server_ip: IpAddr,
+        _tun_name: &str,
+        _app_ids: &[PathBuf],
+    ) -> Result<MockCover, RoutingError> {
+        Ok(MockCover)
+    }
 }
 
 struct MockCover;

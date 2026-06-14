@@ -264,7 +264,6 @@ fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingE
 ///
 /// On load failure the host is restored (`lockdown_disengage`) and Err returned;
 /// the bridge's fail-FATAL caller aborts the start.
-#[allow(dead_code)] // caller is the cfg-free `failclosed::engage_lockdown` facade (not yet wired on macOS)
 pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> Result<Cover, RoutingError> {
     let (token, nat_snapshot) = match lockdown_state::load(state_dir) {
         // Adopt re-engage: reuse the persisted host snapshot+token so the real
@@ -340,7 +339,6 @@ fn lockdown_disengage(state_dir: &Path) {
 /// interface); the next connect's `engage_lockdown` reuses the persisted
 /// snapshot and reloads with the fresh utun name. `Sweep` (intent OFF): full
 /// restore via `lockdown_disengage`. `Noop`: nothing.
-#[allow(dead_code)] // caller is the cfg-free `failclosed::recover_lockdown` facade (not yet wired on macOS)
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     use crate::routing::CoverRecovery::*;
     match decision {

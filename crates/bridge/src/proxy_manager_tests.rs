@@ -277,6 +277,18 @@ impl Routing for MockRouting {
             state: Arc::clone(&self.state),
         })
     }
+
+    fn install_lockdown(
+        &self,
+        _server_ip: IpAddr,
+        _tun_name: &str,
+        _app_ids: &[std::path::PathBuf],
+    ) -> Result<MockCover, RoutingError> {
+        self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(MockCover {
+            state: Arc::clone(&self.state),
+        })
+    }
 }
 
 struct MockRoutes {
