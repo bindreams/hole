@@ -163,13 +163,15 @@ targets:
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
-          + package(handle-holders) + package(tombstone)'
+          + package(handle-holders) + package(tombstone)
+          + package(hole-test-observability)'
     run: >
       cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)
-          + package(handle-holders) + package(tombstone)'
+          + package(handle-holders) + package(tombstone)
+          + package(hole-test-observability)'
 
   plugin-e2e-tests:
     # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray↔stock interop

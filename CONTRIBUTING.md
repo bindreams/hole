@@ -677,6 +677,11 @@ timeouts. Job-level timeouts (`build` 30m, `test-hole` 20m, `test-garter`/
   framework/job timeout is the failure-to-human signal). Use the codebase's
   rendezvous primitives (oneshot, `watch`, `WaitableWriter`, `CancellationToken`,
   `JoinHandle.await`, `tokio::time::pause/advance`) for intra-process sync (#383).
+- **Every crate runs in CI** — the `every_workspace_crate_runs_in_ci` conformance
+  test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
+  workspace crate's tests are run by no CI job (the recurring orphaned-test
+  class). A new crate must join some CI test job's package filter, or — if it has
+  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526)
 
 ## Logging & diagnostics
 

@@ -12,6 +12,7 @@ use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
+pub mod ci_coverage;
 pub mod ex_ray;
 pub mod galoshes;
 pub mod golangci_lint;
@@ -26,6 +27,9 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "ci_coverage_tests.rs"]
+mod ci_coverage_tests;
 #[cfg(test)]
 #[path = "external_bin_tests.rs"]
 mod external_bin_tests;
