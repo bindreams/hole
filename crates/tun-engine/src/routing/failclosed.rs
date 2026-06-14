@@ -19,6 +19,8 @@ pub mod lockdown_pf_state;
 pub mod luid;
 pub use luid::{LuidResolver, SystemLuidResolver};
 
+pub mod lockdown_state;
+
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
 mod platform;
