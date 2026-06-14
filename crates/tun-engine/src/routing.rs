@@ -1,5 +1,6 @@
 //! Route table management — platform-specific split routing.
 
+pub mod failclosed;
 pub mod state;
 
 use std::net::IpAddr;
@@ -56,6 +57,13 @@ pub(crate) const PHASE_SETUP: &str = "setup";
 pub(crate) const PHASE_TEARDOWN: &str = "teardown";
 pub(crate) const PHASE_RECOVER_SPLIT: &str = "recover-split";
 pub(crate) const PHASE_RECOVER_BYPASS: &str = "recover-bypass";
+pub(crate) const PHASE_RECOVER_COVER: &str = "recover-cover";
+// macOS-only: the pf cover engages via `pfctl` subprocesses (Windows engages
+// via FWPM FFI — no subprocess phase). Gated so it is not dead code on a
+// non-test Windows lib build under `-D warnings`. `PHASE_RECOVER_COVER` stays
+// all-targets because `is_recovery_phase` references it on every platform.
+#[cfg(target_os = "macos")]
+pub(crate) const PHASE_COVER: &str = "cover-engage";
 
 /// Execute route setup commands. Logs each command and its result.
 pub fn setup_routes(
@@ -97,7 +105,10 @@ pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<Str
 /// Adding a new `PHASE_*` constant that should silently tolerate non-zero
 /// exit codes MUST be paired with a matching arm here.
 fn is_recovery_phase(phase: &str) -> bool {
-    matches!(phase, PHASE_RECOVER_SPLIT | PHASE_RECOVER_BYPASS | PHASE_TEARDOWN)
+    matches!(
+        phase,
+        PHASE_RECOVER_SPLIT | PHASE_RECOVER_BYPASS | PHASE_TEARDOWN | PHASE_RECOVER_COVER
+    )
 }
 
 fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
@@ -136,6 +147,34 @@ fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run a single command, feeding `stdin` if present and returning the full
+/// `Output` so callers can parse stdout/stderr. Increments
+/// [`ROUTING_SUBPROCESS_SPAWN_COUNT`] (the no-spawn invariant covers cover
+/// engage too). Used by the macOS pf cover; not for route commands.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_capturing(
+    cmd: &[String],
+    stdin: Option<&[u8]>,
+    phase: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::Stdio;
+    debug_assert!(!cmd.is_empty(), "command must not be empty");
+    ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+    info!(phase, cmd = cmd.join(" "), "running cover command");
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(bytes) = stdin {
+        child.stdin.take().expect("piped stdin").write_all(bytes)?;
+        // stdin dropped here -> EOF to the child.
+    }
+    child.wait_with_output()
 }
 
 // Crash recovery ======================================================================================================

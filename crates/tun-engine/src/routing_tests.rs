@@ -275,6 +275,19 @@ fn setup_phase_is_not_recovery() {
     assert!(!is_recovery_phase(PHASE_SETUP));
 }
 
+#[skuld::test]
+fn recover_cover_phase_is_classified_as_expected_failures() {
+    assert!(is_recovery_phase(PHASE_RECOVER_COVER));
+}
+
+// `PHASE_COVER` is macOS-only (the engage subprocess phase), so this
+// assertion is too. Engage failures are real anomalies that abort the cutover.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn cover_engage_phase_is_not_recovery() {
+    assert!(!is_recovery_phase(PHASE_COVER));
+}
+
 // recover_routes_with tests ===========================================================================================
 //
 // These use an injectable command runner so the test doesn't shell out.

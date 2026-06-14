@@ -194,3 +194,48 @@ reason = "Menu commits must go through `tray::rebuild_tray_menu` so rebuilds sta
 [[disallowed-methods]]
 path = "hole_common::config::AppConfig::save"
 reason = "Go through `ConfigStore::save` — direct saves bypass the #467 save_blocked gate and can destroy a quarantine-pending config.json. See bindreams/hole#467."
+
+# tun-engine fail-closed cover — WFP/FWPM native FFI -------------------------------------------------------------------
+#
+# The Windows Filtering Platform FFIs must only be called from inside the
+# fail-closed cover impl (`crates/tun-engine/src/routing/failclosed/windows.rs`)
+# and its recovery sweep, so unit tests exercise only the pure `build_cover_spec`
+# data builder — never the host firewall (the #165 isolation contract). The
+# sanctioned call sites carry per-site `#[allow(clippy::disallowed_methods)]`.
+# `allow-invalid = true` because only tun-engine wires the WFP feature; other
+# workspace crates can't resolve the path (mirrors the Win32 DNS-FFI block).
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0"
+reason = "Fail-closed WFP cover must go through `routing::failclosed::engage`/`recover_cover`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0"
+reason = "Fail-closed WFP cover must go through `routing::failclosed::engage`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0"
+reason = "Fail-closed WFP cover must go through `routing::failclosed::engage`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0"
+reason = "Fail-closed WFP cover must go through `routing::failclosed::engage`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0"
+reason = "Fail-closed WFP cover teardown must go through `routing::failclosed` (Drop / recover_cover). Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerDeleteByKey0"
+reason = "Fail-closed WFP cover teardown must go through `routing::failclosed`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderDeleteByKey0"
+reason = "Fail-closed WFP cover teardown must go through `routing::failclosed`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
+allow-invalid = true
