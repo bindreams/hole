@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 import msi_installer
-from conftest import NS, WXS_PATH
+from conftest import NS, WXS_PATH, canonical_windows_bindir
 
 pytestmark = [
     pytest.mark.skipif(platform.system() != "Windows", reason="Windows-only (needs WiX + msiexec)"),
@@ -26,14 +26,15 @@ pytestmark = [
 
 @pytest.fixture(scope="session")
 def staged_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Create a staging directory with non-zero dummy binaries.
+    """Stage exactly the canonical Windows BINDIR set as non-zero dummies.
 
-    Non-zero so the embedded cabinet actually contains data and the
-    relocated-extract test has files to find post-extraction.
+    Derived from `cargo xtask bindir-names` (the single source of truth) so the
+    build->package->extract round-trip is a true conformance run, not a
+    hand-maintained list that can drift (#512). Non-zero bytes so the embedded
+    cabinet has data and the relocated-extract test finds files post-extraction.
     """
     d = tmp_path_factory.mktemp("stage")
-    # Mirror the bindir layout from `cargo xtask stage` (hole.exe + hole.pdb + ex-ray.exe + wintun.dll + NOTICES.md).
-    for name in ("hole.exe", "hole.pdb", "ex-ray.exe", "wintun.dll", "NOTICES.md"):
+    for name in sorted(canonical_windows_bindir()):
         (d / name).write_bytes(b"x" * 1024)
     return d
 
@@ -339,9 +340,16 @@ def test_msi_admin_extract_works_when_separated_from_build_dir(
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
-    payload_files = {"hole.exe", "hole.pdb", "ex-ray.exe", "wintun.dll", "NOTICES.md"}
-    extracted = {p.name for p in extract_dir.rglob("*") if p.is_file() and p.name in payload_files}
-    assert extracted == payload_files, (f"MSI extracted but expected payload missing: got {extracted}")
+    # Derive the expected payload from the source of truth, and compare the
+    # FULL extracted set (no `if p.name in payload_files` pre-filter, which
+    # made the old assertion self-fulfilling). Subset, not equality: `msiexec
+    # /a` also writes its own files (the relocated .msi, MSI metadata), so
+    # exact equality on the whole tree is fragile. Exact-equality of the
+    # manifest <File> set is guarded by test_hole_wxs.py::test_wxs_files_
+    # match_canonical_bindir; this is the real-artifact presence backstop.
+    payload_files = canonical_windows_bindir()
+    extracted = {p.name for p in extract_dir.rglob("*") if p.is_file()}
+    assert payload_files <= extracted, (f"MSI payload missing expected files: {payload_files - extracted}")
 
 
 # UI property + dialog tests ===========================================================================================
