@@ -97,12 +97,14 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
     let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
         // A *failed engage* is the sole place this module fails OPEN on its own
-        // error: we must not leave a half-loaded ruleset blocking traffic, so we
-        // roll back (drop our refcount, clear the file) and report the error up.
-        // The PR3 cutover treats an engage error as fatal and aborts before
-        // stopping the old bridge, so the tunnel is never torn down uncovered.
-        let _ = pfctl(&["-X", &token], None, PHASE_RECOVER_COVER);
-        let _ = state::clear(state_dir);
+        // error: we must not leave a half-loaded ruleset blocking traffic. Note
+        // `-Fa` already flushed the host's prior rules, so a full `disengage`
+        // (restore `/etc/pf.conf` + drop our refcount + clear the state file) is
+        // required to undo the flush — dropping only the refcount would strand
+        // the host with an empty pass-all ruleset. The PR3 cutover treats an
+        // engage error as fatal and aborts before stopping the old bridge, so
+        // the tunnel is never torn down uncovered.
+        disengage(&token, state_dir);
         return Err(RoutingError::RouteSetup(format!(
             "pfctl load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
