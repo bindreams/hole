@@ -30,21 +30,33 @@ fn main() {
     // lives in `cargo xtask deps`, not here — this build.rs is
     // compile-time metadata only.
 
-    ensure_external_bin_stub(&repo_root);
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    ensure_external_bin_stubs(&repo_root);
     tauri_build::build();
 }
 
-/// Ensure the `externalBin` stub exists so `tauri_build::build()` passes
-/// validation even when `cargo xtask deps` has not been run yet.
-/// The real binary is built by `cargo xtask deps`.
-fn ensure_external_bin_stub(repo_root: &Path) {
+/// Stub every `externalBin` sidecar so `tauri_build::build()` passes
+/// validation even when `cargo xtask deps` has not been run yet. The stub
+/// list derives from `tauri.conf.json`'s `bundle.externalBin`, so a new
+/// sidecar entry can never desync from its stub. Each entry `<base>` resolves
+/// to `<repo>/<base>-<target>{suffix}`, mirroring what Tauri's bundler reads.
+/// The real binaries are built by `cargo xtask deps`.
+fn ensure_external_bin_stubs(repo_root: &Path) {
     let target = std::env::var("TARGET").unwrap();
     let suffix = if target.contains("windows") { ".exe" } else { "" };
-    let path = repo_root.join(".cache/ex-ray").join(format!("ex-ray-{target}{suffix}"));
-    if !path.exists() {
-        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create .cache/ex-ray/");
-        std::fs::File::create(&path).expect("failed to create ex-ray stub");
-        println!("cargo:warning=created empty ex-ray stub — run `cargo xtask deps` for a real build");
+    let conf = std::fs::read_to_string("tauri.conf.json").expect("failed to read tauri.conf.json");
+    let conf: serde_json::Value = serde_json::from_str(&conf).expect("failed to parse tauri.conf.json");
+    let entries = conf["bundle"]["externalBin"]
+        .as_array()
+        .expect("tauri.conf.json bundle.externalBin must be an array");
+    for entry in entries {
+        let base = entry.as_str().expect("externalBin entry must be a string");
+        let path = repo_root.join(format!("{base}-{target}{suffix}"));
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create sidecar cache dir");
+            std::fs::File::create(&path).expect("failed to create sidecar stub");
+            println!("cargo:warning=created empty {base} stub — run `cargo xtask deps` for a real build");
+        }
     }
 }
 
