@@ -58,7 +58,7 @@ serde_json = "1"
 # resolve to a DISTINCT, incompatible type and fail to unify with crash-handler's
 # API in the on_crash signature / minidump rebuild. (0.6.3 field shapes verified.)
 crash-handler = "0.7"
-crash-context = "0.6"
+crash-context = "0.7"
 minidump-writer = "0.12"
 sadness-generator = "0.7"
 
