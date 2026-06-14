@@ -83,6 +83,9 @@ fn launch_gui(show_dashboard: bool) {
     if let Err(e) = hole::relaunch::await_predecessor() {
         tracing::warn!(error = %e, "await_predecessor failed; launching anyway");
     }
+    // Snapshot the installed image identity now, before any later update can
+    // rename it — the self-heal compares against it on a version mismatch.
+    hole::selfheal::init_startup();
 
     tauri::Builder::default()
         // `UiReady` is registered on the builder (not in `.setup`) so

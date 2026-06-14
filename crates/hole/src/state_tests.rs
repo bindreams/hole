@@ -136,12 +136,31 @@ fn status_response(running: bool) -> StatusResponse {
     }
 }
 
+/// A no-op self-heal hook for `BridgeLink` tests that don't exercise a
+/// version mismatch.
+fn noop_hook() -> SelfHealHook {
+    std::sync::Arc::new(|_| {})
+}
+
 /// Serve `router` on `path`, accepting connections in a loop (BridgeLink
 /// reconnects after transport errors, and `send_oneshot` always dials
 /// fresh). Each connection is served on its own task so a parked handler
 /// cannot block later accepts.
 async fn serve_router(path: &std::path::Path, router: axum::Router) -> tokio::task::JoinHandle<()> {
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    // Stamp the matching version unless the test already set one (mismatch
+    // tests do) — otherwise the client's per-response check rejects every reply.
+    let router = router.layer(axum::middleware::map_response(
+        |mut resp: axum::response::Response| async move {
+            if !resp.headers().contains_key("x-hole-bridge-version") {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static(hole::version::VERSION),
+                );
+            }
+            resp
+        },
+    ));
     tokio::spawn(async move {
         loop {
             let Ok(stream) = listener.accept().await else { return };
@@ -170,7 +189,7 @@ async fn start_ack_commits_true() {
     let router = axum::Router::new().route(ROUTE_START, post(|| async { Json(EmptyResponse {}) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     assert!(!link.cell().snapshot().running);
     let resp = link
         .send(BridgeRequest::Start {
@@ -183,10 +202,43 @@ async fn start_ack_commits_true() {
 }
 
 #[skuld::test]
+async fn version_mismatch_fires_hook_and_does_not_flip_running() {
+    let path = test_socket_path("ver-mismatch-link");
+    // Mock stamps a mismatching version (overrides serve_router's default).
+    let router = axum::Router::new()
+        .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }))
+        .layer(axum::middleware::map_response(
+            |mut resp: axum::response::Response| async move {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static("0.0.0-mismatch"),
+                );
+                resp
+            },
+        ));
+    let _mock = serve_router(&path, router).await;
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired2 = fired.clone();
+    let link = BridgeLink::new(
+        path,
+        Arc::new(move |_| {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+
+    let before = link.cell().snapshot();
+    let result = link.send(BridgeRequest::Status).await;
+    assert!(matches!(result, Err(ClientError::VersionMismatch { .. })));
+    assert_eq!(fired.load(Ordering::SeqCst), 1, "self-heal hook fires once");
+    assert_eq!(link.cell().snapshot(), before, "running must not flip during self-heal");
+}
+
+#[skuld::test]
 async fn transport_error_commits_false() {
     let path = test_socket_path("dead");
     let _ = std::fs::remove_file(&path);
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     link.cell().commit(true); // pretend we believed it was running
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 2, running: false });
@@ -201,7 +253,7 @@ async fn oneshot_never_commits() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     link.cell().commit(true);
     link.send_oneshot(BridgeRequest::Cancel).await.unwrap();
     assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 1, running: true });
@@ -225,7 +277,7 @@ async fn untracked_requests_never_commit() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     link.send(BridgeRequest::Metrics).await.unwrap();
     assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 0, running: false });
 }
@@ -254,7 +306,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = Arc::new(BridgeLink::new(path));
+    let link = Arc::new(BridgeLink::new(path, noop_hook()));
     let a = tokio::spawn({
         let link = link.clone();
         async move {
@@ -300,7 +352,7 @@ async fn reload_if_running_skips_when_stopped() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(!reloaded);
     // The resurrection guard: bridge-side `reload` on a stopped proxy
@@ -327,7 +379,7 @@ async fn reload_if_running_reloads_when_running() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path);
+    let link = BridgeLink::new(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(reloaded);
     assert_eq!(reloads.load(Ordering::SeqCst), 1);
