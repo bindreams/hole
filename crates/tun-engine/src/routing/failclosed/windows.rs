@@ -559,7 +559,7 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
         }
         // FwpmGetAppIdFromFileName0 normalizes the path to the kernel device form WFP
         // expects; the returned FWP_BYTE_BLOB is WFP-owned and freed on AppIdBlob drop
-        // (after FwpmFilterAdd0 copies it during the transaction commit).
+        // (after FwpmFilterAdd0 copies it during the FwpmFilterAdd0 call itself).
         Condition::AppId(path) => {
             app_id_blob = Some(get_app_id_blob(path)?);
             let blob = app_id_blob.as_mut().expect("just set");
