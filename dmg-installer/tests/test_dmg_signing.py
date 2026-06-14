@@ -79,3 +79,9 @@ def test_galoshes_sidecar_present_and_signed(installed_app: Path) -> None:
         f"galoshes sidecar still carries the linker-applied ad-hoc signature "
         f"— Tauri's codesign step did not re-sign it:\n{output}"
     )
+
+
+def test_notices_present_in_bundle(installed_app: Path) -> None:
+    """Apache-2.0 §4(d): the NOTICE file must ship with the bundle (#512)."""
+    notices = installed_app / "Contents" / "Resources" / "NOTICES.md"
+    assert notices.exists(), "NOTICES.md missing from the .app bundle"
