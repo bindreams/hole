@@ -294,7 +294,10 @@ jobs:
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set → different fingerprint → fresh build), which expands
       # `tauri::generate_context!()` in production mode and panics on
-      # missing `ui/dist/`. See bindreams/hole#372.
+      # missing `ui/dist/`. See bindreams/hole#372. The
+      # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
+      # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
+      # compiled actually run (matching feature set → no rebuild). See #522.
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
@@ -302,10 +305,11 @@ jobs:
           SKULD_LABELS: "!tun"
         run: >
           cargo nextest run --no-default-features
+          --features tombstone/crash-dumps,tombstone/crash-child
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+              + package(handle-holders) + package(tombstone)'
 
       - name: Test (TUN, runs last for #200)
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
@@ -315,10 +319,11 @@ jobs:
           SKULD_LABELS: "tun"
         run: >
           cargo nextest run --no-default-features
+          --features tombstone/crash-dumps,tombstone/crash-child
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+              + package(handle-holders) + package(tombstone)'
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
