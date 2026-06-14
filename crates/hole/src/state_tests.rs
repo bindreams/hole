@@ -37,6 +37,8 @@ fn status_resp(running: bool) -> BridgeResponse {
         invalid_filters: vec![],
         udp_proxy_available: true,
         ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
     }
 }
 
@@ -133,6 +135,8 @@ fn status_response(running: bool) -> StatusResponse {
         invalid_filters: Vec::new(),
         udp_proxy_available: true,
         ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
     }
 }
 

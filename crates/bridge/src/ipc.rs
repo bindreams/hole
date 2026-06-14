@@ -231,6 +231,9 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         invalid_filters: pm.invalid_filters(),
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
+        // Populated with the real intent/cover getters in the IPC task.
+        lockdown_enabled: false,
+        lockdown_active: false,
     })
 }
 

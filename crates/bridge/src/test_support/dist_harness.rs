@@ -31,9 +31,9 @@
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::protocol::{
-    BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, MetricsResponse, StatusResponse,
-    TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START,
-    ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, LockdownRequest, MetricsResponse,
+    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN,
+    ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -553,6 +553,8 @@ impl BridgeIpcClient {
                         invalid_filters: status.invalid_filters,
                         udp_proxy_available: status.udp_proxy_available,
                         ipv6_bypass_available: status.ipv6_bypass_available,
+                        lockdown_enabled: status.lockdown_enabled,
+                        lockdown_active: status.lockdown_active,
                     })
                 } else {
                     parse_bridge_error(resp).await
@@ -635,6 +637,15 @@ impl BridgeIpcClient {
                     Ok(BridgeResponse::TestServerResult {
                         outcome: parsed.outcome,
                     })
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
+            BridgeRequest::SetLockdown { enabled } => {
+                let body = serde_json::to_vec(&LockdownRequest { enabled })?;
+                let resp = self.http_post(ROUTE_LOCKDOWN, body).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
                 } else {
                     parse_bridge_error(resp).await
                 }

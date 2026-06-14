@@ -50,6 +50,11 @@ pub enum BridgeRequest {
     TestServer {
         entry: ServerEntry,
     },
+    /// Set the standing kill switch intent (last-writer-wins). Maps to
+    /// `POST /v1/lockdown`.
+    SetLockdown {
+        enabled: bool,
+    },
 }
 
 /// The exact string the bridge writes into `ErrorResponse` when a `Start` is
@@ -70,6 +75,8 @@ pub enum BridgeResponse {
         invalid_filters: Vec<InvalidFilter>,
         udp_proxy_available: bool,
         ipv6_bypass_available: bool,
+        lockdown_enabled: bool,
+        lockdown_active: bool,
     },
     Error {
         message: String,
@@ -269,6 +276,13 @@ pub struct TestServerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TestServerResponse {
     pub outcome: ServerTestOutcome,
+}
+
+/// Body of `POST /v1/lockdown`: the absolute lockdown intent to set
+/// (last-writer-wins). Hand-written, not generated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockdownRequest {
+    pub enabled: bool,
 }
 
 // Constants ===========================================================================================================

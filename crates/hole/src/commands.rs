@@ -309,6 +309,7 @@ pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::
             invalid_filters,
             udp_proxy_available,
             ipv6_bypass_available,
+            ..
         }) => serde_json::json!({
             "uptime_secs": uptime_secs,
             "error": error,

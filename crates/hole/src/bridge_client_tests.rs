@@ -31,6 +31,8 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     invalid_filters: Vec::new(),
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
+                    lockdown_enabled: false,
+                    lockdown_active: false,
                 })
             }),
         )
@@ -122,6 +124,8 @@ fn send_status_request_receives_response() {
                 invalid_filters: Vec::new(),
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
+                lockdown_enabled: false,
+                lockdown_active: false,
             }
         );
     });
@@ -282,6 +286,8 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     invalid_filters: Vec::new(),
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
+                    lockdown_enabled: false,
+                    lockdown_active: false,
                 })
             }),
         )
@@ -430,6 +436,8 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 invalid_filters: Vec::new(),
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
+                lockdown_enabled: false,
+                lockdown_active: false,
             })
         }),
     );
