@@ -246,12 +246,12 @@ fn e2e_ws_tls_socks_only_roundtrip(
 /// auto-enables TLS and v2ray-core's `getCertPool` drops the custom cert on
 /// Windows (same limit as `e2e_ws_tls_socks_only_roundtrip`).
 ///
-/// `#[ignore]`: the bridge→galoshes QUIC path returns a truncated response on
-/// macOS — its only remaining platform — so it runs nowhere green yet. Un-ignore
-/// once that is fixed. See bindreams/hole#516.
+/// `#[ignore]`: galoshes' QUIC (UDP) transport is unreliable on CI runners — the
+/// roundtrip truncates on macOS. Part of the galoshes UDP-flow-on-CI family;
+/// un-ignore once that is fixed. See bindreams/hole#518.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "bridge→galoshes QUIC returns a truncated response on macOS — see bindreams/hole#516"]
+#[ignore = "galoshes QUIC transport unreliable on CI (truncated roundtrip) — see bindreams/hole#518"]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,

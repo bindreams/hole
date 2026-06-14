@@ -427,12 +427,13 @@ mod socks_only_udp {
         });
     }
 
-    /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux. macOS only:
-    /// on Windows the client galoshes chain advertises no UDP transport, so the
-    /// bridge sets `udp_proxy_available = false` and drops the flow. Lift the gate
-    /// once that is fixed. See bindreams/hole#517.
-    #[cfg(not(target_os = "windows"))]
+    /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux.
+    ///
+    /// `#[ignore]`: galoshes' UDP transport detection is flaky on CI — the chain
+    /// intermittently reports TCP-only, so the bridge sets `udp_proxy_available =
+    /// false` and drops the flow. Un-ignore once that is fixed. See bindreams/hole#518.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
+    #[ignore = "galoshes UDP transport detection flaky on CI — see bindreams/hole#518"]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,

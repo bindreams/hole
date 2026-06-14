@@ -1035,13 +1035,12 @@ mod proxy_manager_tests;
 // - **Non-galoshes** DistHarness e2e (`e2e_none`, lifecycle, cipher, and the
 //   listener-selection tests) run on every Hole platform (Win+mac).
 // - **galoshes-fronted** tests front a galoshes *server* via the garter
-//   `ChainRunner` launcher (`plugin_e2e::ssserver`). They run on Hole's real
-//   platforms, per-test: WS on Win+mac; WS-TLS on macOS only (v2ray-core drops
-//   custom certs on Windows); the WS full-tunnel test on the Windows TUN lane.
-//   Two paths un-orphaning surfaced are blocked on tracked bugs: QUIC is
-//   `#[ignore]`d (truncates on macOS, #516) and UDP-associate is macOS-only
-//   (no UDP transport on Windows, #517). Transport coverage proper lives in
-//   the `plugin-e2e` crate.
+//   `ChainRunner` launcher (`plugin_e2e::ssserver`). The TCP-transport tests run
+//   on Hole's real platforms: WS on Win+mac, WS-TLS on macOS only (v2ray-core
+//   drops custom certs on Windows), the WS full-tunnel test on the Windows TUN
+//   lane. The two UDP-flow tests (QUIC and UDP-associate) are `#[ignore]`d —
+//   galoshes' UDP transport is unreliable on CI runners (#518). Transport
+//   coverage proper lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
