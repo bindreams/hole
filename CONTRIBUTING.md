@@ -312,6 +312,32 @@ target; status/connect text is baked into the menu at build time. Persisted
 designated input for a future `StartupBehavior::RestoreLastState` consumer),
 with `tray::persist_intended_enabled` as its sole writer.
 
+### Version lockstep
+
+The GUI and bridge must never *operate* as a mismatched-version pair — the
+single-exe design assumes it and the IPC contract has no version negotiation.
+The bridge stamps its build version on **every** IPC response
+(`X-Hole-Bridge-Version`, in [`build_router`](crates/bridge/src/ipc.rs)) and
+serves it at `GET /v1/version`; the value is injected into `IpcServer::bind`
+from the `hole` crate (the bridge crate can't read `HOLE_VERSION`). The GUI
+client compares that header to its own `HOLE_VERSION` on every exchange and
+returns `ClientError::VersionMismatch`; [`BridgeLink`](crates/hole/src/state.rs)
+fires an injected self-heal hook ([selfheal.rs](crates/hole/src/selfheal.rs))
+which, by `same_file` file-identity (startup image vs. the file at that path
+now), either relaunches the updated image — via the cross-platform exit-wait
+primitive [relaunch.rs](crates/hole/src/relaunch.rs) (Windows
+`WaitForSingleObject`, macOS `kqueue`/`NOTE_EXIT`) — or, if it *is* the
+installed image, shows a path-free reinstall dialog. The only `#[cfg]` live in
+the `ArmedWait`/identity seams; `decide` and the wiring are platform-agnostic
+and table-tested. Inert until an update produces a mismatch, and gated off for
+dev/snapshot builds.
+
+**One-time caveat:** a GUI built *before* this feature has no self-heal logic,
+so the *first* upgrade-to-this-version can run a stale GUI against the new
+bridge until the user restarts it — benign because the change is purely
+additive (the IPC contract is preserved). The bridge cutover that *produces*
+the mismatch leak-free is a follow-up PR.
+
 ## Workspace layout
 
 Each publishable member declares a release group in
