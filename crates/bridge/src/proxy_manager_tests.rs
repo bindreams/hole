@@ -168,6 +168,9 @@ struct MockRoutingState {
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
     cover_disengage_calls: AtomicU32,
+    lockdown_engage_calls: AtomicU32,
+    lockdown_disengage_calls: AtomicU32,
+    fail_lockdown: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -179,6 +182,9 @@ impl Default for MockRoutingState {
             fail_gateway: AtomicBool::new(false),
             cover_engage_calls: AtomicU32::new(0),
             cover_disengage_calls: AtomicU32::new(0),
+            lockdown_engage_calls: AtomicU32::new(0),
+            lockdown_disengage_calls: AtomicU32::new(0),
+            fail_lockdown: AtomicBool::new(false),
         }
     }
 }
@@ -211,6 +217,12 @@ impl MockRouting {
     fn failing_gateway(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_gateway.store(true, Ordering::SeqCst);
+        m
+    }
+
+    fn failing_lockdown(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_lockdown.store(true, Ordering::SeqCst);
         m
     }
 
@@ -275,6 +287,7 @@ impl Routing for MockRouting {
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
+            lockdown: false,
         })
     }
 
@@ -284,9 +297,13 @@ impl Routing for MockRouting {
         _tun_name: &str,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
-        self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_lockdown.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
+        }
+        self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
+            lockdown: true,
         })
     }
 }
@@ -305,12 +322,56 @@ impl Drop for MockRoutes {
 
 struct MockCover {
     state: Arc<MockRoutingState>,
+    /// Whether this guard holds the standing lockdown cover (vs the transient
+    /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
+    /// the kind-aware `failclosed::Cover`.
+    lockdown: bool,
 }
 
 impl Drop for MockCover {
     fn drop(&mut self) {
-        self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        if self.lockdown {
+            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        }
     }
+}
+
+// MockRouting lockdown instrumentation ================================================================================
+//
+// These exercise the mock seam directly (no ProxyManager) so the later
+// standing-guard lifecycle tests (engage / fail-FATAL / disengage) can rely on
+// the counters, fail flag, and kind-aware Drop dispatch being correct.
+
+#[skuld::test]
+fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+
+    let cover = routing
+        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[])
+        .expect("lockdown engages");
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+    // The transient-cover counter must NOT move — the two covers are distinct.
+    assert_eq!(state.cover_engage_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+
+    drop(cover);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 0);
+}
+
+#[skuld::test]
+fn mock_failing_lockdown_returns_err_without_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
+    let state = routing.state();
+
+    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[]);
+    assert!(result.is_err(), "failing_lockdown must return Err");
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
 }
 
 // Helpers =============================================================================================================
