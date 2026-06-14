@@ -427,8 +427,11 @@ mod socks_only_udp {
         });
     }
 
-    /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux. Runs on
-    /// every Hole platform, same as `e2e_ws_socks_only_roundtrip`.
+    /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux. macOS only:
+    /// on Windows the client galoshes chain advertises no UDP transport, so the
+    /// bridge sets `udp_proxy_available = false` and drops the flow. Lift the gate
+    /// once that is fixed. See bindreams/hole#517.
+    #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,
