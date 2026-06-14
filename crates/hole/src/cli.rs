@@ -375,14 +375,21 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             let result: Result<(), Box<dyn std::error::Error>> = if service {
                 #[cfg(target_os = "macos")]
                 {
-                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir, hole::version::VERSION)
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir).map_err(|e| Box::new(e) as _)
+                    hole_bridge::platform::os::run(&socket_path, &state_dir, &log_dir, hole::version::VERSION)
+                        .map_err(|e| Box::new(e) as _)
                 }
             } else {
-                hole_bridge::foreground::run(&socket_path, &state_dir, &log_dir, ready_notify.as_deref())
+                hole_bridge::foreground::run(
+                    &socket_path,
+                    &state_dir,
+                    &log_dir,
+                    ready_notify.as_deref(),
+                    hole::version::VERSION,
+                )
             };
 
             if let Err(e) = result {

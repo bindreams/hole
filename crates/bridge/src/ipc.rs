@@ -11,8 +11,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, StatusResponse, TestServerRequest,
-    TestServerResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START,
-    ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
+    ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -51,6 +51,10 @@ pub struct IpcState<P: Proxy, R: Routing> {
     pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
+    /// This bridge's build version, stamped on every response
+    /// (`X-Hole-Bridge-Version`) and served at `/v1/version` so a
+    /// freshly-updated GUI can detect a still-old bridge.
+    pub version: String,
 }
 
 // Server ==============================================================================================================
@@ -74,6 +78,7 @@ impl IpcServer {
     pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
+        version: &str,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -86,8 +91,9 @@ impl IpcServer {
         let state = Arc::new(IpcState {
             proxy,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+            version: version.to_owned(),
         });
-        let router = build_router(state);
+        let router = build_router(state, version);
         Ok(Self {
             listener,
             router,
@@ -183,7 +189,11 @@ where
 
 // Router ==============================================================================================================
 
-fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P, R>>) -> axum::Router {
+fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P, R>>, version: &str) -> axum::Router {
+    // Stamped on every response — including handler errors and routing 404s,
+    // which axum has already converted to a `Response` before this layer runs.
+    let header_val =
+        axum::http::HeaderValue::from_str(version).unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown"));
     axum::Router::new()
         .route(ROUTE_STATUS, axum::routing::get(handle_status::<P, R>))
         .route(ROUTE_START, axum::routing::post(handle_start::<P, R>))
@@ -193,7 +203,17 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_METRICS, axum::routing::get(handle_metrics::<P, R>))
         .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<P, R>))
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
+        .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .layer(axum::middleware::map_response(
+            move |mut resp: axum::response::Response| {
+                let header_val = header_val.clone();
+                async move {
+                    resp.headers_mut().insert("x-hole-bridge-version", header_val);
+                    resp
+                }
+            },
+        ))
         .with_state(state)
 }
 
@@ -418,6 +438,14 @@ async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
     let cfg = TestConfig::production();
     let outcome = run_server_test(&req.entry, &cfg).await;
     Json(TestServerResponse { outcome })
+}
+
+async fn handle_version<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: state.version.clone(),
+    })
 }
 
 // Security ============================================================================================================

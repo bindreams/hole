@@ -29,15 +29,20 @@ static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// Used by diagnostic artefacts to land alongside `bridge.log` in the
 /// same directory.
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+/// GUI build version override set by the CLI before service dispatch. The
+/// `bind` runs inside `service_main` (a SCM callback with no access to
+/// `run`'s args), so the version is threaded through this static.
+static VERSION_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 /// Run as a Windows Service (called by the service control manager).
-pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path) -> Result<(), windows_service::Error> {
+pub fn run(socket_path: &Path, state_dir: &Path, log_dir: &Path, version: &str) -> Result<(), windows_service::Error> {
     let default = hole_common::protocol::default_bridge_socket_path();
     if socket_path != default {
         SOCKET_PATH_OVERRIDE.set(socket_path.to_owned()).ok();
     }
     STATE_DIR_OVERRIDE.set(state_dir.to_owned()).ok();
     LOG_DIR_OVERRIDE.set(log_dir.to_owned()).ok();
+    VERSION_OVERRIDE.set(version.to_owned()).ok();
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
 }
 
@@ -108,7 +113,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // can touch routing state. Route recovery is offloaded via
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind(&socket_path, proxy)?;
+        let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
+        let server = crate::ipc::IpcServer::bind(&socket_path, proxy, &version)?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =

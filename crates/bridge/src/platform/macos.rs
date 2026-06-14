@@ -211,6 +211,7 @@ pub fn run(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
     log_dir: &std::path::Path,
+    version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -227,7 +228,7 @@ pub fn run(
         // can touch routing state. Route recovery is offloaded via
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+        let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
