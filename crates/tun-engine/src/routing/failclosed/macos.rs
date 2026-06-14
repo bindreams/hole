@@ -1,14 +1,20 @@
-//! macOS fail-closed cover via pf (`pfctl`).
+//! macOS fail-closed cover via pf (`pfctl`). Two layers share the `Cover` guard:
 //!
-//! Engage enables pf (refcounted, `pfctl -E`), flushes all state, and loads a
-//! self-contained ruleset that blocks every outbound packet except loopback
-//! and the SS server IP. Disengage restores the canonical `/etc/pf.conf` and
-//! drops our enable refcount (`pfctl -X <token>`).
+//! - **Transient cover** (`engage`/`disengage`): enables pf (refcounted,
+//!   `pfctl -E`), flushes all state (`-Fa`), and loads a self-contained ruleset
+//!   blocking every outbound packet except loopback and the SS server IP.
+//!   Disengage restores the canonical `/etc/pf.conf` and drops the refcount.
+//! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
+//!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
+//!   rules forward and blocks all egress except the TUN and server IP. Disengage
+//!   restores the host's pre-lockdown filter+nat from the persisted snapshot —
+//!   not a blind `/etc/pf.conf` reload — and drops the refcount.
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
-//! - Restore reloads the on-disk `/etc/pf.conf`, not a snapshot of whatever
-//!   ruleset was live before us (matches wg-quick's macOS behavior).
+//! - The transient restore reloads `/etc/pf.conf`; the lockdown restore reloads
+//!   the captured snapshot. Neither can recover prior `set` options (pf exposes
+//!   no dump of them), so both restore under pf defaults.
 //! - The `pfctl -E` token is parsed from stderr — its only exposure.
 
 use std::net::IpAddr;
@@ -36,43 +42,63 @@ pub fn build_pf_ruleset(server_ip: IpAddr) -> String {
     )
 }
 
-/// pf anchor name for the standing lockdown ruleset. Scoped so the
-/// session-long guard does not flush user/MDM pf policy (unlike the transient
-/// cover's `-Fa`). A named anchor only evaluates when the MAIN ruleset
-/// references it — see [`build_main_ruleset_with_anchor`].
-pub const LOCKDOWN_ANCHOR: &str = "com.hole.lockdown";
+/// Normalize a snapshot fragment to end in exactly one `\n`. Empty stays empty
+/// (so an absent NAT section contributes no stray blank line); non-empty text
+/// gets a single trailing newline if it lacks one.
+pub fn ensure_trailing_nl(s: &str) -> String {
+    if s.is_empty() || s.ends_with('\n') {
+        s.to_owned()
+    } else {
+        format!("{s}\n")
+    }
+}
 
-/// Build the BODY loaded into the [`LOCKDOWN_ANCHOR`] (`pfctl -a <anchor> -f -`).
-/// Blocks all outbound except loopback, the TUN interface (so app traffic flows
-/// while connected), and the server IP. pf has no per-process matching, so the
-/// server permit is IP-based (Decision A: macOS pins the server IP for the
-/// session). All passes are `quick` so they win over the anchor's own
-/// `block out all` without relying on last-match. This body is INERT until the
-/// main ruleset references the anchor.
-pub fn build_lockdown_ruleset(tun_name: &str, server_ip: IpAddr) -> String {
+/// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
+/// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
+/// `block drop out quick all` is the fail-closed base, with earlier `quick`
+/// permits for the TUN and the server IP.
+///
+/// `set` lives here (main-ruleset-only — it is a parse error inside an anchor),
+/// and the host's translation rules (`nat_snapshot`, from `pfctl -sn`) are
+/// carried forward so the session does not flush NAT. Ordering is
+/// `require-order`-enforced: Options -> Translation (nat) -> Filter. The server
+/// permit precedes `block drop out quick inet6 all` so a v6 server is not
+/// killed. pf has no per-process matching, so the server permit is IP-based.
+pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapshot: &str) -> String {
+    let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
     format!(
         "set block-policy drop\n\
-         block out all\n\
-         pass out quick on lo0 all\n\
-         pass in quick on lo0 all\n\
-         pass out quick on {tun_name} all\n\
-         pass out quick from any to {server_ip}\n"
+         set skip on lo0\n\
+         {nat}\
+         pass out quick proto {proto} from any to {ip}\n\
+         pass out quick on {tun} all\n\
+         block drop out quick inet6 all\n\
+         block drop out quick all\n",
+        nat = ensure_trailing_nl(nat_snapshot),
+        proto = proto,
+        ip = server_ip,
+        tun = tun_name,
     )
 }
 
-/// Compose the MAIN ruleset to load (NO `-Fa`): the host's pre-lockdown main
-/// ruleset `snapshot` (captured via `pfctl -sr`) followed by the
-/// `anchor "com.hole.lockdown"` call-out that makes the anchor body evaluate.
-/// Without this call-out the lockdown anchor is inert and the kill switch does
-/// nothing — this is the load-bearing composition.
-pub fn build_main_ruleset_with_anchor(snapshot: &str) -> String {
-    let mut main = String::with_capacity(snapshot.len() + 64);
-    main.push_str(snapshot);
-    if !snapshot.ends_with('\n') && !snapshot.is_empty() {
-        main.push('\n');
-    }
-    main.push_str(&format!("anchor \"{LOCKDOWN_ANCHOR}\"\n"));
-    main
+/// Build the ruleset that restores the host's pre-lockdown policy on Sweep,
+/// reloaded via `pfctl -f -`. Composes the captured translation (`nat_snapshot`,
+/// from `pfctl -sn`) and filter (`main_snapshot`, from `pfctl -sr`) snapshots.
+///
+/// `set require-order no` leads: `pfctl -sr` on macOS emits a NORMALIZATION line
+/// (`scrub-anchor "com.apple/*"`) interleaved with filter rules, so naively
+/// concatenating `{nat}{filter}` puts translation before normalization — a
+/// `require-order` parse error that would silently fail the restore. Disabling
+/// the order check lets pfctl accept the snapshots verbatim, exactly as the
+/// host had them loaded.
+pub fn build_lockdown_restore_ruleset(nat_snapshot: &str, main_snapshot: &str) -> String {
+    format!(
+        "set require-order no\n\
+         set block-policy drop\n\
+         {nat}{filter}",
+        nat = ensure_trailing_nl(nat_snapshot),
+        filter = main_snapshot,
+    )
 }
 
 /// Parse the enable token from `pfctl -E` output (it prints `Token : <n>`).
@@ -203,55 +229,78 @@ pub fn recover_cover(state_dir: &Path) {
 
 // --- lockdown layer ---
 
-/// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`:
-///
-/// 1. `pfctl -E` (refcount) + capture token.
-/// 2. `pfctl -sr` snapshot of the current main ruleset.
-/// 3. Persist {token, snapshot} to `bridge-lockdown-pf.json`.
-/// 4. Load the anchor BODY into `com.hole.lockdown` (`-a <anchor> -f -`).
-/// 5. Load the COMPOSED main (snapshot + anchor call-out) WITHOUT `-Fa`, so
-///    the anchor evaluates while host/MDM policy is preserved.
-///
-/// On any load failure the host is restored (Sweep) and Err returned; the
-/// bridge's fail-FATAL caller aborts the start.
-#[allow(dead_code)] // caller is the cfg-free `failclosed::engage_lockdown` facade (not yet wired on macOS)
-pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> Result<Cover, RoutingError> {
-    let en = pfctl(&["-E"], None, PHASE_COVER)?;
-    let token = parse_enable_token(&String::from_utf8_lossy(&en.stderr))
-        .or_else(|| parse_enable_token(&String::from_utf8_lossy(&en.stdout)))
-        .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))?;
-
+/// Snapshot the host's filter (`-sr`) and translation (`-sn`) rules and persist
+/// them with `token` (persist-before-mutate). Returns the nat snapshot for the
+/// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
+/// refcount) by the caller without leaking the `-E` enable.
+fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingError> {
     let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
     let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
+    let sn = pfctl(&["-sn"], None, PHASE_COVER)?;
+    let nat_snapshot = String::from_utf8_lossy(&sn.stdout).into_owned();
 
     lockdown_state::save(
         state_dir,
         &lockdown_state::LockdownPfState {
             version: lockdown_state::SCHEMA_VERSION,
-            pf_token: token.clone(),
-            main_snapshot: main_snapshot.clone(),
+            pf_token: token.to_owned(),
+            main_snapshot,
+            nat_snapshot: nat_snapshot.clone(),
         },
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist lockdown-pf-state: {e}")))?;
+    Ok(nat_snapshot)
+}
 
-    // Helper to restore-and-fail on any load error.
-    let fail = |what: &str, stderr: &[u8]| -> RoutingError {
-        lockdown_disengage(state_dir);
-        RoutingError::RouteSetup(format!("{what}: {}", String::from_utf8_lossy(stderr).trim()))
+/// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`:
+///
+/// 1. If a valid `bridge-lockdown-pf.json` already exists (Adopt re-engage),
+///    REUSE its token + snapshots — re-running `-sr`/`-sn` here would snapshot
+///    our own lockdown ruleset as the "host" and lose the real host policy.
+/// 2. Else: `pfctl -E` (refcount) + capture token; `pfctl -sr` (filter) and
+///    `pfctl -sn` (nat) snapshots; persist {token, snapshots} before mutating.
+/// 3. Load the self-contained main ruleset via `pfctl -f -` (NO `-Fa`), so the
+///    block takes effect while host translation is carried forward.
+///
+/// On load failure the host is restored (`lockdown_disengage`) and Err returned;
+/// the bridge's fail-FATAL caller aborts the start.
+#[allow(dead_code)] // caller is the cfg-free `failclosed::engage_lockdown` facade (not yet wired on macOS)
+pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> Result<Cover, RoutingError> {
+    let (token, nat_snapshot) = match lockdown_state::load(state_dir) {
+        // Adopt re-engage: reuse the persisted host snapshot+token so the real
+        // host policy is preserved for the eventual restore.
+        Some(st) => (st.pf_token, st.nat_snapshot),
+        None => {
+            let en = pfctl(&["-E"], None, PHASE_COVER)?;
+            let token = parse_enable_token(&String::from_utf8_lossy(&en.stderr))
+                .or_else(|| parse_enable_token(&String::from_utf8_lossy(&en.stdout)))
+                .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))?;
+
+            // The refcount is now held. Capture + persist may fail, so undo the
+            // `-E` on any error before propagating — else the refcount leaks with
+            // no state file to recover it from.
+            match capture_and_persist(&token, state_dir) {
+                Ok(nat_snapshot) => (token, nat_snapshot),
+                Err(e) => {
+                    if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
+                        tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
+                    }
+                    return Err(e);
+                }
+            }
+        }
     };
 
-    // 4. Anchor body.
-    let body = build_lockdown_ruleset(tun_name, server_ip);
-    let body_out = pfctl(&["-a", LOCKDOWN_ANCHOR, "-f", "-"], Some(body.as_bytes()), PHASE_COVER)?;
-    if !body_out.status.success() {
-        return Err(fail("pfctl lockdown anchor load failed", &body_out.stderr));
-    }
-
-    // 5. Composed main (NO -Fa) — this is what makes the anchor evaluate.
-    let main = build_main_ruleset_with_anchor(&main_snapshot);
-    let main_out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
-    if !main_out.status.success() {
-        return Err(fail("pfctl lockdown main load failed", &main_out.stderr));
+    let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
+    let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
+    if !out.status.success() {
+        // Restore the host (snapshot reload + drop refcount) before failing, so
+        // a partially-loaded ruleset never strands the host.
+        lockdown_disengage(state_dir);
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl lockdown load failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
 
     Ok(Cover {
@@ -261,16 +310,19 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
     })
 }
 
-/// Sweep: restore the snapshot main ruleset, flush the anchor, drop our pf
-/// refcount, clear the state. Shared by Drop (user-stop) and `recover_lockdown`
-/// when the persisted intent is OFF. Best-effort; logs on failure.
+/// Sweep: restore the host's pre-lockdown ruleset from the snapshot, drop our pf
+/// refcount, clear the state. The snapshot reload IS the restore — there is no
+/// anchor to flush. Shared by Drop (user-stop) and `recover_lockdown` when the
+/// persisted intent is OFF. Best-effort; logs on failure.
+///
+/// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
+/// host's filter+nat rules under pf defaults (same class of limitation the
+/// transient cover documents for its `/etc/pf.conf` reload).
 fn lockdown_disengage(state_dir: &Path) {
     if let Some(st) = lockdown_state::load(state_dir) {
-        if let Err(e) = pfctl(&["-f", "-"], Some(st.main_snapshot.as_bytes()), PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "lockdown main-snapshot restore failed");
-        }
-        if let Err(e) = pfctl(&["-a", LOCKDOWN_ANCHOR, "-F", "all"], None, PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "lockdown anchor flush failed");
+        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+        if let Err(e) = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER) {
+            tracing::warn!(error = %e, "lockdown snapshot restore failed");
         }
         if let Err(e) = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER) {
             tracing::warn!(error = %e, "pfctl -X failed during lockdown disengage");
@@ -283,11 +335,11 @@ fn lockdown_disengage(state_dir: &Path) {
 
 /// Act on a recovery decision for the lockdown cover (called from
 /// `failclosed::recover_lockdown`). `Adopt` (intent ON): KEEP the host
-/// fail-closed — leave the composed main + anchor body + state file untouched;
-/// only the now-dead utun permit inside the anchor is stale, and the next
-/// connect's `install_lockdown` reloads the anchor body with the fresh utun
-/// name (idempotent). `Sweep` (intent OFF): full restore via
-/// `lockdown_disengage`. `Noop`: nothing.
+/// fail-closed — leave the lockdown ruleset + state file in force. The dead
+/// utun name in the `pass out quick on <tun>` line is harmless (matches no live
+/// interface); the next connect's `engage_lockdown` reuses the persisted
+/// snapshot and reloads with the fresh utun name. `Sweep` (intent OFF): full
+/// restore via `lockdown_disengage`. `Noop`: nothing.
 #[allow(dead_code)] // caller is the cfg-free `failclosed::recover_lockdown` facade (not yet wired on macOS)
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     use crate::routing::CoverRecovery::*;
@@ -299,7 +351,7 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             // restart (this IS the crash-leak fix). NOTE: macOS pf rules do
             // NOT survive a reboot, so a reboot opens a boot->first-connect
             // window — tracked under the deferred Decision C-b (block when
-            // disconnected, needs an early-boot block). See spec §9 C.
+            // disconnected, needs an early-boot block).
         }
         Sweep => {
             tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");

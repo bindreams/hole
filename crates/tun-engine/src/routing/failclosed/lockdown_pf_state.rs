@@ -1,9 +1,10 @@
 //! macOS-only persisted state for the STANDING lockdown cover. Distinct file
 //! from `bridge-failclosed.json` (the transient cover, used concurrently by
 //! PR2's cutover): the lockdown cover has an independent lifetime. Records the
-//! pf enable token (replayed to `pfctl -X` on Sweep) and the pre-lockdown main
-//! ruleset snapshot (re-loaded on Sweep to restore the host without `-Fa`,
-//! matching the engaged-without-flush contract).
+//! pf enable token (replayed to `pfctl -X` on Sweep) and the pre-lockdown
+//! filter (`pfctl -sr`) and translation (`pfctl -sn`) snapshots (re-loaded on
+//! Sweep to restore the host without `-Fa`, matching the engaged-without-flush
+//! contract).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,14 @@ pub struct LockdownPfState {
     pub version: u32,
     /// Opaque enable token from `pfctl -E`, replayed to `pfctl -X` on Sweep.
     pub pf_token: String,
-    /// The host's main ruleset (`pfctl -sr`) captured before we composed in
-    /// the anchor call-out. Re-loaded on Sweep so the host returns to its
-    /// pre-lockdown policy (NOT a blind `/etc/pf.conf` reload).
+    /// The host's filter ruleset (`pfctl -sr`) captured before we replaced the
+    /// main ruleset with the lockdown policy. Re-loaded on Sweep so the host
+    /// returns to its pre-lockdown policy (NOT a blind `/etc/pf.conf` reload).
     pub main_snapshot: String,
+    /// The host's translation rules (`pfctl -sn`: nat/rdr) captured alongside
+    /// `main_snapshot`. Carried forward into the lockdown ruleset (so the
+    /// session does not flush NAT) and re-loaded on Sweep for restore.
+    pub nat_snapshot: String,
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {
