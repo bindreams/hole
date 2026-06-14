@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p stepstool -p dev-console -p xtask -p xtask-lib --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p stepstool -p dev-console -p xtask -p xtask-lib -p util --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
 
       # The artifact is consumed by test-garter, test-galoshes, and
       # test-tooling; test-hole does its own build.
@@ -245,7 +245,7 @@ jobs:
           cargo nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
-            -E 'package(kill-group) + package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib)'
+            -E 'package(kill-group) + package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(util)'
 
   # test-hole runs a fresh build + nextest run (no archive). Hole tests have
   # too many environmental couplings (trybuild --offline registry, dist_fixture
