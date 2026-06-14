@@ -33,6 +33,14 @@ fn plugin_sidecars_are_ex_ray_and_galoshes() {
     assert_eq!(plugin_sidecar_names(), &["ex-ray", "galoshes"]);
 }
 
+#[skuld::test]
+fn bindir_names_command_emits_json_for_os() {
+    let json = crate::render_bindir_names(Os::Windows);
+    let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+    assert!(parsed.contains(&"galoshes.exe".to_string()));
+    assert_eq!(parsed, bindir_dest_names(Os::Windows));
+}
+
 /// Build a fake repo layout in a tempdir that satisfies `bindir_files()` so we
 /// can call it without depending on the real `target/` and `.cache/`.
 fn fake_repo() -> tempfile::TempDir {
