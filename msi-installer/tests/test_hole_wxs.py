@@ -625,10 +625,16 @@ def test_notices_md_component_exists(package: ET.Element) -> None:
 
 
 def _wxs_bindir_file_basenames(package: ET.Element) -> set[str]:
-    """Basenames of every <File> sourced from the BinDir bindpath."""
+    """Basenames of every <File> sourced from the BinDir bindpath.
+
+    Captures only the last path segment so a future nested Source
+    (`...BinDir)\\sub\\x.exe`) still compares against the flat
+    bindir_dest_names. The staged BINDIR is flat (stage.rs rejects
+    separators in dest_name), so today every match is already a basename.
+    """
     names: set[str] = set()
     for f in package.iter(f"{{{NS['wix']}}}File"):
-        m = re.search(r"!\(bindpath\.BinDir\)\\(.+)$", f.get("Source", ""))
+        m = re.search(r"!\(bindpath\.BinDir\)\\([^\\]+)$", f.get("Source", ""))
         if m:
             names.add(m.group(1))
     return names

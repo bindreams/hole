@@ -107,17 +107,18 @@ pub fn plugin_sidecar_names() -> &'static [&'static str] {
     &["ex-ray", "galoshes"]
 }
 
-/// The host OS as a manifest [`Os`]. Panics on an unsupported host — the same
-/// platforms `bindir_files` already supports.
-fn host_os() -> Os {
-    Os::host().expect("bindir_files runs only on supported hosts")
+/// The host OS as a manifest [`Os`], or an error on a host outside the
+/// supported set (windows/darwin/linux) — the same platforms `bindir_files`
+/// already supports.
+fn host_os() -> Result<Os> {
+    Os::host().ok_or_else(|| anyhow!("host OS is not one of windows/darwin/linux; cannot resolve BINDIR"))
 }
 
 /// Resolve the canonical BINDIR file list for the host platform and given
 /// profile. The *set* and order come from [`bindir_dest_names`]; this fn maps
 /// each name to its host source path.
 pub fn bindir_files(profile: Profile, repo_root: &Path) -> Result<Vec<BindirFile>> {
-    let host = host_os();
+    let host = host_os()?;
     let target_dir = repo_root.join("target").join(profile.dir_name());
 
     // ex-ray is built per-target-triple into `.cache/ex-ray/ex-ray-<triple>{.exe}`;
