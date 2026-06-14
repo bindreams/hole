@@ -10,9 +10,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
-    DiagnosticsResponse, EmptyResponse, ErrorResponse, MetricsResponse, ProxyConfig, StatusResponse, TestServerRequest,
-    TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_METRICS,
-    ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER, ROUTE_VERSION,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StatusResponse,
+    TestServerRequest, TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
+    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -204,6 +205,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_DIAGNOSTICS, axum::routing::get(handle_diagnostics::<P, R>))
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
+        .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
             move |mut resp: axum::response::Response| {
@@ -231,9 +233,8 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         invalid_filters: pm.invalid_filters(),
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
-        // Populated with the real intent/cover getters in the IPC task.
-        lockdown_enabled: false,
-        lockdown_active: false,
+        lockdown_enabled: pm.lockdown_enabled(),
+        lockdown_active: pm.lockdown_active(),
     })
 }
 
@@ -327,6 +328,30 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
         cs.pending = true;
     }
     Json(EmptyResponse {})
+}
+
+/// Set the standing kill switch intent (last-writer-wins absolute set). Any
+/// authorized caller may toggle it. The bridge is the authority; the GUI only
+/// sends intent. The intent takes effect on the next start/stop — this handler
+/// does NOT engage/disengage a live cover.
+async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+    Json(req): Json<LockdownRequest>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let pm = state.proxy.lock().await;
+    match pm.set_lockdown_intent(req.enabled) {
+        Ok(()) => {
+            info!(enabled = req.enabled, "lockdown intent set");
+            Ok(Json(EmptyResponse {}))
+        }
+        Err(e) => {
+            error!(error = %e, "failed to set lockdown intent");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { message: e.to_string() }),
+            ))
+        }
+    }
 }
 
 async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(

@@ -356,6 +356,30 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
     }
 
+    /// Whether the standing kill switch intent is on (from `bridge-lockdown.json`).
+    /// Default-off when there is no state_dir or no file.
+    pub fn lockdown_enabled(&self) -> bool {
+        self.state_dir
+            .as_deref()
+            .map(lockdown_state::load_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Last-writer-wins absolute set of the lockdown intent. Persists to
+    /// `bridge-lockdown.json`. ERRORS when there is no state_dir: the bridge
+    /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
+    /// a fail-open footgun — the GUI would believe lockdown is armed when
+    /// nothing was written).
+    pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
+        let dir = self.state_dir.as_deref().ok_or_else(|| {
+            ProxyError::Runtime(std::io::Error::other(
+                "cannot set lockdown intent: bridge has no state_dir to persist it",
+            ))
+        })?;
+        lockdown_state::set_enabled(dir, enabled)
+            .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    }
+
     /// Non-cancellable convenience wrapper around
     /// [`start_cancellable`](Self::start_cancellable). Equivalent to
     /// passing a fresh, never-signaled `CancellationToken`. Used by

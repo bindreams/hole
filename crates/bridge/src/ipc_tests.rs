@@ -245,6 +245,16 @@ fn mock_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
+/// `mock_proxy` variant whose manager has a persisted state_dir, so
+/// `set_lockdown_intent` can write `bridge-lockdown.json`. The TempDir is
+/// `.keep()`-ed (created, auto-cleanup suppressed) like the other helpers.
+fn mock_proxy_with_state_dir() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir.clone());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+    Arc::new(Mutex::new(pm))
+}
+
 /// `mock_proxy` variant that also hands back the mock's traffic counters
 /// so tests can simulate tunnel bytes.
 fn mock_proxy_with_traffic() -> (Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>, Arc<MockTraffic>) {
@@ -381,6 +391,18 @@ async fn post_cancel(client: &mut TestClient) -> http::Response<hyper::body::Inc
         .uri(ROUTE_CANCEL)
         .header("host", "localhost")
         .body(Full::new(Bytes::new()))
+        .unwrap();
+    client.send(req).await
+}
+
+async fn post_lockdown(client: &mut TestClient, enabled: bool) -> http::Response<hyper::body::Incoming> {
+    let body = serde_json::to_vec(&hole_common::protocol::LockdownRequest { enabled }).unwrap();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(ROUTE_LOCKDOWN)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
         .unwrap();
     client.send(req).await
 }
@@ -529,6 +551,65 @@ fn multiple_requests_on_same_connection() {
 
         let s2 = get_status(&mut client).await;
         assert!(!s2.running);
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn lockdown_post_sets_intent_and_status_reflects_it() {
+    rt().block_on(async {
+        let path = test_socket_path("lockdown-post");
+        let server = IpcServer::bind(&path, mock_proxy_with_state_dir(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // POST /v1/lockdown { enabled: true }
+        let resp = post_lockdown(&mut client, true).await;
+        assert_eq!(resp.status(), 200, "lockdown POST should 200");
+        assert_eq!(
+            resp.headers().get("x-hole-bridge-version").unwrap(),
+            "test",
+            "version header stamped on the lockdown response"
+        );
+        let _ = resp.into_body().collect().await;
+
+        // GET /v1/status reflects the intent (same connection).
+        let status = get_status(&mut client).await;
+        assert!(status.lockdown_enabled, "status must reflect the set intent");
+        assert!(!status.lockdown_active, "no cover engaged while stopped");
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn lockdown_post_errors_without_state_dir() {
+    // A kill-switch request the bridge cannot persist must fail loudly, not
+    // silently 200: a silent Ok would make the GUI believe lockdown is armed
+    // when nothing was written. `mock_proxy()` has no `.with_state_dir(..)`.
+    rt().block_on(async {
+        let path = test_socket_path("lockdown-no-statedir");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_lockdown(&mut client, true).await;
+        assert_eq!(
+            resp.status(),
+            500,
+            "lockdown POST without a state_dir must error, not silently succeed"
+        );
+        let _ = resp.into_body().collect().await;
 
         drop(client);
         handle.abort();
