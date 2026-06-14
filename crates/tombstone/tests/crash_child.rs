@@ -112,8 +112,16 @@ crash_class_test!(crash_marker_segfault, "segfault");
 crash_class_test!(crash_marker_stack_overflow, "stack_overflow");
 crash_class_test!(crash_marker_abort, "abort");
 crash_class_test!(crash_marker_illegal_instruction, "illegal_instruction");
-crash_class_test!(crash_marker_floating_point, "floating_point_exception");
 crash_class_test!(crash_marker_trap, "trap");
+
+// x86-only: integer divide-by-zero raises SIGFPE on x86, but is non-trapping on
+// AArch64 (the ISA returns 0 instead of faulting). There is no crash to observe
+// on arm64, so this fault class can't be exercised there.
+crash_class_test!(
+    crash_marker_floating_point,
+    "floating_point_exception",
+    not(target_arch = "aarch64")
+);
 
 // Windows-only fault classes.
 crash_class_test!(crash_marker_purecall, "purecall", windows);
