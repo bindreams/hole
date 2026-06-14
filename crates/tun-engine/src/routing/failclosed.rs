@@ -35,7 +35,9 @@ mod platform;
 // `platform::Cover` carries its own `Drop`; the field-drop runs it. No
 // explicit `Drop for Cover` needed.
 pub struct Cover {
-    #[allow(dead_code)] // engaged only by PR3's cutover; PR2 has no production caller
+    // Read via field-drop; the first production caller (`install_lockdown`,
+    // Task 9) lands the read path. Drop until then.
+    #[allow(dead_code)]
     inner: platform::Cover,
 }
 
@@ -54,26 +56,57 @@ pub fn recover_cover(state_dir: &Path) {
     platform::recover_cover(state_dir);
 }
 
-/// Engage the standing lockdown cover: block all egress except loopback, the
-/// `tun_luid` interface (Windows) so app traffic flows, the `app_ids` binaries,
-/// and `server_ip`. `state_dir` is where macOS persists its recovery state.
-/// On failure the host is left uncovered (the caller decides fail-FATAL).
-#[cfg(target_os = "windows")]
+/// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
+/// Windows— plugin/bridge App-IDs permitted, all else blocked). Returns the
+/// SAME [`Cover`] wrapper the transient `engage` returns — the platform guard
+/// is kind-aware, so dropping it disengages the lockdown cover specifically.
+/// On Windows the LUID is re-resolved here every engage (never persisted). On
+/// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
+/// the start. `app_ids` is empty on macOS (pf has no per-process matching).
 pub fn engage_lockdown(
     server_ip: IpAddr,
-    tun_luid: u64,
+    tun_name: &str,
+    resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
     state_dir: &Path,
 ) -> Result<Cover, RoutingError> {
-    Ok(Cover {
-        inner: platform::engage_lockdown(server_ip, tun_luid, app_ids, state_dir)?,
-    })
+    #[cfg(target_os = "windows")]
+    {
+        let luid = resolver.resolve(tun_name)?;
+        Ok(Cover {
+            inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (resolver, app_ids);
+        Ok(Cover {
+            inner: platform::engage_lockdown(server_ip, tun_name, state_dir)?,
+        })
+    }
 }
 
-/// Reconcile a possibly-present standing lockdown cover with the persisted
-/// intent at bridge startup. `Adopt` keeps the host fail-closed (removes only
-/// the dead TUN permit); `Sweep` disengages fully; `Noop` does nothing.
-#[cfg(target_os = "windows")]
+/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
+/// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
+/// fail-closed (removing only the dead TUN permit); `Sweep` fully disengages;
+/// `Noop` does nothing. cfg-free for `routing::recover_routes`.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     platform::recover_lockdown(decision, state_dir);
 }
+
+/// Windows-only test helper: resolve the LUID then build the spec, exercising
+/// the exact resolve-then-build ordering `engage_lockdown` uses, without FWPM.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn build_lockdown_spec_for_test(
+    resolver: &dyn LuidResolver,
+    tun_name: &str,
+    server_ip: IpAddr,
+    app_ids: &[std::path::PathBuf],
+) -> platform::CoverSpec {
+    let luid = resolver.resolve(tun_name).expect("mock resolver");
+    platform::build_lockdown_spec(server_ip, luid, app_ids)
+}
+
+#[cfg(test)]
+#[path = "failclosed/facade_tests.rs"]
+mod facade_tests;
