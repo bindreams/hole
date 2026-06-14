@@ -235,6 +235,12 @@ targets:
     build: cargo nextest run --no-run -p dev-console
     run: cargo nextest run -p dev-console
 
+  util-tests:
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    build: cargo nextest run --no-run -p util
+    run: cargo nextest run -p util
+
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a
   # first-class runnable invoked via `cargo xtask run <name>`, replacing the
