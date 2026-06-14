@@ -16,6 +16,9 @@ pub mod failclosed_state;
 #[cfg(target_os = "macos")]
 pub mod lockdown_pf_state;
 
+pub mod luid;
+pub use luid::{LuidResolver, SystemLuidResolver};
+
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
 mod platform;
