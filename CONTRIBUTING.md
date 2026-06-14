@@ -240,13 +240,24 @@ performs equivalent cleanup from outside.
 
 ### Fail-closed cover
 
+Two egress-block covers share the platform `Cover` guard (kind-aware `Drop`):
+the **transient cutover cover** below and the **standing lockdown cover**
+([next section](#lockdown-mode)). Both are RAII guards permitting a curated
+egress set and blocking everything else; they differ in lifetime and which set
+they permit.
+
+#### Transient cutover cover
+
 `Routing::install_failclosed_cover(server_ip)` engages a leak-free egress block —
 permit loopback and the SS server IP, **block everything else** — as an RAII
 guard whose `Drop` disengages it. It exists for the leak-free in-place-update
 cutover (#468): the bridge is briefly stopped and restarted onto new code, and
-without a cover the missing split routes would let traffic egress in the clear
-(Hole fails *open* — there is no kill switch). The cover holds the line during
-that window; a crash mid-cutover leaves traffic **blocked, not leaked**.
+without a cover the missing split routes would let traffic egress in the clear.
+Default-off Hole fails *open* across that gap; the cover makes the cutover
+leak-free **iff [lockdown](#lockdown-mode) is enabled** (the standing cover
+already holds when the cutover starts) — otherwise this transient cover holds the
+line for the sub-second window. A crash mid-cutover leaves traffic **blocked, not
+leaked**.
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -266,11 +277,49 @@ the accepted fail-closed cost.
   blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
   the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
 
-Each platform splits a pure, unit-tested rule/spec builder (`build_cover_spec` /
-`build_pf_ruleset`) from the thin engage layer — mirroring `build_setup_commands`
-vs `run_commands`. The kernel-level engage is exercised by the privileged cutover
-path, not unit tests (the [#165](#bridge-test-isolation-contract) isolation
-contract). The recovery sweep runs on every bridge start via `recover_routes`.
+Each platform splits a pure, unit-tested rule/spec builder (transient:
+`build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
+`build_lockdown_main_ruleset`) from the thin engage layer — mirroring
+`build_setup_commands` vs `run_commands`. Under the
+[#165](#bridge-test-isolation-contract) isolation contract the builders are the
+only thing unit-tested; the kernel-level engage is exercised in production and,
+for the lockdown cover, by the privileged-lane real-engage test (Windows
+`hole-tests` TUN lane, #527) that proves the WFP cover actually blocks a
+non-permitted egress while loopback stays permitted. The recovery sweep runs on
+every bridge start via `recover_routes`.
+
+### Lockdown mode
+
+The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
+opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
+persistent OS-level egress block permitting **only** loopback, the `hole-tun`
+interface, the onward server connection, and (Windows) the plugin + bridge
+binaries by App-ID — so normal traffic flows while connected and the block holds
+across a bridge restart for free. When disabled, behavior is byte-identical to a
+Hole without it.
+
+It contrasts with the [transient cutover cover](#transient-cutover-cover) on
+three axes:
+
+- **Permit set.** Lockdown adds a TUN-interface permit (Windows: by `NET_LUID`;
+  macOS: `pass out quick on <tun>`) so app traffic flows; the transient cover
+  deliberately omits it (permit loopback + server only) because holding it while
+  connected would block all browsing.
+- **Lifetime.** Lockdown is authoritative and standing — it persists across a
+  crash or restart and is reconciled on the next start via
+  `decide_cover_recovery` (Adopt keeps the host fail-closed, removing only the
+  dead TUN permit; Sweep disengages when intent is off). The transient cover
+  exists only for the sub-second cutover window.
+- **Failure mode.** A failed lockdown engage during a lockdown-on start is
+  **fail-FATAL** — it aborts the start and tears everything down; the transient
+  cover fails *open* on its own engage error so a half-loaded ruleset never
+  strands the host. Lockdown is **last-writer-wins**: an absolute set via
+  `POST /v1/lockdown`, system-wide.
+
+Intent persists to `bridge-lockdown.json`; macOS additionally records the
+pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
+without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
+re-resolved every engage via `LuidResolver`.
 
 ### Config corruption recovery
 
