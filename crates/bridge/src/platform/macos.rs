@@ -211,6 +211,7 @@ pub fn run(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
     log_dir: &std::path::Path,
+    version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -227,7 +228,7 @@ pub fn run(
         // can touch routing state. Route recovery is offloaded via
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+        let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
@@ -255,16 +256,10 @@ pub fn run(
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
 
-        tokio::select! {
-            result = server.run() => {
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "IPC server error");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("received shutdown signal");
-            }
-        }
+        // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
+        // here would skip the pm.stop() teardown below and leak routes/DNS.
+        // `shutdown_signal()` handles SIGINT *and* SIGTERM (foreground.rs).
+        serve_until_signal(server.run(), crate::foreground::shutdown_signal()).await;
 
         // Clean shutdown: stop proxy before exiting
         let mut pm = proxy_shutdown.lock().await;
@@ -275,6 +270,25 @@ pub fn run(
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
+}
+
+/// Drive the IPC server until it finishes or a shutdown signal arrives,
+/// whichever comes first. Extracted from `run` so the select can be
+/// unit-tested without delivering real OS signals.
+pub(crate) async fn serve_until_signal(
+    server: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "IPC server error");
+            }
+        }
+        _ = shutdown => {
+            info!("received shutdown signal");
+        }
+    }
 }
 
 #[cfg(test)]

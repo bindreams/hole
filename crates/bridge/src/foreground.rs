@@ -23,9 +23,10 @@ pub fn run(
     state_dir: &Path,
     log_dir: &Path,
     ready_notify: Option<&str>,
+    version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify))
+    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify, version))
 }
 
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
@@ -107,6 +108,7 @@ async fn run_inner(
     state_dir: &Path,
     log_dir: &Path,
     ready_notify: Option<&str>,
+    version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
@@ -116,7 +118,7 @@ async fn run_inner(
 
     // Bind BEFORE recovery. If a second bridge instance tries to run, the
     // bind() fails and we exit without touching any routing state.
-    let server = crate::ipc::IpcServer::bind(socket_path, proxy)?;
+    let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect

@@ -17,6 +17,18 @@ paths:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
 
+  /v1/version:
+    get:
+      summary: Get the bridge build version
+      operationId: getVersion
+      responses:
+        "200":
+          description: The bridge's build version string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+
   /v1/start:
     post:
       summary: Start the proxy
@@ -185,6 +197,14 @@ components:
         - message
       properties:
         message:
+          type: string
+
+    VersionResponse:
+      type: object
+      required:
+        - version
+      properties:
+        version:
           type: string
 
     EmptyResponse:

@@ -152,7 +152,7 @@ fn foreground_run_accepts_ipc_and_shuts_down() {
             )));
             let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-            let server = crate::ipc::IpcServer::bind(&path_clone, proxy).unwrap();
+            let server = crate::ipc::IpcServer::bind(&path_clone, proxy, "test").unwrap();
             // Server is bound; let the test side connect.
             let _ = ready_tx.send(());
 

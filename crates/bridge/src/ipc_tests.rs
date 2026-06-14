@@ -382,7 +382,7 @@ async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Res
 fn server_accepts_connection() {
     rt().block_on(async {
         let path = test_socket_path("accept");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -394,10 +394,79 @@ fn server_accepts_connection() {
 }
 
 #[skuld::test]
+fn every_response_carries_bridge_version_header() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-header");
+        let server = IpcServer::bind(&path, mock_proxy(), "9.9.9").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(ROUTE_STATUS)
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.send(req).await;
+        assert_eq!(resp.headers().get("x-hole-bridge-version").unwrap(), "9.9.9");
+        let _ = resp.into_body().collect().await;
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn error_response_carries_bridge_version_header() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-err-header");
+        let server = IpcServer::bind(&path, failing_proxy(), "9.9.9").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_start(&mut client, &sample_config()).await;
+        assert_eq!(resp.status(), 500);
+        assert_eq!(resp.headers().get("x-hole-bridge-version").unwrap(), "9.9.9");
+        let _ = resp.into_body().collect().await;
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn version_route_returns_injected_version() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-route");
+        let server = IpcServer::bind(&path, mock_proxy(), "9.9.9").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(ROUTE_VERSION)
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.send(req).await;
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: hole_common::protocol::VersionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.version, "9.9.9");
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
 fn status_when_not_running_returns_false() {
     rt().block_on(async {
         let path = test_socket_path("status");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -426,7 +495,7 @@ fn status_when_not_running_returns_false() {
 fn multiple_requests_on_same_connection() {
     rt().block_on(async {
         let path = test_socket_path("multi");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -448,7 +517,7 @@ fn multiple_requests_on_same_connection() {
 fn invalid_request_returns_error_response() {
     rt().block_on(async {
         let path = test_socket_path("invalid");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -476,7 +545,7 @@ fn invalid_request_returns_error_response() {
 fn server_handles_client_disconnect() {
     rt().block_on(async {
         let path = test_socket_path("disconnect");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -493,7 +562,7 @@ fn start_request_starts_proxy() {
     rt().block_on(async {
         let path = test_socket_path("start");
         let pm = mock_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -521,7 +590,7 @@ fn stop_request_stops_proxy() {
     rt().block_on(async {
         let path = test_socket_path("stop");
         let pm = mock_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -549,7 +618,7 @@ fn start_failure_returns_error() {
     rt().block_on(async {
         let path = test_socket_path("start-fail");
         let pm = failing_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -577,7 +646,7 @@ fn reload_request_reloads_proxy() {
     rt().block_on(async {
         let path = test_socket_path("reload");
         let pm = mock_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -607,7 +676,7 @@ fn reload_request_reloads_proxy() {
 fn run_cancellation_aborts_connection_handlers() {
     rt().block_on(async {
         let path = test_socket_path("run-cancel");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run().await.unwrap();
         });
@@ -649,7 +718,7 @@ fn run_cancellation_aborts_connection_handlers() {
 fn unknown_route_returns_404() {
     rt().block_on(async {
         let path = test_socket_path("404");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -674,7 +743,7 @@ fn unknown_route_returns_404() {
 fn wrong_method_returns_405() {
     rt().block_on(async {
         let path = test_socket_path("405");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -729,7 +798,7 @@ async fn get_diagnostics(client: &mut TestClient) -> DiagnosticsResponse {
 fn metrics_returns_zeros_when_stopped() {
     rt().block_on(async {
         let path = test_socket_path("metrics-stopped");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -754,7 +823,7 @@ fn metrics_returns_uptime_when_running() {
     rt().block_on(async {
         let path = test_socket_path("metrics-running");
         let pm = mock_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -785,7 +854,7 @@ fn metrics_reports_traffic_totals_when_running() {
     rt().block_on(async {
         let path = test_socket_path("metrics-traffic");
         let (pm, traffic) = mock_proxy_with_traffic();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -819,7 +888,7 @@ fn metrics_reports_speed_over_window() {
         let path = test_socket_path("metrics-speed");
         let (pm, traffic) = mock_proxy_with_traffic();
         let pm_for_shift = Arc::clone(&pm);
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -858,7 +927,7 @@ fn diagnostics_bridge_running() {
     rt().block_on(async {
         let path = test_socket_path("diag-running");
         let pm = mock_proxy();
-        let server = IpcServer::bind(&path, pm).unwrap();
+        let server = IpcServer::bind(&path, pm, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -891,7 +960,7 @@ fn diagnostics_bridge_running() {
 fn diagnostics_network_error_when_gateway_unavailable() {
     rt().block_on(async {
         let path = test_socket_path("diag-net-err");
-        let server = IpcServer::bind(&path, gateway_failing_proxy()).unwrap();
+        let server = IpcServer::bind(&path, gateway_failing_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -919,7 +988,7 @@ fn diagnostics_network_error_when_gateway_unavailable() {
 fn diagnostics_proxy_stopped() {
     rt().block_on(async {
         let path = test_socket_path("diag-stopped");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -951,7 +1020,7 @@ fn diagnostics_proxy_stopped() {
 fn diagnostics_bridge_error_after_failed_start() {
     rt().block_on(async {
         let path = test_socket_path("diag-bridge-err");
-        let server = IpcServer::bind(&path, gateway_failing_proxy()).unwrap();
+        let server = IpcServer::bind(&path, gateway_failing_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1003,7 +1072,7 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         let path = test_socket_path("cancel-in-flight");
         let gate = Arc::new(tokio::sync::Notify::new());
         let (entered_tx, entered_rx) = oneshot::channel();
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx), "test").unwrap();
         // Bound the accept loop to exactly the two connections this test
         // uses, instead of running indefinitely. See `run_n` docstring.
         let handle = tokio::spawn(async move { server.run_n(2).await });
@@ -1058,7 +1127,7 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
     // proxy mutex or call Proxy::start.
     rt().block_on(async {
         let path = test_socket_path("cancel-prearm");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         // Single client connection — use run_once to avoid long-lived
         // accept polling on Windows.
         let handle = tokio::spawn(async move { server.run_once().await });
@@ -1091,7 +1160,7 @@ fn cancel_with_no_start_is_ack_idempotent() {
     // is idempotent: arming it twice is equivalent to arming it once.
     rt().block_on(async {
         let path = test_socket_path("cancel-noop");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move { server.run_once().await });
 
         let mut client = TestClient::connect(&path).await;
@@ -1116,7 +1185,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         let path = test_socket_path("concurrent-start");
         let gate = Arc::new(tokio::sync::Notify::new());
         let (entered_tx, entered_rx) = oneshot::channel();
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx), "test").unwrap();
         // 3 connections: A start, B start, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -1171,7 +1240,7 @@ fn sequential_start_cancel_start_consumes_pre_arm_once() {
     // consumed exactly once, not forever.
     rt().block_on(async {
         let path = test_socket_path("seq-start-cancel-start");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         // Single client connection — use run_once.
         let handle = tokio::spawn(async move { server.run_once().await });
 
@@ -1212,7 +1281,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         let path = test_socket_path("double-cancel");
         let gate = Arc::new(tokio::sync::Notify::new());
         let (entered_tx, entered_rx) = oneshot::channel();
-        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx)).unwrap();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx), "test").unwrap();
         // 3 connections: A start, B cancel, C cancel.
         let handle = tokio::spawn(async move { server.run_n(3).await });
 
@@ -1334,7 +1403,7 @@ fn is_valid_sid_string_rejects_invalid() {
 fn bind_accepts_connection() {
     rt().block_on(async {
         let path = test_socket_path("bind-accept");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1349,7 +1418,7 @@ fn bind_accepts_connection() {
 fn bind_status_query() {
     rt().block_on(async {
         let path = test_socket_path("bind-status");
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -1373,13 +1442,13 @@ fn socket_recreated_on_bind() {
         let path = test_socket_path("recreate");
 
         // First bind
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         assert!(path.exists(), "socket file should exist after bind");
         drop(server); // Drop removes the file
         assert!(!path.exists(), "socket file should be removed after drop");
 
         // Second bind (recreates the socket)
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         assert!(path.exists(), "socket file should exist after second bind");
         drop(server);
     });
@@ -1390,7 +1459,7 @@ fn socket_removed_on_drop() {
     rt().block_on(async {
         let path = test_socket_path("drop-cleanup");
 
-        let server = IpcServer::bind(&path, mock_proxy()).unwrap();
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
         assert!(path.exists(), "socket file should exist after bind");
 
         drop(server);

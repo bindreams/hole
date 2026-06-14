@@ -28,11 +28,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config_store: ConfigStore, config: AppConfig, app_handle: tauri::AppHandle) -> Self {
+        // The self-heal hook captures the AppHandle (BridgeLink has none of
+        // its own). `hole::selfheal` resolves in both the lib and bin units.
+        let hook_app = app_handle.clone();
+        let self_heal: SelfHealHook = std::sync::Arc::new(move |bridge| hole::selfheal::trigger(&hook_app, bridge));
         Self {
             config_store,
             config: Mutex::new(config),
             app_handle,
-            link: BridgeLink::new(resolve_bridge_socket_path()),
+            link: BridgeLink::new(resolve_bridge_socket_path(), self_heal),
             test_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -85,23 +89,38 @@ fn resolve_bridge_socket_path() -> PathBuf {
 /// exchange revealed about `running` (see `observed_running`) BEFORE
 /// releasing the client lock — commit order therefore equals bridge
 /// processing order, with no separate synchronization.
+/// Fired (off the reactor) whenever a bridge exchange reveals a version
+/// mismatch, to drive the GUI self-heal. Injected so `BridgeLink` stays
+/// testable and holds no `AppHandle` of its own.
+pub type SelfHealHook = std::sync::Arc<dyn Fn(Option<String>) + Send + Sync>;
+
 pub struct BridgeLink {
     socket_path: PathBuf,
     client: tokio::sync::Mutex<Option<BridgeClient>>,
     cell: ProxyStateCell,
+    self_heal: SelfHealHook,
 }
 
 impl BridgeLink {
-    pub fn new(socket_path: PathBuf) -> Self {
+    pub fn new(socket_path: PathBuf, self_heal: SelfHealHook) -> Self {
         Self {
             socket_path,
             client: tokio::sync::Mutex::new(None),
             cell: ProxyStateCell::new(),
+            self_heal,
         }
     }
 
     pub fn cell(&self) -> &ProxyStateCell {
         &self.cell
+    }
+
+    /// Drive the self-heal hook if the exchange revealed a version mismatch.
+    /// Covers every send path (pooled, oneshot, reload) since all funnel here.
+    fn note_mismatch(&self, result: &Result<BridgeResponse, ClientError>) {
+        if let Err(ClientError::VersionMismatch { bridge }) = result {
+            (self.self_heal)(bridge.clone());
+        }
     }
 
     /// Send a request to the bridge, lazily connecting on first use.
@@ -114,6 +133,7 @@ impl BridgeLink {
         if let Some(running) = observed_running(kind, &result) {
             self.cell.commit(running);
         }
+        self.note_mismatch(&result);
         result
     }
 
@@ -144,6 +164,10 @@ impl BridgeLink {
             .await
         {
             Ok(resp) => Ok(resp),
+            // A version mismatch is not a broken connection — keep the pooled
+            // client (reconnecting cannot fix a version skew). `ClientError`
+            // is not `Clone`, so bind-and-move the error out of the match.
+            Err(e @ ClientError::VersionMismatch { .. }) => Err(e),
             Err(e) => {
                 // Connection broken — clear so next call reconnects
                 warn!(error = %e, "bridge communication error, will reconnect");
@@ -168,7 +192,9 @@ impl BridgeLink {
     /// is still the right choice for normal request traffic.
     pub async fn send_oneshot(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
         let mut client = BridgeClient::connect(&self.socket_path).await?;
-        client.send(req).await
+        let result = client.send(req).await;
+        self.note_mismatch(&result);
+        result
     }
 
     /// Send Reload iff the proxy is running, decided at the linearization
@@ -183,13 +209,16 @@ impl BridgeLink {
     pub async fn reload_if_running(&self, config: hole_common::protocol::ProxyConfig) -> Result<bool, String> {
         let mut guard = self.client.lock().await;
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
+        self.note_mismatch(&status);
         if let Some(running) = observed_running(ReqKind::Status, &status) {
             self.cell.commit(running);
         }
         if !matches!(status, Ok(BridgeResponse::Status { running: true, .. })) {
             return Ok(false); // Not running; changes apply on next start.
         }
-        match Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Reload { config }).await {
+        let reload = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Reload { config }).await;
+        self.note_mismatch(&reload);
+        match reload {
             Ok(BridgeResponse::Ack) => Ok(true),
             Ok(BridgeResponse::Error { message }) => Err(message),
             Ok(_) => Err("unexpected response from bridge".into()),
@@ -306,6 +335,9 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
     match (kind, result) {
         (Other, _) => None,
         (_, Err(ClientError::PermissionDenied)) => None,
+        // A version mismatch triggers self-heal; do not flip `running` during
+        // the self-heal window (must precede the `(_, Err(_))` catch-all).
+        (_, Err(ClientError::VersionMismatch { .. })) => None,
         (_, Err(_)) => Some(false),
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
