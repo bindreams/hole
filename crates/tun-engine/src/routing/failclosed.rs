@@ -13,6 +13,9 @@ use crate::error::RoutingError;
 #[cfg(target_os = "macos")]
 pub mod failclosed_state;
 
+#[cfg(target_os = "macos")]
+pub mod lockdown_pf_state;
+
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
 mod platform;

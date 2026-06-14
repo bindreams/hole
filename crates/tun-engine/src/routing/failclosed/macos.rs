@@ -19,6 +19,7 @@ use crate::error::RoutingError;
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
+use super::lockdown_pf_state as lockdown_state;
 
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
@@ -101,11 +102,19 @@ fn pfctl(args: &[&str], stdin: Option<&[u8]>, phase: &str) -> Result<std::proces
     run_capturing(&cmd, stdin, phase).map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))
 }
 
-/// pf-backed cover guard. Drop restores `/etc/pf.conf` and drops our enable
-/// refcount.
+/// Which cover a [`Cover`] guard owns — selects its Drop disengage path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverKind {
+    Transient,
+    Lockdown,
+}
+
+/// pf-backed cover guard. Drop disengages per [`CoverKind`]: the transient
+/// cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
 pub struct Cover {
     token: String,
     state_dir: std::path::PathBuf,
+    kind: CoverKind,
 }
 
 pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError> {
@@ -153,12 +162,16 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
     Ok(Cover {
         token,
         state_dir: state_dir.to_owned(),
+        kind: CoverKind::Transient,
     })
 }
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        disengage(&self.token, &self.state_dir);
+        match self.kind {
+            CoverKind::Transient => disengage(&self.token, &self.state_dir),
+            CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
+        }
     }
 }
 
@@ -186,6 +199,113 @@ pub fn recover_cover(state_dir: &Path) {
         "recovering fail-closed cover from crashed run"
     );
     disengage(&st.pf_token, state_dir);
+}
+
+// --- lockdown layer ---
+
+/// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`:
+///
+/// 1. `pfctl -E` (refcount) + capture token.
+/// 2. `pfctl -sr` snapshot of the current main ruleset.
+/// 3. Persist {token, snapshot} to `bridge-lockdown-pf.json`.
+/// 4. Load the anchor BODY into `com.hole.lockdown` (`-a <anchor> -f -`).
+/// 5. Load the COMPOSED main (snapshot + anchor call-out) WITHOUT `-Fa`, so
+///    the anchor evaluates while host/MDM policy is preserved.
+///
+/// On any load failure the host is restored (Sweep) and Err returned; the
+/// bridge's fail-FATAL caller aborts the start.
+#[allow(dead_code)] // caller is the cfg-free `failclosed::engage_lockdown` facade (not yet wired on macOS)
+pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> Result<Cover, RoutingError> {
+    let en = pfctl(&["-E"], None, PHASE_COVER)?;
+    let token = parse_enable_token(&String::from_utf8_lossy(&en.stderr))
+        .or_else(|| parse_enable_token(&String::from_utf8_lossy(&en.stdout)))
+        .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))?;
+
+    let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
+    let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
+
+    lockdown_state::save(
+        state_dir,
+        &lockdown_state::LockdownPfState {
+            version: lockdown_state::SCHEMA_VERSION,
+            pf_token: token.clone(),
+            main_snapshot: main_snapshot.clone(),
+        },
+    )
+    .map_err(|e| RoutingError::RouteSetup(format!("failed to persist lockdown-pf-state: {e}")))?;
+
+    // Helper to restore-and-fail on any load error.
+    let fail = |what: &str, stderr: &[u8]| -> RoutingError {
+        lockdown_disengage(state_dir);
+        RoutingError::RouteSetup(format!("{what}: {}", String::from_utf8_lossy(stderr).trim()))
+    };
+
+    // 4. Anchor body.
+    let body = build_lockdown_ruleset(tun_name, server_ip);
+    let body_out = pfctl(&["-a", LOCKDOWN_ANCHOR, "-f", "-"], Some(body.as_bytes()), PHASE_COVER)?;
+    if !body_out.status.success() {
+        return Err(fail("pfctl lockdown anchor load failed", &body_out.stderr));
+    }
+
+    // 5. Composed main (NO -Fa) — this is what makes the anchor evaluate.
+    let main = build_main_ruleset_with_anchor(&main_snapshot);
+    let main_out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
+    if !main_out.status.success() {
+        return Err(fail("pfctl lockdown main load failed", &main_out.stderr));
+    }
+
+    Ok(Cover {
+        token,
+        state_dir: state_dir.to_owned(),
+        kind: CoverKind::Lockdown,
+    })
+}
+
+/// Sweep: restore the snapshot main ruleset, flush the anchor, drop our pf
+/// refcount, clear the state. Shared by Drop (user-stop) and `recover_lockdown`
+/// when the persisted intent is OFF. Best-effort; logs on failure.
+fn lockdown_disengage(state_dir: &Path) {
+    if let Some(st) = lockdown_state::load(state_dir) {
+        if let Err(e) = pfctl(&["-f", "-"], Some(st.main_snapshot.as_bytes()), PHASE_RECOVER_COVER) {
+            tracing::warn!(error = %e, "lockdown main-snapshot restore failed");
+        }
+        if let Err(e) = pfctl(&["-a", LOCKDOWN_ANCHOR, "-F", "all"], None, PHASE_RECOVER_COVER) {
+            tracing::warn!(error = %e, "lockdown anchor flush failed");
+        }
+        if let Err(e) = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER) {
+            tracing::warn!(error = %e, "pfctl -X failed during lockdown disengage");
+        }
+    }
+    if let Err(e) = lockdown_state::clear(state_dir) {
+        tracing::warn!(error = %e, "lockdown-pf-state clear failed during disengage");
+    }
+}
+
+/// Act on a recovery decision for the lockdown cover (called from
+/// `failclosed::recover_lockdown`). `Adopt` (intent ON): KEEP the host
+/// fail-closed — leave the composed main + anchor body + state file untouched;
+/// only the now-dead utun permit inside the anchor is stale, and the next
+/// connect's `install_lockdown` reloads the anchor body with the fresh utun
+/// name (idempotent). `Sweep` (intent OFF): full restore via
+/// `lockdown_disengage`. `Noop`: nothing.
+#[allow(dead_code)] // caller is the cfg-free `failclosed::recover_lockdown` facade (not yet wired on macOS)
+pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
+    use crate::routing::CoverRecovery::*;
+    match decision {
+        Noop => {}
+        Adopt => {
+            tracing::info!("lockdown recovery: adopting persistent cover (host stays fail-closed)");
+            // Intentionally NOTHING removed: the block must survive the
+            // restart (this IS the crash-leak fix). NOTE: macOS pf rules do
+            // NOT survive a reboot, so a reboot opens a boot->first-connect
+            // window — tracked under the deferred Decision C-b (block when
+            // disconnected, needs an early-boot block). See spec §9 C.
+        }
+        Sweep => {
+            tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
+            lockdown_disengage(state_dir);
+        }
+    }
 }
 
 #[cfg(test)]
