@@ -321,9 +321,8 @@ fn e2e_start_rejects_full_mode_without_socks5(
 // Gated to Windows for the same reason as the existing `mod tun` in
 // `proxy_manager_e2e_tests.rs`: `TunnelMode::Full` needs elevation, and
 // `windows-latest` CI runs as `RUNNERADMIN`. The SocksOnly UDP path is
-// covered by `mod socks_only_udp` below — it runs on every job
-// (Linux + Windows pass-1; the galoshes variant is additionally
-// Windows-skipped under #197).
+// covered by `mod socks_only_udp` below — it runs in the non-TUN pass on
+// every Hole platform (Win+mac), both the no-plugin and galoshes variants.
 //
 // The test asserts a client-facing UDP round-trip, which covers the
 // entire TUN→dispatcher→Socks5Endpoint→shadowsocks-service UDP stack
