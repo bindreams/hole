@@ -35,6 +35,45 @@ pub fn build_pf_ruleset(server_ip: IpAddr) -> String {
     )
 }
 
+/// pf anchor name for the standing lockdown ruleset. Scoped so the
+/// session-long guard does not flush user/MDM pf policy (unlike the transient
+/// cover's `-Fa`). A named anchor only evaluates when the MAIN ruleset
+/// references it — see [`build_main_ruleset_with_anchor`].
+pub const LOCKDOWN_ANCHOR: &str = "com.hole.lockdown";
+
+/// Build the BODY loaded into the [`LOCKDOWN_ANCHOR`] (`pfctl -a <anchor> -f -`).
+/// Blocks all outbound except loopback, the TUN interface (so app traffic flows
+/// while connected), and the server IP. pf has no per-process matching, so the
+/// server permit is IP-based (Decision A: macOS pins the server IP for the
+/// session). All passes are `quick` so they win over the anchor's own
+/// `block out all` without relying on last-match. This body is INERT until the
+/// main ruleset references the anchor.
+pub fn build_lockdown_ruleset(tun_name: &str, server_ip: IpAddr) -> String {
+    format!(
+        "set block-policy drop\n\
+         block out all\n\
+         pass out quick on lo0 all\n\
+         pass in quick on lo0 all\n\
+         pass out quick on {tun_name} all\n\
+         pass out quick from any to {server_ip}\n"
+    )
+}
+
+/// Compose the MAIN ruleset to load (NO `-Fa`): the host's pre-lockdown main
+/// ruleset `snapshot` (captured via `pfctl -sr`) followed by the
+/// `anchor "com.hole.lockdown"` call-out that makes the anchor body evaluate.
+/// Without this call-out the lockdown anchor is inert and the kill switch does
+/// nothing — this is the load-bearing composition.
+pub fn build_main_ruleset_with_anchor(snapshot: &str) -> String {
+    let mut main = String::with_capacity(snapshot.len() + 64);
+    main.push_str(snapshot);
+    if !snapshot.ends_with('\n') && !snapshot.is_empty() {
+        main.push('\n');
+    }
+    main.push_str(&format!("anchor \"{LOCKDOWN_ANCHOR}\"\n"));
+    main
+}
+
 /// Parse the enable token from `pfctl -E` output (it prints `Token : <n>`).
 pub fn parse_enable_token(output: &str) -> Option<String> {
     output
