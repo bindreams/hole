@@ -375,3 +375,21 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     assert!(log.into_inner().is_empty(), "no route-state file => no route commands");
     assert!(swept.get(), "recover_routes_with must invoke the cover sweep");
 }
+
+// decide_cover_recovery ===============================================================================================
+
+#[skuld::test]
+fn cover_recovery_on_and_present_adopts() {
+    assert_eq!(decide_cover_recovery(true, true), CoverRecovery::Adopt);
+}
+
+#[skuld::test]
+fn cover_recovery_off_and_present_sweeps() {
+    assert_eq!(decide_cover_recovery(false, true), CoverRecovery::Sweep);
+}
+
+#[skuld::test]
+fn cover_recovery_absent_is_noop_regardless_of_intent() {
+    assert_eq!(decide_cover_recovery(true, false), CoverRecovery::Noop);
+    assert_eq!(decide_cover_recovery(false, false), CoverRecovery::Noop);
+}

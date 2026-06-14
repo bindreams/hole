@@ -192,6 +192,38 @@ pub fn recover_routes(state_dir: &Path) {
     recover_routes_with(state_dir, run_commands, failclosed::recover_cover);
 }
 
+/// What crash-recovery should do with a possibly-present standing lockdown
+/// cover, given the persisted lockdown intent and whether a cover is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverRecovery {
+    /// Intent ON + cover present: KEEP the host fail-closed across the restart.
+    /// Remove ONLY the stale TUN-interface permit (its LUID/utun is dead after
+    /// teardown); block-all + loopback + server-IP + App-ID stay in force. The
+    /// next connect's `install_lockdown` re-adds the TUN permit with a freshly
+    /// resolved LUID/utun (idempotent). This is the crash-leak fix: a crash
+    /// never runs `stop()`, so the persistent cover survives and Adopt holds it.
+    Adopt,
+    /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
+    /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +
+    /// drop the pf token).
+    Sweep,
+    /// No cover present: nothing to do.
+    Noop,
+}
+
+/// Pure recovery decision. `intent` is the persisted lockdown-enabled bool
+/// (`bridge-lockdown.json`); `prior_present` is whether a lockdown cover from a
+/// prior run is present, keyed on the cover's OWN evidence (NOT
+/// `bridge-routes.json` — the cover's lifetime is independent of routes). See
+/// `recover_routes_with` for how `prior_present` is derived per platform.
+pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery {
+    match (intent, prior_present) {
+        (_, false) => CoverRecovery::Noop,
+        (true, true) => CoverRecovery::Adopt,
+        (false, true) => CoverRecovery::Sweep,
+    }
+}
+
 /// Test seam for [`recover_routes`]: accepts an injected command runner and an
 /// injected cover-recovery sweep so unit tests can assert behavior without
 /// shelling out to `netsh`/`route` or touching the host firewall. Production
