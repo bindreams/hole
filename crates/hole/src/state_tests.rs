@@ -7,13 +7,37 @@ use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
 #[skuld::test]
 fn cell_bumps_seq_only_on_change() {
     let cell = ProxyStateCell::new();
-    assert_eq!(cell.snapshot(), ProxySnapshot { seq: 0, running: false });
+    assert_eq!(
+        cell.snapshot(),
+        ProxySnapshot {
+            seq: 0,
+            running: false,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
     cell.commit(false);
     assert_eq!(cell.snapshot().seq, 0, "no-change commit must not bump seq");
     cell.commit(true);
-    assert_eq!(cell.snapshot(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        cell.snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
     cell.commit(false);
-    assert_eq!(cell.snapshot(), ProxySnapshot { seq: 2, running: false });
+    assert_eq!(
+        cell.snapshot(),
+        ProxySnapshot {
+            seq: 2,
+            running: false,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 #[skuld::test]
@@ -24,7 +48,28 @@ async fn cell_wakes_watchers_only_on_change() {
     assert!(!rx.has_changed().unwrap());
     cell.commit(true);
     assert!(rx.has_changed().unwrap());
-    assert_eq!(*rx.borrow_and_update(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        *rx.borrow_and_update(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false,
+        }
+    );
+}
+
+#[skuld::test]
+fn commit_status_carries_lockdown_fields() {
+    let cell = ProxyStateCell::new();
+    // Initial snapshot defaults the lockdown fields to false.
+    let s0 = cell.snapshot();
+    assert!(!s0.lockdown_enabled && !s0.lockdown_active);
+    // A Status commit threads both lockdown bools alongside `running`.
+    cell.commit_status(true, true, false);
+    let s1 = cell.snapshot();
+    assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
+    assert_eq!(s1.seq, 1, "seq bumped on change");
 }
 
 // observed_running ====================================================================================================
@@ -202,7 +247,15 @@ async fn start_ack_commits_true() {
         .await
         .unwrap();
     assert!(matches!(resp, BridgeResponse::Ack));
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 #[skuld::test]
@@ -245,7 +298,15 @@ async fn transport_error_commits_false() {
     let link = BridgeLink::new(path, noop_hook());
     link.cell().commit(true); // pretend we believed it was running
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 2, running: false });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 2,
+            running: false,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 #[skuld::test]
@@ -260,7 +321,15 @@ async fn oneshot_never_commits() {
     let link = BridgeLink::new(path, noop_hook());
     link.cell().commit(true);
     link.send_oneshot(BridgeRequest::Cancel).await.unwrap();
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 #[skuld::test]
@@ -283,7 +352,15 @@ async fn untracked_requests_never_commit() {
 
     let link = BridgeLink::new(path, noop_hook());
     link.send(BridgeRequest::Metrics).await.unwrap();
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 0, running: false });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 0,
+            running: false,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 /// The ordering guarantee under test is the CLIENT-LOCK serialization:
@@ -334,7 +411,15 @@ async fn concurrent_requests_commit_in_bridge_order() {
     assert!(matches!(a, BridgeResponse::Ack));
     assert!(matches!(b, BridgeResponse::Status { running: true, .. }));
     // Start committed true (seq 1); the queued Status confirmed true (no bump).
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
 
 #[skuld::test]
@@ -388,5 +473,13 @@ async fn reload_if_running_reloads_when_running() {
     assert!(reloaded);
     assert_eq!(reloads.load(Ordering::SeqCst), 1);
     // The Status leg committed the observation.
-    assert_eq!(link.cell().snapshot(), ProxySnapshot { seq: 1, running: true });
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        }
+    );
 }
