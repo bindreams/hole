@@ -1,6 +1,6 @@
 //! Generates Rust types and route constants from the OpenAPI spec at `api/openapi.yaml`.
 //!
-//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `InvalidFilter`, `FilterMetrics`.
+//! Generated types: `StatusResponse`, `ErrorResponse`, `EmptyResponse`, `MetricsResponse`, `DiagnosticsResponse`, `InvalidFilter`, `FilterMetrics`, `VersionResponse`.
 //! Generated constants: one `ROUTE_*` const per `/v1/*` path in `api/openapi.yaml` (e.g. `ROUTE_STATUS`, `ROUTE_START`, `ROUTE_STOP`, `ROUTE_CANCEL`, `ROUTE_RELOAD`, …).
 //!
 //! The remaining schemas — including `ProxyConfig`, `ServerEntry`, `ValidationState`,
@@ -27,6 +27,7 @@ fn main() {
         "DiagnosticsResponse",
         "InvalidFilter",
         "FilterMetrics",
+        "VersionResponse",
     ];
 
     let ref_types: Vec<(String, Schema)> = types_to_generate

@@ -29,6 +29,18 @@ fn sample_config() -> ProxyConfig {
     }
 }
 
+#[skuld::test]
+fn version_response_roundtrips_and_route_const_exists() {
+    use crate::protocol::{VersionResponse, ROUTE_VERSION};
+    assert_eq!(ROUTE_VERSION, "/v1/version");
+    let v = VersionResponse {
+        version: "1.2.3".to_string(),
+    };
+    assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"version":"1.2.3"}"#);
+    let back: VersionResponse = serde_json::from_str(r#"{"version":"1.2.3"}"#).unwrap();
+    assert_eq!(back.version, "1.2.3");
+}
+
 // BridgeRequest/BridgeResponse JSON serialization (used by elevation flow) --------------------------------------------
 
 #[skuld::test]
