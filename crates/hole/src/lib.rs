@@ -12,6 +12,7 @@ pub mod config_recovery;
 pub mod elevation;
 pub mod logging;
 pub mod path_management;
+pub mod relaunch;
 pub mod selfheal;
 pub mod setup;
 pub mod state;

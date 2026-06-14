@@ -75,6 +75,15 @@ fn launch_gui(show_dashboard: bool) {
     // spawn_blocking — there is no runtime worker to protect yet).
     tombstone::sweep(&log_dir);
 
+    // If we were relaunched to take over from a stale predecessor (version
+    // self-heal, or post-update), wait for it to exit before the
+    // single-instance plugin contends for the `com.hole.app` lock — otherwise
+    // we would forward-and-exit to the old instance. No-op for an ordinary
+    // launch (the env marker is unset).
+    if let Err(e) = hole::relaunch::await_predecessor() {
+        tracing::warn!(error = %e, "await_predecessor failed; launching anyway");
+    }
+
     tauri::Builder::default()
         // `UiReady` is registered on the builder (not in `.setup`) so
         // it is available to command handlers at first dispatch — the
