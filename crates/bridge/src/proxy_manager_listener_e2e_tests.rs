@@ -385,8 +385,7 @@ mod tun {
 // Two variants:
 // * `e2e_socks_only_udp_associate_no_plugin` — direct ss tunnel.
 // * `e2e_socks_only_udp_associate_galoshes` — UDP through galoshes'
-//   YAMUX-multiplexed plugin chain. Skipped on Windows under #197 (same
-//   `PluginConfig` bind race that gates `e2e_ws_socks_only_roundtrip`).
+//   YAMUX-multiplexed plugin chain.
 //
 // Both labeled `[DIST_BIN]` (no `TUN`) → run in pass-1
 // (`SKULD_LABELS="!tun"`) where loopback delivery is intact.
@@ -429,10 +428,8 @@ mod socks_only_udp {
         });
     }
 
-    /// Linux-only: the galoshes *server* (`ssserver_ws` fixture) hits the #197
-    /// `PluginConfig` bind race on Win+mac, same as `e2e_ws_socks_only_roundtrip`.
-    /// Lift this gate once #197 lands a custom server-side launcher. See #435.
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux. Runs on
+    /// every Hole platform, same as `e2e_ws_socks_only_roundtrip`.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,

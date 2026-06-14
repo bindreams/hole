@@ -1,10 +1,10 @@
 //! Unit tests for [`super::server_endpoint_is_udp`] — the transport-aware
 //! preflight gate added in bindreams/hole#421.
 //!
-//! Deliberately NOT in `server_test_tests.rs`: that module is gated
-//! `cfg(not(any(macos, windows)))` (Linux-only, #197/#200). These are pure,
-//! I/O-free table assertions that MUST run on every platform, because the QUIC
-//! interop tests that depend on the preflight skip run on Windows too.
+//! Kept separate from `server_test_tests.rs`: these are pure, I/O-free table
+//! assertions that must run on every platform, whereas `server_test_tests` does
+//! real connectivity I/O. The QUIC interop tests that depend on the preflight
+//! skip run on Windows too.
 
 use super::server_endpoint_is_udp;
 use hole_common::config::ServerEntry;

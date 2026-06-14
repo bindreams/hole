@@ -217,12 +217,9 @@ fn e2e_metrics_report_tunnel_traffic(
     });
 }
 
-/// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
-///
-/// Linux-only: the galoshes *server* hits the #197 `PluginConfig` port race on
-/// Win+mac (yamux-server loses the bind). The galoshes WS transport proper is
-/// covered on Linux by `plugin-e2e`'s `galoshes_ws_roundtrip` (#435).
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+/// Test 2: SocksOnly mode with galoshes (websocket, no TLS). Runs on every Hole
+/// platform — WS is the baseline transport galoshes serves everywhere; the
+/// transport proper is covered by `plugin-e2e`'s `galoshes_ws_roundtrip`.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -232,11 +229,10 @@ fn e2e_ws_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 3: SocksOnly mode with galoshes (websocket + TLS).
-///
-/// Linux-only: same #197 galoshes-server bind race as
-/// `e2e_ws_socks_only_roundtrip` (Win+mac). See #435.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+/// Test 3: SocksOnly mode with galoshes (websocket + TLS). Off Windows: the
+/// server presents a self-signed cert and v2ray-core's `getCertPool` drops
+/// custom certs on Windows (same limit as `plugin-e2e`'s `galoshes_ws_tls_roundtrip`).
+#[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -246,15 +242,11 @@ fn e2e_ws_tls_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
-/// Test 4: SocksOnly mode with galoshes (QUIC).
-///
-/// Linux-only: same #197 galoshes-server bind race as
-/// `e2e_ws_socks_only_roundtrip` (Win+mac). galoshes embeds `ex-ray` (#414),
-/// which UDP-probes its inbound and reports `transports:["udp"]` for
-/// server+quic, so galoshes-as-server-with-QUIC starts again (#421); the QUIC
-/// transport proper is covered on Linux by `plugin-e2e`'s
-/// `galoshes_quic_roundtrip` (#435).
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+/// Test 4: SocksOnly mode with galoshes (QUIC, auto-TLS). Off Windows: QUIC
+/// auto-enables TLS and v2ray-core's `getCertPool` drops the custom cert on
+/// Windows (same limit as `e2e_ws_tls_socks_only_roundtrip`); the transport
+/// proper is covered by `plugin-e2e`'s `galoshes_quic_roundtrip`.
+#[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
@@ -345,15 +337,9 @@ mod tun {
         rt().block_on(run_full_tunnel_e2e(dist, ss, http));
     }
 
-    /// Test 6: Full mode with galoshes (websocket). Requires Windows
-    /// admin.
-    ///
-    /// Gated never-compile via the contradictory cfg pair (the `mod tun`
-    /// guard above is `cfg(target_os = "windows")`, this is
-    /// `cfg(not(target_os = "windows"))`) because the galoshes
-    /// `PluginConfig` bind race fires here too (bindreams/hole#197).
-    /// Remove the cfg once #197 lands.
-    #[cfg(not(target_os = "windows"))]
+    /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
+    /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs
+    /// elevation; WS needs no custom cert, so it runs on the Windows TUN lane.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
@@ -614,10 +600,8 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 // IPv6 axis ===========================================================================================================
 
-/// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
-///
-/// Linux-only: same #197 galoshes-server bind race (Win+mac). See #435.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+/// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`. Runs on
+/// every Hole platform (WS galoshes + IPv6 loopback work on both).
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
