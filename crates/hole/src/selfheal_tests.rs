@@ -69,41 +69,36 @@ impl SelfHealOs for Spy {
 }
 
 #[skuld::test]
-fn run_with_relaunch_spawns_then_exits() {
+fn dispatch_relaunch_spawns_then_exits() {
     let mut spy = Spy::ok();
-    assert_eq!(
-        run_with("6", Some("7"), 1u8, Some(2u8), &mut spy),
-        SelfHealAction::Relaunch
-    );
+    dispatch(SelfHealAction::Relaunch, &mut spy);
     assert!(spy.spawned && spy.exited && !spy.dialoged);
 }
 
 #[skuld::test]
-fn run_with_reinstall_dialogs_then_exits() {
+fn dispatch_reinstall_dialogs_then_exits() {
     let mut spy = Spy::ok();
-    assert_eq!(
-        run_with("7", Some("6"), 1u8, Some(1u8), &mut spy),
-        SelfHealAction::Reinstall
-    );
+    dispatch(SelfHealAction::Reinstall, &mut spy);
     assert!(spy.dialoged && spy.exited && !spy.spawned);
 }
 
 #[skuld::test]
-fn run_with_transient_does_nothing() {
+fn dispatch_operate_does_nothing() {
     let mut spy = Spy::ok();
-    assert_eq!(
-        run_with("6", Some("7"), 1u8, None::<u8>, &mut spy),
-        SelfHealAction::Transient
-    );
+    dispatch(SelfHealAction::Operate, &mut spy);
     assert!(!spy.spawned && !spy.dialoged && !spy.exited);
 }
 
 #[skuld::test]
-fn run_with_relaunch_spawn_failure_does_not_exit() {
+fn dispatch_transient_does_nothing() {
+    let mut spy = Spy::ok();
+    dispatch(SelfHealAction::Transient, &mut spy);
+    assert!(!spy.spawned && !spy.dialoged && !spy.exited);
+}
+
+#[skuld::test]
+fn dispatch_relaunch_spawn_failure_does_not_exit() {
     let mut spy = Spy::default(); // spawn_ok = false
-    assert_eq!(
-        run_with("6", Some("7"), 1u8, Some(2u8), &mut spy),
-        SelfHealAction::Relaunch
-    );
+    dispatch(SelfHealAction::Relaunch, &mut spy);
     assert!(spy.spawned && !spy.exited);
 }

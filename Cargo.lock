@@ -2950,6 +2950,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ico",
+ "libc",
  "minisign-verify",
  "png 0.18.1",
  "resvg",

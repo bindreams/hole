@@ -62,6 +62,19 @@ fn main() {
 }
 
 fn launch_gui(show_dashboard: bool) {
+    // BEFORE logging redirects stdout into the (lossy) log relay: if we were
+    // relaunched to take over a stale predecessor (version self-heal, or
+    // post-update), signal READY over the inherited stdout pipe and wait for
+    // the predecessor to exit, so the single-instance plugin acquires the
+    // `com.hole.app` lock uncontested. Routing READY through the relay could
+    // drop it and hang the handshake, so it must happen pre-`logging::init`.
+    // No-op (returns immediately) for an ordinary launch — the env marker is
+    // unset, so no console/stdout is touched. No subscriber yet, so report a
+    // (rare) failure to stderr.
+    if let Err(e) = hole::relaunch::await_predecessor() {
+        eprintln!("hole: await_predecessor failed; launching anyway: {e}");
+    }
+
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
@@ -75,14 +88,6 @@ fn launch_gui(show_dashboard: bool) {
     // spawn_blocking — there is no runtime worker to protect yet).
     tombstone::sweep(&log_dir);
 
-    // If we were relaunched to take over from a stale predecessor (version
-    // self-heal, or post-update), wait for it to exit before the
-    // single-instance plugin contends for the `com.hole.app` lock — otherwise
-    // we would forward-and-exit to the old instance. No-op for an ordinary
-    // launch (the env marker is unset).
-    if let Err(e) = hole::relaunch::await_predecessor() {
-        tracing::warn!(error = %e, "await_predecessor failed; launching anyway");
-    }
     // Snapshot the installed image identity now, before any later update can
     // rename it — the self-heal compares against it on a version mismatch.
     hole::selfheal::init_startup();

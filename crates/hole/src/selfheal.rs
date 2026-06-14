@@ -3,8 +3,8 @@
 //! When the GUI detects (via the `X-Hole-Bridge-Version` header) that the
 //! bridge runs a different version, it must not operate the mismatched pair.
 //! [`decide`] is the pure, `#[cfg]`-free policy; the OS-specific bits live
-//! behind the [`canonical_install_exe`](capture_startup_identity)/identity
-//! seam and [`crate::relaunch`]. Inert until an update produces a mismatch.
+//! behind the [`capture_startup_identity`]/[`file_identity`] seam and
+//! [`crate::relaunch`]. Inert until an update produces a mismatch.
 
 use std::path::{Path, PathBuf};
 
@@ -75,15 +75,18 @@ pub fn file_identity(p: &Path) -> std::io::Result<same_file::Handle> {
     same_file::Handle::from_path(p)
 }
 
-/// Show the path-free "please reinstall" dialog (the `Reinstall` action). The
-/// running-image-vs-canonical path detail is logged to `gui.log` at the
-/// trigger, never shown — PII stays out of the dialog.
-pub fn show_reinstall_dialog(app: &tauri::AppHandle) {
+/// Show the path-free "please reinstall" dialog (the `Reinstall` action),
+/// blocking until the user dismisses it (so it actually renders before the
+/// process exits). The running-image-vs-canonical path detail is logged to
+/// `gui.log` at the trigger, never shown — PII stays out of the dialog. Must
+/// run off the main thread / reactor; the trigger runs it on a dedicated thread.
+fn show_reinstall_dialog(app: &tauri::AppHandle) {
     use tauri_plugin_dialog::DialogExt;
-    app.dialog()
+    let _ = app
+        .dialog()
         .message("Hole is in an inconsistent state and needs to be reinstalled.")
         .title("Hole")
-        .show(|_| {});
+        .blocking_show();
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,23 +106,17 @@ pub fn init_startup() {
 /// the process; `Operate`/`Transient`/relaunch-spawn-failure release it.
 static EVALUATING: AtomicBool = AtomicBool::new(false);
 
-/// Seam for unit-testing the action dispatch without a real relaunch /
-/// dialog / process exit.
-pub trait SelfHealOs {
+/// Effects seam, so the dispatch shipped in production is exactly the one the
+/// tests drive (via a recording stub). Each method may block.
+trait SelfHealOs {
     fn spawn_successor(&mut self) -> std::io::Result<()>;
     fn show_reinstall_dialog(&mut self);
     fn request_exit(&mut self);
 }
 
-/// Unit-tested core: decide, then dispatch via the injected seam.
-pub fn run_with<T: PartialEq>(
-    own: &str,
-    bridge: Option<&str>,
-    running: T,
-    canonical: Option<T>,
-    os: &mut impl SelfHealOs,
-) -> SelfHealAction {
-    let action = decide(own, bridge, running, canonical);
+/// Perform `action` via the seam. Shared by [`trigger`] (production) and the
+/// unit tests, so the shipped dispatch IS the tested one.
+fn dispatch(action: SelfHealAction, os: &mut impl SelfHealOs) {
     match action {
         SelfHealAction::Relaunch => {
             if os.spawn_successor().is_ok() {
@@ -132,14 +129,36 @@ pub fn run_with<T: PartialEq>(
         }
         SelfHealAction::Operate | SelfHealAction::Transient => {}
     }
-    action
+}
+
+/// Production effects: relaunch via the exit-wait primitive, the blocking
+/// reinstall dialog, and `app.exit`. `exited` records whether a terminal
+/// action ran, so the caller knows whether to release the single-flight latch.
+struct ProdOs {
+    app: tauri::AppHandle,
+    exe: PathBuf,
+    exited: bool,
+}
+
+impl SelfHealOs for ProdOs {
+    fn spawn_successor(&mut self) -> std::io::Result<()> {
+        crate::relaunch::spawn_successor(&self.exe)
+    }
+    fn show_reinstall_dialog(&mut self) {
+        show_reinstall_dialog(&self.app);
+    }
+    fn request_exit(&mut self) {
+        self.app.exit(0);
+        self.exited = true;
+    }
 }
 
 /// Production driver, fired on every observed version mismatch. Decides once
-/// with the *real* startup-vs-now image identities and dispatches directly
-/// (it does NOT call [`run_with`] — that is the separately-tested core).
-/// `decide`'s quick stat runs inline; only the blocking relaunch goes to a
-/// thread, which is intentionally never joined (the process exits).
+/// with the *real* startup-vs-now image identities, then runs the (blocking)
+/// dispatch on a dedicated thread — `spawn_successor` waits on the successor's
+/// READY and the reinstall dialog blocks until dismissed, neither of which may
+/// run on the reactor. The thread is never joined (the process exits on a
+/// terminal action).
 pub fn trigger(app: &tauri::AppHandle, bridge: Option<String>) {
     let Some(Some(startup)) = STARTUP.get() else {
         return; // dev build (or pre-init) — never self-heal
@@ -148,28 +167,29 @@ pub fn trigger(app: &tauri::AppHandle, bridge: Option<String>) {
         return; // an evaluation is already in flight
     }
 
+    // Quick stat inline; compare the startup identity (borrowed) against the
+    // file at that path now. Only the blocking dispatch is offloaded.
     let now = file_identity(&startup.exe).ok();
-    match decide(crate::version::VERSION, bridge.as_deref(), &startup.id, now.as_ref()) {
-        SelfHealAction::Relaunch => {
-            tracing::warn!(exe = %startup.exe.display(), "self-heal: installed image changed under us; relaunching");
-            let (app, exe) = (app.clone(), startup.exe.clone());
-            std::thread::spawn(move || {
-                if crate::relaunch::spawn_successor(&exe).is_ok() {
-                    app.exit(0); // EVALUATING stays set; the process is exiting
-                } else {
-                    EVALUATING.store(false, Ordering::SeqCst); // spawn failed → allow retry next poll
-                }
-            });
-        }
-        SelfHealAction::Reinstall => {
-            tracing::warn!(exe = %startup.exe.display(), "self-heal: version mismatch, image unchanged; prompting reinstall");
-            show_reinstall_dialog(app);
-            app.exit(0); // EVALUATING stays set; the process is exiting
-        }
-        SelfHealAction::Operate | SelfHealAction::Transient => {
+    let action = decide(crate::version::VERSION, bridge.as_deref(), &startup.id, now.as_ref());
+    if matches!(action, SelfHealAction::Operate | SelfHealAction::Transient) {
+        EVALUATING.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    tracing::warn!(exe = %startup.exe.display(), ?action, "self-heal: bridge version mismatch");
+    let mut os = ProdOs {
+        app: app.clone(),
+        exe: startup.exe.clone(),
+        exited: false,
+    };
+    std::thread::spawn(move || {
+        dispatch(action, &mut os);
+        if !os.exited {
+            // Relaunch's spawn_successor failed — release the latch so the
+            // next status poll retries.
             EVALUATING.store(false, Ordering::SeqCst);
         }
-    }
+    });
 }
 
 #[cfg(test)]

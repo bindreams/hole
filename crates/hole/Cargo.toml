@@ -84,6 +84,9 @@ windows = { version = "0.62", features = [
 # because the bug it fixes (osascript-admin elevation creating user-home
 # files as root) doesn't occur on Windows (UAC same-user elevation).
 walkdir = "2"
+# `relaunch::ArmedWait` uses kqueue (EVFILT_PROC/NOTE_EXIT) to wait on the
+# predecessor's exit during a self-heal relaunch.
+libc = "0.2"
 
 [dev-dependencies]
 skuld = { workspace = true }
