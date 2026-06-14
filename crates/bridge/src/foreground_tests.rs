@@ -107,6 +107,7 @@ impl StubRouting {
 
 impl Routing for StubRouting {
     type Installed = StubRoutes;
+    type Cover = StubCover;
     fn install(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<StubRoutes, RoutingError> {
         Ok(StubRoutes {
             _state_dir: self.state_dir.clone(),
@@ -120,11 +121,20 @@ impl Routing for StubRouting {
             ipv6_available: false,
         })
     }
+    fn install_failclosed_cover(&self, _: IpAddr) -> Result<StubCover, RoutingError> {
+        Ok(StubCover)
+    }
 }
 
 struct StubRoutes {
     // Unused; held only to mirror production's state-dir-owning routes type.
     _state_dir: PathBuf,
+}
+
+struct StubCover;
+
+impl Drop for StubCover {
+    fn drop(&mut self) {}
 }
 
 fn test_socket_path(suffix: &str) -> PathBuf {

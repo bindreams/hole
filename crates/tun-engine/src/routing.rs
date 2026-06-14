@@ -189,63 +189,70 @@ pub(crate) fn run_capturing(
 /// are logged at `warn` level and the function returns `()` (there is no
 /// meaningful caller recovery).
 pub fn recover_routes(state_dir: &Path) {
-    recover_routes_with(state_dir, run_commands);
+    recover_routes_with(state_dir, run_commands, failclosed::recover_cover);
 }
 
-/// Test seam for [`recover_routes`]: accepts an injected command runner so
-/// unit tests can assert on the emitted commands without shelling out to
-/// `netsh`/`route`.
-pub(crate) fn recover_routes_with<R>(state_dir: &Path, runner: R)
+/// Test seam for [`recover_routes`]: accepts an injected command runner and an
+/// injected cover-recovery sweep so unit tests can assert behavior without
+/// shelling out to `netsh`/`route` or touching the host firewall. Production
+/// passes `run_commands` and [`failclosed::recover_cover`].
+pub(crate) fn recover_routes_with<R, S>(state_dir: &Path, runner: R, sweep_cover: S)
 where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
+    S: FnOnce(&Path),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
-    // Read the state file first. If absent, there's nothing to recover —
-    // return early without poking any global routing state.
+    // Route recovery is guarded by the route-state file. Its absence means the
+    // previous run installed no routes (the write-ordering contract persists
+    // state BEFORE any route mutation), so we skip route teardown.
     //
     // State-file-driven recovery (not unconditional split-route teardown)
     // is required so concurrent bridge subprocesses don't rip routes out
     // from under each other: a SOCKS5-only bridge unconditionally issuing
     // `netsh delete route ... hole-tun` on startup would tear down the
-    // routes of a concurrent TUN bridge mid-flight. The caller's
-    // write-ordering contract guarantees the state file is persisted
-    // BEFORE any route mutation, so a crashed run that installed routes
-    // MUST have left a state file behind.
-    let Some(st) = state::load(state_dir) else {
+    // routes of a concurrent TUN bridge mid-flight.
+    if let Some(st) = state::load(state_dir) {
+        info!(
+            tun = %st.tun_name,
+            server_ip = %st.server_ip,
+            iface = %st.interface_name,
+            "recovering routes from crashed run"
+        );
+
+        // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
+        //    absent. Runs under state-file guard so this only fires when we
+        //    have positive evidence of a prior route install. Uses the TUN
+        //    name persisted in the state file (the caller controls this —
+        //    tun-engine has no opinion on naming).
+        let split_cmds = build_split_route_teardown_commands(&st.tun_name);
+        if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
+            warn!(error = %e, "split-route teardown failed during recovery");
+        }
+
+        // 2. Per-server bypass route recorded in the state file.
+        let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
+        if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
+            warn!(error = %e, "bypass-route teardown failed during recovery");
+        }
+
+        // 3. Delete the state file regardless of command outcomes. Next
+        //    startup re-runs the idempotent teardown if anything leaked
+        //    past a failure.
+        if let Err(e) = state::clear(state_dir) {
+            warn!(error = %e, "failed to clear route-state file during recovery");
+        }
+    } else {
         debug!("no route-state file found, nothing to recover");
-        return;
-    };
-
-    info!(
-        tun = %st.tun_name,
-        server_ip = %st.server_ip,
-        iface = %st.interface_name,
-        "recovering routes from crashed run"
-    );
-
-    // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
-    //    absent. Runs under state-file guard so this only fires when we
-    //    have positive evidence of a prior route install. Uses the TUN
-    //    name persisted in the state file (the caller controls this —
-    //    tun-engine has no opinion on naming).
-    let split_cmds = build_split_route_teardown_commands(&st.tun_name);
-    if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
-        warn!(error = %e, "split-route teardown failed during recovery");
     }
 
-    // 2. Per-server bypass route recorded in the state file.
-    let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
-    if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
-        warn!(error = %e, "bypass-route teardown failed during recovery");
-    }
-
-    // 3. Delete the state file regardless of command outcomes. Next
-    //    startup re-runs the idempotent teardown if anything leaked
-    //    past a failure.
-    if let Err(e) = state::clear(state_dir) {
-        warn!(error = %e, "failed to clear route-state file during recovery");
-    }
+    // Sweep any fail-closed cover left by a crashed update cutover. Runs
+    // UNCONDITIONALLY (outside the route-state guard above): a crash can leave a
+    // cover engaged with the routes already torn down, so there is no
+    // bridge-routes.json, yet the cover persists. The cover is keyed
+    // independently — Windows by fixed WFP GUIDs, macOS by bridge-failclosed.json
+    // — and the sweep is idempotent when no cover is present.
+    sweep_cover(state_dir);
 }
 
 // Routing trait =======================================================================================================
@@ -297,6 +304,20 @@ pub trait Routing: Send + Sync {
     /// seam, every consumer unit test would depend on the host having a
     /// route to the Internet.
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError>;
+
+    /// RAII guard returned by [`install_failclosed_cover`](Self::install_failclosed_cover).
+    /// Dropping it disengages the fail-closed cover. `Send` so a cutover
+    /// coordinator can hold it across `.await`.
+    type Cover: Send;
+
+    /// Engage a fail-closed cover: block all egress except loopback and
+    /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
+    /// survives a process crash (Windows: persistent WFP filters keyed by fixed
+    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and
+    /// is swept by [`recover_routes`] on the next start. Name-agnostic — it does
+    /// NOT permit the TUN interface (the cover only needs loopback + server IP
+    /// for the new bridge's start-time self-test); see the #468 PR2 plan.
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -316,6 +337,7 @@ impl SystemRouting {
 
 impl Routing for SystemRouting {
     type Installed = SystemRoutes;
+    type Cover = failclosed::Cover;
 
     fn install(
         &self,
@@ -361,6 +383,10 @@ impl Routing for SystemRouting {
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
+    }
+
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError> {
+        failclosed::engage(server_ip, &self.state_dir)
     }
 }
 
