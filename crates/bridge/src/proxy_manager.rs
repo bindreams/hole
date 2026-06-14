@@ -1036,12 +1036,12 @@ mod proxy_manager_tests;
 //   listener-selection tests) run on every Hole platform (Win+mac).
 // - **galoshes-fronted** tests front a galoshes *server* via the garter
 //   `ChainRunner` launcher (`plugin_e2e::ssserver`). They are all `#[ignore]`d:
-//   galoshes plugin data delivery is flaky on macOS CI — the roundtrips truncate
+//   galoshes plugin data delivery is flaky on CI — the roundtrips truncate
 //   intermittently across every transport (#518; the bridge itself is correct).
-//   They compile on their real platforms (WS on Win+mac, WS-TLS on macOS only
-//   for the Windows custom-cert limit, the full-tunnel test on the Windows TUN
-//   lane) and run again once #518 is fixed. galoshes transport coverage proper
-//   lives in the `plugin-e2e` crate.
+//   They compile on their real platforms (WS on Win+mac, WS-TLS and QUIC on
+//   macOS only for the Windows custom-cert limit, the full-tunnel test on the
+//   Windows TUN lane) and run again once #518 is fixed. galoshes transport
+//   coverage proper lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;

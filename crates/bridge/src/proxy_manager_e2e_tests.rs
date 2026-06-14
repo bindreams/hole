@@ -223,7 +223,7 @@ fn e2e_metrics_report_tunnel_traffic(
 /// macOS CI (all transports) — see bindreams/hole#518. The galoshes WS transport
 /// proper is covered by `plugin-e2e`'s `galoshes_ws_roundtrip`.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes bridge e2e flaky on macOS CI (truncated responses) — see bindreams/hole#518"]
+#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -236,11 +236,11 @@ fn e2e_ws_socks_only_roundtrip(
 /// the server presents a self-signed cert and v2ray-core's `getCertPool` drops
 /// custom certs on Windows (same limit as `plugin-e2e`'s `galoshes_ws_tls_roundtrip`).
 ///
-/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on macOS CI — see
+/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on CI — see
 /// bindreams/hole#518.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes bridge e2e flaky on macOS CI (truncated responses) — see bindreams/hole#518"]
+#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
@@ -616,10 +616,10 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on macOS CI — see
+/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on CI — see
 /// bindreams/hole#518.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
-#[ignore = "galoshes bridge e2e flaky on macOS CI (truncated responses) — see bindreams/hole#518"]
+#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
