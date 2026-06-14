@@ -14,44 +14,9 @@ use anyhow::{anyhow, bail, Context, Result};
 /// Returns the platform-specific output filename matching what shadowsocks-rust
 /// expects and what `crates/galoshes/build.rs` reads via
 /// `ex-ray-{TARGET}{ext}`. The trailing `.exe` is included on Windows.
-///
-/// Supports every target triple in the workspace CI matrix (Hole's
-/// Windows/macOS release set plus the ex-Galoshes Linux / Windows-arm64
-/// test matrix).
-pub fn output_name() -> &'static str {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        "ex-ray-x86_64-pc-windows-msvc.exe"
-    }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-        "ex-ray-aarch64-pc-windows-msvc.exe"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "ex-ray-aarch64-apple-darwin"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "ex-ray-x86_64-apple-darwin"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        "ex-ray-x86_64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        "ex-ray-aarch64-unknown-linux-gnu"
-    }
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-    )))]
-    compile_error!("unsupported platform for ex-ray sidecar");
+pub fn output_name() -> String {
+    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
+    format!("ex-ray-{}{exe}", crate::target::host_target_triple())
 }
 
 /// Build (or rebuild) the ex-ray binary for the host platform.

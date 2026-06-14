@@ -18,6 +18,7 @@ pub mod golangci_lint;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
+pub mod target;
 pub mod test_binaries;
 pub mod upstream_v2ray;
 pub mod wintun;
@@ -25,6 +26,9 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "galoshes_tests.rs"]
+mod galoshes_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
