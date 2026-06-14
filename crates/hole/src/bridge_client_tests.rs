@@ -74,7 +74,16 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     internet: "ok".to_string(),
                 })
             }),
-        );
+        )
+        .layer(axum::middleware::map_response(
+            |mut resp: axum::response::Response| async move {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static(hole::version::VERSION),
+                );
+                resp
+            },
+        ));
 
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
@@ -286,7 +295,16 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     }),
                 )
             }),
-        );
+        )
+        .layer(axum::middleware::map_response(
+            |mut resp: axum::response::Response| async move {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static(hole::version::VERSION),
+                );
+                resp
+            },
+        ));
 
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
@@ -373,6 +391,96 @@ fn send_metrics_returns_response() {
                 filter: None,
             }
         );
+    });
+}
+
+// Version lockstep ====================================================================================================
+
+/// Accept one connection and serve the given router on it.
+fn serve_one(listener: hole_bridge::socket::LocalListener, router: axum::Router) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+            let router = router.clone();
+            async move {
+                use tower::ServiceExt;
+                let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await;
+    })
+}
+
+/// Mock serving GET /v1/status. When `version` is `Some`, stamps it on every
+/// response via `X-Hole-Bridge-Version`; when `None`, sends no such header
+/// (an old bridge predating the stamp). Has no /v1/version route (→ 404).
+async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>) -> tokio::task::JoinHandle<()> {
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    let mut router = axum::Router::new().route(
+        hole_common::protocol::ROUTE_STATUS,
+        axum::routing::get(|| async {
+            Json(StatusResponse {
+                running: false,
+                uptime_secs: 0,
+                error: None,
+                invalid_filters: Vec::new(),
+                udp_proxy_available: true,
+                ipv6_bypass_available: true,
+            })
+        }),
+    );
+    if let Some(v) = version {
+        router = router.layer(axum::middleware::map_response(
+            move |mut resp: axum::response::Response| async move {
+                resp.headers_mut()
+                    .insert("x-hole-bridge-version", axum::http::HeaderValue::from_static(v));
+                resp
+            },
+        ));
+    }
+    serve_one(listener, router)
+}
+
+#[skuld::test]
+fn matching_version_is_ok() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-match");
+        let _m = spawn_status_mock(&path, Some("7.0.0")).await;
+        let mut c = BridgeClient::connect_with_version(&path, "7.0.0").await.unwrap();
+        assert!(matches!(
+            c.send(BridgeRequest::Status).await,
+            Ok(BridgeResponse::Status { .. })
+        ));
+    });
+}
+
+#[skuld::test]
+fn mismatching_version_is_version_mismatch() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-mismatch");
+        let _m = spawn_status_mock(&path, Some("6.0.0")).await;
+        let mut c = BridgeClient::connect_with_version(&path, "7.0.0").await.unwrap();
+        assert!(matches!(
+            c.send(BridgeRequest::Status).await,
+            Err(ClientError::VersionMismatch { .. })
+        ));
+    });
+}
+
+#[skuld::test]
+fn absent_version_header_is_version_mismatch() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-absent");
+        let _m = spawn_status_mock(&path, None).await; // old bridge: no header
+        let mut c = BridgeClient::connect_with_version(&path, "7.0.0").await.unwrap();
+        assert!(matches!(
+            c.send(BridgeRequest::Status).await,
+            Err(ClientError::VersionMismatch { .. })
+        ));
     });
 }
 

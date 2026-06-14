@@ -1,3 +1,9 @@
+// Self-alias so modules compiled in BOTH the lib and the bin (e.g.
+// `bridge_client`, `state`) can name this crate uniformly as `hole::`:
+// `crate::version` breaks in the bin (no `mod version` there), `hole::version`
+// breaks in the lib without this alias.
+extern crate self as hole;
+
 pub mod bridge_client;
 #[macro_use]
 pub mod cli_log;

@@ -27,6 +27,11 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The bridge reported a different version than ours (or, when `bridge`
+    /// is `None`, sent no version header — an old bridge predating the
+    /// stamp). Path-free by construction so it can never leak PII to a toast.
+    #[error("version mismatch: the Hole bridge is a different version")]
+    VersionMismatch { bridge: Option<String> },
 }
 
 // Client ==============================================================================================================
@@ -36,6 +41,9 @@ pub struct BridgeClient {
     sender: http1::SendRequest<Full<Bytes>>,
     /// Background task driving the HTTP/1.1 connection. Aborted on drop.
     conn_task: tokio::task::JoinHandle<()>,
+    /// Our own build version, compared against the bridge's
+    /// `X-Hole-Bridge-Version` on every response.
+    own_version: String,
 }
 
 impl Drop for BridgeClient {
@@ -46,16 +54,24 @@ impl Drop for BridgeClient {
 }
 
 impl BridgeClient {
-    /// Connect to the bridge at the given Unix domain socket path.
+    /// Connect to the bridge at the given Unix domain socket path, comparing
+    /// the bridge's version against our own `HOLE_VERSION`.
     pub async fn connect(path: &Path) -> Result<Self, ClientError> {
+        Self::connect_with_version(path, hole::version::VERSION).await
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit own-version — the
+    /// value matched against the bridge's `X-Hole-Bridge-Version`. Tests use
+    /// this to drive matched / mismatched version pairs.
+    pub async fn connect_with_version(path: &Path, own_version: &str) -> Result<Self, ClientError> {
         let stream = hole_bridge::socket::LocalStream::connect(path)
             .await
             .map_err(map_connect_error)?;
-        Self::handshake(stream).await
+        Self::handshake(stream, own_version.to_owned()).await
     }
 
     /// Perform HTTP/1.1 handshake over a connected stream.
-    async fn handshake<S>(stream: S) -> Result<Self, ClientError>
+    async fn handshake<S>(stream: S, own_version: String) -> Result<Self, ClientError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -68,7 +84,11 @@ impl BridgeClient {
                 debug!(error = %e, "HTTP client connection ended");
             }
         });
-        Ok(Self { sender, conn_task })
+        Ok(Self {
+            sender,
+            conn_task,
+            own_version,
+        })
     }
 
     /// Send a request and wait for the response.
@@ -182,7 +202,26 @@ impl BridgeClient {
         }
     }
 
+    /// GET that validates the bridge's version header before returning, so
+    /// every `send` arm refuses to operate a mismatched bridge.
     async fn http_get(&mut self, path: &str) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
+        let resp = self.http_get_unchecked(path).await?;
+        self.check_version(&resp)?;
+        Ok(resp)
+    }
+
+    /// POST counterpart to [`http_get`](Self::http_get).
+    async fn http_post(
+        &mut self,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
+        let resp = self.http_post_unchecked(path, body).await?;
+        self.check_version(&resp)?;
+        Ok(resp)
+    }
+
+    async fn http_get_unchecked(&mut self, path: &str) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
         let req = http::Request::builder()
             .method("GET")
             .uri(path)
@@ -200,7 +239,7 @@ impl BridgeClient {
             .map_err(|e| ClientError::Protocol(e.to_string()))
     }
 
-    async fn http_post(
+    async fn http_post_unchecked(
         &mut self,
         path: &str,
         body: Vec<u8>,
@@ -221,6 +260,22 @@ impl BridgeClient {
             .send_request(req)
             .await
             .map_err(|e| ClientError::Protocol(e.to_string()))
+    }
+
+    /// Compare the bridge's stamped version against ours. An absent header
+    /// means an old bridge predating the stamp ⇒ treated as a mismatch.
+    fn check_version(&self, resp: &http::Response<hyper::body::Incoming>) -> Result<(), ClientError> {
+        let bridge = resp
+            .headers()
+            .get("x-hole-bridge-version")
+            .and_then(|v| v.to_str().ok());
+        if bridge == Some(self.own_version.as_str()) {
+            Ok(())
+        } else {
+            Err(ClientError::VersionMismatch {
+                bridge: bridge.map(str::to_owned),
+            })
+        }
     }
 }
 
