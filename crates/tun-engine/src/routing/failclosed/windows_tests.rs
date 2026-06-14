@@ -84,3 +84,102 @@ fn spec_uses_the_fixed_hole_guids() {
     assert_eq!(s.provider, PROVIDER_GUID);
     assert_eq!(s.sublayer, SUBLAYER_GUID);
 }
+
+// build_lockdown_spec =================================================================================================
+
+fn luid() -> u64 {
+    0x0000_0006_0000_0000 // a representative NET_LUID value
+}
+fn plugin_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\Program Files\Hole\ex-ray.exe")
+}
+fn bridge_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\Program Files\Hole\hole.exe")
+}
+
+#[skuld::test]
+fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    // loopback on both layers
+    let loopback = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
+        .count();
+    assert_eq!(loopback, 2, "loopback permit on V4 and V6");
+    // local-interface (TUN LUID) permit on both layers
+    let tun = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::LocalInterface(l) if l == luid()))
+        .count();
+    assert_eq!(tun, 2, "TUN LUID permit on V4 and V6");
+    // one AppId permit per binary, on both layers
+    let appids = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::AppId(_)))
+        .count();
+    assert_eq!(appids, 4, "two binaries x V4+V6");
+    // server permit, on the v4 layer only
+    let server: Vec<_> = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::RemoteIp(_)))
+        .collect();
+    assert_eq!(server.len(), 1);
+    assert_eq!(server[0].layer, Layer::ConnectV4);
+    // block-all on both layers
+    assert!(s
+        .filters
+        .iter()
+        .any(|f| f.layer == Layer::ConnectV4 && f.action == Action::Block));
+    assert!(s
+        .filters
+        .iter()
+        .any(|f| f.layer == Layer::ConnectV6 && f.action == Action::Block));
+}
+
+#[skuld::test]
+fn lockdown_spec_permits_are_hard_and_outweigh_block() {
+    let s = build_lockdown_spec(v6(), luid(), &[plugin_path()]);
+    for f in &s.filters {
+        match f.action {
+            Action::Permit => {
+                assert!(f.hard, "lockdown permits must be hard (CLEAR_ACTION_RIGHT)");
+                assert_eq!(f.weight, PERMIT_WEIGHT);
+            }
+            Action::Block => {
+                assert!(!f.hard);
+                assert_eq!(f.weight, BLOCK_WEIGHT);
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn lockdown_spec_uses_distinct_guids_from_transient_cover() {
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    let cover = build_cover_spec(v4());
+    let lock_guids: std::collections::HashSet<_> = lock.filters.iter().map(|f| f.guid).collect();
+    let cover_guids: std::collections::HashSet<_> = cover.filters.iter().map(|f| f.guid).collect();
+    assert!(
+        lock_guids.is_disjoint(&cover_guids),
+        "lockdown and transient covers must use disjoint filter GUIDs so recovery sweeps both unconditionally"
+    );
+    // shared provider + sublayer (one Hole sublayer)
+    assert_eq!(lock.provider, PROVIDER_GUID);
+    assert_eq!(lock.sublayer, SUBLAYER_GUID);
+}
+
+#[skuld::test]
+fn lockdown_spec_v6_server_lands_on_v6_layer() {
+    let s = build_lockdown_spec(v6(), luid(), &[plugin_path()]);
+    let server: Vec<_> = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::RemoteIp(_)))
+        .collect();
+    assert_eq!(server.len(), 1);
+    assert_eq!(server[0].layer, Layer::ConnectV6);
+}

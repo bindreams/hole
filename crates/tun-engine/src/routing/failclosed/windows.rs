@@ -32,6 +32,52 @@ pub const FILTER_GUIDS: [GUID; 6] = [
     GUID::from_u128(0x1a48594b_c2d5_be1f_0374_8f9001122334), // block-all V6
 ];
 
+// Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
+// these (Sweep) or deletes only the TUN-LUID pair (Adopt) — see
+// `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
+// engaged is reconciled on the next start.
+// Layout: [loopback V4, loopback V6, TUN V4, TUN V6, server V4, server V6,
+//          block-all V4, block-all V6]. App-ID filters get per-binary
+//          dynamically-derived GUIDs (see build_lockdown_spec).
+pub const LOCKDOWN_FILTER_GUIDS: [GUID; 8] = [
+    GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback V4
+    GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback V6
+    GUID::from_u128(0x04216435_0209_4b16_95c4_41f7c26af397), // TUN V4
+    GUID::from_u128(0x316261ca_7bd2_4949_a64b_08f6ddd66519), // TUN V6
+    GUID::from_u128(0x38bea56b_116b_4df8_8cac_280ef661d248), // server V4
+    GUID::from_u128(0xf733418b_a1c8_4365_85b5_d5ce8810b144), // server V6
+    GUID::from_u128(0x4710d661_94cb_4fc7_ab52_f03f75774d3e), // block-all V4
+    GUID::from_u128(0x20af67ac_58ec_41e6_a49d_6fd2ed55c184), // block-all V6
+];
+
+/// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
+/// re-engage over an unswept cover is idempotent and recovery can delete by
+/// key. XORs a fixed namespace keyed by the (index, is_v6) pair —
+/// collision-free for the small binary counts we use, asserted by
+/// `all_swept_guids_are_mutually_distinct`.
+fn appid_filter_guid(index: usize, v6: bool) -> GUID {
+    let base = 0xf611_568d_6af6_4127_8600_2d32_3950_0000u128;
+    let salt = ((index as u128) << 8) | (v6 as u128);
+    GUID::from_u128(base ^ salt)
+}
+
+/// Per-binary App-ID GUID budget recovery sweeps: the plugin + bridge exe; 4
+/// gives headroom. Sweeping a superset is idempotent (a "not found" delete is
+/// ignored), so an unused App-ID slot is harmless.
+const MAX_APPID_BINARIES: usize = 4;
+
+/// Every lockdown filter GUID a full Sweep must delete: the eight fixed
+/// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
+/// separately by `delete_all`.)
+fn swept_lockdown_guids() -> Vec<GUID> {
+    let mut guids: Vec<GUID> = LOCKDOWN_FILTER_GUIDS.to_vec();
+    for i in 0..MAX_APPID_BINARIES {
+        guids.push(appid_filter_guid(i, false));
+        guids.push(appid_filter_guid(i, true));
+    }
+    guids
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     ConnectV4,
@@ -44,17 +90,26 @@ pub enum Action {
     Block,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Condition {
     /// Match the WFP loopback flag (`FWP_CONDITION_FLAG_IS_LOOPBACK`).
     Loopback,
     /// Match a single remote host address (`FWPM_CONDITION_IP_REMOTE_ADDRESS`).
     RemoteIp(IpAddr),
+    /// Match the local interface by `NET_LUID` (`FWPM_CONDITION_IP_LOCAL_INTERFACE`,
+    /// `FWP_UINT64`). Carries app traffic: route selection picks hole-tun
+    /// before `ALE_AUTH_CONNECT`, so a connect to any destination classifies
+    /// on the tunnel's LUID.
+    LocalInterface(u64),
+    /// Match the connecting process image path (`FWPM_CONDITION_ALE_APP_ID`).
+    /// Carries the onward server connection regardless of which A-record the
+    /// plugin re-resolves to; path-keyed so it survives the cutover rename.
+    AppId(std::path::PathBuf),
     /// No condition — matches every connect at the layer (block-all).
     Any,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FilterSpec {
     pub guid: GUID,
     pub layer: Layer,
@@ -141,6 +196,80 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
     }
 }
 
+/// Build the data description of the standing lockdown cover for `server_ip`,
+/// the hole-tun interface `tun_luid`, and the process image paths `app_ids`
+/// (plugin binary + the bridge's own exe). Per family (V4+V6) at
+/// `ALE_AUTH_CONNECT`: loopback permit + LocalInterface(luid) permit + one
+/// AppId permit per binary + server-IP permit + block-all. All permits hard
+/// (`CLEAR_ACTION_RIGHT`) at `PERMIT_WEIGHT`. Pure — no FFI.
+pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
+    let server_layer = match server_ip {
+        IpAddr::V4(_) => Layer::ConnectV4,
+        IpAddr::V6(_) => Layer::ConnectV6,
+    };
+    let mut filters = vec![
+        permit(LOCKDOWN_FILTER_GUIDS[0], Layer::ConnectV4, Condition::Loopback),
+        permit(LOCKDOWN_FILTER_GUIDS[1], Layer::ConnectV6, Condition::Loopback),
+        permit(
+            LOCKDOWN_FILTER_GUIDS[2],
+            Layer::ConnectV4,
+            Condition::LocalInterface(tun_luid),
+        ),
+        permit(
+            LOCKDOWN_FILTER_GUIDS[3],
+            Layer::ConnectV6,
+            Condition::LocalInterface(tun_luid),
+        ),
+    ];
+    for (i, path) in app_ids.iter().enumerate() {
+        filters.push(permit(
+            appid_filter_guid(i, false),
+            Layer::ConnectV4,
+            Condition::AppId(path.clone()),
+        ));
+        filters.push(permit(
+            appid_filter_guid(i, true),
+            Layer::ConnectV6,
+            Condition::AppId(path.clone()),
+        ));
+    }
+    let server_guid = if server_layer == Layer::ConnectV4 {
+        LOCKDOWN_FILTER_GUIDS[4]
+    } else {
+        LOCKDOWN_FILTER_GUIDS[5]
+    };
+    filters.push(permit(server_guid, server_layer, Condition::RemoteIp(server_ip)));
+    filters.push(block(LOCKDOWN_FILTER_GUIDS[6], Layer::ConnectV4));
+    filters.push(block(LOCKDOWN_FILTER_GUIDS[7], Layer::ConnectV6));
+    CoverSpec {
+        provider: PROVIDER_GUID,
+        sublayer: SUBLAYER_GUID,
+        filters,
+    }
+}
+
+fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
+    FilterSpec {
+        guid,
+        layer,
+        action: Action::Permit,
+        condition,
+        weight: PERMIT_WEIGHT,
+        hard: true,
+    }
+}
+
+fn block(guid: GUID, layer: Layer) -> FilterSpec {
+    FilterSpec {
+        guid,
+        layer,
+        action: Action::Block,
+        condition: Condition::Any,
+        weight: BLOCK_WEIGHT,
+        hard: false,
+    }
+}
+
 // --- engage layer ---
 
 /// `FWP_E_ALREADY_EXISTS` as the Win32 DWORD the FWPM `*Add0` functions return
@@ -148,9 +277,17 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
 /// our own object is benign idempotency, not an error.
 const FWP_E_ALREADY_EXISTS_DWORD: u32 = 0x8032_0009;
 
-/// WFP-backed cover guard. Drop deletes our provider/sublayer/filters by GUID.
+/// Which cover a [`Cover`] guard owns — selects the GUID set its Drop deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverKind {
+    Transient,
+    Lockdown,
+}
+
+/// WFP-backed cover guard. Drop deletes the filters it installed by GUID.
 pub struct Cover {
     engine: HANDLE,
+    kind: CoverKind,
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
@@ -213,7 +350,50 @@ pub fn engage(server_ip: IpAddr, _state_dir: &Path) -> Result<Cover, RoutingErro
             let _ = FwpmEngineClose0(engine);
             return Err(e);
         }
-        Ok(Cover { engine })
+        Ok(Cover {
+            engine,
+            kind: CoverKind::Transient,
+        })
+    }
+}
+
+#[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
+pub fn engage_lockdown(
+    server_ip: IpAddr,
+    tun_luid: u64,
+    app_ids: &[std::path::PathBuf],
+    _state_dir: &Path,
+) -> Result<Cover, RoutingError> {
+    let spec = build_lockdown_spec(server_ip, tun_luid, app_ids);
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let result = (|| -> Result<(), RoutingError> {
+            wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            // Idempotent over an unswept cover: add_provider/add_sublayer use
+            // ok_or_exists, and the filter keys are fixed — a re-engage after
+            // an Adopt (which left block-all in place) re-adds only the TUN
+            // permit (its key was deleted by `recover_lockdown`).
+            add_provider(engine, spec.provider)?;
+            add_sublayer(engine, spec.sublayer, spec.provider)?;
+            for f in &spec.filters {
+                add_filter(engine, spec.provider, spec.sublayer, f)?;
+            }
+            wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = FwpmTransactionAbort0(engine);
+            let _ = FwpmEngineClose0(engine);
+            return Err(e);
+        }
+        Ok(Cover {
+            engine,
+            kind: CoverKind::Lockdown,
+        })
     }
 }
 
@@ -250,6 +430,39 @@ unsafe fn add_sublayer(engine: HANDLE, key: GUID, provider: GUID) -> Result<(), 
     ok_or_exists(FwpmSubLayerAdd0(engine, &sublayer, None), "FwpmSubLayerAdd0")
 }
 
+/// Owned WFP app-id blob produced by `FwpmGetAppIdFromFileName0`; frees the
+/// WFP-allocated `FWP_BYTE_BLOB` on drop.
+struct AppIdBlob {
+    ptr: *mut FWP_BYTE_BLOB,
+}
+impl AppIdBlob {
+    fn as_mut_ptr(&mut self) -> *mut FWP_BYTE_BLOB {
+        self.ptr
+    }
+}
+impl Drop for AppIdBlob {
+    fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        unsafe {
+            if !self.ptr.is_null() {
+                let mut p = self.ptr as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+        }
+    }
+}
+
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, RoutingError> {
+    let wide_path = wide(&path.to_string_lossy());
+    let mut out: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
+    wfp_check(
+        FwpmGetAppIdFromFileName0(PCWSTR(wide_path.as_ptr()), &mut out),
+        "FwpmGetAppIdFromFileName0",
+    )?;
+    Ok(AppIdBlob { ptr: out })
+}
+
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterSpec) -> Result<(), RoutingError> {
     let layer = match f.layer {
@@ -274,8 +487,15 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
     let mut name = wide("Hole fail-closed filter");
     let mut provider_key = provider;
     let mut v6buf = FWP_BYTE_ARRAY16 { byteArray16: [0u8; 16] };
+    // The placeholder initializers below are overwritten in the matching arm
+    // before the pointer is taken; declared here only so they outlive the FFI
+    // call (the keep-alive contract).
+    #[allow(unused_assignments)]
+    let mut luid_buf: u64 = 0; // keep-alive for FWP_UINT64's *mut u64
+    #[allow(unused_assignments)]
+    let mut app_id_blob: Option<AppIdBlob> = None; // keep-alive for the app-id blob
     let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::new();
-    match f.condition {
+    match &f.condition {
         Condition::Loopback => conditions.push(FWPM_FILTER_CONDITION0 {
             fieldKey: FWPM_CONDITION_FLAGS,
             matchType: FWP_MATCH_FLAGS_ALL_SET,
@@ -293,7 +513,7 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
                 r#type: FWP_UINT32,
                 // WFP expects the address in host byte order; `u32::from`
                 // yields exactly that (first octet most-significant).
-                Anonymous: FWP_CONDITION_VALUE0_0 { uint32: u32::from(v4) },
+                Anonymous: FWP_CONDITION_VALUE0_0 { uint32: u32::from(*v4) },
             },
         }),
         Condition::RemoteIp(IpAddr::V6(v6)) => {
@@ -305,6 +525,36 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
                     r#type: FWP_BYTE_ARRAY16_TYPE,
                     Anonymous: FWP_CONDITION_VALUE0_0 {
                         byteArray16: &mut v6buf,
+                    },
+                },
+            });
+        }
+        // FWP_UINT64 carries a *mut u64; `luid_buf` is the stack keep-alive (mirror
+        // of the v6buf pattern). FWPM copies the pointee during FwpmFilterAdd0.
+        Condition::LocalInterface(luid) => {
+            luid_buf = *luid;
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_LOCAL_INTERFACE,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT64,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint64: &mut luid_buf },
+                },
+            });
+        }
+        // FwpmGetAppIdFromFileName0 normalizes the path to the kernel device form WFP
+        // expects; the returned FWP_BYTE_BLOB is WFP-owned and freed on AppIdBlob drop
+        // (after FwpmFilterAdd0 copies it during the transaction commit).
+        Condition::AppId(path) => {
+            app_id_blob = Some(get_app_id_blob(path)?);
+            let blob = app_id_blob.as_mut().expect("just set");
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_BLOB_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: blob.as_mut_ptr(),
                     },
                 },
             });
@@ -344,7 +594,18 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
 impl Drop for Cover {
     fn drop(&mut self) {
         unsafe {
-            delete_all(self.engine);
+            match self.kind {
+                // Transient: today's full sweep (filters + sublayer + provider).
+                CoverKind::Transient => delete_all(self.engine),
+                // Lockdown: delete only the lockdown + App-ID filters; the
+                // shared sublayer/provider are owned by the transient sweep.
+                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+                CoverKind::Lockdown => {
+                    for g in swept_lockdown_guids() {
+                        let _ = FwpmFilterDeleteByKey0(self.engine, &g);
+                    }
+                }
+            }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
             let _ = FwpmEngineClose0(self.engine);
         }

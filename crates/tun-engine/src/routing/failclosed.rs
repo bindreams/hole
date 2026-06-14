@@ -47,3 +47,19 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
 pub fn recover_cover(state_dir: &Path) {
     platform::recover_cover(state_dir);
 }
+
+/// Engage the standing lockdown cover: block all egress except loopback, the
+/// `tun_luid` interface (Windows) so app traffic flows, the `app_ids` binaries,
+/// and `server_ip`. `state_dir` is where macOS persists its recovery state.
+/// On failure the host is left uncovered (the caller decides fail-FATAL).
+#[cfg(target_os = "windows")]
+pub fn engage_lockdown(
+    server_ip: IpAddr,
+    tun_luid: u64,
+    app_ids: &[std::path::PathBuf],
+    state_dir: &Path,
+) -> Result<Cover, RoutingError> {
+    Ok(Cover {
+        inner: platform::engage_lockdown(server_ip, tun_luid, app_ids, state_dir)?,
+    })
+}
