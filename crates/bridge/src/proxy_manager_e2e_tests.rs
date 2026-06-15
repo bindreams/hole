@@ -336,6 +336,12 @@ mod tun {
     /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows
     /// admin. TUN tests are serial because they all bind the hardcoded
     /// `hole-tun` device name.
+    ///
+    /// COUPLED NAME: the `_full_tunnel_roundtrip` suffix is the literal substring
+    /// `.config/nextest.toml`'s `global-net-state` filter matches to serialize
+    /// this live-egress e2e against tun-engine's system-wide WFP lockdown test
+    /// across binaries. Renaming the suffix without updating that filter drops
+    /// this test from the group → cross-binary data race.
     #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
     fn e2e_none_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,

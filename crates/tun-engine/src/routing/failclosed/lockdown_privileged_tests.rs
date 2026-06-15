@@ -24,6 +24,12 @@
 //! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
 //! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
 //! `serial = TUN` only serializes within one binary.
+//!
+//! COUPLED NAMES: that group's filter matches these tests by the name prefixes
+//! `windows_lockdown_permits_server_ip_` and `macos_lockdown_permits_server_ip_`.
+//! Renaming a prefix WITHOUT updating `.config/nextest.toml` drops the test from
+//! the group → a silent cross-binary race with the bridge's live-egress
+//! `e2e_none_full_tunnel_roundtrip`. Change both together.
 
 use super::*;
 
