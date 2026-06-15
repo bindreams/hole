@@ -394,10 +394,12 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
 
     let lockdown_on = { state.proxy.lock().await.lockdown_enabled() };
 
-    // Consent seam: a lockdown-off update without explicit consent is refused.
+    // Consent seam: a lockdown-off update without explicit consent is refused
+    // with 403 — a client precondition failure (the caller must supply consent),
+    // not a server fault.
     if crate::cutover::apply::consent_gate(lockdown_on, req.consent).is_err() {
         return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::FORBIDDEN,
             Json(ErrorResponse {
                 message: "a lockdown-off update requires explicit consent".into(),
             }),

@@ -645,7 +645,8 @@ fn lockdown_post_errors_without_state_dir() {
 #[skuld::test]
 fn update_apply_lockdown_off_without_consent_is_refused() {
     // The consent seam: a lockdown-off update without consent must be refused
-    // (500) BEFORE any extract/spawn. `mock_proxy()` defaults lockdown off.
+    // BEFORE any extract/spawn, with 403 (a client precondition failure, not a
+    // server error). `mock_proxy()` defaults lockdown off.
     rt().block_on(async {
         let path = test_socket_path("update-apply-no-consent");
         let log_dir = tempfile::tempdir().unwrap().keep();
@@ -658,8 +659,8 @@ fn update_apply_lockdown_off_without_consent_is_refused() {
         let resp = post_update_apply(&mut client, "/tmp/x.msi", false).await;
         assert_eq!(
             resp.status(),
-            500,
-            "lockdown-off update without consent must be refused"
+            403,
+            "lockdown-off update without consent must be refused with 403"
         );
         let _ = resp.into_body().collect().await;
         // No marker was written (the refusal preceded the marker write).
