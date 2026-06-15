@@ -71,20 +71,43 @@ fn find_staged_exe_errs_when_absent() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn find_staged_terminates_through_a_directory_symlink_cycle() {
-    // A directory-symlink cycle must not recurse forever (stack overflow).
-    // root/sub/loop -> root is self-referential; the visited-set guard breaks it
-    // and the search still finds the file in a sibling dir.
+    // Integration smoke test: a self-referential directory symlink must not
+    // recurse forever. Search for an absent name so the search is FORCED to
+    // traverse the whole cyclic tree.
     let root = tempfile::tempdir().unwrap();
     let sub = root.path().join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     // sub/loop -> root: descending into `loop` re-enters root → a cycle.
     std::os::windows::fs::symlink_dir(root.path(), sub.join("loop")).unwrap();
-    let target = root.path().join("PFiles");
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(target.join("hole.exe"), b"stub").unwrap();
 
-    let found = extract::find_staged(root.path(), "hole.exe").unwrap();
-    assert_eq!(found.file_name().unwrap(), "hole.exe");
+    let missing = extract::find_staged(root.path(), "does-not-exist.exe");
+    assert!(missing.is_err(), "absent name must error (not recurse forever)");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn find_file_inner_skips_an_already_visited_canonical_dir() {
+    use std::collections::HashSet;
+
+    // Deterministic proof the guard is load-bearing: a directory whose canonical
+    // path is already in `visited` is NOT traversed, so the file it contains is
+    // NOT found. This is the cycle break (revisiting a canonical path is a no-op),
+    // independent of OS path-length limits.
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("hole.exe"), b"stub").unwrap();
+    let canon = std::fs::canonicalize(&real).unwrap();
+
+    let mut visited = HashSet::new();
+    // Not yet visited: the file is found.
+    let found = extract::find_file_inner(&real, "hole.exe", &mut visited).unwrap();
+    assert!(found.is_some(), "first visit finds the file");
+
+    // Already visited (canonical path present): the dir is skipped, not re-walked.
+    let mut seeded = HashSet::from([canon]);
+    let skipped = extract::find_file_inner(&real, "hole.exe", &mut seeded).unwrap();
+    assert!(skipped.is_none(), "an already-visited canonical dir is not traversed");
 }
 
 #[cfg(target_os = "windows")]

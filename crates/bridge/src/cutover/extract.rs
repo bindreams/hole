@@ -80,6 +80,9 @@ pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<Ex
 #[cfg(target_os = "windows")]
 pub use imp_windows::{find_staged, find_staged_exe};
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use imp_windows::find_file_inner;
+
 #[cfg(target_os = "windows")]
 mod imp_windows {
     use std::path::{Path, PathBuf};
@@ -88,7 +91,7 @@ mod imp_windows {
 
     /// Subdirectory where the MSI payload lands.
     const STAGING_NAME: &str = ".update-staging";
-    /// Canonical binary the swap pivots on.
+    /// The binary used for the post-extract fail-closed presence check.
     pub const EXE_NAME: &str = "hole.exe";
 
     /// Locate `name` under a staging dir, erroring if absent (the detached
@@ -147,17 +150,17 @@ mod imp_windows {
         find_file_inner(root, name, &mut visited)
     }
 
-    fn find_file_inner(
+    pub(crate) fn find_file_inner(
         dir: &Path,
         name: &str,
         visited: &mut std::collections::HashSet<PathBuf>,
     ) -> std::io::Result<Option<PathBuf>> {
         // Dedup on the resolved identity so a symlink back to an ancestor is a
-        // no-op the second time. A dir we cannot canonicalize is left untraversed.
-        let Ok(canon) = std::fs::canonicalize(dir) else {
-            return Ok(None);
-        };
-        if !visited.insert(canon) {
+        // no-op the second time. If canonicalize fails (broken reparse point,
+        // path too long), fall back to the literal path as the key — traverse
+        // the dir rather than hide a real target under it, while still deduping.
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if !visited.insert(key) {
             return Ok(None);
         }
         for entry in std::fs::read_dir(dir)? {
