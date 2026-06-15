@@ -125,7 +125,9 @@ pub(crate) fn build_lockdown_spec_for_test(
     platform::build_lockdown_spec(server_ip, luid, app_ids)
 }
 
-#[cfg(test)]
+// Windows-only: pins the resolve-then-build LUID ordering. macOS keys pf on the
+// interface name, so there is no LUID to re-resolve.
+#[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/facade_tests.rs"]
 mod facade_tests;
 

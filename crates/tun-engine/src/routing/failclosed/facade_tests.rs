@@ -18,25 +18,16 @@ impl LuidResolver for RecordingResolver {
 fn engage_lockdown_reresolves_luid_every_call() {
     // The facade must call resolver.resolve() before building the spec — the
     // LUID is never cached. We can't run real FWPM here (#165), so this test
-    // pins the resolve-then-build ordering via the pure build path exposed
-    // for tests. On non-Windows the resolver is bypassed (pf keys on name),
-    // so this test is Windows-only.
-    #[cfg(target_os = "windows")]
-    {
-        let r = RecordingResolver {
-            calls: std::sync::atomic::AtomicU32::new(0),
-            luid: 0x99,
-        };
-        let spec = build_lockdown_spec_for_test(&r, "hole-tun", "203.0.113.7".parse().unwrap(), &[]);
-        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(spec.filters.iter().any(|f| matches!(
-            f.condition,
-            platform::Condition::LocalInterface(l) if l == 0x99
-        )));
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = RecordingResolver {
+    // pins the resolve-then-build ordering via the pure build path exposed for
+    // tests.
+    let r = RecordingResolver {
         calls: std::sync::atomic::AtomicU32::new(0),
-        luid: 0,
+        luid: 0x99,
     };
+    let spec = build_lockdown_spec_for_test(&r, "hole-tun", "203.0.113.7".parse().unwrap(), &[]);
+    assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(spec.filters.iter().any(|f| matches!(
+        f.condition,
+        platform::Condition::LocalInterface(l) if l == 0x99
+    )));
 }
