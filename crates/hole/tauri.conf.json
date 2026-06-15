@@ -25,7 +25,10 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "files": {
+        "MacOS/hole.dSYM": "../../target/release/hole.dSYM"
+      }
     },
     "externalBin": [
       ".cache/ex-ray/ex-ray",
