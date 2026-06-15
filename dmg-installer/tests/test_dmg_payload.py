@@ -45,16 +45,28 @@ def test_dsym_is_sibling_of_binary(installed_app: Path) -> None:
     std's backtrace symbolizer (library/backtrace `Mapping::new`) reads the
     running binary's Mach-O UUID, scans the binary's parent directory for any
     `*.dSYM`, and matches by UUID inside `<dSYM>/Contents/Resources/DWARF/`. So
-    the dSYM must be a sibling of the binary, with its DWARF Mach-O inside.
+    the dSYM must be a sibling of the binary with its DWARF Mach-O inside.
     """
     macos = installed_app / "Contents" / "MacOS"
-    binary = macos / "hole"
-    dwarf = macos / "hole.dSYM" / "Contents" / "Resources" / "DWARF" / "hole"
-    assert binary.is_file(), f"main binary missing at {binary}"
-    assert dwarf.is_file(), (
-        f"dSYM DWARF missing at {dwarf} — std's backtrace scans the binary's "
-        f"parent dir ({macos}) for *.dSYM, so the dSYM must be a sibling of the binary"
+    assert (macos / "hole").is_file(), f"main binary missing at {macos / 'hole'}"
+    dwarfs = _dsym_dwarf_machos(installed_app)
+    assert dwarfs, (
+        f"no DWARF Mach-O inside {macos / 'hole.dSYM' / 'Contents' / 'Resources' / 'DWARF'} — "
+        f"std's backtrace scans {macos} for a *.dSYM, so the dSYM must be a real directory "
+        f"sibling of the binary with its DWARF Mach-O inside"
     )
+
+
+def _dsym_dwarf_machos(installed_app: Path) -> list[Path]:
+    """Mach-O files inside hole.dSYM/Contents/Resources/DWARF/.
+
+    dsymutil names the DWARF after its *input* binary — cargo compiles
+    `deps/hole-<hash>`, so the file is `hole-<hash>`, not `hole`. std matches by
+    UUID, not filename (`Mapping::try_dsym_candidate` scans the dir), so we scan
+    rather than assume a name.
+    """
+    dwarf_dir = installed_app / "Contents" / "MacOS" / "hole.dSYM" / "Contents" / "Resources" / "DWARF"
+    return [p for p in dwarf_dir.iterdir() if p.is_file()] if dwarf_dir.is_dir() else []
 
 
 def _macho_uuids(path: Path) -> set[str]:
@@ -72,16 +84,18 @@ def _macho_uuids(path: Path) -> set[str]:
 def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
     """The dSYM's DWARF must carry the binary's UUID, or backtrace ignores it.
 
-    This is the deterministic proof that std's symbolizer will resolve: the
-    sibling-directory scan (test_dsym_is_sibling_of_binary) plus a UUID match
-    are exactly the two conditions `Mapping::new` requires.
+    Deterministic proof std's symbolizer will resolve: the sibling-directory
+    scan (test_dsym_is_sibling_of_binary) plus a UUID match are exactly the two
+    conditions `Mapping::new` requires. The match is by UUID across whatever
+    Mach-O(s) the DWARF dir holds — `Mapping::try_dsym_candidate` does the same.
     """
-    macos = installed_app / "Contents" / "MacOS"
-    binary_uuids = _macho_uuids(macos / "hole")
-    dwarf_uuids = _macho_uuids(macos / "hole.dSYM" / "Contents" / "Resources" / "DWARF" / "hole")
+    binary_uuids = _macho_uuids(installed_app / "Contents" / "MacOS" / "hole")
+    dwarf_uuids: set[str] = set()
+    for dwarf in _dsym_dwarf_machos(installed_app):
+        dwarf_uuids |= _macho_uuids(dwarf)
     assert binary_uuids, "no Mach-O UUID found in the hole binary"
-    assert dwarf_uuids, "no Mach-O UUID found in the dSYM DWARF Mach-O"
-    assert binary_uuids == dwarf_uuids, (
-        f"binary UUID(s) {binary_uuids} != dSYM UUID(s) {dwarf_uuids}; std's backtrace "
-        f"symbolizer would skip the dSYM and panic frames would render <unknown> (#393)"
+    assert binary_uuids <= dwarf_uuids, (
+        f"binary UUID(s) {binary_uuids} not all present in dSYM DWARF UUID(s) {dwarf_uuids}; "
+        f"std's backtrace symbolizer would skip the dSYM and panic frames would render "
+        f"<unknown> (#393)"
     )
