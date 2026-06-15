@@ -35,14 +35,10 @@ fn spec_permits_loopback_on_all_four_ale_layers() {
     // A loopback connect is authorized at CONNECT *and* RECV_ACCEPT (the inbound
     // accept side); a permit on CONNECT alone is denied at accept. Hole's data
     // plane runs app->hole-tun->loopback SOCKS5->ss-service, so the cover must
-    // permit loopback on both ALE directions, V4 and V6.
+    // permit loopback on both ALE directions, V4 and V6. The deterministic
+    // matcher is the address range (LoopbackNet) on ALL FOUR layers; the
+    // IS_LOOPBACK flag isn't reliably set on CI's elevated lane.
     let s = build_cover_spec(v4());
-    let loopback_permits = s
-        .filters
-        .iter()
-        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
-        .count();
-    assert_eq!(loopback_permits, 4, "loopback permit on CONNECT + RECV_ACCEPT, V4 + V6");
     for layer in [
         Layer::ConnectV4,
         Layer::ConnectV6,
@@ -50,10 +46,10 @@ fn spec_permits_loopback_on_all_four_ale_layers() {
         Layer::RecvAcceptV6,
     ] {
         assert!(
-            s.filters
-                .iter()
-                .any(|f| f.layer == layer && f.action == Action::Permit && matches!(f.condition, Condition::Loopback)),
-            "loopback permit missing on {layer:?}"
+            s.filters.iter().any(|f| f.layer == layer
+                && f.action == Action::Permit
+                && matches!(f.condition, Condition::LoopbackNet(_))),
+            "address-range loopback permit missing on {layer:?}"
         );
     }
 }
@@ -126,14 +122,22 @@ fn bridge_path() -> std::path::PathBuf {
 #[skuld::test]
 fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
     let s = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
-    // loopback on all four ALE layers (CONNECT + RECV_ACCEPT) — see
-    // spec_permits_loopback_on_all_four_ale_layers for why the accept side matters.
-    let loopback = s
-        .filters
-        .iter()
-        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
-        .count();
-    assert_eq!(loopback, 4, "loopback permit on CONNECT + RECV_ACCEPT, V4 + V6");
+    // loopback on all four ALE layers (CONNECT + RECV_ACCEPT) by the deterministic
+    // address-range matcher — see spec_permits_loopback_on_all_four_ale_layers for
+    // why the accept side matters and why the flag is unreliable.
+    for layer in [
+        Layer::ConnectV4,
+        Layer::ConnectV6,
+        Layer::RecvAcceptV4,
+        Layer::RecvAcceptV6,
+    ] {
+        assert!(
+            s.filters.iter().any(|f| f.layer == layer
+                && f.action == Action::Permit
+                && matches!(f.condition, Condition::LoopbackNet(_))),
+            "address-range loopback permit missing on {layer:?}"
+        );
+    }
     // local-interface (TUN LUID) permit on both layers
     let tun = s
         .filters
@@ -336,22 +340,32 @@ fn adopt_drops_server_permit_so_reengage_can_update_it() {
 }
 
 #[skuld::test]
-fn both_specs_permit_loopback_recv_accept_on_the_accept_layers() {
+fn both_specs_permit_loopback_recv_accept_by_address_range() {
     // The accept-side permits must land on the RECV_ACCEPT layers (not a second
-    // CONNECT permit). Asserts the layer mapping for both covers.
+    // CONNECT permit) AND match by the deterministic address range, not the
+    // IS_LOOPBACK flag: on CI's elevated lane the flag doesn't match at
+    // RECV_ACCEPT, so a flag-only permit leaves the loopback accept dropped. At
+    // RECV_ACCEPT IP_REMOTE_ADDRESS is the peer (127.0.0.1 for a loopback accept),
+    // so the 127.0.0.0/8 or ::1/128 range matches. The matching family per layer:
+    // V4 range on RecvAcceptV4, V6 range on RecvAcceptV6.
     for s in [
         build_cover_spec(v4()),
         build_lockdown_spec(v4(), luid(), &[plugin_path()]),
     ] {
-        for layer in [Layer::RecvAcceptV4, Layer::RecvAcceptV6] {
-            assert!(
-                s.filters.iter().any(|f| f.layer == layer
-                    && f.action == Action::Permit
-                    && f.hard
-                    && matches!(f.condition, Condition::Loopback)),
-                "loopback permit missing on {layer:?}"
-            );
-        }
+        assert!(
+            s.filters.iter().any(|f| f.layer == Layer::RecvAcceptV4
+                && f.action == Action::Permit
+                && f.hard
+                && f.condition == Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))),
+            "address-range loopback permit (127.0.0.0/8) missing on RECV_ACCEPT V4"
+        );
+        assert!(
+            s.filters.iter().any(|f| f.layer == Layer::RecvAcceptV6
+                && f.action == Action::Permit
+                && f.hard
+                && f.condition == Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))),
+            "address-range loopback permit (::1/128) missing on RECV_ACCEPT V6"
+        );
     }
 }
 
@@ -447,19 +461,29 @@ fn both_specs_permit_loopback_by_address_range_at_connect() {
 }
 
 #[skuld::test]
-fn flag_loopback_permits_are_kept_alongside_the_address_range_ones() {
-    // The address-range permits are ADDITIVE belt-and-suspenders: the flag permits
-    // on all four ALE layers must still be present (the diagnosis keeps both).
+fn flag_loopback_permits_are_kept_only_on_connect() {
+    // At CONNECT the flag permits stay as harmless belt-and-suspenders alongside
+    // the address-range ones (don't churn them). At RECV_ACCEPT the flag is
+    // dropped in favor of the deterministic address-range permit, because the
+    // flag doesn't match there on CI's elevated lane.
     let s = build_cover_spec(v4());
-    let flag_permits = s
+    let flag_permits: Vec<_> = s
         .filters
         .iter()
         .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
-        .count();
+        .collect();
     assert_eq!(
-        flag_permits, 4,
-        "flag loopback permits (CONNECT + RECV_ACCEPT, V4+V6) kept"
+        flag_permits.len(),
+        2,
+        "flag loopback permits kept on CONNECT V4+V6 only"
     );
+    for f in &flag_permits {
+        assert!(
+            matches!(f.layer, Layer::ConnectV4 | Layer::ConnectV6),
+            "flag loopback permit must be CONNECT-only, found on {:?}",
+            f.layer
+        );
+    }
 }
 
 #[skuld::test]

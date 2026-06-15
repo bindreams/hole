@@ -271,12 +271,13 @@ the accepted fail-closed cost.
   transaction. Loopback is permitted on `ALE_AUTH_CONNECT_V4`/`_V6` *and*
   `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
   directions, so a CONNECT-only permit would deny the accept side and break the
-  loopback data plane). Loopback at CONNECT is permitted *two ways*: the
-  `FWP_CONDITION_FLAG_IS_LOOPBACK` flag **and** the destination address range
-  (`127.0.0.0/8` V4, `::1/128` V6). The flag is not reliably set at
-  `ALE_AUTH_CONNECT` under CI's elevated token — flag-only left a loopback connect
-  blocked by block-all — so the address-range permit is the deterministic match;
-  the flag permit is kept additively (it also covers `RECV_ACCEPT`). The server IP
+  loopback data plane). The deterministic matcher on *all four* layers is the
+  `FWPM_CONDITION_IP_REMOTE_ADDRESS` range (`127.0.0.0/8` V4, `::1/128` V6) — at
+  CONNECT the remote is the destination, at RECV_ACCEPT the peer, both `127.x`/`::1`
+  for a loopback flow. The `FWP_CONDITION_FLAG_IS_LOOPBACK` flag is **not reliably
+  set at either ALE layer** under CI's elevated token (flag-only left the loopback
+  connect blocked by block-all *and* the accept side dropped), so it is no longer
+  load-bearing; it is kept at CONNECT only as belt-and-suspenders. The server IP
   is permitted on CONNECT, all else blocked on CONNECT (egress kill switch).
   Permits are *hard* via `CLEAR_ACTION_RIGHT`.
   **Non-dynamic session** — a dynamic

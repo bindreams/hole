@@ -22,15 +22,18 @@ use super::*;
 const TUN: skuld::Label;
 
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover (a
-/// `LocalInterface` LUID permit + loopback flag permit + block-all) and proves
+/// `LocalInterface` LUID permit + loopback permits + block-all) and proves
 /// (a) loopback stays permitted and (b) egress to an arbitrary non-permitted
 /// public IP is BLOCKED at `ALE_AUTH_CONNECT` — so the cover is not inert.
 ///
-/// Loopback is carried by the `IS_LOOPBACK` flag permit (on CONNECT *and*
-/// RECV_ACCEPT — a loopback connect authorizes on both) AND, at CONNECT, by the
-/// loopback destination-range permit (127.0.0.0/8 + ::1/128) that matches even
-/// when the flag isn't set at ALE_AUTH_CONNECT; NOT by the LUID permit.
-/// The interface alias is resolved only to drive the real
+/// Loopback is carried by the address-range permit (127.0.0.0/8 + ::1/128) on all
+/// four ALE layers — CONNECT *and* RECV_ACCEPT, which a loopback connect both
+/// authorizes — plus the `IS_LOOPBACK` flag permit on CONNECT as
+/// belt-and-suspenders; NOT by the LUID permit. The range is the deterministic
+/// matcher because the flag isn't reliably set at either ALE layer on the
+/// elevated lane. A closed-port probe disambiguates any loopback failure
+/// (refused => CONNECT permitted, so a listener-probe timeout is an accept-side
+/// drop). The interface alias is resolved only to drive the real
 /// `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; that permit
 /// matches the named interface's traffic, not loopback in general. The block
 /// assertion does not depend on a live `hole-tun`. `serial = TUN` serializes
@@ -51,8 +54,26 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let loopback_port = listener.local_addr().unwrap().port();
 
+    // A closed loopback port: bind to grab a free port, then drop the listener so
+    // nothing accepts there. Probing it disambiguates a listener-probe failure —
+    // ConnectionRefused proves the CONNECT itself is permitted (kernel reached the
+    // closed port and RST'd), so a listener-probe timeout is an accept-side drop;
+    // TimedOut/PermissionDenied means the CONNECT is blocked outright.
+    let closed_probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed_probe.local_addr().unwrap().port();
+    drop(closed_probe);
+
     let cover = engage_lockdown(server_ip, "Loopback Pseudo-Interface 1", &resolver, &[], dir.path())
         .expect("engage real WFP lockdown cover");
+
+    // Discriminating probe: connect to the closed loopback port. See above for how
+    // its error kind separates a CONNECT block from a RECV_ACCEPT drop.
+    let closed_probe_err = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{closed_port}").parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .err()
+    .map(|e| e.kind());
 
     // (a) Loopback connect still succeeds (loopback permit). External event with
     // graceful failure bound: the timeout is the failure-to-human signal, not a
@@ -61,12 +82,15 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
         &format!("127.0.0.1:{loopback_port}").parse().unwrap(),
         Duration::from_secs(2),
     );
-    // Include the OS error so a third failure shows what kind (timeout = still
-    // blocked at CONNECT, refused = permit held but nobody listening, perm = ACL).
+    // Include both probes' error kinds so a failure shows where the drop is: the
+    // listener probe's kind (timeout = still dropped, refused = nobody listening,
+    // perm = ACL) and the closed-port probe (refused => CONNECT permitted, so a
+    // listener-probe timeout is an accept-side drop).
     assert!(
         lo.is_ok(),
-        "loopback must stay permitted under lockdown: {:?}",
-        lo.err()
+        "loopback must stay permitted under lockdown: listener_probe={:?} closed_port_probe(refused=>connect-permitted)={:?}",
+        lo.err(),
+        closed_probe_err
     );
 
     // (b) Egress to a non-permitted public IP is blocked at ALE_AUTH_CONNECT.

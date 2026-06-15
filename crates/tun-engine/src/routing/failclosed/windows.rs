@@ -3,13 +3,14 @@
 //! Engage installs a persistent provider + sublayer + filter set in one FWPM
 //! transaction: permit loopback (hard) on `ALE_AUTH_CONNECT_V4`/`_V6` and
 //! `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
-//! directions) — by both the IS_LOOPBACK flag AND the loopback destination range
-//! (127.0.0.0/8, ::1/128) at CONNECT, since the flag isn't reliably set at
-//! ALE_AUTH_CONNECT in some elevated environments — + the SS server IP (hard) on
-//! CONNECT, block everything else on CONNECT (egress kill switch). Persistent
-//! (boot-time) filters — NOT a dynamic session — so a coordinator crash
-//! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
-//! sweeps them by their fixed GUIDs on the next bridge start.
+//! directions) — by the loopback address range (127.0.0.0/8, ::1/128) on ALL
+//! four layers, since the IS_LOOPBACK flag isn't reliably set at either ALE layer
+//! in some elevated environments (CONNECT keeps the flag permit too as harmless
+//! belt-and-suspenders) — + the SS server IP (hard) on CONNECT, block everything
+//! else on CONNECT (egress kill switch). Persistent (boot-time) filters — NOT a
+//! dynamic session — so a coordinator crash mid-cutover leaves traffic blocked
+//! (fail-closed), not leaked; `recover_cover` sweeps them by their fixed GUIDs on
+//! the next bridge start.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -137,12 +138,15 @@ pub enum Action {
 pub enum Condition {
     /// Match the WFP loopback flag (`FWP_CONDITION_FLAG_IS_LOOPBACK`).
     Loopback,
-    /// Match the loopback network by the connect's DESTINATION address range:
+    /// Match the loopback network by `FWPM_CONDITION_IP_REMOTE_ADDRESS` range:
     /// V4 -> 127.0.0.0/8, V6 -> ::1/128 (the carried `IpAddr` selects only the
-    /// family). The IS_LOOPBACK flag is not reliably set at ALE_AUTH_CONNECT in
-    /// some elevated environments, so the flag permit alone leaves a loopback
-    /// connect denied by block-all; an address-range permit on the destination
-    /// matches deterministically. Additive to [`Condition::Loopback`].
+    /// family). The IS_LOOPBACK flag is not reliably set at either ALE layer in
+    /// some elevated environments, so the flag permit alone leaves a loopback flow
+    /// denied by block-all; the address-range permit on the remote address matches
+    /// deterministically. At CONNECT the remote is the destination, at RECV_ACCEPT
+    /// the peer — both are 127.0.0.1/::1 for a loopback flow, so the same range
+    /// matches on all four layers. At CONNECT it co-exists with the (now-redundant)
+    /// [`Condition::Loopback`] flag permit; at RECV_ACCEPT it is the only matcher.
     LoopbackNet(IpAddr),
     /// Match a single remote host address (`FWPM_CONDITION_IP_REMOTE_ADDRESS`).
     RemoteIp(IpAddr),
@@ -188,10 +192,10 @@ pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the data description of the fail-closed cover for `server_ip`.
 /// Permits loopback on CONNECT *and* RECV_ACCEPT (loopback connects authorize on
-/// both ALE directions) — by both the IS_LOOPBACK flag and the loopback
-/// destination range at CONNECT — + the server IP on CONNECT; blocks all else on
-/// CONNECT only (egress kill switch). Pure — no FFI; `engage` submits it in one
-/// transaction.
+/// both ALE directions) by the loopback address range (127.0.0.0/8, ::1/128) on
+/// all four layers, plus the IS_LOOPBACK flag on CONNECT as belt-and-suspenders,
+/// plus the server IP on CONNECT; blocks all else on CONNECT only (egress kill
+/// switch). Pure — no FFI; `engage` submits it in one transaction.
 pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -236,11 +240,16 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
         },
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
+        // Match by the address range, not the IS_LOOPBACK flag: on CI's elevated
+        // lane the flag isn't set at RECV_ACCEPT, so a flag-only permit drops the
+        // loopback accept (connect-side then times out). At RECV_ACCEPT
+        // IP_REMOTE_ADDRESS is the peer = 127.0.0.1/::1 for a loopback accept, so
+        // the 127.0.0.0/8 or ::1/128 range matches deterministically.
         FilterSpec {
             guid: FILTER_GUIDS[6],
             layer: Layer::RecvAcceptV4,
             action: Action::Permit,
-            condition: Condition::Loopback,
+            condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
             hard: true,
         },
@@ -248,7 +257,7 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             guid: FILTER_GUIDS[7],
             layer: Layer::RecvAcceptV6,
             action: Action::Permit,
-            condition: Condition::Loopback,
+            condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
             hard: true,
         },
@@ -291,11 +300,12 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
 /// Build the data description of the standing lockdown cover for `server_ip`,
 /// the hole-tun interface `tun_luid`, and the process image paths `app_ids`
 /// (plugin binary plus the bridge's own exe). Per family (V4+V6) at
-/// `ALE_AUTH_CONNECT`: a loopback permit (flag and destination range), a
+/// `ALE_AUTH_CONNECT`: a loopback permit (address range and flag), a
 /// LocalInterface(luid) permit, one AppId permit per binary, a server-IP permit,
-/// and block-all; plus a loopback flag permit at `ALE_AUTH_RECV_ACCEPT` (the
-/// accept side a loopback connect also authorizes). Block stays CONNECT-only —
-/// egress kill switch, not inbound. All permits hard (`CLEAR_ACTION_RIGHT`) at
+/// and block-all; plus a loopback address-range permit at `ALE_AUTH_RECV_ACCEPT`
+/// (the accept side a loopback connect also authorizes — the flag is unreliable
+/// there, so the range is the only matcher). Block stays CONNECT-only — egress
+/// kill switch, not inbound. All permits hard (`CLEAR_ACTION_RIGHT`) at
 /// `PERMIT_WEIGHT`. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
@@ -321,8 +331,21 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
         ),
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
-        permit(LOCKDOWN_FILTER_GUIDS[8], Layer::RecvAcceptV4, Condition::Loopback),
-        permit(LOCKDOWN_FILTER_GUIDS[9], Layer::RecvAcceptV6, Condition::Loopback),
+        // Match by the address range, not the IS_LOOPBACK flag: on CI's elevated
+        // lane the flag isn't set at RECV_ACCEPT, so a flag-only permit drops the
+        // loopback accept (connect-side then times out). At RECV_ACCEPT
+        // IP_REMOTE_ADDRESS is the peer = 127.0.0.1/::1 for a loopback accept, so
+        // the 127.0.0.0/8 or ::1/128 range matches deterministically.
+        permit(
+            LOCKDOWN_FILTER_GUIDS[8],
+            Layer::RecvAcceptV4,
+            Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        ),
+        permit(
+            LOCKDOWN_FILTER_GUIDS[9],
+            Layer::RecvAcceptV6,
+            Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        ),
         permit(
             LOCKDOWN_FILTER_GUIDS[2],
             Layer::ConnectV4,
@@ -626,10 +649,11 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
                 },
             },
         }),
-        // Match the connect's DESTINATION against the loopback range. addr/mask are
-        // host byte order, mirroring the RemoteIp(V4) arm's `u32::from`. Fields are
-        // mutated in place (mirror of the v6buf pattern) so the keep-alive struct
-        // outlives FwpmFilterAdd0.
+        // Match IP_REMOTE_ADDRESS against the loopback range (the destination at
+        // CONNECT, the peer at RECV_ACCEPT — both 127.x/::1 for loopback; the
+        // encoding is layer-independent). addr/mask are host byte order, mirroring
+        // the RemoteIp(V4) arm's `u32::from`. Fields are mutated in place (mirror
+        // of the v6buf pattern) so the keep-alive struct outlives FwpmFilterAdd0.
         Condition::LoopbackNet(IpAddr::V4(_)) => {
             v4mask.addr = 0x7F00_0000; // 127.0.0.0
             v4mask.mask = 0xFF00_0000; // /8
