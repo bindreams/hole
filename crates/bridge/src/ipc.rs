@@ -415,8 +415,11 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         ));
     }
 
-    // Marker FIRST — FATAL on failure, BEFORE any extract/spawn. A cutover whose
-    // marker did not land would flash Disconnected and would not disarm the cover.
+    // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE any extract/spawn.
+    // `write_new` is `create-new`: two concurrent requests cannot both win (the
+    // 409 read-check above is only a fast-path; this is the race-free guard). A
+    // cutover whose marker did not land would flash Disconnected and would not
+    // disarm the cover, so a non-occupancy write failure is FATAL (500).
     let marker = hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
         from_version: state.version.clone(),
@@ -427,13 +430,16 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             .unwrap_or_default()
             .as_secs(),
     };
-    if let Err(e) = hole_common::update_marker::write(log_dir, &marker) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: format!("cutover marker write failed: {e}"),
-            }),
-        ));
+    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
+        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cutover marker write failed: {e}"),
+            )
+        };
+        return Err((code, Json(ErrorResponse { message })));
     }
 
     // Extract the bare binaries onto the destination volume. A failure clears

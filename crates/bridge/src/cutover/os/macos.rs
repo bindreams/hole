@@ -46,9 +46,11 @@ impl CutoverOs for MacosCutoverOs {
     }
 
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {
-        // KeepAlive may race-respawn after SIGTERM; an explicit start after the
-        // confirmed exit is idempotent and deterministic. launchd re-execs the
-        // (now swapped) helper path = new inode.
+        // Belt-and-suspenders explicit start. The plist's KeepAlive=true already
+        // respawns the bridge after the SIGTERM exit (re-execing the now-swapped
+        // helper = new inode), and in the inline self-restart model THIS process
+        // is gone by here, so the line is reached only if a future model drives
+        // the restart from a surviving orchestrator. Idempotent regardless.
         Self::launchctl(&["start", LAUNCHD_LABEL])
     }
 }

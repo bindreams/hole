@@ -67,6 +67,63 @@ fn marker_mode_is_world_readable() {
 }
 
 #[skuld::test]
+fn write_new_is_an_atomic_single_occupancy_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = MarkerInfo {
+        version: MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
+    };
+    // First claim wins and the full content is readable (never a partial file).
+    write_new(dir.path(), &info).unwrap();
+    assert_eq!(read(dir.path()).expect("present"), info);
+
+    // A second claim loses with AlreadyExists (the race-free 409 guard) and does
+    // not overwrite the first claim's content.
+    let other = MarkerInfo {
+        to_version: "9.9.9".into(),
+        ..info.clone()
+    };
+    let err = write_new(dir.path(), &other).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(read(dir.path()).expect("unchanged").to_version, "0.3.0");
+
+    // No leftover temp file from either the win or the lost claim.
+    let leftover = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+    assert!(!leftover, "no stray .tmp after write_new");
+
+    // After a clear, the claim is available again.
+    clear(dir.path()).unwrap();
+    write_new(dir.path(), &other).unwrap();
+    assert_eq!(read(dir.path()).expect("re-claimed").to_version, "9.9.9");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn write_new_marker_mode_is_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let info = MarkerInfo {
+        version: MARKER_VERSION,
+        from_version: "a".into(),
+        to_version: "b".into(),
+        pid: 1,
+        started_at_unix: 0,
+    };
+    write_new(dir.path(), &info).unwrap();
+    let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644, "the claimed marker must be GUI-readable too");
+}
+
+#[skuld::test]
 fn service_log_dir_matches_log_collector_constants() {
     // Pins the dedup: the resolver must equal the dirs the GUI's log_collector
     // hardcodes (so the GUI reads the same place the bridge writes).

@@ -1,9 +1,10 @@
 //! Extract the bare binaries from the verified MSI/DMG onto the destination
 //! volume. The bundle was minisign-verified on download (the GUI's `cli.rs`
 //! path), so the extracted bytes are trusted; the bridge confirms the payload is
-//! present + readable before doing anything irreversible (fail-closed), and logs
-//! a best-effort signature observation as defense-in-depth — NOT a gate (gating
-//! on it risks a self-inflicted brick on signing-cert rotation).
+//! present + readable before doing anything irreversible (fail-closed). A deeper
+//! Authenticode/codesign observation belongs here as log-only defense-in-depth
+//! (NOT a gate — gating risks a self-inflicted brick on signing-cert rotation);
+//! the trust root is the on-download minisign check.
 //!
 //! Same-volume staging is required so the subsequent rename is a directory-entry
 //! flip, not a cross-volume copy (Windows) / `EXDEV` (macOS).
@@ -80,13 +81,22 @@ mod imp_windows {
 
     use super::{msiexec_admin_args, ExtractedImages};
 
-    /// Subdirectory where the MSI payload lands (under the same-volume parent).
+    /// Subdirectory where the MSI payload lands.
     const STAGING_NAME: &str = ".update-staging";
     /// Canonical binary the swap pivots on.
     const EXE_NAME: &str = "hole.exe";
 
-    pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<ExtractedImages> {
-        let staging_dir = staging_parent.join(STAGING_NAME);
+    /// Extract into a staging dir guaranteed to be on the SAME volume as the
+    /// installed binary (the swap is `std::fs::rename`, which fails cross-device).
+    /// `_staging_parent` (the service state dir) is ignored on Windows: it may be
+    /// on a different volume than Program Files, so the install dir is the only
+    /// safe same-volume parent.
+    pub fn extract(payload_path: &Path, _staging_parent: &Path) -> std::io::Result<ExtractedImages> {
+        let install_dir = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
+            .to_path_buf();
+        let staging_dir = install_dir.join(STAGING_NAME);
         // A leftover staging dir from a crashed prior attempt would poison the
         // admin-install; start clean.
         if staging_dir.exists() {
@@ -135,8 +145,12 @@ mod imp_macos {
 
     /// Subdirectory on the destination volume where the bundle is staged.
     const STAGING_NAME: &str = ".update-staging";
-    /// Helper Mach-O inside the staged `.app` (what the privileged helper runs).
+    /// Helper Mach-O inside the `.app` (what the privileged helper runs).
     const HELPER_IN_APP: &str = "Contents/MacOS/hole";
+    /// Staged-helper basename, a SIBLING of the staged `.app` (NOT inside it).
+    /// The app swap deletes the staged `.app` tree, so the helper must live
+    /// outside it or its staging path vanishes before the helper swap.
+    const STAGED_HELPER_NAME: &str = "com.hole.bridge.staged";
 
     pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<ExtractedImages> {
         let staging_dir = staging_parent.join(STAGING_NAME);
@@ -170,7 +184,12 @@ mod imp_macos {
             .output();
 
         let app = result?;
-        let helper = app.join(HELPER_IN_APP);
+        // Stage the helper as a sibling of the `.app`. It is copied from the
+        // bundle's in-app Mach-O, then swapped independently into HELPER_PATH —
+        // the app swap deletes the staged `.app`, so a helper path inside it
+        // would be gone (ENOENT) by the time the helper swap runs.
+        let helper = staging_dir.join(STAGED_HELPER_NAME);
+        std::fs::copy(app.join(HELPER_IN_APP), &helper)?;
         Ok(ExtractedImages {
             staging_dir,
             app,
