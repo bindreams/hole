@@ -62,6 +62,46 @@ pub fn same_volume(a_dev: u64, b_dev: u64) -> bool {
     a_dev == b_dev
 }
 
+/// The per-image primitives the orchestrator drives. The real macOS FFI provides
+/// `swap`/`reswap`/`delete_staging`; tests provide a recorder so the all-or-
+/// nothing ordering is verified cfg-free, without privilege.
+pub trait SwapOps {
+    /// Swap `img.staging` onto `img.dest` (RENAME_SWAP for a dir, plain rename
+    /// for a file). `index` identifies the image (0 = app, 1 = helper).
+    fn swap(&self, img: &ImageSwap, index: usize) -> std::io::Result<()>;
+    /// Undo a committed swap: swap `img.dest` back to `img.staging`. Best-effort
+    /// (a rollback step that cannot complete must not mask the original error).
+    fn reswap(&self, img: &ImageSwap, index: usize);
+    /// Delete the swapped-out staging left by a RENAME_SWAP. Run only after every
+    /// image has swapped (so a rollback before it can still restore the bundle).
+    fn delete_staging(&self, img: &ImageSwap, index: usize);
+}
+
+/// Drive a planned swap ALL-OR-NOTHING: swap every image first; on any failure
+/// roll back the committed swaps (in reverse) and error, leaving the prior
+/// consistent set; only after the whole set commits delete the swapped-out
+/// staging. Deferring the delete is what makes the rollback possible — a swapped-
+/// out `.app` is unrecoverable once its staging is removed.
+pub fn execute_plan<O: SwapOps>(plan: &SwapPlan, ops: &O) -> std::io::Result<()> {
+    let images = [&plan.app, &plan.helper];
+    let mut committed: Vec<usize> = Vec::with_capacity(images.len());
+    for (index, img) in images.iter().enumerate() {
+        if let Err(e) = ops.swap(img, index) {
+            for &done in committed.iter().rev() {
+                ops.reswap(images[done], done);
+            }
+            return Err(e);
+        }
+        committed.push(index);
+    }
+    for &index in &committed {
+        if images[index].delete_swapped_out_staging {
+            ops.delete_staging(images[index], index);
+        }
+    }
+    Ok(())
+}
+
 // macOS FFI seam ======================================================================================================
 
 #[cfg(target_os = "macos")]
@@ -73,7 +113,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    use super::{same_volume, ImageSwap, SwapPlan, SwapPrimitive};
+    use super::{execute_plan, same_volume, ImageSwap, SwapOps, SwapPlan, SwapPrimitive};
 
     fn cstring(path: &Path) -> io::Result<std::ffi::CString> {
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)
@@ -150,7 +190,8 @@ mod imp {
         Ok(std::fs::metadata(parent)?.dev())
     }
 
-    fn execute_one(img: &ImageSwap) -> io::Result<()> {
+    /// Swap one image by its primitive after asserting same-volume staging.
+    fn swap_one(img: &ImageSwap) -> io::Result<()> {
         let sdev = parent_dev(&img.staging)?;
         let ddev = parent_dev(&img.dest)?;
         if !same_volume(sdev, ddev) {
@@ -160,23 +201,41 @@ mod imp {
             )));
         }
         match img.primitive {
-            SwapPrimitive::RenameSwap => {
-                rename_swap(&img.staging, &img.dest)?;
-                if img.delete_swapped_out_staging {
-                    // The pre-swap destination now sits at `staging`; remove it.
-                    std::fs::remove_dir_all(&img.staging)?;
-                }
-            }
-            SwapPrimitive::PlainRename => std::fs::rename(&img.staging, &img.dest)?,
+            // RENAME_SWAP exchanges entries, so the inverse is the same call.
+            SwapPrimitive::RenameSwap => rename_swap(&img.staging, &img.dest),
+            SwapPrimitive::PlainRename => std::fs::rename(&img.staging, &img.dest),
         }
-        Ok(())
     }
 
-    /// Execute a planned swap: per image, assert same-volume staging, swap by the
-    /// chosen primitive, then delete the swapped-out staging when required.
+    /// Real FFI swap primitives. `delete_staging` runs only after the whole set
+    /// commits (`execute_plan`), so a mid-set failure can still RENAME_SWAP the
+    /// `.app` back from its swapped-out staging.
+    struct MacosSwapOps;
+
+    impl SwapOps for MacosSwapOps {
+        fn swap(&self, img: &ImageSwap, _index: usize) -> io::Result<()> {
+            swap_one(img)
+        }
+        fn reswap(&self, img: &ImageSwap, _index: usize) {
+            // The swapped-in dest sits at `dest`; exchange/rename it back. For
+            // PlainRename the pre-swap dest is gone (it was a single file moved
+            // onto by the new bytes — not recoverable), so only RENAME_SWAP has a
+            // meaningful inverse. The helper is the LAST image, so it never needs
+            // reswap (nothing committed after it).
+            if matches!(img.primitive, SwapPrimitive::RenameSwap) {
+                let _ = rename_swap(&img.dest, &img.staging);
+            }
+        }
+        fn delete_staging(&self, img: &ImageSwap, _index: usize) {
+            // The pre-swap destination now sits at `staging`; remove it.
+            let _ = std::fs::remove_dir_all(&img.staging);
+        }
+    }
+
+    /// Execute a planned swap ALL-OR-NOTHING (swap both, roll back on failure,
+    /// delete swapped-out staging only after both commit).
     pub fn execute_swap(plan: &SwapPlan) -> io::Result<()> {
-        execute_one(&plan.app)?;
-        execute_one(&plan.helper)
+        execute_plan(plan, &MacosSwapOps)
     }
 }
 
