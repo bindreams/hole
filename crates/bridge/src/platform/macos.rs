@@ -261,6 +261,12 @@ pub fn run(
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
+        // The new bridge is authoritative once it has bound: any update marker is
+        // a completed cutover, so clear it unconditionally (remove-by-path).
+        let log_dir_marker = log_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
+            tracing::warn!(error = %e, "marker sweep task panicked");
+        }
 
         // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
         // here would skip the pm.stop() teardown below and leak routes/DNS.
@@ -292,6 +298,16 @@ pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::Sto
     }
 }
 
+/// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
+/// The marker's presence is co-extensive with "a cutover during which no bridge
+/// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
+/// from->to schema bump across the cutover cannot strand it.
+pub(crate) fn sweep_marker(log_dir: &std::path::Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+    }
+}
+
 /// Drive the IPC server until it finishes or a shutdown signal arrives,
 /// whichever comes first. Extracted from `run` so the select can be
 /// unit-tested without delivering real OS signals.
@@ -308,6 +324,18 @@ pub(crate) async fn serve_until_signal(
         _ = shutdown => {
             info!("received shutdown signal");
         }
+    }
+}
+
+/// A valid marker for the post-bind-sweep test.
+#[cfg(test)]
+fn test_marker() -> hole_common::update_marker::MarkerInfo {
+    hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
     }
 }
 

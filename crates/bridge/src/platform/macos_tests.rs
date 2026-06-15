@@ -71,6 +71,15 @@ fn shutdown_reason_keys_on_marker() {
 }
 
 #[skuld::test]
+fn post_bind_sweep_clears_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker()).unwrap();
+    sweep_marker(dir.path());
+    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    sweep_marker(dir.path()); // idempotent: absent marker is a no-op
+}
+
+#[skuld::test]
 fn plist_does_not_set_standard_paths() {
     // The FD-level stdio redirect in hole_common::logging::init captures
     // stdout/stderr into bridge.log; a launchd-side capture would only

@@ -142,6 +142,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
+        // The new bridge is authoritative once it has bound: any update marker is
+        // a completed cutover, so clear it unconditionally (remove-by-path).
+        let log_dir_marker = log_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
+            tracing::warn!(error = %e, "marker sweep task panicked");
+        }
 
         // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
@@ -213,6 +219,16 @@ pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::Sto
         crate::proxy_manager::StopReason::Cutover
     } else {
         crate::proxy_manager::StopReason::UserStop
+    }
+}
+
+/// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
+/// The marker's presence is co-extensive with "a cutover during which no bridge
+/// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
+/// from->to schema bump across the cutover cannot strand it.
+pub(crate) fn sweep_marker(log_dir: &Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
     }
 }
 
@@ -345,6 +361,18 @@ pub fn is_running() -> bool {
         return false;
     };
     status.current_state == ServiceState::Running
+}
+
+/// A valid marker for the post-bind-sweep test.
+#[cfg(test)]
+fn test_marker() -> hole_common::update_marker::MarkerInfo {
+    hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
+    }
 }
 
 #[cfg(test)]
