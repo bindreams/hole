@@ -828,6 +828,33 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Pa
     }
 }
 
+/// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
+/// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
+/// delete is a no-op, so a clean host returns `Ok`). The failure that means
+/// "cannot disengage" is the ENGINE OPEN: it fails when the process is not
+/// elevated, in which case we could not have torn anything down → `Err`. There
+/// is no persisted Windows state to key absence on (delete-by-GUID is
+/// idempotent), so a successful open always reports `Ok`.
+pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
+    unsafe {
+        let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed ({rc}); not elevated? cannot disengage the lockdown cover"
+            )));
+        }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        for g in swept_lockdown_guids() {
+            let _ = FwpmFilterDeleteByKey0(engine, &g);
+        }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+    }
+    Ok(())
+}
+
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {
     // Windows is structurally safe regardless: the transient cover and the
     // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient

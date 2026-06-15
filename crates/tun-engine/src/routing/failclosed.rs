@@ -105,8 +105,28 @@ pub fn engage_lockdown(
 /// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
 /// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
 /// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
+/// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
+/// startup recovery has no caller to act on it.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
-    platform::recover_lockdown(decision, state_dir);
+    use crate::routing::CoverRecovery::*;
+    match decision {
+        Noop | Adopt => platform::recover_lockdown(decision, state_dir),
+        Sweep => {
+            if let Err(e) = disengage_lockdown(state_dir) {
+                tracing::warn!(error = %e, "lockdown sweep could not disengage the cover");
+            }
+        }
+    }
+}
+
+/// Fail-loud disengage of a standing lockdown cover, with no running bridge.
+/// Unlike [`recover_lockdown`]'s best-effort `Sweep`, this PROPAGATES failure so
+/// the `bridge unlock` escape hatch can refuse to claim success (and refuse to
+/// flip the intent off) while the cover is still engaged. An absent cover is
+/// `Ok` (nothing to disengage); a real failure (not elevated / engine open /
+/// pfctl) is `Err`.
+pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+    platform::disengage_lockdown(state_dir)
 }
 
 /// Whether a standing lockdown cover from a prior run is present — the recovery

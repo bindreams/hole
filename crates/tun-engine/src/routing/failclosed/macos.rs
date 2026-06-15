@@ -385,36 +385,59 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
     })
 }
 
-/// Sweep: restore the host's pre-lockdown ruleset from the snapshot, drop our pf
-/// refcount, clear the state. The snapshot reload IS the restore — there is no
-/// anchor to flush. Shared by Drop (user-stop) and `recover_lockdown` when the
-/// persisted intent is OFF. Best-effort; logs on failure.
+/// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop
+/// our pf refcount, clear the state. An ABSENT cover (no state file) is `Ok` —
+/// nothing to disengage, so no pfctl is spawned. A PRESENT cover that fails to
+/// restore propagates the error and LEAVES the state file in place, so a retry
+/// (or the next start) still sees the cover rather than reading "disengaged"
+/// while the block persists. Powers the `bridge unlock` escape hatch.
 ///
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
 /// transient cover documents for its `/etc/pf.conf` reload).
-fn lockdown_disengage(state_dir: &Path) {
-    if let Some(st) = lockdown_state::load(state_dir) {
-        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-        if let Err(e) = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "lockdown snapshot restore failed");
-        }
-        if let Err(e) = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "pfctl -X failed during lockdown disengage");
-        }
+pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+    let Some(st) = lockdown_state::load(state_dir) else {
+        return Ok(()); // No cover engaged — nothing to disengage.
+    };
+    let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?;
+    if !out.status.success() {
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl lockdown restore failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
+    let xout = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER)?;
+    if !xout.status.success() {
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl -X (drop pf refcount) failed: {}",
+            String::from_utf8_lossy(&xout.stderr).trim()
+        )));
+    }
+    // State cleared only after a confirmed restore — a failed clear is the only
+    // remaining best-effort step (the cover is already down).
     if let Err(e) = lockdown_state::clear(state_dir) {
-        tracing::warn!(error = %e, "lockdown-pf-state clear failed during disengage");
+        tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
+    }
+    Ok(())
+}
+
+/// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
+/// no caller to surface an error to.
+fn lockdown_disengage(state_dir: &Path) {
+    if let Err(e) = disengage_lockdown(state_dir) {
+        tracing::warn!(error = %e, "lockdown disengage failed during Drop");
     }
 }
 
-/// Act on a recovery decision for the lockdown cover (called from
-/// `failclosed::recover_lockdown`). `Adopt` (intent ON): KEEP the host
-/// fail-closed — leave the lockdown ruleset + state file in force. The dead
-/// utun name in the `pass out quick on <tun>` line is harmless (matches no live
-/// interface); the next connect's `engage_lockdown` reuses the persisted
-/// snapshot and reloads with the fresh utun name. `Sweep` (intent OFF): full
-/// restore via `lockdown_disengage`. `Noop`: nothing.
+/// Act on a recovery decision for the lockdown cover (the facade routes `Sweep`
+/// through the fail-loud `disengage_lockdown`; this best-effort path remains
+/// correct if called directly). `Adopt` (intent ON): KEEP the host fail-closed —
+/// leave the lockdown ruleset + state file in force. The dead utun name in the
+/// `pass out quick on <tun>` line is harmless (matches no live interface); the
+/// next connect's `engage_lockdown` reuses the persisted snapshot and reloads
+/// with the fresh utun name. `Sweep` (intent OFF): best-effort restore. `Noop`:
+/// nothing.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     use crate::routing::CoverRecovery::*;
     match decision {

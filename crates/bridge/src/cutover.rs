@@ -90,12 +90,24 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 }
 
 /// Disengage a standing lockdown cover and clear the persisted intent, with no
-/// running bridge required. Last-writer-wins recovery hatch: sweep the cover,
-/// then set the intent off so the next start does not re-engage it.
+/// running bridge required. The escape hatch must actually disengage or FAIL
+/// LOUD: it disengages FIRST and only flips the intent off after a confirmed
+/// success. A swallowed failure (e.g. run unprivileged) would leave the cover
+/// engaged — egress still blocked — while the intent reads "off", misleading the
+/// user.
 pub fn unlock() -> std::io::Result<()> {
     let state_dir = service_state_dir();
-    tun_engine::routing::failclosed::recover_lockdown(tun_engine::routing::CoverRecovery::Sweep, &state_dir);
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(&state_dir, false)
+    unlock_with(&state_dir, || {
+        tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other)
+    })
+}
+
+/// `unlock`'s ordering, with the disengage step injected so tests can drive the
+/// cannot-disengage path without touching the host firewall. Disengage → flip;
+/// the intent flips off ONLY after the disengage confirms success.
+fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    disengage()?;
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false)
 }
 
 #[cfg(test)]

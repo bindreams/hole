@@ -12,6 +12,41 @@ fn service_state_dir_matches_install_convention() {
     assert_eq!(d, std::path::PathBuf::from("/var/db/hole/state"));
 }
 
+// `bridge unlock` ordering: the escape hatch must actually disengage the cover
+// before flipping intent off, or fail loud. A swallowed disengage failure would
+// leave the cover engaged (egress blocked) while intent reads off — misleading.
+use tun_engine::routing::failclosed::lockdown_state;
+
+#[skuld::test]
+fn unlock_failing_disengage_does_not_flip_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true).unwrap();
+
+    let result = unlock_with(dir.path(), || {
+        Err(std::io::Error::other("cannot disengage / not elevated"))
+    });
+
+    assert!(result.is_err(), "unlock must fail loud when it cannot disengage");
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "intent must stay ON when the cover could not be disengaged"
+    );
+}
+
+#[skuld::test]
+fn unlock_successful_disengage_flips_intent_off() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true).unwrap();
+
+    let result = unlock_with(dir.path(), || Ok(()));
+
+    assert!(result.is_ok());
+    assert!(
+        !lockdown_state::load_enabled(dir.path()),
+        "intent flips off only after a confirmed disengage"
+    );
+}
+
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn find_staged_exe_locates_hole_exe_in_nested_tree() {
