@@ -63,6 +63,29 @@ fn parse_pf_enabled_reads_status() {
     assert!(!parse_pf_enabled("Status: Disabled\n"));
 }
 
+// engage_pf_action (idempotent-enable decision) =======================================================================
+
+#[skuld::test]
+fn engage_action_no_persisted_state_is_fresh_enable() {
+    // First engage: snapshot the host + `pfctl -E`, regardless of pf's current state.
+    assert_eq!(engage_pf_action(false, false), PfEngageAction::FreshEnable);
+    assert_eq!(engage_pf_action(true, false), PfEngageAction::FreshEnable);
+}
+
+#[skuld::test]
+fn engage_action_persisted_but_pf_disabled_reenables() {
+    // Reboot reset pf + its refcount but the state file survived: the old token is
+    // stale, so re-enable and capture a fresh one — else the ruleset loads inert.
+    assert_eq!(engage_pf_action(false, true), PfEngageAction::Reenable);
+}
+
+#[skuld::test]
+fn engage_action_persisted_and_pf_enabled_reuses_token() {
+    // Live Adopt re-engage within one boot: pf still enabled and we hold the token —
+    // reuse it, do NOT double `-E` (that would inflate the refcount).
+    assert_eq!(engage_pf_action(true, true), PfEngageAction::ReuseToken);
+}
+
 // ensure_trailing_nl ==================================================================================================
 
 #[skuld::test]
