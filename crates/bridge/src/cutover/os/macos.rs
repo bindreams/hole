@@ -1,12 +1,17 @@
 //! Real macOS `CutoverOs`: swap both images (`renamex_np` for the `.app`, plain
-//! rename for `HELPER_PATH`) + graceful SIGTERM restart with a kqueue
-//! wait-for-exit. Self-orchestrated inline (the bridge is root; the restart is a
-//! fire-once `launchctl` call launchd carries out, so no detached survivor is
-//! needed beyond the response-flush task the apply layer spawns).
+//! rename for `HELPER_PATH`), then trigger the bridge's own graceful shutdown.
 //!
-//! Raw FFI (libc kqueue) is sanctioned here per the #165 isolation contract;
-//! the blocking `kevent` is a kernel rendezvous for `NOTE_EXIT`, not a poll.
-#![allow(clippy::disallowed_methods)]
+//! The actor runs INLINE in the bridge, so its stop step SIGTERMs its own
+//! process. SIGTERM rides `foreground::shutdown_signal` -> `pm.stop()`, so the
+//! marker-conditional `stop_with(Cutover)` disarms the standing cover (it
+//! persists) and routes/DNS tear down. The process then exits and launchd's
+//! `KeepAlive=true` respawns the now-swapped binary (the swap precedes the
+//! shutdown); the persistent pf cover + the new bridge's `Adopt` hold the gap.
+//! There is deliberately no self-wait-for-exit and no explicit `launchctl start`
+//! — both would be unreachable past the self-SIGTERM.
+//!
+//! Raw `launchctl` invocation is the sanctioned restart primitive (the bridge is
+//! root); no libc FFI is needed here.
 
 use crate::cutover::os::CutoverOs;
 use crate::platform::os::LAUNCHD_LABEL;
@@ -14,8 +19,6 @@ use crate::platform::swap::{execute_swap, SwapPlan};
 
 pub struct MacosCutoverOs {
     pub plan: SwapPlan,
-    /// Pid of the running bridge to wait on for exit after SIGTERM.
-    pub bridge_pid: i32,
 }
 
 impl MacosCutoverOs {
@@ -39,54 +42,9 @@ impl CutoverOs for MacosCutoverOs {
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()> {
         // Graceful SIGTERM (NOT `kickstart -k`'s SIGKILL): rides
         // `shutdown_signal` -> `pm.stop()`, so the marker-conditional disarm
-        // fires and routes/DNS tear down. Then a kqueue `NOTE_EXIT` waits for
-        // the real exit — a kernel event, never a sleep.
-        Self::launchctl(&["kill", "SIGTERM", &format!("system/{LAUNCHD_LABEL}")])?;
-        wait_pid_exit(self.bridge_pid)
+        // fires and routes/DNS tear down. This SIGTERMs THIS process, so there
+        // is no return past it to wait on or to issue a start — KeepAlive=true
+        // respawns the swapped binary.
+        Self::launchctl(&["kill", "SIGTERM", &format!("system/{LAUNCHD_LABEL}")])
     }
-
-    fn start_service_wait_running(&mut self) -> std::io::Result<()> {
-        // Belt-and-suspenders explicit start. The plist's KeepAlive=true already
-        // respawns the bridge after the SIGTERM exit (re-execing the now-swapped
-        // helper = new inode), and in the inline self-restart model THIS process
-        // is gone by here, so the line is reached only if a future model drives
-        // the restart from a surviving orchestrator. Idempotent regardless.
-        Self::launchctl(&["start", LAUNCHD_LABEL])
-    }
-}
-
-/// Block until `pid` exits via kqueue `EVFILT_PROC`/`NOTE_EXIT` (a real kernel
-/// event — never a sleep). Mirrors `hole`'s `relaunch.rs` exit-wait; the two are
-/// kept in sync. A pid already gone yields `ESRCH`, treated as "already exited".
-fn wait_pid_exit(pid: i32) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    // SAFETY: kqueue() returns a fresh owned fd or -1.
-    let kq = unsafe { libc::kqueue() };
-    if kq < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: kq is a fresh, owned kqueue fd; OwnedFd closes it on drop.
-    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
-
-    let change = libc::kevent {
-        ident: pid as libc::uintptr_t,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    let mut out: libc::kevent = unsafe { std::mem::zeroed() };
-    // SAFETY: one change registered + one event awaited (NULL timeout blocks
-    // until NOTE_EXIT). A dead pid yields -1 + ESRCH = already exited.
-    let n = unsafe { libc::kevent(kq.as_raw_fd(), &change, 1, &mut out, 1, std::ptr::null()) };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(()); // already gone
-        }
-        return Err(err);
-    }
-    Ok(())
 }

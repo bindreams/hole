@@ -12,9 +12,15 @@ impl CutoverOs for Recorder {
         Ok(())
     }
     fn stop_service_wait_stopped(&mut self) -> std::io::Result<()> {
+        // The stop step is OS-asymmetric: Windows waits for a real STOPPED;
+        // macOS SIGTERMs its own process (graceful, no self-wait).
+        #[cfg(target_os = "windows")]
         self.calls.borrow_mut().push("stop_wait_stopped");
+        #[cfg(target_os = "macos")]
+        self.calls.borrow_mut().push("trigger_graceful_shutdown");
         Ok(())
     }
+    #[cfg(target_os = "windows")]
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {
         self.calls.borrow_mut().push("start_wait_running");
         Ok(())
@@ -38,13 +44,13 @@ fn windows_sequence_is_stop_swap_start() {
 
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn macos_sequence_is_swap_then_sigterm_restart() {
+fn macos_sequence_is_swap_then_graceful_shutdown() {
     let mut os = Recorder::default();
     run_cutover(&mut os).unwrap();
     // macOS swaps both images FIRST (the running daemon keeps its old inode),
-    // then SIGTERM-stops (graceful, runs pm.stop()) + waits exit, then starts.
-    assert_eq!(
-        *os.calls.borrow(),
-        vec!["swap", "stop_wait_stopped", "start_wait_running"]
-    );
+    // then triggers its OWN graceful shutdown (SIGTERM rides pm.stop(), so the
+    // marker-conditional disarm fires). It does NOT wait-for-exit or start: the
+    // inline actor SIGTERMs its own process, so a self-wait + explicit start are
+    // unreachable — launchd's KeepAlive=true respawns the now-swapped binary.
+    assert_eq!(*os.calls.borrow(), vec!["swap", "trigger_graceful_shutdown"]);
 }

@@ -157,10 +157,7 @@ mod macos {
             &staged.helper,
             std::path::Path::new(HELPER_PATH),
         );
-        let mut os = MacosCutoverOs {
-            plan,
-            bridge_pid: std::process::id() as i32,
-        };
+        let mut os = MacosCutoverOs { plan };
         // Detached: the 200 must flush before the actor SIGTERMs this process.
         // Never joined — the process is about to exit and the new bridge adopts.
         tokio::spawn(async move {
