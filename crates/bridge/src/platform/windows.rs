@@ -204,10 +204,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 // Install/uninstall ===================================================================================================
 
 /// System log directory for the Windows service (`C:\ProgramData\hole\logs`).
+/// Deduped to the single cross-privilege resolver the GUI also reads from.
 fn service_log_dir() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("logs")
+    hole_common::update_marker::service_log_dir()
 }
 
 /// System state directory for the Windows service (`C:\ProgramData\hole\state`).

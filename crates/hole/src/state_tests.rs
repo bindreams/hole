@@ -246,6 +246,20 @@ fn noop_hook() -> SelfHealHook {
     std::sync::Arc::new(|_| {})
 }
 
+/// Build a `BridgeLink` whose update-marker dir is a unique, never-created temp
+/// path. `BridgeLink::new` would otherwise read the real system service log dir,
+/// where a stray cutover marker would make `update_in_progress()` hold the
+/// snapshot and break these transport-error assertions. A non-existent dir reads
+/// as "no marker" (the `read` ENOENT path), keeping every test hermetic.
+fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
+    let marker_dir = std::env::temp_dir().join(format!(
+        "hole-link-marker-{}-{}",
+        std::process::id(),
+        socket_path.file_name().and_then(|s| s.to_str()).unwrap_or("x")
+    ));
+    BridgeLink::with_service_log_dir(socket_path, marker_dir, self_heal)
+}
+
 /// Serve `router` on `path`, accepting connections in a loop (BridgeLink
 /// reconnects after transport errors, and `send_oneshot` always dials
 /// fresh). Each connection is served on its own task so a parked handler
@@ -293,7 +307,7 @@ async fn start_ack_commits_true() {
     let router = axum::Router::new().route(ROUTE_START, post(|| async { Json(EmptyResponse {}) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     assert!(!link.cell().snapshot().running);
     let resp = link
         .send(BridgeRequest::Start {
@@ -332,7 +346,7 @@ async fn version_mismatch_fires_hook_and_does_not_flip_running() {
 
     let fired = Arc::new(AtomicUsize::new(0));
     let fired2 = fired.clone();
-    let link = BridgeLink::new(
+    let link = test_link(
         path,
         Arc::new(move |_| {
             fired2.fetch_add(1, Ordering::SeqCst);
@@ -350,7 +364,7 @@ async fn version_mismatch_fires_hook_and_does_not_flip_running() {
 async fn transport_error_commits_false() {
     let path = test_socket_path("dead");
     let _ = std::fs::remove_file(&path);
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.cell().commit(true); // pretend we believed it was running
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(
@@ -365,6 +379,40 @@ async fn transport_error_commits_false() {
 }
 
 #[skuld::test]
+async fn transport_error_holds_snapshot_while_marker_present() {
+    // End-to-end wiring: a cutover marker in the link's service log dir must make
+    // a transport error hold the last snapshot (no surprise Disconnected),
+    // unlike `transport_error_commits_false` above.
+    let path = test_socket_path("dead-marker");
+    let _ = std::fs::remove_file(&path);
+    let marker_dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(
+        marker_dir.path(),
+        &hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            from_version: "0.2.0".into(),
+            to_version: "0.3.0".into(),
+            pid: std::process::id(),
+            started_at_unix: 0,
+        },
+    )
+    .unwrap();
+    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    link.cell().commit(true); // believed running before the cutover gap
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            lockdown_enabled: false,
+            lockdown_active: false
+        },
+        "marker present => transport error holds the last snapshot"
+    );
+}
+
+#[skuld::test]
 async fn oneshot_never_commits() {
     let path = test_socket_path("oneshot");
     let router = axum::Router::new().route(
@@ -373,7 +421,7 @@ async fn oneshot_never_commits() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.cell().commit(true);
     link.send_oneshot(BridgeRequest::Cancel).await.unwrap();
     assert_eq!(
@@ -405,7 +453,7 @@ async fn untracked_requests_never_commit() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.send(BridgeRequest::Metrics).await.unwrap();
     assert_eq!(
         link.cell().snapshot(),
@@ -442,7 +490,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = Arc::new(BridgeLink::new(path, noop_hook()));
+    let link = Arc::new(test_link(path, noop_hook()));
     let a = tokio::spawn({
         let link = link.clone();
         async move {
@@ -496,7 +544,7 @@ async fn reload_if_running_skips_when_stopped() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(!reloaded);
     // The resurrection guard: bridge-side `reload` on a stopped proxy
@@ -523,7 +571,7 @@ async fn reload_if_running_reloads_when_running() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(reloaded);
     assert_eq!(reloads.load(Ordering::SeqCst), 1);

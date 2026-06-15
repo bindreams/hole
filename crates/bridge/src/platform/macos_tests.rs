@@ -39,6 +39,16 @@ fn helper_path_is_stable() {
 }
 
 #[skuld::test]
+fn service_log_dir_const_matches_shared_resolver() {
+    // The const is referenced widely here, but the marker lives at the same
+    // cross-privilege dir the GUI reads. Pin them equal so they cannot drift.
+    assert_eq!(
+        std::path::Path::new(SERVICE_LOG_DIR),
+        hole_common::update_marker::service_log_dir()
+    );
+}
+
+#[skuld::test]
 async fn serve_until_signal_returns_when_signal_fires() {
     // A server future that never completes, and a shutdown future we control.
     // Firing the shutdown must return control so the daemon's pm.stop()
