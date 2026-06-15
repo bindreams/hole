@@ -1,8 +1,17 @@
 //! Privileged-lane real-engage verification for the standing lockdown cover
 //! (#527). Unlike the pure builder unit tests (`windows_tests` / `macos_tests`,
 //! the #165 isolation contract), these engage the REAL OS cover (Windows: live
-//! FWPM; macOS: live pf) and assert it actually blocks egress — proving the kill
-//! switch is not inert.
+//! FWPM; macOS: live pf) and prove at runtime that it is SELECTIVE: it permits
+//! the configured server IP and blocks all other egress, then restores on
+//! disengage. That catches the block-everything arbitration class of bug (the
+//! permit must beat block-all) AND proves no-leak (a non-permitted host is
+//! blocked).
+//!
+//! The probe is OUTBOUND egress, not inbound loopback: an egress kill switch
+//! governs outbound flows, and the GitHub Actions Windows runner's firewall
+//! drops inbound loopback to the test exe — a pre-cover baseline connect to a
+//! local listener TIMES OUT even with no cover, so loopback can't tell a working
+//! cover from a broken one. Outbound to a routable IP works on the runner.
 //!
 //! They run on the elevated `tun` lane only: the `TUN` label (→ skuld filter
 //! name `tun`) gates them so the unprivileged `SKULD_LABELS="!tun"` pass
@@ -21,135 +30,126 @@ use super::*;
 #[skuld::label]
 const TUN: skuld::Label;
 
-/// Windows real-engage verification. Engages the REAL WFP lockdown cover (a
-/// `LocalInterface` LUID permit + loopback permits + block-all) and proves
-/// (a) loopback stays permitted and (b) egress to an arbitrary non-permitted
-/// public IP is BLOCKED at `ALE_AUTH_CONNECT` — so the cover is not inert.
+// Two routable anycast hosts on :443 (the runner has outbound internet). IP
+// literals only — the cover blocks DNS, so a hostname connect would fail for the
+// wrong reason. PERMITTED is engaged as the server IP; NON_PERMITTED proves the
+// block holds.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const PERMITTED: &str = "1.1.1.1:443";
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const NON_PERMITTED: &str = "8.8.8.8:443";
+
+/// Windows real-engage verification. Engages the REAL WFP lockdown cover with
+/// `server_ip = 1.1.1.1` and proves it is SELECTIVE: egress to the permitted
+/// server IP stays Ok (the permit beats block-all — the assertion that catches
+/// the block-everything arbitration bug) while egress to a non-permitted host is
+/// blocked at `ALE_AUTH_CONNECT` (no leak). Drop restores both.
 ///
-/// Loopback is carried by the address-range permit (127.0.0.0/8 + ::1/128) on all
-/// four ALE layers — CONNECT *and* RECV_ACCEPT, which a loopback connect both
-/// authorizes — plus the `IS_LOOPBACK` flag permit on CONNECT as
-/// belt-and-suspenders; NOT by the LUID permit. The range is the deterministic
-/// matcher because the flag isn't reliably set at either ALE layer on the
-/// elevated lane. A closed-port probe disambiguates any loopback failure
-/// (refused => CONNECT permitted, so a listener-probe timeout is an accept-side
-/// drop). The interface alias is resolved only to drive the real
-/// `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; that permit
-/// matches the named interface's traffic, not loopback in general. The block
-/// assertion does not depend on a live `hole-tun`. `serial = TUN` serializes
-/// against other in-binary TUN tests; the cross-binary race with the bridge's
-/// real-egress e2e is handled by the `global-net-state` test-group
-/// (`.config/nextest.toml`).
+/// The interface alias resolves a real, always-present LUID purely to drive the
+/// real `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; the
+/// block/permit assertions don't depend on it (the `LocalInterface` permit
+/// matches that interface's traffic, not the egress probed here), nor on a live
+/// `hole-tun`. `serial = TUN` serializes against other in-binary TUN tests; the
+/// cross-binary race with the bridge's real-egress e2e is handled by the
+/// `global-net-state` test-group (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn windows_lockdown_blocks_egress_and_permits_loopback() {
-    use std::net::TcpListener;
+fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
+    use std::net::TcpStream;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
-    let server_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
 
-    // A loopback listener proves the loopback permit holds while the cover is up.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let loopback_port = listener.local_addr().unwrap().port();
+    // External-event probe with a graceful failure bound: the timeout is the
+    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    // A closed loopback port: bind to grab a free port, then drop the listener so
-    // nothing accepts there. Probing it disambiguates a listener-probe failure —
-    // ConnectionRefused proves the CONNECT itself is permitted (kernel reached the
-    // closed port and RST'd), so a listener-probe timeout is an accept-side drop;
-    // TimedOut/PermissionDenied means the CONNECT is blocked outright.
-    let closed_probe = TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed_port = closed_probe.local_addr().unwrap().port();
-    drop(closed_probe);
+    // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
+    // network/reachability problem, not the cover — fail loud and self-validate the
+    // probe so a network blip is never a false pass.
+    let base_permitted = connect(PERMITTED);
+    let base_non = connect(NON_PERMITTED);
+    assert!(
+        base_permitted.is_ok() && base_non.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
+        base_permitted.err().map(|e| e.kind()),
+        base_non.err().map(|e| e.kind()),
+    );
 
-    // Baseline (PRE-cover): characterize the runner so the post-cover result is
-    // interpretable. `base_lo` should be Ok (loopback works without the cover);
-    // `base_closed` tells us whether this runner RSTs a closed loopback port
-    // (ConnectionRefused) or silently drops (TimedOut) — which decides whether the
-    // post-cover closed-port probe can distinguish a CONNECT block from an
-    // accept-side drop at all.
-    let base_lo = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{loopback_port}").parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .err()
-    .map(|e| e.kind());
-    let base_closed = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{closed_port}").parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .err()
-    .map(|e| e.kind());
-
+    // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
+    // source to exercise the real resolve + `LocalInterface` filter path.
     let cover = engage_lockdown(server_ip, "Loopback Pseudo-Interface 1", &resolver, &[], dir.path())
         .expect("engage real WFP lockdown cover");
 
-    // Discriminating probe: connect to the closed loopback port. See above for how
-    // its error kind separates a CONNECT block from a RECV_ACCEPT drop.
-    let closed_probe_err = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{closed_port}").parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .err()
-    .map(|e| e.kind());
+    let permitted = connect(PERMITTED);
+    let non = connect(NON_PERMITTED);
 
-    // (a) Loopback connect still succeeds (loopback permit). External event with
-    // graceful failure bound: the timeout is the failure-to-human signal, not a
-    // sync sleep; the assertion is success, not "completed within N".
-    let lo = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{loopback_port}").parse().unwrap(),
-        Duration::from_secs(2),
-    );
-    // Include both probes' error kinds so a failure shows where the drop is: the
-    // listener probe's kind (timeout = still dropped, refused = nobody listening,
-    // perm = ACL) and the closed-port probe (refused => CONNECT permitted, so a
-    // listener-probe timeout is an accept-side drop).
+    // Permit beats block-all: the server IP stays reachable (catches block-everything).
     assert!(
-        lo.is_ok(),
-        "loopback must stay permitted under lockdown: \
-         baseline(pre-cover) lo={base_lo:?} closed={base_closed:?}; \
-         post-cover listener={:?} closed(refused=>connect-permitted)={:?}",
-        lo.err(),
-        closed_probe_err
+        permitted.is_ok(),
+        "server-IP permit must beat block-all (else the cover blocks everything): \
+         {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+        permitted.err().map(|e| e.kind()),
     );
-
-    // (b) Egress to a non-permitted public IP is blocked at ALE_AUTH_CONNECT.
-    // 198.51.100.1 (TEST-NET-2) discard port: external event with graceful
-    // failure bound — the assertion is that it ERRORS, not that it times out.
-    let blocked = std::net::TcpStream::connect_timeout(&"198.51.100.1:9".parse().unwrap(), Duration::from_secs(2));
-    assert!(blocked.is_err(), "lockdown must block egress to a non-permitted IP");
+    // No leak: egress to a non-permitted host is blocked at ALE_AUTH_CONNECT.
+    assert!(
+        non.is_err(),
+        "lockdown must block egress to a non-permitted host (leak!): \
+         {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+    );
 
     // Drop sweeps the lockdown filters (kind-aware Cover Drop); egress restored.
     drop(cover);
-    drop(listener);
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
+        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
 }
 
 /// macOS real-engage verification. Engages the REAL pf lockdown cover (an
 /// authoritative main-ruleset replace: `block drop out quick all` with earlier
 /// `quick` permits for loopback, the TUN, and the server IP — no anchor, so
-/// there is no inert-anchor failure mode) and proves (a) the live filter
-/// ruleset carries our block rule, (b) egress to a non-server, non-loopback IP
-/// is dropped while the cover holds, and (c) Drop restores the pre-lockdown
-/// snapshot.
+/// there is no inert-anchor failure mode) with `server_ip = 1.1.1.1` and proves
+/// (a) the live ruleset carries our block rule, (b) it is SELECTIVE — egress to
+/// the server IP stays Ok while a non-permitted host is dropped, and (c) Drop
+/// restores the pre-lockdown snapshot.
 ///
-/// No live utun is needed for the block assertion: `pass out quick on
-/// <tun-absent>` simply never matches, so a probe to an arbitrary IP is blocked
-/// by `block drop out quick all`. `serial = TUN` + the `global-net-state`
-/// test-group serialize the process-global pf state: `pfctl -E`/`-X` is
-/// refcounted and the main ruleset is host-wide, so a concurrent cover test
-/// would race the snapshot restore. (On macOS only this binary carries a TUN
-/// test — the bridge TUN e2e is `cfg(windows)` — so the group is single-member,
-/// but it costs nothing.)
+/// No live utun is needed: `pass out quick on <tun-absent>` simply never matches,
+/// so the block rule governs the probed egress. `serial = TUN` + the
+/// `global-net-state` test-group serialize the process-global pf state:
+/// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
+/// concurrent cover test would race the snapshot restore.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn macos_lockdown_actually_blocks_and_restores() {
+fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
+    use std::net::TcpStream;
     use std::process::Command;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
-    let server_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    // External-event probe with a graceful failure bound: the timeout is the
+    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    // Baseline (PRE-cover): both hosts must be reachable. A failure here is a
+    // network/reachability problem, not the cover — fail loud and self-validate the
+    // probe so a network blip is never a false pass.
+    let base_permitted = connect(PERMITTED);
+    let base_non = connect(NON_PERMITTED);
+    assert!(
+        base_permitted.is_ok() && base_non.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
+        base_permitted.err().map(|e| e.kind()),
+        base_non.err().map(|e| e.kind()),
+    );
 
     let cover =
         engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path()).expect("engage real pf lockdown cover");
@@ -162,17 +162,32 @@ fn macos_lockdown_actually_blocks_and_restores() {
         "main ruleset must carry the lockdown block (else inert):\n{rules}"
     );
 
-    // (b) Egress to a non-permitted IP is blocked while the cover holds.
-    // External event with graceful failure bound: the assertion is that it
-    // ERRORS, not that it times out.
-    let blocked = std::net::TcpStream::connect_timeout(&"198.51.100.1:9".parse().unwrap(), Duration::from_secs(2));
-    assert!(blocked.is_err(), "lockdown must block egress to a non-permitted IP");
+    let permitted = connect(PERMITTED);
+    let non = connect(NON_PERMITTED);
 
-    // (c) Drop restores the pre-lockdown snapshot; our block rule is gone.
+    // (b) Selective: permit beats block (server IP reachable), non-permitted blocked.
+    assert!(
+        permitted.is_ok(),
+        "server-IP permit must beat block-all (else the cover blocks everything): \
+         {PERMITTED}={:?}; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+        permitted.err().map(|e| e.kind()),
+    );
+    assert!(
+        non.is_err(),
+        "lockdown must block egress to a non-permitted host (leak!): \
+         {NON_PERMITTED} connected; baseline {PERMITTED}=Ok {NON_PERMITTED}=Ok",
+    );
+
+    // (c) Drop restores the pre-lockdown snapshot: block rule gone, egress restored.
     drop(cover);
     let after = Command::new("pfctl").args(["-sr"]).output().unwrap();
     assert!(
         !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
         "snapshot restore must remove our lockdown block rule"
+    );
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
+        connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
 }
