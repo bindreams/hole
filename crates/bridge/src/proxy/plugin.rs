@@ -253,7 +253,7 @@ async fn spawn_plugin_runner_at(
     ),
     ProxyError,
 > {
-    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts);
+    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts).readiness(readiness_for(plugin_name));
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();
@@ -422,20 +422,39 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
 ///
 /// Per-plugin syntax differs:
 ///
-/// - **`v2ray-plugin`** / **`ex-ray`**: appends `loglevel=debug`
-///   (semicolon-separated). Both honor the LAST occurrence of any
-///   duplicate key (same v2ray-core log config), so a user's earlier
-///   `loglevel=warning` still loses to our debug. The friendly wire name
-///   `v2ray-plugin` resolves to the first-party `ex-ray` binary
-///   (`hole_common::plugin`), but a config may also name `ex-ray`
-///   directly; this arm covers both spellings (#414).
-/// - Anything else: pass through unchanged. (`galoshes` is a Rust
-///   `ChainPlugin` and not started via this binary path; future binary
-///   plugins can be added here.)
+/// - **`v2ray-plugin`** / **`ex-ray`** / **`galoshes`**: appends
+///   `loglevel=debug` (semicolon-separated). v2ray-core honors the LAST
+///   occurrence of any duplicate key, so a user's earlier `loglevel=warning`
+///   still loses to our debug. The friendly wire name `v2ray-plugin` resolves
+///   to the first-party `ex-ray` binary (`hole_common::plugin`), but a config
+///   may also name `ex-ray` directly; this arm covers both spellings (#414).
+///   `galoshes` ignores the key itself but forwards the whole options string to
+///   its inner ex-ray, so the directive reaches that hop's v2ray-core.
+/// - Anything else: pass through unchanged.
 fn inject_plugin_debug_logging(plugin_name: &str, opts: Option<&str>) -> Option<String> {
     match plugin_name {
-        "v2ray-plugin" | "ex-ray" => Some(append_sip003_directive(opts, "loglevel=debug")),
+        "v2ray-plugin" | "ex-ray" | "galoshes" => Some(append_sip003_directive(opts, "loglevel=debug")),
         _ => opts.map(String::from),
+    }
+}
+
+/// Plugin-readiness mode for the spawn.
+///
+/// Bundled plugins (galoshes, ex-ray / v2ray-plugin) speak the sitrep
+/// handshake, so [`ReadinessMode::ExpectSitrep`] reads their AUTHORITATIVE
+/// transports — the UDP-drop policy needs `tcp,udp` from galoshes, which the
+/// `Probe` self-probe (a TCP connect, hardcoded TCP-only) would discard (#536).
+/// An unknown plugin (an arbitrary binary resolved via PATH — see
+/// [`resolve_plugin_path`] / #414) may not speak sitrep, so it keeps the
+/// conservative `Probe` readiness rather than hanging until the readiness
+/// timeout waiting for a sitrep that never comes.
+///
+/// [`ReadinessMode::ExpectSitrep`]: garter::ReadinessMode::ExpectSitrep
+fn readiness_for(plugin_name: &str) -> garter::ReadinessMode {
+    if hole_common::plugin::is_known(plugin_name) {
+        garter::ReadinessMode::ExpectSitrep
+    } else {
+        garter::ReadinessMode::Probe
     }
 }
 
@@ -540,12 +559,33 @@ mod inject_tests {
     }
 
     #[skuld::test]
+    fn galoshes_existing_opts_get_loglevel_appended() {
+        // galoshes ignores `loglevel` itself but forwards the whole options
+        // string to its inner ex-ray, so the directive reaches that hop.
+        assert_eq!(
+            inject_plugin_debug_logging("galoshes", Some("host=cloudfront.com;path=/")).as_deref(),
+            Some("host=cloudfront.com;path=/;loglevel=debug"),
+        );
+    }
+
+    #[skuld::test]
     fn unknown_plugin_passes_through_unchanged() {
         assert_eq!(
             inject_plugin_debug_logging("some-future-plugin", Some("k=v")).as_deref(),
             Some("k=v")
         );
         assert_eq!(inject_plugin_debug_logging("some-future-plugin", None), None);
+    }
+
+    #[skuld::test]
+    fn readiness_known_plugins_expect_sitrep_unknown_probes() {
+        use garter::ReadinessMode;
+        // Bundled, sitrep-speaking plugins: authoritative transports.
+        assert_eq!(readiness_for("galoshes"), ReadinessMode::ExpectSitrep);
+        assert_eq!(readiness_for("v2ray-plugin"), ReadinessMode::ExpectSitrep);
+        assert_eq!(readiness_for("ex-ray"), ReadinessMode::ExpectSitrep);
+        // Arbitrary PATH plugin (may not speak sitrep): conservative probe.
+        assert_eq!(readiness_for("some-future-plugin"), ReadinessMode::Probe);
     }
 }
 
