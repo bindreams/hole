@@ -16,7 +16,7 @@ before editing; the sections linked below are the authoritative source.
 
 - **Single binary, two modes.** GUI (system tray, settings, config) and bridge
   (TUN, routing, shadowsocks-service) selected by CLI args; they speak HTTP/1.1
-  REST (JSON) over a Unix socket (macOS) / named pipe (Windows). →
+  REST (JSON) over an AF_UNIX socket on both platforms (Windows via `socket2`). →
   [CONTRIBUTING.md#architecture](CONTRIBUTING.md#architecture)
 - **Single-instance GUI.** Single-instance via `tauri-plugin-single-instance`
   (`com.hole.app`); CLI subcommands bypass the lock. →
