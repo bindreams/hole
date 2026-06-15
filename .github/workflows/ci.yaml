@@ -320,6 +320,24 @@ jobs:
               + package(dump) + package(dump-macros)
               + package(handle-holders)'
 
+      # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
+      # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
+      # and the user-owned `target/` are reused via `sudo env PATH/HOME` (the
+      # binaries are prebuilt above; nextest only re-executes them). macOS
+      # runners have passwordless sudo. Windows engages WFP from the elevated
+      # token above; macOS has no such token, so root is the equivalent.
+      - name: Test (TUN, macOS — root for pfctl)
+        if: matrix.os == 'darwin'
+        id: test-tun-macos
+        shell: bash
+        run: >
+          sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
+          cargo nextest run --no-default-features
+          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+              + package(tun-engine) + package(tun-engine-macros)
+              + package(dump) + package(dump-macros)
+              + package(handle-holders)'
+
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).

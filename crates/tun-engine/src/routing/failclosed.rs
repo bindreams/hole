@@ -128,3 +128,10 @@ pub(crate) fn build_lockdown_spec_for_test(
 #[cfg(test)]
 #[path = "failclosed/facade_tests.rs"]
 mod facade_tests;
+
+// Privileged-lane real-engage verification (#527): engages the REAL OS cover and
+// asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the
+// `TUN` label (see the module docs); excluded from the unprivileged pass.
+#[cfg(test)]
+#[path = "failclosed/lockdown_privileged_tests.rs"]
+mod lockdown_privileged_tests;
