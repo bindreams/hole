@@ -9,7 +9,10 @@ fn v6() -> IpAddr {
 }
 
 #[skuld::test]
-fn spec_blocks_on_both_v4_and_v6_layers() {
+fn spec_blocks_egress_only_on_both_v4_and_v6_layers() {
+    // The block-all is an egress kill switch: CONNECT only. Blocking RECV_ACCEPT
+    // would make it an inbound firewall (out of scope, and inconsistent with the
+    // macOS `set skip on lo0` egress-only model).
     let s = build_cover_spec(v4());
     assert!(s
         .filters
@@ -19,17 +22,40 @@ fn spec_blocks_on_both_v4_and_v6_layers() {
         .filters
         .iter()
         .any(|f| f.layer == Layer::ConnectV6 && f.action == Action::Block));
+    assert!(
+        !s.filters
+            .iter()
+            .any(|f| matches!(f.layer, Layer::RecvAcceptV4 | Layer::RecvAcceptV6) && f.action == Action::Block),
+        "block-all must stay CONNECT-only (egress kill switch, not an inbound firewall)"
+    );
 }
 
 #[skuld::test]
-fn spec_permits_loopback_on_both_layers() {
+fn spec_permits_loopback_on_all_four_ale_layers() {
+    // A loopback connect is authorized at CONNECT *and* RECV_ACCEPT (the inbound
+    // accept side); a permit on CONNECT alone is denied at accept. Hole's data
+    // plane runs app->hole-tun->loopback SOCKS5->ss-service, so the cover must
+    // permit loopback on both ALE directions, V4 and V6.
     let s = build_cover_spec(v4());
     let loopback_permits = s
         .filters
         .iter()
         .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
         .count();
-    assert_eq!(loopback_permits, 2, "loopback permit on V4 and V6");
+    assert_eq!(loopback_permits, 4, "loopback permit on CONNECT + RECV_ACCEPT, V4 + V6");
+    for layer in [
+        Layer::ConnectV4,
+        Layer::ConnectV6,
+        Layer::RecvAcceptV4,
+        Layer::RecvAcceptV6,
+    ] {
+        assert!(
+            s.filters
+                .iter()
+                .any(|f| f.layer == layer && f.action == Action::Permit && matches!(f.condition, Condition::Loopback)),
+            "loopback permit missing on {layer:?}"
+        );
+    }
 }
 
 #[skuld::test]
@@ -100,13 +126,14 @@ fn bridge_path() -> std::path::PathBuf {
 #[skuld::test]
 fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
     let s = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
-    // loopback on both layers
+    // loopback on all four ALE layers (CONNECT + RECV_ACCEPT) — see
+    // spec_permits_loopback_on_all_four_ale_layers for why the accept side matters.
     let loopback = s
         .filters
         .iter()
         .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
         .count();
-    assert_eq!(loopback, 2, "loopback permit on V4 and V6");
+    assert_eq!(loopback, 4, "loopback permit on CONNECT + RECV_ACCEPT, V4 + V6");
     // local-interface (TUN LUID) permit on both layers
     let tun = s
         .filters
@@ -129,7 +156,7 @@ fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
         .collect();
     assert_eq!(server.len(), 1);
     assert_eq!(server[0].layer, Layer::ConnectV4);
-    // block-all on both layers
+    // block-all on both CONNECT layers; never on RECV_ACCEPT (egress-only kill switch)
     assert!(s
         .filters
         .iter()
@@ -138,6 +165,12 @@ fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
         .filters
         .iter()
         .any(|f| f.layer == Layer::ConnectV6 && f.action == Action::Block));
+    assert!(
+        !s.filters
+            .iter()
+            .any(|f| matches!(f.layer, Layer::RecvAcceptV4 | Layer::RecvAcceptV6) && f.action == Action::Block),
+        "lockdown block-all must stay CONNECT-only (egress kill switch)"
+    );
 }
 
 #[skuld::test]
@@ -202,7 +235,7 @@ fn all_swept_guids_cover_both_covers() {
 
 #[skuld::test]
 fn all_swept_guids_are_mutually_distinct() {
-    // Transient six + lockdown eight + every App-ID-derived GUID must be
+    // Transient eight + lockdown ten + every App-ID-derived GUID must be
     // pairwise distinct: two filters sharing a key means the second add
     // silently clobbers the first (FwpmFilterAdd0 keys on filterKey). GUID
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
@@ -248,11 +281,19 @@ fn adopt_deletes_volatile_permits() {
     );
     assert!(
         !adopt.contains(&LOCKDOWN_FILTER_GUIDS[0]),
-        "Adopt must NOT delete loopback V4"
+        "Adopt must NOT delete loopback CONNECT V4"
     );
     assert!(
         !adopt.contains(&LOCKDOWN_FILTER_GUIDS[1]),
-        "Adopt must NOT delete loopback V6"
+        "Adopt must NOT delete loopback CONNECT V6"
+    );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[8]),
+        "Adopt must NOT delete loopback RECV_ACCEPT V4 (fail-closed floor)"
+    );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[9]),
+        "Adopt must NOT delete loopback RECV_ACCEPT V6 (fail-closed floor)"
     );
 }
 
@@ -272,8 +313,16 @@ fn adopt_drops_server_permit_so_reengage_can_update_it() {
     // The fail-closed floor MUST NOT be in the Adopt-delete set.
     assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[6]), "block-all V4 stays");
     assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[7]), "block-all V6 stays");
-    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[0]), "loopback V4 stays");
-    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[1]), "loopback V6 stays");
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[0]), "loopback CONNECT V4 stays");
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[1]), "loopback CONNECT V6 stays");
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[8]),
+        "loopback RECV_ACCEPT V4 stays"
+    );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[9]),
+        "loopback RECV_ACCEPT V6 stays"
+    );
     for i in 0..MAX_APPID_BINARIES {
         assert!(
             !adopt.contains(&appid_filter_guid(i, false)),
@@ -283,5 +332,82 @@ fn adopt_drops_server_permit_so_reengage_can_update_it() {
             !adopt.contains(&appid_filter_guid(i, true)),
             "App-ID floor stays (V6 #{i})"
         );
+    }
+}
+
+#[skuld::test]
+fn both_specs_permit_loopback_recv_accept_on_the_accept_layers() {
+    // The accept-side permits must land on the RECV_ACCEPT layers (not a second
+    // CONNECT permit). Asserts the layer mapping for both covers.
+    for s in [
+        build_cover_spec(v4()),
+        build_lockdown_spec(v4(), luid(), &[plugin_path()]),
+    ] {
+        for layer in [Layer::RecvAcceptV4, Layer::RecvAcceptV6] {
+            assert!(
+                s.filters.iter().any(|f| f.layer == layer
+                    && f.action == Action::Permit
+                    && f.hard
+                    && matches!(f.condition, Condition::Loopback)),
+                "loopback permit missing on {layer:?}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn loopback_recv_accept_permits_are_in_both_sweep_floors() {
+    // The accept-side loopback permits are part of the fail-closed FLOOR: the
+    // transient sweep (delete_all iterates FILTER_GUIDS) and the lockdown sweep
+    // (swept_lockdown_guids) must both delete them, but Adopt must keep them.
+    // The transient cover wires its RECV_ACCEPT loopback GUIDs from FILTER_GUIDS,
+    // so iterating the array sweeps them; assert they actually appear in the spec.
+    let cover = build_cover_spec(v4());
+    let cover_guids: std::collections::HashSet<GUID> = cover.filters.iter().map(|f| f.guid).collect();
+    assert!(
+        cover_guids.contains(&FILTER_GUIDS[6]),
+        "transient RECV_ACCEPT V4 in spec"
+    );
+    assert!(
+        cover_guids.contains(&FILTER_GUIDS[7]),
+        "transient RECV_ACCEPT V6 in spec"
+    );
+
+    let swept = swept_lockdown_guids();
+    assert!(
+        swept.contains(&LOCKDOWN_FILTER_GUIDS[8]),
+        "lockdown RECV_ACCEPT V4 swept"
+    );
+    assert!(
+        swept.contains(&LOCKDOWN_FILTER_GUIDS[9]),
+        "lockdown RECV_ACCEPT V6 swept"
+    );
+}
+
+#[skuld::test]
+fn every_emitted_filter_guid_is_in_its_sweep_set() {
+    // Structural fail-closed invariant: any filter a cover installs must be
+    // deletable by recovery, else a crash leaks an unswept block across restarts.
+    // Transient -> delete_all iterates FILTER_GUIDS; lockdown -> swept_lockdown_guids.
+    for ip in [v4(), v6()] {
+        let cover = build_cover_spec(ip);
+        for f in &cover.filters {
+            assert!(
+                FILTER_GUIDS.contains(&f.guid),
+                "transient filter {:?} ({:?}) is not in FILTER_GUIDS",
+                f.guid,
+                f.layer
+            );
+        }
+        let swept: std::collections::HashSet<GUID> = swept_lockdown_guids().into_iter().collect();
+        let lock = build_lockdown_spec(ip, luid(), &[plugin_path(), bridge_path()]);
+        for f in &lock.filters {
+            assert!(
+                swept.contains(&f.guid),
+                "lockdown filter {:?} ({:?}) is not in swept_lockdown_guids",
+                f.guid,
+                f.layer
+            );
+        }
     }
 }

@@ -1,8 +1,10 @@
 //! Windows fail-closed cover via the Windows Filtering Platform (WFP/FWPM).
 //!
 //! Engage installs a persistent provider + sublayer + filter set in one FWPM
-//! transaction: permit loopback (hard) and the SS server IP (hard) on
-//! `ALE_AUTH_CONNECT_V4`/`_V6`, block everything else. Persistent (boot-time)
+//! transaction: permit loopback (hard) on `ALE_AUTH_CONNECT_V4`/`_V6` and
+//! `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
+//! directions) + the SS server IP (hard) on CONNECT, block everything else on
+//! CONNECT (egress kill switch). Persistent (boot-time)
 //! filters — NOT a dynamic session — so a coordinator crash mid-cutover leaves
 //! traffic blocked (fail-closed), not leaked; `recover_cover` sweeps them by
 //! their fixed GUIDs on the next bridge start.
@@ -21,33 +23,40 @@ use crate::error::RoutingError;
 // persisted runtime state. Generated once; never reuse for anything else.
 pub const PROVIDER_GUID: GUID = GUID::from_u128(0xa3f1c2d4_5b6e_47a8_9c0d_1e2f3a4b5c6d);
 pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b5c6d7e);
-// Six fixed filter GUIDs — recovery deletes all six unconditionally
+// Eight fixed filter GUIDs — recovery deletes all eight unconditionally
 // (idempotent), so the set is deterministic regardless of server family.
-pub const FILTER_GUIDS: [GUID; 6] = [
-    GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback V4
-    GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback V6
+pub const FILTER_GUIDS: [GUID; 8] = [
+    GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback CONNECT V4
+    GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback CONNECT V6
     GUID::from_u128(0xe7152618_9fa2_8bec_d041_5c6d7e8f9001), // server V4
     GUID::from_u128(0xf8263729_a0b3_9cfd_e152_6d7e8f900112), // server V6
     GUID::from_u128(0x0937483a_b1c4_ad0e_f263_7e8f90011223), // block-all V4
     GUID::from_u128(0x1a48594b_c2d5_be1f_0374_8f9001122334), // block-all V6
+    GUID::from_u128(0x9fc31d47_1c7d_662f_c0af_263264e68d4c), // loopback RECV_ACCEPT V4
+    GUID::from_u128(0x64f1885c_8acb_79c4_fac2_cd84e29f45eb), // loopback RECV_ACCEPT V6
 ];
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
 // these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
 // `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
 // engaged is reconciled on the next start.
-// Layout: [loopback V4, loopback V6, TUN V4, TUN V6, server V4, server V6,
-//          block-all V4, block-all V6]. App-ID filters get per-binary
-//          dynamically-derived GUIDs (see build_lockdown_spec).
-pub const LOCKDOWN_FILTER_GUIDS: [GUID; 8] = [
-    GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback V4
-    GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback V6
+// Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
+//          server V4, server V6, block-all V4, block-all V6,
+//          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6]. The accept-side
+//          loopback pair is appended (indices 8/9) so the earlier indices
+//          referenced by LOCKDOWN_{TUN,SERVER}_GUID_INDICES stay stable. App-ID
+//          filters get per-binary dynamically-derived GUIDs (see build_lockdown_spec).
+pub const LOCKDOWN_FILTER_GUIDS: [GUID; 10] = [
+    GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback CONNECT V4
+    GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback CONNECT V6
     GUID::from_u128(0x04216435_0209_4b16_95c4_41f7c26af397), // TUN V4
     GUID::from_u128(0x316261ca_7bd2_4949_a64b_08f6ddd66519), // TUN V6
     GUID::from_u128(0x38bea56b_116b_4df8_8cac_280ef661d248), // server V4
     GUID::from_u128(0xf733418b_a1c8_4365_85b5_d5ce8810b144), // server V6
     GUID::from_u128(0x4710d661_94cb_4fc7_ab52_f03f75774d3e), // block-all V4
     GUID::from_u128(0x20af67ac_58ec_41e6_a49d_6fd2ed55c184), // block-all V6
+    GUID::from_u128(0xfcd09bee_0a6a_7bb7_de78_f59dcf653693), // loopback RECV_ACCEPT V4
+    GUID::from_u128(0xda582b53_9a85_b667_c519_e80db74ab67e), // loopback RECV_ACCEPT V6
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
@@ -74,7 +83,7 @@ fn appid_filter_guid(index: usize, v6: bool) -> GUID {
 /// ignored), so an unused App-ID slot is harmless.
 const MAX_APPID_BINARIES: usize = 4;
 
-/// Every lockdown filter GUID a full Sweep must delete: the eight fixed
+/// Every lockdown filter GUID a full Sweep must delete: the ten fixed
 /// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
 /// separately by `delete_all`.)
 fn swept_lockdown_guids() -> Vec<GUID> {
@@ -104,6 +113,11 @@ fn adopt_delete_guids() -> Vec<GUID> {
 pub enum Layer {
     ConnectV4,
     ConnectV6,
+    /// Inbound accept side (`ALE_AUTH_RECV_ACCEPT`). A loopback connect is
+    /// authorized here as well as at CONNECT; the cover permits loopback on both
+    /// so the loopback data plane works. We never block here (egress-only).
+    RecvAcceptV4,
+    RecvAcceptV6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +173,9 @@ pub const PERMIT_WEIGHT: u8 = 15;
 pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the data description of the fail-closed cover for `server_ip`.
-/// Pure — no FFI; the engage layer (`engage`) submits this in one transaction.
+/// Permits loopback on CONNECT *and* RECV_ACCEPT (loopback connects authorize on
+/// both ALE directions) + the server IP on CONNECT; blocks all else on CONNECT
+/// only (egress kill switch). Pure — no FFI; `engage` submits it in one transaction.
 pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -177,6 +193,24 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
         FilterSpec {
             guid: FILTER_GUIDS[1],
             layer: Layer::ConnectV6,
+            action: Action::Permit,
+            condition: Condition::Loopback,
+            weight: PERMIT_WEIGHT,
+            hard: true,
+        },
+        // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
+        // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
+        FilterSpec {
+            guid: FILTER_GUIDS[6],
+            layer: Layer::RecvAcceptV4,
+            action: Action::Permit,
+            condition: Condition::Loopback,
+            weight: PERMIT_WEIGHT,
+            hard: true,
+        },
+        FilterSpec {
+            guid: FILTER_GUIDS[7],
+            layer: Layer::RecvAcceptV6,
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
@@ -222,8 +256,10 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
 /// the hole-tun interface `tun_luid`, and the process image paths `app_ids`
 /// (plugin binary + the bridge's own exe). Per family (V4+V6) at
 /// `ALE_AUTH_CONNECT`: loopback permit + LocalInterface(luid) permit + one
-/// AppId permit per binary + server-IP permit + block-all. All permits hard
-/// (`CLEAR_ACTION_RIGHT`) at `PERMIT_WEIGHT`. Pure — no FFI.
+/// AppId permit per binary + server-IP permit + block-all; plus a loopback
+/// permit at `ALE_AUTH_RECV_ACCEPT` (the accept side a loopback connect also
+/// authorizes). Block stays CONNECT-only — egress kill switch, not inbound. All
+/// permits hard (`CLEAR_ACTION_RIGHT`) at `PERMIT_WEIGHT`. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -232,6 +268,10 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     let mut filters = vec![
         permit(LOCKDOWN_FILTER_GUIDS[0], Layer::ConnectV4, Condition::Loopback),
         permit(LOCKDOWN_FILTER_GUIDS[1], Layer::ConnectV6, Condition::Loopback),
+        // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
+        // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
+        permit(LOCKDOWN_FILTER_GUIDS[8], Layer::RecvAcceptV4, Condition::Loopback),
+        permit(LOCKDOWN_FILTER_GUIDS[9], Layer::RecvAcceptV6, Condition::Loopback),
         permit(
             LOCKDOWN_FILTER_GUIDS[2],
             Layer::ConnectV4,
@@ -491,6 +531,8 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
     let layer = match f.layer {
         Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
         Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
     };
     let action_type = match f.action {
         Action::Permit => FWP_ACTION_PERMIT,
@@ -681,7 +723,7 @@ pub fn recover_cover(_state_dir: &Path) {
     }
 }
 
-/// Delete filters (by their six fixed GUIDs), then the sublayer, then the
+/// Delete filters (by their fixed GUIDs), then the sublayer, then the
 /// provider. Order matters: a sublayer/provider delete fails while filters
 /// still reference it. Each delete is idempotent — a "not found" return is
 /// ignored (recovery runs even when no cover is present).

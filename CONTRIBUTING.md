@@ -268,8 +268,12 @@ the accepted fail-closed cost.
 
 - **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
   a persistent provider + sublayer + filter set installed in one FWPM
-  transaction on `ALE_AUTH_CONNECT_V4`/`_V6` (permit loopback + server IP *hard*
-  via `CLEAR_ACTION_RIGHT`, block all else). **Non-dynamic session** — a dynamic
+  transaction. Loopback is permitted on `ALE_AUTH_CONNECT_V4`/`_V6` *and*
+  `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
+  directions, so a CONNECT-only permit would deny the accept side and break the
+  loopback data plane); the server IP is permitted on CONNECT, all else blocked
+  on CONNECT (egress kill switch). Permits are *hard* via `CLEAR_ACTION_RIGHT`.
+  **Non-dynamic session** — a dynamic
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.

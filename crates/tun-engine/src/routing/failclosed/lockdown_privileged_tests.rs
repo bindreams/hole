@@ -22,16 +22,19 @@ use super::*;
 const TUN: skuld::Label;
 
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover (a
-/// `LocalInterface` LUID permit + loopback permit + block-all) and proves
+/// `LocalInterface` LUID permit + loopback flag permit + block-all) and proves
 /// (a) loopback stays permitted and (b) egress to an arbitrary non-permitted
 /// public IP is BLOCKED at `ALE_AUTH_CONNECT` — so the cover is not inert.
 ///
-/// The LUID is resolved for the host's loopback adapter ("Loopback
-/// Pseudo-Interface 1") purely to drive the real `ConvertInterfaceAliasToLuid`
-/// + `LocalInterface` filter path; the block assertion does not depend on a
-/// live `hole-tun`. `serial = TUN` serializes against other in-binary TUN
-/// tests; the cross-binary race with the bridge's real-egress e2e is handled by
-/// the `global-net-state` test-group (`.config/nextest.toml`).
+/// Loopback is carried by the `IS_LOOPBACK` flag permit (on CONNECT *and*
+/// RECV_ACCEPT — a loopback connect authorizes on both), NOT by the LUID permit.
+/// The interface alias is resolved only to drive the real
+/// `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; that permit
+/// matches the named interface's traffic, not loopback in general. The block
+/// assertion does not depend on a live `hole-tun`. `serial = TUN` serializes
+/// against other in-binary TUN tests; the cross-binary race with the bridge's
+/// real-egress e2e is handled by the `global-net-state` test-group
+/// (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn windows_lockdown_blocks_egress_and_permits_loopback() {
