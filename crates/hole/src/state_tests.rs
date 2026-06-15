@@ -138,8 +138,43 @@ fn observed_running_rules() {
         (Other, Err(transport_err()), None),
     ];
     for (kind, result, expected) in &table {
-        assert_eq!(observed_running(*kind, result), *expected, "{kind:?} / {result:?}");
+        assert_eq!(
+            observed_running(*kind, result, false),
+            *expected,
+            "{kind:?} / {result:?}"
+        );
     }
+}
+
+#[skuld::test]
+fn observed_running_update_in_progress_holds_snapshot() {
+    let transport_err: Result<BridgeResponse, ClientError> = Err(ClientError::Protocol("boom".into()));
+
+    // Marker SET: a transport error commits None (hold last snapshot), not Some(false).
+    for kind in [ReqKind::Status, ReqKind::Start, ReqKind::Stop] {
+        assert_eq!(
+            observed_running(kind, &transport_err, true),
+            None,
+            "{kind:?} marker-set"
+        );
+    }
+    // Marker CLEAR: the existing pessimistic flip stands.
+    for kind in [ReqKind::Status, ReqKind::Start, ReqKind::Stop] {
+        assert_eq!(
+            observed_running(kind, &transport_err, false),
+            Some(false),
+            "{kind:?} no-marker"
+        );
+    }
+    // VersionMismatch precedence unchanged (None regardless of the marker).
+    let vm: Result<BridgeResponse, ClientError> = Err(ClientError::VersionMismatch {
+        bridge: Some("9.9.9".into()),
+    });
+    assert_eq!(observed_running(ReqKind::Status, &vm, false), None);
+    assert_eq!(observed_running(ReqKind::Status, &vm, true), None);
+    // A successful Status still reports truth (marker irrelevant on Ok).
+    let ok: Result<BridgeResponse, ClientError> = Ok(status_resp(true));
+    assert_eq!(observed_running(ReqKind::Status, &ok, true), Some(true));
 }
 
 #[skuld::test]

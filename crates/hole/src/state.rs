@@ -130,7 +130,7 @@ impl BridgeLink {
         let kind = ReqKind::of(&req);
         let mut guard = self.client.lock().await;
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
-        if let Some(running) = observed_running(kind, &result) {
+        if let Some(running) = observed_running(kind, &result, false) {
             // A Status exchange reveals lockdown too — commit all three
             // atomically under this lock; other exchanges know only `running`.
             match observed_lockdown(&result) {
@@ -215,7 +215,7 @@ impl BridgeLink {
         let mut guard = self.client.lock().await;
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
         self.note_mismatch(&status);
-        if let Some(running) = observed_running(ReqKind::Status, &status) {
+        if let Some(running) = observed_running(ReqKind::Status, &status, false) {
             match observed_lockdown(&status) {
                 Some((le, la)) => self.cell.commit_status(running, le, la),
                 None => self.cell.commit(running),
@@ -371,7 +371,14 @@ pub(crate) fn classify_start_error(message: &str) -> StartErrorKind {
 ///   says nothing about the tunnel.
 /// - Transport errors on tracked kinds commit false: an unreachable
 ///   bridge tunnels nothing (the mapping `get_proxy_status` always used).
-pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, ClientError>) -> Option<bool> {
+/// - A transport error WHILE an update cutover is in progress commits
+///   nothing: the bridge is mid-restart, so the gap is expected, not a
+///   Disconnected — hold the last snapshot.
+pub(crate) fn observed_running(
+    kind: ReqKind,
+    result: &Result<BridgeResponse, ClientError>,
+    update_in_progress: bool,
+) -> Option<bool> {
     use ReqKind::*;
     match (kind, result) {
         (Other, _) => None,
@@ -379,6 +386,12 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
         // A version mismatch triggers self-heal; do not flip `running` during
         // the self-heal window (must precede the `(_, Err(_))` catch-all).
         (_, Err(ClientError::VersionMismatch { .. })) => None,
+        // A cutover is in progress (the bridge is mid-restart). A transport
+        // error here is the expected gap, not a Disconnected — hold the last
+        // snapshot. Must precede the `(_, Err(_))` catch-all, like the
+        // VersionMismatch arm: keying on VersionMismatch alone is too late, as
+        // it arrives only after the new bridge answers.
+        (_, Err(_)) if update_in_progress => None,
         (_, Err(_)) => Some(false),
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
