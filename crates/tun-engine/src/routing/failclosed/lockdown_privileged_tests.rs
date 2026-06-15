@@ -63,6 +63,25 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
     let closed_port = closed_probe.local_addr().unwrap().port();
     drop(closed_probe);
 
+    // Baseline (PRE-cover): characterize the runner so the post-cover result is
+    // interpretable. `base_lo` should be Ok (loopback works without the cover);
+    // `base_closed` tells us whether this runner RSTs a closed loopback port
+    // (ConnectionRefused) or silently drops (TimedOut) — which decides whether the
+    // post-cover closed-port probe can distinguish a CONNECT block from an
+    // accept-side drop at all.
+    let base_lo = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{loopback_port}").parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .err()
+    .map(|e| e.kind());
+    let base_closed = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{closed_port}").parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .err()
+    .map(|e| e.kind());
+
     let cover = engage_lockdown(server_ip, "Loopback Pseudo-Interface 1", &resolver, &[], dir.path())
         .expect("engage real WFP lockdown cover");
 
@@ -88,7 +107,9 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
     // listener-probe timeout is an accept-side drop).
     assert!(
         lo.is_ok(),
-        "loopback must stay permitted under lockdown: listener_probe={:?} closed_port_probe(refused=>connect-permitted)={:?}",
+        "loopback must stay permitted under lockdown: \
+         baseline(pre-cover) lo={base_lo:?} closed={base_closed:?}; \
+         post-cover listener={:?} closed(refused=>connect-permitted)={:?}",
         lo.err(),
         closed_probe_err
     );
