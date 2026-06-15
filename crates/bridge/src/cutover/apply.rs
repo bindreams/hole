@@ -159,9 +159,19 @@ mod macos {
         );
         let mut os = MacosCutoverOs { plan };
         // Detached: the 200 must flush before the actor SIGTERMs this process.
-        // Never joined — the process is about to exit and the new bridge adopts.
+        // Never joined — on success the actor SIGTERMs this process, so control
+        // never returns here. The ONLY way past `run_cutover` is a swap failure
+        // BEFORE the SIGTERM; clear the marker so the GUI stops masking
+        // Disconnected (no new bridge will start to clear it).
         tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || run_cutover(&mut os)).await;
+            let outcome = tokio::task::spawn_blocking(move || run_cutover(&mut os)).await;
+            let failed = match outcome {
+                Ok(Ok(())) => return, // unreachable in practice (SIGTERM'd above)
+                Ok(Err(e)) => format!("{e}"),
+                Err(e) => format!("cutover actor panicked: {e}"),
+            };
+            tracing::error!(error = %failed, "macOS cutover failed before restart; clearing marker");
+            let _ = hole_common::update_marker::clear(&hole_common::update_marker::service_log_dir());
         });
         Ok(())
     }

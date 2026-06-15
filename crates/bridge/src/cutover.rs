@@ -32,8 +32,9 @@ pub fn service_state_dir() -> PathBuf {
 
 /// Run the cutover from the detached `hole bridge cutover` child (Windows: the
 /// bridge cannot SCM-restart itself, so it spawns this LocalSystem child). Swaps
-/// the staged binaries into the install dir and SCM-restarts the service, then
-/// clears the marker so the new bridge does not re-enter the no-flash window.
+/// the staged binaries into the install dir and SCM-restarts the service. The
+/// marker is left for the new bridge's post-bind sweep to clear (it is the
+/// authoritative, always-runs clear once any new bridge binds).
 ///
 /// `payload` is the staging dir holding the extracted binaries; `target_version`
 /// names the `.old-<ver>` rename-away path.
@@ -58,9 +59,7 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         images,
         target_version: target_version.to_string(),
     };
-    run_cutover(&mut os)?;
-    // The new service is up; clear the marker so the GUI resumes truth-telling.
-    hole_common::update_marker::clear(&hole_common::update_marker::service_log_dir())
+    run_cutover(&mut os)
 }
 
 #[cfg(not(target_os = "windows"))]

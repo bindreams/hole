@@ -1,8 +1,7 @@
-//! Shared macOS image-swap: the `.app` bundle via `renamex_np(RENAME_SWAP)`
-//! (APFS atomic directory exchange) + the single `HELPER_PATH` file via plain
-//! `fs::rename`. Used by BOTH the update cutover and `install_from_mount` so the
-//! two paths cannot drift (the DMG-helper bug was `install_from_mount` swapping
-//! only the `.app`).
+//! macOS image-swap: the `.app` bundle via `renamex_np(RENAME_SWAP)` (APFS atomic
+//! directory exchange) + the single `HELPER_PATH` file via plain `fs::rename`.
+//! Swapping BOTH in one place keeps the `.app` and its privileged helper in
+//! lockstep across an update.
 //!
 //! The plan is pure (cfg-free, table-tested on any host); the real FFI
 //! (`renamex_np`, the `getattrlist VOL_CAP_INT_RENAME_SWAP` volume probe, and
