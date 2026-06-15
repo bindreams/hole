@@ -157,3 +157,10 @@ xtask = { path = "../../xtask" }
 name = "cutover_privileged"
 path = "tests/cutover_privileged.rs"
 harness = false
+
+# Privileged-lane cutover LEAK proofs (real WFP/pf engage + egress probes:
+# Mullvad-#8470 fail-open, both-covers recovery).
+[[test]]
+name = "cutover_leak_privileged"
+path = "tests/cutover_leak_privileged.rs"
+harness = false
