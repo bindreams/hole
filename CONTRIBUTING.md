@@ -253,11 +253,12 @@ permit loopback and the SS server IP, **block everything else** — as an RAII
 guard whose `Drop` disengages it. It exists for the leak-free in-place-update
 cutover (#468): the bridge is briefly stopped and restarted onto new code, and
 without a cover the missing split routes would let traffic egress in the clear.
-Default-off Hole fails *open* across that gap; the cover makes the cutover
-leak-free **iff [lockdown](#lockdown-mode) is enabled** (the standing cover
-already holds when the cutover starts) — otherwise this transient cover holds the
-line for the sub-second window. A crash mid-cutover leaves traffic **blocked, not
-leaked**.
+This cover holds the line across that **bounded** window regardless of
+[lockdown](#lockdown-mode); a crash mid-cutover leaves traffic **blocked, not
+leaked**. It does *not* cover an indefinite outage (a bridge that stays down,
+or any gap outside an update) — without lockdown, default-off Hole fails *open*
+there. Lockdown closes that broader gap with a standing cover that already holds
+when the cutover starts.
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -283,10 +284,11 @@ Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_setup_commands` vs `run_commands`. Under the
 [#165](#bridge-test-isolation-contract) isolation contract the builders are the
 only thing unit-tested; the kernel-level engage is exercised in production and,
-for the lockdown cover, by the privileged-lane real-engage test (Windows
-`hole-tests` TUN lane, #527) that proves the WFP cover actually blocks a
-non-permitted egress while loopback stays permitted. The recovery sweep runs on
-every bridge start via `recover_routes`.
+for the lockdown cover, by the privileged-lane real-engage tests (#527) — both
+on the `tun` lane (Windows under the elevated CI token; macOS under root for
+`pfctl`) — proving the WFP/pf cover actually blocks a non-permitted egress while
+loopback stays permitted. The recovery sweep runs on every bridge start via
+`recover_routes`.
 
 ### Lockdown mode
 
