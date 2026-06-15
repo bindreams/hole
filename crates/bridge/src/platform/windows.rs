@@ -114,7 +114,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
         let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
-        let server = crate::ipc::IpcServer::bind(&socket_path, proxy, &version)?;
+        let server =
+            crate::ipc::IpcServer::bind_with_dirs(&socket_path, proxy, &version, log_dir.clone(), state_dir.clone())?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =

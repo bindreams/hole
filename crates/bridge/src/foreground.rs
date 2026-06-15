@@ -118,7 +118,13 @@ async fn run_inner(
 
     // Bind BEFORE recovery. If a second bridge instance tries to run, the
     // bind() fails and we exit without touching any routing state.
-    let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
+    let server = crate::ipc::IpcServer::bind_with_dirs(
+        socket_path,
+        proxy,
+        version,
+        log_dir.to_path_buf(),
+        state_dir.to_path_buf(),
+    )?;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect

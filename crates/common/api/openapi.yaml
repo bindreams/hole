@@ -117,6 +117,43 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/update-apply:
+    post:
+      summary: Apply a verified update (service-manager cutover)
+      description: |
+        The privileged bridge swaps its own binary by rename and restarts the
+        bridge service. The request carries the already-downloaded+verified
+        payload path; the bridge re-verifies before extracting. A lockdown-off
+        update REQUIRES consent=true (informed-consent seam). Returns 200 once
+        the cutover has been kicked off; the actual restart is asynchronous and
+        every GUI self-heals onto the new image.
+      operationId: applyUpdate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApplyRequest"
+      responses:
+        "200":
+          description: Cutover accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "409":
+          description: A cutover is already in progress (single-occupancy)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Cutover refused (no consent, verify failed, marker-write failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/reload:
     post:
       summary: Reload the proxy with new configuration
@@ -554,3 +591,23 @@ components:
       properties:
         enabled:
           type: boolean
+
+    UpdateApplyRequest:
+      type: object
+      description: "Hand-written in protocol.rs."
+      required:
+        - payload_path
+        - target_version
+        - consent
+      properties:
+        payload_path:
+          type: string
+          description: Path to the downloaded+verified MSI/DMG.
+        target_version:
+          type: string
+        consent:
+          type: boolean
+          description: >-
+            Informed consent that the tunnel may briefly leak during the
+            restart. REQUIRED true for a lockdown-off update; ignored under
+            lockdown-on (the standing cover holds the gap).

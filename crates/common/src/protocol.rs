@@ -55,6 +55,15 @@ pub enum BridgeRequest {
     SetLockdown {
         enabled: bool,
     },
+    /// Apply a verified update via the service-manager cutover. Maps to
+    /// `POST /v1/update-apply`. `consent` is the informed-consent seam: REQUIRED
+    /// true for a lockdown-off update (the standing cover holds the gap under
+    /// lockdown-on).
+    ApplyUpdate {
+        payload_path: PathBuf,
+        target_version: String,
+        consent: bool,
+    },
 }
 
 /// The exact string the bridge writes into `ErrorResponse` when a `Start` is
@@ -283,6 +292,15 @@ pub struct TestServerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockdownRequest {
     pub enabled: bool,
+}
+
+/// Wire body for `POST /v1/update-apply`. Hand-written (the openapi schema is
+/// doc-only). `payload_path` is the GUI's already-downloaded+verified MSI/DMG.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateApplyRequest {
+    pub payload_path: String,
+    pub target_version: String,
+    pub consent: bool,
 }
 
 // Constants ===========================================================================================================

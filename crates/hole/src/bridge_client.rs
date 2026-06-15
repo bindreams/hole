@@ -3,8 +3,9 @@
 use bytes::Bytes;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, LockdownRequest, MetricsResponse,
-    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN,
-    ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
+    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    ROUTE_UPDATE_APPLY,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -205,6 +206,24 @@ impl BridgeClient {
                 let body = serde_json::to_vec(&LockdownRequest { enabled })
                     .map_err(|e| ClientError::Protocol(e.to_string()))?;
                 let resp = self.http_post(ROUTE_LOCKDOWN, body).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
+            BridgeRequest::ApplyUpdate {
+                payload_path,
+                target_version,
+                consent,
+            } => {
+                let body = serde_json::to_vec(&UpdateApplyRequest {
+                    payload_path: payload_path.to_string_lossy().into_owned(),
+                    target_version,
+                    consent,
+                })
+                .map_err(|e| ClientError::Protocol(e.to_string()))?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {

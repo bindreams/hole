@@ -11,9 +11,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StatusResponse,
-    TestServerRequest, TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
-    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
-    ROUTE_VERSION,
+    TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL,
+    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    ROUTE_TEST_SERVER, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -56,6 +56,10 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// (`X-Hole-Bridge-Version`) and served at `/v1/version` so a
     /// freshly-updated GUI can detect a still-old bridge.
     pub version: String,
+    /// Service log dir — where the cutover marker is written (GUI-readable).
+    pub log_dir: PathBuf,
+    /// Service state dir — the same-volume parent for the cutover staging.
+    pub state_dir: PathBuf,
 }
 
 // Server ==============================================================================================================
@@ -76,10 +80,12 @@ impl IpcServer {
     /// Removes any stale socket file, creates parent directories, binds with
     /// restrictive initial permissions (umask on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
-    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+    pub fn bind_with_dirs<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
         version: &str,
+        log_dir: PathBuf,
+        state_dir: PathBuf,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -93,6 +99,8 @@ impl IpcServer {
             proxy,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
+            log_dir,
+            state_dir,
         });
         let router = build_router(state, version);
         Ok(Self {
@@ -100,6 +108,19 @@ impl IpcServer {
             router,
             socket_path: path.to_owned(),
         })
+    }
+
+    /// Test-only shim: production calls `bind_with_dirs`. The cutover dirs
+    /// default to a fresh temp dir so per-test markers/staging don't collide
+    /// across the shared skuld process.
+    #[cfg(test)]
+    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<P, R>>>,
+        version: &str,
+    ) -> std::io::Result<Self> {
+        let tmp = tempfile::tempdir()?.keep();
+        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp)
     }
 
     /// Accept and handle one client connection, then return.
@@ -206,6 +227,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
+        .route(ROUTE_UPDATE_APPLY, axum::routing::post(handle_update_apply::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
             move |mut resp: axum::response::Response| {
@@ -352,6 +374,98 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             ))
         }
     }
+}
+
+async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+    Json(req): Json<UpdateApplyRequest>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let log_dir = &state.log_dir;
+
+    // Single-occupancy: refuse a second cutover.
+    if crate::cutover::apply::cutover_in_progress(log_dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                message: "a cutover is already in progress".into(),
+            }),
+        ));
+    }
+
+    let lockdown_on = { state.proxy.lock().await.lockdown_enabled() };
+
+    // Consent seam: a lockdown-off update without explicit consent is refused.
+    if crate::cutover::apply::consent_gate(lockdown_on, req.consent).is_err() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "a lockdown-off update requires explicit consent".into(),
+            }),
+        ));
+    }
+
+    let payload = std::path::PathBuf::from(&req.payload_path);
+    // Re-verify before anything irreversible (defense-in-depth; fail-closed).
+    if let Err(e) = crate::cutover::extract::reverify(&payload) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("payload verification failed: {e}"),
+            }),
+        ));
+    }
+
+    // Marker FIRST — FATAL on failure, BEFORE any extract/spawn. A cutover whose
+    // marker did not land would flash Disconnected and would not disarm the cover.
+    let marker = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: state.version.clone(),
+        to_version: req.target_version.clone(),
+        pid: std::process::id(),
+        started_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Err(e) = hole_common::update_marker::write(log_dir, &marker) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("cutover marker write failed: {e}"),
+            }),
+        ));
+    }
+
+    // Extract the bare binaries onto the destination volume. A failure clears
+    // the marker so the GUI does not mask Disconnected forever.
+    let staged = match crate::cutover::extract::extract(&payload, &state.state_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction failed: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
+    // a detached child (returns naturally); macOS runs the actor on a detached
+    // task that SIGTERMs THIS process only after this 200 is on the wire.
+    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version) {
+        let _ = hole_common::update_marker::clear(log_dir);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("cutover failed to start: {e}"),
+            }),
+        ));
+    }
+
+    info!(target_version = %req.target_version, "update cutover kicked off");
+    Ok(Json(EmptyResponse {}))
 }
 
 async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(

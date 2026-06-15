@@ -423,6 +423,27 @@ async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Res
     client.send(req).await
 }
 
+async fn post_update_apply(
+    client: &mut TestClient,
+    payload_path: &str,
+    consent: bool,
+) -> http::Response<hyper::body::Incoming> {
+    let body = serde_json::to_vec(&hole_common::protocol::UpdateApplyRequest {
+        payload_path: payload_path.into(),
+        target_version: "0.3.0".into(),
+        consent,
+    })
+    .unwrap();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(hole_common::protocol::ROUTE_UPDATE_APPLY)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    client.send(req).await
+}
+
 // Tests ===============================================================================================================
 
 #[skuld::test]
@@ -613,6 +634,69 @@ fn lockdown_post_errors_without_state_dir() {
             500,
             "lockdown POST without a state_dir must error, not silently succeed"
         );
+        let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn update_apply_lockdown_off_without_consent_is_refused() {
+    // The consent seam: a lockdown-off update without consent must be refused
+    // (500) BEFORE any extract/spawn. `mock_proxy()` defaults lockdown off.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-no-consent");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_update_apply(&mut client, "/tmp/x.msi", false).await;
+        assert_eq!(
+            resp.status(),
+            500,
+            "lockdown-off update without consent must be refused"
+        );
+        let _ = resp.into_body().collect().await;
+        // No marker was written (the refusal preceded the marker write).
+        assert!(hole_common::update_marker::read(&log_dir).is_none());
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn update_apply_with_existing_marker_is_409() {
+    // Single-occupancy: a present marker means a cutover is already in flight.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-409");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        hole_common::update_marker::write(
+            &log_dir,
+            &hole_common::update_marker::MarkerInfo {
+                version: hole_common::update_marker::MARKER_VERSION,
+                from_version: "0.2.0".into(),
+                to_version: "0.3.0".into(),
+                pid: 1,
+                started_at_unix: 0,
+            },
+        )
+        .unwrap();
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the 409 occupancy check (which runs first) is what fires.
+        let resp = post_update_apply(&mut client, "/tmp/x.msi", true).await;
+        assert_eq!(resp.status(), 409, "a second cutover must be rejected");
         let _ = resp.into_body().collect().await;
 
         drop(client);

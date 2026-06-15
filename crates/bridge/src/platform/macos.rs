@@ -228,7 +228,13 @@ pub fn run(
         // can touch routing state. Route recovery is offloaded via
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
+        let server = crate::ipc::IpcServer::bind_with_dirs(
+            socket_path,
+            proxy,
+            version,
+            log_dir.to_path_buf(),
+            state_dir.to_path_buf(),
+        )?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
