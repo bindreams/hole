@@ -235,8 +235,8 @@ fn all_swept_guids_cover_both_covers() {
 
 #[skuld::test]
 fn all_swept_guids_are_mutually_distinct() {
-    // Transient eight + lockdown ten + every App-ID-derived GUID must be
-    // pairwise distinct: two filters sharing a key means the second add
+    // Every transient + lockdown + App-ID-derived GUID must be pairwise
+    // distinct: two filters sharing a key means the second add
     // silently clobbers the first (FwpmFilterAdd0 keys on filterKey). GUID
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
     let mut all: Vec<GUID> = FILTER_GUIDS.to_vec();
@@ -410,4 +410,109 @@ fn every_emitted_filter_guid_is_in_its_sweep_set() {
             );
         }
     }
+}
+
+// address-range loopback permits at CONNECT ===========================================================================
+
+#[skuld::test]
+fn both_specs_permit_loopback_by_address_range_at_connect() {
+    // The IS_LOOPBACK flag is not reliably set at ALE_AUTH_CONNECT in CI's
+    // elevated lane, so the flag permit alone leaves loopback connects denied by
+    // block-all. An address-range permit keyed on the connect's DESTINATION
+    // matches deterministically: 127.0.0.0/8 on CONNECT V4, ::1/128 on CONNECT V6.
+    for s in [
+        build_cover_spec(v4()),
+        build_lockdown_spec(v4(), luid(), &[plugin_path()]),
+    ] {
+        let v4_net = s.filters.iter().any(|f| {
+            f.layer == Layer::ConnectV4
+                && f.action == Action::Permit
+                && f.hard
+                && f.weight == PERMIT_WEIGHT
+                && f.condition == Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        });
+        assert!(
+            v4_net,
+            "address-range loopback permit (127.0.0.0/8) missing on CONNECT V4"
+        );
+        let v6_net = s.filters.iter().any(|f| {
+            f.layer == Layer::ConnectV6
+                && f.action == Action::Permit
+                && f.hard
+                && f.weight == PERMIT_WEIGHT
+                && f.condition == Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        });
+        assert!(v6_net, "address-range loopback permit (::1/128) missing on CONNECT V6");
+    }
+}
+
+#[skuld::test]
+fn flag_loopback_permits_are_kept_alongside_the_address_range_ones() {
+    // The address-range permits are ADDITIVE belt-and-suspenders: the flag permits
+    // on all four ALE layers must still be present (the diagnosis keeps both).
+    let s = build_cover_spec(v4());
+    let flag_permits = s
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::Loopback))
+        .count();
+    assert_eq!(
+        flag_permits, 4,
+        "flag loopback permits (CONNECT + RECV_ACCEPT, V4+V6) kept"
+    );
+}
+
+#[skuld::test]
+fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
+    // The new address-range loopback GUIDs are part of the fail-closed FLOOR:
+    // the transient sweep (delete_all iterates FILTER_GUIDS) and the lockdown
+    // sweep (swept_lockdown_guids) must both delete them. They must also be
+    // distinct from every prior GUID (a shared key silently clobbers).
+    let cover = build_cover_spec(v4());
+    for f in cover
+        .filters
+        .iter()
+        .filter(|f| matches!(f.condition, Condition::LoopbackNet(_)))
+    {
+        assert!(
+            FILTER_GUIDS.contains(&f.guid),
+            "transient LoopbackNet GUID {:?} must be in FILTER_GUIDS (transient sweep)",
+            f.guid
+        );
+    }
+    let swept: std::collections::HashSet<GUID> = swept_lockdown_guids().into_iter().collect();
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for f in lock
+        .filters
+        .iter()
+        .filter(|f| matches!(f.condition, Condition::LoopbackNet(_)))
+    {
+        assert!(
+            swept.contains(&f.guid),
+            "lockdown LoopbackNet GUID {:?} must be swept",
+            f.guid
+        );
+    }
+}
+
+#[skuld::test]
+fn adopt_does_not_delete_the_address_range_loopback_floor() {
+    // The address-range loopback permits are floor, not volatile: Adopt must keep
+    // them (only the TUN-LUID + server-IP pairs are dropped). adopt_delete_guids
+    // is keyed on the [2,3] / [4,5] indices, which the appended GUIDs do not touch.
+    let adopt: std::collections::HashSet<GUID> = adopt_delete_guids().into_iter().collect();
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for f in lock
+        .filters
+        .iter()
+        .filter(|f| matches!(f.condition, Condition::LoopbackNet(_)))
+    {
+        assert!(
+            !adopt.contains(&f.guid),
+            "Adopt must NOT delete the address-range loopback floor {:?}",
+            f.guid
+        );
+    }
+    // Adopt still drops exactly the four volatile permits — unchanged by this fix.
+    assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
 }

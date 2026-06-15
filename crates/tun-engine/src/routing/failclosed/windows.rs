@@ -3,11 +3,13 @@
 //! Engage installs a persistent provider + sublayer + filter set in one FWPM
 //! transaction: permit loopback (hard) on `ALE_AUTH_CONNECT_V4`/`_V6` and
 //! `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
-//! directions) + the SS server IP (hard) on CONNECT, block everything else on
-//! CONNECT (egress kill switch). Persistent (boot-time)
-//! filters — NOT a dynamic session — so a coordinator crash mid-cutover leaves
-//! traffic blocked (fail-closed), not leaked; `recover_cover` sweeps them by
-//! their fixed GUIDs on the next bridge start.
+//! directions) — by both the IS_LOOPBACK flag AND the loopback destination range
+//! (127.0.0.0/8, ::1/128) at CONNECT, since the flag isn't reliably set at
+//! ALE_AUTH_CONNECT in some elevated environments — + the SS server IP (hard) on
+//! CONNECT, block everything else on CONNECT (egress kill switch). Persistent
+//! (boot-time) filters — NOT a dynamic session — so a coordinator crash
+//! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
+//! sweeps them by their fixed GUIDs on the next bridge start.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -23,9 +25,9 @@ use crate::error::RoutingError;
 // persisted runtime state. Generated once; never reuse for anything else.
 pub const PROVIDER_GUID: GUID = GUID::from_u128(0xa3f1c2d4_5b6e_47a8_9c0d_1e2f3a4b5c6d);
 pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b5c6d7e);
-// Eight fixed filter GUIDs — recovery deletes all eight unconditionally
+// Ten fixed filter GUIDs — recovery deletes all ten unconditionally
 // (idempotent), so the set is deterministic regardless of server family.
-pub const FILTER_GUIDS: [GUID; 8] = [
+pub const FILTER_GUIDS: [GUID; 10] = [
     GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback CONNECT V4
     GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback CONNECT V6
     GUID::from_u128(0xe7152618_9fa2_8bec_d041_5c6d7e8f9001), // server V4
@@ -34,6 +36,8 @@ pub const FILTER_GUIDS: [GUID; 8] = [
     GUID::from_u128(0x1a48594b_c2d5_be1f_0374_8f9001122334), // block-all V6
     GUID::from_u128(0x9fc31d47_1c7d_662f_c0af_263264e68d4c), // loopback RECV_ACCEPT V4
     GUID::from_u128(0x64f1885c_8acb_79c4_fac2_cd84e29f45eb), // loopback RECV_ACCEPT V6
+    GUID::from_u128(0x8827e6e8_461b_48a0_9e88_dc6371486cb0), // loopback-net CONNECT V4 (127.0.0.0/8)
+    GUID::from_u128(0x07d38d29_4bbb_472f_aeb3_e9d71f8967d9), // loopback-net CONNECT V6 (::1/128)
 ];
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
@@ -42,11 +46,12 @@ pub const FILTER_GUIDS: [GUID; 8] = [
 // engaged is reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
 //          server V4, server V6, block-all V4, block-all V6,
-//          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6]. The accept-side
-//          loopback pair is appended (indices 8/9) so the earlier indices
-//          referenced by LOCKDOWN_{TUN,SERVER}_GUID_INDICES stay stable. App-ID
+//          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6,
+//          loopback-net CONNECT V4, loopback-net CONNECT V6]. New pairs are
+//          appended so the earlier indices referenced by
+//          LOCKDOWN_{TUN,SERVER}_GUID_INDICES stay stable. App-ID
 //          filters get per-binary dynamically-derived GUIDs (see build_lockdown_spec).
-pub const LOCKDOWN_FILTER_GUIDS: [GUID; 10] = [
+pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback CONNECT V4
     GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback CONNECT V6
     GUID::from_u128(0x04216435_0209_4b16_95c4_41f7c26af397), // TUN V4
@@ -57,6 +62,8 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 10] = [
     GUID::from_u128(0x20af67ac_58ec_41e6_a49d_6fd2ed55c184), // block-all V6
     GUID::from_u128(0xfcd09bee_0a6a_7bb7_de78_f59dcf653693), // loopback RECV_ACCEPT V4
     GUID::from_u128(0xda582b53_9a85_b667_c519_e80db74ab67e), // loopback RECV_ACCEPT V6
+    GUID::from_u128(0x2f10387e_8f54_4f82_91ca_44aa862d945e), // loopback-net CONNECT V4 (127.0.0.0/8)
+    GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
@@ -130,6 +137,13 @@ pub enum Action {
 pub enum Condition {
     /// Match the WFP loopback flag (`FWP_CONDITION_FLAG_IS_LOOPBACK`).
     Loopback,
+    /// Match the loopback network by the connect's DESTINATION address range:
+    /// V4 -> 127.0.0.0/8, V6 -> ::1/128 (the carried `IpAddr` selects only the
+    /// family). The IS_LOOPBACK flag is not reliably set at ALE_AUTH_CONNECT in
+    /// some elevated environments, so the flag permit alone leaves a loopback
+    /// connect denied by block-all; an address-range permit on the destination
+    /// matches deterministically. Additive to [`Condition::Loopback`].
+    LoopbackNet(IpAddr),
     /// Match a single remote host address (`FWPM_CONDITION_IP_REMOTE_ADDRESS`).
     RemoteIp(IpAddr),
     /// Match the local interface by `NET_LUID` (`FWPM_CONDITION_IP_LOCAL_INTERFACE`,
@@ -174,8 +188,10 @@ pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the data description of the fail-closed cover for `server_ip`.
 /// Permits loopback on CONNECT *and* RECV_ACCEPT (loopback connects authorize on
-/// both ALE directions) + the server IP on CONNECT; blocks all else on CONNECT
-/// only (egress kill switch). Pure — no FFI; `engage` submits it in one transaction.
+/// both ALE directions) — by both the IS_LOOPBACK flag and the loopback
+/// destination range at CONNECT — + the server IP on CONNECT; blocks all else on
+/// CONNECT only (egress kill switch). Pure — no FFI; `engage` submits it in one
+/// transaction.
 pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -195,6 +211,26 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             layer: Layer::ConnectV6,
             action: Action::Permit,
             condition: Condition::Loopback,
+            weight: PERMIT_WEIGHT,
+            hard: true,
+        },
+        // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
+        // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
+        // connect's DESTINATION range (127.0.0.0/8, ::1/128) — that classifies
+        // deterministically.
+        FilterSpec {
+            guid: FILTER_GUIDS[8],
+            layer: Layer::ConnectV4,
+            action: Action::Permit,
+            condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            weight: PERMIT_WEIGHT,
+            hard: true,
+        },
+        FilterSpec {
+            guid: FILTER_GUIDS[9],
+            layer: Layer::ConnectV6,
+            action: Action::Permit,
+            condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
             hard: true,
         },
@@ -254,12 +290,13 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
 
 /// Build the data description of the standing lockdown cover for `server_ip`,
 /// the hole-tun interface `tun_luid`, and the process image paths `app_ids`
-/// (plugin binary + the bridge's own exe). Per family (V4+V6) at
-/// `ALE_AUTH_CONNECT`: loopback permit + LocalInterface(luid) permit + one
-/// AppId permit per binary + server-IP permit + block-all; plus a loopback
-/// permit at `ALE_AUTH_RECV_ACCEPT` (the accept side a loopback connect also
-/// authorizes). Block stays CONNECT-only — egress kill switch, not inbound. All
-/// permits hard (`CLEAR_ACTION_RIGHT`) at `PERMIT_WEIGHT`. Pure — no FFI.
+/// (plugin binary plus the bridge's own exe). Per family (V4+V6) at
+/// `ALE_AUTH_CONNECT`: a loopback permit (flag and destination range), a
+/// LocalInterface(luid) permit, one AppId permit per binary, a server-IP permit,
+/// and block-all; plus a loopback flag permit at `ALE_AUTH_RECV_ACCEPT` (the
+/// accept side a loopback connect also authorizes). Block stays CONNECT-only —
+/// egress kill switch, not inbound. All permits hard (`CLEAR_ACTION_RIGHT`) at
+/// `PERMIT_WEIGHT`. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -268,6 +305,20 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     let mut filters = vec![
         permit(LOCKDOWN_FILTER_GUIDS[0], Layer::ConnectV4, Condition::Loopback),
         permit(LOCKDOWN_FILTER_GUIDS[1], Layer::ConnectV6, Condition::Loopback),
+        // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
+        // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
+        // connect's DESTINATION range (127.0.0.0/8, ::1/128) — that classifies
+        // deterministically.
+        permit(
+            LOCKDOWN_FILTER_GUIDS[10],
+            Layer::ConnectV4,
+            Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        ),
+        permit(
+            LOCKDOWN_FILTER_GUIDS[11],
+            Layer::ConnectV6,
+            Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        ),
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
         permit(LOCKDOWN_FILTER_GUIDS[8], Layer::RecvAcceptV4, Condition::Loopback),
@@ -552,6 +603,10 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
     let mut name = wide("Hole fail-closed filter");
     let mut provider_key = provider;
     let mut v6buf = FWP_BYTE_ARRAY16 { byteArray16: [0u8; 16] };
+    // Keep-alive for the addr+mask structs the LoopbackNet arms point at (mirror
+    // of the v6buf pattern); FWPM copies the pointee during FwpmFilterAdd0.
+    let mut v4mask = FWP_V4_ADDR_AND_MASK::default();
+    let mut v6mask = FWP_V6_ADDR_AND_MASK::default();
     // The placeholder initializers below are overwritten in the matching arm
     // before the pointer is taken; declared here only so they outlive the FFI
     // call (the keep-alive contract).
@@ -571,6 +626,38 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
                 },
             },
         }),
+        // Match the connect's DESTINATION against the loopback range. addr/mask are
+        // host byte order, mirroring the RemoteIp(V4) arm's `u32::from`. Fields are
+        // mutated in place (mirror of the v6buf pattern) so the keep-alive struct
+        // outlives FwpmFilterAdd0.
+        Condition::LoopbackNet(IpAddr::V4(_)) => {
+            v4mask.addr = 0x7F00_0000; // 127.0.0.0
+            v4mask.mask = 0xFF00_0000; // /8
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_V4_ADDR_MASK,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v4AddrMask: &mut v4mask,
+                    },
+                },
+            });
+        }
+        Condition::LoopbackNet(IpAddr::V6(_)) => {
+            v6mask.addr = std::net::Ipv6Addr::LOCALHOST.octets(); // ::1
+            v6mask.prefixLength = 128;
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_V6_ADDR_MASK,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v6AddrMask: &mut v6mask,
+                    },
+                },
+            });
+        }
         Condition::RemoteIp(IpAddr::V4(v4)) => conditions.push(FWPM_FILTER_CONDITION0 {
             fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
             matchType: FWP_MATCH_EQUAL,

@@ -27,7 +27,9 @@ const TUN: skuld::Label;
 /// public IP is BLOCKED at `ALE_AUTH_CONNECT` — so the cover is not inert.
 ///
 /// Loopback is carried by the `IS_LOOPBACK` flag permit (on CONNECT *and*
-/// RECV_ACCEPT — a loopback connect authorizes on both), NOT by the LUID permit.
+/// RECV_ACCEPT — a loopback connect authorizes on both) AND, at CONNECT, by the
+/// loopback destination-range permit (127.0.0.0/8 + ::1/128) that matches even
+/// when the flag isn't set at ALE_AUTH_CONNECT; NOT by the LUID permit.
 /// The interface alias is resolved only to drive the real
 /// `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; that permit
 /// matches the named interface's traffic, not loopback in general. The block
@@ -59,7 +61,13 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
         &format!("127.0.0.1:{loopback_port}").parse().unwrap(),
         Duration::from_secs(2),
     );
-    assert!(lo.is_ok(), "loopback must stay permitted under lockdown");
+    // Include the OS error so a third failure shows what kind (timeout = still
+    // blocked at CONNECT, refused = permit held but nobody listening, perm = ACL).
+    assert!(
+        lo.is_ok(),
+        "loopback must stay permitted under lockdown: {:?}",
+        lo.err()
+    );
 
     // (b) Egress to a non-permitted public IP is blocked at ALE_AUTH_CONNECT.
     // 198.51.100.1 (TEST-NET-2) discard port: external event with graceful
