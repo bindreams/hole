@@ -279,7 +279,18 @@ the accepted fail-closed cost.
   connect blocked by block-all *and* the accept side dropped), so it is no longer
   load-bearing; it is kept at CONNECT only as belt-and-suspenders. The server IP
   is permitted on CONNECT, all else blocked on CONNECT (egress kill switch).
-  Permits are *hard* via `CLEAR_ACTION_RIGHT`.
+  **One sublayer, weight-based arbitration**: permits sit at weight 15, block-all
+  at weight 0, and the higher-weight permit wins within the sublayer. **No filter
+  sets `CLEAR_ACTION_RIGHT`** — that flag makes a filter's own action *soft*
+  (cross-sublayer overridable); omitting it makes the action *hard*, and hardness
+  governs only cross-sublayer arbitration, never within one. A `FWP_ACTION_BLOCK`
+  with the flag omitted is therefore a *default hard* block; setting the flag only
+  on the permits (soft) left block-all (hard) vetoing every permit, so the cover
+  blocked everything. This weight-ordered layout matches wireguard-windows (its
+  loopback/TUN/DHCP permits and block-all are weight-ordered with the flag off; it
+  sets `CLEAR_ACTION_RIGHT` only on its own service permit, none of ours). A
+  higher-weight third-party sublayer could in principle override us (accepted), and
+  a two-sublayer hard-permit/soft-block layout is a possible future hardening.
   **Non-dynamic session** — a dynamic
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so

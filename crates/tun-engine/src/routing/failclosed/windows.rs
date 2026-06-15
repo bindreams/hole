@@ -1,16 +1,33 @@
 //! Windows fail-closed cover via the Windows Filtering Platform (WFP/FWPM).
 //!
 //! Engage installs a persistent provider + sublayer + filter set in one FWPM
-//! transaction: permit loopback (hard) on `ALE_AUTH_CONNECT_V4`/`_V6` and
+//! transaction: permit loopback on `ALE_AUTH_CONNECT_V4`/`_V6` and
 //! `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
 //! directions) — by the loopback address range (127.0.0.0/8, ::1/128) on ALL
 //! four layers, since the IS_LOOPBACK flag isn't reliably set at either ALE layer
 //! in some elevated environments (CONNECT keeps the flag permit too as harmless
-//! belt-and-suspenders) — + the SS server IP (hard) on CONNECT, block everything
-//! else on CONNECT (egress kill switch). Persistent (boot-time) filters — NOT a
-//! dynamic session — so a coordinator crash mid-cutover leaves traffic blocked
-//! (fail-closed), not leaked; `recover_cover` sweeps them by their fixed GUIDs on
-//! the next bridge start.
+//! belt-and-suspenders) — + the SS server IP on CONNECT, block everything else on
+//! CONNECT (egress kill switch).
+//!
+//! One sublayer, weight-based arbitration: the permits sit at weight 15 and the
+//! block-all at weight 0, so within the sublayer the higher-weight permit wins.
+//! NO filter sets `CLEAR_ACTION_RIGHT`. That flag makes THIS filter's own action
+//! soft (cross-sublayer overridable); omitting it makes the action HARD. Hardness
+//! only governs cross-sublayer arbitration — within a sublayer it does nothing.
+//! The old bug: it set the flag on the permits (making them soft) but not on the
+//! block-all (a default-HARD block), so block-all vetoed every permit and the
+//! cover blocked everything. With the flag off everywhere, within-sublayer
+//! arbitration is pure weight: the weight-15 permits beat the weight-0 block-all.
+//! This is the wireguard-windows recipe — its loopback/TUN/DHCP permits and
+//! block-all are weight-ordered with the flag off; it sets `CLEAR_ACTION_RIGHT`
+//! only on its own service app-ID permit, none of ours. The trade-off: a
+//! higher-weight third-party sublayer could in principle override us (accepted —
+//! wireguard ships the same all-but-one-soft layout); a two-sublayer
+//! hard-permit/soft-block layout is a possible future hardening.
+//!
+//! Persistent (boot-time) filters — NOT a dynamic session — so a coordinator crash
+//! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
+//! sweeps them by their fixed GUIDs on the next bridge start.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -169,12 +186,10 @@ pub struct FilterSpec {
     pub layer: Layer,
     pub action: Action,
     pub condition: Condition,
-    /// FWPM filter weight (0..=15). Permits get 15, block gets 0; higher
-    /// weight wins within our sublayer.
+    /// FWPM filter weight (0..=15). Permits get 15, block gets 0; arbitration
+    /// within our single sublayer is pure weight, so the higher-weight permit
+    /// wins over block-all.
     pub weight: u8,
-    /// `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` — a hard permit no lower-priority
-    /// sublayer can veto. Set on permits, not on block.
-    pub hard: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -184,8 +199,11 @@ pub struct CoverSpec {
     pub filters: Vec<FilterSpec>,
 }
 
-/// Filter weight (0..=15) for the hard permits — higher than [`BLOCK_WEIGHT`]
-/// so loopback/server-IP permits win over block-all within our sublayer.
+/// Filter weight (0..=15) for the permits — higher than [`BLOCK_WEIGHT`] so
+/// loopback/server-IP permits win over block-all. Within our single sublayer
+/// WFP arbitrates by weight alone (no `CLEAR_ACTION_RIGHT`), so the higher
+/// weight is what makes the permit beat the block — as in wireguard-windows
+/// (weight-ordered permits ~13-15 over a weight-0 block-all in one sublayer).
 pub const PERMIT_WEIGHT: u8 = 15;
 /// Filter weight for the block-all filters.
 pub const BLOCK_WEIGHT: u8 = 0;
@@ -208,7 +226,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         FilterSpec {
             guid: FILTER_GUIDS[1],
@@ -216,7 +233,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
         // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
@@ -228,7 +244,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         FilterSpec {
             guid: FILTER_GUIDS[9],
@@ -236,7 +251,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
@@ -251,7 +265,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         FilterSpec {
             guid: FILTER_GUIDS[7],
@@ -259,7 +272,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         FilterSpec {
             guid: if server_layer == Layer::ConnectV4 {
@@ -271,7 +283,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Permit,
             condition: Condition::RemoteIp(server_ip),
             weight: PERMIT_WEIGHT,
-            hard: true,
         },
         FilterSpec {
             guid: FILTER_GUIDS[4],
@@ -279,7 +290,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Block,
             condition: Condition::Any,
             weight: BLOCK_WEIGHT,
-            hard: false,
         },
         FilterSpec {
             guid: FILTER_GUIDS[5],
@@ -287,7 +297,6 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             action: Action::Block,
             condition: Condition::Any,
             weight: BLOCK_WEIGHT,
-            hard: false,
         },
     ];
     CoverSpec {
@@ -305,8 +314,9 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
 /// and block-all; plus a loopback address-range permit at `ALE_AUTH_RECV_ACCEPT`
 /// (the accept side a loopback connect also authorizes — the flag is unreliable
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
-/// kill switch, not inbound. All permits hard (`CLEAR_ACTION_RIGHT`) at
-/// `PERMIT_WEIGHT`. Pure — no FFI.
+/// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
+/// within the single sublayer the higher-weight permit wins (no
+/// `CLEAR_ACTION_RIGHT`). Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -391,7 +401,6 @@ fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
         action: Action::Permit,
         condition,
         weight: PERMIT_WEIGHT,
-        hard: true,
     }
 }
 
@@ -402,7 +411,6 @@ fn block(guid: GUID, layer: Layer) -> FilterSpec {
         action: Action::Block,
         condition: Condition::Any,
         weight: BLOCK_WEIGHT,
-        hard: false,
     }
 }
 
@@ -612,14 +620,15 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    let flags = FWPM_FILTER_FLAGS(
-        FWPM_FILTER_FLAG_PERSISTENT.0
-            | if f.hard {
-                FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0
-            } else {
-                0
-            },
-    );
+    // PERSISTENT only — NO CLEAR_ACTION_RIGHT. Setting that flag makes a filter's
+    // action SOFT (cross-sublayer overridable); omitting it makes the action HARD,
+    // and hardness governs only cross-sublayer arbitration. A BLOCK with the flag
+    // omitted is thus a default-HARD block — and the old code set the flag on the
+    // permits (soft) but not the block (hard), so block-all vetoed every permit
+    // (the cover blocked everything). With the flag off everywhere, within-sublayer
+    // arbitration is pure weight: the weight-15 permits beat the weight-0 block-all
+    // (the wireguard-windows recipe — see the module doc).
+    let flags = FWPM_FILTER_FLAGS(FWPM_FILTER_FLAG_PERSISTENT.0);
 
     // Keep-alive bindings: `FWPM_FILTER0` holds raw pointers into these; they
     // must outlive the `FwpmFilterAdd0` call below.

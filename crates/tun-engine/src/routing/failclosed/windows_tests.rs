@@ -79,23 +79,18 @@ fn spec_permits_v6_server_on_v6_layer_only() {
     assert_eq!(server_permits[0].layer, Layer::ConnectV6);
 }
 
+// Arbitration within our single sublayer is pure weight (no CLEAR_ACTION_RIGHT on
+// any filter): the permits must outweigh block-all, else block-all wins and the
+// cover blocks everything. A compile-time invariant, not a runtime check.
+const _: () = assert!(PERMIT_WEIGHT > BLOCK_WEIGHT);
+
 #[skuld::test]
-fn permit_filters_are_hard_and_outweigh_block() {
+fn permit_filters_outweigh_block() {
     let s = build_cover_spec(v4());
     for f in &s.filters {
         match f.action {
-            Action::Permit => {
-                assert!(
-                    f.hard,
-                    "permits must be hard (CLEAR_ACTION_RIGHT) so other firewalls can't veto"
-                );
-                assert_eq!(f.weight, PERMIT_WEIGHT);
-                assert!(f.weight > BLOCK_WEIGHT, "permit must outweigh block in our sublayer");
-            }
-            Action::Block => {
-                assert!(!f.hard);
-                assert_eq!(f.weight, BLOCK_WEIGHT);
-            }
+            Action::Permit => assert_eq!(f.weight, PERMIT_WEIGHT),
+            Action::Block => assert_eq!(f.weight, BLOCK_WEIGHT),
         }
     }
 }
@@ -178,18 +173,13 @@ fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
 }
 
 #[skuld::test]
-fn lockdown_spec_permits_are_hard_and_outweigh_block() {
+fn lockdown_spec_permits_outweigh_block() {
+    // Weight-only arbitration in one sublayer (see the const assert above).
     let s = build_lockdown_spec(v6(), luid(), &[plugin_path()]);
     for f in &s.filters {
         match f.action {
-            Action::Permit => {
-                assert!(f.hard, "lockdown permits must be hard (CLEAR_ACTION_RIGHT)");
-                assert_eq!(f.weight, PERMIT_WEIGHT);
-            }
-            Action::Block => {
-                assert!(!f.hard);
-                assert_eq!(f.weight, BLOCK_WEIGHT);
-            }
+            Action::Permit => assert_eq!(f.weight, PERMIT_WEIGHT),
+            Action::Block => assert_eq!(f.weight, BLOCK_WEIGHT),
         }
     }
 }
@@ -355,14 +345,14 @@ fn both_specs_permit_loopback_recv_accept_by_address_range() {
         assert!(
             s.filters.iter().any(|f| f.layer == Layer::RecvAcceptV4
                 && f.action == Action::Permit
-                && f.hard
+                && f.weight == PERMIT_WEIGHT
                 && f.condition == Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))),
             "address-range loopback permit (127.0.0.0/8) missing on RECV_ACCEPT V4"
         );
         assert!(
             s.filters.iter().any(|f| f.layer == Layer::RecvAcceptV6
                 && f.action == Action::Permit
-                && f.hard
+                && f.weight == PERMIT_WEIGHT
                 && f.condition == Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))),
             "address-range loopback permit (::1/128) missing on RECV_ACCEPT V6"
         );
@@ -441,7 +431,6 @@ fn both_specs_permit_loopback_by_address_range_at_connect() {
         let v4_net = s.filters.iter().any(|f| {
             f.layer == Layer::ConnectV4
                 && f.action == Action::Permit
-                && f.hard
                 && f.weight == PERMIT_WEIGHT
                 && f.condition == Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         });
@@ -452,7 +441,6 @@ fn both_specs_permit_loopback_by_address_range_at_connect() {
         let v6_net = s.filters.iter().any(|f| {
             f.layer == Layer::ConnectV6
                 && f.action == Action::Permit
-                && f.hard
                 && f.weight == PERMIT_WEIGHT
                 && f.condition == Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
         });
