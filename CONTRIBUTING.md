@@ -558,9 +558,11 @@ backtrace symbolizer locates a `*.dSYM` by scanning the running binary's directo
 and matching its Mach-O UUID — so production panic backtraces resolve frame names +
 line numbers (the Windows `hole.pdb` analog; see #393). `bundle.macOS.files` is
 bundle-time-only (not validated by `tauri_build::build()` like `resources`), so the
-dSYM — the build's own output — needs no `build.rs` stub. The `hole-dmg-tests`
-pytest derives its expected payload from `cargo xtask bindir-names --os darwin`, so
-the Tauri config can't silently drift.
+dSYM — the build's own output — needs no `build.rs` stub. cargo's `split-debuginfo = "packed"` emits `target/release/hole.dSYM` as a *symlink* into `deps/`, which the
+bundler would ship dangling; the `hole-dmg` build dereferences it into `.cache/`
+(the source `macOS.files` points at) before bundling. The `hole-dmg-tests` pytest
+derives its expected payload from `cargo xtask bindir-names --os darwin`, so the
+Tauri config can't silently drift.
 
 ## Development
 
