@@ -108,7 +108,15 @@ targets:
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     # `-v` surfaces the hdiutil stderr tauri-bundler otherwise swallows (#446).
-    build: npx tauri build -v
+    build:
+      - |
+        npx tauri build -v && BUILD_RC=0 || BUILD_RC=$?
+        echo "DIAG-pwd=$(pwd)"
+        echo "DIAG-find-dsym:"; find target -maxdepth 3 -name '*.dSYM' 2>/dev/null || true
+        echo "DIAG-ls-release:"; ls -la target/release 2>/dev/null | grep -iE 'hole|dsym' || echo "(none)"
+        echo "DIAG-ls-deps-dsym:"; ls -la target/release/deps 2>/dev/null | grep -i dsym || echo "(none)"
+        echo "DIAG-end rc=$BUILD_RC"
+        exit $BUILD_RC
 
   hole-dmg-tests:
     # Pytest harness that asserts the produced .app's code signature is
