@@ -413,6 +413,52 @@ async fn transport_error_holds_snapshot_while_marker_present() {
 }
 
 #[skuld::test]
+async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
+    // End-to-end: while the cutover marker is present, a failing Status (the
+    // expected restart gap) must NOT flip the cell to Disconnected — no seq bump.
+    // Once the new bridge clears the marker, the same failing Status commits
+    // Disconnected. Proves the marker read flows through `observed_running`,
+    // opening and closing the no-flash window with the marker.
+    let path = test_socket_path("cutover-flash");
+    let _ = std::fs::remove_file(&path); // dead socket: every send is a transport error
+    let marker_dir = tempfile::tempdir().unwrap();
+    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    link.cell().commit(true); // believed Connected before the cutover
+    let seq_connected = link.cell().snapshot().seq;
+
+    // Marker SET: the failing Status must hold the Connected snapshot.
+    hole_common::update_marker::write(
+        marker_dir.path(),
+        &hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            from_version: "0.2.0".into(),
+            to_version: "0.3.0".into(),
+            pid: std::process::id(),
+            started_at_unix: 0,
+        },
+    )
+    .unwrap();
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert_eq!(
+        link.cell().snapshot().seq,
+        seq_connected,
+        "no Disconnected flash while the marker is set"
+    );
+    assert!(
+        link.cell().snapshot().running,
+        "snapshot still Connected during the gap"
+    );
+
+    // Marker CLEAR: the same failing Status now commits Disconnected.
+    hole_common::update_marker::clear(marker_dir.path()).unwrap();
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert!(
+        !link.cell().snapshot().running,
+        "Disconnected commits once the marker is gone"
+    );
+}
+
+#[skuld::test]
 async fn oneshot_never_commits() {
     let path = test_socket_path("oneshot");
     let router = axum::Router::new().route(
