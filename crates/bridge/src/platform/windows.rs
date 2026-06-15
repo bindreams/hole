@@ -304,33 +304,22 @@ pub fn start() -> Result<(), windows_service::Error> {
     Ok(())
 }
 
-/// Send a stop control to the service and wait for it to stop (up to 10s).
+/// Send a stop control to the service and wait until it is really stopped via
+/// `NotifyServiceStatusChangeW` — a kernel rendezvous on the STOPPED transition,
+/// not a sleep-poll. Returns immediately when already stopped.
 pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
-
-    // Check current state before sending stop
-    let status = service.query_status()?;
-    if status.current_state == ServiceState::Stopped {
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
+    if service.query_status()?.current_state == ServiceState::Stopped {
         return Ok(());
     }
+    drop(service);
 
-    service.stop()?;
     info!("stop signal sent, waiting for service to stop");
-
-    // Poll until stopped or timeout
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let status = service.query_status()?;
-        if status.current_state == ServiceState::Stopped {
-            info!("Windows service stopped");
-            return Ok(());
-        }
-        if std::time::Instant::now() > deadline {
-            return Err(format!("service did not stop within 10s (state: {:?})", status.current_state).into());
-        }
-    }
+    let mut actor = crate::cutover::scm_wait::SystemScmActor::open(SERVICE_NAME)?;
+    crate::cutover::scm_wait::stop_via_notify(&mut actor)?;
+    info!("Windows service stopped");
+    Ok(())
 }
 
 // Query ===============================================================================================================
