@@ -63,18 +63,29 @@ use plugin_e2e::certs::{path_for_plugin_opts, TestCerts};
 use plugin_e2e::locators::locate_built_galoshes;
 use plugin_e2e::ssserver::{
     start_real_ss_server, start_real_ss_server_with_plugin_quic, start_real_ss_server_with_plugin_ws,
-    start_real_ss_server_with_plugin_ws_tls, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
+    start_real_ss_server_with_plugin_ws_tls, PluginServer, TEST_METHOD, TEST_METHOD_STR, TEST_PASSWORD,
 };
 use std::net::SocketAddr;
 
 /// Common shape for every `ssserver_*` fixture. Owns the tokio runtime that
 /// the server task runs on; dropping the struct shuts down the runtime.
+///
+/// For the plugin variants it ALSO owns the [`PluginServer`] handle: its
+/// `Drop` cancels the galoshes/ex-ray server chain, so the handle must live
+/// as long as the fixture. Dropping it at setup time (the previous bug)
+/// tore the server subprocess down before any test connected — the bridge
+/// client's WS dial was then refused and every response truncated
+/// (bindreams/hole#518). `None` for the no-plugin `ssserver_none`.
 pub(crate) struct SsServerHandle {
     pub addr: SocketAddr,
     pub method: &'static str,
     pub password: String,
     pub plugin: Option<String>,
     pub plugin_opts: Option<String>,
+    // Drop guard: its `Drop` cancels the server chain. Declared before
+    // `_runtime` so the cancel is observed before the runtime aborts the task;
+    // subprocess reaping is guaranteed regardless by garter's `kill_on_drop`.
+    _plugin_server: Option<PluginServer>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -114,6 +125,7 @@ pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
         password: TEST_PASSWORD.to_string(),
         plugin: None,
         plugin_opts: None,
+        _plugin_server: None,
         _runtime: runtime,
     })
 }
@@ -123,16 +135,15 @@ pub(crate) fn ssserver_none() -> Result<SsServerHandle, String> {
 pub(crate) fn ssserver_ws() -> Result<SsServerHandle, String> {
     let plugin_path = require_galoshes();
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    let addr = runtime.block_on(async {
-        let (addr, _handle) = start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, &plugin_path).await;
-        addr
-    });
+    let (addr, server) =
+        runtime.block_on(async { start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, &plugin_path).await });
     Ok(SsServerHandle {
         addr,
         method: TEST_METHOD_STR,
         password: TEST_PASSWORD.to_string(),
         plugin: Some("galoshes".to_string()),
         plugin_opts: Some("host=cloudfront.com;path=/".to_string()),
+        _plugin_server: Some(server),
         _runtime: runtime,
     })
 }
@@ -147,10 +158,8 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
         path_for_plugin_opts(&certs.cert_path),
         path_for_plugin_opts(&certs.key_path)
     );
-    let addr = runtime.block_on(async {
-        let (addr, _handle) =
-            start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await;
-        addr
+    let (addr, server) = runtime.block_on(async {
+        start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await
     });
     Ok(SsServerHandle {
         addr,
@@ -158,6 +167,7 @@ pub(crate) fn ssserver_ws_tls(#[fixture(test_certs)] certs: &TestCerts) -> Resul
         password: TEST_PASSWORD.to_string(),
         plugin: Some("galoshes".to_string()),
         plugin_opts: Some(plugin_opts),
+        _plugin_server: Some(server),
         _runtime: runtime,
     })
 }
@@ -173,10 +183,8 @@ pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<
         path_for_plugin_opts(&certs.cert_path),
         path_for_plugin_opts(&certs.key_path)
     );
-    let addr = runtime.block_on(async {
-        let (addr, _handle) =
-            start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await;
-        addr
+    let (addr, server) = runtime.block_on(async {
+        start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &plugin_path, certs).await
     });
     Ok(SsServerHandle {
         addr,
@@ -184,6 +192,7 @@ pub(crate) fn ssserver_quic(#[fixture(test_certs)] certs: &TestCerts) -> Result<
         password: TEST_PASSWORD.to_string(),
         plugin: Some("galoshes".to_string()),
         plugin_opts: Some(plugin_opts),
+        _plugin_server: Some(server),
         _runtime: runtime,
     })
 }
