@@ -72,6 +72,26 @@ fn commit_status_carries_lockdown_fields() {
     assert_eq!(s1.seq, 1, "seq bumped on change");
 }
 
+#[skuld::test]
+fn commit_preserves_lockdown_fields() {
+    // Every Start/Stop/reconciler exchange goes through `commit` (not
+    // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
+    // a prior Status established (`enabled && !active` is the tray warning state).
+    let cell = ProxyStateCell::new();
+    cell.commit_status(true, true, false); // running + lockdown enabled, not active
+    let before = cell.snapshot();
+    assert!(before.lockdown_enabled && !before.lockdown_active);
+
+    cell.commit(false); // a Stop/transport observation knows only `running`
+    let after = cell.snapshot();
+    assert!(!after.running, "running flipped to false");
+    assert!(
+        after.lockdown_enabled && !after.lockdown_active,
+        "commit must preserve the lockdown fields, got {after:?}"
+    );
+    assert_eq!(after.seq, before.seq + 1, "running change bumps seq");
+}
+
 // observed_running ====================================================================================================
 
 fn status_resp(running: bool) -> BridgeResponse {
