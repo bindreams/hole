@@ -76,6 +76,9 @@ pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<Ex
 }
 
 #[cfg(target_os = "windows")]
+pub use imp_windows::find_staged_exe;
+
+#[cfg(target_os = "windows")]
 mod imp_windows {
     use std::path::{Path, PathBuf};
 
@@ -84,7 +87,15 @@ mod imp_windows {
     /// Subdirectory where the MSI payload lands.
     const STAGING_NAME: &str = ".update-staging";
     /// Canonical binary the swap pivots on.
-    const EXE_NAME: &str = "hole.exe";
+    pub const EXE_NAME: &str = "hole.exe";
+
+    /// Locate the staged `hole.exe` under a staging dir (the detached `bridge
+    /// cutover` child receives only the staging dir path, so it re-finds the exe).
+    pub fn find_staged_exe(staging_dir: &Path) -> std::io::Result<PathBuf> {
+        find_file(staging_dir, EXE_NAME)?.ok_or_else(|| {
+            std::io::Error::other(format!("{EXE_NAME} not found in staged payload under {staging_dir:?}"))
+        })
+    }
 
     /// Extract into a staging dir guaranteed to be on the SAME volume as the
     /// installed binary (the swap is `std::fs::rename`, which fails cross-device).
@@ -114,9 +125,7 @@ mod imp_windows {
             )));
         }
 
-        let exe = find_file(&staging_dir, EXE_NAME)?.ok_or_else(|| {
-            std::io::Error::other(format!("{EXE_NAME} not found in extracted MSI under {staging_dir:?}"))
-        })?;
+        let exe = find_staged_exe(&staging_dir)?;
         Ok(ExtractedImages { staging_dir, exe })
     }
 

@@ -792,26 +792,35 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Run installer (interactive mode).
-    let dest_clone = dest.clone();
-    let install_result = tokio::task::spawn_blocking(move || hole::update::run_installer(&dest_clone, false)).await;
+    // Hand the verified payload to the privileged bridge, which owns the cutover
+    // (binary swap + service restart). The GUI does NOT exit — it self-heals onto
+    // the new image via the version-lockstep relaunch once the bridge is back.
+    // For PR2 the tray's existing user-initiated "install update" click is the
+    // gate, so consent is passed true (PR3 wires an explicit dialog).
+    let apply = BridgeRequest::ApplyUpdate {
+        payload_path: dest.clone(),
+        target_version: info.version.to_string(),
+        consent: true,
+    };
+    let result = app.state::<AppState>().bridge_send(apply).await;
+    drop(download_dir);
 
-    match install_result {
-        Ok(Ok(())) => {
-            // On Windows, exit app to let MSI complete.
-            // On macOS, the installer already copied the app.
-            drop(download_dir);
-            app.exit(0);
-        }
-        Ok(Err(e)) => {
-            error!("installation failed: {e}");
+    match result {
+        Ok(BridgeResponse::Ack) => {}
+        Ok(BridgeResponse::Error { message }) => {
+            error!("bridge rejected update: {message}");
             app.dialog()
-                .message(format!("Installation failed: {e}"))
+                .message(format!("Update failed: {message}"))
                 .title("Update Error")
                 .blocking_show();
         }
+        Ok(other) => error!("unexpected bridge response to update apply: {other:?}"),
         Err(e) => {
-            error!("install task panicked: {e}");
+            error!("update apply failed: {e}");
+            app.dialog()
+                .message(format!("Update failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
         }
     }
 }

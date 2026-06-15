@@ -148,6 +148,11 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
             tracing::warn!(error = %e, "marker sweep task panicked");
         }
+        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
+        // (it fails while an old process still maps the renamed inode).
+        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
+            tracing::warn!(error = %e, "old-binary sweep task panicked");
+        }
 
         // Capture WFP + NDIS state after recovery; see
         // `diagnostics::{wfp,ndis}`.
@@ -229,6 +234,49 @@ pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::Sto
 pub(crate) fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
         tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+    }
+}
+
+/// Prefix of a rename-away leftover from a cutover swap (`<file>.old-<ver>`); see
+/// `cutover::os::windows::old_name`.
+const OLD_BINARY_PREFIX: &str = "hole.exe.old-";
+
+/// Sweep `hole.exe.old-*` leftovers from the install dir. The cutover swap renames
+/// the live binary aside and tries a best-effort delete, which fails while an old
+/// GUI/bridge still maps the inode; the next bridge start (once nothing maps it)
+/// removes the survivors. A still-mapped file's delete fails and is left for a
+/// later start. No delete cap — the set is bounded by the number of past updates.
+pub(crate) fn sweep_old_binaries(install_dir: &Path) {
+    let entries = match std::fs::read_dir(install_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %install_dir.display(), "old-binary sweep: read_dir failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(OLD_BINARY_PREFIX) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            // Still mapped by a live process — expected; a later start retries.
+            tracing::debug!(error = %e, file = %name, "old-binary sweep: still mapped, deferring");
+        }
+    }
+}
+
+/// Resolve the install dir from `current_exe` and sweep its `hole.exe.old-*`
+/// leftovers. Thin wrapper so the dir-scanning core (`sweep_old_binaries`) stays
+/// table-testable.
+fn sweep_old_binaries_in_install_dir() {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        Some(install_dir) => sweep_old_binaries(&install_dir),
+        None => tracing::warn!("old-binary sweep: could not resolve install dir from current_exe"),
     }
 }
 

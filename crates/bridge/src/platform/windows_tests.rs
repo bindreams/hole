@@ -30,3 +30,21 @@ fn post_bind_sweep_clears_marker() {
     assert!(hole_common::update_marker::read(dir.path()).is_none());
     sweep_marker(dir.path()); // idempotent: absent marker is a no-op
 }
+
+#[skuld::test]
+fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let old1 = dir.path().join("hole.exe.old-0.0.0");
+    let old2 = dir.path().join("hole.exe.old-0.2.1");
+    let live = dir.path().join("hole.exe");
+    let other = dir.path().join("config.json");
+    for p in [&old1, &old2, &live, &other] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    sweep_old_binaries(dir.path());
+    assert!(!old1.exists(), "rename-away leftover must be swept");
+    assert!(!old2.exists(), "rename-away leftover must be swept");
+    assert!(live.exists(), "the live binary must be spared");
+    assert!(other.exists(), "unrelated files must be spared");
+    sweep_old_binaries(dir.path()); // idempotent on a clean dir
+}
