@@ -288,19 +288,12 @@ fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingE
 
 /// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`. Engage
 /// idempotently ENSURES pf is enabled (`engage_pf_action` on the `pfctl -s info`
-/// read) so the ruleset never loads into a disabled, INERT pf:
+/// read) so the ruleset never loads into a disabled, INERT pf. The three cases
+/// (single-line bullets keep clippy's doc_lazy_continuation happy):
 ///
-/// 1. `FreshEnable` (no persisted state): `pfctl -E` (refcount) + capture token;
-///    `pfctl -sr` (filter) and `pfctl -sn` (nat) snapshots; persist {token,
-///    snapshots} before mutating.
-/// 2. `ReuseToken` (Adopt re-engage, pf still enabled): reuse the persisted token
-///    + snapshots — re-running `-sr`/`-sn` would snapshot our OWN lockdown ruleset
-///    as the "host" and lose the real host policy.
-/// 3. `Reenable` (Adopt re-engage but pf DISABLED — e.g. a reboot reset pf and its
-///    refcount): the persisted token is stale, so `pfctl -E` for a FRESH token and
-///    re-persist it under the SAME host snapshot. Without this the ruleset would
-///    load into a disabled pf and the cover would be inert while reported active —
-///    egress in the clear during an armed session (not just the boot window).
+/// - `FreshEnable` (no persisted state): `pfctl -E` (refcount) + capture token, snapshot `pfctl -sr` (filter) and `pfctl -sn` (nat), persist {token, snapshots} before mutating.
+/// - `ReuseToken` (Adopt re-engage, pf still enabled): reuse the persisted token + snapshots; re-running `-sr`/`-sn` would snapshot our OWN lockdown ruleset as the host and lose the real host policy.
+/// - `Reenable` (Adopt re-engage but pf DISABLED, e.g. a reboot reset pf and its refcount): the persisted token is stale, so `pfctl -E` for a FRESH token and re-persist it under the SAME host snapshot. Without this the ruleset loads into a disabled pf and the cover is inert while reported active — egress in the clear during an armed session, not just the boot window.
 ///
 /// Then load the self-contained main ruleset via `pfctl -f -` (NO `-Fa`), so the
 /// block takes effect while host translation is carried forward.
