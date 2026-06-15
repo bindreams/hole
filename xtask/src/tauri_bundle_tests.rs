@@ -110,3 +110,36 @@ fn tauri_bundle_covers_full_darwin_bindir() {
          sibling of the binary at MacOS/hole.dSYM). Shipped basenames: {shipped:?}"
     );
 }
+
+#[skuld::test]
+fn dsym_ships_as_a_sibling_of_the_binary() {
+    // The coverage test above is basename-only, so a dSYM mis-routed to
+    // Contents/Resources/ would still pass it. But std's backtrace symbolizer
+    // finds a dSYM ONLY by scanning the running binary's own directory and
+    // UUID-matching — so the dSYM must ship at MacOS/<name> (next to
+    // Contents/MacOS/hole) or production backtraces never resolve. Lock the dest
+    // directory here so a misroute fails on any host, not just the darwin DMG
+    // lane (which proves it on the real bundle via test_dsym_is_sibling_of_binary).
+    let conf = tauri_conf();
+    let dsym = bindir_dest_names(Os::Darwin)
+        .into_iter()
+        .find(|n| n.ends_with(".dSYM"))
+        .expect("darwin bindir_dest_names includes a .dSYM");
+    let files = conf["bundle"]["macOS"]["files"]
+        .as_object()
+        .expect("bundle.macOS.files must be a map shipping the dSYM");
+    let dest = files.keys().find(|k| basename(k) == dsym).unwrap_or_else(|| {
+        panic!(
+            "bundle.macOS.files ships no {dsym}; have {:?}",
+            files.keys().collect::<Vec<_>>()
+        )
+    });
+    // MacOS/ is the fixed app-bundle dir Tauri places the main binary in; the
+    // dSYM is its sibling there.
+    assert_eq!(
+        *dest,
+        format!("MacOS/{dsym}"),
+        "{dsym} must ship at MacOS/{dsym} (sibling of Contents/MacOS/hole) so runtime backtraces \
+         resolve; got dest {dest:?}"
+    );
+}
