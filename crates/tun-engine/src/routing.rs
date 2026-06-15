@@ -205,11 +205,14 @@ pub fn recover_routes(state_dir: &Path) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverRecovery {
     /// Intent ON + cover present: KEEP the host fail-closed across the restart.
-    /// Remove ONLY the stale TUN-interface permit (its LUID/utun is dead after
-    /// teardown); block-all + loopback + server-IP + App-ID stay in force. The
-    /// next connect's `install_lockdown` re-adds the TUN permit with a freshly
-    /// resolved LUID/utun (idempotent). This is the crash-leak fix: a crash
-    /// never runs `stop()`, so the persistent cover survives and Adopt holds it.
+    /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
+    /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
+    /// teardown) and the server-IP permit (the server may change before the next
+    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
+    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
+    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
+    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
+    /// cover survives and Adopt holds it.
     Adopt,
     /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
     /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +

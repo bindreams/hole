@@ -217,25 +217,71 @@ fn all_swept_guids_are_mutually_distinct() {
 }
 
 #[skuld::test]
-fn adopt_deletes_only_the_tun_luid_pair() {
-    // Adopt keeps the host fail-closed: it removes ONLY the two stale TUN-LUID
-    // permits (their LUID is dead after teardown), never block-all / loopback /
-    // server / App-ID. The next connect re-adds the TUN permit.
+fn adopt_deletes_volatile_permits() {
+    // Adopt keeps the host fail-closed but drops the VOLATILE permits — the
+    // TUN-LUID pair (LUID dead after teardown) AND the server-IP pair (the
+    // server changes between connects). Both are re-added fresh by the next
+    // connect's engage with current values. The fail-closed floor (block-all,
+    // loopback, App-ID) stays in force.
     let adopt = adopt_delete_guids();
-    assert_eq!(adopt.len(), 2);
+    assert_eq!(adopt.len(), 4, "TUN V4/V6 + server V4/V6");
     for &i in &LOCKDOWN_TUN_GUID_INDICES {
         assert!(
             adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
             "Adopt must delete the TUN permit at index {i}"
         );
     }
-    // It must NOT delete the block-all or server permits.
+    for &i in &LOCKDOWN_SERVER_GUID_INDICES {
+        assert!(
+            adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
+            "Adopt must delete the server permit at index {i}"
+        );
+    }
+    // It must NOT delete the fail-closed floor: block-all or loopback.
     assert!(
         !adopt.contains(&LOCKDOWN_FILTER_GUIDS[6]),
         "Adopt must NOT delete block-all V4"
     );
     assert!(
-        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[4]),
-        "Adopt must NOT delete the server permit"
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[7]),
+        "Adopt must NOT delete block-all V6"
     );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[0]),
+        "Adopt must NOT delete loopback V4"
+    );
+    assert!(
+        !adopt.contains(&LOCKDOWN_FILTER_GUIDS[1]),
+        "Adopt must NOT delete loopback V6"
+    );
+}
+
+#[skuld::test]
+fn adopt_drops_server_permit_so_reengage_can_update_it() {
+    // Regression: keeping the fixed-GUID server permit across an Adopt left a
+    // stale IP permitted — the next engage to a different server hits
+    // FWP_E_ALREADY_EXISTS (treated as success) and never updates the address.
+    // Adopt must drop the server GUIDs (so engage re-adds fresh) while keeping
+    // the floor (block-all + loopback + App-ID), which must survive untouched.
+    let adopt: std::collections::HashSet<GUID> = adopt_delete_guids().into_iter().collect();
+
+    // Server permits MUST be in the Adopt-delete set.
+    assert!(adopt.contains(&LOCKDOWN_FILTER_GUIDS[4]), "server V4 must be dropped");
+    assert!(adopt.contains(&LOCKDOWN_FILTER_GUIDS[5]), "server V6 must be dropped");
+
+    // The fail-closed floor MUST NOT be in the Adopt-delete set.
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[6]), "block-all V4 stays");
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[7]), "block-all V6 stays");
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[0]), "loopback V4 stays");
+    assert!(!adopt.contains(&LOCKDOWN_FILTER_GUIDS[1]), "loopback V6 stays");
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(
+            !adopt.contains(&appid_filter_guid(i, false)),
+            "App-ID floor stays (V4 #{i})"
+        );
+        assert!(
+            !adopt.contains(&appid_filter_guid(i, true)),
+            "App-ID floor stays (V6 #{i})"
+        );
+    }
 }

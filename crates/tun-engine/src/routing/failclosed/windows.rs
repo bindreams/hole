@@ -33,7 +33,7 @@ pub const FILTER_GUIDS: [GUID; 6] = [
 ];
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
-// these (Sweep) or deletes only the TUN-LUID pair (Adopt) — see
+// these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
 // `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
 // engaged is reconciled on the next start.
 // Layout: [loopback V4, loopback V6, TUN V4, TUN V6, server V4, server V6,
@@ -51,9 +51,12 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 8] = [
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
-/// pair. Adopt recovery deletes ONLY these (the LUID is dead after teardown);
-/// the next connect's engage re-adds them with a freshly-resolved LUID.
+/// pair — one of the two volatile permits Adopt drops (see
+/// [`adopt_delete_guids`]).
 const LOCKDOWN_TUN_GUID_INDICES: [usize; 2] = [2, 3]; // TUN V4, TUN V6
+/// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the server-IP permit pair — the
+/// other volatile permit Adopt drops (see [`adopt_delete_guids`]).
+const LOCKDOWN_SERVER_GUID_INDICES: [usize; 2] = [4, 5]; // server V4, server V6
 
 /// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
 /// re-engage over an unswept cover is idempotent and recovery can delete by
@@ -83,12 +86,16 @@ fn swept_lockdown_guids() -> Vec<GUID> {
     guids
 }
 
-/// The GUIDs Adopt deletes: ONLY the two stale TUN-LUID permits. Everything
-/// else (block-all, loopback, server, App-ID) stays in force so the host
-/// remains fail-closed across the restart — the crash-leak fix.
+/// The GUIDs Adopt deletes: the VOLATILE permits — the TUN-LUID pair (dies with
+/// the TUN) and the server-IP pair (changes with the server). They carry fixed
+/// keys, so engage's `ok_or_exists` would silently keep a stale one; deleting
+/// them lets the next connect re-add both fresh with current values. The floor
+/// (block-all, loopback, App-ID) is left in force so the host stays fail-closed
+/// across the restart.
 fn adopt_delete_guids() -> Vec<GUID> {
     LOCKDOWN_TUN_GUID_INDICES
         .iter()
+        .chain(LOCKDOWN_SERVER_GUID_INDICES.iter())
         .map(|&i| LOCKDOWN_FILTER_GUIDS[i])
         .collect()
 }
@@ -390,8 +397,9 @@ pub fn engage_lockdown(
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Idempotent over an unswept cover: add_provider/add_sublayer use
             // ok_or_exists, and the filter keys are fixed — a re-engage after
-            // an Adopt (which left block-all in place) re-adds only the TUN
-            // permit (its key was deleted by `recover_lockdown`).
+            // an Adopt re-adds the TUN + server permits fresh (their keys were
+            // deleted by `recover_lockdown`, so the new server IP takes effect);
+            // the kept floor (block-all + loopback + App-ID) is a benign re-add.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
@@ -628,8 +636,11 @@ impl Drop for Cover {
 }
 
 /// Reconcile a possibly-present standing lockdown cover with the persisted
-/// intent. Opens the engine; `Adopt` deletes ONLY the dead TUN-LUID permits
-/// (host stays fail-closed); `Sweep` deletes all lockdown + App-ID filters,
+/// intent. Opens the engine; `Adopt` deletes the volatile permits — the dead
+/// TUN-LUID pair and the server-IP pair — keeping the fail-closed floor
+/// (block-all + loopback + App-ID) so the host stays blocked across the restart
+/// and the next connect re-adds TUN + server fresh; `Sweep` deletes all
+/// lockdown + App-ID filters,
 /// then the sublayer/provider IFF the transient cover isn't also using them
 /// (they share PROVIDER_GUID/SUBLAYER_GUID, so leave them — the transient
 /// `delete_all` owns their removal, and an orphaned empty sublayer is benign).

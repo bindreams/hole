@@ -309,8 +309,9 @@ three axes:
   connected would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed, removing only the
-  dead TUN permit; Sweep disengages when intent is off). The transient cover
+  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
+  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
+  disengages when intent is off). The transient cover
   exists only for the sub-second cutover window.
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
