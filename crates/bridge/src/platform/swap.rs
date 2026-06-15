@@ -82,8 +82,22 @@ pub trait SwapOps {
 /// consistent set; only after the whole set commits delete the swapped-out
 /// staging. Deferring the delete is what makes the rollback possible — a swapped-
 /// out `.app` is unrecoverable once its staging is removed.
+///
+/// ROLLBACK PRECONDITION: a `PlainRename` image has no recoverable inverse (its
+/// pre-swap dest was overwritten by the new bytes), so `reswap` is a no-op for
+/// it. Rollback is therefore correct only if no `PlainRename` image is ever in
+/// the committed-and-then-rolled-back set — i.e. every `PlainRename` image must
+/// be the LAST in the plan, so a later image's failure can never strand it. The
+/// debug-assert enforces this so a future image-set growth that misplaces a
+/// `PlainRename` image fails loud instead of silently leaving a mixed set.
 pub fn execute_plan<O: SwapOps>(plan: &SwapPlan, ops: &O) -> std::io::Result<()> {
     let images = [&plan.app, &plan.helper];
+    debug_assert!(
+        images[..images.len() - 1]
+            .iter()
+            .all(|img| matches!(img.primitive, SwapPrimitive::RenameSwap)),
+        "a PlainRename image must be last (its swap has no recoverable inverse for rollback)"
+    );
     let mut committed: Vec<usize> = Vec::with_capacity(images.len());
     for (index, img) in images.iter().enumerate() {
         if let Err(e) = ops.swap(img, index) {
