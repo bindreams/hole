@@ -1,5 +1,6 @@
 """Shared fixtures for DMG installer tests."""
 
+import json
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -15,6 +16,25 @@ REPO_ROOT = dmg_installer._find_repo_root()
 # downloaded .dmg, so Gatekeeper assesses the test bundle on the same code
 # path as a real user install.
 QUARANTINE_VALUE = "0381;6a0b6446;Brave;FAKE0000-0000-0000-0000-000000000000"
+
+
+def canonical_darwin_bindir() -> set[str]:
+    """Canonical macOS BINDIR filenames, from the single source of truth.
+
+    Runs `cargo xtask bindir-names --os darwin` so the DMG payload is checked
+    against `bindir::bindir_dest_names`, not a hand-restated copy (mirrors
+    `msi-installer/tests/conftest.py::canonical_windows_bindir`). The dmg lane
+    builds via cargo, so the toolchain is present; `check=True` surfaces a
+    missing toolchain loudly rather than silently skipping.
+    """
+    out = subprocess.run(
+        ["cargo", "xtask", "bindir-names", "--os", "darwin"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return set(json.loads(out.stdout))
 
 
 @pytest.fixture(scope="module")
