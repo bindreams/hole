@@ -172,9 +172,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Clean shutdown: stop proxy before exiting
+        // Clean shutdown: stop proxy before exiting. A cutover-driven shutdown
+        // (marker present) disarms the standing cover so the persistent WFP
+        // filters survive the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        if let Err(e) = pm.stop().await {
+        let reason = shutdown_reason(hole_common::update_marker::read(&log_dir).is_some());
+        if let Err(e) = pm.stop_with(reason).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
 
@@ -199,6 +202,17 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     run_result
+}
+
+/// Map an update-in-progress marker's presence to the stop reason: present
+/// means a cutover is mid-flight, so the standing cover is disarmed (persists)
+/// rather than disengaged. Pure so the decision is table-testable.
+pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::StopReason {
+    if marker_present {
+        crate::proxy_manager::StopReason::Cutover
+    } else {
+        crate::proxy_manager::StopReason::UserStop
+    }
 }
 
 // Install/uninstall ===================================================================================================

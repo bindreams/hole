@@ -64,6 +64,13 @@ async fn serve_until_signal_returns_when_signal_fires() {
 }
 
 #[skuld::test]
+fn shutdown_reason_keys_on_marker() {
+    use crate::proxy_manager::StopReason;
+    assert_eq!(shutdown_reason(true), StopReason::Cutover);
+    assert_eq!(shutdown_reason(false), StopReason::UserStop);
+}
+
+#[skuld::test]
 fn plist_does_not_set_standard_paths() {
     // The FD-level stdio redirect in hole_common::logging::init captures
     // stdout/stderr into bridge.log; a launchd-side capture would only

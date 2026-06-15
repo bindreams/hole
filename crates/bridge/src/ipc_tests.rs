@@ -221,6 +221,10 @@ impl Drop for MockCover {
     fn drop(&mut self) {}
 }
 
+impl tun_engine::routing::CoverGuard for MockCover {
+    fn disarm(self) {}
+}
+
 struct MockRoutes {
     state_dir: PathBuf,
 }

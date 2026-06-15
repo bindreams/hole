@@ -140,6 +140,10 @@ impl Drop for StubCover {
     fn drop(&mut self) {}
 }
 
+impl tun_engine::routing::CoverGuard for StubCover {
+    fn disarm(self) {}
+}
+
 fn test_socket_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hole-fg-test-{}-{suffix}.sock", std::process::id()))
 }

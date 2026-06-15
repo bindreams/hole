@@ -14,3 +14,10 @@ fn service_display_name_is_set() {
 fn service_description_is_set() {
     assert!(!SERVICE_DESCRIPTION.is_empty());
 }
+
+#[skuld::test]
+fn shutdown_reason_keys_on_marker() {
+    use crate::proxy_manager::StopReason;
+    assert_eq!(shutdown_reason(true), StopReason::Cutover);
+    assert_eq!(shutdown_reason(false), StopReason::UserStop);
+}

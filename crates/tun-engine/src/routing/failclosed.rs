@@ -41,6 +41,18 @@ pub struct Cover {
     _inner: platform::Cover,
 }
 
+impl crate::routing::CoverGuard for Cover {
+    /// Persist the underlying filters without disengaging: consumes the guard so
+    /// its `Drop` does not run. The filters are persistent-by-design, so leaving
+    /// them in force across a cutover restart is exactly correct — the new
+    /// bridge re-adopts them. Forgetting the inner guard also skips its other
+    /// teardown (the Windows WFP engine handle close), so call only immediately
+    /// before process exit (see [`CoverGuard::disarm`]).
+    fn disarm(self) {
+        std::mem::forget(self._inner);
+    }
+}
+
 /// Engage the cover blocking all egress except loopback and `server_ip`.
 /// `state_dir` is where macOS persists its enable token for crash recovery
 /// (unused on Windows). On failure the host is left uncovered.

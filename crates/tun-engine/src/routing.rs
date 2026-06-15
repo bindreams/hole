@@ -327,6 +327,23 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
 
 // Routing trait =======================================================================================================
 
+/// A cover RAII guard that can be DISARMED — consumed without disengaging — so
+/// the persistent WFP/pf filters survive a cutover restart; the new bridge
+/// re-adopts them via `decide_cover_recovery == Adopt`. A trait (not an inherent
+/// method) because `RunningState.lockdown` holds the cover behind the
+/// `Routing::Cover` associated type, and an inherent method is not callable
+/// through that type parameter.
+pub trait CoverGuard {
+    /// Persist the underlying filters without disengaging: consume the guard so
+    /// its `Drop` (the disengage) never runs.
+    ///
+    /// PRECONDITION: call only immediately before process exit. Skipping `Drop`
+    /// also skips releasing the guard's other resources (e.g. the Windows WFP
+    /// engine handle), which the kernel reclaims on exit but which a long-lived
+    /// caller would leak per call.
+    fn disarm(self);
+}
+
 /// OS routing: install split-tunnel routes and query routing state.
 ///
 /// # Test-isolation contract
@@ -377,8 +394,9 @@ pub trait Routing: Send + Sync {
 
     /// RAII guard returned by [`install_failclosed_cover`](Self::install_failclosed_cover).
     /// Dropping it disengages the fail-closed cover. `Send` so a cutover
-    /// coordinator can hold it across `.await`.
-    type Cover: Send;
+    /// coordinator can hold it across `.await`; [`CoverGuard`] so a cutover stop
+    /// can disarm it (persist-without-disengage).
+    type Cover: Send + CoverGuard;
 
     /// Engage a fail-closed cover: block all egress except loopback and
     /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
