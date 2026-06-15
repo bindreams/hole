@@ -8,6 +8,7 @@
 //! version`) instead of being reimplemented per consumer — so the logic
 //! stays testable in one place.
 
+pub mod bindir;
 pub mod ex_ray_version;
 pub mod repo_root;
 pub mod version;

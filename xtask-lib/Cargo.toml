@@ -12,10 +12,19 @@ name = "xtask_lib"
 path = "src/lib.rs"
 harness = false
 
+[features]
+# Opt-in derives for the shared `bindir::Os` enum. `xtask` enables both (it
+# deserializes `Os` from build.yaml and exposes it as a clap arg); the bridge
+# cutover enables neither (it only needs the pure name-set fns).
+serde = ["dep:serde"]
+clap = ["dep:clap"]
+
 [dependencies]
 anyhow = "1"
 semver = "1"
 toml = "1.0"
+serde = { version = "1", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
