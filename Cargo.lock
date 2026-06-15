@@ -3015,6 +3015,7 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-pki-types",
+ "same-file",
  "serde",
  "serde_json",
  "shadowsocks",

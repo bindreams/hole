@@ -22,6 +22,9 @@ nextest-version = "0.9.130"
 #     crates/bridge/src/proxy_manager_e2e_tests.rs::e2e_none_full_tunnel_roundtrip
 #   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
+#   - `cutover_global_net_state_` prefix:
+#     crates/bridge/src/cutover/cutover_privileged_tests.rs (real cutover + SCM)
+#     crates/bridge/src/cutover/leak_privileged_tests.rs (NIC-capture leak proofs)
 # Renaming any of them WITHOUT updating this filter silently drops it from the
 # group → cross-binary data race. Verify with `cargo nextest show-config
 # test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
@@ -29,5 +32,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/cutover_global_net_state_/)'
 test-group = 'global-net-state'
