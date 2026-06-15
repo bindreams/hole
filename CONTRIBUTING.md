@@ -346,6 +346,13 @@ pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
 without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
 re-resolved every engage via `LuidResolver`.
 
+`hole bridge unlock` is the elevated escape hatch to disengage a standing cover
+when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
+Sweep, it is **fail-loud**: it disengages via `failclosed::disengage_lockdown`
+FIRST and flips the intent off only on confirmed success, returning a non-zero
+exit otherwise (e.g. run unprivileged). A swallowed failure would leave the
+cover engaged — egress still blocked — while the intent read "off".
+
 ### Config corruption recovery
 
 `ConfigStore` ([crates/common/src/config_store.rs](crates/common/src/config_store.rs))
