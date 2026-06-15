@@ -50,10 +50,13 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
     })
 }
 
-/// Sweep a cover left behind by a crashed run. Idempotent — a no-op when no
-/// cover is present. Called from `routing::recover_routes` at bridge startup.
-pub fn recover_cover(state_dir: &Path) {
-    platform::recover_cover(state_dir);
+/// Sweep a transient cover left behind by a crashed run. Idempotent — a no-op
+/// when no cover is present. Called from `routing::recover_routes` at bridge
+/// startup. When `adopting` is true a standing lockdown cover is being adopted,
+/// so the transient restore must leave the lockdown ruleset in force (macOS
+/// skips the `/etc/pf.conf` reload).
+pub fn recover_cover(state_dir: &Path, adopting: bool) {
+    platform::recover_cover(state_dir, adopting);
 }
 
 /// Engage the standing lockdown cover (loopback + TUN + onward-server + —on

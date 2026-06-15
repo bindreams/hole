@@ -211,8 +211,10 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
         // required to undo the flush — dropping only the refcount would strand
         // the host with an empty pass-all ruleset. The PR3 cutover treats an
         // engage error as fatal and aborts before stopping the old bridge, so
-        // the tunnel is never torn down uncovered.
-        disengage(&token, state_dir);
+        // the tunnel is never torn down uncovered. No standing cover is being
+        // adopted on this engage-failure path, so the `/etc/pf.conf` restore
+        // (undoing the `-Fa` flush) must run.
+        disengage(&token, state_dir, false);
         return Err(RoutingError::RouteSetup(format!(
             "pfctl load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -229,16 +231,23 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
 impl Drop for Cover {
     fn drop(&mut self) {
         match self.kind {
-            CoverKind::Transient => disengage(&self.token, &self.state_dir),
+            // A user-stop drop never has a standing cover being adopted.
+            CoverKind::Transient => disengage(&self.token, &self.state_dir, false),
             CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
         }
     }
 }
 
-/// Restore the canonical ruleset, drop our enable refcount, clear the file.
-/// Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
-fn disengage(token: &str, state_dir: &Path) {
-    if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
+/// Drop the transient enable refcount + clear the file. When `adopting` is
+/// false, also restore the canonical ruleset (the transient engage did `-Fa`,
+/// flushing host rules, so the restore is mandatory to undo the flush). When a
+/// standing cover is being adopted, skip the `/etc/pf.conf` reload — it would
+/// wipe the standing lockdown ruleset (which is the live main ruleset) before
+/// Adopt. Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
+fn disengage(token: &str, state_dir: &Path, adopting: bool) {
+    if adopting {
+        tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
+    } else if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
         tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
     }
     if let Err(e) = pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
@@ -249,7 +258,7 @@ fn disengage(token: &str, state_dir: &Path) {
     }
 }
 
-pub fn recover_cover(state_dir: &Path) {
+pub fn recover_cover(state_dir: &Path, adopting: bool) {
     let Some(st) = state::load(state_dir) else {
         tracing::debug!("no failclosed-state file, nothing to recover");
         return;
@@ -258,7 +267,7 @@ pub fn recover_cover(state_dir: &Path) {
         was_enabled = st.pf_was_enabled,
         "recovering fail-closed cover from crashed run"
     );
-    disengage(&st.pf_token, state_dir);
+    disengage(&st.pf_token, state_dir, adopting);
 }
 
 // --- lockdown layer ---

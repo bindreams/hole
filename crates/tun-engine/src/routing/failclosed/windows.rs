@@ -828,7 +828,12 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Pa
     }
 }
 
-pub fn recover_cover(_state_dir: &Path) {
+pub fn recover_cover(_state_dir: &Path, adopting: bool) {
+    // Windows is structurally safe regardless: the transient cover and the
+    // standing lockdown use disjoint WFP filter GUIDs, so deleting the transient
+    // filters cannot touch the lockdown ones (the shared sublayer/provider
+    // delete fails while the lockdown filters still pin it). No reload to skip.
+    let _ = adopting;
     unsafe {
         let mut engine = HANDLE::default();
         // FwpmEngineOpen0 returns u32 — compare to ERROR_SUCCESS.0, NOT `.is_ok()`.
