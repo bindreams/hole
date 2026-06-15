@@ -16,8 +16,9 @@ bridge, selected by CLI arguments:
   shadowsocks connection. Foreground by default; runs as a system service
   (Windows SCM / macOS launchd) with `--service`. Needs elevation.
 
-GUI ↔ bridge speak HTTP/1.1 REST (JSON) over a local Unix socket (macOS) or
-named pipe (Windows), defined by `crates/common/api/openapi.yaml`.
+GUI ↔ bridge speak HTTP/1.1 REST (JSON) over an AF_UNIX socket on both platforms
+(macOS via `tokio::net::UnixListener`, Windows via `socket2` — see
+`crates/bridge/src/socket.rs`), defined by `crates/common/api/openapi.yaml`.
 
 ### Build-time vs runtime tooling
 
@@ -250,15 +251,15 @@ they permit.
 
 `Routing::install_failclosed_cover(server_ip)` engages a leak-free egress block —
 permit loopback and the SS server IP, **block everything else** — as an RAII
-guard whose `Drop` disengages it. It exists for the leak-free in-place-update
-cutover (#468): the bridge is briefly stopped and restarted onto new code, and
-without a cover the missing split routes would let traffic egress in the clear.
-This cover holds the line across that **bounded** window regardless of
-[lockdown](#lockdown-mode); a crash mid-cutover leaves traffic **blocked, not
-leaked**. It does *not* cover an indefinite outage (a bridge that stays down,
-or any gap outside an update) — without lockdown, default-off Hole fails *open*
-there. Lockdown closes that broader gap with a standing cover that already holds
-when the cutover starts.
+guard whose `Drop` disengages it. It is a bounded-window kill switch holding the
+line regardless of [lockdown](#lockdown-mode); a crash while it is held leaves
+traffic **blocked, not leaked**. It has **no production caller today**: the
+[update cutover](#update-cutover) holds its gap with the *standing* lockdown cover
+(disarmed across the restart), not a transient one, and a lockdown-off cutover
+fails *open* by design. The trait method + RAII guard stay for the test seam and
+as the recovery target swept on every start. It does *not* cover an indefinite
+outage (a bridge that stays down) — without lockdown, default-off Hole fails
+*open* there; lockdown closes that broader gap.
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -352,6 +353,48 @@ Sweep, it is **fail-loud**: it disengages via `failclosed::disengage_lockdown`
 FIRST and flips the intent off only on confirmed success, returning a non-zero
 exit otherwise (e.g. run unprivileged). A swallowed failure would leave the
 cover engaged — egress still blocked — while the intent read "off".
+
+### Update cutover
+
+`POST /v1/update-apply` ([`cutover/apply.rs`](crates/bridge/src/cutover/apply.rs))
+swaps the bridge's own running binary and restarts the service in place. The GUI
+already minisign-verified the MSI/DMG on download; the handler re-checks the
+payload, then writes the marker, extracts the bare binaries, and dispatches the
+OS actor. A lockdown-off update **requires `consent: true`** (the enforcement
+seam — a brief leak is accepted only with informed consent); under lockdown-on
+the standing cover holds the gap, so consent is moot.
+
+Leak-correctness rides the **standing lockdown cover**, not a transient one. The
+bridge's marker-conditional shutdown sees the marker and `disarm`s the cover
+(persist-without-disengage via `std::mem::forget`) instead of dropping it, so the
+WFP/pf filters survive the restart and the new bridge re-adopts them
+(`decide_cover_recovery == Adopt`). `plan_cutover` structurally never engages a
+transient cover (the Mullvad-#8470 brick); a lockdown-off cutover is a plain
+restart that fails *open*.
+
+The **swap is rename-away-then-move-in** and **all-or-nothing**: the live binary
+is renamed aside (`std::fs::rename` uses POSIX semantics, renaming a running exe
+held `FILE_SHARE_DELETE`; macOS `.app` via `renamex_np(RENAME_SWAP)`) and the
+staged new bytes move onto the freed canonical path, flipping `same_file::Handle`
+identity so the GUI self-heal returns Relaunch. The swap covers the **full BINDIR
+set** (every bundled binary, not just `hole.exe`); a mid-set failure rolls the
+committed swaps back to the prior consistent set before erroring, so the service
+never boots a mixed old/new mix (the destructive delete of swapped-out images is
+deferred until the whole set commits, which is what makes the rollback possible).
+
+The restart is **OS-asymmetric**. Windows spawns a detached LocalSystem
+`hole bridge cutover` child (a service cannot SCM-restart itself) that
+stops → swaps → starts via `NotifyServiceStatusChange` (a real kernel rendezvous,
+gated on a RUNNING callback, never a sleep or loopback probe). macOS runs inline:
+swap first, then `launchctl kill SIGTERM` rides the graceful shutdown
+(`pm.stop()` → the marker-conditional disarm fires), and `KeepAlive=true`
+respawns the now-swapped binary.
+
+The **marker** (`update-in-progress.json` in the service log dir, world-readable
+0o644 cross-privilege) does triple duty: the GUI holds its last snapshot instead
+of flashing Disconnected while it is set, the bridge shutdown disarms the cover
+while it is set, and it is the PR3 banner source. It is cleared unconditionally
+(remove-by-path) on the next bridge's post-bind sweep.
 
 ### Config corruption recovery
 
@@ -456,8 +499,8 @@ dev/snapshot builds.
 **One-time caveat:** a GUI built *before* this feature has no self-heal logic,
 so the *first* upgrade-to-this-version can run a stale GUI against the new
 bridge until the user restarts it — benign because the change is purely
-additive (the IPC contract is preserved). The bridge cutover that *produces*
-the mismatch leak-free is a follow-up PR.
+additive (the IPC contract is preserved). The leak-free bridge swap that
+*produces* the mismatch is the [update cutover](#update-cutover).
 
 ## Workspace layout
 
