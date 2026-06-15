@@ -4,12 +4,17 @@
 //! FWPM; macOS: live pf) and assert it actually blocks egress — proving the kill
 //! switch is not inert.
 //!
-//! They run on the elevated `hole-tests` TUN lane only: the `TUN` label (→
-//! skuld filter name `tun`) gates them so the unprivileged `SKULD_LABELS="!tun"`
-//! pass excludes them and the elevated `SKULD_LABELS="tun"` pass (Windows in CI)
-//! runs them. They are NOT `#[ignore]`d and do not skip on missing privilege —
-//! a default `cargo nextest` run on an unelevated box runs them and fails loud;
-//! opting out is the explicit `!tun` filter, and CI provisions the elevation.
+//! They run on the elevated `tun` lane only: the `TUN` label (→ skuld filter
+//! name `tun`) gates them so the unprivileged `SKULD_LABELS="!tun"` pass
+//! excludes them and the `SKULD_LABELS="tun"` pass runs them — Windows under
+//! CI's elevated token, macOS under `sudo` (pf needs root). They are NOT
+//! `#[ignore]`d and do not skip on missing privilege: a default `cargo nextest`
+//! run on an unelevated box runs them and fails loud; opting out is the explicit
+//! `!tun` filter, and CI provisions the elevation.
+//!
+//! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
+//! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
+//! `serial = TUN` only serializes within one binary.
 
 use super::*;
 
@@ -24,8 +29,9 @@ const TUN: skuld::Label;
 /// The LUID is resolved for the host's loopback adapter ("Loopback
 /// Pseudo-Interface 1") purely to drive the real `ConvertInterfaceAliasToLuid`
 /// + `LocalInterface` filter path; the block assertion does not depend on a
-/// live `hole-tun`. Serial on `TUN`: a single WFP sublayer is shared, and a
-/// concurrent transient-cover test would race the egress assertion.
+/// live `hole-tun`. `serial = TUN` serializes against other in-binary TUN
+/// tests; the cross-binary race with the bridge's real-egress e2e is handled by
+/// the `global-net-state` test-group (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn windows_lockdown_blocks_egress_and_permits_loopback() {
@@ -73,9 +79,12 @@ fn windows_lockdown_blocks_egress_and_permits_loopback() {
 ///
 /// No live utun is needed for the block assertion: `pass out quick on
 /// <tun-absent>` simply never matches, so a probe to an arbitrary IP is blocked
-/// by `block drop out quick all`. Serial on `TUN`: `pfctl -E`/`-X` is
-/// refcounted and the main ruleset is process-global; a concurrent cover test
-/// would race the snapshot restore.
+/// by `block drop out quick all`. `serial = TUN` + the `global-net-state`
+/// test-group serialize the process-global pf state: `pfctl -E`/`-X` is
+/// refcounted and the main ruleset is host-wide, so a concurrent cover test
+/// would race the snapshot restore. (On macOS only this binary carries a TUN
+/// test — the bridge TUN e2e is `cfg(windows)` — so the group is single-member,
+/// but it costs nothing.)
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn macos_lockdown_actually_blocks_and_restores() {

@@ -2,3 +2,20 @@
 # which garter's tests use to locate the mock-plugin fixture bin. See
 # bindreams/hole#496 and crates/garter/tests/common/mod.rs.
 nextest-version = "0.9.130"
+
+# Cross-binary serialization for tests that mutate GLOBAL OS network state
+# (real WFP filters / pf rules / TUN routes). skuld's `serial = TUN` only
+# serializes within ONE test binary, but the Windows TUN lane runs the
+# `hole-bridge` and `tun-engine` binaries concurrently — the bridge's
+# `*_full_tunnel_roundtrip` e2e drives live egress while the tun-engine
+# `windows_lockdown_*` test holds a system-wide block-all WFP cover, so without
+# this they race on global state. `max-threads = 1` makes nextest run the whole
+# group on one thread across binaries. macOS is unaffected (the bridge TUN
+# tests are `cfg(windows)`), but the lockdown pf test joins the group for free.
+# Add any new real-engage/real-TUN test here when introduced.
+[test-groups.global-net-state]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/_lockdown_blocks_egress_/) + test(/_lockdown_actually_blocks_/)'
+test-group = 'global-net-state'
