@@ -31,9 +31,6 @@ mod bindir_tests;
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
 #[cfg(test)]
-#[path = "external_bin_tests.rs"]
-mod external_bin_tests;
-#[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
 #[cfg(test)]
@@ -45,6 +42,9 @@ mod orchestrate_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
+#[cfg(test)]
+#[path = "tauri_bundle_tests.rs"]
+mod tauri_bundle_tests;
 #[cfg(test)]
 #[path = "test_binaries_tests.rs"]
 mod test_binaries_tests;

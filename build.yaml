@@ -107,8 +107,19 @@ targets:
     # exists before `npx tauri build` runs — see the frontend-build note.
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
-    # `-v` surfaces the hdiutil stderr tauri-bundler otherwise swallows (#446).
-    build: npx tauri build -v
+    build:
+      # Stage hole.dSYM for `bundle.macOS.files`. cargo's `split-debuginfo =
+      # "packed"` emits target/release/hole.dSYM as a SYMLINK into
+      # deps/<hash>.dSYM; the tauri bundler copies macOS.files verbatim and ships
+      # a symlink root as-is, so it would dangle in the .app. Build first, then
+      # dereference (`cp -RL`) into a real directory under .cache — the same
+      # place externalBin sidecars are staged, and a stable path (relative to the
+      # build's repo-root CWD) that `bundle.macOS.files` points at. `npx tauri
+      # build`'s own release build is then an incremental no-op.
+      - cargo build --release -p hole
+      - rm -rf .cache/hole.dSYM && cp -RL target/release/hole.dSYM .cache/hole.dSYM
+      # `-v` surfaces the hdiutil stderr tauri-bundler otherwise swallows (#446).
+      - npx tauri build -v
 
   hole-dmg-tests:
     # Pytest harness that asserts the produced .app's code signature is

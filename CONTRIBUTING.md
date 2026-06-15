@@ -547,8 +547,22 @@ cd msi-installer && uv run --group dev pytest -v   # WiX source + MSI build vali
 
 ```sh
 cargo xtask build hole-dmg       # produces .dmg (npx tauri build under the hood)
-cargo xtask run hole-dmg-tests   # mount + assert .app code signature is intact
+cargo xtask run hole-dmg-tests   # mount + assert payload + code signature are intact
 ```
+
+The DMG does not use `cargo xtask stage`; Tauri bundles the canonical BINDIR via
+`crates/hole/tauri.conf.json` — `externalBin` (plugin sidecars → `Contents/MacOS/`),
+`resources` (`NOTICES.md` → `Contents/Resources/`), and `macOS.files` (`hole.dSYM`
+→ `Contents/MacOS/hole.dSYM`). The dSYM ships **next to the binary** because std's
+backtrace symbolizer locates a `*.dSYM` by scanning the running binary's directory
+and matching its Mach-O UUID — so production panic backtraces resolve frame names +
+line numbers (the Windows `hole.pdb` analog; see #393). `bundle.macOS.files` is
+bundle-time-only (not validated by `tauri_build::build()` like `resources`), so the
+dSYM — the build's own output — needs no `build.rs` stub. cargo's `split-debuginfo = "packed"` emits `target/release/hole.dSYM` as a *symlink* into `deps/`, which the
+bundler would ship dangling; the `hole-dmg` build dereferences it into `.cache/`
+(the source `macOS.files` points at) before bundling. The `hole-dmg-tests` pytest
+derives its expected payload from `cargo xtask bindir-names --os darwin`, so the
+Tauri config can't silently drift.
 
 ## Development
 
