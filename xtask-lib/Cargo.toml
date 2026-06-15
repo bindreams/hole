@@ -13,6 +13,11 @@ path = "src/lib.rs"
 harness = false
 
 [features]
+# Group-version computation (`version`/`ex_ray_version`), which pulls `toml` +
+# `semver`. Off by default so a `bindir`/`repo_root`-only consumer — the SYSTEM/
+# root bridge cutover — links neither. The build.rs version stamps + xtask
+# enable it.
+version = ["dep:semver", "dep:toml"]
 # Opt-in derives for the shared `bindir::Os` enum. `xtask` enables both (it
 # deserializes `Os` from build.yaml and exposes it as a clap arg); the bridge
 # cutover enables neither (it only needs the pure name-set fns).
@@ -21,8 +26,8 @@ clap = ["dep:clap"]
 
 [dependencies]
 anyhow = "1"
-semver = "1"
-toml = "1.0"
+semver = { version = "1", optional = true }
+toml = { version = "1.0", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
