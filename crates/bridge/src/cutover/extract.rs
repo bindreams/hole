@@ -26,13 +26,14 @@ pub fn reverify(payload_path: &Path) -> std::io::Result<()> {
 }
 
 /// Staged binaries extracted onto the destination volume, ready to rename-swap.
+///
+/// Windows carries only the staging dir: the detached cutover child re-finds
+/// every bundled binary by name under it, so individual staged paths aren't
+/// threaded here.
 #[derive(Debug, Clone)]
 pub struct ExtractedImages {
     /// Directory on the destination volume holding the extracted binaries.
     pub staging_dir: PathBuf,
-    /// The staged `hole.exe`.
-    #[cfg(target_os = "windows")]
-    pub exe: PathBuf,
     /// The staged `Hole.app` bundle.
     #[cfg(target_os = "macos")]
     pub app: PathBuf,
@@ -42,7 +43,7 @@ pub struct ExtractedImages {
 }
 
 /// Build the Windows `msiexec /a` admin-install args that extract the MSI's
-/// payload (including `hole.exe`) to `target_dir`. Quiet (`/qn`) so no UI.
+/// full payload (every bundled binary) to `target_dir`. Quiet (`/qn`) so no UI.
 #[cfg(target_os = "windows")]
 pub fn msiexec_admin_args(msi: &Path, target_dir: &Path) -> Vec<String> {
     vec![
@@ -56,7 +57,8 @@ pub fn msiexec_admin_args(msi: &Path, target_dir: &Path) -> Vec<String> {
 /// Extract the bare binaries onto the destination volume.
 ///
 /// Windows: `msiexec /a` admin-install of the MSI into a staging dir on the same
-/// volume as the install dir, then locate `hole.exe` under it. macOS: `hdiutil
+/// volume as the install dir (the cutover re-finds each bundled binary under
+/// it). macOS: `hdiutil
 /// attach` the DMG, copy the `.app` onto the destination volume (the DMG mount
 /// is a separate volume → `EXDEV`), then detach.
 pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<ExtractedImages> {
@@ -76,7 +78,7 @@ pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<Ex
 }
 
 #[cfg(target_os = "windows")]
-pub use imp_windows::find_staged_exe;
+pub use imp_windows::{find_staged, find_staged_exe};
 
 #[cfg(target_os = "windows")]
 mod imp_windows {
@@ -89,12 +91,17 @@ mod imp_windows {
     /// Canonical binary the swap pivots on.
     pub const EXE_NAME: &str = "hole.exe";
 
-    /// Locate the staged `hole.exe` under a staging dir (the detached `bridge
-    /// cutover` child receives only the staging dir path, so it re-finds the exe).
+    /// Locate `name` under a staging dir, erroring if absent (the detached
+    /// `bridge cutover` child receives only the staging dir path, so it re-finds
+    /// each bundled binary by name).
+    pub fn find_staged(staging_dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+        find_file(staging_dir, name)?
+            .ok_or_else(|| std::io::Error::other(format!("{name} not found in staged payload under {staging_dir:?}")))
+    }
+
+    /// Locate the staged `hole.exe` — the payload-present fail-closed check.
     pub fn find_staged_exe(staging_dir: &Path) -> std::io::Result<PathBuf> {
-        find_file(staging_dir, EXE_NAME)?.ok_or_else(|| {
-            std::io::Error::other(format!("{EXE_NAME} not found in staged payload under {staging_dir:?}"))
-        })
+        find_staged(staging_dir, EXE_NAME)
     }
 
     /// Extract into a staging dir guaranteed to be on the SAME volume as the
@@ -125,8 +132,9 @@ mod imp_windows {
             )));
         }
 
-        let exe = find_staged_exe(&staging_dir)?;
-        Ok(ExtractedImages { staging_dir, exe })
+        // Fail-closed: confirm hole.exe is present before the irreversible swap.
+        find_staged_exe(&staging_dir)?;
+        Ok(ExtractedImages { staging_dir })
     }
 
     /// Find `name` anywhere under `root` (an MSI lays out files into a versioned

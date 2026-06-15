@@ -3039,6 +3039,7 @@ dependencies = [
  "windows 0.62.2",
  "windows-service",
  "xtask",
+ "xtask-lib",
 ]
 
 [[package]]

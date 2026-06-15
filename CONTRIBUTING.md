@@ -656,8 +656,8 @@ Windows) matching the installed `Program Files\hole\bin\`. The bridge must be
 staged out of the cargo target dir because the running bridge file-locks its own
 exe; the plugin sidecars must be siblings so `resolve_plugin_path_inner` finds
 them. The canonical file list (the single source of truth, per-OS) is
-[`bindir_dest_names`](xtask/src/bindir.rs); the installer manifests are checked
-against it by conformance tests (`cargo xtask bindir-names`).
+[`bindir_dest_names`](xtask-lib/src/bindir.rs); the installer manifests are
+checked against it by conformance tests (`cargo xtask bindir-names`).
 
 ### Flags
 

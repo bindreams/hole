@@ -41,25 +41,43 @@ pub fn service_state_dir() -> PathBuf {
 #[cfg(target_os = "windows")]
 pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()> {
     use crate::cutover::os::run_cutover;
-    use crate::cutover::os::windows::{ImageMove, WindowsCutoverOs};
+    use crate::cutover::os::windows::WindowsCutoverOs;
 
     let install_dir = std::env::current_exe()?
         .parent()
         .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
         .to_path_buf();
-    let staged_exe = extract::find_staged_exe(payload)?;
-    let exe_name = staged_exe
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("staged exe has no filename"))?;
-    let images = vec![ImageMove {
-        installed: install_dir.join(exe_name),
-        staged: staged_exe.clone(),
-    }];
+    let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
+    let images = plan_windows_images(&install_dir, payload, &names)?;
     let mut os = WindowsCutoverOs {
         images,
         target_version: target_version.to_string(),
     };
     run_cutover(&mut os)
+}
+
+/// Build the rename-swap plan for every bundled binary: each `name` maps from
+/// its staged copy under `payload` to its canonical path in `install_dir`.
+/// `names` is the single source of truth (`bindir_dest_names`), so a release
+/// that updates the plugin/driver swaps them too — not just `hole.exe`. Loaded
+/// DLLs (wintun.dll) and the running plugin exe rename-swap fine via the same
+/// FILE_SHARE_DELETE POSIX-rename path as `hole.exe`; no special handling.
+#[cfg(target_os = "windows")]
+fn plan_windows_images(
+    install_dir: &Path,
+    payload: &Path,
+    names: &[String],
+) -> std::io::Result<Vec<crate::cutover::os::windows::ImageMove>> {
+    use crate::cutover::os::windows::ImageMove;
+
+    let mut images = Vec::with_capacity(names.len());
+    for name in names {
+        images.push(ImageMove {
+            installed: install_dir.join(name),
+            staged: extract::find_staged(payload, name)?,
+        });
+    }
+    Ok(images)
 }
 
 #[cfg(not(target_os = "windows"))]

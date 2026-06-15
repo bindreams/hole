@@ -12,7 +12,8 @@ use crate::platform::os::SERVICE_NAME;
 /// One image to rename-away-then-move-in: the live binary at `installed` is
 /// renamed aside, then the staged new bytes are moved onto `installed`.
 pub struct ImageMove {
-    /// Canonical installed path (e.g. the Program Files `hole.exe`/galoshes).
+    /// Canonical installed path (e.g. the Program Files `hole.exe`, galoshes,
+    /// wintun.dll).
     pub installed: PathBuf,
     /// New image staged on the SAME volume as `installed` (cross-volume rename
     /// fails / copies, breaking the running-image swap).
@@ -20,7 +21,8 @@ pub struct ImageMove {
 }
 
 pub struct WindowsCutoverOs {
-    /// Every bundled binary to swap (hole.exe + galoshes), in order.
+    /// Every bundled binary to swap (the full BINDIR set: hole.exe, plugins,
+    /// wintun.dll, debug symbols, NOTICES), in order.
     pub images: Vec<ImageMove>,
     /// Target version, used for the `.old-<ver>` rename-away name.
     pub target_version: String,
