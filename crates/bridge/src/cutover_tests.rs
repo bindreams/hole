@@ -70,6 +70,25 @@ fn find_staged_exe_errs_when_absent() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
+fn find_staged_terminates_through_a_directory_symlink_cycle() {
+    // A directory-symlink cycle must not recurse forever (stack overflow).
+    // root/sub/loop -> root is self-referential; the visited-set guard breaks it
+    // and the search still finds the file in a sibling dir.
+    let root = tempfile::tempdir().unwrap();
+    let sub = root.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    // sub/loop -> root: descending into `loop` re-enters root → a cycle.
+    std::os::windows::fs::symlink_dir(root.path(), sub.join("loop")).unwrap();
+    let target = root.path().join("PFiles");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("hole.exe"), b"stub").unwrap();
+
+    let found = extract::find_staged(root.path(), "hole.exe").unwrap();
+    assert_eq!(found.file_name().unwrap(), "hole.exe");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
 fn plan_windows_images_covers_full_bindir_set() {
     use std::collections::BTreeSet;
 

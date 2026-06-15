@@ -138,12 +138,32 @@ mod imp_windows {
     }
 
     /// Find `name` anywhere under `root` (an MSI lays out files into a versioned
-    /// subtree, so the exe is not at a fixed depth).
+    /// subtree, so the exe is not at a fixed depth). Guards against directory
+    /// symlink cycles: `is_dir()` follows symlinks, so a cycle would otherwise
+    /// recurse forever — a `visited` set of canonical paths breaks it. This is a
+    /// cycle BREAK, not a depth cap (the tree is otherwise traversed in full).
     fn find_file(root: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
-        for entry in std::fs::read_dir(root)? {
+        let mut visited = std::collections::HashSet::new();
+        find_file_inner(root, name, &mut visited)
+    }
+
+    fn find_file_inner(
+        dir: &Path,
+        name: &str,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> std::io::Result<Option<PathBuf>> {
+        // Dedup on the resolved identity so a symlink back to an ancestor is a
+        // no-op the second time. A dir we cannot canonicalize is left untraversed.
+        let Ok(canon) = std::fs::canonicalize(dir) else {
+            return Ok(None);
+        };
+        if !visited.insert(canon) {
+            return Ok(None);
+        }
+        for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
             if path.is_dir() {
-                if let Some(found) = find_file(&path, name)? {
+                if let Some(found) = find_file_inner(&path, name, visited)? {
                     return Ok(Some(found));
                 }
             } else if path.file_name().is_some_and(|f| f == name) {
