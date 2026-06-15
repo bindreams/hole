@@ -172,6 +172,10 @@ struct MockRoutingState {
     lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
+    /// Ordered record of teardown events ("routes" / "lockdown") so a test can
+    /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
+    /// both `MockRoutes` and `MockCover` clone.
+    teardown_order: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl Default for MockRoutingState {
@@ -186,6 +190,7 @@ impl Default for MockRoutingState {
             lockdown_engage_calls: AtomicU32::new(0),
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
+            teardown_order: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -317,6 +322,7 @@ struct MockRoutes {
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.teardown_order.lock().unwrap().push("routes");
         let _ = route_state::clear(&self.state_dir);
     }
 }
@@ -333,6 +339,7 @@ impl Drop for MockCover {
     fn drop(&mut self) {
         if self.lockdown {
             self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.teardown_order.lock().unwrap().push("lockdown");
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -933,6 +940,34 @@ fn lockdown_engage_failure_is_fatal_and_tears_down() {
         assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
         assert!(pm.last_error().is_some());
+    });
+}
+
+#[skuld::test]
+fn lockdown_engage_failure_tears_down_routes_only() {
+    // Fail-FATAL engage: routes were installed (engage runs after install) then the
+    // `?` on install_lockdown unwinds the locally-owned `routes` guard. The lockdown
+    // cover is never constructed (the `?` fires before the `lockdown` binding
+    // completes), so the ordered recorder must show exactly one teardown — "routes" —
+    // and the cover disengage counter must stay at zero. (On a clean stop the order
+    // is the reverse — routes then lockdown — by design; see ProxyManager::stop.)
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(err.to_string().contains("mock lockdown failure"));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes"],
+            "engage failure tears down routes only; no cover was created"
+        );
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
     });
 }
 
