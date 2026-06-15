@@ -132,6 +132,7 @@ const ID_AUTOSTART: &str = "autostart";
 const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
 const ID_INSTALL_UPDATE: &str = "install_update";
+const ID_LOCKDOWN: &str = "lockdown";
 
 // Window menu ---------------------------------------------------------------------------------------------------------
 const ID_WINDOW_IMPORT: &str = "window_import";
@@ -144,17 +145,30 @@ const ID_COLLECT_LOGS: &str = "window_collect_logs";
 
 // Tray creation =======================================================================================================
 
+/// Tray label for the lockdown toggle from the (enabled, active) snapshot.
+/// `enabled && !active` is a warning state — never silent green (#527).
+fn lockdown_menu_label(enabled: bool, active: bool) -> String {
+    match (enabled, active) {
+        (true, true) => "Lockdown: On".into(),
+        (true, false) => "Lockdown: On (warning: not engaged)".into(),
+        (false, _) => "Lockdown".into(),
+    }
+}
+
 /// Build the tray menu, optionally including an "Install Update" item.
 ///
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
 /// never persisted config — #462); `transition` is an in-flight
 /// connect/disconnect target, rendered as Connecting…/Disconnecting…
-/// with the action item disabled.
+/// with the action item disabled. `lockdown_enabled`/`lockdown_active` render
+/// the standing kill-switch toggle (#527).
 fn build_tray_menu(
     app: &AppHandle,
     update: Option<&hole::update::UpdateInfo>,
     running: bool,
     transition: Option<bool>,
+    lockdown_enabled: bool,
+    lockdown_active: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     let status_text = match (transition, running) {
         (Some(true), _) => "Connecting...",
@@ -173,6 +187,16 @@ fn build_tray_menu(
     let status = MenuItem::with_id(app, ID_STATUS, status_text, false, None::<&str>)?;
     let connect = MenuItem::with_id(app, action_id, action_text, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
+    // Checked tracks intent; the warning label covers the enabled-but-inactive
+    // state since a checkmark alone can't signal "armed but not engaged".
+    let lockdown = CheckMenuItem::with_id(
+        app,
+        ID_LOCKDOWN,
+        lockdown_menu_label(lockdown_enabled, lockdown_active),
+        true,
+        lockdown_enabled,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(app, ID_SETTINGS, "Dashboard...", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -194,6 +218,7 @@ fn build_tray_menu(
                 &connect,
                 &sep1,
                 &autostart,
+                &lockdown,
                 &settings,
                 &sep2,
                 &update_item,
@@ -202,7 +227,10 @@ fn build_tray_menu(
             ],
         )
     } else {
-        tauri::menu::Menu::with_items(app, &[&status, &connect, &sep1, &autostart, &settings, &sep2, &exit])
+        tauri::menu::Menu::with_items(
+            app,
+            &[&status, &connect, &sep1, &autostart, &lockdown, &settings, &sep2, &exit],
+        )
     }
 }
 
@@ -238,9 +266,16 @@ fn sync_autostart_state(app: &AppHandle, menu: &tauri::menu::Menu<tauri::Wry>) {
 /// over no tunnel (#462); the status reconciler's immediate first tick
 /// corrects the genuine bridge-survived-a-GUI-crash case.
 pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
-    let running = app.state::<AppState>().proxy_snapshot().running;
-    let menu = build_tray_menu(app.handle(), None, running, None)?;
-    let icon = tray_icons::tray_image(running.into());
+    let snap = app.state::<AppState>().proxy_snapshot();
+    let menu = build_tray_menu(
+        app.handle(),
+        None,
+        snap.running,
+        None,
+        snap.lockdown_enabled,
+        snap.lockdown_active,
+    )?;
+    let icon = tray_icons::tray_image(snap.running.into());
 
     #[allow(unused_mut)]
     let mut builder = TrayIconBuilder::with_id("main")
@@ -287,7 +322,14 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
         let update_info = update_state.rx.borrow().clone();
         let snap = handle.state::<AppState>().proxy_snapshot();
         let transition = handle.state::<TransitionSlot>().target();
-        match build_tray_menu(&handle, update_info.as_ref(), snap.running, transition) {
+        match build_tray_menu(
+            &handle,
+            update_info.as_ref(),
+            snap.running,
+            transition,
+            snap.lockdown_enabled,
+            snap.lockdown_active,
+        ) {
             Ok(menu) => {
                 sync_autostart_state(&handle, &menu);
                 // Sanctioned `set_menu` site: the one ordered commit point
@@ -555,6 +597,24 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 handle_install_update_from_tray(app_handle).await;
+            });
+        }
+        ID_LOCKDOWN => {
+            // muda flipped the checkmark before this handler ran. The desired
+            // intent is the inverse of the snapshot we rendered from. The
+            // bridge is the authority (last-writer-wins); send intent, re-fetch
+            // Status (which commits the new lockdown fields into the snapshot),
+            // then rebuild from the authoritative reply.
+            let desired = !app.state::<AppState>().proxy_snapshot().lockdown_enabled;
+            info!(desired, "tray: lockdown toggled");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                if let Err(e) = state.bridge_send(BridgeRequest::SetLockdown { enabled: desired }).await {
+                    error!(error = %e, "tray: SetLockdown failed");
+                }
+                let _ = state.bridge_send(BridgeRequest::Status).await; // commits new snapshot
+                rebuild_tray_menu(&app_handle);
             });
         }
         _ => {}

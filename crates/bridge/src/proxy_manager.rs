@@ -41,6 +41,7 @@ use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{Routing, SystemRouting};
 
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
@@ -103,6 +104,8 @@ pub enum ProxyState {
 /// 3. `plugin_chain` drop — graceful stop via SIGTERM/CTRL_BREAK.
 /// 4. `proxy.stop().await` — releases SS task.
 /// 5. `routes` drop — RAII teardown.
+/// 6. `lockdown` drop — disengage standing cover (user-approved stop opens
+///    the host). Last so the persistent filters outlive routes by Drop order.
 ///
 /// `None` fields for SocksOnly mode where routing / dispatcher / DNS are
 /// skipped, or when no plugin is configured.
@@ -125,6 +128,11 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     /// Installed routes. `None` in SocksOnly mode.
     #[allow(dead_code)]
     routes: Option<R::Installed>,
+    /// Standing lockdown cover, engaged only when intent is on (#527). `None`
+    /// when lockdown is off — then behavior is byte-identical to today. Read by
+    /// `lockdown_active()`; disengaged in `stop()` after routes tear down (its
+    /// Drop is the catastrophic safety net).
+    lockdown: Option<R::Cover>,
     /// Handle on the running proxy. Drop aborts the task (best-effort);
     /// supported graceful shutdown is via `stop().await` from
     /// [`ProxyManager::stop`].
@@ -342,6 +350,36 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.ipv6_bypass_available
     }
 
+    /// Whether a standing lockdown cover is currently engaged (the `active`
+    /// signal). Distinct from the persisted intent (`enabled`).
+    pub fn lockdown_active(&self) -> bool {
+        self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
+    }
+
+    /// Whether the standing kill switch intent is on (from `bridge-lockdown.json`).
+    /// Default-off when there is no state_dir or no file.
+    pub fn lockdown_enabled(&self) -> bool {
+        self.state_dir
+            .as_deref()
+            .map(lockdown_state::load_enabled)
+            .unwrap_or(false)
+    }
+
+    /// Last-writer-wins absolute set of the lockdown intent. Persists to
+    /// `bridge-lockdown.json`. ERRORS when there is no state_dir: the bridge
+    /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
+    /// a fail-open footgun — the GUI would believe lockdown is armed when
+    /// nothing was written).
+    pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
+        let dir = self.state_dir.as_deref().ok_or_else(|| {
+            ProxyError::Runtime(std::io::Error::other(
+                "cannot set lockdown intent: bridge has no state_dir to persist it",
+            ))
+        })?;
+        lockdown_state::set_enabled(dir, enabled)
+            .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    }
+
     /// Non-cancellable convenience wrapper around
     /// [`start_cancellable`](Self::start_cancellable). Equivalent to
     /// passing a fresh, never-signaled `CancellationToken`. Used by
@@ -460,13 +498,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `Err(ProxyError::Cancelled)` cooperatively. Earlier RAII guards
     /// drop in reverse-declaration order when the function returns Err,
     /// tearing down anything that was constructed before the cancel
-    /// observation:
+    /// observation (listed in declaration order — later items drop first):
     ///
     /// 1. `PluginChain` — on drop, cancels its garter token and clears
     ///    the plugin state file.
     /// 2. `P::Running` — on drop, aborts the spawned proxy task.
     /// 3. `R::Installed` — on drop, tears down routes and clears the
     ///    crash-recovery state file.
+    /// 4. `Option<R::Cover>` (lockdown) — declared last, so it drops first,
+    ///    before `R::Installed`; disengages the standing cover (only `Some`
+    ///    when intent is on and engage already succeeded). On the fail-FATAL
+    ///    engage `?` it is never constructed, so only `R::Installed` tears down.
     ///
     /// Per-phase cancellation strategy:
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
@@ -623,6 +665,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 dispatcher: None,
                 plugin_chain,
                 routes: None,
+                lockdown: None,
                 proxy: running_proxy,
                 server_ip: None,
                 started_at: Instant::now(),
@@ -773,6 +816,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
+        // Standing lockdown cover (#527). Engaged only when intent is on; when
+        // off this whole block is a no-op and the start is byte-identical to
+        // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
+        // and BEFORE Dns::apply, so the line is held the moment routes go live.
+        // FAIL-FATAL: an engage error under intent-on aborts the start; the
+        // locally-owned `routes` guard (declared above) Drops on the Err
+        // unwind, tearing down — the opposite of the transient cover's
+        // fail-open. Committed only on the Ok path (the field below).
+        let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
+            let app_ids = lockdown_app_ids(config);
+            Some(routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids)?)
+        } else {
+            None
+        };
+
         // Phase 7: apply system DNS AFTER routes install so the OS
         // "best-route to DNS server" lookup resolves through the TUN.
         // We advertise the configured upstream resolver IPs — OS UDP/53 to
@@ -818,6 +876,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             dispatcher,
             plugin_chain,
             routes: Some(routes),
+            lockdown,
             proxy: running_proxy,
             server_ip: Some(server_ip),
             started_at: Instant::now(),
@@ -837,6 +896,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             plugin_chain,
             proxy,
             routes,
+            lockdown,
             server_ip: _,
             started_at: _,
             udp_proxy_available: _,
@@ -870,6 +930,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // 4. Routes tear down via RAII Drop.
         drop(routes);
+
+        // 5. Disengage the standing lockdown cover (user-approved stop opens
+        // the host; the cutover-stop exception is PR2). Dropping the guard
+        // disengages it (Windows: delete WFP filters; macOS: restore pf).
+        drop(lockdown);
 
         // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
         // related references remain in either layer. Cheap and
@@ -1023,6 +1088,35 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
     match mode {
         TunnelMode::Full => "full",
         TunnelMode::SocksOnly => "socks_only",
+    }
+}
+
+/// The process image paths the Windows lockdown cover permits by App-ID: the
+/// resolved plugin binary (if a plugin is configured) and the bridge's own exe.
+/// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
+/// survives a cutover rename.
+fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = config;
+        Vec::new()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut ids: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ref plugin) = config.server.plugin {
+            ids.push(std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path(
+                plugin,
+            )));
+        }
+        match std::env::current_exe() {
+            Ok(exe) => ids.push(exe),
+            // The bridge's own egress still rides the server-IP permit, so a
+            // missing exe path narrows but does not break the cover. Warn so a
+            // bug report carries the shrunken-permit-set signal.
+            Err(e) => warn!(error = %e, "lockdown: current_exe() failed; bridge App-ID permit omitted"),
+        }
+        ids
     }
 }
 

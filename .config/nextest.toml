@@ -2,3 +2,32 @@
 # which garter's tests use to locate the mock-plugin fixture bin. See
 # bindreams/hole#496 and crates/garter/tests/common/mod.rs.
 nextest-version = "0.9.130"
+
+# Cross-binary serialization for tests that mutate GLOBAL OS network state
+# (real WFP filters / pf rules / TUN routes). skuld's `serial = TUN` only
+# serializes within ONE test binary, but the Windows TUN lane runs the
+# `hole-bridge` and `tun-engine` binaries concurrently — the bridge's
+# `e2e_none_full_tunnel_roundtrip` e2e drives live egress while the tun-engine
+# `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
+# system-wide block-all WFP cover, so without this they race on global state.
+# `max-threads = 1` makes nextest run the whole group on one thread across
+# binaries. On macOS the bridge TUN e2es are `cfg(windows)` so there is no
+# macOS bridge partner today; the `macos_lockdown_permits_server_ip_...` pf test
+# still joins the group for free (and is auto-grouped against any future macOS
+# bridge TUN e2e).
+#
+# COUPLED NAMES — the filter below matches tests BY NAME SUBSTRING. These names
+# are load-bearing and must change in lockstep with the filter:
+#   - `_full_tunnel_roundtrip` suffix:
+#     crates/bridge/src/proxy_manager_e2e_tests.rs::e2e_none_full_tunnel_roundtrip
+#   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
+#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
+# Renaming any of them WITHOUT updating this filter silently drops it from the
+# group → cross-binary data race. Verify with `cargo nextest show-config
+# test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
+[test-groups.global-net-state]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/)'
+test-group = 'global-net-state'

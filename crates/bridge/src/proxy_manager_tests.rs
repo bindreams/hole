@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{self, state as route_state, Routing};
 use tun_engine::RoutingError;
 
@@ -168,6 +169,13 @@ struct MockRoutingState {
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
     cover_disengage_calls: AtomicU32,
+    lockdown_engage_calls: AtomicU32,
+    lockdown_disengage_calls: AtomicU32,
+    fail_lockdown: AtomicBool,
+    /// Ordered record of teardown events ("routes" / "lockdown") so a test can
+    /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
+    /// both `MockRoutes` and `MockCover` clone.
+    teardown_order: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl Default for MockRoutingState {
@@ -179,6 +187,10 @@ impl Default for MockRoutingState {
             fail_gateway: AtomicBool::new(false),
             cover_engage_calls: AtomicU32::new(0),
             cover_disengage_calls: AtomicU32::new(0),
+            lockdown_engage_calls: AtomicU32::new(0),
+            lockdown_disengage_calls: AtomicU32::new(0),
+            fail_lockdown: AtomicBool::new(false),
+            teardown_order: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -211,6 +223,12 @@ impl MockRouting {
     fn failing_gateway(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_gateway.store(true, Ordering::SeqCst);
+        m
+    }
+
+    fn failing_lockdown(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_lockdown.store(true, Ordering::SeqCst);
         m
     }
 
@@ -275,6 +293,23 @@ impl Routing for MockRouting {
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
+            lockdown: false,
+        })
+    }
+
+    fn install_lockdown(
+        &self,
+        _server_ip: IpAddr,
+        _tun_name: &str,
+        _app_ids: &[std::path::PathBuf],
+    ) -> Result<MockCover, RoutingError> {
+        if self.state.fail_lockdown.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
+        }
+        self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(MockCover {
+            state: Arc::clone(&self.state),
+            lockdown: true,
         })
     }
 }
@@ -287,18 +322,64 @@ struct MockRoutes {
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.teardown_order.lock().unwrap().push("routes");
         let _ = route_state::clear(&self.state_dir);
     }
 }
 
 struct MockCover {
     state: Arc<MockRoutingState>,
+    /// Whether this guard holds the standing lockdown cover (vs the transient
+    /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
+    /// the kind-aware `failclosed::Cover`.
+    lockdown: bool,
 }
 
 impl Drop for MockCover {
     fn drop(&mut self) {
-        self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        if self.lockdown {
+            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.teardown_order.lock().unwrap().push("lockdown");
+        } else {
+            self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        }
     }
+}
+
+// MockRouting lockdown instrumentation ================================================================================
+//
+// These exercise the mock seam directly (no ProxyManager) so the later
+// standing-guard lifecycle tests (engage / fail-FATAL / disengage) can rely on
+// the counters, fail flag, and kind-aware Drop dispatch being correct.
+
+#[skuld::test]
+fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+
+    let cover = routing
+        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[])
+        .expect("lockdown engages");
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+    // The transient-cover counter must NOT move — the two covers are distinct.
+    assert_eq!(state.cover_engage_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+
+    drop(cover);
+    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.cover_disengage_calls.load(Ordering::SeqCst), 0);
+}
+
+#[skuld::test]
+fn mock_failing_lockdown_returns_err_without_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
+    let state = routing.state();
+
+    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[]);
+    assert!(result.is_err(), "failing_lockdown must return Err");
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
 }
 
 // Helpers =============================================================================================================
@@ -326,6 +407,20 @@ fn new_manager_with_routing(
     dir: tempfile::TempDir,
 ) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
     let pm = ProxyManager::new(proxy, routing);
+    (pm, dir)
+}
+
+/// Build a manager whose routing + manager share `dir` as state_dir, with the
+/// lockdown intent seeded to `enabled`. The shared state_dir is how the manager
+/// reads `bridge-lockdown.json` in `start_inner`.
+fn new_manager_with_lockdown(
+    proxy: MockProxy,
+    routing: MockRouting,
+    dir: tempfile::TempDir,
+    enabled: bool,
+) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
+    lockdown_state::set_enabled(dir.path(), enabled).unwrap();
+    let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
     (pm, dir)
 }
 
@@ -751,6 +846,129 @@ fn mock_cover_engage_disengage_never_spawns() {
     assert_eq!(routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst), 0);
     assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 10);
     assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 10);
+}
+
+// Standing lockdown guard lifecycle (#527) ============================================================================
+//
+// `start_inner` engages the standing lockdown cover AFTER routing.install and
+// BEFORE Dns::apply, ONLY when `bridge-lockdown.json` intent is on. The Cover
+// is committed to RunningState only on the Ok path; `stop()` disengages it. A
+// failed engage under intent-on is fail-FATAL: it aborts the start and the
+// locally-owned routes guard tears down (mirror of the forwarder-self-test gate).
+
+#[skuld::test]
+fn lockdown_off_does_not_engage_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert!(!pm.lockdown_active(), "lockdown OFF must leave no cover engaged");
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "lockdown OFF must be byte-identical to today (no engage)"
+        );
+
+        pm.stop().await.unwrap();
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[skuld::test]
+fn lockdown_on_engages_after_install_and_disengages_on_stop() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.state(), ProxyState::Running);
+        assert!(pm.lockdown_active(), "intent-on start must engage the cover");
+        assert_eq!(st.install_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "engaged on a lockdown-on start"
+        );
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "still engaged while running"
+        );
+
+        pm.stop().await.unwrap();
+        assert!(!pm.lockdown_active(), "cover disengaged after stop");
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "disengaged on stop"
+        );
+    });
+}
+
+#[skuld::test]
+fn lockdown_engage_failure_is_fatal_and_tears_down() {
+    // Fail-FATAL mirror of start_blocks_on_forwarder_self_test_failure: a
+    // failed lockdown engage under intent-ON aborts the start and tears down
+    // routes (the opposite of the transient cover's fail-open).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("mock lockdown failure"),
+            "expected the lockdown engage error, got {err}"
+        );
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        // routes WERE installed (engage runs after install) then torn down on
+        // the Err unwind — net teardown count equals install count.
+        assert_eq!(st.install_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            st.teardown_calls.load(Ordering::SeqCst),
+            1,
+            "routes must be torn down when lockdown engage fails (fail-FATAL)"
+        );
+        // The engage never succeeded, so no cover was committed and none disengaged.
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+        assert!(pm.last_error().is_some());
+    });
+}
+
+#[skuld::test]
+fn lockdown_engage_failure_tears_down_routes_only() {
+    // Fail-FATAL engage: routes were installed (engage runs after install) then the
+    // `?` on install_lockdown unwinds the locally-owned `routes` guard. The lockdown
+    // cover is never constructed (the `?` fires before the `lockdown` binding
+    // completes), so the ordered recorder must show exactly one teardown — "routes" —
+    // and the cover disengage counter must stay at zero. (On a clean stop the order
+    // is the reverse — routes then lockdown — by design; see ProxyManager::stop.)
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(err.to_string().contains("mock lockdown failure"));
+        assert_eq!(pm.state(), ProxyState::Stopped);
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes"],
+            "engage failure tears down routes only; no cover was created"
+        );
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+    });
 }
 
 // last_error coverage for early-failure paths =========================================================================

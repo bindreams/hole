@@ -311,7 +311,7 @@ fn recover_without_state_file_is_a_noop() {
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {});
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {}, false, || false, |_| {});
 
     let log = log.into_inner();
     assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
@@ -330,7 +330,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     state::save(tmp.path(), &persisted_state).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {});
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {}, false, || false, |_| {});
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
@@ -355,7 +355,7 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing, |_| {});
+    recover_routes_with(tmp.path(), failing, |_| {}, false, || false, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -370,8 +370,86 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     let swept = std::cell::Cell::new(false);
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| swept.set(true));
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_| swept.set(true),
+        false,
+        || false,
+        |_| {},
+    );
 
     assert!(log.into_inner().is_empty(), "no route-state file => no route commands");
     assert!(swept.get(), "recover_routes_with must invoke the cover sweep");
+}
+
+// recover_routes_with lockdown wiring =================================================================================
+
+#[skuld::test]
+fn recover_sweeps_lockdown_when_intent_off_and_present() {
+    // NO route-state file — proves the lockdown decision is decoupled from
+    // bridge-routes.json (keyed on the injected presence probe instead).
+    let tmp = tempfile::tempdir().unwrap();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_| {},
+        false,
+        || true,
+        |decision| decided.set(Some(decision)),
+    );
+    assert_eq!(decided.get(), Some(CoverRecovery::Sweep));
+}
+
+#[skuld::test]
+fn recover_adopts_lockdown_when_intent_on_and_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_| {},
+        true,
+        || true,
+        |d| decided.set(Some(d)),
+    );
+    assert_eq!(decided.get(), Some(CoverRecovery::Adopt));
+}
+
+#[skuld::test]
+fn recover_lockdown_noop_when_cover_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    // Probe says no cover present => Noop regardless of intent.
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_| {},
+        true,
+        || false,
+        |d| decided.set(Some(d)),
+    );
+    assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
+}
+
+// decide_cover_recovery ===============================================================================================
+
+#[skuld::test]
+fn cover_recovery_on_and_present_adopts() {
+    assert_eq!(decide_cover_recovery(true, true), CoverRecovery::Adopt);
+}
+
+#[skuld::test]
+fn cover_recovery_off_and_present_sweeps() {
+    assert_eq!(decide_cover_recovery(false, true), CoverRecovery::Sweep);
+}
+
+#[skuld::test]
+fn cover_recovery_absent_is_noop_regardless_of_intent() {
+    assert_eq!(decide_cover_recovery(true, false), CoverRecovery::Noop);
+    assert_eq!(decide_cover_recovery(false, false), CoverRecovery::Noop);
 }

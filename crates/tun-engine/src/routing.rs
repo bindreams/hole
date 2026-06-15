@@ -189,17 +189,71 @@ pub(crate) fn run_capturing(
 /// are logged at `warn` level and the function returns `()` (there is no
 /// meaningful caller recovery).
 pub fn recover_routes(state_dir: &Path) {
-    recover_routes_with(state_dir, run_commands, failclosed::recover_cover);
+    let intent = failclosed::lockdown_state::load_enabled(state_dir);
+    recover_routes_with(
+        state_dir,
+        run_commands,
+        failclosed::recover_cover,
+        intent,
+        || failclosed::lockdown_cover_present(state_dir),
+        |decision| failclosed::recover_lockdown(decision, state_dir),
+    );
 }
 
-/// Test seam for [`recover_routes`]: accepts an injected command runner and an
-/// injected cover-recovery sweep so unit tests can assert behavior without
-/// shelling out to `netsh`/`route` or touching the host firewall. Production
-/// passes `run_commands` and [`failclosed::recover_cover`].
-pub(crate) fn recover_routes_with<R, S>(state_dir: &Path, runner: R, sweep_cover: S)
-where
+/// What crash-recovery should do with a possibly-present standing lockdown
+/// cover, given the persisted lockdown intent and whether a cover is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverRecovery {
+    /// Intent ON + cover present: KEEP the host fail-closed across the restart.
+    /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
+    /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
+    /// teardown) and the server-IP permit (the server may change before the next
+    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
+    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
+    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
+    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
+    /// cover survives and Adopt holds it.
+    Adopt,
+    /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
+    /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +
+    /// drop the pf token).
+    Sweep,
+    /// No cover present: nothing to do.
+    Noop,
+}
+
+/// Pure recovery decision. `intent` is the persisted lockdown-enabled bool
+/// (`bridge-lockdown.json`); `prior_present` is whether a lockdown cover from a
+/// prior run is present, keyed on the cover's OWN evidence (NOT
+/// `bridge-routes.json` — the cover's lifetime is independent of routes). See
+/// `recover_routes_with` for how `prior_present` is derived per platform.
+pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery {
+    match (intent, prior_present) {
+        (_, false) => CoverRecovery::Noop,
+        (true, true) => CoverRecovery::Adopt,
+        (false, true) => CoverRecovery::Sweep,
+    }
+}
+
+/// Test seam for [`recover_routes`]: accepts an injected command runner, an
+/// injected transient-cover sweep, and the standing-lockdown reconciliation
+/// inputs (intent + presence probe + recover action) so unit tests can assert
+/// behavior without shelling out to `netsh`/`route` or touching the host
+/// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
+/// the persisted lockdown intent, [`failclosed::lockdown_cover_present`], and
+/// [`failclosed::recover_lockdown`].
+pub(crate) fn recover_routes_with<R, S, P, L>(
+    state_dir: &Path,
+    runner: R,
+    sweep_cover: S,
+    lockdown_intent: bool,
+    lockdown_present: P,
+    lockdown_recover: L,
+) where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
     S: FnOnce(&Path),
+    P: FnOnce() -> bool,
+    L: FnOnce(CoverRecovery),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
@@ -253,6 +307,13 @@ where
     // independently — Windows by fixed WFP GUIDs, macOS by bridge-failclosed.json
     // — and the sweep is idempotent when no cover is present.
     sweep_cover(state_dir);
+
+    // Reconcile a standing lockdown cover. `prior_present` is the lockdown
+    // cover's OWN evidence (injected probe), NOT the route-state file, whose
+    // lifetime is independent of the cover. The recover action keeps the host
+    // fail-closed (Adopt) or disengages (Sweep).
+    let prior_present = lockdown_present();
+    lockdown_recover(decide_cover_recovery(lockdown_intent, prior_present));
 }
 
 // Routing trait =======================================================================================================
@@ -318,6 +379,22 @@ pub trait Routing: Send + Sync {
     /// NOT permit the TUN interface (the cover only needs loopback + server IP
     /// for the new bridge's start-time self-test); see the #468 PR2 plan.
     fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError>;
+
+    /// Engage the STANDING lockdown cover for this connected session: permit
+    /// loopback + the `tun_name` interface + the onward server connection (and,
+    /// on Windows, the `app_ids` binaries by App-ID), block all else. Returns
+    /// the SAME [`Cover`](Self::Cover) RAII guard
+    /// [`install_failclosed_cover`](Self::install_failclosed_cover) returns —
+    /// the platform guard is kind-aware, so its Drop disengages whichever cover
+    /// it holds. Distinct from `install_failclosed_cover`, which does NOT permit
+    /// the TUN. The LUID is re-resolved on every call (never persisted).
+    /// Fail-FATAL: the bridge aborts the start on Err.
+    fn install_lockdown(
+        &self,
+        server_ip: IpAddr,
+        tun_name: &str,
+        app_ids: &[PathBuf],
+    ) -> Result<Self::Cover, RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -387,6 +464,16 @@ impl Routing for SystemRouting {
 
     fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError> {
         failclosed::engage(server_ip, &self.state_dir)
+    }
+
+    fn install_lockdown(
+        &self,
+        server_ip: IpAddr,
+        tun_name: &str,
+        app_ids: &[PathBuf],
+    ) -> Result<Self::Cover, RoutingError> {
+        let resolver = failclosed::SystemLuidResolver;
+        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir)
     }
 }
 

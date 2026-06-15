@@ -240,13 +240,25 @@ performs equivalent cleanup from outside.
 
 ### Fail-closed cover
 
+Two egress-block covers share the platform `Cover` guard (kind-aware `Drop`):
+the **transient cutover cover** below and the **standing lockdown cover**
+([next section](#lockdown-mode)). Both are RAII guards permitting a curated
+egress set and blocking everything else; they differ in lifetime and which set
+they permit.
+
+#### Transient cutover cover
+
 `Routing::install_failclosed_cover(server_ip)` engages a leak-free egress block —
 permit loopback and the SS server IP, **block everything else** — as an RAII
 guard whose `Drop` disengages it. It exists for the leak-free in-place-update
 cutover (#468): the bridge is briefly stopped and restarted onto new code, and
-without a cover the missing split routes would let traffic egress in the clear
-(Hole fails *open* — there is no kill switch). The cover holds the line during
-that window; a crash mid-cutover leaves traffic **blocked, not leaked**.
+without a cover the missing split routes would let traffic egress in the clear.
+This cover holds the line across that **bounded** window regardless of
+[lockdown](#lockdown-mode); a crash mid-cutover leaves traffic **blocked, not
+leaked**. It does *not* cover an indefinite outage (a bridge that stays down,
+or any gap outside an update) — without lockdown, default-off Hole fails *open*
+there. Lockdown closes that broader gap with a standing cover that already holds
+when the cutover starts.
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -256,8 +268,30 @@ the accepted fail-closed cost.
 
 - **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
   a persistent provider + sublayer + filter set installed in one FWPM
-  transaction on `ALE_AUTH_CONNECT_V4`/`_V6` (permit loopback + server IP *hard*
-  via `CLEAR_ACTION_RIGHT`, block all else). **Non-dynamic session** — a dynamic
+  transaction. Loopback is permitted on `ALE_AUTH_CONNECT_V4`/`_V6` *and*
+  `ALE_AUTH_RECV_ACCEPT_V4`/`_V6` (a loopback connect authorizes on both ALE
+  directions, so a CONNECT-only permit would deny the accept side and break the
+  loopback data plane). The deterministic matcher on *all four* layers is the
+  `FWPM_CONDITION_IP_REMOTE_ADDRESS` range (`127.0.0.0/8` V4, `::1/128` V6) — at
+  CONNECT the remote is the destination, at RECV_ACCEPT the peer, both `127.x`/`::1`
+  for a loopback flow. The `FWP_CONDITION_FLAG_IS_LOOPBACK` flag is **not reliably
+  set at either ALE layer** under CI's elevated token (flag-only left the loopback
+  connect blocked by block-all *and* the accept side dropped), so it is no longer
+  load-bearing; it is kept at CONNECT only as belt-and-suspenders. The server IP
+  is permitted on CONNECT, all else blocked on CONNECT (egress kill switch).
+  **One sublayer, weight-based arbitration**: permits sit at weight 15, block-all
+  at weight 0, and the higher-weight permit wins within the sublayer. **No filter
+  sets `CLEAR_ACTION_RIGHT`** — that flag makes a filter's own action *soft*
+  (cross-sublayer overridable); omitting it makes the action *hard*, and hardness
+  governs only cross-sublayer arbitration, never within one. A `FWP_ACTION_BLOCK`
+  with the flag omitted is therefore a *default hard* block; setting the flag only
+  on the permits (soft) left block-all (hard) vetoing every permit, so the cover
+  blocked everything. This weight-ordered layout matches wireguard-windows (its
+  loopback/TUN/DHCP permits and block-all are weight-ordered with the flag off; it
+  sets `CLEAR_ACTION_RIGHT` only on its own service permit, none of ours). A
+  higher-weight third-party sublayer could in principle override us (accepted), and
+  a two-sublayer hard-permit/soft-block layout is a possible future hardening.
+  **Non-dynamic session** — a dynamic
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
@@ -266,11 +300,51 @@ the accepted fail-closed cost.
   blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
   the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
 
-Each platform splits a pure, unit-tested rule/spec builder (`build_cover_spec` /
-`build_pf_ruleset`) from the thin engage layer — mirroring `build_setup_commands`
-vs `run_commands`. The kernel-level engage is exercised by the privileged cutover
-path, not unit tests (the [#165](#bridge-test-isolation-contract) isolation
-contract). The recovery sweep runs on every bridge start via `recover_routes`.
+Each platform splits a pure, unit-tested rule/spec builder (transient:
+`build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
+`build_lockdown_main_ruleset`) from the thin engage layer — mirroring
+`build_setup_commands` vs `run_commands`. Under the
+[#165](#bridge-test-isolation-contract) isolation contract the builders are the
+only thing unit-tested; the kernel-level engage is exercised in production and,
+for the lockdown cover, by the privileged-lane real-engage tests (#527) — both
+on the `tun` lane (Windows under the elevated CI token; macOS under root for
+`pfctl`) — proving the WFP/pf cover actually blocks a non-permitted egress while
+loopback stays permitted. The recovery sweep runs on every bridge start via
+`recover_routes`.
+
+### Lockdown mode
+
+The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
+opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
+persistent OS-level egress block permitting **only** loopback, the `hole-tun`
+interface, the onward server connection, and (Windows) the plugin + bridge
+binaries by App-ID — so normal traffic flows while connected and the block holds
+across a bridge restart for free. When disabled, behavior is byte-identical to a
+Hole without it.
+
+It contrasts with the [transient cutover cover](#transient-cutover-cover) on
+three axes:
+
+- **Permit set.** Lockdown adds a TUN-interface permit (Windows: by `NET_LUID`;
+  macOS: `pass out quick on <tun>`) so app traffic flows; the transient cover
+  deliberately omits it (permit loopback + server only) because holding it while
+  connected would block all browsing.
+- **Lifetime.** Lockdown is authoritative and standing — it persists across a
+  crash or restart and is reconciled on the next start via
+  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
+  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
+  disengages when intent is off). The transient cover
+  exists only for the sub-second cutover window.
+- **Failure mode.** A failed lockdown engage during a lockdown-on start is
+  **fail-FATAL** — it aborts the start and tears everything down; the transient
+  cover fails *open* on its own engage error so a half-loaded ruleset never
+  strands the host. Lockdown is **last-writer-wins**: an absolute set via
+  `POST /v1/lockdown`, system-wide.
+
+Intent persists to `bridge-lockdown.json`; macOS additionally records the
+pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
+without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
+re-resolved every engage via `LuidResolver`.
 
 ### Config corruption recovery
 

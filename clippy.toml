@@ -259,3 +259,13 @@ allow-invalid = true
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0"
 reason = "Fail-closed WFP cover must go through `routing::failclosed::engage`. Only `failclosed/windows.rs` may call FWPM. See bindreams/hole#468."
 allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmGetAppIdFromFileName0"
+reason = "Lockdown cover App-ID permit must go through `routing::failclosed`. Only `failclosed/windows.rs` may call FWPM. See #527."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0"
+reason = "Lockdown cover App-ID blob free must go through `routing::failclosed`. Only `failclosed/windows.rs` may call FWPM. See #527."
+allow-invalid = true

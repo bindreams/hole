@@ -103,3 +103,27 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
     let (_, reloaded, _) = ConfigStore::load(path, time::OffsetDateTime::UNIX_EPOCH);
     assert!(!reloaded.enabled);
 }
+
+// lockdown_menu_label =================================================================================================
+
+#[skuld::test]
+fn lockdown_enabled_but_inactive_renders_warning_label() {
+    // enabled && !active must never render silent green — it is a warning.
+    let label = lockdown_menu_label(true, false);
+    assert!(
+        label.to_lowercase().contains("warning") || label.contains('!'),
+        "enabled+inactive must signal a warning, got {label:?}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_active_renders_on_label() {
+    let label = lockdown_menu_label(true, true);
+    assert!(label.to_lowercase().contains("on") || label.to_lowercase().contains("lockdown"));
+}
+
+#[skuld::test]
+fn lockdown_off_renders_plain_label() {
+    let label = lockdown_menu_label(false, false);
+    assert!(!label.to_lowercase().contains("warning"));
+}

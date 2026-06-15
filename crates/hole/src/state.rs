@@ -131,7 +131,12 @@ impl BridgeLink {
         let mut guard = self.client.lock().await;
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
         if let Some(running) = observed_running(kind, &result) {
-            self.cell.commit(running);
+            // A Status exchange reveals lockdown too — commit all three
+            // atomically under this lock; other exchanges know only `running`.
+            match observed_lockdown(&result) {
+                Some((le, la)) => self.cell.commit_status(running, le, la),
+                None => self.cell.commit(running),
+            }
         }
         self.note_mismatch(&result);
         result
@@ -211,7 +216,10 @@ impl BridgeLink {
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
         self.note_mismatch(&status);
         if let Some(running) = observed_running(ReqKind::Status, &status) {
-            self.cell.commit(running);
+            match observed_lockdown(&status) {
+                Some((le, la)) => self.cell.commit_status(running, le, la),
+                None => self.cell.commit(running),
+            }
         }
         if !matches!(status, Ok(BridgeResponse::Status { running: true, .. })) {
             return Ok(false); // Not running; changes apply on next start.
@@ -237,6 +245,11 @@ impl BridgeLink {
 pub struct ProxySnapshot {
     pub seq: u64,
     pub running: bool,
+    /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
+    pub lockdown_enabled: bool,
+    /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
+    /// warning state — never silent green.
+    pub lockdown_active: bool,
 }
 
 /// Single owner of the GUI's view of "is the proxy running" (#462).
@@ -252,12 +265,18 @@ impl Default for ProxyStateCell {
 
 impl ProxyStateCell {
     pub fn new() -> Self {
-        let (tx, _) = tokio::sync::watch::channel(ProxySnapshot { seq: 0, running: false });
+        let (tx, _) = tokio::sync::watch::channel(ProxySnapshot {
+            seq: 0,
+            running: false,
+            lockdown_enabled: false,
+            lockdown_active: false,
+        });
         Self { tx }
     }
 
     /// Commit an observed running state. Bumps `seq` (and wakes watchers)
-    /// only when the value actually changes.
+    /// only when the value actually changes. Preserves the lockdown fields:
+    /// the non-Status paths that call this only know `running`.
     pub fn commit(&self, running: bool) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running {
@@ -266,6 +285,28 @@ impl ProxyStateCell {
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running,
+                ..*snap
+            };
+            true
+        });
+    }
+
+    /// Commit a full Status observation (running + lockdown). Bumps `seq`
+    /// (waking watchers) when any field changes. Used by the `Status` arm so
+    /// all three commit atomically under the one client lock.
+    pub fn commit_status(&self, running: bool, lockdown_enabled: bool, lockdown_active: bool) {
+        self.tx.send_if_modified(|snap| {
+            if snap.running == running
+                && snap.lockdown_enabled == lockdown_enabled
+                && snap.lockdown_active == lockdown_active
+            {
+                return false;
+            }
+            *snap = ProxySnapshot {
+                seq: snap.seq + 1,
+                running,
+                lockdown_enabled,
+                lockdown_active,
             };
             true
         });
@@ -350,6 +391,20 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),
         (Stop, Ok(BridgeResponse::Error { .. })) => None,
         (_, Ok(_)) => None,
+    }
+}
+
+/// The lockdown (enabled, active) a Status exchange revealed, if any. Only a
+/// `Status` Ok carries them; every other exchange yields None (leave the
+/// snapshot's prior lockdown fields untouched).
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool)> {
+    match result {
+        Ok(BridgeResponse::Status {
+            lockdown_enabled,
+            lockdown_active,
+            ..
+        }) => Some((*lockdown_enabled, *lockdown_active)),
+        _ => None,
     }
 }
 

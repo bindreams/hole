@@ -113,6 +113,8 @@ fn bridge_response_status_json_roundtrip() {
         }],
         udp_proxy_available: true,
         ipv6_bypass_available: false,
+        lockdown_enabled: false,
+        lockdown_active: false,
     };
     let json = serde_json::to_vec(&resp).unwrap();
     let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
@@ -159,6 +161,8 @@ fn status_response_json_roundtrip() {
         }],
         udp_proxy_available: false,
         ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -174,6 +178,8 @@ fn status_response_without_error() {
         invalid_filters: Vec::new(),
         udp_proxy_available: true,
         ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
     assert!(!json.contains("error"), "None error should be skipped in serialization");
@@ -216,6 +222,41 @@ fn route_constants_are_correct() {
     assert_eq!(ROUTE_STOP, "/v1/stop");
     assert_eq!(ROUTE_CANCEL, "/v1/cancel");
     assert_eq!(ROUTE_RELOAD, "/v1/reload");
+}
+
+#[skuld::test]
+fn route_lockdown_path_is_stable() {
+    use crate::protocol::ROUTE_LOCKDOWN;
+    assert_eq!(ROUTE_LOCKDOWN, "/v1/lockdown");
+}
+
+#[skuld::test]
+fn status_response_lockdown_fields_default_false_for_old_clients() {
+    use crate::protocol::StatusResponse;
+    // An old client sends a StatusResponse JSON without the lockdown fields;
+    // serde-default must fill them as false (matching udp/ipv6 fields).
+    let json = r#"{"running":true,"uptime_secs":0}"#;
+    let s: StatusResponse = serde_json::from_str(json).unwrap();
+    assert!(!s.lockdown_enabled);
+    assert!(!s.lockdown_active);
+}
+
+#[skuld::test]
+fn lockdown_request_json_roundtrip() {
+    use crate::protocol::LockdownRequest;
+    let req = LockdownRequest { enabled: true };
+    let json = serde_json::to_string(&req).unwrap();
+    assert_eq!(json, r#"{"enabled":true}"#);
+    let decoded: LockdownRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, req);
+}
+
+#[skuld::test]
+fn bridge_request_set_lockdown_json_roundtrip() {
+    let req = BridgeRequest::SetLockdown { enabled: true };
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
+    assert_eq!(decoded, req);
 }
 
 // New response types --------------------------------------------------------------------------------------------------

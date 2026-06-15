@@ -89,6 +89,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/EmptyResponse"
 
+  /v1/lockdown:
+    post:
+      summary: Set the standing kill switch (lockdown mode) intent
+      description: |
+        Last-writer-wins absolute set of the bridge-owned, system-wide
+        lockdown intent. Any authorized caller may toggle it freely. Returns
+        200 with EmptyResponse on success.
+      operationId: setLockdown
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LockdownRequest"
+      responses:
+        "200":
+          description: Lockdown intent recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "500":
+          description: Failed to persist lockdown intent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/reload:
     post:
       summary: Reload the proxy with new configuration
@@ -190,6 +218,19 @@ components:
         ipv6_bypass_available:
           type: boolean
           default: true
+        lockdown_enabled:
+          type: boolean
+          default: false
+          description: >-
+            Whether the standing kill switch (lockdown mode) intent is on.
+            Bridge-owned, system-wide. serde-default false so older clients that
+            don't send it keep today's behavior.
+        lockdown_active:
+          type: boolean
+          default: false
+          description: >-
+            Whether a lockdown cover is currently engaged. `lockdown_enabled &&
+            !lockdown_active` is a tray warning state — never silent green.
 
     ErrorResponse:
       type: object
@@ -504,3 +545,12 @@ components:
             tunnel_handshake_failed {kind}, server_cannot_reach_internet {kind},
             sentinel_mismatch {kind, detail}, internal_error {kind, detail}.
             See protocol.rs::ServerTestOutcome.
+
+    LockdownRequest:
+      type: object
+      description: "Hand-written in protocol.rs."
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
