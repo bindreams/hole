@@ -318,14 +318,18 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
+        # DIAGNOSTIC (#541): isolate the two _full_tunnel_roundtrip tests so the
+        # intermittently-hanging e2e_socks5_udp_associate can't hold the serial
+        # TUN lock and block e2e_ws_full_tunnel behind it (masking its evidence).
+        # Reverted with the real fix.
         run: >
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+          -E '(package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
               + package(handle-holders) + package(tombstone)
-              + package(hole-test-observability)'
+              + package(hole-test-observability)) & test(/_full_tunnel_roundtrip$/)'
 
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest

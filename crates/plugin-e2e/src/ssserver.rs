@@ -223,8 +223,18 @@ async fn spawn_ss_with_plugin(
         };
         let chain = tokio::spawn(async move { runner.run(env).await });
 
-        match ready_rx.await {
-            Ok(Ok(chain_ready)) => {
+        // Bound readiness: a wedged server plugin chain must FAIL LOUDLY, not
+        // hang the fixture forever (a fixture hang yields no captured output and
+        // wedges the whole serial group — the #197/#518 lesson; surfaced again
+        // diagnosing bindreams/hole#541). 60s is generous for a cold Windows host
+        // extracting+scanning a fresh ex-ray.exe; a genuine readiness gap fails.
+        // Class-2 subprocess failure-bound, not intra-process sync.
+        match tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx).await {
+            Err(_elapsed) => {
+                cancel.cancel();
+                panic!("server plugin did not become ready within 60s (attempt {attempt})");
+            }
+            Ok(Ok(Ok(chain_ready))) => {
                 return (
                     chain_ready.listen,
                     PluginServer {
@@ -234,7 +244,7 @@ async fn spawn_ss_with_plugin(
                     },
                 );
             }
-            Ok(Err(StartError::BindConflict { addr, errno })) => {
+            Ok(Ok(Err(StartError::BindConflict { addr, errno }))) => {
                 // Adaptive milestone logging (mirrors port_alloc) so a stuck loop
                 // is visible without flooding the happy path.
                 if attempt == 1 || attempt.is_multiple_of(10) {
@@ -249,12 +259,12 @@ async fn spawn_ss_with_plugin(
                 let _ = chain.await;
                 // retry with a fresh public_port
             }
-            Ok(Err(StartError::Fatal { detail, errno })) => {
+            Ok(Ok(Err(StartError::Fatal { detail, errno }))) => {
                 cancel.cancel();
                 let _ = chain.await;
                 panic!("server plugin failed to start: {detail} (errno={errno:?})");
             }
-            Err(_recv) => {
+            Ok(Err(_recv)) => {
                 cancel.cancel();
                 let outcome = chain.await;
                 panic!("server plugin exited before readiness: {outcome:?}");
