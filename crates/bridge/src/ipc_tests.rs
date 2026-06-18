@@ -363,13 +363,22 @@ async fn consume(resp: http::Response<hyper::body::Incoming>) -> u16 {
     status
 }
 
-async fn post_start(client: &mut TestClient, config: &ProxyConfig) -> http::Response<hyper::body::Incoming> {
+/// `X-Hole-Attempt-Id`: the per-attempt idempotency key the GUI mints and sends
+/// on both Start and Cancel; the bridge scopes start-cancellation to it (#465).
+const ATTEMPT_ID_HEADER: &str = "x-hole-attempt-id";
+
+async fn post_start(
+    client: &mut TestClient,
+    config: &ProxyConfig,
+    attempt_id: &str,
+) -> http::Response<hyper::body::Incoming> {
     let body_bytes = serde_json::to_vec(config).unwrap();
     let req = http::Request::builder()
         .method("POST")
         .uri(ROUTE_START)
         .header("host", "localhost")
         .header("content-type", "application/json")
+        .header(ATTEMPT_ID_HEADER, attempt_id)
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap();
     client.send(req).await
@@ -385,11 +394,12 @@ async fn post_stop(client: &mut TestClient) -> http::Response<hyper::body::Incom
     client.send(req).await
 }
 
-async fn post_cancel(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
+async fn post_cancel(client: &mut TestClient, attempt_id: &str) -> http::Response<hyper::body::Incoming> {
     let req = http::Request::builder()
         .method("POST")
         .uri(ROUTE_CANCEL)
         .header("host", "localhost")
+        .header(ATTEMPT_ID_HEADER, attempt_id)
         .body(Full::new(Bytes::new()))
         .unwrap();
     client.send(req).await
@@ -469,7 +479,7 @@ fn error_response_carries_bridge_version_header() {
             server.run_once().await.unwrap();
         });
         let mut client = TestClient::connect(&path).await;
-        let resp = post_start(&mut client, &sample_config()).await;
+        let resp = post_start(&mut client, &sample_config(), "t").await;
         assert_eq!(resp.status(), 500);
         assert_eq!(resp.headers().get("x-hole-bridge-version").unwrap(), "9.9.9");
         let _ = resp.into_body().collect().await;
@@ -674,7 +684,7 @@ fn start_request_starts_proxy() {
         let mut client = TestClient::connect(&path).await;
 
         // Start
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "t").await).await, 200);
 
         // Status should show running
         let status = get_status(&mut client).await;
@@ -702,7 +712,7 @@ fn stop_request_stops_proxy() {
         let mut client = TestClient::connect(&path).await;
 
         // Start
-        consume(post_start(&mut client, &sample_config()).await).await;
+        consume(post_start(&mut client, &sample_config(), "t").await).await;
 
         // Stop
         assert_eq!(consume(post_stop(&mut client).await).await, 200);
@@ -728,7 +738,7 @@ fn start_failure_returns_error() {
         });
 
         let mut client = TestClient::connect(&path).await;
-        let resp = post_start(&mut client, &sample_config()).await;
+        let resp = post_start(&mut client, &sample_config(), "t").await;
 
         assert_eq!(resp.status(), 500);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -758,7 +768,7 @@ fn reload_request_reloads_proxy() {
         let mut client = TestClient::connect(&path).await;
 
         // Start first
-        consume(post_start(&mut client, &sample_config()).await).await;
+        consume(post_start(&mut client, &sample_config(), "t").await).await;
 
         // Reload
         assert_eq!(consume(post_reload(&mut client, &sample_config()).await).await, 200);
@@ -935,7 +945,7 @@ fn metrics_returns_uptime_when_running() {
         let mut client = TestClient::connect(&path).await;
 
         // Start proxy
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "t").await).await, 200);
 
         let metrics = get_metrics(&mut client).await;
         // Running but idle: no traffic injected into the mock, so totals are 0.
@@ -964,7 +974,7 @@ fn metrics_reports_traffic_totals_when_running() {
         });
 
         let mut client = TestClient::connect(&path).await;
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "t").await).await, 200);
 
         traffic.bytes_in.fetch_add(1_048_576, Ordering::SeqCst);
         traffic.bytes_out.fetch_add(65_536, Ordering::SeqCst);
@@ -998,7 +1008,7 @@ fn metrics_reports_speed_over_window() {
         });
 
         let mut client = TestClient::connect(&path).await;
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "t").await).await, 200);
 
         // First poll establishes the rate window.
         let first = get_metrics(&mut client).await;
@@ -1039,7 +1049,7 @@ fn diagnostics_bridge_running() {
         let mut client = TestClient::connect(&path).await;
 
         // Start proxy
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "t").await).await, 200);
 
         let diag = get_diagnostics(&mut client).await;
         assert_eq!(diag.app, "ok");
@@ -1134,7 +1144,7 @@ fn diagnostics_bridge_error_after_failed_start() {
         // Trigger a failed start so ProxyManager.last_error is populated.
         // The gateway-failing mock makes default_gateway return Err, which
         // ProxyManager::start now records via inspect_err.
-        let resp = post_start(&mut client, &sample_config()).await;
+        let resp = post_start(&mut client, &sample_config(), "t").await;
         assert_eq!(resp.status(), 500);
         let _ = resp.into_body().collect().await;
 
@@ -1186,7 +1196,7 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         let path_a = path.clone();
         let start_future = tokio::spawn(async move {
             let mut client_a = TestClient::connect(&path_a).await;
-            let resp = post_start(&mut client_a, &sample_config()).await;
+            let resp = post_start(&mut client_a, &sample_config(), "t").await;
             (client_a, resp)
         });
 
@@ -1198,7 +1208,7 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         // waiting for the in-flight Start (which never completes since the
         // gate is not released).
         let mut client_b = TestClient::connect(&path).await;
-        let cancel_resp = post_cancel(&mut client_b).await;
+        let cancel_resp = post_cancel(&mut client_b, "t").await;
         assert_eq!(
             cancel_resp.status(),
             200,
@@ -1238,16 +1248,17 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
 
         let mut client = TestClient::connect(&path).await;
 
-        // Pre-arm: cancel with no start in flight — still 200 Ack.
-        let resp = post_cancel(&mut client).await;
+        // Pre-arm: cancel attempt A with no start in flight — still 200 Ack.
+        let resp = post_cancel(&mut client, "A").await;
         assert_eq!(consume(resp).await, 200);
 
-        // Now start — should be rejected as cancelled, consuming the pre-arm.
-        let start_resp = post_start(&mut client, &sample_config()).await;
+        // Start carrying the SAME attempt id A — rejected as cancelled,
+        // consuming the named pre-arm.
+        let start_resp = post_start(&mut client, &sample_config(), "A").await;
         assert_eq!(error_message(start_resp).await, CANCELLED_MESSAGE);
 
-        // A second start with no pre-arm should succeed normally.
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
+        // A second start (a different attempt B) with no pre-arm succeeds.
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "B").await).await, 200);
 
         // Cleanup
         consume(post_stop(&mut client).await).await;
@@ -1269,8 +1280,8 @@ fn cancel_with_no_start_is_ack_idempotent() {
 
         let mut client = TestClient::connect(&path).await;
 
-        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
-        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
+        assert_eq!(consume(post_cancel(&mut client, "t").await).await, 200);
+        assert_eq!(consume(post_cancel(&mut client, "t").await).await, 200);
 
         drop(client);
         handle.abort();
@@ -1297,7 +1308,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         let path_a = path.clone();
         let a_future = tokio::spawn(async move {
             let mut client_a = TestClient::connect(&path_a).await;
-            let resp = post_start(&mut client_a, &sample_config()).await;
+            let resp = post_start(&mut client_a, &sample_config(), "t").await;
             (client_a, resp)
         });
 
@@ -1306,7 +1317,7 @@ fn concurrent_start_is_rejected_with_conflict() {
 
         // Client B sends a concurrent Start and must be rejected.
         let mut client_b = TestClient::connect(&path).await;
-        let b_resp = post_start(&mut client_b, &sample_config()).await;
+        let b_resp = post_start(&mut client_b, &sample_config(), "t").await;
         assert_eq!(
             b_resp.status(),
             409,
@@ -1323,7 +1334,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         // B's rejection must not have perturbed A's token slot — a
         // subsequent cancel must still reach A. Send it.
         let mut client_c = TestClient::connect(&path).await;
-        assert_eq!(consume(post_cancel(&mut client_c).await).await, 200);
+        assert_eq!(consume(post_cancel(&mut client_c, "t").await).await, 200);
 
         // A's start must return Cancelled. If cancellation regresses,
         // a_future hangs and the test framework's timeout surfaces it.
@@ -1337,38 +1348,122 @@ fn concurrent_start_is_rejected_with_conflict() {
 }
 
 #[skuld::test]
-fn sequential_start_cancel_start_consumes_pre_arm_once() {
-    // Plan scenario: Start completes, then Cancel arrives (sets pending),
-    // then another Start arrives (consumes pending → Cancelled). A third
-    // Start after that must succeed normally — the pre-arm must be
-    // consumed exactly once, not forever.
+fn stale_prearm_does_not_cancel_unrelated_start() {
+    // #465 regression (the reported P0). Attempt A starts and succeeds; a late
+    // Cancel(A) loses the race and pre-arms (no in-flight start); the frontend's
+    // compensating follow-up Stop fires. The NEXT, unrelated Connect (attempt B)
+    // must SUCCEED — the stale pre-arm for A can never match B's id.
+    //
+    // This inverts the old `sequential_start_cancel_start_consumes_pre_arm_once`,
+    // which codified the bug (Start→Stop→Cancel→Start returned CANCELLED).
     rt().block_on(async {
-        let path = test_socket_path("seq-start-cancel-start");
+        let path = test_socket_path("stale-prearm-unrelated");
         let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
-        // Single client connection — use run_once.
         let handle = tokio::spawn(async move { server.run_once().await });
 
         let mut client = TestClient::connect(&path).await;
 
-        // Start #1 succeeds.
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
-        // Stop so the next start has somewhere to go.
+        // Attempt A: start succeeds.
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "A").await).await, 200);
+        // User clicks Cancel late — Start(A) already succeeded, so this Cancel
+        // arrives with no in-flight start and pre-arms for A.
+        assert_eq!(consume(post_cancel(&mut client, "A").await).await, 200);
+        // Frontend's compensating follow-up Stop.
         assert_eq!(consume(post_stop(&mut client).await).await, 200);
 
-        // Cancel with nothing in flight — pre-arms the flag.
-        assert_eq!(consume(post_cancel(&mut client).await).await, 200);
+        // Attempt B: a brand-new connect. Must NOT consume the stale A arm.
+        assert_eq!(
+            consume(post_start(&mut client, &sample_config(), "B").await).await,
+            200,
+            "second, unrelated Connect must succeed — the stale pre-arm for A must not kill it"
+        );
 
-        // Start #2 consumes the pre-arm and must fail with Cancelled.
-        let resp2 = post_start(&mut client, &sample_config()).await;
-        assert_eq!(error_message(resp2).await, CANCELLED_MESSAGE);
-
-        // Start #3 must succeed (pre-arm was a one-shot).
-        assert_eq!(consume(post_start(&mut client, &sample_config()).await).await, 200);
-
-        // Cleanup.
         consume(post_stop(&mut client).await).await;
-
         drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn named_prearm_still_cancels_its_own_attempt() {
+    // The legitimate pre-arm race must still work: a Cancel that beats its own
+    // Start's registration (SAME id) still cancels THAT start. Guards against a
+    // fix that over-corrects and breaks the race the pre-arm was built for.
+    rt().block_on(async {
+        let path = test_socket_path("named-prearm-same");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move { server.run_once().await });
+        let mut client = TestClient::connect(&path).await;
+
+        assert_eq!(consume(post_cancel(&mut client, "A").await).await, 200); // pre-arm A
+        let start = post_start(&mut client, &sample_config(), "A").await; // same id
+        assert_eq!(error_message(start).await, CANCELLED_MESSAGE);
+        // A fresh attempt afterward succeeds (the arm was a one-shot for A).
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "B").await).await, 200);
+
+        consume(post_stop(&mut client).await).await;
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn prearm_without_arriving_start_does_not_block_future_starts() {
+    // Cancel(A) arms with no in-flight start; A's start NEVER arrives and no
+    // Stop fires (the case clear-on-stop alone cannot fix). The next unrelated
+    // Start(B) must still SUCCEED and self-heal the stale A arm, so a subsequent
+    // Start(C) also succeeds.
+    rt().block_on(async {
+        let path = test_socket_path("prearm-never-arrives");
+        let server = IpcServer::bind(&path, mock_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move { server.run_once().await });
+        let mut client = TestClient::connect(&path).await;
+
+        assert_eq!(consume(post_cancel(&mut client, "A").await).await, 200); // arm A, no start
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "B").await).await, 200);
+        consume(post_stop(&mut client).await).await;
+        // Self-heal proven: C is unaffected by the long-dead A arm.
+        assert_eq!(consume(post_start(&mut client, &sample_config(), "C").await).await, 200);
+
+        consume(post_stop(&mut client).await).await;
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn cross_id_cancel_does_not_cancel_unrelated_in_flight_start() {
+    // Start(B) parks in-flight on the gate. Cancel(A) (A != B) arrives: it must
+    // 200 and pre-arm A WITHOUT signalling B's token. Releasing the gate lets B
+    // complete normally (200), proving an unrelated cancel never aborts it.
+    rt().block_on(async {
+        let path = test_socket_path("cross-id-cancel");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let server = IpcServer::bind(&path, gated_proxy(gate.clone(), entered_tx), "test").unwrap();
+        let handle = tokio::spawn(async move { server.run_n(2).await });
+
+        // Connection B: a start parked inside MockProxy::start.
+        let path_b = path.clone();
+        let start_future = tokio::spawn(async move {
+            let mut client_b = TestClient::connect(&path_b).await;
+            let resp = post_start(&mut client_b, &sample_config(), "B").await;
+            (client_b, resp)
+        });
+        entered_rx.await.expect("MockProxy::start never entered");
+
+        // Connection A: cancel a DIFFERENT attempt. Must 200 and not touch B.
+        let mut client_a = TestClient::connect(&path).await;
+        assert_eq!(consume(post_cancel(&mut client_a, "A").await).await, 200);
+
+        // Release the gate: B is not cancelled, so it returns 200.
+        gate.notify_one();
+        let (_client_b, resp_b) = start_future.await.expect("start task panicked");
+        assert_eq!(consume(resp_b).await, 200, "an unrelated cancel must not abort B");
+
         handle.abort();
         let _ = handle.await;
     });
@@ -1393,7 +1488,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         let path_a = path.clone();
         let a_future = tokio::spawn(async move {
             let mut client_a = TestClient::connect(&path_a).await;
-            let resp = post_start(&mut client_a, &sample_config()).await;
+            let resp = post_start(&mut client_a, &sample_config(), "t").await;
             (client_a, resp)
         });
         entered_rx.await.expect("MockProxy::start never entered");
@@ -1402,12 +1497,12 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         let path_b = path.clone();
         let b_task = tokio::spawn(async move {
             let mut client = TestClient::connect(&path_b).await;
-            post_cancel(&mut client).await
+            post_cancel(&mut client, "t").await
         });
         let path_c = path.clone();
         let c_task = tokio::spawn(async move {
             let mut client = TestClient::connect(&path_c).await;
-            post_cancel(&mut client).await
+            post_cancel(&mut client, "t").await
         });
 
         let b_resp = b_task.await.unwrap();
