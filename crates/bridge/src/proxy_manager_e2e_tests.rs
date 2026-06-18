@@ -232,6 +232,59 @@ fn e2e_ws_socks_only_roundtrip(
     rt().block_on(run_socks_only_e2e(dist, ss, http));
 }
 
+/// #536: the bridge must honor galoshes' authoritative sitrep transports
+/// (`tcp,udp`) rather than the readiness self-probe's hardcoded TCP-only, so a
+/// galoshes chain reports `udp_proxy_available = true`. With the previous
+/// `ReadinessMode::Probe` this was always false and Full-mode galoshes UDP was
+/// wrongly dropped. Asserts the start-time chain transports via the Status
+/// endpoint — no data flow, so it is independent of the e2e roundtrip path.
+#[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
+fn e2e_galoshes_chain_reports_udp_available(
+    #[fixture(dist_dir)] dist: &Path,
+    #[fixture(ssserver_ws)] ss: &SsServerHandle,
+) {
+    rt().block_on(async {
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let config = ProxyConfig {
+            server: entry_from(ss),
+            local_port,
+            tunnel_mode: TunnelMode::SocksOnly,
+            filters: vec![],
+            dns: hole_common::config::DnsConfig {
+                enabled: false,
+                ..hole_common::config::DnsConfig::default()
+            },
+            proxy_socks5: true,
+            proxy_http: false,
+            local_port_http: 4075,
+            diagnostic_plugin_tap: false,
+        };
+
+        let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
+        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
+
+        let status = harness.send(BridgeRequest::Status).await.expect("send Status");
+        match status {
+            BridgeResponse::Status {
+                running,
+                udp_proxy_available,
+                error,
+                ..
+            } => {
+                assert!(running, "bridge not running (error: {error:?})");
+                assert!(
+                    udp_proxy_available,
+                    "galoshes chain must report UDP available — the bridge must honor the tcp,udp sitrep (ExpectSitrep)"
+                );
+            }
+            other => panic!("expected Status response, got {other:?}"),
+        }
+
+        harness.send(BridgeRequest::Stop).await.expect("send Stop");
+    });
+}
+
 /// Test 3: SocksOnly mode with galoshes (websocket + TLS). `cfg(not(windows))`:
 /// the server presents a self-signed cert and v2ray-core's `getCertPool` drops
 /// custom certs on Windows (same limit as `plugin-e2e`'s `galoshes_ws_tls_roundtrip`).
