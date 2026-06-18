@@ -209,7 +209,12 @@ mod macos {
     ) -> std::io::Result<()> {
         let plan = plan_swap(&staged.app, app_dest, &staged.helper, std::path::Path::new(HELPER_PATH));
         let mut os = MacosCutoverOs { plan };
-        // Detached: the 200 must flush before the actor SIGTERMs this process.
+        // The handler already wrote the cutover marker before the 200 — that
+        // marker, not flush ordering, is the GUI's source of truth: it masks the
+        // restart gap (`HoleAppState::update_in_progress`, state.rs) and the
+        // version flip drives self-heal (`note_mismatch`). The detached
+        // `tokio::spawn` only lets the 200 flush for a clean UX; correctness does
+        // NOT depend on the actor running after the response.
         // Never joined — on success the actor SIGTERMs this process, so control
         // never returns here. The ONLY way past `run_cutover` is a swap failure
         // BEFORE the SIGTERM; clear the marker so the GUI stops masking

@@ -248,6 +248,9 @@ mod system {
                 unsafe { SleepEx(u32::MAX, true) };
             }
             let state = self.status.current_state.load(Ordering::Acquire);
+            // Trace here, NOT in `notify_callback`: that runs in an APC where any
+            // allocation/lock (which `tracing` may take) is a hazard.
+            tracing::debug!(scm_current_state = state, awaiting = ?self.awaiting, "SCM status callback fired");
             if state == SERVICE_RUNNING.0 {
                 return Ok(WantState::Running);
             }

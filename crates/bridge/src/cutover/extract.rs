@@ -157,8 +157,9 @@ mod imp_windows {
     ) -> std::io::Result<Option<PathBuf>> {
         // Dedup on the resolved identity so a symlink back to an ancestor is a
         // no-op the second time. If canonicalize fails (broken reparse point,
-        // path too long), fall back to the literal path as the key — traverse
-        // the dir rather than hide a real target under it, while still deduping.
+        // path too long), fall back to the literal path as the key: this dedups
+        // only byte-identical literal paths (not symlink aliases), but that beats
+        // hiding a real target under an unresolvable dir by skipping it.
         let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if !visited.insert(key) {
             return Ok(None);
@@ -179,6 +180,13 @@ mod imp_windows {
 
 #[cfg(target_os = "macos")]
 mod imp_macos {
+    //! Same-volume assumption: `/Applications`, `/Library`, and `/var` (the
+    //! staging parent) are firmlinks into the one shared APFS Data volume on a
+    //! standard install, so staging here is same-volume with both swap
+    //! destinations. A non-standard layout that breaks this is caught — not
+    //! assumed away: `swap_one`'s `same_volume` check fails closed (EXDEV) before
+    //! any irreversible step.
+
     use std::path::{Path, PathBuf};
 
     use super::ExtractedImages;

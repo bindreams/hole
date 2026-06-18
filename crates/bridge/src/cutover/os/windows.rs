@@ -33,6 +33,12 @@ pub struct WindowsCutoverOs {
 /// this inode (held `FILE_SHARE_DELETE`), so the canonical path is freed for the
 /// new bytes; the next bridge start sweeps `*.old-*` once no process maps it.
 pub fn old_name(installed: &Path, target_version: &str) -> PathBuf {
+    // A BINDIR entry always has a filename; a missing one is a caller bug, not a
+    // runtime condition to paper over with an empty rename target.
+    debug_assert!(
+        installed.file_name().is_some(),
+        "BINDIR image has no filename: {installed:?}"
+    );
     let file = installed
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
