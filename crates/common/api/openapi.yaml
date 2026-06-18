@@ -33,6 +33,17 @@ paths:
     post:
       summary: Start the proxy
       operationId: startProxy
+      parameters:
+        - in: header
+          name: X-Hole-Attempt-Id
+          required: false
+          schema:
+            type: string
+          description: >-
+            Client-minted per-attempt idempotency key (a UUID). The bridge scopes
+            start-cancellation to it so a stale pre-armed cancel can never silently
+            cancel a later, unrelated attempt (#465). Absent/empty degrades to the
+            legacy unscoped behavior; the GUI/CLI always send a non-empty value.
       requestBody:
         required: true
         content:
@@ -75,12 +86,24 @@ paths:
     post:
       summary: Cancel an in-flight proxy start
       description: |
-        Idempotent signal that interrupts an in-flight `POST /v1/start`. If no
-        start is currently in flight, the cancel is "pre-armed" and consumed by
-        the very next start. Always returns 200 — the bridge records the intent
-        regardless of whether there is anything to cancel right now. The
-        cancelled start itself returns 500 with `ErrorResponse { message: "cancelled" }`.
+        Idempotent signal that interrupts the in-flight `POST /v1/start` whose
+        `X-Hole-Attempt-Id` matches. If no matching start is in flight, the cancel
+        is "pre-armed" and consumed by the next start carrying the SAME attempt id
+        — a stale arm can never match a later, unrelated attempt's id (#465).
+        Always returns 200 — the bridge records the intent regardless of whether
+        there is anything to cancel right now. The cancelled start itself returns
+        500 with `ErrorResponse { message: "cancelled" }`.
       operationId: cancelProxy
+      parameters:
+        - in: header
+          name: X-Hole-Attempt-Id
+          required: false
+          schema:
+            type: string
+          description: >-
+            The attempt id this cancel targets (see `POST /v1/start`). Matched
+            against the in-flight start, or pre-armed for the start that will
+            carry it.
       responses:
         "200":
           description: Cancel recorded (idempotent)
