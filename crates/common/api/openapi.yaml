@@ -42,8 +42,9 @@ paths:
           description: >-
             Client-minted per-attempt idempotency key (a UUID). The bridge scopes
             start-cancellation to it so a stale pre-armed cancel can never silently
-            cancel a later, unrelated attempt (#465). Absent/empty degrades to the
-            legacy unscoped behavior; the GUI/CLI always send a non-empty value.
+            cancel a later, unrelated attempt (#465). Absent/empty disables pre-arm
+            scoping for that request (fail-safe: a start never consumes a pre-arm,
+            a cancel never arms); the GUI/CLI always send a non-empty value.
       requestBody:
         required: true
         content:

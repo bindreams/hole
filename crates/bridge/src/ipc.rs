@@ -29,8 +29,11 @@ use tracing::{debug, error, info};
 
 // IPC state ===========================================================================================================
 
-/// Opaque per-attempt id minted by the client (a UUID, in practice). The bridge
-/// only ever compares it for equality — never parses or orders it.
+/// Opaque per-attempt id minted by the client (a UUIDv4, in practice). The
+/// bridge only ever compares it for equality — never parses or orders it.
+/// Correctness rests on the client minting a fresh, never-reused id per connect
+/// attempt: that uniqueness is what makes a stale pre-arm un-matchable by any
+/// later attempt (#465).
 type AttemptId = String;
 
 /// The `X-Hole-Attempt-Id` request header carrying the per-attempt idempotency
@@ -313,16 +316,18 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         pm.start_cancellable(&config, token).await
     };
 
-    // Identity-guarded clear: only null the slot if it still holds OUR attempt.
-    // Single-occupancy guarantees it does; the guard keeps the invariant local
-    // (so a future relaxation cannot silently clobber a successor's slot) and a
-    // Cancel landing in the tiny post-start window signals a token already done
-    // — harmless.
+    // Clear the slot. Single-occupancy (the 409 above) guarantees it still holds
+    // OUR attempt: no other start can register while in_flight is Some, and
+    // neither cancel nor stop ever nulls it. Assert that contract rather than
+    // branch on it — a violation (e.g. a future relaxation of single-occupancy)
+    // then fails loudly in tests instead of silently masking.
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-        if matches!(&cs.in_flight, Some((cur, _)) if *cur == attempt_id) {
-            cs.in_flight = None;
-        }
+        debug_assert!(
+            matches!(&cs.in_flight, Some((cur, _)) if *cur == attempt_id),
+            "in_flight slot must still hold this attempt at clear"
+        );
+        cs.in_flight = None;
     }
 
     match result {
