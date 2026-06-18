@@ -61,3 +61,48 @@ fn reverify_rejects_a_payload_not_signed_by_the_production_key() {
         "a payload not signed by the production key must fail closed"
     );
 }
+
+#[skuld::test]
+fn stage_payload_copy_is_stable_against_source_mutation() {
+    // The TOCTOU close: the bridge verifies and extracts ONLY the private copy,
+    // never the caller-supplied path. Proving the copy is decoupled from the
+    // source proves the verified bytes are the extracted bytes regardless of any
+    // post-copy source mutation by a hole-group attacker.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("payload.bin");
+    std::fs::write(&src, b"good").unwrap();
+
+    let private_dir = tempfile::tempdir().unwrap();
+    let copy = stage_payload(&src, private_dir.path()).expect("stage must copy into the private dir");
+
+    assert!(
+        copy.starts_with(private_dir.path()),
+        "the staged copy must live under the private dir, not the source dir"
+    );
+
+    std::fs::write(&src, b"EVIL").expect("overwrite source after staging");
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"good",
+        "the staged copy must be the verified bytes, immune to source mutation"
+    );
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn stage_payload_private_dir_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("payload.bin");
+    std::fs::write(&src, b"good").unwrap();
+
+    // A not-yet-existing private dir: stage_payload must create it 0700 so no
+    // attacker can swap the copy between verify and extract.
+    let base = tempfile::tempdir().unwrap();
+    let private_dir = base.path().join("payload-private");
+    stage_payload(&src, &private_dir).unwrap();
+
+    let mode = std::fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the private staging dir must be owner-only");
+}

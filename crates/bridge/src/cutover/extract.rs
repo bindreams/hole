@@ -9,7 +9,56 @@
 //! Same-volume staging is required so the subsequent rename is a directory-entry
 //! flip, not a cross-volume copy (Windows) / `EXDEV` (macOS).
 
+use std::io;
 use std::path::{Path, PathBuf};
+
+/// Per-OS base for the bridge-private payload copy that closes the verify/extract
+/// TOCTOU. The IPC re-verifies and extracts ONLY this copy, never the caller-
+/// supplied path: a hole-group member can pass a genuinely-signed payload, then
+/// overwrite it before extract opens it. Copying first to a directory the
+/// attacker cannot write makes the verified bytes the extracted bytes.
+///
+/// Windows: the install dir (`current_exe` parent) — Program Files, writable
+/// only by admin/SYSTEM, the same root-trust anchor `extract` already relies on.
+/// macOS: the root-owned service `state_dir`.
+pub fn private_payload_dir(state_dir: &Path) -> io::Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = state_dir;
+        let install_dir = std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| io::Error::other("current_exe has no parent dir"))?
+            .to_path_buf();
+        Ok(install_dir.join(".update-payload"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(state_dir.join(".update-payload"))
+    }
+}
+
+/// Copy the caller-supplied payload into `private_dir` (created owner-only on
+/// unix) and return the copy path. The copy is the only payload the bridge then
+/// verifies and extracts, so a post-copy mutation of the source is inert. A
+/// leftover copy from a crashed prior attempt is cleared first.
+pub fn stage_payload(payload_path: &Path, private_dir: &Path) -> io::Result<PathBuf> {
+    if private_dir.exists() {
+        std::fs::remove_dir_all(private_dir)?;
+    }
+    std::fs::create_dir_all(private_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(private_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let name = payload_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload path has no file name"))?;
+    let copy = private_dir.join(name);
+    std::fs::copy(payload_path, &copy)?;
+    Ok(copy)
+}
 
 /// Re-verify the payload offline before the irreversible steps: minisign over
 /// the caller-supplied `SHA256SUMS` manifest, then the payload's SHA-256 against
