@@ -5,6 +5,7 @@
 // assembled from local state.
 
 import { type ConnectionState, stateForToggleOutcome, type ToggleOutcome } from "./connection-state";
+import type { Operation } from "./operation";
 import type { ToastKind } from "./toast";
 import { toggleFailureToast } from "./toggle-failure";
 import type { Config } from "./types";
@@ -42,6 +43,11 @@ export interface ToggleDeps {
   /// Sequenced AFTER the mark so the in-memory config sees the new
   /// validation state.
   loadConfig(): Promise<void>;
+  /// Begin a new power operation, superseding any in flight. A superseded
+  /// operation's late IPC continuation is fenced (see ui/operation.ts), so a
+  /// stale start_proxy/stop_proxy result cannot resurrect a transition the user
+  /// has escaped.
+  beginOp(): Operation;
 }
 
 /// Issue `start_proxy`/`stop_proxy` — explicit intent on the wire, so
@@ -49,14 +55,14 @@ export interface ToggleDeps {
 /// state (#462) — and apply the resulting state transition.
 ///
 /// The UI stays in `connecting`/`disconnecting` until the bridge IPC
-/// returns. There is no client-side timeout: the bridge supports
-/// cooperative cancellation, so the user's `Cancel` button (which fires
-/// `cancel_proxy` on a fresh bridge connection) is the escape hatch for
-/// a genuinely-hung bridge. A client-side timer would only produce
-/// false-failure toasts on slow machines while the bridge is still
-/// making progress.
+/// returns; there is no client-side timeout. A wedged transition is
+/// escapable by a click (see `power-button.ts` handlePowerClick) and
+/// reconciled by the observation gate once the bridge speaks. Each
+/// transition is owned by an `Operation`; a superseded op's late
+/// continuation is fenced via `op.settle` so it cannot clobber an escape.
 export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps): Promise<void> {
-  deps.setState(goingToConnect ? "connecting" : "disconnecting");
+  const op = deps.beginOp();
+  op.settle(() => deps.setState(goingToConnect ? "connecting" : "disconnecting"));
 
   const command = goingToConnect ? "start_proxy" : "stop_proxy";
   let outcome: ToggleOutcome;
@@ -64,44 +70,55 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
     outcome = await deps.invoke<ToggleOutcome>(command);
   } catch (error) {
     console.error(`${command} failed:`, error);
-    const spec = toggleFailureToast({ error });
-    deps.showToast(spec.message, spec.kind);
-    deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
+    op.settle(() => {
+      const spec = toggleFailureToast({ error });
+      deps.showToast(spec.message, spec.kind);
+      deps.setState(goingToConnect ? "connection-failed" : "disconnection-failed");
+    });
     return;
   }
 
   // Race: the user clicked Cancel during connecting, but the Start had
-  // already succeeded at the bridge before the cancel reached it. The
-  // outcome is Running despite the user's intent to cancel. Honor the
-  // user's intent by firing a follow-up Stop. This preserves the plan's
-  // "cancelling --raced-- disconnecting" transition.
-  if (deps.getState() === "cancelling" && outcome === "running") {
+  // already succeeded at the bridge before the cancel reached it. Honor the
+  // cancel intent with a follow-up Stop — but only while this connect still
+  // owns the transition. If the user escaped the wedged cancel meanwhile, a
+  // superseding op now owns the UI and the started proxy is reconciled by the
+  // observation gate instead.
+  if (op.isCurrent() && deps.getState() === "cancelling" && outcome === "running") {
     console.info("cancel raced with successful start — firing follow-up stop");
-    deps.setState("disconnecting");
+    const stopOp = deps.beginOp();
+    stopOp.settle(() => deps.setState("disconnecting"));
     try {
       const stopOutcome = await deps.invoke<ToggleOutcome>("stop_proxy");
-      deps.setState(stateForToggleOutcome(stopOutcome));
+      stopOp.settle(() => deps.setState(stateForToggleOutcome(stopOutcome)));
     } catch (err) {
       console.error("follow-up stop failed:", err);
-      const spec = toggleFailureToast({ error: err });
-      deps.showToast(spec.message, spec.kind);
-      deps.setState("disconnection-failed");
+      stopOp.settle(() => {
+        const spec = toggleFailureToast({ error: err });
+        deps.showToast(spec.message, spec.kind);
+        deps.setState("disconnection-failed");
+      });
     }
-    deps.updatePublicIp();
+    stopOp.settle(() => {
+      deps.updatePublicIp();
+    });
     return;
   }
 
-  deps.setState(stateForToggleOutcome(outcome));
+  op.settle(() => deps.setState(stateForToggleOutcome(outcome)));
   // Fire-and-forget — the state transition has already settled; the IP
   // refresh races in the background and renders when it lands.
-  deps.updatePublicIp();
+  op.settle(() => {
+    deps.updatePublicIp();
+  });
 
-  // User-initiated connect succeeded — mark the selected server as
-  // validated so the UI gets a green dot without a separate test run.
-  // Sequence the persist BEFORE the reload so loadConfig() sees the
-  // new validation state.
+  // User-initiated connect succeeded — mark the selected server as validated so
+  // the UI gets a green dot without a separate test run. Skip if a superseding
+  // op has taken over (the user escaped this transition); re-check after each
+  // await, since supersession can happen across the suspension point. Sequence
+  // the persist BEFORE the reload so loadConfig() sees the new validation state.
   const config = deps.getConfig();
-  if (goingToConnect && outcome === "running" && config?.selected_server) {
+  if (goingToConnect && outcome === "running" && config?.selected_server && op.isCurrent()) {
     try {
       await deps.invoke("mark_validated_by_proxy_start", { entryId: config.selected_server });
     } catch (err) {
@@ -110,9 +127,9 @@ export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps):
       // instead of leaving a silently unvalidated server. Scoped to the
       // mark alone: loadConfig below never rejects (it catches and
       // toasts internally), and this message would misdescribe it.
-      deps.showToast(`Connected, but couldn't record server validation: ${err}`, "error");
+      op.settle(() => deps.showToast(`Connected, but couldn't record server validation: ${err}`, "error"));
       return;
     }
-    await deps.loadConfig();
+    if (op.isCurrent()) await deps.loadConfig();
   }
 }

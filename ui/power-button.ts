@@ -15,6 +15,7 @@ import {
 } from "./connection-state";
 import { updatePublicIp } from "./ip-display";
 import { config, loadConfig } from "./main";
+import { OperationGate } from "./operation";
 import { showToast } from "./toast";
 import { toggleFromIdle } from "./toggle-flow";
 import type { ProxyStatus } from "./types";
@@ -22,6 +23,11 @@ import type { ProxyStatus } from "./types";
 let currentState: ConnectionState = "disconnected";
 let powerBtn: HTMLElement | null = null;
 let statusWord: HTMLElement | null = null;
+
+/// Fences stale transition continuations: a Tauri invoke() can't be aborted, so
+/// a superseded operation's late result is dropped instead of clobbering the
+/// state the user escaped to. See ui/operation.ts.
+const operations = new OperationGate();
 
 function setState(next: ConnectionState): void {
   currentState = next;
@@ -65,6 +71,7 @@ async function handlePowerClick(): Promise<void> {
     showToast,
     getConfig: () => config,
     loadConfig,
+    beginOp: () => operations.begin(),
   });
 }
 
