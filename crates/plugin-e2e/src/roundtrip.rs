@@ -57,6 +57,14 @@ pub struct RoundtripConfig {
     pub ss_connect_timeout: Duration,
     pub read_timeout: Duration,
     pub ready_timeout: Duration,
+    /// When set, read the tunneled response to EOF instead of taking the first
+    /// chunk. This exercises server->client half-close (FIN) propagation all the
+    /// way back through the chain: the sentinel writes its response and FINs, and
+    /// the read only returns once that FIN traverses ss-server -> server-plugin ->
+    /// transport -> client-plugin -> ss-client. The default single-chunk read
+    /// returns as soon as the first bytes arrive and never observes the FIN — the
+    /// gap that hid bindreams/hole#541.
+    pub read_to_eof: bool,
 }
 
 impl Default for RoundtripConfig {
@@ -65,6 +73,7 @@ impl Default for RoundtripConfig {
             ss_connect_timeout: Duration::from_secs(20),
             read_timeout: Duration::from_secs(20),
             ready_timeout: Duration::from_secs(30),
+            read_to_eof: false,
         }
     }
 }
@@ -171,6 +180,26 @@ async fn run_tunnel(
     };
 
     let _ = stream.write_all(HEAD_REQUEST).await;
+
+    if cfg.read_to_eof {
+        // Read to EOF: only returns once the sentinel's FIN has propagated the
+        // whole way back. The data path crosses the client/server plugin
+        // SUBPROCESSES, so this read_timeout is the sanctioned class-2
+        // failure-to-human bound for a wedged subprocess (see the struct doc),
+        // not intra-process synchronization. A genuine FIN-propagation failure
+        // (bindreams/hole#541) surfaces here as a timeout.
+        let mut got = Vec::new();
+        return match timeout(cfg.read_timeout, stream.read_to_end(&mut got)).await {
+            Ok(Ok(_)) if got.starts_with(b"HTTP") => {
+                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).max(1);
+                Roundtrip::Reachable { latency_ms }
+            }
+            Ok(Ok(0)) => Roundtrip::NotReachable("EOF before any reply".into()),
+            Ok(Ok(n)) => Roundtrip::NotReachable(format!("non-HTTP reply: {}", hex::encode(&got[..n.min(16)]))),
+            Ok(Err(e)) => Roundtrip::NotReachable(format!("read: {e}")),
+            Err(_) => Roundtrip::NotReachable("read to EOF timed out — server FIN never propagated".into()),
+        };
+    }
 
     let mut buf = [0u8; 64];
     match timeout(cfg.read_timeout, stream.read(&mut buf)).await {

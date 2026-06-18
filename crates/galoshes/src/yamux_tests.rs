@@ -409,3 +409,27 @@ async fn tcp_full_response_survives_client_half_close() {
 
     shutdown.cancel();
 }
+
+#[skuld::test]
+async fn tcp_server_fin_propagates_without_client_half_close() {
+    // REPRO for bindreams/hole#541: the app does NOT half-close its write side.
+    // It writes the request and then reads to EOF with the write half still open
+    // — exactly what the full-tunnel e2e client (`direct_http_get`) and a plain
+    // HTTP/1.0 `Connection: close` reader do. The upstream responds and FINs
+    // (server->client half-close); the app's `read_to_end` must return when that
+    // FIN propagates back through the relay even though the client->server
+    // direction never closes.
+    const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    let upstream = spawn_tcp_responder(RESPONSE.to_vec()).await;
+    let (client_tcp, shutdown) = setup_tcp_relay(upstream).await;
+
+    let mut app = TcpStream::connect(client_tcp).await.expect("connect client TCP");
+    app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
+    // NO app.shutdown(): the write half stays open, like a real reader.
+
+    let mut got = Vec::new();
+    app.read_to_end(&mut got).await.expect("read response to EOF");
+    assert_eq!(got, RESPONSE, "server FIN must propagate without a client half-close");
+
+    shutdown.cancel();
+}
