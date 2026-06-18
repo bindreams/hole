@@ -22,6 +22,7 @@ import { initSettings, renderSettings } from "./settings";
 import {
   applyProxyStateObservation,
   initSidebar,
+  setCapabilityFlags,
   startPublicIpAutoRefresh,
   updateDiagnostics,
   updateMetrics,
@@ -152,6 +153,7 @@ async function pollProxyStatus() {
     if (epoch === filtersEpoch()) {
       setInvalidFilters(status.invalid_filters);
     }
+    setCapabilityFlags(status.udp_proxy_available, status.ipv6_bypass_available, status.running);
   } catch (err) {
     console.error("get_proxy_status failed:", err);
   }
