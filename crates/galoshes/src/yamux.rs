@@ -279,20 +279,21 @@ async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Resul
     stream.flush().await
 }
 
-/// Relay between a tokio TCP stream and a yamux stream (bidirectional).
+/// Relay between a tokio TCP stream and a yamux stream (bidirectional),
+/// with correct half-close.
+///
+/// When one direction reaches EOF, `copy_bidirectional` shuts down the peer's
+/// write half (propagating the FIN) and keeps copying the other direction until
+/// it too reaches EOF. A `tokio::select!` over two one-directional
+/// `tokio::io::copy`s would instead drop the surviving copy the instant either
+/// finished, discarding an in-flight response — a truncation when a client
+/// half-closes its write side mid-request. The compat shim maps
+/// `copy_bidirectional`'s `poll_shutdown` onto `yamux::Stream::poll_close`, so
+/// the yamux FIN is sent without a separate `close()`. Mirrors the bridge's own
+/// endpoints (`endpoint/socks5.rs`, `endpoint/interface.rs`).
 async fn relay_tcp(mut yamux_stream: yamux::Stream, mut tcp_stream: TcpStream) -> Result<()> {
-    // Convert yamux stream (futures AsyncRead/Write) to tokio-compatible.
     let mut compat = (&mut yamux_stream).compat();
-    let (mut yr, mut yw) = tokio::io::split(&mut compat);
-    let (mut tr, mut tw) = tcp_stream.split();
-
-    let _result = tokio::select! {
-        r = tokio::io::copy(&mut yr, &mut tw) => r,
-        r = tokio::io::copy(&mut tr, &mut yw) => r,
-    };
-
-    // Best-effort shutdown.
-    let _ = yamux_stream.close().await;
+    tokio::io::copy_bidirectional(&mut compat, &mut tcp_stream).await?;
     Ok(())
 }
 
@@ -458,13 +459,25 @@ async fn run_udp_association(
     let _ = cleanup_tx.send((peer, generation)).await;
 }
 
+/// The client's bound local listener addresses, reported via the `run_client`
+/// test seam. The TCP listener and UDP socket are bound separately, so on a
+/// `:0` (ephemeral) `local` they land on different ports — tests need both.
+/// Production passes `None` and never observes this.
+// The fields are read only from `#[cfg(test)]` code (the relay tests), so the
+// non-test lib build sees them as write-only; allow that, keep the lint in tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ClientBoundAddrs {
+    pub tcp: SocketAddr,
+    pub udp: SocketAddr,
+}
+
 pub(crate) async fn run_client(
     config: yamux::Config,
     local: SocketAddr,
     remote: SocketAddr,
     udp_timeout: Duration,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<ClientBoundAddrs>>,
 ) -> Result<()> {
     // Bind the local TCP + UDP listeners once for the client's lifetime. They
     // belong to `local` (the SS_LOCAL address), not to any single upstream
@@ -475,10 +488,12 @@ pub(crate) async fn run_client(
     let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
     let udp_socket = Arc::new(bind_udp(local).context("bind local UDP")?);
 
-    // Report the actual bound UDP address (test seam). Production passes `None`.
+    // Report the actual bound listener addresses (test seam). Production passes `None`.
     if let Some(tx) = bound_addr_tx {
-        let addr = udp_socket.local_addr().context("local udp addr")?;
-        let _ = tx.send(addr);
+        let _ = tx.send(ClientBoundAddrs {
+            tcp: tcp_listener.local_addr().context("local tcp addr")?,
+            udp: udp_socket.local_addr().context("local udp addr")?,
+        });
     }
 
     loop {

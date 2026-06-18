@@ -6,7 +6,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -14,8 +15,8 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, FrameAccumulator, StreamTag,
-    DEFAULT_UDP_TIMEOUT,
+    deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, ClientBoundAddrs,
+    FrameAccumulator, StreamTag, DEFAULT_UDP_TIMEOUT,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -203,14 +204,12 @@ async fn spawn_udp_echo(ip: IpAddr) -> SocketAddr {
     addr
 }
 
-/// Stand up a client+server yamux relay whose upstream is a UDP echo server
-/// bound on `echo_ip`. Returns the client's local UDP address (where a test
-/// "app" socket sends) and the shutdown token.
+/// Stand up a client+server yamux relay pointed at `upstream`, returning the
+/// client's bound listener addresses and the shutdown token.
 ///
 /// No artificial delay orders startup: `run_server`/`run_client` report their
 /// bound address via the readiness oneshot, and we await each before using it.
-async fn setup_relay(echo_ip: IpAddr, udp_timeout: Duration) -> (SocketAddr, CancellationToken) {
-    let echo_addr = spawn_udp_echo(echo_ip).await;
+async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (ClientBoundAddrs, CancellationToken) {
     let shutdown = CancellationToken::new();
     let loopback_v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -218,7 +217,7 @@ async fn setup_relay(echo_ip: IpAddr, udp_timeout: Duration) -> (SocketAddr, Can
     tokio::spawn(run_server(
         ::yamux::Config::default(),
         loopback_v4,
-        echo_addr,
+        upstream,
         shutdown.clone(),
         Some(srv_tx),
     ));
@@ -233,9 +232,17 @@ async fn setup_relay(echo_ip: IpAddr, udp_timeout: Duration) -> (SocketAddr, Can
         shutdown.clone(),
         Some(cli_tx),
     ));
-    let client_udp_addr = cli_rx.await.expect("client bound");
+    let addrs = cli_rx.await.expect("client bound");
 
-    (client_udp_addr, shutdown)
+    (addrs, shutdown)
+}
+
+/// [`setup_relay_inner`] fronted by a UDP echo server bound on `echo_ip`.
+/// Returns the client's local UDP address (where a test "app" socket sends).
+async fn setup_relay(echo_ip: IpAddr, udp_timeout: Duration) -> (SocketAddr, CancellationToken) {
+    let echo_addr = spawn_udp_echo(echo_ip).await;
+    let (addrs, shutdown) = setup_relay_inner(echo_addr, udp_timeout).await;
+    (addrs.udp, shutdown)
 }
 
 /// Send one datagram from `app` to the client's local UDP port and await the
@@ -345,5 +352,60 @@ async fn udp_idle_eviction_and_recreation() {
 
     // A datagram from the same peer transparently re-creates the association.
     assert_eq!(round_trip(&app, client_addr, b"second").await, b"second");
+    shutdown.cancel();
+}
+
+// End-to-end TCP relay (half-close) -----------------------------------------------------------------------------------
+
+/// Spawn a TCP "upstream" (stands in for the ss-server side). On each accepted
+/// connection it drains the request, writes `response`, then half-closes its
+/// write side (FIN) — what an HTTP/1.0 `Connection: close` target does.
+async fn spawn_tcp_responder(response: Vec<u8>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp responder");
+    let addr = listener.local_addr().expect("responder local_addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let response = response.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await; // drain (part of) the request
+                let _ = sock.write_all(&response).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// [`setup_relay_inner`] pointed at the TCP responder at `upstream`. Returns the
+/// client's local TCP listener address (where a test "app" connects).
+async fn setup_tcp_relay(upstream: SocketAddr) -> (SocketAddr, CancellationToken) {
+    let (addrs, shutdown) = setup_relay_inner(upstream, DEFAULT_UDP_TIMEOUT).await;
+    (addrs.tcp, shutdown)
+}
+
+#[skuld::test]
+async fn tcp_full_response_survives_client_half_close() {
+    // The app half-closes its write side right after the request (a legitimate
+    // `Connection: close` client), then reads the response to EOF. The request
+    // reaches the relay before any response round-trips, so the old
+    // `select!{copy;copy}` relay completed its request-direction copy first and
+    // dropped the still-live response-direction copy — truncating the response.
+    // The ordering is causal (the FIN follows the request on the same direction;
+    // the response can only arrive after a full round-trip), so the assertion is
+    // deterministic, not timing-dependent. `copy_bidirectional` instead FINs the
+    // peer and keeps draining the response to completion.
+    const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    let upstream = spawn_tcp_responder(RESPONSE.to_vec()).await;
+    let (client_tcp, shutdown) = setup_tcp_relay(upstream).await;
+
+    let mut app = TcpStream::connect(client_tcp).await.expect("connect client TCP");
+    app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
+    app.shutdown().await.expect("half-close write"); // FIN; keep reading
+
+    let mut got = Vec::new();
+    app.read_to_end(&mut got).await.expect("read response to EOF");
+    assert_eq!(got, RESPONSE, "the full response must survive a client half-close");
+
     shutdown.cancel();
 }
