@@ -169,8 +169,9 @@ pub(crate) enum BridgeAction {
         #[arg(long, conflicts_with = "then_send")]
         then_send_file: Option<std::path::PathBuf>,
         /// Write the typed outcome (ElevatedOutcome JSON) here for an elevated
-        /// parent to read back across stripped stdio.
-        #[arg(long)]
+        /// parent to read back across stripped stdio. Meaningful only with the
+        /// file-based request path, so it conflicts with the base64 channel.
+        #[arg(long, conflicts_with = "then_send")]
         result_file: Option<std::path::PathBuf>,
     },
     /// Send a single IPC command to the bridge (requires elevation)
@@ -182,8 +183,9 @@ pub(crate) enum BridgeAction {
         #[arg(long, conflicts_with = "base64")]
         request_file: Option<std::path::PathBuf>,
         /// Write the typed outcome (ElevatedOutcome JSON) here for an elevated
-        /// parent to read back across stripped stdio.
-        #[arg(long)]
+        /// parent to read back across stripped stdio. Meaningful only with the
+        /// file-based request path, so it conflicts with the base64 channel.
+        #[arg(long, conflicts_with = "base64")]
         result_file: Option<std::path::PathBuf>,
     },
 }

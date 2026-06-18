@@ -161,9 +161,8 @@ fn read_request_file_missing_file_returns_error() {
 
 use super::{read_result_file, write_result_file, ElevatedOutcome};
 
-/// An empty result-file target with its handle closed, mirroring how the parent
-/// creates one (`write_result_file_target`, added with its consumer); the child
-/// then writes to it.
+/// An empty result-file target with its handle closed, mirroring the parent's
+/// `write_result_file_target`; the child then writes to it.
 fn result_target() -> tempfile::TempPath {
     tempfile::NamedTempFile::new().unwrap().into_temp_path()
 }
