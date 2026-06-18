@@ -336,7 +336,9 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         ]);
 
         // ORDER MATTERS: the would-leak marker first, the permitted tail second,
-        // both from the same socket+NIC. The tail's presence proves the leak
+        // both from the same socket+NIC. ALE classification is synchronous on the
+        // send path and pktmon records a single NIC component in egress order, so
+        // the FIFO holds at BOTH layers: the tail's presence proves the leak
         // marker's ALE decision already resolved (same egress FIFO), so its
         // absence is a DROP, not a pending send. No sleep, no poll.
         //
