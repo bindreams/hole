@@ -835,6 +835,22 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
   `loglevel=debug` to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`; stderr is
   captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`.
 
+### ETW consumer (HOLE_BRIDGE_ETW, Windows)
+
+On Windows the bridge runs an ETW consumer
+([`diagnostics::etw`](crates/bridge/src/diagnostics/etw.rs)) that snapshots its
+own TCP/Winsock/WFP activity into `bridge.log` for bug reports. It opens a
+*system-wide* real-time trace and filters to the bridge PID in userspace.
+
+`HOLE_BRIDGE_ETW=0` (also `off`/`false`/`no`, case-insensitive, trimmed)
+disables the consumer; absent or any other value keeps it on. The stale-session
+[crash-recovery](#crash-recovery) sweep runs regardless. One bridge pays the
+trace cost once, but N concurrent bridges each re-parse every other's events —
+O(N²) — so the e2e `DistHarness` sets `HOLE_BRIDGE_ETW=0`. It is a coarse
+on/off rather than a kernel PID filter because `ferrisetw`'s
+`EventFilter::ByPids` is effective only on kernel-mode logger sessions, not the
+`UserTrace` this uses (bindreams/hole#542).
+
 ## CLI (dev/admin commands)
 
 User-facing commands are in [README.md](README.md#commands). The rest:

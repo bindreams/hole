@@ -219,15 +219,12 @@ fn e2e_metrics_report_tunnel_traffic(
 
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
-/// Gated off Windows: the Windows bridge-e2e lane intermittently stalls
-/// 600–740s, and the galoshes/ex-ray chain's internal timeouts fire under the
-/// stall → truncated response. Reliable on macOS; the galoshes WS transport is
-/// covered on Windows by `plugin-e2e`. See bindreams/hole#542.
+/// Runs on every platform. `DistHarness` sets `HOLE_BRIDGE_ETW=0`: the
+/// per-bridge ETW consumer's system-wide trace, multiplied across the
+/// concurrent e2e bridges, otherwise starves the Windows runner until the
+/// galoshes/ex-ray 600s idle reaper truncates the response. See
+/// bindreams/hole#542.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "galoshes bridge e2e truncates under the Windows bridge-e2e stall — see bindreams/hole#542"
-)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -672,14 +669,9 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// Gated off Windows for the same reason as `e2e_ws_socks_only_roundtrip` (the
-/// intermittent Windows bridge-e2e stall truncates the galoshes chain). Runs on
-/// macOS. See bindreams/hole#542.
+/// Runs on every platform; same `HOLE_BRIDGE_ETW=0` rationale as
+/// `e2e_ws_socks_only_roundtrip`. See bindreams/hole#542.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "galoshes bridge e2e truncates under the Windows bridge-e2e stall — see bindreams/hole#542"
-)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
