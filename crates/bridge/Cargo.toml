@@ -96,14 +96,6 @@ webpki-roots = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
-# Pure-Rust pcapng parsing + IP/UDP decode for the Windows wire-level no-leak
-# proof (`tests/cutover_nic_capture_privileged.rs`): pktmon captures the egress
-# NIC to an .etl, converts to pcapng, and the test parses it. NO `pcap` crate /
-# Npcap — pktmon is in-box and the parse is pure Rust.
-[target.'cfg(windows)'.dev-dependencies]
-pcap-file = "2"
-etherparse = "0.20"
-
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8"
 windows = { version = "0.62", features = [

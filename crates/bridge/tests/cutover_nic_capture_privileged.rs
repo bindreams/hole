@@ -126,42 +126,18 @@ fn send_marker(
     rt.block_on(socket.send_to(&payload, dst)).map(|_| ())
 }
 
-/// Parse a pktmon-converted pcapng and report whether any captured UDP packet's
-/// PAYLOAD contains `nonce`. Matching on the payload (not the destination)
-/// rules out ambient runner UDP aliasing the verdict.
+/// Whether the pktmon capture contains `nonce` anywhere in its bytes. The pktmon
+/// filter scopes the capture to UDP, the nonce is the leading 16 bytes of our UDP
+/// payload, and pktmon logs the full frame verbatim (`--pkt-size 0`), so the
+/// nonce appears contiguously in the file iff its packet was captured. A 16-byte
+/// random nonce cannot alias unrelated bytes, so a raw scan is sound — and it
+/// sidesteps both the pcapng-block quirks that trip strict pure-Rust pcapng
+/// parsers on pktmon output and any link-layer (Ethernet II vs raw IP) assumption.
 #[cfg(target_os = "windows")]
-fn pcapng_has_udp_nonce(pcapng: &Path, nonce: [u8; 16]) -> bool {
-    use pcap_file::pcapng::{Block, PcapNgReader};
-
-    let file = std::fs::File::open(pcapng)
-        .unwrap_or_else(|e| panic!("pktmon must have produced the pcapng {}: {e}", pcapng.display()));
-    let mut reader = PcapNgReader::new(file).unwrap_or_else(|e| panic!("pcapng {} must parse: {e}", pcapng.display()));
-
-    while let Some(block) = reader.next_block() {
-        let block = block.unwrap_or_else(|e| panic!("pcapng {} block must parse: {e}", pcapng.display()));
-        let matched = match &block {
-            Block::EnhancedPacket(p) => frame_has_udp_nonce(p.data.as_ref(), nonce),
-            Block::SimplePacket(p) => frame_has_udp_nonce(p.data.as_ref(), nonce),
-            _ => false,
-        };
-        if matched {
-            return true;
-        }
-    }
-    false
-}
-
-/// Whether one captured Ethernet II frame carries a UDP packet whose payload
-/// contains `nonce`. pktmon's etl2pcap writes physical-NIC frames as Ethernet II.
-#[cfg(target_os = "windows")]
-fn frame_has_udp_nonce(frame: &[u8], nonce: [u8; 16]) -> bool {
-    let Ok(sliced) = etherparse::SlicedPacket::from_ethernet(frame) else {
-        return false;
-    };
-    let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport else {
-        return false;
-    };
-    udp.payload().windows(16).any(|w| w == nonce)
+fn capture_contains_nonce(pcapng: &Path, nonce: [u8; 16]) -> bool {
+    let bytes = std::fs::read(pcapng)
+        .unwrap_or_else(|e| panic!("pktmon must have produced the capture {}: {e}", pcapng.display()));
+    bytes.windows(16).any(|w| w == nonce)
 }
 
 /// Generate a fresh random 16-byte nonce per marker so two markers in one
@@ -263,7 +239,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         drop(_guard); // remove the Phase-A filter before Phase-B re-adds it
 
         assert!(
-            pcapng_has_udp_nonce(&pcap, nonce_a_ctrl),
+            capture_contains_nonce(&pcap, nonce_a_ctrl),
             "POSITIVE CONTROL FAILED: the capture pipeline/NIC/filter did not record a marker sent with NO cover \
              engaged — an empty Phase-B capture would be meaningless. NIC={:?} (comp nics)",
             gw.interface_name
@@ -318,8 +294,8 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         pktmon(&["stop"]);
         pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
 
-        let tail_seen = pcapng_has_udp_nonce(&pcap, nonce_tail);
-        let leak_seen = pcapng_has_udp_nonce(&pcap, nonce_leak);
+        let tail_seen = capture_contains_nonce(&pcap, nonce_tail);
+        let leak_seen = capture_contains_nonce(&pcap, nonce_leak);
 
         // Tear the cover down BEFORE the asserts so a failure never leaves the box
         // severed. The capture verdicts are already in hand.
