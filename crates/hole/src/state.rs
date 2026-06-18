@@ -131,10 +131,10 @@ impl BridgeLink {
         let mut guard = self.client.lock().await;
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
         if let Some(running) = observed_running(kind, &result) {
-            // A Status exchange reveals lockdown too — commit all three
+            // A Status exchange reveals error + lockdown too — commit all
             // atomically under this lock; other exchanges know only `running`.
             match observed_lockdown(&result) {
-                Some((le, la)) => self.cell.commit_status(running, le, la),
+                Some((le, la)) => self.cell.commit_status(running, observed_error(&result), le, la),
                 None => self.cell.commit(running),
             }
         }
@@ -217,7 +217,7 @@ impl BridgeLink {
         self.note_mismatch(&status);
         if let Some(running) = observed_running(ReqKind::Status, &status) {
             match observed_lockdown(&status) {
-                Some((le, la)) => self.cell.commit_status(running, le, la),
+                Some((le, la)) => self.cell.commit_status(running, observed_error(&status), le, la),
                 None => self.cell.commit(running),
             }
         }
@@ -241,10 +241,17 @@ impl BridgeLink {
 /// only when `running` changes; consumers (tray watcher, webview) discard
 /// observations whose seq is not newer than the last applied, which makes
 /// application monotone across the unordered event/poll channels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProxySnapshot {
     pub seq: u64,
     pub running: bool,
+    /// Reason for the most recent running transition, when the bridge reported
+    /// one (#470). Carried on BOTH the poll and the `proxy-state-changed` event
+    /// so whichever channel wins the death-seq race surfaces the same string.
+    /// Only ever the path-free out-of-band-death sentinel or `None` (set by
+    /// `commit_status` from a Status response; cleared by `commit`), so a toast
+    /// of this value cannot leak PII — see `commands::map_status_response`.
+    pub error: Option<String>,
     /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
     /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
@@ -268,6 +275,7 @@ impl ProxyStateCell {
         let (tx, _) = tokio::sync::watch::channel(ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false,
         });
@@ -275,8 +283,10 @@ impl ProxyStateCell {
     }
 
     /// Commit an observed running state. Bumps `seq` (and wakes watchers)
-    /// only when the value actually changes. Preserves the lockdown fields:
-    /// the non-Status paths that call this only know `running`.
+    /// only when the value actually changes. Preserves the lockdown fields
+    /// (the non-Status paths that call this only know `running`) and clears
+    /// `error`: a non-Status running edge (Start/Stop/Cancel) is user-initiated
+    /// and carries no death reason (#470).
     pub fn commit(&self, running: bool) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running {
@@ -285,16 +295,20 @@ impl ProxyStateCell {
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running,
-                ..*snap
+                error: None,
+                lockdown_enabled: snap.lockdown_enabled,
+                lockdown_active: snap.lockdown_active,
             };
             true
         });
     }
 
-    /// Commit a full Status observation (running + lockdown). Bumps `seq`
-    /// (waking watchers) when any field changes. Used by the `Status` arm so
-    /// all three commit atomically under the one client lock.
-    pub fn commit_status(&self, running: bool, lockdown_enabled: bool, lockdown_active: bool) {
+    /// Commit a full Status observation (running + error + lockdown). Bumps
+    /// `seq` (waking watchers) when `running` or a lockdown field changes. Used
+    /// by the `Status` arm so all commit atomically under the one client lock.
+    /// `error` rides the same write — it is meaningful only alongside a running
+    /// edge (a death), so it is not part of the change check.
+    pub fn commit_status(&self, running: bool, error: Option<String>, lockdown_enabled: bool, lockdown_active: bool) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
@@ -305,6 +319,7 @@ impl ProxyStateCell {
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running,
+                error,
                 lockdown_enabled,
                 lockdown_active,
             };
@@ -313,7 +328,7 @@ impl ProxyStateCell {
     }
 
     pub fn snapshot(&self) -> ProxySnapshot {
-        *self.tx.borrow()
+        self.tx.borrow().clone()
     }
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<ProxySnapshot> {
@@ -391,6 +406,18 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),
         (Stop, Ok(BridgeResponse::Error { .. })) => None,
         (_, Ok(_)) => None,
+    }
+}
+
+/// The error a Status exchange revealed, if any. Only a `Status` Ok carries it
+/// (#470); every other exchange yields None. On a death the bridge's
+/// `last_error` is the static path-free sentinel, so this never carries PII —
+/// the start-failure `e.to_string()` rides the non-Status `commit` path, which
+/// clears `error`.
+pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Option<String> {
+    match result {
+        Ok(BridgeResponse::Status { error, .. }) => error.clone(),
+        _ => None,
     }
 }
 

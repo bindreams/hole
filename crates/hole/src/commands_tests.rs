@@ -358,6 +358,128 @@ fn get_diagnostics_unexpected_response_falls_back() {
     assert_eq!(json["bridge"], "unknown");
 }
 
+// map_status_response (#470) ==========================================================================================
+
+fn status_snap(seq: u64, running: bool, error: Option<&str>) -> crate::state::ProxySnapshot {
+    crate::state::ProxySnapshot {
+        seq,
+        running,
+        error: error.map(Into::into),
+        lockdown_enabled: false,
+        lockdown_active: false,
+    }
+}
+
+/// All seven keys are present on the Status-Ok arm; cosmetics come from the
+/// response, running/state_seq from the snapshot.
+#[skuld::test]
+fn map_status_emits_full_shape_on_status_ok() {
+    let resp = Ok(BridgeResponse::Status {
+        running: true,
+        uptime_secs: 42,
+        error: None,
+        invalid_filters: vec![hole_common::protocol::InvalidFilter {
+            index: 2,
+            error: "bad".into(),
+        }],
+        udp_proxy_available: false,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(7, true, None));
+    for k in [
+        "running",
+        "state_seq",
+        "error",
+        "uptime_secs",
+        "invalid_filters",
+        "udp_proxy_available",
+        "ipv6_bypass_available",
+    ] {
+        assert!(j.get(k).is_some(), "missing key {k}");
+    }
+    assert_eq!(j["running"], true);
+    assert_eq!(j["state_seq"], 7);
+    assert_eq!(j["uptime_secs"], 42);
+    assert_eq!(j["udp_proxy_available"], false);
+    assert_eq!(j["ipv6_bypass_available"], true);
+    assert_eq!(j["invalid_filters"][0]["index"], 2);
+    assert_eq!(j["invalid_filters"][0]["error"], "bad");
+}
+
+/// running/state_seq/error come from the SNAPSHOT, not the response — distinct
+/// values prove the snapshot wins.
+#[skuld::test]
+fn map_status_sources_running_seq_error_from_snap() {
+    let resp = Ok(BridgeResponse::Status {
+        running: true, // response disagrees with the committed snapshot
+        uptime_secs: 0,
+        error: Some("RESPONSE-ERROR".into()),
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(9, false, Some("proxy task exited unexpectedly")));
+    assert_eq!(j["running"], false, "running from snap");
+    assert_eq!(j["state_seq"], 9, "state_seq from snap");
+    assert_eq!(
+        j["error"], "proxy task exited unexpectedly",
+        "error from snap, not the response"
+    );
+}
+
+/// Error arm: caps null (unknown), error from snap, running stale from snap.
+#[skuld::test]
+fn map_status_error_arm_caps_null_error_from_snap() {
+    let j = map_status_response(
+        Ok(BridgeResponse::Error { message: "boom".into() }),
+        status_snap(3, true, None),
+    );
+    assert!(j["udp_proxy_available"].is_null(), "caps unknown on non-Status arm");
+    assert!(j["ipv6_bypass_available"].is_null());
+    assert!(j["error"].is_null(), "error from snap (None), not the response message");
+    assert_eq!(j["running"], true, "running from snap (stale truth)");
+    assert_eq!(j["invalid_filters"], serde_json::json!([]));
+    assert_eq!(j["uptime_secs"], 0);
+}
+
+/// Transport error: caps null, running/seq/error from snap.
+#[skuld::test]
+fn map_status_transport_error_caps_null() {
+    let err = ClientError::Connection(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "x"));
+    let j = map_status_response(Err(err), status_snap(1, false, None));
+    assert!(j["udp_proxy_available"].is_null());
+    assert!(j["ipv6_bypass_available"].is_null());
+    assert_eq!(j["running"], false);
+    assert_eq!(j["state_seq"], 1);
+    assert!(j["error"].is_null());
+}
+
+/// PII guard: on a death the mapper emits the snapshot's path-free sentinel,
+/// never the response's (possibly PII) error.
+#[skuld::test]
+fn map_status_death_error_is_the_sentinel_only() {
+    let resp = Ok(BridgeResponse::Status {
+        running: false,
+        uptime_secs: 0,
+        error: Some("/home/user/secret/path failed".into()), // would-be PII on the wire
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(4, false, Some("proxy task exited unexpectedly")));
+    assert_eq!(j["error"], "proxy task exited unexpectedly");
+    assert!(
+        !j["error"].as_str().unwrap().contains('/'),
+        "the snapshot error (path-free sentinel) is used, never the response's"
+    );
+}
+
 /// `parse_cf_trace` pulls `ip=` / `loc=` out of Cloudflare's trace body.
 #[skuld::test]
 fn parse_cf_trace_extracts_ip_and_country() {
