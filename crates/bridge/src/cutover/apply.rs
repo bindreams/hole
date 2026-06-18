@@ -1,9 +1,10 @@
 //! `POST /v1/update-apply` cutover orchestration helpers: the consent gate, the
 //! single-occupancy guard, the macOS destination pre-flight, and the OS-specific
 //! actor spawn. The handler in `ipc.rs` sequences them (409 guard → consent →
-//! app_dest+volume pre-flight (macOS) → stage_payload → re-verify → marker →
-//! extract → spawn) and owns the HTTP status mapping. Every pre-flight check
-//! sits before the marker, and verify+extract run against the private copy.
+//! app_dest+volume pre-flight (macOS) → marker → stage_payload → re-verify →
+//! extract → spawn) and owns the HTTP status mapping. The marker is claimed
+//! before staging so only the marker-winner touches the shared private staging
+//! dir; verify+extract then run against that private copy.
 
 use std::path::Path;
 

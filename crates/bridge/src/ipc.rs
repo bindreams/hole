@@ -430,15 +430,48 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     #[cfg(not(target_os = "macos"))]
     let app_dest: Option<std::path::PathBuf> = None;
 
+    // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE resolving or
+    // touching the shared private staging dir. `write_new` is `create-new`: two
+    // concurrent requests cannot both win (the 409 read-check above is only a
+    // fast-path; this is the race-free guard), so ONLY the marker-winner ever
+    // stages a payload. A loser 409s here and never touches the shared staging
+    // dir — otherwise its `stage_payload` (which clears+rewrites the fixed dir)
+    // could clobber the winner's already-verified copy mid-extract, reopening the
+    // verify/use TOCTOU via a privileged write on the loser's behalf.
+    let marker = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: state.version.clone(),
+        to_version: req.target_version.clone(),
+        pid: std::process::id(),
+        started_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
+        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cutover marker write failed: {e}"),
+            )
+        };
+        return Err((code, Json(ErrorResponse { message })));
+    }
+
     // Stage the caller-supplied payload into a bridge-private, non-attacker-
-    // writable directory FIRST, then verify and extract ONLY that copy — never
+    // writable directory, then verify and extract ONLY that copy — never
     // `req.payload_path` again. This closes the verify/extract TOCTOU: a
     // hole-group member can pass a genuinely-signed payload (verify passes) and
     // overwrite the file before extract opens it; copying first makes the verified
-    // bytes the extracted bytes. The copy is removed on every exit path.
+    // bytes the extracted bytes. The marker claimed above guarantees a single
+    // occupant, so the fixed staging path is never raced. The copy and the marker
+    // are cleared on every exit path below.
     let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
         Ok(d) => d,
         Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -451,8 +484,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // Stage + re-verify on a blocking thread (filesystem copy + minisign/SHA-256),
     // off the async worker. The GUI is untrusted in the bridge's model, so a
     // verify failure is a corruption/tamper event the user must see distinctly
-    // (422), while a staging I/O failure is a server fault (500). Both precede the
-    // marker, so neither claims a cutover.
+    // (422), while a staging I/O failure is a server fault (500).
     let source = std::path::PathBuf::from(&req.payload_path);
     let stage_dir = private_dir.clone();
     let asset_name = req.asset_name.clone();
@@ -468,6 +500,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let payload = match staged_copy {
         Ok(Ok(copy)) => copy,
         Ok(Err(StageError::Verify(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -477,6 +510,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Ok(Err(StageError::Io(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -486,6 +520,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -496,42 +531,12 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
     };
 
-    // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE any extract/spawn.
-    // `write_new` is `create-new`: two concurrent requests cannot both win (the
-    // 409 read-check above is only a fast-path; this is the race-free guard). A
-    // cutover whose marker did not land would flash Disconnected and would not
-    // disarm the cover, so a non-occupancy write failure is FATAL (500).
-    let marker = hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
-        from_version: state.version.clone(),
-        to_version: req.target_version.clone(),
-        pid: std::process::id(),
-        started_at_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    };
-    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
-        let _ = std::fs::remove_dir_all(&private_dir);
-        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
-            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
-        } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cutover marker write failed: {e}"),
-            )
-        };
-        return Err((code, Json(ErrorResponse { message })));
-    }
-
     // Extract the bare binaries from the PRIVATE copy onto the destination volume.
     // The extract shells out to a blocking `msiexec`/`hdiutil`, so run it on a
     // blocking thread to keep it off the async worker. A failure clears the marker
     // so the GUI does not mask Disconnected forever.
     let state_dir = state.state_dir.clone();
-    let extract_payload = payload.clone();
-    let extracted =
-        tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&extract_payload, &state_dir)).await;
+    let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
     let staged = match extracted {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {

@@ -166,14 +166,16 @@ paths:
         "422":
           description: >-
             Payload re-verification failed (signature/hash mismatch or asset not
-            in the manifest) — a corruption/tamper event, refused before the
-            marker write
+            in the manifest) — a corruption/tamper event; the cutover marker is
+            claimed then cleared, so no cutover proceeds
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "500":
-          description: Cutover failed (marker-write failed or extract failed)
+          description: >-
+            Cutover failed (private-dir resolution, payload staging I/O,
+            marker-write, or extract failed)
           content:
             application/json:
               schema:
