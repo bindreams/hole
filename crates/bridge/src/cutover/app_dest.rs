@@ -61,19 +61,26 @@ pub fn validate_app_dest(dest: &Path) -> std::io::Result<()> {
             format!("swap target does not exist: {dest:?}"),
         ));
     }
-    let plist = dest.join("Contents").join("Info.plist");
-    let text = std::fs::read_to_string(&plist).map_err(|e| {
-        Error::new(
-            e.kind(),
-            format!("cannot read the swap target's Info.plist ({plist:?}): {e}"),
-        )
-    })?;
-    let id = bundle_identifier(&text).ok_or_else(|| {
+    // Parse the bundle's `Info.plist` with the `plist` crate (handles both the XML
+    // and binary plist forms a real `.app` can ship) — a security gate must not
+    // hand-roll structured-data parsing.
+    let plist_path = dest.join("Contents").join("Info.plist");
+    let value = plist::Value::from_file(&plist_path).map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
-            format!("swap target's Info.plist has no CFBundleIdentifier: {plist:?}"),
+            format!("cannot read the swap target's Info.plist ({plist_path:?}): {e}"),
         )
     })?;
+    let id = value
+        .as_dictionary()
+        .and_then(|d| d.get("CFBundleIdentifier"))
+        .and_then(|v| v.as_string())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("swap target's Info.plist has no string CFBundleIdentifier: {plist_path:?}"),
+            )
+        })?;
     if id != HOLE_BUNDLE_ID {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -81,18 +88,6 @@ pub fn validate_app_dest(dest: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Read `CFBundleIdentifier` from an XML `Info.plist`. Minimal, dependency-free:
-/// finds the `<key>CFBundleIdentifier</key>` element and returns the next
-/// `<string>` value's text. Returns `None` if the key or its value is absent.
-fn bundle_identifier(plist_xml: &str) -> Option<String> {
-    let key_tag = "<key>CFBundleIdentifier</key>";
-    let after_key = &plist_xml[plist_xml.find(key_tag)? + key_tag.len()..];
-    let open = after_key.find("<string>")? + "<string>".len();
-    let rest = &after_key[open..];
-    let end = rest.find("</string>")?;
-    Some(rest[..end].trim().to_string())
 }
 
 #[cfg(test)]

@@ -61,6 +61,9 @@ http = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# Robust Info.plist parse (XML + binary) for the macOS .app swap-target identity
+# anchor in cutover::app_dest — a security gate must not hand-roll string search.
+plist = "1"
 # Filter engine dependencies. All except `lru` and `tls-parser` are already
 # pulled in transitively via shadowsocks-service; promoted to direct deps so
 # the filter module can `use` them. Pinned to the same minor versions that

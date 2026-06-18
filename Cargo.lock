@@ -3041,6 +3041,7 @@ dependencies = [
  "libc",
  "lru",
  "pcap-file",
+ "plist",
  "plugin-e2e",
  "rand 0.10.1",
  "regex",
