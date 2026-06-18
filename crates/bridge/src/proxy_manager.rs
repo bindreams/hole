@@ -1197,10 +1197,8 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    // The in-TUN endpoint is the sole OS DNS path: OS DNS now routes
-    // into hole-tun and is intercepted here, not via a loopback :53 server.
-    // It is built whenever DNS is enabled, independent of `intercept_udp53`
-    // (legacy flag — the in-TUN forwarder is now the mechanism).
+    // The in-TUN endpoint is the sole OS DNS path: OS DNS routes into hole-tun
+    // and is intercepted here, not via a loopback :53 server.
     let endpoint = crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder));
 
     Ok((Some(endpoint), Some(forwarder)))

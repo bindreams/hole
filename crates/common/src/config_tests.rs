@@ -481,7 +481,6 @@ fn dns_config_default_is_doh_cloudflare() {
     let cfg = DnsConfig::default();
     assert!(cfg.enabled);
     assert_eq!(cfg.protocol, DnsProtocol::Https);
-    assert!(cfg.intercept_udp53);
     assert_eq!(cfg.servers.len(), 2);
     assert_eq!(cfg.servers[0], "1.1.1.1".parse::<std::net::IpAddr>().unwrap());
     assert_eq!(cfg.servers[1], "1.0.0.1".parse::<std::net::IpAddr>().unwrap());
@@ -506,7 +505,6 @@ fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
             enabled: false,
             servers: vec!["9.9.9.9".parse().unwrap(), "149.112.112.112".parse().unwrap()],
             protocol: DnsProtocol::Tls,
-            intercept_udp53: false,
         },
         ..Default::default()
     };
@@ -543,12 +541,26 @@ fn dns_config_accepts_mixed_v4_v6_servers() {
         enabled: true,
         servers: vec!["1.1.1.1".parse().unwrap(), "2606:4700:4700::1111".parse().unwrap()],
         protocol: DnsProtocol::Https,
-        intercept_udp53: true,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let parsed: DnsConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(cfg, parsed);
     assert!(parsed.servers[1].is_ipv6());
+}
+
+#[skuld::test]
+fn dns_config_loads_and_drops_legacy_intercept_udp53_key() {
+    // An older on-disk config carries the retired intercept_udp53 key. It must
+    // still deserialize (unknown key ignored — DnsConfig has no
+    // deny_unknown_fields), and re-serializing must not reintroduce the dead key.
+    let json = r#"{"servers":[],"local_port":4073,"enabled":false,"dns":{"enabled":true,"servers":["1.1.1.1"],"protocol":"https","intercept_udp53":false}}"#;
+    let config: AppConfig = serde_json::from_str(json).expect("legacy config must still load");
+    assert!(config.dns.enabled);
+    let reserialized = serde_json::to_string(&config.dns).unwrap();
+    assert!(
+        !reserialized.contains("intercept_udp53"),
+        "retired key must not round-trip back out, got: {reserialized}"
+    );
 }
 
 // Plugin name validation ==============================================================================================
