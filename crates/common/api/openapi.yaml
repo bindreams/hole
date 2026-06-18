@@ -175,7 +175,7 @@ paths:
         "500":
           description: >-
             Cutover failed (private-dir resolution, payload staging I/O,
-            marker-write, or extract failed)
+            marker-write, extract, actor spawn, or a blocking-task panic)
           content:
             application/json:
               schema:

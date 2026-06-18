@@ -16,9 +16,10 @@ pub use verify::fetch_manifest;
 
 /// The macOS `.app` swap-target hint for `ApplyUpdate`, derived from the GUI's
 /// own `current_exe` (`<bundle>/Contents/MacOS/hole`). The bridge re-validates it
-/// against `CFBundleIdentifier == com.hole.app`, so an undeterminable path is
-/// rejected there (422). Windows has no bundle and sends `None` (the SCM install
-/// dir is canonical).
+/// against `CFBundleIdentifier == com.hole.app`, so a bad/undeterminable path is
+/// rejected there as a destination precondition (400, distinct from the 422
+/// payload-verify failure). Windows has no bundle and sends `None` (the SCM
+/// install dir is canonical).
 pub fn app_dest_hint() -> Option<String> {
     #[cfg(target_os = "macos")]
     {

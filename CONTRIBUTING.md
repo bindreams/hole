@@ -310,7 +310,12 @@ only thing unit-tested; the kernel-level engage is exercised in production and,
 for the lockdown cover, by the privileged-lane real-engage tests (#527) — both
 on the `tun` lane (Windows under the elevated CI token; macOS under root for
 `pfctl`) — proving the WFP/pf cover actually blocks a non-permitted egress while
-loopback stays permitted. The recovery sweep runs on every bridge start via
+loopback stays permitted. On Windows the no-leak is additionally proven **at the
+wire** by an in-box `pktmon` capture keyed on a per-marker UDP-payload nonce
+([`cutover_nic_capture_privileged.rs`](crates/bridge/tests/cutover_nic_capture_privileged.rs),
+with a load-bearing positive control); macOS keeps the connect()-probe there
+because its BPF tap sits upstream of pf, so an en0 capture would record packets pf
+later drops (unsound). The recovery sweep runs on every bridge start via
 `recover_routes`.
 
 ### Lockdown mode
@@ -334,8 +339,9 @@ three axes:
   crash or restart and is reconciled on the next start via
   `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
   volatile TUN + server permits so the next connect re-adds them fresh; Sweep
-  disengages when intent is off). The transient cover
-  exists only for the sub-second cutover window.
+  disengages when intent is off). The transient cover is a non-standing,
+  bounded-window RAII guard with **no production caller today** (a test seam +
+  recovery target swept by `recover_routes`).
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never
@@ -358,17 +364,23 @@ cover engaged — egress still blocked — while the intent read "off".
 
 `POST /v1/update-apply` ([`cutover/apply.rs`](crates/bridge/src/cutover/apply.rs))
 swaps the bridge's own running binary and restarts the service in place. The GUI
-already minisign-verified the MSI/DMG on download; the handler re-checks the
-payload, then writes the marker, extracts the bare binaries, and dispatches the
-OS actor. A lockdown-off update **requires `consent: true`** (the enforcement
-seam — a brief leak is accepted only with informed consent); under lockdown-on
-the standing cover holds the gap, so consent is moot.
+already minisign-verified the MSI/DMG on download; the handler claims the marker
+(the atomic single-occupancy guard) **first**, copies the payload into a
+bridge-private dir, **re-verifies that copy offline** (minisign + SHA), extracts
+the bare binaries from it, and dispatches the OS actor — so the verified bytes are
+the extracted bytes and only the marker-winner ever stages (no concurrent-stage
+clobber). On macOS the `.app` swap target is validated to a genuine
+`com.hole.app` bundle *before* the marker (a destination precondition, 400). A
+lockdown-off update **requires `consent: true`** (the enforcement seam — a brief
+leak is accepted only with informed consent); under lockdown-on the standing cover
+holds the gap, so consent is moot.
 
 Leak-correctness rides the **standing lockdown cover**, not a transient one. The
 bridge's marker-conditional shutdown sees the marker and `disarm`s the cover
 (persist-without-disengage via `std::mem::forget`) instead of dropping it, so the
 WFP/pf filters survive the restart and the new bridge re-adopts them
-(`decide_cover_recovery == Adopt`). `plan_cutover` structurally never engages a
+(`decide_cover_recovery == Adopt`). The `cutover::os::CutoverOs` effects trait
+exposes no cover-mutating method, so a cutover structurally cannot engage a
 transient cover (the Mullvad-#8470 brick); a lockdown-off cutover is a plain
 restart that fails *open*.
 
