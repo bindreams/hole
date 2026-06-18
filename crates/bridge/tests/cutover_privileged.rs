@@ -110,13 +110,14 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn cutover_global_net_state_swap_running_helper_preserves_identity() {
-    use hole_bridge::platform::swap::{execute_swap, plan_swap, volume_supports_rename_swap};
+    use hole_bridge::platform::swap::{execute_swap, plan_swap, volume_supports_rename_swap, RenameSwapSupport};
 
     let dir = tempfile::tempdir().unwrap();
     // RENAME_SWAP is a per-volume capability; the tempdir's volume must advertise
     // it (APFS does). Fail loud if not — the destination volume is wrong.
-    assert!(
+    assert_eq!(
         volume_supports_rename_swap(dir.path()).unwrap(),
+        RenameSwapSupport::Supported,
         "the destination volume must support RENAME_SWAP (APFS)"
     );
 

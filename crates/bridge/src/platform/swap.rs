@@ -62,6 +62,34 @@ pub fn same_volume(a_dev: u64, b_dev: u64) -> bool {
     a_dev == b_dev
 }
 
+/// Three-state result of the `VOL_CAP_INT_RENAME_SWAP` volume probe. A probe
+/// ERROR is distinct from genuine unsupport: collapsing both to `false` would
+/// brick a legit APFS update on a transient `getattrlist` failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameSwapSupport {
+    /// The volume advertises `VOL_CAP_INT_RENAME_SWAP`.
+    Supported,
+    /// The volume positively does NOT advertise it — no atomic swap is possible.
+    Unsupported,
+    /// The capability probe itself failed (transient/unexpected). Treated as
+    /// proceed-with-warning: the swap fail-closes via rollback if the volume
+    /// truly cannot swap, so a probe error must not pre-emptively brick.
+    ProbeFailed,
+}
+
+/// Pre-flight gate on the volume probe: `Supported` proceeds; `Unsupported` is a
+/// clear error (no point claiming the cutover marker for a swap that cannot run);
+/// `ProbeFailed` proceeds (the caller warns) — NEVER brick on a probe error.
+pub fn rename_swap_gate(probe: RenameSwapSupport) -> std::io::Result<()> {
+    match probe {
+        RenameSwapSupport::Supported | RenameSwapSupport::ProbeFailed => Ok(()),
+        RenameSwapSupport::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "destination volume does not support atomic swap (VOL_CAP_INT_RENAME_SWAP)",
+        )),
+    }
+}
+
 /// The per-image primitives the orchestrator drives. The real macOS FFI provides
 /// `swap`/`reswap`/`delete_staging`; tests provide a recorder so the all-or-
 /// nothing ordering is verified cfg-free, without privilege.
@@ -127,7 +155,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    use super::{execute_plan, same_volume, ImageSwap, SwapOps, SwapPlan, SwapPrimitive};
+    use super::{execute_plan, same_volume, ImageSwap, RenameSwapSupport, SwapOps, SwapPlan, SwapPrimitive};
 
     fn cstring(path: &Path) -> io::Result<std::ffi::CString> {
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)
@@ -160,9 +188,10 @@ mod imp {
 
     /// Probe whether `vol_path`'s volume supports `RENAME_SWAP`
     /// (`VOL_CAP_INT_RENAME_SWAP`). This is a per-VOLUME capability, not an
-    /// OS-version gate. On any probe failure, returns `Ok(false)` so the caller
-    /// takes the documented fallback rather than risking an `ENOTSUP` mid-swap.
-    pub fn volume_supports_rename_swap(vol_path: &Path) -> io::Result<bool> {
+    /// OS-version gate. Three-state: a `getattrlist` error is `ProbeFailed`
+    /// (transient — the caller proceeds with a warning), DISTINCT from a positive
+    /// `Unsupported`, so a probe error never bricks a legit APFS update.
+    pub fn volume_supports_rename_swap(vol_path: &Path) -> io::Result<RenameSwapSupport> {
         let cpath = cstring(vol_path)?;
         let mut attrlist = libc::attrlist {
             bitmapcount: libc::ATTR_BIT_MAP_COUNT,
@@ -189,12 +218,16 @@ mod imp {
             )
         };
         if rc != 0 {
-            return Ok(false);
+            return Ok(RenameSwapSupport::ProbeFailed);
         }
         let valid = buf.caps.valid[libc::VOL_CAPABILITIES_INTERFACES];
         let caps = buf.caps.capabilities[libc::VOL_CAPABILITIES_INTERFACES];
         let bit = libc::VOL_CAP_INT_RENAME_SWAP;
-        Ok((valid & bit != 0) && (caps & bit != 0))
+        if (valid & bit != 0) && (caps & bit != 0) {
+            Ok(RenameSwapSupport::Supported)
+        } else {
+            Ok(RenameSwapSupport::Unsupported)
+        }
     }
 
     fn parent_dev(path: &Path) -> io::Result<u64> {

@@ -20,6 +20,23 @@ fn swap_plan_app_uses_rename_swap_helper_uses_plain_rename() {
 }
 
 #[skuld::test]
+fn rename_swap_gate_admits_supported_and_probe_failure_but_not_unsupported() {
+    // The volume probe is three-state: a genuine `Unsupported` is a clear
+    // pre-flight error (no atomic swap is possible), but a `ProbeFailed`
+    // (transient getattrlist error) must NOT brick a legit APFS update — the
+    // swap itself fail-closes via rollback if the volume truly cannot swap.
+    rename_swap_gate(RenameSwapSupport::Supported).expect("supported volume must pass");
+    rename_swap_gate(RenameSwapSupport::ProbeFailed).expect("a probe error must not brick the update");
+
+    let err = rename_swap_gate(RenameSwapSupport::Unsupported).expect_err("unsupported must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert!(
+        err.to_string().contains("atomic swap"),
+        "the error must name the missing capability: {err}"
+    );
+}
+
+#[skuld::test]
 fn same_volume_check_rejects_cross_device() {
     // A DMG mount is a separate volume from /Applications -> EXDEV. The pure
     // checker keys on a caller-supplied (dev, dev) pair so we can table-test it.

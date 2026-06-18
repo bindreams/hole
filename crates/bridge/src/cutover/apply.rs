@@ -1,7 +1,8 @@
 //! `POST /v1/update-apply` cutover orchestration helpers: the consent gate, the
-//! single-occupancy guard, and the OS-specific actor spawn. The handler in
-//! `ipc.rs` sequences them (consent → 409 guard → re-verify → marker → extract →
-//! spawn) and owns the HTTP status mapping.
+//! single-occupancy guard, the macOS destination pre-flight, and the OS-specific
+//! actor spawn. The handler in `ipc.rs` sequences them (consent → 409 guard →
+//! app_dest+volume pre-flight (macOS) → re-verify → marker → extract → spawn) and
+//! owns the HTTP status mapping. Every pre-flight check sits before the marker.
 
 use std::path::Path;
 
@@ -29,12 +30,14 @@ pub fn cutover_in_progress(log_dir: &Path) -> bool {
 }
 
 /// macOS pre-flight: validate the GUI-supplied `.app` swap target is a genuine
-/// `com.hole.app` bundle. Runs BEFORE the marker so a bad target is a clean 422,
-/// never a claimed cutover. The validated bundle path is returned for the actor.
-/// An absent `app_dest` on macOS is itself a rejection (the GUI must supply its
-/// bundle hint).
+/// `com.hole.app` bundle AND its volume can atomically swap. Runs BEFORE the
+/// marker so a bad target is a clean 422, never a claimed cutover. The validated
+/// bundle path is returned for the actor. An absent `app_dest` on macOS is itself
+/// a rejection (the GUI must supply its bundle hint).
 #[cfg(target_os = "macos")]
 pub fn preflight_app_dest(app_dest: Option<&Path>) -> std::io::Result<std::path::PathBuf> {
+    use crate::platform::swap::{rename_swap_gate, volume_supports_rename_swap, RenameSwapSupport};
+
     let dest = app_dest.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -42,6 +45,18 @@ pub fn preflight_app_dest(app_dest: Option<&Path>) -> std::io::Result<std::path:
         )
     })?;
     crate::cutover::app_dest::validate_app_dest(dest)?;
+
+    // Gate on the destination volume's atomic-swap capability. A probe ERROR is
+    // not unsupport — proceed with a warning rather than brick a legit APFS
+    // update (the swap itself fail-closes via rollback if truly unsupported).
+    let probe = volume_supports_rename_swap(dest).unwrap_or(RenameSwapSupport::ProbeFailed);
+    if matches!(probe, RenameSwapSupport::ProbeFailed) {
+        tracing::warn!(
+            ?dest,
+            "RENAME_SWAP volume probe failed; proceeding (swap fail-closes on rollback)"
+        );
+    }
+    rename_swap_gate(probe)?;
     Ok(dest.to_path_buf())
 }
 
