@@ -87,7 +87,7 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
 /// standing-adopt works. The Task-4 reorder invariant it targeted -- lockdown
 /// reconcile BEFORE the transient sweep, the sweep told `standing_held` so it
 /// skips the `/etc/pf.conf` reload -- is proven at the unit level by
-/// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_held`.)
+/// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_adopting`.)
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {

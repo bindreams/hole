@@ -1,8 +1,9 @@
 //! `POST /v1/update-apply` cutover orchestration helpers: the consent gate, the
 //! single-occupancy guard, the macOS destination pre-flight, and the OS-specific
-//! actor spawn. The handler in `ipc.rs` sequences them (consent → 409 guard →
-//! app_dest+volume pre-flight (macOS) → re-verify → marker → extract → spawn) and
-//! owns the HTTP status mapping. Every pre-flight check sits before the marker.
+//! actor spawn. The handler in `ipc.rs` sequences them (409 guard → consent →
+//! app_dest+volume pre-flight (macOS) → stage_payload → re-verify → marker →
+//! extract → spawn) and owns the HTTP status mapping. Every pre-flight check
+//! sits before the marker, and verify+extract run against the private copy.
 
 use std::path::Path;
 
@@ -31,7 +32,7 @@ pub fn cutover_in_progress(log_dir: &Path) -> bool {
 
 /// macOS pre-flight: validate the GUI-supplied `.app` swap target is a genuine
 /// `com.hole.app` bundle AND its volume can atomically swap. Runs BEFORE the
-/// marker so a bad target is a clean 422, never a claimed cutover. The validated
+/// marker so a bad target is a clean 400, never a claimed cutover. The validated
 /// bundle path is returned for the actor. An absent `app_dest` on macOS is itself
 /// a rejection (the GUI must supply its bundle hint).
 #[cfg(target_os = "macos")]
