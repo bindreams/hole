@@ -42,6 +42,49 @@ describe("power-button state machine", () => {
     expect(cancelCalls).toHaveLength(1);
   });
 
+  it("threads one non-empty attempt id to both start_proxy and cancel_proxy (#465)", async () => {
+    invokeMock.mockReturnValue(new Promise(() => {}));
+    const { initPowerButton } = await import("./power-button");
+    initPowerButton();
+    const btn = document.getElementById("power-btn")!;
+    btn.click(); // disconnected → connecting, fires start_proxy
+    await Promise.resolve();
+    btn.click(); // connecting → cancelling, fires cancel_proxy
+    await Promise.resolve();
+
+    const startCall = invokeMock.mock.calls.find(([cmd]) => cmd === "start_proxy");
+    const cancelCall = invokeMock.mock.calls.find(([cmd]) => cmd === "cancel_proxy");
+    const startId = (startCall?.[1] as { attemptId: string } | undefined)?.attemptId;
+    const cancelId = (cancelCall?.[1] as { attemptId: string } | undefined)?.attemptId;
+    expect(typeof startId).toBe("string");
+    expect(startId).toBeTruthy();
+    // The cancel targets the SAME attempt the start opened — this is the whole
+    // point of the fix (the bridge matches the cancel to that start by id).
+    expect(cancelId).toBe(startId);
+  });
+
+  it("mints a fresh attempt id for each connect attempt (#465)", async () => {
+    const { initPowerButton } = await import("./power-button");
+    initPowerButton();
+    const btn = document.getElementById("power-btn")!;
+
+    // Attempt 1: start settles as `cancelled` → back to the disconnected idle.
+    invokeMock.mockResolvedValueOnce("cancelled");
+    btn.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    const id1 = (invokeMock.mock.calls.find(([c]) => c === "start_proxy")?.[1] as { attemptId: string }).attemptId;
+
+    // Attempt 2: a fresh connect mints a different id.
+    invokeMock.mockReturnValue(new Promise(() => {}));
+    btn.click();
+    await Promise.resolve();
+    const startCalls = invokeMock.mock.calls.filter(([c]) => c === "start_proxy");
+    const id2 = (startCalls[startCalls.length - 1][1] as { attemptId: string }).attemptId;
+    expect(id2).toBeTruthy();
+    expect(id2).not.toBe(id1);
+  });
+
   it("updateProxyStatus writes through when current state is idle", async () => {
     const { initPowerButton, updateProxyStatus, getConnectionState } = await import("./power-button");
     initPowerButton();

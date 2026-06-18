@@ -22,6 +22,11 @@ import type { ProxyStatus } from "./types";
 let currentState: ConnectionState = "disconnected";
 let powerBtn: HTMLElement | null = null;
 let statusWord: HTMLElement | null = null;
+// Id of the in-progress connect attempt. Minted when leaving idle to connect
+// and reused for the Cancel fired during that attempt's spinner, so the bridge
+// scopes the cancel to exactly this start and a stale arm can't kill a later one
+// (#465). Module-scoped because start and cancel are two separate clicks.
+let currentAttemptId = "";
 
 function setState(next: ConnectionState): void {
   currentState = next;
@@ -47,7 +52,7 @@ async function handlePowerClick(): Promise<void> {
   // the in-flight start.
   if (currentState === "connecting") {
     setState("cancelling");
-    invoke("cancel_proxy").catch((err) => {
+    invoke("cancel_proxy", { attemptId: currentAttemptId }).catch((err) => {
       console.error("cancel_proxy failed:", err);
     });
     return;
@@ -57,15 +62,22 @@ async function handlePowerClick(): Promise<void> {
   // effectively on. Retry paths (connection-failed, disconnection-failed)
   // are treated as their base idle states for the purpose of this dispatch.
   const goingToConnect = !isEffectivelyOn(currentState);
-  await toggleFromIdle(goingToConnect, {
-    invoke,
-    getState: () => currentState,
-    setState,
-    updatePublicIp,
-    showToast,
-    getConfig: () => config,
-    loadConfig,
-  });
+  if (goingToConnect) {
+    currentAttemptId = crypto.randomUUID();
+  }
+  await toggleFromIdle(
+    goingToConnect,
+    {
+      invoke,
+      getState: () => currentState,
+      setState,
+      updatePublicIp,
+      showToast,
+      getConfig: () => config,
+      loadConfig,
+    },
+    currentAttemptId,
+  );
 }
 
 /** Initialize: bind DOM refs + click listener. */
