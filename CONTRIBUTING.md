@@ -422,9 +422,11 @@ The rebuild renders from the runtime truth, never from persisted config
 (#462): proxy state comes from `AppState`'s `ProxyStateCell` (fed by every
 bridge exchange, inside the client lock) plus the in-flight `TransitionSlot`
 target; status/connect text is baked into the menu at build time. Persisted
-`config.enabled` is a write-only record of the last honored intent (the
-designated input for a future `StartupBehavior::RestoreLastState` consumer),
-with `tray::persist_intended_enabled` as its sole writer.
+`config.enabled` records the last honored intent, with
+`tray::persist_intended_enabled` as its sole writer; it is read at launch by
+`tray::startup_should_connect` for `StartupBehavior::RestoreLastState` (#458).
+The tray never renders from it — display and direction come from the
+`ProxyStateCell`.
 
 ### Version lockstep
 

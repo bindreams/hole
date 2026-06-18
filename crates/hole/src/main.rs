@@ -178,6 +178,10 @@ fn launch_gui(show_dashboard: bool) {
             // bridge's actual state (#462).
             tray::spawn_proxy_state_sync(app.handle());
             tray::spawn_status_reconciler(app.handle());
+            // Honor the persisted "On startup" policy: auto-connect once,
+            // silently (no install/elevation/error modal at an unattended
+            // login). #458
+            tray::spawn_startup_auto_connect(app.handle());
             platform::on_setup(app)?;
             if show_dashboard {
                 tray::open_settings_window(app.handle());

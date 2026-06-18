@@ -3,12 +3,13 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
+use hole_common::config::StartupBehavior;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ToggleOutcome =======================================================================================================
 
@@ -104,9 +105,9 @@ pub(crate) fn outcome_for_stop_response(
 }
 
 /// Sole writer of persisted `config.enabled` (#462): records the last user
-/// intent the bridge honored, as input for a future
-/// `StartupBehavior::RestoreLastState`. Nothing reads it at runtime —
-/// display and direction come from the `ProxyStateCell`.
+/// intent the bridge honored. Read at launch by `startup_should_connect` for
+/// `StartupBehavior::RestoreLastState` (#458); display and direction still come
+/// from the `ProxyStateCell`, never this flag.
 pub(crate) fn persist_intended_enabled(
     config: &std::sync::Mutex<hole_common::config::AppConfig>,
     store: &hole_common::config_store::ConfigStore,
@@ -119,6 +120,17 @@ pub(crate) fn persist_intended_enabled(
     config.enabled = enabled;
     if let Err(e) = store.save(&config) {
         warn!(error = %e, path = %store.path().display(), "failed to persist intended enabled state");
+    }
+}
+
+/// Pure launch-time decision (#458): should the GUI auto-connect now?
+/// `last_enabled` is the persisted last-honored intent (#462), read only here.
+/// The exhaustive match makes a future `StartupBehavior` variant a compile error.
+pub(crate) fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> bool {
+    match behavior {
+        StartupBehavior::DoNotConnect => false,
+        StartupBehavior::RestoreLastState => last_enabled,
+        StartupBehavior::AlwaysConnect => true,
     }
 }
 
@@ -354,10 +366,10 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 
 /// Send a best-effort Stop to the bridge and exit the application.
 ///
-/// Persisted `config.enabled` is deliberately untouched: it is the
-/// write-only record of the last honored intent (the future
-/// `RestoreLastState` input), and the tray renders from bridge Status at
-/// the next launch, never from that flag (#462).
+/// Persisted `config.enabled` is deliberately untouched: it is the record of
+/// the last honored intent (the `RestoreLastState` input read at next launch by
+/// `startup_should_connect`, #458), and the tray renders from bridge Status,
+/// never from that flag (#462).
 async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
@@ -411,6 +423,30 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
     }
 }
 
+/// Whether a connect attempt may surface UI that demands a human: the
+/// bridge-install prompt, the UAC/elevation prompt, an error modal.
+/// `Forbidden` is the unattended startup auto-connect path (#458) — it must
+/// fail passively into the tray's Disconnected state, never block a login on a
+/// modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prompts {
+    Allowed,
+    Forbidden,
+}
+
+/// Interactive connect/disconnect entry — the tray menu items and the
+/// `start_proxy`/`stop_proxy` commands. Delegates with prompts allowed.
+pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled_inner(app, enable, Prompts::Allowed).await
+}
+
+/// The sole non-interactive connect entry — startup auto-connect (#458).
+/// Connect-only by construction (no `enable` param), so silent-disconnect is
+/// unrepresentable; the shared #462 commit tail stays single-sourced.
+async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled_inner(app, true, Prompts::Forbidden).await
+}
+
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
 /// describing whether the proxy ended up Running, Stopped, or the Start
 /// was Cancelled before it could complete (only when `enable == true`).
@@ -421,20 +457,29 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
 /// the webview, and persisted `config.enabled` records only an intent
 /// the bridge actually honored. On failure, one follow-up Status commits
 /// reality — a failed Disconnect can no longer re-assert "Connected"
-/// over a stopped tunnel.
-/// Used by the tray menu items and the `start_proxy`/`stop_proxy`
-/// commands.
-pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
+/// over a stopped tunnel. Used by the tray menu items and the
+/// `start_proxy`/`stop_proxy` commands.
+///
+/// `prompts` is consulted only on the enable path's two prompt sites (the
+/// bridge-install gate and the elevation fallback): `Allowed` shows the UI;
+/// `Forbidden` (unattended startup) suppresses both and fails passively. The
+/// disconnect path is always interactive (startup never disconnects).
+async fn set_proxy_enabled_inner(app: &AppHandle, enable: bool, prompts: Prompts) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
     // Bridge install gate: if the user is trying to enable the proxy and
     // the bridge isn't installed yet, prompt for installation BEFORE
     // anything else.
-    if enable
-        && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled
-        && !crate::setup::prompt_bridge_install(app.clone()).await
-    {
-        return Err("The Hole bridge must be installed to connect.".into());
+    if enable && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled {
+        match prompts {
+            Prompts::Allowed => {
+                if !crate::setup::prompt_bridge_install(app.clone()).await {
+                    return Err("The Hole bridge must be installed to connect.".into());
+                }
+            }
+            // Startup must not throw an admin install wizard at a login.
+            Prompts::Forbidden => return Err("The Hole bridge is not installed.".into()),
+        }
     }
 
     // Resolve the start payload BEFORE claiming the transition slot — a
@@ -466,7 +511,14 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOu
                 info!(?outcome, "proxy start settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
+            StartDecision::NeedsElevation => match prompts {
+                Prompts::Allowed => elevate_and_confirm(app, request).await,
+                // No UAC at an unattended startup; fail into Disconnected.
+                Prompts::Forbidden => {
+                    debug!("startup auto-connect needs elevation; skipping (unattended)");
+                    Err("Connecting requires elevation, which is unavailable at startup.".into())
+                }
+            },
             StartDecision::Fail(msg) => {
                 error!("proxy start failed: {msg}");
                 Err(msg)
@@ -1096,6 +1148,31 @@ pub fn spawn_status_reconciler(app: &AppHandle) {
             tick.tick().await;
             // Result irrelevant: the commit happens inside send.
             let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+        }
+    });
+}
+
+/// Evaluate the persisted on-startup policy and, if it calls for connecting,
+/// spawn one silent (non-interactive) auto-connect (#458). Runs once per live
+/// GUI instance (single-instance makes a second launch a no-op before
+/// `setup()` runs). Snapshots the two Copy fields under the config lock and
+/// drops the guard before the spawn — never holds the std Mutex across `.await`.
+pub fn spawn_startup_auto_connect(app: &AppHandle) {
+    let (behavior, last_enabled) = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        (cfg.on_startup, cfg.enabled)
+    };
+    if !startup_should_connect(behavior, last_enabled) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Both arms log at info: failing into the tray's Disconnected state is
+        // the contract, not an error.
+        match connect_silently(&app).await {
+            Ok(outcome) => info!(?outcome, "startup auto-connect settled"),
+            Err(e) => info!(reason = %e, "startup auto-connect did not connect"),
         }
     });
 }

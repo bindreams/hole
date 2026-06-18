@@ -127,3 +127,19 @@ fn lockdown_off_renders_plain_label() {
     let label = lockdown_menu_label(false, false);
     assert!(!label.to_lowercase().contains("warning"));
 }
+
+// startup_should_connect ==============================================================================================
+
+#[skuld::test]
+fn startup_should_connect_truth_table() {
+    use hole_common::config::StartupBehavior::*;
+    // DoNotConnect: never, regardless of last_enabled.
+    assert!(!startup_should_connect(DoNotConnect, false));
+    assert!(!startup_should_connect(DoNotConnect, true));
+    // RestoreLastState: mirror the last honored intent.
+    assert!(!startup_should_connect(RestoreLastState, false));
+    assert!(startup_should_connect(RestoreLastState, true));
+    // AlwaysConnect: always.
+    assert!(startup_should_connect(AlwaysConnect, false));
+    assert!(startup_should_connect(AlwaysConnect, true));
+}
