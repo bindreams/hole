@@ -56,11 +56,11 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
 // host fail-open, not bricked) is NOT a faithful privileged-lane test without a
 // real failed-new-bridge-start harness: a lockdown-off cutover engages no cover,
 // so with nothing engaged an egress probe is a tautology (baseline reachability,
-// independent of any cutover code path). The load-bearing invariant --
-// `plan_cutover(false)` is a `PlainRestart` that engages no cover, so a failed
-// start cannot brick the host (the Mullvad-#8470 class) -- is proven structurally
-// by `cutover::plan_tests::plan_cutover_never_engages_transient_cover`. The
-// privileged version is reported back as needing a real failed-start fixture.
+// independent of any cutover code path). The load-bearing invariant -- a cutover
+// engages no transient cover, so a failed start cannot brick the host (the
+// Mullvad-#8470 class) -- is enforced STRUCTURALLY: the `cutover::os::CutoverOs`
+// effects trait exposes no cover-mutating method. The privileged version is
+// reported back as needing a real failed-start fixture.
 
 /// The standing lockdown cover's egress block must SURVIVE a `disarm` -- that is
 /// the cutover leak invariant on the real ruleset. The bridge's marker-

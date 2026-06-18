@@ -1,14 +1,14 @@
 //! Service-manager update cutover. The privileged bridge swaps its own running
 //! binary by rename and restarts the bridge service; the standing lockdown cover
-//! holds the gap and every GUI self-heals onto the new image. Pure planners live
-//! in `plan`; the OS effects seam in `os`; the apply handler logic in `apply`;
-//! binary extraction in `extract`.
+//! holds the gap and every GUI self-heals onto the new image. The OS effects seam
+//! lives in `os`; the apply handler logic in `apply`; binary extraction in
+//! `extract`; the macOS destination anchor in `app_dest`. The no-transient-cover
+//! property is structural — the `os::CutoverOs` trait exposes no cover method.
 
 pub mod app_dest;
 pub mod apply;
 pub mod extract;
 pub mod os;
-pub mod plan;
 
 #[cfg(target_os = "windows")]
 pub mod scm_wait;
