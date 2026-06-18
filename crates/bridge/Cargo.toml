@@ -93,6 +93,14 @@ webpki-roots = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
+# Pure-Rust pcapng parsing + IP/UDP decode for the Windows wire-level no-leak
+# proof (`tests/cutover_nic_capture_privileged.rs`): pktmon captures the egress
+# NIC to an .etl, converts to pcapng, and the test parses it. NO `pcap` crate /
+# Npcap — pktmon is in-box and the parse is pure Rust.
+[target.'cfg(windows)'.dev-dependencies]
+pcap-file = "2"
+etherparse = "0.20"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8"
 windows = { version = "0.62", features = [
@@ -163,4 +171,12 @@ harness = false
 [[test]]
 name = "cutover_leak_privileged"
 path = "tests/cutover_leak_privileged.rs"
+harness = false
+
+# Privileged-lane WIRE-LEVEL no-leak proof (Windows in-box pktmon capture of the
+# physical egress NIC across the standing lockdown cover). The body is
+# cfg(windows); on other platforms the target is just main() + a cfg'd-out test.
+[[test]]
+name = "cutover_nic_capture_privileged"
+path = "tests/cutover_nic_capture_privileged.rs"
 harness = false

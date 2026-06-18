@@ -46,16 +46,11 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
     TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
 }
 
-// The deferred NIC-capture UDP no-leak proof (physical-NIC pcap across the
-// cutover gap, asserting no UDP egress except to the server) is NOT added here:
-// physical-NIC packet capture is net-new infra with no pcap dependency in the
-// tree and is unverifiable on this dev box, so a stub would either silently never
-// run or fail CI blindly (both forbidden). The invariant it would prove -- a
-// standing lockdown cover blocks non-server egress and the cutover never
-// disengages it -- is covered by the disarm-preserves-the-block proof below (the
-// cover survives the cutover-shutdown disarm) plus the `stop_with` disarm unit
-// test (the cover is disarmed, never disengaged, on a cutover). The capture proof
-// is reported back as needing a CI pcap lane + a live-TUN cutover fixture.
+// The wire-level NIC-capture UDP no-leak proof lives in
+// `cutover_nic_capture_privileged.rs` (Windows in-box pktmon — no pcap crate /
+// Npcap). macOS has no NIC arm there by design: its BPF tap is upstream of pf,
+// so an en0 capture would record packets pf later drops (unsound); macOS keeps
+// the connect()-probe in tun-engine's `lockdown_privileged_tests.rs`.
 
 // The Mullvad-#8470 fail-open negative (a failed lockdown-off restart leaves the
 // host fail-open, not bricked) is NOT a faithful privileged-lane test without a

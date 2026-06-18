@@ -25,6 +25,8 @@ nextest-version = "0.9.130"
 #   - `cutover_global_net_state_` prefix:
 #     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
 #     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
+#     crates/bridge/tests/cutover_nic_capture_privileged.rs (Windows pktmon NIC
+#       wire-capture no-UDP-leak proof)
 # Renaming any of them WITHOUT updating this filter silently drops it from the
 # group → cross-binary data race. Verify with `cargo nextest show-config
 # test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
