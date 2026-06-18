@@ -106,43 +106,6 @@ impl Drop for PktmonGuard {
     }
 }
 
-/// Resolve the pktmon component id of the physical egress NIC from the gateway's
-/// friendly interface name. `pktmon list --json` is an array of component
-/// objects keyed `Id` (component id) and `Name` (friendly name, e.g. "Wi-Fi");
-/// match the gateway's friendly name case-insensitively. Fails loud if no
-/// component matches — a NIC we can't target is not a no-leak proof.
-#[cfg(target_os = "windows")]
-fn resolve_nic_component_id(friendly_name: &str) -> u32 {
-    let out = pktmon(&["list", "--json"]);
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "pktmon list --json must be valid JSON: {e}; raw={}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
-
-    // The components live either at the top level or under a "Components" key,
-    // depending on the pktmon build; accept both. Each entry carries an integer
-    // `Id` and a string `Name`.
-    let entries = json
-        .as_array()
-        .or_else(|| json.get("Components").and_then(|c| c.as_array()))
-        .unwrap_or_else(|| panic!("pktmon list --json has no component array: {json}"));
-
-    let want = friendly_name.trim().to_ascii_lowercase();
-    for entry in entries {
-        let name = entry.get("Name").and_then(|n| n.as_str()).unwrap_or_default();
-        if name.trim().to_ascii_lowercase() == want {
-            let id = entry
-                .get("Id")
-                .and_then(|i| i.as_u64())
-                .unwrap_or_else(|| panic!("pktmon component {name:?} has no integer Id: {entry}"));
-            return id as u32;
-        }
-    }
-    panic!("no pktmon component matched the egress NIC {friendly_name:?}; components: {json}");
-}
-
 /// Send `nonce` followed by 16 zero filler bytes (a 32-byte datagram) to `dst`
 /// from the NIC-bound `socket`. The nonce is the wire fingerprint matched in the
 /// capture.
@@ -241,8 +204,12 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     let non_permitted: SocketAddr = SocketAddr::new(NON_PERMITTED_IP.parse().unwrap(), DST_PORT);
     let permitted_tail: SocketAddr = SocketAddr::new(server_ip, DST_PORT);
 
-    // Resolve the PHYSICAL egress NIC: its friendly name + interface index drive
-    // both the socket binding and the pktmon component selection.
+    // The PHYSICAL egress NIC's interface index pins the sentinel socket so every
+    // marker egresses the real NIC (not loopback). The capture targets ALL NIC
+    // components (`--comp nics`): no fragile friendly-name→component-id mapping
+    // (pktmon names a component by adapter description, not the connection name),
+    // and an SR-IOV VF datapath can't dodge an all-NIC capture. The nonce-payload
+    // match — not the component — is what attributes a captured frame to a marker.
     let gw = get_default_gateway_info().expect("default egress NIC must be discoverable");
     assert!(
         !gw.gateway_ip.is_loopback() && !gw.interface_name.trim().is_empty(),
@@ -254,8 +221,6 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         "hole-tun",
         "the capture NIC must be the physical egress, never hole-tun"
     );
-    let nic_id = resolve_nic_component_id(&gw.interface_name);
-    let nic_id_s = nic_id.to_string();
 
     // Baseline (PRE-cover) reachability self-check: the egress path is healthy
     // before we touch the cover, so a Phase-B verdict is the cover's doing, not a
@@ -276,7 +241,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     {
         let cap = dir.path().join("phase_a.etl");
         let pcap = dir.path().join("phase_a.pcapng");
-        // Filter to UDP only, capture on the resolved NIC, log the whole packet.
+        // Filter to UDP only, capture all NIC components, log the whole packet.
         pktmon(&["filter", "remove"]); // start from a clean filter set
         pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
         let _guard = PktmonGuard;
@@ -284,7 +249,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             "start",
             "--capture",
             "--comp",
-            &nic_id_s,
+            "nics",
             "--pkt-size",
             "0",
             "--file-name",
@@ -300,7 +265,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         assert!(
             pcapng_has_udp_nonce(&pcap, nonce_a_ctrl),
             "POSITIVE CONTROL FAILED: the capture pipeline/NIC/filter did not record a marker sent with NO cover \
-             engaged — an empty Phase-B capture would be meaningless. NIC={:?} comp={nic_id}",
+             engaged — an empty Phase-B capture would be meaningless. NIC={:?} (comp nics)",
             gw.interface_name
         );
     }
@@ -328,7 +293,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
             "start",
             "--capture",
             "--comp",
-            &nic_id_s,
+            "nics",
             "--pkt-size",
             "0",
             "--file-name",
