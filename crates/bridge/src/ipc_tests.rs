@@ -742,11 +742,12 @@ fn make_valid_app_dest(parent: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[skuld::test]
-fn update_apply_unverifiable_payload_is_422_no_marker() {
+fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
     // The bridge re-verifies the payload offline before anything irreversible.
     // A present payload whose manifest is not signed by the production key (the
-    // GUI is untrusted) must be refused with 422 BEFORE the marker is written —
-    // no marker, no actor spawned.
+    // GUI is untrusted) is refused with 422. The marker is claimed before staging
+    // (single-occupancy), then cleared on the verify failure — so no cutover is
+    // left in progress and no actor is spawned.
     rt().block_on(async {
         let path = test_socket_path("update-apply-422");
         let log_dir = tempfile::tempdir().unwrap().keep();
@@ -785,10 +786,61 @@ fn update_apply_unverifiable_payload_is_422_no_marker() {
         .await;
         assert_eq!(resp.status(), 422, "an unverifiable payload must be refused with 422");
         let _ = resp.into_body().collect().await;
-        // The refusal preceded the marker write — no cutover was claimed.
+        // The marker is claimed then cleared on the verify failure — no cutover
+        // is left in progress.
         assert!(
             hole_common::update_marker::read(&log_dir).is_none(),
-            "a verify failure must not write a marker"
+            "a verify failure must clear the marker it claimed"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// A post-marker failure must clear the marker (else the GUI masks Disconnected
+/// and a later shutdown wrongly disarms the cover). A non-existent payload passes
+/// consent/409/app_dest, the marker is claimed, then `stage_payload` fails to copy
+/// the source (I/O) → 500 and the marker is cleared. macOS-gated: there the
+/// private staging dir is the per-test `state_dir`, so concurrent tests don't
+/// collide; on Windows it is the shared install dir (production serializes that via
+/// the single global marker, which per-test markers can't reproduce). The extract/
+/// spawn clears are unreachable in-test (they need a production-signed payload) but
+/// use this same proven clear-on-failure pattern.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn update_apply_staging_io_failure_clears_the_marker() {
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-stage-io");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let missing = payload_dir.path().join("does-not-exist.dmg");
+
+        let app_dest_dir = tempfile::tempdir().unwrap();
+        let app_dest = Some(make_valid_app_dest(app_dest_dir.path()).to_string_lossy().into_owned());
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_update_apply_full(
+            &mut client,
+            &missing.to_string_lossy(),
+            true,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  hole.dmg\n",
+            "untrusted comment: forged\nnot-a-real-signature\n",
+            "hole.dmg",
+            app_dest.as_deref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 500, "a staging I/O failure is a server fault");
+        let _ = resp.into_body().collect().await;
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a post-marker staging failure must clear the marker it claimed"
         );
 
         drop(client);
