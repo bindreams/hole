@@ -410,10 +410,9 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
 }
 
 /// The error a Status exchange revealed, if any. Only a `Status` Ok carries it
-/// (#470); every other exchange yields None. On a death the bridge's
-/// `last_error` is the static path-free sentinel, so this never carries PII —
-/// the start-failure `e.to_string()` rides the non-Status `commit` path, which
-/// clears `error`.
+/// (#470); every other exchange yields None. `StatusResponse.error` is the
+/// bridge's path-free `death_reason` (NOT the PII-bearing `last_error`; see
+/// `ProxyManager::DEATH_REASON`), so this can never carry PII to the toast.
 pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Option<String> {
     match result {
         Ok(BridgeResponse::Status { error, .. }) => error.clone(),

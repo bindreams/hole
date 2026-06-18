@@ -229,7 +229,11 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
-        error: pm.last_error().map(|s| s.to_string()),
+        // Death reason only (path-free, #470) — NOT `last_error`, which can
+        // carry a filesystem path/hostname from a failed start and must never
+        // reach the GUI toast. The rich detail stays in `last_error` for
+        // diagnostics (bridge="error") and the click-path start-error surface.
+        error: pm.death_reason().map(|s| s.to_string()),
         invalid_filters: pm.invalid_filters(),
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),

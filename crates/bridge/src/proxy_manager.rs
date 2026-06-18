@@ -174,12 +174,23 @@ pub struct TrafficMetrics {
 
 // ProxyManager ========================================================================================================
 
+/// The one reason an out-of-band death is reported to the GUI. A `&'static str`
+/// so the status/toast surface is path-free by construction (#470): unlike the
+/// operation-error `last_error`, which can carry a filesystem path or hostname
+/// from a failed start, this can never embed PII.
+pub const DEATH_REASON: &str = "proxy task exited unexpectedly";
+
 pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting, D: Dns = SystemDns> {
     proxy: P,
     routing: R,
     dns: D,
     running: Option<RunningState<P, R, D>>,
     last_error: Option<String>,
+    /// The out-of-band death reason surfaced to the GUI status/toast, distinct
+    /// from `last_error` (which keeps the rich, possibly-PII operation detail
+    /// for diagnostics and the click-path start-error surface). Set only by
+    /// `check_health`; cleared on every start attempt and on stop (#470).
+    death_reason: Option<&'static str>,
     /// Last successfully-started config. Used by `reload` to detect
     /// filter-only changes (hot-swap path vs full restart).
     active_config: Option<ProxyConfig>,
@@ -211,6 +222,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             dns,
             running: None,
             last_error: None,
+            death_reason: None,
             active_config: None,
             udp_proxy_available: true,
             ipv6_bypass_available: true,
@@ -319,6 +331,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The out-of-band death reason for the GUI status/toast (path-free by
+    /// type), or None if the proxy did not die unexpectedly (#470).
+    pub fn death_reason(&self) -> Option<&'static str> {
+        self.death_reason
     }
 
     /// Delegation for `handle_diagnostics`: expose the routing provider's
@@ -434,6 +452,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.running.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
+
+        // A (re)start supersedes any prior out-of-band death — clear the death
+        // reason regardless of this attempt's outcome (#470).
+        self.death_reason = None;
 
         // `start_inner` is a free associated function — it does NOT
         // touch `self`, so any cancel-driven unwind leaves `self`
@@ -949,6 +971,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Clear any error from a previous failed start. See issue #142.
         self.last_error = None;
+        self.death_reason = None;
         self.active_config = None;
         self.udp_proxy_available = true;
         self.ipv6_bypass_available = true;
@@ -1013,7 +1036,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if let Some(state) = &self.running {
             if !state.proxy.is_alive() {
                 error!("proxy task exited unexpectedly");
-                self.last_error = Some("proxy task exited unexpectedly".into());
+                self.last_error = Some(DEATH_REASON.into());
+                // Path-free death reason for the GUI status/toast (#470).
+                self.death_reason = Some(DEATH_REASON);
                 self.running = None; // Drop tears down routes + clears state file
                 self.active_config = None;
                 self.udp_proxy_available = true;
