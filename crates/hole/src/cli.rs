@@ -777,6 +777,8 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     local_port_http,
                     diagnostic_plugin_tap: false,
                 },
+                // CLI-initiated start has no paired cancel; a fresh id is fine.
+                attempt_id: uuid::Uuid::new_v4().to_string(),
             };
             match send_bridge_request_inner(request) {
                 Ok(BridgeResponse::Ack) => {

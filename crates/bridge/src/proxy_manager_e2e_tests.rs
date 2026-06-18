@@ -115,7 +115,13 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
     };
 
     let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
     assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
@@ -169,6 +175,7 @@ fn e2e_metrics_report_tunnel_traffic(
         let resp = harness
             .send(BridgeRequest::Start {
                 config: config_template.clone(),
+                attempt_id: "e2e".into(),
             })
             .await
             .expect("send Start");
@@ -197,7 +204,10 @@ fn e2e_metrics_report_tunnel_traffic(
             ..config_template
         };
         let resp = harness
-            .send(BridgeRequest::Start { config: config2 })
+            .send(BridgeRequest::Start {
+                config: config2,
+                attempt_id: "e2e".into(),
+            })
             .await
             .expect("send Start 2");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -265,7 +275,13 @@ fn e2e_galoshes_chain_reports_udp_available(
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
         let status = harness.send(BridgeRequest::Status).await.expect("send Status");
@@ -365,7 +381,13 @@ mod tun {
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
         // Direct TCP to `http.addr` (the primary non-loopback IPv4) —
@@ -449,12 +471,21 @@ fn lifecycle_start_twice_returns_error(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         let resp1 = harness
-            .send(BridgeRequest::Start { config: config.clone() })
+            .send(BridgeRequest::Start {
+                config: config.clone(),
+                attempt_id: "e2e".into(),
+            })
             .await
             .unwrap();
         assert!(matches!(resp1, BridgeResponse::Ack));
 
-        let resp2 = harness.send(BridgeRequest::Start { config }).await.unwrap();
+        let resp2 = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         // The second start should return an Error response (the bridge
         // maps the ProxyError::AlreadyRunning into a 5xx).
         assert!(
@@ -510,6 +541,7 @@ fn lifecycle_reload_changes_local_port(
         harness
             .send(BridgeRequest::Start {
                 config: config1.clone(),
+                attempt_id: "e2e".into(),
             })
             .await
             .unwrap();
@@ -556,7 +588,13 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         let state_file = harness.state_dir.path().join("bridge-routes.json");
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
 
         assert!(
             !state_file.exists(),
@@ -613,7 +651,13 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
@@ -662,7 +706,13 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });

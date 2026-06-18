@@ -47,6 +47,7 @@ fn version_response_roundtrips_and_route_const_exists() {
 fn bridge_request_start_json_roundtrip() {
     let req = BridgeRequest::Start {
         config: sample_config(),
+        attempt_id: "attempt-1".into(),
     };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
@@ -81,7 +82,9 @@ fn bridge_request_reload_json_roundtrip() {
 
 #[skuld::test]
 fn bridge_request_cancel_json_roundtrip() {
-    let req = BridgeRequest::Cancel;
+    let req = BridgeRequest::Cancel {
+        attempt_id: "attempt-1".into(),
+    };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);

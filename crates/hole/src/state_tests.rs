@@ -262,6 +262,7 @@ async fn start_ack_commits_true() {
     assert!(!link.cell().snapshot().running);
     let resp = link
         .send(BridgeRequest::Start {
+            attempt_id: "x".into(),
             config: test_proxy_config(),
         })
         .await
@@ -340,7 +341,9 @@ async fn oneshot_never_commits() {
 
     let link = BridgeLink::new(path, noop_hook());
     link.cell().commit(true);
-    link.send_oneshot(BridgeRequest::Cancel).await.unwrap();
+    link.send_oneshot(BridgeRequest::Cancel { attempt_id: "x".into() })
+        .await
+        .unwrap();
     assert_eq!(
         link.cell().snapshot(),
         ProxySnapshot {
@@ -412,6 +415,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         let link = link.clone();
         async move {
             link.send(BridgeRequest::Start {
+                attempt_id: "x".into(),
                 config: test_proxy_config(),
             })
             .await

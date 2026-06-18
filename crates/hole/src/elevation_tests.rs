@@ -30,6 +30,7 @@ fn encode_request_roundtrips() {
             local_port_http: 4074,
             diagnostic_plugin_tap: false,
         },
+        attempt_id: "elev-test".into(),
     };
 
     let b64 = super::encode_request(&request);
@@ -85,6 +86,7 @@ fn write_request_file_roundtrip() {
             local_port_http: 4074,
             diagnostic_plugin_tap: false,
         },
+        attempt_id: "elev-test".into(),
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -128,6 +130,7 @@ fn read_request_file_roundtrip() {
             local_port_http: 4074,
             diagnostic_plugin_tap: false,
         },
+        attempt_id: "elev-test".into(),
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -155,4 +158,24 @@ fn read_request_file_missing_file_returns_error() {
     let path = std::path::Path::new("/tmp/claude/nonexistent-request-file");
     let result = super::read_request_file(path);
     assert!(result.is_err());
+}
+
+#[skuld::test]
+fn start_attempt_id_survives_request_file_roundtrip() {
+    // The attempt id is a STRUCT FIELD, so it round-trips through the elevation
+    // re-serialization path (write/read_request_file). A header minted only in
+    // bridge_client would be dropped on the elevated replay — then an elevated
+    // Start could never match a pre-arm (#465).
+    let request = BridgeRequest::Start {
+        config: ProxyConfig::default(),
+        attempt_id: "elev-attempt-42".into(),
+    };
+    let temp_path = super::write_request_file(&request).unwrap();
+    let path = temp_path.to_path_buf();
+    temp_path.keep().unwrap();
+    let parsed = super::read_request_file(&path).unwrap();
+    match parsed {
+        BridgeRequest::Start { attempt_id, .. } => assert_eq!(attempt_id, "elev-attempt-42"),
+        other => panic!("expected Start, got {other:?}"),
+    }
 }
