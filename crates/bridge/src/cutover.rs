@@ -4,6 +4,7 @@
 //! in `plan`; the OS effects seam in `os`; the apply handler logic in `apply`;
 //! binary extraction in `extract`.
 
+pub mod app_dest;
 pub mod apply;
 pub mod extract;
 pub mod os;

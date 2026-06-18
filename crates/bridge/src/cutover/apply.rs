@@ -28,26 +28,52 @@ pub fn cutover_in_progress(log_dir: &Path) -> bool {
     hole_common::update_marker::read(log_dir).is_some()
 }
 
+/// macOS pre-flight: validate the GUI-supplied `.app` swap target is a genuine
+/// `com.hole.app` bundle. Runs BEFORE the marker so a bad target is a clean 422,
+/// never a claimed cutover. The validated bundle path is returned for the actor.
+/// An absent `app_dest` on macOS is itself a rejection (the GUI must supply its
+/// bundle hint).
+#[cfg(target_os = "macos")]
+pub fn preflight_app_dest(app_dest: Option<&Path>) -> std::io::Result<std::path::PathBuf> {
+    let dest = app_dest.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "macOS update requires an app_dest swap target",
+        )
+    })?;
+    crate::cutover::app_dest::validate_app_dest(dest)?;
+    Ok(dest.to_path_buf())
+}
+
 /// Kick off the cutover actor and return immediately, BEFORE any self-restart.
 ///
 /// - Windows: spawn the DETACHED LocalSystem `hole bridge cutover` child (a
 ///   service cannot SCM-restart itself); it outlives this process and drives
-///   stop → swap → start. Returns once the child is spawned.
+///   stop → swap → start. Returns once the child is spawned. `app_dest` is unused
+///   (the SCM install dir is canonical).
 /// - macOS: build the inline actor and run it on a DETACHED tokio task so the
 ///   200 flushes before the actor SIGTERMs this very process. The task is never
 ///   joined — the process is about to be killed and the new bridge takes over.
-pub fn spawn_actor(staged: ExtractedImages, target_version: &str) -> std::io::Result<()> {
+///   `app_dest` is the bundle path already validated by `preflight_app_dest`.
+pub fn spawn_actor(staged: ExtractedImages, target_version: &str, app_dest: Option<&Path>) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
+        let _ = app_dest;
         windows::spawn_detached_child(&staged, target_version)
     }
     #[cfg(target_os = "macos")]
     {
-        macos::spawn_inline_task(staged, target_version)
+        let dest = app_dest.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "macOS cutover requires a validated app_dest",
+            )
+        })?;
+        macos::spawn_inline_task(staged, target_version, dest)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = (staged, target_version);
+        let _ = (staged, target_version, app_dest);
         Err(std::io::Error::other("cutover unsupported on this platform"))
     }
 }
@@ -141,22 +167,18 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::path::Path;
+
     use crate::cutover::extract::ExtractedImages;
     use crate::cutover::os::macos::MacosCutoverOs;
     use crate::cutover::os::run_cutover;
     use crate::platform::os::HELPER_PATH;
     use crate::platform::swap::plan_swap;
 
-    /// Canonical installed `.app` (what Finder/launchd launch).
-    const APP_DEST: &str = "/Applications/Hole.app";
-
-    pub fn spawn_inline_task(staged: ExtractedImages, _target_version: &str) -> std::io::Result<()> {
-        let plan = plan_swap(
-            &staged.app,
-            std::path::Path::new(APP_DEST),
-            &staged.helper,
-            std::path::Path::new(HELPER_PATH),
-        );
+    /// `app_dest` is the bundle the handler already validated as a genuine
+    /// `com.hole.app` (`preflight_app_dest`) — never trusted raw here.
+    pub fn spawn_inline_task(staged: ExtractedImages, _target_version: &str, app_dest: &Path) -> std::io::Result<()> {
+        let plan = plan_swap(&staged.app, app_dest, &staged.helper, std::path::Path::new(HELPER_PATH));
         let mut os = MacosCutoverOs { plan };
         // Detached: the 200 must flush before the actor SIGTERMs this process.
         // Never joined — on success the actor SIGTERMs this process, so control

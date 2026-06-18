@@ -70,6 +70,10 @@ pub enum BridgeRequest {
         sha256sums_minisig: String,
         /// The payload's filename, used to find its hash in `sha256sums`.
         asset_name: String,
+        /// macOS only: the GUI's `current_exe`-derived `.app` swap target. A
+        /// HINT the bridge re-validates (the bundle there must be a genuine
+        /// `com.hole.app`) — never a trust anchor. `None` on Windows.
+        app_dest: Option<String>,
     },
 }
 
@@ -315,6 +319,10 @@ pub struct UpdateApplyRequest {
     pub sha256sums_minisig: String,
     /// The payload's filename, used to find its hash in `sha256sums`.
     pub asset_name: String,
+    /// macOS only: the GUI's `current_exe`-derived `.app` swap target. A HINT the
+    /// bridge re-validates against `CFBundleIdentifier == com.hole.app` — never a
+    /// trust anchor. `None` on Windows (the SCM install dir is canonical there).
+    pub app_dest: Option<String>,
 }
 
 // Constants ===========================================================================================================

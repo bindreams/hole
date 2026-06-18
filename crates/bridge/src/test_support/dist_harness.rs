@@ -658,6 +658,7 @@ impl BridgeIpcClient {
                 sha256sums,
                 sha256sums_minisig,
                 asset_name,
+                app_dest,
             } => {
                 let body = serde_json::to_vec(&UpdateApplyRequest {
                     payload_path: payload_path.to_string_lossy().into_owned(),
@@ -666,6 +667,7 @@ impl BridgeIpcClient {
                     sha256sums,
                     sha256sums_minisig,
                     asset_name,
+                    app_dest,
                 })?;
                 let resp = self.http_post(ROUTE_UPDATE_APPLY, body).await?;
                 if resp.status().is_success() {

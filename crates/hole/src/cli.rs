@@ -353,6 +353,7 @@ fn handle_upgrade() -> i32 {
                 sha256sums,
                 sha256sums_minisig,
                 asset_name: info.asset_name.clone(),
+                app_dest: hole::update::app_dest_hint(),
             };
             match send_bridge_request_inner(apply) {
                 Ok(hole_common::protocol::BridgeResponse::Ack) => {}

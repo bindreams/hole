@@ -28,6 +28,37 @@ fn concurrent_cutover_detected_via_existing_marker() {
     assert!(cutover_in_progress(dir.path()), "marker present -> in progress (409)");
 }
 
+#[cfg(target_os = "macos")]
+fn make_bundle_in(dir: &std::path::Path, name: &str, id: &str) -> std::path::PathBuf {
+    let app = dir.join(name);
+    std::fs::create_dir_all(app.join("Contents").join("MacOS")).unwrap();
+    std::fs::write(
+        app.join("Contents").join("Info.plist"),
+        format!("<plist><dict>\n<key>CFBundleIdentifier</key>\n<string>{id}</string>\n</dict></plist>"),
+    )
+    .unwrap();
+    app
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn preflight_app_dest_anchors_to_the_hole_identity() {
+    // An absent hint is rejected; a foreign bundle identity is rejected; a genuine
+    // `com.hole.app` passes — all before any marker. The path is a hint, the
+    // identity is the trust anchor.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(preflight_app_dest(None).is_err(), "an absent app_dest must be rejected");
+
+    let evil = make_bundle_in(dir.path(), "Evil.app", "com.evil.app");
+    assert!(
+        preflight_app_dest(Some(&evil)).is_err(),
+        "a foreign bundle identity must be rejected"
+    );
+
+    let genuine = make_bundle_in(dir.path(), "Hole.app", "com.hole.app");
+    preflight_app_dest(Some(&genuine)).expect("a genuine com.hole.app bundle must pass");
+}
+
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn breakaway_only_when_in_job_and_job_permits() {

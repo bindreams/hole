@@ -262,6 +262,7 @@ fn bridge_request_set_lockdown_json_roundtrip() {
 #[skuld::test]
 fn update_apply_request_json_roundtrip() {
     use crate::protocol::UpdateApplyRequest;
+    // Windows: no app_dest (the SCM install dir is canonical).
     let req = UpdateApplyRequest {
         payload_path: "/tmp/x.msi".into(),
         target_version: "0.3.0".into(),
@@ -269,10 +270,20 @@ fn update_apply_request_json_roundtrip() {
         sha256sums: "deadbeef  hole.msi\n".into(),
         sha256sums_minisig: "untrusted comment: x\nsig\n".into(),
         asset_name: "hole.msi".into(),
+        app_dest: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let decoded: UpdateApplyRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded, req);
+
+    // macOS: app_dest carries the GUI's current_exe-derived bundle hint.
+    let mac = UpdateApplyRequest {
+        app_dest: Some("/Applications/Hole.app".into()),
+        ..req
+    };
+    let json = serde_json::to_string(&mac).unwrap();
+    let decoded: UpdateApplyRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, mac);
 }
 
 #[skuld::test]

@@ -409,6 +409,26 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         }
     }
 
+    // macOS destination pre-flight (before the marker): the GUI-supplied `.app`
+    // swap target is a hint, never a trust anchor — the bridge anchors it to a
+    // genuine `com.hole.app` bundle and a swap-capable volume. A bad target is a
+    // 422 (caller precondition), independent of payload bytes, so it precedes the
+    // payload re-verify. Windows skips it (the SCM install dir is canonical).
+    #[cfg(target_os = "macos")]
+    let app_dest = match crate::cutover::apply::preflight_app_dest(req.app_dest.as_deref().map(std::path::Path::new)) {
+        Ok(dest) => Some(dest),
+        Err(e) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    message: format!("invalid update destination: {e}"),
+                }),
+            ));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let app_dest: Option<std::path::PathBuf> = None;
+
     let payload = std::path::PathBuf::from(&req.payload_path);
     // Re-verify offline before anything irreversible. The GUI is untrusted in the
     // bridge's model, so a re-verify failure is a corruption/tamper event the
@@ -469,7 +489,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
     // a detached child (returns naturally); macOS runs the actor on a detached
     // task that SIGTERMs THIS process only after this 200 is on the wire.
-    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version) {
+    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref()) {
         let _ = hole_common::update_marker::clear(log_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

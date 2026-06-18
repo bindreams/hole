@@ -832,6 +832,7 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         sha256sums,
         sha256sums_minisig,
         asset_name: info.asset_name.clone(),
+        app_dest: hole::update::app_dest_hint(),
     };
     let result = app.state::<AppState>().bridge_send(apply).await;
     drop(download_dir);

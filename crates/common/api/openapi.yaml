@@ -640,3 +640,10 @@ components:
         asset_name:
           type: string
           description: The payload's filename, used to find its hash in sha256sums.
+        app_dest:
+          type: string
+          nullable: true
+          description: >-
+            macOS only: the GUI's current_exe-derived .app swap target. A hint
+            the bridge re-validates (CFBundleIdentifier == com.hole.app) before
+            swapping; never a trust anchor. Null/absent on Windows.

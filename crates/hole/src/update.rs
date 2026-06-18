@@ -14,6 +14,23 @@ pub use error::UpdateError;
 pub use periodic::start_update_checker;
 pub use verify::{fetch_manifest, verify_asset};
 
+/// The macOS `.app` swap-target hint for `ApplyUpdate`, derived from the GUI's
+/// own `current_exe` (`<bundle>/Contents/MacOS/hole`). The bridge re-validates it
+/// against `CFBundleIdentifier == com.hole.app`, so an undeterminable path is
+/// rejected there (422). Windows has no bundle and sends `None` (the SCM install
+/// dir is canonical).
+pub fn app_dest_hint() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        hole_bridge::cutover::app_dest::resolve_app_dest_from_exe(&exe).map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Tauri-managed state for update availability.
 pub struct UpdateState {
     pub tx: tokio::sync::watch::Sender<Option<UpdateInfo>>,

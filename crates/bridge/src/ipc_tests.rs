@@ -431,7 +431,7 @@ async fn post_update_apply(
     // Manifest/sig/asset_name are placeholders: the consent (403) and
     // single-occupancy (409) gates fire BEFORE re-verification, so these tests
     // never reach the verify step. The 422 path has its own dedicated test.
-    post_update_apply_full(client, payload_path, consent, "x  hole.msi\n", "sig", "hole.msi").await
+    post_update_apply_full(client, payload_path, consent, "x  hole.msi\n", "sig", "hole.msi", None).await
 }
 
 async fn post_update_apply_full(
@@ -441,6 +441,7 @@ async fn post_update_apply_full(
     sha256sums: &str,
     sha256sums_minisig: &str,
     asset_name: &str,
+    app_dest: Option<&str>,
 ) -> http::Response<hyper::body::Incoming> {
     let body = serde_json::to_vec(&hole_common::protocol::UpdateApplyRequest {
         payload_path: payload_path.into(),
@@ -449,6 +450,7 @@ async fn post_update_apply_full(
         sha256sums: sha256sums.into(),
         sha256sums_minisig: sha256sums_minisig.into(),
         asset_name: asset_name.into(),
+        app_dest: app_dest.map(|s| s.to_string()),
     })
     .unwrap();
     let req = http::Request::builder()
@@ -723,6 +725,22 @@ fn update_apply_with_existing_marker_is_409() {
     });
 }
 
+/// Build a genuine `com.hole.app` bundle under `parent` so the macOS app_dest
+/// pre-flight passes and a test can reach the payload re-verify step. On Windows
+/// there is no app_dest gate, so callers pass `None` instead.
+#[cfg(target_os = "macos")]
+fn make_valid_app_dest(parent: &std::path::Path) -> std::path::PathBuf {
+    let app = parent.join("Hole.app");
+    let contents = app.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::write(
+        contents.join("Info.plist"),
+        "<?xml version=\"1.0\"?>\n<plist><dict>\n<key>CFBundleIdentifier</key>\n<string>com.hole.app</string>\n</dict></plist>\n",
+    )
+    .unwrap();
+    app
+}
+
 #[skuld::test]
 fn update_apply_unverifiable_payload_is_422_no_marker() {
     // The bridge re-verifies the payload offline before anything irreversible.
@@ -735,6 +753,17 @@ fn update_apply_unverifiable_payload_is_422_no_marker() {
         let payload_dir = tempfile::tempdir().unwrap();
         let payload = payload_dir.path().join("hole.msi");
         std::fs::write(&payload, b"hello world").unwrap();
+
+        // macOS gates the destination before the payload; supply a genuine bundle
+        // so the re-verify step is what fails here. Windows has no app_dest gate.
+        #[cfg(target_os = "macos")]
+        let app_dest_dir = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let app_dest = make_valid_app_dest(app_dest_dir.path());
+        #[cfg(target_os = "macos")]
+        let app_dest = Some(app_dest.to_string_lossy().into_owned());
+        #[cfg(not(target_os = "macos"))]
+        let app_dest: Option<String> = None;
 
         let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
         let handle = tokio::spawn(async move {
@@ -751,6 +780,7 @@ fn update_apply_unverifiable_payload_is_422_no_marker() {
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  hole.msi\n",
             "untrusted comment: forged\nnot-a-real-signature\n",
             "hole.msi",
+            app_dest.as_deref(),
         )
         .await;
         assert_eq!(resp.status(), 422, "an unverifiable payload must be refused with 422");
@@ -759,6 +789,61 @@ fn update_apply_unverifiable_payload_is_422_no_marker() {
         assert!(
             hole_common::update_marker::read(&log_dir).is_none(),
             "a verify failure must not write a marker"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// macOS: a `.app` swap target whose bundle identity is not `com.hole.app` (a
+/// spoofed `Evil.app`) is refused 422 BEFORE the marker — the bridge anchors the
+/// swap to a root-trusted identity, never the GUI-supplied path. Runs on the
+/// macOS unprivileged lane (the rejection precedes any privileged step).
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn update_apply_spoofed_app_dest_is_422_no_marker() {
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-app-dest-422");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let payload = payload_dir.path().join("hole.dmg");
+        std::fs::write(&payload, b"hello world").unwrap();
+
+        // A bundle with a foreign CFBundleIdentifier — the security case.
+        let evil_dir = tempfile::tempdir().unwrap();
+        let evil = evil_dir.path().join("Evil.app");
+        std::fs::create_dir_all(evil.join("Contents").join("MacOS")).unwrap();
+        std::fs::write(
+            evil.join("Contents").join("Info.plist"),
+            "<?xml version=\"1.0\"?>\n<plist><dict>\n<key>CFBundleIdentifier</key>\n<string>com.evil.app</string>\n</dict></plist>\n",
+        )
+        .unwrap();
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the destination gate (not consent/409) is what fires;
+        // the payload/manifest never matter because app_dest is checked first.
+        let resp = post_update_apply_full(
+            &mut client,
+            &payload.to_string_lossy(),
+            true,
+            "deadbeef  hole.dmg\n",
+            "sig",
+            "hole.dmg",
+            Some(&evil.to_string_lossy()),
+        )
+        .await;
+        assert_eq!(resp.status(), 422, "a spoofed bundle identity must be refused with 422");
+        let _ = resp.into_body().collect().await;
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a destination rejection must not write a marker"
         );
 
         drop(client);
