@@ -56,7 +56,6 @@ export interface DnsConfig {
   enabled: boolean;
   servers: string[];
   protocol: DnsProtocol;
-  intercept_udp53: boolean;
 }
 
 export interface Config {

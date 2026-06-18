@@ -82,8 +82,6 @@ const SETTINGS_DOM = `
         <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="https">DNS over HTTPS</button>
       </div>
     </div>
-    <span class="setting-label" id="lbl-dns-intercept">Intercept UDP/53 to other servers</span>
-    <button type="button" class="toggle" id="toggle-dns-intercept" role="switch" aria-checked="false" aria-labelledby="lbl-dns-intercept"></button>
   </div>
 `;
 
@@ -97,7 +95,7 @@ function freshConfig(): Record<string, unknown> {
     local_port_http: 4074,
     on_startup: "do_not_connect",
     theme: "dark",
-    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
   };
 }
 
@@ -146,7 +144,7 @@ describe("settings toggles", () => {
     expect(nested.classList.contains("muted")).toBe(true);
   });
 
-  it("DNS toggles patch config.dns and sync aria-checked", async () => {
+  it("DNS enabled toggle patches config.dns and syncs aria-checked", async () => {
     await setup();
     const enabled = document.getElementById("toggle-dns-enabled")!;
     expect(enabled.getAttribute("aria-checked")).toBe("true");
@@ -154,11 +152,6 @@ describe("settings toggles", () => {
     expect((mainMock.config!.dns as { enabled: boolean }).enabled).toBe(false);
     expect(enabled.getAttribute("aria-checked")).toBe("false");
     expect(document.getElementById("dns-nested")!.classList.contains("muted")).toBe(true);
-
-    const intercept = document.getElementById("toggle-dns-intercept")!;
-    intercept.click();
-    expect((mainMock.config!.dns as { intercept_udp53: boolean }).intercept_udp53).toBe(false);
-    expect(intercept.getAttribute("aria-checked")).toBe("false");
   });
 });
 
@@ -310,16 +303,6 @@ describe("DNS controls with no config loaded", () => {
     const { initSettings } = await import("./settings");
     initSettings();
     const el = document.getElementById("toggle-dns-enabled")!;
-    el.click();
-    expect(el.classList.contains("on")).toBe(false);
-    expect(el.getAttribute("aria-checked")).toBe("false");
-  });
-
-  it("dns-intercept toggle does not flip its visual state when config is null", async () => {
-    mainMock.config = null;
-    const { initSettings } = await import("./settings");
-    initSettings();
-    const el = document.getElementById("toggle-dns-intercept")!;
     el.click();
     expect(el.classList.contains("on")).toBe(false);
     expect(el.getAttribute("aria-checked")).toBe("false");
