@@ -8,7 +8,7 @@ import { error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
-import { initFilters, renderFilters } from "./filters";
+import { filtersEpoch, initFilters, renderFilters, setInvalidFilters } from "./filters";
 import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
 import {
@@ -132,6 +132,9 @@ export function isDirty() {
 
 /** Poll proxy status every 5 seconds. */
 async function pollProxyStatus() {
+  // Capture the filters epoch before the round-trip; a mutation during the
+  // fetch invalidates the response's invalid_filters indices (#470).
+  const epoch = filtersEpoch();
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
@@ -143,6 +146,11 @@ async function pollProxyStatus() {
     // already connected when the GUI started".
     if (result.changed) {
       updatePublicIp();
+    }
+    // Drop a result that resolved after a ruleset mutation — its indices no
+    // longer match the rendered rows.
+    if (epoch === filtersEpoch()) {
+      setInvalidFilters(status.invalid_filters);
     }
   } catch (err) {
     console.error("get_proxy_status failed:", err);

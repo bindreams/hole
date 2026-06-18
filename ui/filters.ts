@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { config, saveConfig } from "./main";
 import { menuKeydown } from "./menu-keys";
 import { showToast } from "./toast";
-import type { FilterRule } from "./types";
+import type { FilterRule, InvalidFilter } from "./types";
 
 // Constants ===========================================================================================================
 
@@ -48,6 +48,59 @@ let openDropdown: (HTMLDivElement & { _td?: HTMLTableCellElement }) | null = nul
 /** Index of the row being edited inline (address input), or -1. */
 let editingIndex = -1;
 
+// Invalid-filter badges (#470) ========================================================================================
+
+/// The bridge's list of dropped rules from the latest status poll, keyed by
+/// their index in `config.filters`. Repainted onto rows by `applyInvalidFilterBadges`.
+let invalidFilters: InvalidFilter[] = [];
+
+/// Monotonic epoch, bumped whenever a local mutation changes the ruleset shape.
+/// The poll captures it before fetching and discards a result that resolved
+/// after a mutation — those indices no longer match the rendered rows.
+let epoch = 0;
+
+/** Current ruleset epoch; the poll uses it to drop a stale-revision result. */
+export function filtersEpoch(): number {
+  return epoch;
+}
+
+/// Drop the cached invalid-filter list and bump the epoch. Called synchronously
+/// from every ruleset mutation BEFORE its re-render, so a badge can never paint
+/// against indices the bridge has not re-judged.
+function invalidateInvalidFilters(): void {
+  epoch++;
+  invalidFilters = [];
+  applyInvalidFilterBadges();
+}
+
+/** Latest dropped-rule list from the status poll; repaints the badges. */
+export function setInvalidFilters(list: InvalidFilter[]): void {
+  invalidFilters = list;
+  applyInvalidFilterBadges();
+}
+
+/// Targeted badge paint: add/remove a `.filter-invalid` marker on each row by
+/// its index. NOT a full re-render — it must not cancel a drag, close a
+/// dropdown, or commit a half-typed edit on the 5s poll. Derives purely from
+/// the current rows + the cache, so it is correct however it is reached.
+function applyInvalidFilterBadges(): void {
+  const byIndex = new Map<number, string>();
+  for (const f of invalidFilters) byIndex.set(f.index, f.error);
+  for (const tr of tbody.querySelectorAll<HTMLTableRowElement>("tr")) {
+    tr.querySelector(".filter-invalid")?.remove();
+    const i = parseInt(tr.dataset.index ?? "", 10);
+    const err = byIndex.get(i);
+    const host = tr.querySelector(".cp-addr");
+    if (err == null || !host) continue;
+    const badge = document.createElement("span");
+    badge.className = "filter-invalid";
+    badge.textContent = "⚠"; // ⚠
+    badge.title = `Rule not applied: ${err}`;
+    badge.setAttribute("aria-label", `Rule not applied: ${err}`);
+    host.appendChild(badge);
+  }
+}
+
 // Persistence =========================================================================================================
 
 /// Persist the rule list, then push it to the running proxy.
@@ -64,6 +117,9 @@ let editingIndex = -1;
 let persistChain: Promise<void> = Promise.resolve();
 
 function persistFilters(): Promise<void> {
+  // The bridge has not re-judged the mutated ruleset; drop stale badges now and
+  // invalidate any in-flight poll result via the epoch (#470).
+  invalidateInvalidFilters();
   persistChain = persistChain.then(async () => {
     await saveConfig();
     try {
@@ -95,6 +151,9 @@ function ensureDefaultRule() {
       matching: "wildcard",
       action: "proxy",
     });
+    // The unshift shifts every later index — stale invalid-filter indices no
+    // longer match the rows (#470).
+    invalidateInvalidFilters();
     saveConfig();
   }
 }
@@ -267,6 +326,10 @@ export function renderFilters() {
     const index = byIdentity >= 0 ? byIdentity : restoreIndex;
     tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] ${restoreControl}`)?.focus({ preventScroll: true });
   }
+
+  // Repaint invalid-filter badges from the cache (#470): the table was rebuilt,
+  // so the prior badge spans are gone.
+  applyInvalidFilterBadges();
 
   // Re-evaluate test filtering after render.
   evaluateTestFilter();

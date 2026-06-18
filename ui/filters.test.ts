@@ -405,3 +405,54 @@ describe("abandoning a new rule", () => {
     expect(rules().every((r) => r.address !== "")).toBe(true);
   });
 });
+
+describe("invalid_filters badges (#470)", () => {
+  it("badges the row at InvalidFilter.index with the error tooltip", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad pattern" }]);
+    const badge = row(1).querySelector(".filter-invalid")!;
+    expect(badge).toBeTruthy();
+    expect(badge.getAttribute("title")).toBe("Rule not applied: bad pattern");
+    expect(row(2).querySelector(".filter-invalid")).toBeNull();
+    expect(row(0).querySelector(".filter-invalid")).toBeNull();
+  });
+
+  it("clears badges when the list goes empty", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.setInvalidFilters([]);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+  });
+
+  it("re-applies badges from the cache across a config-reload render", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.renderFilters(); // a config reload re-renders the table
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+  });
+
+  it("a ruleset mutation bumps the epoch and clears badges synchronously", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    const before = mod.filtersEpoch();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click(); // delete -> persistFilters
+    expect(mod.filtersEpoch()).toBeGreaterThan(before);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+    await flushPersist();
+  });
+
+  it("an index-shifting ensureDefaultRule bumps the epoch and clears badges", async () => {
+    // Config missing the default rule: the next render unshifts it at index 0,
+    // shifting every later index. The stale cache must be dropped (epoch bump),
+    // not painted onto the shifted rows.
+    mainMock.config!.filters = [{ address: "example.com", matching: "exactly", action: "bypass" }];
+    const mod = await setup(); // setup()'s renderFilters already inserted the default
+    mod.setInvalidFilters([{ index: 0, error: "bad" }]);
+    const before = mod.filtersEpoch();
+    mainMock.config!.filters = [{ address: "example.com", matching: "exactly", action: "bypass" }]; // drop default again
+    mod.renderFilters(); // ensureDefaultRule unshifts -> epoch bump
+    expect(mod.filtersEpoch()).toBeGreaterThan(before);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+    await flushPersist();
+  });
+});
