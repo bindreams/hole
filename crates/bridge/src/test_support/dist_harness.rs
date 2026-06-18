@@ -320,8 +320,18 @@ impl Drop for DistHarness {
                         };
                         rt.block_on(async move {
                             let mut client = client;
-                            if client.send(BridgeRequest::Stop).await.is_err() {
-                                return false;
+                            // Bound the Stop send: a WEDGED bridge (a hung
+                            // Start/teardown that never serves Stop, as in
+                            // bindreams/hole#541) would otherwise block this Drop
+                            // forever — turning a fast test failure into an
+                            // infinite hang (nextest SLOW → job timeout), with no
+                            // panic-dump and no failure() artifact. Time-bound,
+                            // then fall back to kill below. Class-2 subprocess
+                            // failure-bound, not intra-process sync.
+                            match tokio::time::timeout(Duration::from_secs(10), client.send(BridgeRequest::Stop)).await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(_)) | Err(_) => return false,
                             }
                             drop(client);
 
