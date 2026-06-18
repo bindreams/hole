@@ -613,10 +613,32 @@ fn unprocessable_maps_to_payload_verification_failed() {
 }
 
 #[skuld::test]
-fn other_4xx_maps_to_protocol() {
+fn bad_request_maps_to_invalid_update_destination() {
     rt().block_on(async {
         let path = test_socket_path("err400");
-        let result = start_against_status(&path, axum::http::StatusCode::BAD_REQUEST, "bad request").await;
+        let result = start_against_status(
+            &path,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the update install destination is invalid",
+        )
+        .await;
+        match result {
+            Err(ClientError::InvalidUpdateDestination { message }) => {
+                assert!(
+                    message.contains("destination"),
+                    "expected destination message, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidUpdateDestination, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn other_4xx_maps_to_protocol() {
+    rt().block_on(async {
+        let path = test_socket_path("err404");
+        let result = start_against_status(&path, axum::http::StatusCode::NOT_FOUND, "not found").await;
         assert!(
             matches!(result, Err(ClientError::Protocol(_))),
             "expected Protocol, got: {result:?}"

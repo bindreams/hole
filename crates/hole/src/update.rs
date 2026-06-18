@@ -12,7 +12,7 @@ pub use check::{check_for_update, UpdateInfo};
 pub use download::download_asset;
 pub use error::UpdateError;
 pub use periodic::start_update_checker;
-pub use verify::{fetch_manifest, verify_asset};
+pub use verify::fetch_manifest;
 
 /// The macOS `.app` swap-target hint for `ApplyUpdate`, derived from the GUI's
 /// own `current_exe` (`<bundle>/Contents/MacOS/hole`). The bridge re-validates it

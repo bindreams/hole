@@ -2,12 +2,11 @@
 //
 // The pure offline core (minisign + SHA-256 + manifest parsing) lives in
 // `hole_common::verify` so the privileged bridge can re-verify the same payload
-// without depending on the GUI crate. This module adds the GUI's network layer:
-// download the sidecars, then call the shared core.
+// without depending on the GUI crate. This module is the GUI's network layer:
+// download the sidecars so both the GUI's local verify and the bridge's
+// re-verify can run the shared offline core against the same manifest.
 
-use std::path::Path;
-
-use hole_common::verify::{verify_payload_offline, VerifyError};
+use hole_common::verify::VerifyError;
 
 use super::error::UpdateError;
 
@@ -15,24 +14,6 @@ use super::error::UpdateError;
 const SIDECAR_SIZE_LIMIT: u64 = 1024 * 1024;
 
 // Public API ==========================================================================================================
-
-/// Verify a downloaded asset's integrity (SHA-256) and authenticity (minisign).
-///
-/// Downloads the release-level `SHA256SUMS` manifest and its minisign signature,
-/// verifies the signature first (authenticity), then looks up and verifies the
-/// asset's hash (integrity). Both checks must pass.
-///
-/// This is a blocking function — call from `spawn_blocking`.
-pub fn verify_asset(
-    asset_path: &Path,
-    asset_name: &str,
-    sha256sums_url: &str,
-    sha256sums_minisig_url: &str,
-) -> Result<(), UpdateError> {
-    let (sha256sums, minisig) = fetch_manifest(sha256sums_url, sha256sums_minisig_url)?;
-    verify_payload_offline(asset_path, asset_name, &sha256sums, &minisig)?;
-    Ok(())
-}
 
 /// Download the `SHA256SUMS` manifest and its minisign signature, returning their
 /// texts. The caller passes them to BOTH the local verify and the bridge's

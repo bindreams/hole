@@ -141,6 +141,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EmptyResponse"
+        "400":
+          description: >-
+            The install destination is invalid (macOS): the `.app` swap target is
+            not a genuine `com.hole.app` bundle, or its volume cannot atomically
+            swap. A destination precondition, distinct from a payload-bytes
+            failure; refused before the marker write
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "403":
           description: A lockdown-off update was requested without consent=true
           content:

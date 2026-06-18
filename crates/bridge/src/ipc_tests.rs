@@ -798,12 +798,13 @@ fn update_apply_unverifiable_payload_is_422_no_marker() {
 }
 
 /// macOS: a `.app` swap target whose bundle identity is not `com.hole.app` (a
-/// spoofed `Evil.app`) is refused 422 BEFORE the marker — the bridge anchors the
-/// swap to a root-trusted identity, never the GUI-supplied path. Runs on the
-/// macOS unprivileged lane (the rejection precedes any privileged step).
+/// spoofed `Evil.app`) is refused 400 BEFORE the marker — the bridge anchors the
+/// swap to a root-trusted identity, never the GUI-supplied path. A destination
+/// precondition is distinct from a payload-verify failure (which is 422). Runs on
+/// the macOS unprivileged lane (the rejection precedes any privileged step).
 #[cfg(target_os = "macos")]
 #[skuld::test]
-fn update_apply_spoofed_app_dest_is_422_no_marker() {
+fn update_apply_spoofed_app_dest_is_400_no_marker() {
     rt().block_on(async {
         let path = test_socket_path("update-apply-app-dest-422");
         let log_dir = tempfile::tempdir().unwrap().keep();
@@ -839,7 +840,7 @@ fn update_apply_spoofed_app_dest_is_422_no_marker() {
             Some(&evil.to_string_lossy()),
         )
         .await;
-        assert_eq!(resp.status(), 422, "a spoofed bundle identity must be refused with 422");
+        assert_eq!(resp.status(), 400, "a spoofed bundle identity must be refused with 400");
         let _ = resp.into_body().collect().await;
         assert!(
             hole_common::update_marker::read(&log_dir).is_none(),

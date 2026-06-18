@@ -43,6 +43,11 @@ pub enum ClientError {
     /// minisign/SHA-256 check (422) — corruption or tamper.
     #[error("the downloaded update could not be verified and was not applied")]
     PayloadVerificationFailed { message: String },
+    /// The bridge rejected the update's install destination (400) — an invalid
+    /// `.app` swap target or a volume that cannot atomically swap. Distinct from
+    /// a payload-bytes failure so the user is not told the download is corrupt.
+    #[error("the update install destination is invalid")]
+    InvalidUpdateDestination { message: String },
 }
 
 // Client ==============================================================================================================
@@ -370,6 +375,11 @@ async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Resu
     }
     if status == http::StatusCode::UNPROCESSABLE_ENTITY {
         return Err(ClientError::PayloadVerificationFailed {
+            message: error_message(resp).await,
+        });
+    }
+    if status == http::StatusCode::BAD_REQUEST {
+        return Err(ClientError::InvalidUpdateDestination {
             message: error_message(resp).await,
         });
     }
