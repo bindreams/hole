@@ -492,4 +492,21 @@ describe("test filtering", () => {
     await flushPersist();
     expect(result()).toContain("Could not evaluate");
   });
+
+  it("does not repopulate a cleared box with an in-flight response", async () => {
+    // Type, then clear before the (slow) response lands. The stale verdict
+    // must not overwrite the now-empty box.
+    let resolveSlow!: (v: unknown) => void;
+    const slow = new Promise((r) => {
+      resolveSlow = r;
+    });
+    invokeMock.mockImplementation(async (cmd: unknown) => (cmd === "evaluate_filter" ? slow : undefined));
+    await setup();
+    setTestInput("example.com"); // invoke in-flight (slow)
+    setTestInput(""); // clear the box before it resolves
+    await flushPersist();
+    resolveSlow({ action: "bypass", rule_index: 1, matched_address: "example.com" }); // stale
+    await flushPersist();
+    expect(result()).toBe("");
+  });
 });

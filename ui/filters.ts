@@ -791,12 +791,17 @@ async function evaluateTestFilter() {
   if (!testInput || !testResult) return;
   const input = testInput.value.trim();
 
+  // Bump the generation before the empty-input short-circuit so clearing the
+  // box (or rendering it empty) supersedes any in-flight evaluation —
+  // otherwise a slow response for a previous input could repopulate a box the
+  // user just cleared.
+  const seq = ++testSeq;
+
   if (!input || !config?.filters || config.filters.length === 0) {
     testResult.innerHTML = "";
     return;
   }
 
-  const seq = ++testSeq;
   let result: FilterEvaluation;
   try {
     result = await invoke<FilterEvaluation>("evaluate_filter", { input, filters: config.filters });
