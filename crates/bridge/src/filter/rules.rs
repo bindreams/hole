@@ -61,12 +61,7 @@ impl RuleSet {
             }
         }
 
-        let has_domain_rules = compiled.iter().any(|r| {
-            matches!(
-                r.matcher,
-                Matcher::ExactDomain(_) | Matcher::SubdomainDomain(_) | Matcher::WildcardDomain(_)
-            )
-        });
+        let has_domain_rules = compiled.iter().any(|r| r.matcher.is_domain());
 
         Self {
             rules: compiled,
