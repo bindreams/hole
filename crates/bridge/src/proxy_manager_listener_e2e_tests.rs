@@ -429,11 +429,14 @@ mod socks_only_udp {
 
     /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux.
     ///
-    /// `#[ignore]`: galoshes' UDP transport detection is flaky on CI — the chain
-    /// intermittently reports TCP-only, so the bridge sets `udp_proxy_available =
-    /// false` and drops the flow. Un-ignore once that is fixed. See bindreams/hole#518.
+    /// Gated off Windows: the UDP **reply** leg is intermittently lost on the
+    /// Windows CI lane ("SOCKS5 UDP reply timeout"); it runs reliably on macOS.
+    /// See bindreams/hole#543.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-    #[ignore = "galoshes UDP transport detection flaky on CI — see bindreams/hole#518"]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "galoshes SOCKS5 UDP reply leg flaky on Windows CI — see bindreams/hole#543"
+    )]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,

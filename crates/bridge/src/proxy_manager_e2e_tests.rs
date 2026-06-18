@@ -219,11 +219,15 @@ fn e2e_metrics_report_tunnel_traffic(
 
 /// Test 2: SocksOnly mode with galoshes (websocket, no TLS).
 ///
-/// `#[ignore]`: galoshes-fronted bridge roundtrips truncate intermittently on
-/// macOS CI (all transports) — see bindreams/hole#518. The galoshes WS transport
-/// proper is covered by `plugin-e2e`'s `galoshes_ws_roundtrip`.
+/// Gated off Windows: the Windows bridge-e2e lane intermittently stalls
+/// 600–740s, and the galoshes/ex-ray chain's internal timeouts fire under the
+/// stall → truncated response. Reliable on macOS; the galoshes WS transport is
+/// covered on Windows by `plugin-e2e`. See bindreams/hole#542.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "galoshes bridge e2e truncates under the Windows bridge-e2e stall — see bindreams/hole#542"
+)]
 fn e2e_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -288,12 +292,8 @@ fn e2e_galoshes_chain_reports_udp_available(
 /// Test 3: SocksOnly mode with galoshes (websocket + TLS). `cfg(not(windows))`:
 /// the server presents a self-signed cert and v2ray-core's `getCertPool` drops
 /// custom certs on Windows (same limit as `plugin-e2e`'s `galoshes_ws_tls_roundtrip`).
-///
-/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on CI — see
-/// bindreams/hole#518.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
 fn e2e_ws_tls_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws_tls)] ss: &SsServerHandle,
@@ -305,13 +305,8 @@ fn e2e_ws_tls_socks_only_roundtrip(
 /// Test 4: SocksOnly mode with galoshes (QUIC, auto-TLS). Off Windows: QUIC
 /// auto-enables TLS and v2ray-core's `getCertPool` drops the custom cert on
 /// Windows (same limit as `e2e_ws_tls_socks_only_roundtrip`).
-///
-/// `#[ignore]`: galoshes' QUIC (UDP) transport is unreliable on CI runners — the
-/// roundtrip truncates on macOS. Part of the galoshes UDP-flow-on-CI family;
-/// un-ignore once that is fixed. See bindreams/hole#518.
 #[cfg(not(target_os = "windows"))]
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-#[ignore = "galoshes QUIC transport unreliable on CI (truncated roundtrip) — see bindreams/hole#518"]
 fn e2e_quic_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_quic)] ss: &SsServerHandle,
@@ -410,10 +405,12 @@ mod tun {
     /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
     /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs elevation.
     ///
-    /// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on CI — see
-    /// bindreams/hole#518.
+    /// `#[ignore]`: deterministically hangs — the galoshes-fronted full-tunnel
+    /// chain never completes one half-close, so the SOCKS5-seam
+    /// `copy_bidirectional` waits forever. The no-plugin full-tunnel path
+    /// (`e2e_none_full_tunnel_roundtrip`) passes. See bindreams/hole#541.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
-    #[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
+    #[ignore = "galoshes full-tunnel roundtrip hangs (half-close not propagated) — see bindreams/hole#541"]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -675,10 +672,14 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
 
 /// Test 13: ws plugin, SocksOnly mode, IPv6 HTTP target on `[::1]`.
 ///
-/// `#[ignore]`: galoshes-fronted bridge roundtrips are flaky on CI — see
-/// bindreams/hole#518.
+/// Gated off Windows for the same reason as `e2e_ws_socks_only_roundtrip` (the
+/// intermittent Windows bridge-e2e stall truncates the galoshes chain). Runs on
+/// macOS. See bindreams/hole#542.
 #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, IPV6], serial = IPV6)]
-#[ignore = "galoshes bridge e2e flaky on CI (truncated responses) — see bindreams/hole#518"]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "galoshes bridge e2e truncates under the Windows bridge-e2e stall — see bindreams/hole#542"
+)]
 fn ipv6_ws_socks_only_roundtrip(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_ws)] ss: &SsServerHandle,

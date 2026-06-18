@@ -1129,13 +1129,13 @@ mod proxy_manager_tests;
 // - **Non-galoshes** DistHarness e2e (`e2e_none`, lifecycle, cipher, and the
 //   listener-selection tests) run on every Hole platform (Win+mac).
 // - **galoshes-fronted** tests front a galoshes *server* via the garter
-//   `ChainRunner` launcher (`plugin_e2e::ssserver`). They are all `#[ignore]`d:
-//   galoshes plugin data delivery is flaky on CI — the roundtrips truncate
-//   intermittently across every transport (#518; the bridge itself is correct).
-//   They compile on their real platforms (WS on Win+mac, WS-TLS and QUIC on
-//   macOS only for the Windows custom-cert limit, the full-tunnel test on the
-//   Windows TUN lane) and run again once #518 is fixed. galoshes transport
-//   coverage proper lives in the `plugin-e2e` crate.
+//   `ChainRunner` launcher (`plugin_e2e::ssserver`), which the `SsServerHandle`
+//   fixture keeps alive for the test's lifetime. They run on **macOS**, where
+//   they are reliable. All are gated off the Windows lane pending fixes: the
+//   socks-only WS/IPv6 roundtrips and UDP-associate hit an intermittent Windows
+//   bridge-e2e stall (#542 / #543 for UDP), the full-tunnel TUN test hangs
+//   (#541), and WS-TLS/QUIC are macOS-only anyway (Windows custom-cert limit).
+//   galoshes transport coverage on Windows lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
