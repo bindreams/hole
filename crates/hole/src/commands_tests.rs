@@ -442,7 +442,10 @@ fn map_status_error_arm_caps_null_error_from_snap() {
     assert!(j["ipv6_bypass_available"].is_null());
     assert!(j["error"].is_null(), "error from snap (None), not the response message");
     assert_eq!(j["running"], true, "running from snap (stale truth)");
-    assert_eq!(j["invalid_filters"], serde_json::json!([]));
+    assert!(
+        j["invalid_filters"].is_null(),
+        "invalid_filters unknown on non-Status arm"
+    );
     assert_eq!(j["uptime_secs"], 0);
 }
 

@@ -265,6 +265,33 @@ describe("power-button state machine", () => {
     expect(getConnectionState()).toBe("connecting");
   });
 
+  it("toasts on disconnection-failed -> disconnected with an error (a failed-stop proxy then dies)", async () => {
+    // disconnection-failed is an "on" state (proxy still up after a failed
+    // stop). If it then dies, the transition into disconnected is a genuine
+    // death and must toast.
+    let rejectStop!: (reason: unknown) => void;
+    const stopPromise = new Promise<never>((_, reject) => {
+      rejectStop = reject;
+    });
+    const { initPowerButton, applyProxyStateObservation, updateProxyStatus, getConnectionState } = await import(
+      "./power-button"
+    );
+    initPowerButton();
+    applyProxyStateObservation(3, true);
+    invokeMock.mockReturnValueOnce(stopPromise);
+    document.getElementById("power-btn")!.click(); // -> disconnecting
+    await Promise.resolve();
+    rejectStop("teardown wedged");
+    await stopPromise.catch(() => {});
+    await Promise.resolve();
+    expect(getConnectionState()).toBe("disconnection-failed");
+    showToastMock.mockClear();
+
+    updateProxyStatus(fullStatus({ running: false, state_seq: 4, error: "proxy task exited unexpectedly" }));
+    expect(showToastMock).toHaveBeenCalledTimes(1);
+    expect(showToastMock).toHaveBeenCalledWith("proxy task exited unexpectedly", "error");
+  });
+
   it("does not toast on connection-failed -> disconnected with an error (wasOn gate)", async () => {
     // Drive the genuine `connection-failed` via a rejected start (no back-door
     // setter), then a poll observes running=false carrying an error. Because

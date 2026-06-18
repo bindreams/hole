@@ -123,8 +123,10 @@ export interface ProxyStatus {
   /// one (#470). Non-null only on an out-of-band death (the path-free
   /// sentinel); drives the exactly-once death toast.
   error: string | null;
-  /// Filter rules the bridge rejected and is NOT enforcing.
-  invalid_filters: InvalidFilter[];
+  /// Filter rules the bridge rejected and is NOT enforcing. `null` when the
+  /// bridge could not vouch this poll (a non-Status arm); the UI keeps the
+  /// last-known list in that case.
+  invalid_filters: InvalidFilter[] | null;
   /// `null` when the bridge could not vouch for the capability (a non-Status
   /// poll arm); the UI keeps the last-known value in that case.
   udp_proxy_available: boolean | null;

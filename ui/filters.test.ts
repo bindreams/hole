@@ -424,6 +424,24 @@ describe("invalid_filters badges (#470)", () => {
     expect(document.querySelector(".filter-invalid")).toBeNull();
   });
 
+  it("keeps the last-known badges when the poll arm is unknown (null)", async () => {
+    // A transient non-Status poll arm carries `null` (the bridge could not
+    // vouch); the badges must persist, mirroring the capability dots — not
+    // blink off on every hiccup.
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.setInvalidFilters(null);
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+  });
+
+  it("append (addRule) does not move existing badges", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    document.getElementById("filter-add-btn")!.click(); // appends an empty row at the end
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+    expect(row(3).querySelector(".filter-invalid")).toBeNull();
+  });
+
   it("re-applies badges from the cache across a config-reload render", async () => {
     const mod = await setup();
     mod.setInvalidFilters([{ index: 1, error: "bad" }]);

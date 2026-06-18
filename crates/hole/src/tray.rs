@@ -1069,12 +1069,13 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
                 return; // cell dropped — app teardown
             }
             // `watch` coalesces to the latest snapshot. A death (running=false,
-            // error=sentinel) can only be overwritten before this wakes by a
-            // commit(running=true), which comes solely from a Start (slow,
-            // user/startup-initiated I/O — there is no auto-reconnect on death).
-            // That cannot land in the wake window, so the death snapshot (with
-            // its error, #470) is what gets emitted. clone: ProxySnapshot owns
-            // a String and is no longer Copy.
+            // error=sentinel) loses its error before this wakes only if a later
+            // commit overwrites it AND flips running back to true — which comes
+            // solely from a Start (slow, user/startup I/O; there is no
+            // auto-reconnect on death), so it cannot land in the wake window. A
+            // coalesced lockdown-only re-commit keeps running=false and the
+            // sticky error, so the death still reaches the webview (#470).
+            // clone: ProxySnapshot owns a String and is no longer Copy.
             let snap = rx.borrow_and_update().clone();
             rebuild_tray_menu(&app);
             if let Err(e) = app.emit("proxy-state-changed", snap) {

@@ -73,8 +73,12 @@ function invalidateInvalidFilters(): void {
   applyInvalidFilterBadges();
 }
 
-/** Latest dropped-rule list from the status poll; repaints the badges. */
-export function setInvalidFilters(list: InvalidFilter[]): void {
+/// Latest dropped-rule list from the status poll; repaints the badges. `null`
+/// means the bridge could not vouch this poll (a non-Status arm) — keep the
+/// last-known badges instead of blinking them off on a transient hiccup
+/// (mirrors the capability dots).
+export function setInvalidFilters(list: InvalidFilter[] | null): void {
+  if (list === null) return;
   invalidFilters = list;
   applyInvalidFilterBadges();
 }

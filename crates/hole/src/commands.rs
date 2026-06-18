@@ -335,14 +335,14 @@ fn map_status_response(
             warn!(error = %message, "bridge returned error for status");
             (
                 0,
-                serde_json::json!([]),
+                serde_json::Value::Null,
                 serde_json::Value::Null,
                 serde_json::Value::Null,
             )
         }
         Ok(_) => (
             0,
-            serde_json::json!([]),
+            serde_json::Value::Null,
             serde_json::Value::Null,
             serde_json::Value::Null,
         ),
@@ -350,7 +350,7 @@ fn map_status_response(
             warn!(error = %e, "bridge unreachable for status");
             (
                 0,
-                serde_json::json!([]),
+                serde_json::Value::Null,
                 serde_json::Value::Null,
                 serde_json::Value::Null,
             )
