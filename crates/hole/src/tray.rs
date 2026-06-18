@@ -74,6 +74,22 @@ pub(crate) enum StartDecision {
     Fail(String),
 }
 
+/// Single producer of the user-facing bridge-error string, shared by the elevated
+/// and non-elevated paths so they read identically. The bridge message is shown
+/// raw: it is authored by the bridge running as a system account (LocalSystem /
+/// root) with system-scoped paths, and `ProxyConfig` carries no path field, so it
+/// cannot contain user PII (#475). A future change that threads a user path into a
+/// bridge request and echoes it here must revisit this.
+pub(crate) fn bridge_error_toast(message: &str) -> String {
+    format!("Bridge error: {message}")
+}
+
+/// Toast for a transport failure observed AFTER a successful elevation — the
+/// bridge is unreachable, which is not an elevation denial.
+pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
+    format!("Could not reach the Hole bridge after elevation. {detail} See gui.log for details.")
+}
+
 pub(crate) fn outcome_for_start_response(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> StartDecision {
@@ -83,7 +99,7 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            StartErrorKind::Other => StartDecision::Fail(format!("Bridge error: {message}")),
+            StartErrorKind::Other => StartDecision::Fail(bridge_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
@@ -96,7 +112,7 @@ pub(crate) fn outcome_for_stop_response(
 ) -> StartDecision {
     match result {
         Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Stopped),
-        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(format!("Bridge error: {message}")),
+        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(bridge_error_toast(message)),
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
         Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
@@ -391,23 +407,32 @@ impl Drop for TransitionGuard {
     }
 }
 
-/// Elevation bypasses the pooled bridge channel, so on success confirm
-/// the actual state via a tracked Status instead of assuming: the commit
-/// (inside `BridgeLink::send`) updates the tray and the webview, and the
-/// returned outcome — which the caller persists as the last honored
-/// intent — is derived from that confirmed snapshot, never from the
-/// elevated helper's claim of success.
+/// Translate an elevated send into the final outcome, attributing failure
+/// honestly: a propagated bridge error reads identically to the non-elevated
+/// path, a post-elevation transport failure is not a denial, and only a real
+/// `Cancelled`/`LaunchFailure` keeps the elevation framing.
+///
+/// On success, elevation bypassed the pooled bridge channel, so the actual state
+/// is confirmed via a tracked Status: the commit (inside `BridgeLink::send`)
+/// updates the tray and the webview, and the returned outcome — which the caller
+/// persists as the last honored intent — is derived from that confirmed
+/// snapshot, never from the elevated helper's claim of success.
 async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<ToggleOutcome, String> {
-    if crate::elevation::prompt_elevation(app, request).await {
-        let state = app.state::<AppState>();
-        let _ = state.bridge_send(BridgeRequest::Status).await;
-        Ok(if state.proxy_snapshot().running {
-            ToggleOutcome::Running
-        } else {
-            ToggleOutcome::Stopped
-        })
-    } else {
-        Err("Elevation was denied or failed".into())
+    use crate::elevation::ElevationResult;
+    match crate::elevation::prompt_elevation(app, request).await {
+        ElevationResult::Success => {
+            let state = app.state::<AppState>();
+            let _ = state.bridge_send(BridgeRequest::Status).await;
+            Ok(if state.proxy_snapshot().running {
+                ToggleOutcome::Running
+            } else {
+                ToggleOutcome::Stopped
+            })
+        }
+        ElevationResult::BridgeError(message) => Err(bridge_error_toast(&message)),
+        ElevationResult::Transport(detail) => Err(transport_after_elevation_toast(&detail)),
+        ElevationResult::Cancelled => Err("Elevation was cancelled.".into()),
+        ElevationResult::LaunchFailure => Err("The elevated helper could not start. See gui.log for details.".into()),
     }
 }
 

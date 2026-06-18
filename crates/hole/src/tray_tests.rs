@@ -127,3 +127,21 @@ fn lockdown_off_renders_plain_label() {
     let label = lockdown_menu_label(false, false);
     assert!(!label.to_lowercase().contains("warning"));
 }
+
+// Toast producers =====================================================================================================
+
+#[skuld::test]
+fn bridge_error_toast_formats_message() {
+    assert_eq!(
+        bridge_error_toast("invalid cipher method: aes-999"),
+        "Bridge error: invalid cipher method: aes-999"
+    );
+}
+
+#[skuld::test]
+fn transport_after_elevation_toast_points_to_log() {
+    let toast = transport_after_elevation_toast("connection refused");
+    assert!(toast.to_lowercase().contains("after elevation"), "{toast}");
+    assert!(toast.contains("gui.log"), "{toast}");
+    assert!(toast.contains("connection refused"), "{toast}");
+}

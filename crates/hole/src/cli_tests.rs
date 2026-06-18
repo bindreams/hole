@@ -445,3 +445,58 @@ fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
     })
     .is_none());
 }
+
+// --result-file flag (elevated outcome sink) ==========================================================================
+
+#[skuld::test]
+fn ipc_send_parses_result_file_flag() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "ipc-send",
+        "--request-file",
+        "/tmp/req.json",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .expect("parse ipc-send --result-file");
+    let Some(Command::Bridge {
+        action: BridgeAction::IpcSend {
+            request_file,
+            result_file,
+            ..
+        },
+    }) = cli.command
+    else {
+        panic!("expected IpcSend");
+    };
+    assert_eq!(request_file, Some(std::path::PathBuf::from("/tmp/req.json")));
+    assert_eq!(result_file, Some(std::path::PathBuf::from("/tmp/res.json")));
+}
+
+#[skuld::test]
+fn grant_access_parses_result_file_flag() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "grant-access",
+        "--then-send-file",
+        "/tmp/req.json",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .expect("parse grant-access --result-file");
+    let Some(Command::Bridge {
+        action:
+            BridgeAction::GrantAccess {
+                then_send_file,
+                result_file,
+                ..
+            },
+    }) = cli.command
+    else {
+        panic!("expected GrantAccess");
+    };
+    assert_eq!(then_send_file, Some(std::path::PathBuf::from("/tmp/req.json")));
+    assert_eq!(result_file, Some(std::path::PathBuf::from("/tmp/res.json")));
+}
