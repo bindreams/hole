@@ -45,10 +45,16 @@ async function handlePowerClick(): Promise<void> {
   // Click during connecting → fire cancel. Stays under the in-flight connect
   // operation (no new op) so toggle-flow's cancel-race arm still owns it; the
   // pending start_proxy lives in toggleFromIdle() and `cancel_proxy` races it
-  // on a fresh bridge connection.
+  // on a fresh bridge connection. The rejection is logged only: a cancel
+  // transport failure says nothing about the pending start, which owns the
+  // outcome — the cancel-race arm honors the cancel if the start raced to
+  // success, the connect's catch lands connection-failed if it failed, and
+  // `cancelling` stays interactive so a hung start is one click from escape.
+  // Changing state here would disarm the race arm and strand the user connected
+  // against their cancel.
   if (currentState === "connecting") {
     setState("cancelling");
-    fireCancel();
+    invoke("cancel_proxy").catch((err) => console.error("cancel_proxy failed:", err));
     return;
   }
 
@@ -85,21 +91,6 @@ async function handlePowerClick(): Promise<void> {
     getConfig: () => config,
     loadConfig,
     beginOp: () => operations.begin(),
-  });
-}
-
-/// Fire `cancel_proxy` for an in-flight start. On rejection (the bridge is
-/// unreachable on the fresh cancel connection) the transition would otherwise
-/// wedge in `cancelling` forever, so escape to `connection-failed`. Guarded by
-/// the current state: a rejection that lands after the cancel-race arm or a user
-/// escape already moved past `cancelling` is ignored.
-function fireCancel(): void {
-  invoke("cancel_proxy").catch((err) => {
-    console.error("cancel_proxy failed:", err);
-    if (currentState !== "cancelling") return;
-    operations.begin();
-    setState("connection-failed");
-    showToast("Couldn't reach the bridge to cancel. The connection may still come up — try again.", "error");
   });
 }
 

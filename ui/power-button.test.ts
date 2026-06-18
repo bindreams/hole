@@ -197,13 +197,28 @@ describe("power-button state machine", () => {
 });
 
 describe("power-button wedge escape (#471)", () => {
-  it("cancel_proxy rejection escapes cancelling to connection-failed with a toast", async () => {
+  it("cancel_proxy rejection keeps cancelling and lets the start outcome honor the cancel", async () => {
+    // A cancel transport failure is logged only — it must not change state or
+    // toast. The pending start owns the outcome: here it races to success, so
+    // the cancel-race arm fires a follow-up stop (cancel honored → disconnected).
+    let resolveStart!: (v: string) => void;
+    const startP = new Promise<string>((res) => {
+      resolveStart = res;
+    });
     let rejectCancel!: (e: unknown) => void;
     const cancelP = new Promise<never>((_, rej) => {
       rejectCancel = rej;
     });
+    const proxyCalls: string[] = [];
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "start_proxy") return new Promise(() => {}); // never settles
+      if (cmd === "start_proxy") {
+        proxyCalls.push(cmd);
+        return startP;
+      }
+      if (cmd === "stop_proxy") {
+        proxyCalls.push(cmd);
+        return Promise.resolve("stopped");
+      }
       if (cmd === "cancel_proxy") return cancelP;
       return Promise.resolve();
     });
@@ -213,24 +228,97 @@ describe("power-button wedge escape (#471)", () => {
     const btn = document.getElementById("power-btn")!;
     btn.click();
     await Promise.resolve();
-    expect(getConnectionState()).toBe("connecting");
     btn.click();
     await Promise.resolve();
     expect(getConnectionState()).toBe("cancelling");
 
+    // cancel_proxy rejects — no state change, no toast.
     rejectCancel("bridge unreachable");
     await cancelP.catch(() => {});
     await flush();
-    expect(getConnectionState()).toBe("connection-failed");
-    expect(toast.showToast).toHaveBeenCalledWith(
-      "Couldn't reach the bridge to cancel. The connection may still come up — try again.",
-      "error",
-    );
+    expect(getConnectionState()).toBe("cancelling");
+    expect(toast.showToast).not.toHaveBeenCalled();
 
-    // The escaped state is interactive: a click starts a fresh connect.
+    // The start raced to success → the cancel-race arm honors the cancel.
+    resolveStart("running");
+    await startP;
+    await flush();
+    expect(getConnectionState()).toBe("disconnected");
+    expect(proxyCalls).toEqual(["start_proxy", "stop_proxy"]);
+    expect(toast.showToast).not.toHaveBeenCalled();
+  });
+
+  it("cancel rejection then a start failure lands connection-failed with a single toast", async () => {
+    let rejectStart!: (e: unknown) => void;
+    const startP = new Promise<never>((_, rej) => {
+      rejectStart = rej;
+    });
+    let rejectCancel!: (e: unknown) => void;
+    const cancelP = new Promise<never>((_, rej) => {
+      rejectCancel = rej;
+    });
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "start_proxy") return startP;
+      if (cmd === "cancel_proxy") return cancelP;
+      return Promise.resolve();
+    });
+    const { initPowerButton, getConnectionState } = await import("./power-button");
+    const toast = await import("./toast");
+    initPowerButton();
+    const btn = document.getElementById("power-btn")!;
     btn.click();
     await Promise.resolve();
-    expect(getConnectionState()).toBe("connecting");
+    btn.click();
+    await Promise.resolve();
+    expect(getConnectionState()).toBe("cancelling");
+
+    rejectCancel("unreachable");
+    await cancelP.catch(() => {});
+    await flush();
+    expect(getConnectionState()).toBe("cancelling");
+    expect(toast.showToast).not.toHaveBeenCalled();
+
+    // The start then fails — the connect's own catch resolves it, one toast.
+    rejectStart("forwarder self-test failed");
+    await startP.catch(() => {});
+    await flush();
+    expect(getConnectionState()).toBe("connection-failed");
+    expect(toast.showToast).toHaveBeenCalledTimes(1);
+    expect(toast.showToast).toHaveBeenCalledWith("forwarder self-test failed", "error");
+  });
+
+  it("after a cancel rejection, cancelling stays click-escapable", async () => {
+    let rejectCancel!: (e: unknown) => void;
+    const cancelP = new Promise<never>((_, rej) => {
+      rejectCancel = rej;
+    });
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "start_proxy") return new Promise(() => {}); // hangs
+      if (cmd === "cancel_proxy") return cancelP;
+      return Promise.resolve();
+    });
+    const { initPowerButton, getConnectionState } = await import("./power-button");
+    const toast = await import("./toast");
+    initPowerButton();
+    const btn = document.getElementById("power-btn")!;
+    btn.click();
+    await Promise.resolve();
+    btn.click();
+    await Promise.resolve();
+    rejectCancel("unreachable");
+    await cancelP.catch(() => {});
+    await flush();
+    expect(getConnectionState()).toBe("cancelling");
+    expect(toast.showToast).not.toHaveBeenCalled();
+
+    // The start hangs; the user clicks to escape.
+    btn.click();
+    await Promise.resolve();
+    expect(getConnectionState()).toBe("connection-failed");
+    expect(toast.showToast).toHaveBeenCalledWith(
+      "Cancelling is taking too long. The connection may still come up — try again.",
+      "error",
+    );
   });
 
   it("a click escapes a wedged cancelling; the late start is fenced, then the gate reconciles", async () => {
