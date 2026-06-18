@@ -111,6 +111,12 @@ pub trait SwapOps {
 /// staging. Deferring the delete is what makes the rollback possible — a swapped-
 /// out `.app` is unrecoverable once its staging is removed.
 ///
+/// This is the macOS sibling of Windows `cutover::os::windows::execute_image_swaps`:
+/// both keep the swap all-or-nothing by deferring the destructive delete until the
+/// whole set commits, so any failure rolls back to the prior consistent set. The
+/// drivers differ in primitive (`renamex_np` exchange here vs rename-away/move-in
+/// retaining `.old-<ver>` there) and so are not yet unified.
+///
 /// ROLLBACK PRECONDITION: a `PlainRename` image has no recoverable inverse (its
 /// pre-swap dest was overwritten by the new bytes), so `reswap` is a no-op for
 /// it. Rollback is therefore correct only if no `PlainRename` image is ever in
