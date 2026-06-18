@@ -226,11 +226,17 @@ impl BridgeClient {
                 payload_path,
                 target_version,
                 consent,
+                sha256sums,
+                sha256sums_minisig,
+                asset_name,
             } => {
                 let body = serde_json::to_vec(&UpdateApplyRequest {
                     payload_path: payload_path.to_string_lossy().into_owned(),
                     target_version,
                     consent,
+                    sha256sums,
+                    sha256sums_minisig,
+                    asset_name,
                 })
                 .map_err(|e| ClientError::Protocol(e.to_string()))?;
                 let resp = self.http_post(ROUTE_UPDATE_APPLY, body).await?;

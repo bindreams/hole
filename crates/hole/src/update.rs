@@ -12,7 +12,7 @@ pub use check::{check_for_update, UpdateInfo};
 pub use download::download_asset;
 pub use error::UpdateError;
 pub use periodic::start_update_checker;
-pub use verify::verify_asset;
+pub use verify::{fetch_manifest, verify_asset};
 
 /// Tauri-managed state for update availability.
 pub struct UpdateState {

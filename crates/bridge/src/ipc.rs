@@ -397,20 +397,27 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // Consent seam: a lockdown-off update without explicit consent is refused
     // with 403 — a client precondition failure (the caller must supply consent),
     // not a server fault.
-    if crate::cutover::apply::consent_gate(lockdown_on, req.consent).is_err() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                message: "a lockdown-off update requires explicit consent".into(),
-            }),
-        ));
+    match crate::cutover::apply::consent_gate(lockdown_on, req.consent) {
+        Ok(()) => {}
+        Err(crate::cutover::apply::ConsentError::Required) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    message: "a lockdown-off update requires explicit consent".into(),
+                }),
+            ));
+        }
     }
 
     let payload = std::path::PathBuf::from(&req.payload_path);
-    // Re-verify before anything irreversible (defense-in-depth; fail-closed).
-    if let Err(e) = crate::cutover::extract::reverify(&payload) {
+    // Re-verify offline before anything irreversible. The GUI is untrusted in the
+    // bridge's model, so a re-verify failure is a corruption/tamper event the
+    // user must see distinctly — 422, NOT a 5xx server fault. Before the marker.
+    if let Err(e) =
+        crate::cutover::extract::reverify(&payload, &req.asset_name, &req.sha256sums, &req.sha256sums_minisig)
+    {
         return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
                 message: format!("payload verification failed: {e}"),
             }),

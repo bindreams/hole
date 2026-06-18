@@ -153,8 +153,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            Payload re-verification failed (signature/hash mismatch or asset not
+            in the manifest) — a corruption/tamper event, refused before the
+            marker write
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
-          description: Cutover failed (verify failed, marker-write failed, extract failed)
+          description: Cutover failed (marker-write failed or extract failed)
           content:
             application/json:
               schema:
@@ -605,6 +614,9 @@ components:
         - payload_path
         - target_version
         - consent
+        - sha256sums
+        - sha256sums_minisig
+        - asset_name
       properties:
         payload_path:
           type: string
@@ -617,3 +629,14 @@ components:
             Informed consent that the tunnel may briefly leak during the
             restart. REQUIRED true for a lockdown-off update; ignored under
             lockdown-on (the standing cover holds the gap).
+        sha256sums:
+          type: string
+          description: >-
+            The release SHA256SUMS manifest text, so the privileged bridge can
+            re-verify the payload offline before extracting (no network).
+        sha256sums_minisig:
+          type: string
+          description: The minisign signature over sha256sums.
+        asset_name:
+          type: string
+          description: The payload's filename, used to find its hash in sha256sums.

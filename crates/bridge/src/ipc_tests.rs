@@ -428,10 +428,27 @@ async fn post_update_apply(
     payload_path: &str,
     consent: bool,
 ) -> http::Response<hyper::body::Incoming> {
+    // Manifest/sig/asset_name are placeholders: the consent (403) and
+    // single-occupancy (409) gates fire BEFORE re-verification, so these tests
+    // never reach the verify step. The 422 path has its own dedicated test.
+    post_update_apply_full(client, payload_path, consent, "x  hole.msi\n", "sig", "hole.msi").await
+}
+
+async fn post_update_apply_full(
+    client: &mut TestClient,
+    payload_path: &str,
+    consent: bool,
+    sha256sums: &str,
+    sha256sums_minisig: &str,
+    asset_name: &str,
+) -> http::Response<hyper::body::Incoming> {
     let body = serde_json::to_vec(&hole_common::protocol::UpdateApplyRequest {
         payload_path: payload_path.into(),
         target_version: "0.3.0".into(),
         consent,
+        sha256sums: sha256sums.into(),
+        sha256sums_minisig: sha256sums_minisig.into(),
+        asset_name: asset_name.into(),
     })
     .unwrap();
     let req = http::Request::builder()
@@ -699,6 +716,50 @@ fn update_apply_with_existing_marker_is_409() {
         let resp = post_update_apply(&mut client, "/tmp/x.msi", true).await;
         assert_eq!(resp.status(), 409, "a second cutover must be rejected");
         let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn update_apply_unverifiable_payload_is_422_no_marker() {
+    // The bridge re-verifies the payload offline before anything irreversible.
+    // A present payload whose manifest is not signed by the production key (the
+    // GUI is untrusted) must be refused with 422 BEFORE the marker is written —
+    // no marker, no actor spawned.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-422");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let payload = payload_dir.path().join("hole.msi");
+        std::fs::write(&payload, b"hello world").unwrap();
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the 403/409 gates pass and re-verification is reached;
+        // the manifest is well-formed but not production-signed.
+        let resp = post_update_apply_full(
+            &mut client,
+            &payload.to_string_lossy(),
+            true,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  hole.msi\n",
+            "untrusted comment: forged\nnot-a-real-signature\n",
+            "hole.msi",
+        )
+        .await;
+        assert_eq!(resp.status(), 422, "an unverifiable payload must be refused with 422");
+        let _ = resp.into_body().collect().await;
+        // The refusal preceded the marker write — no cutover was claimed.
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a verify failure must not write a marker"
+        );
 
         drop(client);
         handle.abort();

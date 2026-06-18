@@ -266,6 +266,9 @@ fn update_apply_request_json_roundtrip() {
         payload_path: "/tmp/x.msi".into(),
         target_version: "0.3.0".into(),
         consent: true,
+        sha256sums: "deadbeef  hole.msi\n".into(),
+        sha256sums_minisig: "untrusted comment: x\nsig\n".into(),
+        asset_name: "hole.msi".into(),
     };
     let json = serde_json::to_string(&req).unwrap();
     let decoded: UpdateApplyRequest = serde_json::from_str(&json).unwrap();

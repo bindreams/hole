@@ -40,7 +40,20 @@ pub fn verify_payload_offline(
     sha256sums: &str,
     sha256sums_minisig: &str,
 ) -> Result<(), VerifyError> {
-    verify_minisig_data(sha256sums.as_bytes(), sha256sums_minisig, MINISIGN_PUBLIC_KEY)?;
+    verify_payload_offline_with_key(payload, asset_name, sha256sums, sha256sums_minisig, MINISIGN_PUBLIC_KEY)
+}
+
+/// [`verify_payload_offline`] with the trust anchor injectable — production
+/// callers use the wrapper (locked to `MINISIGN_PUBLIC_KEY`); tests pass a test
+/// keypair so the accept-on-valid path is provable without the release secret.
+pub fn verify_payload_offline_with_key(
+    payload: &Path,
+    asset_name: &str,
+    sha256sums: &str,
+    sha256sums_minisig: &str,
+    public_key: &str,
+) -> Result<(), VerifyError> {
+    verify_minisig_data(sha256sums.as_bytes(), sha256sums_minisig, public_key)?;
     let expected = find_hash_in_sha256sums(sha256sums, asset_name)?;
     verify_sha256_hash(payload, expected)
 }

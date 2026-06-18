@@ -29,10 +29,18 @@ pub fn verify_asset(
     sha256sums_url: &str,
     sha256sums_minisig_url: &str,
 ) -> Result<(), UpdateError> {
-    let sha256sums = download_text(sha256sums_url)?;
-    let minisig = download_text(sha256sums_minisig_url)?;
+    let (sha256sums, minisig) = fetch_manifest(sha256sums_url, sha256sums_minisig_url)?;
     verify_payload_offline(asset_path, asset_name, &sha256sums, &minisig)?;
     Ok(())
+}
+
+/// Download the `SHA256SUMS` manifest and its minisign signature, returning their
+/// texts. The caller passes them to BOTH the local verify and the bridge's
+/// `ApplyUpdate` request, so the bridge can re-verify the same payload offline.
+pub fn fetch_manifest(sha256sums_url: &str, sha256sums_minisig_url: &str) -> Result<(String, String), UpdateError> {
+    let sha256sums = download_text(sha256sums_url)?;
+    let minisig = download_text(sha256sums_minisig_url)?;
+    Ok((sha256sums, minisig))
 }
 
 // Helpers =============================================================================================================

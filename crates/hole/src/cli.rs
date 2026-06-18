@@ -324,24 +324,35 @@ fn handle_upgrade() -> i32 {
             }
 
             cli_log!(info, "verifying...");
-            if let Err(e) = hole::update::verify_asset(
-                &dest,
-                &info.asset_name,
-                &info.sha256sums_url,
-                &info.sha256sums_minisig_url,
-            ) {
+            // Fetch the manifest + signature once; they feed BOTH the local
+            // verify and the bridge's offline re-verify (the bridge must not
+            // re-fetch).
+            let (sha256sums, sha256sums_minisig) =
+                match hole::update::fetch_manifest(&info.sha256sums_url, &info.sha256sums_minisig_url) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        cli_log!(error, "manifest fetch failed: {e}");
+                        return 1;
+                    }
+                };
+            if let Err(e) =
+                hole_common::verify::verify_payload_offline(&dest, &info.asset_name, &sha256sums, &sha256sums_minisig)
+            {
                 cli_log!(error, "verification failed: {e}");
                 return 1;
             }
 
             cli_log!(info, "installing...");
             // The privileged bridge owns the cutover (swap + service restart);
-            // the GUI only hands it the verified payload. `hole upgrade` is an
-            // explicit user action, so consent is implied.
+            // the GUI only hands it the verified payload + manifest. `hole
+            // upgrade` is an explicit user action, so consent is implied.
             let apply = hole_common::protocol::BridgeRequest::ApplyUpdate {
                 payload_path: dest.clone(),
                 target_version: info.version.to_string(),
                 consent: true,
+                sha256sums,
+                sha256sums_minisig,
+                asset_name: info.asset_name.clone(),
             };
             match send_bridge_request_inner(apply) {
                 Ok(hole_common::protocol::BridgeResponse::Ack) => {}

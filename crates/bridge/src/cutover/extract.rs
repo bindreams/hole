@@ -1,28 +1,28 @@
 //! Extract the bare binaries from the verified MSI/DMG onto the destination
-//! volume. The bundle was minisign-verified on download (the GUI's `cli.rs`
-//! path), so the extracted bytes are trusted; the bridge confirms the payload is
-//! present + readable before doing anything irreversible (fail-closed). A deeper
-//! Authenticode/codesign observation belongs here as log-only defense-in-depth
-//! (NOT a gate — gating risks a self-inflicted brick on signing-cert rotation);
-//! the trust root is the on-download minisign check.
+//! volume. The privileged bridge (SYSTEM/root) cannot trust the non-admin GUI
+//! that hands it the payload over the IPC socket: it re-verifies the payload
+//! offline against the embedded minisign key before any irreversible step
+//! (fail-closed). A deeper Authenticode/codesign observation belongs here as
+//! log-only defense-in-depth (NOT a gate — gating risks a self-inflicted brick
+//! on signing-cert rotation).
 //!
 //! Same-volume staging is required so the subsequent rename is a directory-entry
 //! flip, not a cross-volume copy (Windows) / `EXDEV` (macOS).
 
 use std::path::{Path, PathBuf};
 
-/// Confirm the payload is present and readable before the irreversible steps.
-/// Full minisign/SHA verification happened on download (the single verifier in
-/// the GUI); re-running it here would require network access mid-cutover. A
-/// missing or unreadable payload is rejected fail-closed.
-pub fn reverify(payload_path: &Path) -> std::io::Result<()> {
-    let meta = std::fs::metadata(payload_path)?;
-    if !meta.is_file() {
-        return Err(std::io::Error::other(format!(
-            "update payload is not a regular file: {payload_path:?}"
-        )));
-    }
-    Ok(())
+/// Re-verify the payload offline before the irreversible steps: minisign over
+/// the caller-supplied `SHA256SUMS` manifest, then the payload's SHA-256 against
+/// its manifest entry. The GUI already verified on download, but it is the
+/// attacker in the bridge's trust model — re-verification here is mandatory and
+/// fully offline (the manifest + signature are passed in, no network).
+pub fn reverify(
+    payload_path: &Path,
+    asset_name: &str,
+    sha256sums: &str,
+    sha256sums_minisig: &str,
+) -> Result<(), hole_common::verify::VerifyError> {
+    hole_common::verify::verify_payload_offline(payload_path, asset_name, sha256sums, sha256sums_minisig)
 }
 
 /// Staged binaries extracted onto the destination volume, ready to rename-swap.

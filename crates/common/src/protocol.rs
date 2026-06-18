@@ -63,6 +63,13 @@ pub enum BridgeRequest {
         payload_path: PathBuf,
         target_version: String,
         consent: bool,
+        /// The release `SHA256SUMS` manifest text the GUI already fetched, so the
+        /// privileged bridge can re-verify the payload offline (no network).
+        sha256sums: String,
+        /// The minisign signature over `sha256sums`.
+        sha256sums_minisig: String,
+        /// The payload's filename, used to find its hash in `sha256sums`.
+        asset_name: String,
     },
 }
 
@@ -295,12 +302,19 @@ pub struct LockdownRequest {
 }
 
 /// Wire body for `POST /v1/update-apply`. Hand-written (the openapi schema is
-/// doc-only). `payload_path` is the GUI's already-downloaded+verified MSI/DMG.
+/// doc-only). `payload_path` is the GUI's already-downloaded+verified MSI/DMG;
+/// the bridge re-verifies it offline against the supplied manifest + signature.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateApplyRequest {
     pub payload_path: String,
     pub target_version: String,
     pub consent: bool,
+    /// The release `SHA256SUMS` manifest text (for offline re-verification).
+    pub sha256sums: String,
+    /// The minisign signature over `sha256sums`.
+    pub sha256sums_minisig: String,
+    /// The payload's filename, used to find its hash in `sha256sums`.
+    pub asset_name: String,
 }
 
 // Constants ===========================================================================================================

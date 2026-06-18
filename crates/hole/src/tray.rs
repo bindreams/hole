@@ -766,13 +766,41 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Verify integrity and authenticity.
-    let dest_for_verify = dest.clone();
-    let asset_name = info.asset_name.clone();
+    // Fetch the manifest + signature once; they feed BOTH the local verify and
+    // the bridge's offline re-verify (the bridge must not re-fetch).
     let sha256sums_url = info.sha256sums_url.clone();
     let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
+    let manifest_result =
+        tokio::task::spawn_blocking(move || hole::update::fetch_manifest(&sha256sums_url, &sha256sums_minisig_url))
+            .await;
+    let (sha256sums, sha256sums_minisig) = match manifest_result {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            error!("manifest fetch failed: {e}");
+            app.dialog()
+                .message(format!("Update verification failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("manifest fetch task panicked: {e}");
+            return;
+        }
+    };
+
+    // Verify integrity and authenticity locally before handing it to the bridge.
+    let dest_for_verify = dest.clone();
+    let asset_name = info.asset_name.clone();
+    let sums_for_verify = sha256sums.clone();
+    let minisig_for_verify = sha256sums_minisig.clone();
     let verify_result = tokio::task::spawn_blocking(move || {
-        hole::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
+        hole_common::verify::verify_payload_offline(
+            &dest_for_verify,
+            &asset_name,
+            &sums_for_verify,
+            &minisig_for_verify,
+        )
     })
     .await;
 
@@ -801,6 +829,9 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         payload_path: dest.clone(),
         target_version: info.version.to_string(),
         consent: true,
+        sha256sums,
+        sha256sums_minisig,
+        asset_name: info.asset_name.clone(),
     };
     let result = app.state::<AppState>().bridge_send(apply).await;
     drop(download_dir);
