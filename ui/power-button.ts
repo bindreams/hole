@@ -42,20 +42,33 @@ function updateConnectionUI(): void {
 }
 
 async function handlePowerClick(): Promise<void> {
-  // Non-interactive transition states — click is ignored.
-  if (currentState === "cancelling" || currentState === "disconnecting") {
+  // Click during connecting → fire cancel. Stays under the in-flight connect
+  // operation (no new op) so toggle-flow's cancel-race arm still owns it; the
+  // pending start_proxy lives in toggleFromIdle() and `cancel_proxy` races it
+  // on a fresh bridge connection.
+  if (currentState === "connecting") {
+    setState("cancelling");
+    fireCancel();
     return;
   }
 
-  // Click during connecting → fire cancel. The original start_proxy
-  // promise is still pending in toggleFromIdle(); `cancel_proxy`
-  // races it on a fresh bridge connection so it does not block behind
-  // the in-flight start.
-  if (currentState === "connecting") {
-    setState("cancelling");
-    invoke("cancel_proxy").catch((err) => {
-      console.error("cancel_proxy failed:", err);
-    });
+  // Click in a wedged transition → escape. cancel_proxy/stop_proxy may never
+  // settle (a start hung in an uninterruptible phase, or a stop wedged in the
+  // ordered teardown), so the transition needs an explicit user-driven exit.
+  // Mint a fresh op to fence the wedged continuation, land in the
+  // leak-conservative idle failed-state, and let the observation gate reconcile
+  // the truth: cancelling → connection-failed (never claims the tunnel is up),
+  // disconnecting → disconnection-failed (never claims it is down).
+  if (currentState === "cancelling") {
+    operations.begin();
+    setState("connection-failed");
+    showToast("Cancelling is taking too long. The connection may still come up — try again.", "error");
+    return;
+  }
+  if (currentState === "disconnecting") {
+    operations.begin();
+    setState("disconnection-failed");
+    showToast("Disconnecting is taking too long. The proxy may still be active — try again.", "error");
     return;
   }
 
@@ -72,6 +85,21 @@ async function handlePowerClick(): Promise<void> {
     getConfig: () => config,
     loadConfig,
     beginOp: () => operations.begin(),
+  });
+}
+
+/// Fire `cancel_proxy` for an in-flight start. On rejection (the bridge is
+/// unreachable on the fresh cancel connection) the transition would otherwise
+/// wedge in `cancelling` forever, so escape to `connection-failed`. Guarded by
+/// the current state: a rejection that lands after the cancel-race arm or a user
+/// escape already moved past `cancelling` is ignored.
+function fireCancel(): void {
+  invoke("cancel_proxy").catch((err) => {
+    console.error("cancel_proxy failed:", err);
+    if (currentState !== "cancelling") return;
+    operations.begin();
+    setState("connection-failed");
+    showToast("Couldn't reach the bridge to cancel. The connection may still come up — try again.", "error");
   });
 }
 
