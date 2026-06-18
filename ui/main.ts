@@ -265,12 +265,18 @@ function setupEventListeners(): Promise<unknown> {
   // Tray- or backend-initiated proxy state changes reach the power
   // button immediately instead of waiting for the 5s poll (#462). Routed
   // through the same seq-monotone, IDLE-guarded application as the poll.
-  const proxyStateReady = listen<{ seq: number; running: boolean }>("proxy-state-changed", (event) => {
-    const result = applyProxyStateObservation(event.payload.seq, event.payload.running);
-    if (result.changed) {
-      updatePublicIp();
-    }
-  });
+  const proxyStateReady = listen<{ seq: number; running: boolean; error: string | null }>(
+    "proxy-state-changed",
+    (event) => {
+      // Pass `error` so a death observed first (or only) via the event still
+      // surfaces the exactly-once toast — the tray reconciler can be the poller
+      // that commits the death (#470).
+      const result = applyProxyStateObservation(event.payload.seq, event.payload.running, event.payload.error);
+      if (result.changed) {
+        updatePublicIp();
+      }
+    },
+  );
 
   // Joined so init() can await registration before the UI becomes
   // interactive — an emit landing before listen() resolves is silently
