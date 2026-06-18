@@ -18,7 +18,7 @@ fn find_hash_in_sha256sums_found() {
 #[skuld::test]
 fn find_hash_in_sha256sums_not_found() {
     let result = find_hash_in_sha256sums(SAMPLE_MANIFEST, "hole-1.0.0-linux-amd64.tar.gz");
-    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
+    assert!(matches!(result, Err(VerifyError::AssetNotInManifest(_))));
 }
 
 #[skuld::test]
@@ -32,7 +32,7 @@ fn find_hash_in_sha256sums_crlf() {
 fn find_hash_in_sha256sums_invalid_hash_length() {
     let manifest = "shorthash  file.msi\n";
     let result = find_hash_in_sha256sums(manifest, "file.msi");
-    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
+    assert!(matches!(result, Err(VerifyError::AssetNotInManifest(_))));
 }
 
 #[skuld::test]
@@ -40,7 +40,7 @@ fn find_hash_in_sha256sums_non_hex_chars() {
     // 64 characters but contains non-hex 'g'
     let manifest = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg  file.msi\n";
     let result = find_hash_in_sha256sums(manifest, "file.msi");
-    assert!(matches!(result, Err(UpdateError::AssetNotInManifest(_))));
+    assert!(matches!(result, Err(VerifyError::AssetNotInManifest(_))));
 }
 
 // hex_encode ==========================================================================================================
@@ -116,7 +116,7 @@ fn verify_sha256_hash_mismatch() {
         &path,
         "0000000000000000000000000000000000000000000000000000000000000000",
     );
-    assert!(matches!(result, Err(UpdateError::HashMismatch { .. })));
+    assert!(matches!(result, Err(VerifyError::HashMismatch { .. })));
 }
 
 // verify_minisig_data =================================================================================================
@@ -140,24 +140,24 @@ fn verify_minisig_data_valid() {
 #[skuld::test]
 fn verify_minisig_data_wrong_data() {
     let result = verify_minisig_data(b"wrong data", TEST_SIGNATURE, TEST_PUBLIC_KEY);
-    assert!(matches!(result, Err(UpdateError::SignatureInvalid(_))));
+    assert!(matches!(result, Err(VerifyError::SignatureInvalid(_))));
 }
 
 #[skuld::test]
 fn verify_minisig_data_wrong_key() {
     // Use the production public key — it didn't sign this data.
     let result = verify_minisig_data(b"hello world", TEST_SIGNATURE, MINISIGN_PUBLIC_KEY);
-    assert!(matches!(result, Err(UpdateError::SignatureInvalid(_))));
+    assert!(matches!(result, Err(VerifyError::SignatureInvalid(_))));
 }
 
 #[skuld::test]
 fn verify_minisig_data_malformed_key() {
     let result = verify_minisig_data(b"hello world", TEST_SIGNATURE, "not-valid-base64!");
-    assert!(matches!(result, Err(UpdateError::SignatureInvalid(_))));
+    assert!(matches!(result, Err(VerifyError::SignatureInvalid(_))));
 }
 
 #[skuld::test]
 fn verify_minisig_data_malformed_signature() {
     let result = verify_minisig_data(b"hello world", "garbage signature text", TEST_PUBLIC_KEY);
-    assert!(matches!(result, Err(UpdateError::SignatureInvalid(_))));
+    assert!(matches!(result, Err(VerifyError::SignatureInvalid(_))));
 }
