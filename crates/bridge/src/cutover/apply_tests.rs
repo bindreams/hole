@@ -59,6 +59,23 @@ fn preflight_app_dest_anchors_to_the_hole_identity() {
     preflight_app_dest(Some(&genuine)).expect("a genuine com.hole.app bundle must pass");
 }
 
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_actor_failure_clears_the_injected_log_dir() {
+    // The macOS inline actor SIGTERMs its own process on success, so the only
+    // way past `run_cutover` is a swap failure before the SIGTERM. That failure
+    // path must clear the marker in the handler-supplied `log_dir` (next to
+    // bridge.log), NOT re-resolve `service_log_dir()` — a marker stranded in the
+    // wrong dir would make the GUI mask Disconnected forever.
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker()).unwrap();
+    macos::clear_marker_on_actor_failure(Err(std::io::Error::other("swap failed")), dir.path());
+    assert!(
+        hole_common::update_marker::read(dir.path()).is_none(),
+        "the injected log_dir's marker must be cleared on actor failure"
+    );
+}
+
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn breakaway_only_when_in_job_and_job_permits() {

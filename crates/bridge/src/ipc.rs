@@ -489,7 +489,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
     // a detached child (returns naturally); macOS runs the actor on a detached
     // task that SIGTERMs THIS process only after this 200 is on the wire.
-    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref()) {
+    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
         let _ = hole_common::update_marker::clear(log_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

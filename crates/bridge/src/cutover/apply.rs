@@ -64,16 +64,23 @@ pub fn preflight_app_dest(app_dest: Option<&Path>) -> std::io::Result<std::path:
 ///
 /// - Windows: spawn the DETACHED LocalSystem `hole bridge cutover` child (a
 ///   service cannot SCM-restart itself); it outlives this process and drives
-///   stop → swap → start. Returns once the child is spawned. `app_dest` is unused
-///   (the SCM install dir is canonical).
+///   stop → swap → start. Returns once the child is spawned. `app_dest`/`log_dir`
+///   are unused (the SCM install dir is canonical; the detached child leaves the
+///   marker for the next bridge's post-bind sweep).
 /// - macOS: build the inline actor and run it on a DETACHED tokio task so the
 ///   200 flushes before the actor SIGTERMs this very process. The task is never
 ///   joined — the process is about to be killed and the new bridge takes over.
-///   `app_dest` is the bundle path already validated by `preflight_app_dest`.
-pub fn spawn_actor(staged: ExtractedImages, target_version: &str, app_dest: Option<&Path>) -> std::io::Result<()> {
+///   `app_dest` is the bundle path already validated by `preflight_app_dest`;
+///   `log_dir` is where the actor clears the marker on a pre-SIGTERM failure.
+pub fn spawn_actor(
+    staged: ExtractedImages,
+    target_version: &str,
+    app_dest: Option<&Path>,
+    log_dir: &Path,
+) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let _ = app_dest;
+        let _ = (app_dest, log_dir);
         windows::spawn_detached_child(&staged, target_version)
     }
     #[cfg(target_os = "macos")]
@@ -84,11 +91,11 @@ pub fn spawn_actor(staged: ExtractedImages, target_version: &str, app_dest: Opti
                 "macOS cutover requires a validated app_dest",
             )
         })?;
-        macos::spawn_inline_task(staged, target_version, dest)
+        macos::spawn_inline_task(staged, target_version, dest, log_dir.to_path_buf())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = (staged, target_version, app_dest);
+        let _ = (staged, target_version, app_dest, log_dir);
         Err(std::io::Error::other("cutover unsupported on this platform"))
     }
 }
@@ -182,7 +189,7 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crate::cutover::extract::ExtractedImages;
     use crate::cutover::os::macos::MacosCutoverOs;
@@ -191,8 +198,15 @@ mod macos {
     use crate::platform::swap::plan_swap;
 
     /// `app_dest` is the bundle the handler already validated as a genuine
-    /// `com.hole.app` (`preflight_app_dest`) — never trusted raw here.
-    pub fn spawn_inline_task(staged: ExtractedImages, _target_version: &str, app_dest: &Path) -> std::io::Result<()> {
+    /// `com.hole.app` (`preflight_app_dest`) — never trusted raw here. `log_dir`
+    /// is the handler's marker dir, threaded in so the failure path clears the
+    /// marker the handler wrote rather than re-resolving `service_log_dir()`.
+    pub fn spawn_inline_task(
+        staged: ExtractedImages,
+        _target_version: &str,
+        app_dest: &Path,
+        log_dir: PathBuf,
+    ) -> std::io::Result<()> {
         let plan = plan_swap(&staged.app, app_dest, &staged.helper, std::path::Path::new(HELPER_PATH));
         let mut os = MacosCutoverOs { plan };
         // Detached: the 200 must flush before the actor SIGTERMs this process.
@@ -202,15 +216,26 @@ mod macos {
         // Disconnected (no new bridge will start to clear it).
         tokio::spawn(async move {
             let outcome = tokio::task::spawn_blocking(move || run_cutover(&mut os)).await;
-            let failed = match outcome {
-                Ok(Ok(())) => return, // unreachable in practice (SIGTERM'd above)
-                Ok(Err(e)) => format!("{e}"),
-                Err(e) => format!("cutover actor panicked: {e}"),
+            let result = match outcome {
+                Ok(r) => r,
+                Err(e) => Err(std::io::Error::other(format!("cutover actor panicked: {e}"))),
             };
-            tracing::error!(error = %failed, "macOS cutover failed before restart; clearing marker");
-            let _ = hole_common::update_marker::clear(&hole_common::update_marker::service_log_dir());
+            clear_marker_on_actor_failure(result, &log_dir);
         });
         Ok(())
+    }
+
+    /// On a pre-SIGTERM cutover failure, clear the marker the handler wrote into
+    /// `log_dir` so the GUI stops masking Disconnected (no new bridge will start
+    /// to clear it). On success this is unreachable in practice (the actor
+    /// SIGTERMs this process), so it is a no-op. Extracted so the failure path is
+    /// table-testable without driving the real swap/launchctl.
+    pub(super) fn clear_marker_on_actor_failure(result: std::io::Result<()>, log_dir: &Path) {
+        let Err(e) = result else {
+            return;
+        };
+        tracing::error!(error = %e, "macOS cutover failed before restart; clearing marker");
+        let _ = hole_common::update_marker::clear(log_dir);
     }
 }
 

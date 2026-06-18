@@ -51,6 +51,26 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     assert!(!marker.exists(), "marker deleted");
 }
 
+#[skuld::test]
+fn post_bind_sweep_clears_marker() {
+    // Marker parity with the macOS/Windows service paths: once a foreground
+    // bridge binds the IPC socket it is authoritative, so any update-in-progress
+    // marker is a completed cutover and is cleared unconditionally. Mirrors the
+    // service-path `platform::{macos,windows}::sweep_marker` post-bind clear.
+    let marker = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &marker).unwrap();
+    super::sweep_marker(dir.path());
+    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    super::sweep_marker(dir.path()); // idempotent: absent marker is a no-op
+}
+
 // Minimal stub types used only for the foreground-run IPC smoke test.
 // None of their methods are exercised by this test — we only construct
 // the ProxyManager so `IpcServer::bind` can be bound and the status
