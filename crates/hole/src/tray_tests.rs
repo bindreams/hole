@@ -143,3 +143,41 @@ fn startup_should_connect_truth_table() {
     assert!(startup_should_connect(AlwaysConnect, false));
     assert!(startup_should_connect(AlwaysConnect, true));
 }
+
+// should_apply_pending ================================================================================================
+
+fn status_resp(running: bool) -> BridgeResponse {
+    BridgeResponse::Status {
+        running,
+        uptime_secs: 0,
+        error: None,
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    }
+}
+
+#[skuld::test]
+fn should_apply_pending_rules() {
+    use PendingAction::*;
+    // Owned Results, only borrowed (BridgeResponse/ClientError are not Clone).
+    let table: Vec<(Result<BridgeResponse, ClientError>, PendingAction)> = vec![
+        // Bridge reachable and idle -> apply the boot-connect intent now.
+        (Ok(status_resp(false)), Apply),
+        // Bridge reachable and already running -> intent satisfied, drop it.
+        (Ok(status_resp(true)), Drop),
+        // Bridge not reachable yet (still booting) -> keep the intent for a later tick.
+        (Err(transport_err()), Retain),
+        // A DACL/version hiccup proves nothing about readiness -> keep the intent.
+        (Err(ClientError::PermissionDenied), Retain),
+        (Err(ClientError::VersionMismatch { bridge: None }), Retain),
+        // Reachable but the bridge errored on Status -> keep the intent.
+        (Ok(err_resp("busy")), Retain),
+        (Ok(BridgeResponse::Ack), Retain),
+    ];
+    for (result, expected) in &table {
+        assert_eq!(should_apply_pending(result), *expected, "{result:?}");
+    }
+}

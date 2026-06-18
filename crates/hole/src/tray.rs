@@ -436,7 +436,11 @@ pub(crate) enum Prompts {
 
 /// Interactive connect/disconnect entry — the tray menu items and the
 /// `start_proxy`/`stop_proxy` commands. Delegates with prompts allowed.
+///
+/// A manual action supersedes the boot-connect intent (#458): consume the latch
+/// so a later reconciler tick can't override the user's explicit choice.
 pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
+    app.state::<AppState>().take_pending_startup_connect();
     set_proxy_enabled_inner(app, enable, Prompts::Allowed).await
 }
 
@@ -1139,6 +1143,10 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// the webview's 5s status poll — and synchronizes nothing in-process
 /// (`BridgeLink::send` commits synchronously; no code waits on this
 /// loop). The immediate first tick doubles as the startup reconcile.
+///
+/// Beyond presentation, each tick's Status result drives the one-shot
+/// startup-connect intent (#458): the first time the bridge proves reachable
+/// the recorded intent is applied exactly once, then the loop is read-only.
 pub fn spawn_status_reconciler(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1146,35 +1154,89 @@ pub fn spawn_status_reconciler(app: &AppHandle) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            // Result irrelevant: the commit happens inside send.
-            let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+            // The commit happens inside send; the result also drives the
+            // one-shot startup-connect intent (#458).
+            let result = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+            apply_pending_startup_connect(&app, &result);
         }
     });
 }
 
-/// Evaluate the persisted on-startup policy and, if it calls for connecting,
-/// spawn one silent (non-interactive) auto-connect (#458). Runs once per live
-/// GUI instance (single-instance makes a second launch a no-op before
-/// `setup()` runs). Snapshots the two Copy fields under the config lock and
-/// drops the guard before the spawn — never holds the std Mutex across `.await`.
-pub fn spawn_startup_auto_connect(app: &AppHandle) {
+/// Arm the one-shot startup-connect intent (#458) from the persisted
+/// `on_startup` policy. The status reconciler applies it the first time the
+/// bridge is reachable, so a cold-boot race — the bridge service and the GUI
+/// start as independent OS units with no ordering edge, and the GUI can reach
+/// here before the bridge has bound its socket — can't drop the connect. Runs
+/// once per live GUI instance. Snapshots the two Copy config fields under the
+/// lock and drops the guard.
+pub fn arm_startup_auto_connect(app: &AppHandle) {
+    let state = app.state::<AppState>();
     let (behavior, last_enabled) = {
-        let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         (cfg.on_startup, cfg.enabled)
     };
-    if !startup_should_connect(behavior, last_enabled) {
-        return;
+    if startup_should_connect(behavior, last_enabled) {
+        state.arm_pending_startup_connect();
     }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        // Both arms log at info: failing into the tray's Disconnected state is
-        // the contract, not an error.
-        match connect_silently(&app).await {
-            Ok(outcome) => info!(?outcome, "startup auto-connect settled"),
-            Err(e) => info!(reason = %e, "startup auto-connect did not connect"),
+}
+
+/// What the status reconciler should do with a pending startup-connect intent
+/// (#458), given a Status exchange result. The bridge service and the GUI start
+/// as independent OS units with no ordering edge, so the boot connect can race
+/// the bridge's socket bind; this lets the reconciler apply the recorded intent
+/// the first time the bridge proves reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingAction {
+    /// Bridge reachable and idle — connect now and consume the intent.
+    Apply,
+    /// Bridge reachable and already running — intent satisfied; consume it.
+    Drop,
+    /// Readiness unproven (still booting, or a hiccup that says nothing about
+    /// reachability) — keep the intent for a later tick.
+    Retain,
+}
+
+/// Decide the pending startup-connect action from a reconciler `Status` result.
+/// Only a reachable bridge reporting its run state is conclusive; a transport
+/// failure means "not bound yet", and a DACL/version hiccup says nothing about
+/// readiness — both retain so a later tick can apply the intent.
+pub(crate) fn should_apply_pending(
+    result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
+) -> PendingAction {
+    match result {
+        Ok(BridgeResponse::Status { running: false, .. }) => PendingAction::Apply,
+        Ok(BridgeResponse::Status { running: true, .. }) => PendingAction::Drop,
+        _ => PendingAction::Retain,
+    }
+}
+
+/// Apply the one-shot startup-connect intent (#458) against a reconciler Status
+/// result: connect once the bridge is first reachable, drop the intent if it is
+/// already running, retain it while the bridge is still booting. Spawns the
+/// silent connect (the latch is consumed first, so it fires at most once).
+fn apply_pending_startup_connect(app: &AppHandle, status: &Result<BridgeResponse, crate::bridge_client::ClientError>) {
+    let state = app.state::<AppState>();
+    match should_apply_pending(status) {
+        PendingAction::Apply => {
+            if state.take_pending_startup_connect() {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Both arms log at info: failing into the tray's Disconnected
+                    // state is the contract, not an error.
+                    match connect_silently(&app).await {
+                        Ok(outcome) => info!(?outcome, "startup auto-connect settled"),
+                        Err(e) => info!(reason = %e, "startup auto-connect did not connect"),
+                    }
+                });
+            }
         }
-    });
+        // Already running: consume the intent so a later user disconnect can't
+        // be undone by a stale latch.
+        PendingAction::Drop => {
+            state.take_pending_startup_connect();
+        }
+        PendingAction::Retain => {}
+    }
 }
 
 #[cfg(test)]
