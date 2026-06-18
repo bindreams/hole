@@ -1145,8 +1145,8 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// loop). The immediate first tick doubles as the startup reconcile.
 ///
 /// Beyond presentation, each tick's Status result drives the one-shot
-/// startup-connect intent (#458): the first time the bridge proves reachable
-/// the recorded intent is applied exactly once, then the loop is read-only.
+/// startup-connect intent (#458): the recorded intent is applied (connect) at
+/// most once — the first time the bridge proves reachable — and never again.
 pub fn spawn_status_reconciler(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {

@@ -170,9 +170,11 @@ fn should_apply_pending_rules() {
         (Ok(status_resp(true)), Drop),
         // Bridge not reachable yet (still booting) -> keep the intent for a later tick.
         (Err(transport_err()), Retain),
-        // A DACL/version hiccup proves nothing about readiness -> keep the intent.
+        // A DACL/version/transport hiccup proves nothing about readiness -> keep the intent.
         (Err(ClientError::PermissionDenied), Retain),
         (Err(ClientError::VersionMismatch { bridge: None }), Retain),
+        (Err(ClientError::Io(std::io::Error::other("io"))), Retain),
+        (Err(ClientError::Protocol("bad frame".into())), Retain),
         // Reachable but the bridge errored on Status -> keep the intent.
         (Ok(err_resp("busy")), Retain),
         (Ok(BridgeResponse::Ack), Retain),
