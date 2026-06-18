@@ -471,16 +471,29 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         return Err((code, Json(ErrorResponse { message })));
     }
 
-    // Extract the bare binaries onto the destination volume. A failure clears
-    // the marker so the GUI does not mask Disconnected forever.
-    let staged = match crate::cutover::extract::extract(&payload, &state.state_dir) {
-        Ok(s) => s,
-        Err(e) => {
+    // Extract the bare binaries onto the destination volume. The extract shells
+    // out to a blocking `msiexec`/`hdiutil`, so run it on a blocking thread to
+    // keep it off the async worker. A failure clears the marker so the GUI does
+    // not mask Disconnected forever.
+    let state_dir = state.state_dir.clone();
+    let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
+    let staged = match extracted {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             let _ = hole_common::update_marker::clear(log_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     message: format!("update extraction failed: {e}"),
+                }),
+            ));
+        }
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction task panicked: {e}"),
                 }),
             ));
         }
