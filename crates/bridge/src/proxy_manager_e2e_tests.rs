@@ -385,7 +385,7 @@ mod tun {
         let response = tokio::time::timeout(Duration::from_secs(120), direct_http_get(http.addr))
             .await
             .expect("[#541-diag] full-tunnel roundtrip timed out — response never arrived");
-        eprintln!("[#541-diag] roundtrip returned {} bytes", response.len());
+        eprintln!("[#541-diag] roundtrip returned {} bytes; sending Stop", response.len());
         let body = http_response_body(&response).expect("HTTP response has header terminator");
         assert_eq!(
             body,
@@ -393,7 +393,14 @@ mod tun {
             "expected sentinel body, got {response:?}"
         );
 
-        let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
+        // DIAGNOSTIC (#541): the roundtrip succeeding but the test hanging here
+        // for 19 min (with Start/roundtrip bounded) localized the wedge to Stop
+        // teardown. Bound it so the panic + bridge.log dump surface which
+        // teardown step wedges. Class-2 subprocess failure-bound.
+        let resp = tokio::time::timeout(Duration::from_secs(60), harness.send(BridgeRequest::Stop))
+            .await
+            .expect("[#541-diag] Stop did not return within 60s — teardown wedged")
+            .expect("send Stop");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
     }
 
