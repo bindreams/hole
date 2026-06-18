@@ -219,3 +219,32 @@ fn block_rule_overrides_locked_defaults() {
         FilterAction::Proxy
     );
 }
+
+// Original-index provenance ===========================================================================================
+
+#[skuld::test]
+fn decide_reports_original_index_when_earlier_rule_dropped() {
+    // Rule #1 is an invalid CIDR (dropped at compile time). The matching
+    // block rule is the user's #2; decide must report 2, not the compacted
+    // compiled position 1.
+    let rs = RuleSet::from_user_rules(&[
+        rule("*", MatchType::Wildcard, FilterAction::Proxy),
+        rule("not-a-cidr", MatchType::Subnet, FilterAction::Block),
+        rule("example.com", MatchType::Exactly, FilterAction::Block),
+    ]);
+    assert_eq!(rs.rules.len(), 2, "the invalid CIDR is dropped");
+    let d = decide(&rs, &conn("1.2.3.4", 443, Some("example.com")));
+    assert_eq!(d.action, FilterAction::Block);
+    assert_eq!(
+        d.rule_index,
+        Some(2),
+        "must be the user's original index, not the compiled one"
+    );
+}
+
+#[skuld::test]
+fn decide_reports_index_zero_for_first_rule() {
+    let rs = RuleSet::from_user_rules(&[rule("*", MatchType::Wildcard, FilterAction::Proxy)]);
+    let d = decide(&rs, &conn("1.2.3.4", 443, Some("anything.com")));
+    assert_eq!(d.rule_index, Some(0));
+}

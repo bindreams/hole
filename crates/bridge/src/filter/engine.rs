@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use hole_common::config::FilterAction;
 
-use super::rules::RuleSet;
+use super::rules::{CompiledRule, RuleSet};
 
 /// Layer-4 protocol of a connection. The dispatcher branches on this:
 /// TCP flows are peeked for a domain, UDP flows are matched on IP only.
@@ -44,14 +44,16 @@ pub struct Decision {
     pub rule_index: Option<usize>,
 }
 
-/// Run the filter engine for one connection. O(n) in the rule count;
-/// pure function.
-pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
-    for (i, rule) in rules.rules.iter().enumerate().rev() {
-        if rule.matcher.matches(conn) {
+/// Reverse-scan the ruleset and return the action of the first rule for which
+/// `pred` holds (gitignore last-match-wins), reporting that rule's *original*
+/// user index. The terminal fallback is `Proxy` with no index. Both `decide`
+/// and `decide_test` go through here so the two surfaces cannot drift.
+fn first_match(rules: &RuleSet, pred: impl Fn(&CompiledRule) -> bool) -> Decision {
+    for rule in rules.rules.iter().rev() {
+        if pred(rule) {
             return Decision {
                 action: rule.action,
-                rule_index: Some(i),
+                rule_index: Some(rule.original_index),
             };
         }
     }
@@ -61,6 +63,12 @@ pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
         action: FilterAction::Proxy,
         rule_index: None,
     }
+}
+
+/// Run the filter engine for one connection. O(n) in the rule count;
+/// pure function.
+pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
+    first_match(rules, |rule| rule.matcher.matches(conn))
 }
 
 #[cfg(test)]
