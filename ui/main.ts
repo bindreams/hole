@@ -118,6 +118,23 @@ export async function saveConfig() {
   }
 }
 
+/**
+ * Whether the app is registered to start at OS login. The OS is the source of
+ * truth (#457) — the dashboard reads this live, not from config. Rejects on
+ * failure so the caller can surface it.
+ */
+export async function getAutostart(): Promise<boolean> {
+  return await invoke<boolean>("get_autostart");
+}
+
+/**
+ * Set OS start-at-login; resolves to the resulting live state. Rejects with the
+ * backend's PII-free message so the caller can revert and toast (#457).
+ */
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  return await invoke<boolean>("set_autostart", { enabled });
+}
+
 /** Mark the config as having unsaved changes. */
 export function setDirty() {
   dirty = true;
