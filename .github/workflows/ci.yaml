@@ -318,11 +318,11 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
-        # DIAGNOSTIC (#541): run e2e_ws_full_tunnel ALONE — no prior TUN test —
-        # to confirm the prior full-TUN bridge's async wintun teardown is what
-        # poisons the galoshes-server fixture readiness (it hangs when run after
-        # e2e_none_full_tunnel; this checks whether it passes in isolation).
-        # Reverted with the real fix.
+        # DIAGNOSTIC (#541): run e2e_none + e2e_ws full-tunnel (the failing
+        # ordering), now with HOLE_DIAG_SKIP set in DistHarness — if e2e_ws
+        # passes, the bridge WFP/NDIS diagnostics are what poison the next
+        # galoshes-server fixture readiness; if it still hangs, the wintun
+        # adapter residue is. Reverted with the real fix.
         run: >
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child
@@ -330,7 +330,7 @@ jobs:
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
               + package(handle-holders) + package(tombstone)
-              + package(hole-test-observability)) & test(e2e_ws_full_tunnel_roundtrip)'
+              + package(hole-test-observability)) & test(/_full_tunnel_roundtrip$/)'
 
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
