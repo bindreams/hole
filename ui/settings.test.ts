@@ -98,7 +98,6 @@ const SETTINGS_DOM = `
 
 function freshConfig(): Record<string, unknown> {
   return {
-    start_on_login: false,
     proxy_server_enabled: true,
     proxy_socks5: true,
     proxy_http: false,

@@ -94,7 +94,6 @@ function toUiSettings(c: Config): UiSettings {
     selected_server: c.selected_server,
     local_port: c.local_port,
     filters: c.filters,
-    start_on_login: c.start_on_login,
     on_startup: c.on_startup,
     theme: c.theme,
     proxy_server_enabled: c.proxy_server_enabled,
