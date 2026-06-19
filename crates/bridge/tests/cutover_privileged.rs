@@ -73,33 +73,121 @@ fn cutover_global_net_state_running_exe_rename_flips_handle_identity() {
     let _ = child.wait();
 }
 
-/// The real SCM restart must gate strictly on a RUNNING callback from
-/// `NotifyServiceStatusChange` — never a loopback reachability probe. Drives the
-/// real `SystemScmActor` against the installed `HoleBridge` service: stop → wait
-/// STOPPED → start → wait RUNNING, then re-arms + re-waits to confirm RUNNING
-/// (service-state keyed).
-///
-/// CI provisions an installed `HoleBridge` service for this lane; on a box without
-/// it, `SystemScmActor::open` fails loud (the test errors rather than skipping).
+/// A throwaway `HoleBridge` SCM service the test provisions itself, backed by the
+/// no-op `test_service` helper bin. Created on `install`, stopped + deleted on
+/// `Drop` (best-effort, so a panic never strands it). Self-contained on purpose:
+/// the test owns its fixture instead of assuming CI installed one — that
+/// assumption is exactly what left the test unrunnable.
+#[cfg(target_os = "windows")]
+struct ProvisionedService;
+
+#[cfg(target_os = "windows")]
+impl ProvisionedService {
+    fn install(helper: &std::path::Path) -> Self {
+        use hole_bridge::platform::os::SERVICE_NAME;
+        use windows_service::service::{
+            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+        };
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        // Clear any residue, then create fresh. teardown→create is not atomic
+        // (DeleteService only marks-for-delete until the last handle closes), but
+        // it is safe here: the TUN lane runs on a FRESH GH-hosted runner (no prior
+        // service) and the test runs exactly once (nextest retries=0, serial
+        // group), so there is never a marked-for-delete to collide with. A reused
+        // runner would need a retry on ERROR_SERVICE_MARKED_FOR_DELETE.
+        Self::teardown();
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )
+        .expect("open SCM with CREATE_SERVICE (the TUN lane runs elevated)");
+        let info = ServiceInfo {
+            name: std::ffi::OsString::from(SERVICE_NAME),
+            display_name: std::ffi::OsString::from("Hole Bridge (test)"),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::OnDemand,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: helper.to_path_buf(),
+            launch_arguments: vec![],
+            dependencies: vec![],
+            account_name: None, // LocalSystem
+            account_password: None,
+        };
+        manager
+            .create_service(
+                &info,
+                ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+            )
+            .expect("create the throwaway HoleBridge service");
+        ProvisionedService
+    }
+
+    /// Best-effort stop (if running) + delete of the throwaway service.
+    fn teardown() {
+        use hole_bridge::platform::os::SERVICE_NAME;
+        use windows_service::service::{ServiceAccess, ServiceState};
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
+            return;
+        };
+        let Ok(service) = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+        ) else {
+            return; // not present — nothing to clean
+        };
+        if service
+            .query_status()
+            .map(|s| s.current_state != ServiceState::Stopped)
+            .unwrap_or(false)
+        {
+            let _ = service.stop();
+        }
+        let _ = service.delete();
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ProvisionedService {
+    fn drop(&mut self) {
+        Self::teardown();
+    }
+}
+
+/// The Windows cutover's SCM stop/start must gate strictly on real STOPPED then
+/// RUNNING callbacks from `NotifyServiceStatusChange` — never a loopback probe.
+/// This drives the actual production seam (`WindowsCutoverOs::stop_service_wait_stopped`
+/// then `start_service_wait_running`, each opening its own `SystemScmActor` exactly
+/// as the cutover child does) against a SELF-PROVISIONED throwaway service (the
+/// no-op `test_service` helper). The arm-before-start ORDERING is unit-proven
+/// separately against a fake `ScmActor`; this is the real-service integration
+/// half, NOT a full-bridge cutover e2e (no `images`, so the swap never runs).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
-    use hole_bridge::cutover::scm_wait::{restart_via_notify, ScmActor, SystemScmActor, WantState};
-    use hole_bridge::platform::os::SERVICE_NAME;
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
 
-    let mut actor = SystemScmActor::open(SERVICE_NAME)
-        .expect("open the HoleBridge SCM handle (CI provisions the service for the TUN lane)");
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install(helper);
 
-    // Restart via the real event-driven sequence: it returns only once a RUNNING
-    // callback fired — no sleep, no loopback probe.
-    restart_via_notify(&mut actor).expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
-
-    actor.arm(WantState::Running).unwrap();
-    assert_eq!(
-        actor.wait_callback().unwrap(),
-        WantState::Running,
-        "post-restart the service must report RUNNING (service-state keyed, not loopback)"
-    );
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    // Bring the freshly-created (OnDemand → stopped) service up first, so the stop
+    // half has something to stop and the final RUNNING is the restart's doing.
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+    // The thing under test, via the production methods: each returns only once the
+    // real STOPPED / RUNNING callback fires (no sleep, no loopback probe), so a
+    // successful return IS the assertion.
+    os.stop_service_wait_stopped()
+        .expect("SCM stop must reach STOPPED via NotifyServiceStatusChange");
+    os.start_service_wait_running()
+        .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)

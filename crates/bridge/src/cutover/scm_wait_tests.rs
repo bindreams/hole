@@ -3,7 +3,7 @@ use std::cell::RefCell;
 
 /// Records the granular SCM steps in call order and replays a scripted state for
 /// each `wait_callback`. The script asserts the pure ordering of
-/// `restart_via_notify` without touching the real SCM.
+/// `stop_via_notify` / `start_via_notify` without touching the real SCM.
 struct FakeScm<'a> {
     log: &'a RefCell<Vec<&'static str>>,
     /// States the next `wait_callback` calls return, front to back.
@@ -38,47 +38,29 @@ impl ScmActor for FakeScm<'_> {
 }
 
 #[skuld::test]
-fn restart_sequence_arms_running_before_start_and_gates_on_running() {
+fn stop_via_notify_arms_stopped_then_gates_on_stopped() {
     let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
     let mut fake = FakeScm {
         log: &log,
-        // Script: arm STOPPED then stop yields STOPPED; arm RUNNING then start
-        // yields RUNNING.
-        waits: [WantState::Stopped, WantState::Running].into(),
+        waits: [WantState::Stopped].into(),
     };
-    restart_via_notify(&mut fake).unwrap();
+    stop_via_notify(&mut fake).unwrap();
     assert_eq!(
         *log.borrow(),
-        vec![
-            "arm_stopped",
-            "control_stop",
-            "wait",
-            "got_stopped",
-            "arm_running",
-            "start",
-            "wait",
-            "got_running",
-        ]
+        vec!["arm_stopped", "control_stop", "wait", "got_stopped"]
     );
 }
 
 #[skuld::test]
-fn restart_re_arms_after_a_non_terminal_callback() {
+fn stop_re_arms_after_a_non_terminal_callback() {
     let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
     let mut fake = FakeScm {
         log: &log,
-        // A spurious RUNNING fires while waiting for STOPPED, then STOPPED; a
-        // spurious STOPPED fires while waiting for RUNNING, then RUNNING. Each
+        // A spurious RUNNING fires while waiting for STOPPED, then STOPPED; the
         // non-terminal callback must trigger a re-arm.
-        waits: [
-            WantState::Running,
-            WantState::Stopped,
-            WantState::Stopped,
-            WantState::Running,
-        ]
-        .into(),
+        waits: [WantState::Running, WantState::Stopped].into(),
     };
-    restart_via_notify(&mut fake).unwrap();
+    stop_via_notify(&mut fake).unwrap();
     assert_eq!(
         *log.borrow(),
         vec![
@@ -89,6 +71,36 @@ fn restart_re_arms_after_a_non_terminal_callback() {
             "arm_stopped", // re-arm: still waiting for STOPPED
             "wait",
             "got_stopped",
+        ]
+    );
+}
+
+#[skuld::test]
+fn start_via_notify_arms_running_before_start_then_gates_on_running() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm {
+        log: &log,
+        waits: [WantState::Running].into(),
+    };
+    start_via_notify(&mut fake).unwrap();
+    // The critical ordering: arm RUNNING strictly BEFORE start, else a RUNNING
+    // reached before the arm fires only on the NEXT entry — a hang.
+    assert_eq!(*log.borrow(), vec!["arm_running", "start", "wait", "got_running"]);
+}
+
+#[skuld::test]
+fn start_re_arms_after_a_non_terminal_callback() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm {
+        log: &log,
+        // A spurious STOPPED fires while waiting for RUNNING, then RUNNING; the
+        // non-terminal callback must trigger a re-arm.
+        waits: [WantState::Stopped, WantState::Running].into(),
+    };
+    start_via_notify(&mut fake).unwrap();
+    assert_eq!(
+        *log.borrow(),
+        vec![
             "arm_running",
             "start",
             "wait",

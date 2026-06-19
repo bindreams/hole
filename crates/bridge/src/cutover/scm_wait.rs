@@ -25,32 +25,9 @@ pub trait ScmActor {
     fn wait_callback(&mut self) -> std::io::Result<WantState>;
 }
 
-/// Stop-then-start the service, gated strictly on real STOPPED then RUNNING
-/// callbacks. Critical ordering: arm RUNNING BEFORE issuing start, else the
-/// service can reach RUNNING before the arm and the notification only fires on
-/// the NEXT entry into RUNNING — a hang.
-pub fn restart_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
-    a.arm(WantState::Stopped)?;
-    a.control_stop()?;
-    loop {
-        if a.wait_callback()? == WantState::Stopped {
-            break;
-        }
-        a.arm(WantState::Stopped)?; // re-arm after a non-terminal callback
-    }
-    a.arm(WantState::Running)?;
-    a.start()?;
-    loop {
-        if a.wait_callback()? == WantState::Running {
-            break;
-        }
-        a.arm(WantState::Running)?;
-    }
-    Ok(())
-}
-
-/// Wait for the service to reach STOPPED via `NotifyServiceStatusChangeW` (the
-/// stop half of the restart sequence; `platform::os::stop` uses this).
+/// Stop the service, gated strictly on a real STOPPED callback from
+/// `NotifyServiceStatusChangeW`; re-arms after a non-terminal (pending) callback.
+/// The cutover's `stop_service_wait_stopped` and `platform::os::stop` use this.
 pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
     a.arm(WantState::Stopped)?;
     a.control_stop()?;
@@ -58,7 +35,23 @@ pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
         if a.wait_callback()? == WantState::Stopped {
             return Ok(());
         }
-        a.arm(WantState::Stopped)?;
+        a.arm(WantState::Stopped)?; // re-arm after a non-terminal callback
+    }
+}
+
+/// Start the service, gated strictly on a real RUNNING callback; re-arms after a
+/// non-terminal callback. Critical ordering: arm RUNNING BEFORE issuing start,
+/// else the service can reach RUNNING before the arm and the notification only
+/// fires on the NEXT entry into RUNNING — a hang. The cutover's
+/// `start_service_wait_running` uses this.
+pub fn start_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
+    a.arm(WantState::Running)?;
+    a.start()?;
+    loop {
+        if a.wait_callback()? == WantState::Running {
+            return Ok(());
+        }
+        a.arm(WantState::Running)?; // re-arm after a non-terminal callback
     }
 }
 

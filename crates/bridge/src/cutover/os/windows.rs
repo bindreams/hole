@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cutover::os::CutoverOs;
-use crate::cutover::scm_wait::{stop_via_notify, ScmActor, SystemScmActor, WantState};
+use crate::cutover::scm_wait::{start_via_notify, stop_via_notify, SystemScmActor};
 use crate::platform::os::SERVICE_NAME;
 
 /// One image to rename-away-then-move-in: the live binary at `installed` is
@@ -163,12 +163,7 @@ impl CutoverOs for WindowsCutoverOs {
 
     fn start_service_wait_running(&mut self) -> std::io::Result<()> {
         let mut actor = SystemScmActor::open(SERVICE_NAME)?;
-        actor.arm(WantState::Running)?;
-        actor.start()?;
-        while actor.wait_callback()? != WantState::Running {
-            actor.arm(WantState::Running)?;
-        }
-        Ok(())
+        start_via_notify(&mut actor)
     }
 }
 
