@@ -112,11 +112,12 @@ const AUTOSTART_TOGGLE_ID = "toggle-start-on-login";
 export async function applyAutostart(target: boolean): Promise<void> {
   const el = document.getElementById(AUTOSTART_TOGGLE_ID);
   if (!el) return;
-  setToggleState(el, target);
+  const previous = el.classList.contains("on");
+  setToggleState(el, target); // optimistic
   try {
     setToggleState(el, await setAutostart(target));
   } catch (err) {
-    setToggleState(el, !target);
+    setToggleState(el, previous); // revert to the true prior state, not an assumed !target
     showToast(`${err}`, "error");
   }
 }

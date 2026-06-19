@@ -190,6 +190,17 @@ describe("autostart toggle (OS-backed, #457)", () => {
     expect(toastMock).toHaveBeenCalledWith(expect.stringContaining("Start at Login"), "error");
   });
 
+  it("applyAutostart reverts to the true prior state (not !target) on failure", async () => {
+    mainMock.setAutostart.mockRejectedValue("boom");
+    const { applyAutostart } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    login.classList.add("on"); // prior state = on
+    login.setAttribute("aria-checked", "true");
+    await applyAutostart(true); // target == current; an assumed !target would wrongly flip to off
+    expect(login.classList.contains("on")).toBe(true);
+    expect(login.getAttribute("aria-checked")).toBe("true");
+  });
+
   it("syncAutostartToggle reflects the live OS state", async () => {
     mainMock.getAutostart.mockResolvedValue(true);
     const { syncAutostartToggle } = await setup();
