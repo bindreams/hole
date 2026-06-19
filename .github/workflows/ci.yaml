@@ -349,7 +349,7 @@ jobs:
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       - name: Upload bridge logs on test failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
