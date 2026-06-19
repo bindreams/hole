@@ -55,4 +55,4 @@ garter = { path = "../garter", features = ["test-utils"] }
 
 [build-dependencies]
 sha2 = "0.11"
-xtask-lib = { path = "../../xtask-lib" }
+xtask-lib = { path = "../../xtask-lib", features = ["version"] }

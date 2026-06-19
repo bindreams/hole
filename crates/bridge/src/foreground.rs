@@ -103,6 +103,17 @@ async fn notify_ready(spec: &str) {
     }
 }
 
+/// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
+/// The marker's presence is co-extensive with "a cutover during which no bridge
+/// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
+/// from->to schema bump across the cutover cannot strand it. Mirrors the
+/// service-path `platform::{macos,windows}::sweep_marker`.
+fn sweep_marker(log_dir: &Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+    }
+}
+
 async fn run_inner(
     socket_path: &Path,
     state_dir: &Path,
@@ -118,7 +129,13 @@ async fn run_inner(
 
     // Bind BEFORE recovery. If a second bridge instance tries to run, the
     // bind() fails and we exit without touching any routing state.
-    let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
+    let server = crate::ipc::IpcServer::bind_with_dirs(
+        socket_path,
+        proxy,
+        version,
+        log_dir.to_path_buf(),
+        state_dir.to_path_buf(),
+    )?;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect
@@ -189,6 +206,15 @@ async fn run_inner(
     let log_dir_sweep = log_dir.to_path_buf();
     if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
         tracing::warn!(error = %e, "crash sweep task panicked");
+    }
+
+    // Cutover-marker parity with the service paths: once this bridge has bound it
+    // is authoritative, so any update-in-progress marker is a completed cutover.
+    // DISTINCT from the crash-marker sweep above (tombstone) — this is the
+    // GUI-readable cutover marker (`hole_common::update_marker`).
+    let log_dir_marker = log_dir.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
+        tracing::warn!(error = %e, "marker sweep task panicked");
     }
 
     tokio::select! {
