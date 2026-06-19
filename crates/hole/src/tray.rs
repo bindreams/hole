@@ -1052,6 +1052,46 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), Strin
     }
 }
 
+// Autostart (OS login-item) ===========================================================================================
+
+/// Read whether the GUI is registered to start at OS login. The OS registration
+/// (Windows Run key / macOS LaunchAgent) is the single source of truth; the
+/// dashboard renders this live rather than from config (#457).
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    crate::autostart::is_enabled(&*app.autolaunch()).map_err(|e| {
+        // Full detail (may embed the executable path) → gui.log; the dashboard
+        // toast gets only the PII-free summary.
+        error!("{e}");
+        e.user_message().to_string()
+    })
+}
+
+/// Register or unregister GUI start-at-login through the same `crate::autostart`
+/// seam this tray uses, then re-sync the tray checkmark from the new OS state.
+/// Returns the live OS state (#457).
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    crate::autostart::set(&*manager, enabled).map_err(|e| {
+        error!("{e}");
+        e.user_message().to_string()
+    })?;
+    // A successful flip must re-derive the tray checkmark from live OS state, or
+    // the two surfaces disagree (the inverse of the bug). rebuild_tray_menu
+    // marshals onto the main thread itself.
+    rebuild_tray_menu(&app);
+    // Report live OS state, not the intent — the OS is the single source of truth.
+    // A successful set establishes `enabled` (enable()/disable()'s post-condition),
+    // so a failed read-back falls back to it rather than lying.
+    Ok(crate::autostart::is_enabled(&*manager).unwrap_or_else(|e| {
+        warn!("autostart read-back after set failed: {e}");
+        enabled
+    }))
+}
+
 // Proxy state sync ====================================================================================================
 
 /// Forward every committed proxy-state change to the tray and the
