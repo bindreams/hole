@@ -46,9 +46,9 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     Hole.app into /Applications. Quarantine is applied so Gatekeeper's
     assessment runs in the same code path it would for a real download.
 
-    Flags align with `crates/hole/src/update/install.rs::hdiutil_attach_args`
-    (-nobrowse, -quiet, -mountpoint) and add -readonly + -noverify which
-    only make sense for read-only test mounts.
+    Flags align with the bridge cutover's DMG attach in
+    `crates/bridge/src/cutover/extract.rs` (-nobrowse, -quiet, -mountpoint) and
+    add -readonly + -noverify which only make sense for read-only test mounts.
     """
     dmg = dmg_installer.find_built_dmg(REPO_ROOT)
 

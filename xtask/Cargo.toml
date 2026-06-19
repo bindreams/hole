@@ -21,7 +21,7 @@ anyhow = "1"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
-xtask-lib = { path = "../xtask-lib" }
+xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version"] }
 
 # `cargo xtask wintun` / `cargo xtask golangci-lint` (download + extract +
 # SHA256-verify runtime/lint binaries). Deps are unconditional so the workspace
