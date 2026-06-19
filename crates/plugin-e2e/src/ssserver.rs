@@ -224,20 +224,18 @@ async fn spawn_ss_with_plugin(
         let chain = tokio::spawn(async move { runner.run(env).await });
 
         // Bound readiness: a wedged server plugin chain must FAIL LOUDLY, not
-        // hang the fixture forever (a fixture hang yields no captured output and
-        // wedges the whole serial group — the #197/#518 lesson; surfaced again
-        // diagnosing bindreams/hole#541). Generous bound: on the Windows TUN lane
-        // a prior TUN test's NDIS-detach churn can stall the chain's loopback
-        // readiness probe for tens of seconds; the bound only catches a genuine
-        // never-ready. Class-2 subprocess failure-bound, not intra-process sync.
-        match tokio::time::timeout(std::time::Duration::from_secs(120), ready_rx).await {
+        // hang the fixture forever — a fixture hang yields no captured output and
+        // wedges the whole serial group (the #197/#518 lesson). The chain becomes
+        // ready in seconds; this generous bound only catches a genuine never-ready.
+        // Class-2 subprocess failure-bound surfaced to a human, not intra-process sync.
+        match tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx).await {
             Err(_elapsed) => {
                 // Don't `chain.await` here (unlike the Fatal/recv arms below): the
                 // chain is wedged — that's why readiness timed out — so awaiting it
                 // could re-hang. `cancel` signals it; BinaryPlugin's kill_on_drop
                 // reaps the subprocess when the panicking process tears down.
                 cancel.cancel();
-                panic!("server plugin did not become ready within 120s (attempt {attempt})");
+                panic!("server plugin did not become ready within 60s (attempt {attempt})");
             }
             Ok(Ok(Ok(chain_ready))) => {
                 return (

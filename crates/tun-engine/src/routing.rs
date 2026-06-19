@@ -24,12 +24,18 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Build the shell commands to set up split routing.
 ///
-/// Creates five routes:
+/// Creates four or five routes:
 /// 1. `0.0.0.0/1` via TUN — captures first half of IPv4 space
 /// 2. `128.0.0.0/1` via TUN — captures second half of IPv4 space
 /// 3. `::/1` via TUN — captures first half of IPv6 space
 /// 4. `8000::/1` via TUN — captures second half of IPv6 space
 /// 5. Server bypass — `<server_ip>` via `original_gateway` (IPv4 server) or `interface_name` (IPv6 server)
+///
+/// The server bypass (#5) is omitted when `server_ip` is loopback: a loopback
+/// destination is reached via the kernel's on-link `127.0.0.0/8` route, which is
+/// more specific than the `/1` splits, so it needs no bypass — and a `/32` (or
+/// `/128`) gateway bypass for loopback would hijack all loopback traffic to a
+/// gateway that cannot reach it.
 ///
 /// When `server_ip` is IPv6, `original_gateway` is unused — the bypass route is interface-based
 /// because reliable IPv6 gateway detection is not available on all platforms.
@@ -577,25 +583,29 @@ fn platform_setup_commands(
         ],
     ];
 
-    // Bypass: server IP via original gateway/interface
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "add".into(),
-            format!("{server_ip}"),
-            "mask".into(),
-            "255.255.255.255".into(),
-            format!("{original_gateway}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            format!("{server_ip}/128"),
-            interface_name.into(),
-        ]),
+    // Bypass: server IP via original gateway/interface. Skipped for loopback —
+    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
+    // hijack it).
+    if !server_ip.is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "add".into(),
+                format!("{server_ip}"),
+                "mask".into(),
+                "255.255.255.255".into(),
+                format!("{original_gateway}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                format!("{server_ip}/128"),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -642,23 +652,26 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
         ],
     ];
 
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "delete".into(),
-            format!("{server_ip}"),
-            "mask".into(),
-            "255.255.255.255".into(),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            format!("{server_ip}/128"),
-            interface_name.into(),
-        ]),
+    // No bypass was installed for a loopback server, so none to delete.
+    if !server_ip.is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "delete".into(),
+                format!("{server_ip}"),
+                "mask".into(),
+                "255.255.255.255".into(),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "delete".into(),
+                "route".into(),
+                format!("{server_ip}/128"),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -714,26 +727,30 @@ fn platform_setup_commands(
         ],
     ];
 
-    // Bypass: server IP via original gateway/interface
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-            format!("{original_gateway}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-            "-interface".into(),
-            interface_name.into(),
-        ]),
+    // Bypass: server IP via original gateway/interface. Skipped for loopback —
+    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
+    // hijack it).
+    if !server_ip.is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                format!("{original_gateway}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                "-interface".into(),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -772,22 +789,25 @@ fn platform_teardown_commands(_tun_name: &str, server_ip: IpAddr, _interface_nam
         ],
     ];
 
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-        ]),
+    // No bypass was installed for a loopback server, so none to delete.
+    if !server_ip.is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-inet6".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+            ]),
+        }
     }
 
     cmds

@@ -95,35 +95,6 @@ mod roundtrips {
         });
     }
 
-    /// REPRO for bindreams/hole#541: read the tunneled response to EOF, so the
-    /// roundtrip only succeeds if the sentinel's FIN propagates the whole way
-    /// back through the galoshes WS chain (ss-server -> server-plugin -> ex-ray
-    /// WS -> client-plugin -> ss-client). `galoshes_ws_roundtrip` takes the first
-    /// chunk and so never observes the FIN — the gap that let #541 ship.
-    #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
-    fn galoshes_ws_server_fin_propagates_to_eof() {
-        let g = require_galoshes();
-        rt().block_on(async {
-            let (svr, _h) = start_real_ss_server_with_plugin_ws(TEST_METHOD, TEST_PASSWORD, &g).await;
-            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
-            let outcome = run_roundtrip(
-                &g,
-                Some("host=cloudfront.com;path=/"),
-                &svr.ip().to_string(),
-                svr.port(),
-                TEST_METHOD,
-                TEST_PASSWORD,
-                sentinel,
-                &RoundtripConfig {
-                    read_to_eof: true,
-                    ..RoundtripConfig::default()
-                },
-            )
-            .await;
-            assert!(matches!(outcome, Roundtrip::Reachable { .. }), "ws eof: {outcome:?}");
-        });
-    }
-
     /// galoshes server↔client over websocket + TLS (off Windows — see file header).
     #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]

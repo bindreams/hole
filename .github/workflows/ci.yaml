@@ -319,9 +319,10 @@ jobs:
         env:
           SKULD_LABELS: "tun"
           # DIAGNOSTIC (#541): galoshes/garter debug surfaces the fixture chain's
-          # readiness self-probe retries; isolating to the two full-tunnel tests
-          # reproduces the failing e2e_none -> e2e_ws order without the other TUN
-          # tests. Reverted once the probe fix is confirmed.
+          # readiness self-probe; isolating to the two full-tunnel tests reproduces
+          # the failing e2e_none -> e2e_ws order in isolation, for a clean signal on
+          # whether the loopback-bypass route fix alone suffices. Reverted once the
+          # route fix is confirmed.
           RUST_LOG: "galoshes=debug,garter=debug"
         run: >
           cargo nextest run --no-default-features
