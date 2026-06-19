@@ -406,7 +406,7 @@ fn recover_with_loopback_server_skips_bypass() {
     state::save(tmp.path(), &persisted_state).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {}, false, || false, |_| {});
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
 
     let log = log.into_inner();
     assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
