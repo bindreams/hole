@@ -10,8 +10,6 @@ pub enum UpdateError {
     Json(#[from] serde_json::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("installer failed with exit code {0}")]
-    InstallerFailed(i32),
     #[error("SHA-256 hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
     #[error("signature verification failed: {0}")]

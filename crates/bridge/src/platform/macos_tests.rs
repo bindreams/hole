@@ -39,6 +39,16 @@ fn helper_path_is_stable() {
 }
 
 #[skuld::test]
+fn service_log_dir_const_matches_shared_resolver() {
+    // The const is referenced widely here, but the marker lives at the same
+    // cross-privilege dir the GUI reads. Pin them equal so they cannot drift.
+    assert_eq!(
+        std::path::Path::new(SERVICE_LOG_DIR),
+        hole_common::update_marker::service_log_dir()
+    );
+}
+
+#[skuld::test]
 async fn serve_until_signal_returns_when_signal_fires() {
     // A server future that never completes, and a shutdown future we control.
     // Firing the shutdown must return control so the daemon's pm.stop()
@@ -51,6 +61,22 @@ async fn serve_until_signal_returns_when_signal_fires() {
     let join = tokio::spawn(serve_until_signal(server, shutdown));
     tx.send(()).unwrap();
     join.await.unwrap();
+}
+
+#[skuld::test]
+fn shutdown_reason_keys_on_marker() {
+    use crate::proxy_manager::StopReason;
+    assert_eq!(shutdown_reason(true), StopReason::Cutover);
+    assert_eq!(shutdown_reason(false), StopReason::UserStop);
+}
+
+#[skuld::test]
+fn post_bind_sweep_clears_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker()).unwrap();
+    sweep_marker(dir.path());
+    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    sweep_marker(dir.path()); // idempotent: absent marker is a no-op
 }
 
 #[skuld::test]

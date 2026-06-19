@@ -114,7 +114,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
         let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
-        let server = crate::ipc::IpcServer::bind(&socket_path, proxy, &version)?;
+        let server =
+            crate::ipc::IpcServer::bind_with_dirs(&socket_path, proxy, &version, log_dir.clone(), state_dir.clone())?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =
@@ -140,6 +141,17 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let log_dir_sweep = log_dir.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
+        }
+        // The new bridge is authoritative once it has bound: any update marker is
+        // a completed cutover, so clear it unconditionally (remove-by-path).
+        let log_dir_marker = log_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
+            tracing::warn!(error = %e, "marker sweep task panicked");
+        }
+        // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
+        // (it fails while an old process still maps the renamed inode).
+        if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
+            tracing::warn!(error = %e, "old-binary sweep task panicked");
         }
 
         // Capture WFP + NDIS state after recovery; see
@@ -172,9 +184,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Clean shutdown: stop proxy before exiting
+        // Clean shutdown: stop proxy before exiting. A cutover-driven shutdown
+        // (marker present) disarms the standing cover so the persistent WFP
+        // filters survive the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        if let Err(e) = pm.stop().await {
+        let reason = shutdown_reason(hole_common::update_marker::read(&log_dir).is_some());
+        if let Err(e) = pm.stop_with(reason).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
 
@@ -201,13 +216,76 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     run_result
 }
 
+/// Map an update-in-progress marker's presence to the stop reason: present
+/// means a cutover is mid-flight, so the standing cover is disarmed (persists)
+/// rather than disengaged. Pure so the decision is table-testable.
+pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::StopReason {
+    if marker_present {
+        crate::proxy_manager::StopReason::Cutover
+    } else {
+        crate::proxy_manager::StopReason::UserStop
+    }
+}
+
+/// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
+/// The marker's presence is co-extensive with "a cutover during which no bridge
+/// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
+/// from->to schema bump across the cutover cannot strand it.
+pub(crate) fn sweep_marker(log_dir: &Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+    }
+}
+
+/// Prefix of a rename-away leftover from a cutover swap (`<file>.old-<ver>`); see
+/// `cutover::os::windows::old_name`.
+const OLD_BINARY_PREFIX: &str = "hole.exe.old-";
+
+/// Sweep `hole.exe.old-*` leftovers from the install dir. The cutover swap renames
+/// the live binary aside and tries a best-effort delete, which fails while an old
+/// GUI/bridge still maps the inode; the next bridge start (once nothing maps it)
+/// removes the survivors. A still-mapped file's delete fails and is left for a
+/// later start. No delete cap — the set is bounded by the number of past updates.
+pub(crate) fn sweep_old_binaries(install_dir: &Path) {
+    let entries = match std::fs::read_dir(install_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %install_dir.display(), "old-binary sweep: read_dir failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(OLD_BINARY_PREFIX) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            // Still mapped by a live process — expected; a later start retries.
+            tracing::debug!(error = %e, file = %name, "old-binary sweep: still mapped, deferring");
+        }
+    }
+}
+
+/// Resolve the install dir from `current_exe` and sweep its `hole.exe.old-*`
+/// leftovers. Thin wrapper so the dir-scanning core (`sweep_old_binaries`) stays
+/// table-testable.
+fn sweep_old_binaries_in_install_dir() {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        Some(install_dir) => sweep_old_binaries(&install_dir),
+        None => tracing::warn!("old-binary sweep: could not resolve install dir from current_exe"),
+    }
+}
+
 // Install/uninstall ===================================================================================================
 
 /// System log directory for the Windows service (`C:\ProgramData\hole\logs`).
+/// Deduped to the single cross-privilege resolver the GUI also reads from.
 fn service_log_dir() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
-        .join("hole")
-        .join("logs")
+    hole_common::update_marker::service_log_dir()
 }
 
 /// System state directory for the Windows service (`C:\ProgramData\hole\state`).
@@ -291,33 +369,22 @@ pub fn start() -> Result<(), windows_service::Error> {
     Ok(())
 }
 
-/// Send a stop control to the service and wait for it to stop (up to 10s).
+/// Send a stop control to the service and wait until it is really stopped via
+/// `NotifyServiceStatusChangeW` — a kernel rendezvous on the STOPPED transition,
+/// not a sleep-poll. Returns immediately when already stopped.
 pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
-
-    // Check current state before sending stop
-    let status = service.query_status()?;
-    if status.current_state == ServiceState::Stopped {
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
+    if service.query_status()?.current_state == ServiceState::Stopped {
         return Ok(());
     }
+    drop(service);
 
-    service.stop()?;
     info!("stop signal sent, waiting for service to stop");
-
-    // Poll until stopped or timeout
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let status = service.query_status()?;
-        if status.current_state == ServiceState::Stopped {
-            info!("Windows service stopped");
-            return Ok(());
-        }
-        if std::time::Instant::now() > deadline {
-            return Err(format!("service did not stop within 10s (state: {:?})", status.current_state).into());
-        }
-    }
+    let mut actor = crate::cutover::scm_wait::SystemScmActor::open(SERVICE_NAME)?;
+    crate::cutover::scm_wait::stop_via_notify(&mut actor)?;
+    info!("Windows service stopped");
+    Ok(())
 }
 
 // Query ===============================================================================================================
@@ -342,6 +409,18 @@ pub fn is_running() -> bool {
         return false;
     };
     status.current_state == ServiceState::Running
+}
+
+/// A valid marker for the post-bind-sweep test.
+#[cfg(test)]
+fn test_marker() -> hole_common::update_marker::MarkerInfo {
+    hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
+    }
 }
 
 #[cfg(test)]

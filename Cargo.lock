@@ -3010,11 +3010,13 @@ dependencies = [
  "kill-group",
  "libc",
  "lru",
+ "plist",
  "plugin-e2e",
  "rand 0.10.1",
  "regex",
  "rustls",
  "rustls-pki-types",
+ "same-file",
  "serde",
  "serde_json",
  "shadowsocks",
@@ -3039,6 +3041,7 @@ dependencies = [
  "windows 0.62.2",
  "windows-service",
  "xtask",
+ "xtask-lib",
 ]
 
 [[package]]
@@ -3051,12 +3054,14 @@ dependencies = [
  "hole-test-observability",
  "libc",
  "log",
+ "minisign-verify",
  "nu-ansi-term",
  "os_pipe",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "skuld",
  "tempfile",
  "thiserror 2.0.18",
@@ -9598,7 +9603,9 @@ name = "xtask-lib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "semver",
+ "serde",
  "skuld",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",

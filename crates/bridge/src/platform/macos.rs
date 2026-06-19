@@ -228,7 +228,13 @@ pub fn run(
         // can touch routing state. Route recovery is offloaded via
         // spawn_blocking so a hung netsh/route command cannot wedge the
         // runtime while the IPC socket is bound but not yet serving.
-        let server = crate::ipc::IpcServer::bind(socket_path, proxy, version)?;
+        let server = crate::ipc::IpcServer::bind_with_dirs(
+            socket_path,
+            proxy,
+            version,
+            log_dir.to_path_buf(),
+            state_dir.to_path_buf(),
+        )?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
@@ -255,21 +261,51 @@ pub fn run(
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
+        // The new bridge is authoritative once it has bound: any update marker is
+        // a completed cutover, so clear it unconditionally (remove-by-path).
+        let log_dir_marker = log_dir.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
+            tracing::warn!(error = %e, "marker sweep task panicked");
+        }
 
         // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
         // here would skip the pm.stop() teardown below and leak routes/DNS.
         // `shutdown_signal()` handles SIGINT *and* SIGTERM (foreground.rs).
         serve_until_signal(server.run(), crate::foreground::shutdown_signal()).await;
 
-        // Clean shutdown: stop proxy before exiting
+        // Clean shutdown: stop proxy before exiting. A cutover-driven shutdown
+        // (marker present) disarms the standing cover so the persistent pf
+        // ruleset survives the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        if let Err(e) = pm.stop().await {
+        let reason = shutdown_reason(hole_common::update_marker::read(log_dir).is_some());
+        if let Err(e) = pm.stop_with(reason).await {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
+}
+
+/// Map an update-in-progress marker's presence to the stop reason: present
+/// means a cutover is mid-flight, so the standing cover is disarmed (persists)
+/// rather than disengaged. Pure so the decision is table-testable.
+pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::StopReason {
+    if marker_present {
+        crate::proxy_manager::StopReason::Cutover
+    } else {
+        crate::proxy_manager::StopReason::UserStop
+    }
+}
+
+/// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
+/// The marker's presence is co-extensive with "a cutover during which no bridge
+/// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
+/// from->to schema bump across the cutover cannot strand it.
+pub(crate) fn sweep_marker(log_dir: &std::path::Path) {
+    if let Err(e) = hole_common::update_marker::clear(log_dir) {
+        tracing::warn!(error = %e, "failed to clear update-in-progress marker");
+    }
 }
 
 /// Drive the IPC server until it finishes or a shutdown signal arrives,
@@ -288,6 +324,18 @@ pub(crate) async fn serve_until_signal(
         _ = shutdown => {
             info!("received shutdown signal");
         }
+    }
+}
+
+/// A valid marker for the post-bind-sweep test.
+#[cfg(test)]
+fn test_marker() -> hole_common::update_marker::MarkerInfo {
+    hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        pid: 1,
+        started_at_unix: 0,
     }
 }
 

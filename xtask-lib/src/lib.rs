@@ -1,25 +1,30 @@
-//! Helper crate shared by `xtask` (the workspace task runner) and
-//! `crates/hole/build.rs`. Lives outside `xtask/` so that `crates/hole/build.rs`
-//! can depend on it as a build-dependency without dragging in `xtask`'s
-//! clap/glob/ureq machinery.
+//! Helper crate shared by `xtask` (the workspace task runner), the build.rs
+//! version stamps, and the bridge update-cutover. Lives outside `xtask/` so
+//! consumers can depend on it without dragging in `xtask`'s clap/glob/ureq
+//! machinery.
 //!
-//! This crate is the single source of truth for group-aware version
-//! computation, shared by `crates/hole/build.rs` and `xtask` (`cargo xtask
-//! version`) instead of being reimplemented per consumer — so the logic
-//! stays testable in one place.
+//! Modules are split by weight: `bindir` (the BINDIR name set + `Os`) and
+//! `repo_root` need only `anyhow`, so the SYSTEM/root bridge cutover can use
+//! `bindir` without linking a TOML parser. Group-aware version computation
+//! (`version`/`ex_ray_version`) pulls `toml` + `semver` and is gated behind the
+//! `version` feature.
 
-pub mod ex_ray_version;
+pub mod bindir;
 pub mod repo_root;
+
+#[cfg(feature = "version")]
+pub mod ex_ray_version;
+#[cfg(feature = "version")]
 pub mod version;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "version"))]
 mod test_support;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "version"))]
 #[path = "version_tests.rs"]
 mod version_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "version"))]
 #[path = "ex_ray_version_tests.rs"]
 mod ex_ray_version_tests;
 
