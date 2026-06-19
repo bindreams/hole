@@ -207,9 +207,19 @@ impl Drop for Dispatcher {
                 // dispatcher without `shutdown()`), and a reconnect after it
                 // would otherwise race the prior adapter's detach (#541).
                 let luid = self.tun_luid;
+                let abort = self.driver_abort.clone();
                 tokio::task::block_in_place(|| {
                     rt.block_on(async {
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+                        // Abort the engine if it doesn't drain in 2s so its
+                        // `AsyncDevice` drops and `WintunCloseAdapter` runs —
+                        // otherwise the detach-await below would spin to its full
+                        // deadline waiting for an adapter that was never closed.
+                        if tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                            .await
+                            .is_err()
+                        {
+                            abort.abort();
+                        }
                         tun_engine::adapter_cleanup::await_adapter_detached(luid, DETACH_AWAIT_DEADLINE).await;
                     });
                 });

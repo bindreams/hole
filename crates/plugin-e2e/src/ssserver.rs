@@ -231,6 +231,10 @@ async fn spawn_ss_with_plugin(
         // Class-2 subprocess failure-bound, not intra-process sync.
         match tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx).await {
             Err(_elapsed) => {
+                // Don't `chain.await` here (unlike the Fatal/recv arms below): the
+                // chain is wedged — that's why readiness timed out — so awaiting it
+                // could re-hang. `cancel` signals it; BinaryPlugin's kill_on_drop
+                // reaps the subprocess when the panicking process tears down.
                 cancel.cancel();
                 panic!("server plugin did not become ready within 60s (attempt {attempt})");
             }

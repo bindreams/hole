@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `Instant` is only used by the Windows-gated detach-timing tests below.
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 use super::{await_adapter_detached, remove_adapter};
 
