@@ -71,26 +71,6 @@ impl Device {
         &self.config
     }
 
-    /// The kernel NET_LUID of the opened adapter, captured at build time for
-    /// THIS device. Used to await the adapter's async NDIS detach on teardown
-    /// (see [`crate::adapter_cleanup::await_adapter_detached`]).
-    ///
-    /// Returns `0` on platforms with no LUID concept (macOS/Unix), where the
-    /// adapter detaches synchronously on FD close and no wait is needed. The
-    /// LUID is per-adapter and re-minted on each create — valid only for this
-    /// device instance, never reused across starts.
-    pub fn tun_luid(&self) -> u64 {
-        #[cfg(target_os = "windows")]
-        {
-            use tun::AbstractDeviceExt;
-            self.tun.tun_luid()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            0
-        }
-    }
-
     /// Consume and return the underlying async TUN device. Used by the
     /// engine to drive its packet loop.
     #[doc(hidden)]

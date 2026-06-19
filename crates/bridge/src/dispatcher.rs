@@ -28,18 +28,7 @@ pub struct Dispatcher {
     /// aborts via `driver_abort` as a safety net.
     driver_handle: Option<JoinHandle<()>>,
     driver_abort: AbortHandle,
-    /// NET_LUID of the `hole-tun` adapter, captured at build. Teardown awaits
-    /// this adapter's async NDIS detach (after the engine task — owner of the
-    /// `tun::AsyncDevice` — ends and `WintunCloseAdapter` runs) so the host is
-    /// quiescent for the next connect / test instead of mid-detach (#541). 0
-    /// on platforms with no LUID (macOS), where the await is a no-op.
-    tun_luid: u64,
 }
-
-/// Failure-to-human bound on awaiting the `hole-tun` NDIS detach during
-/// teardown. A healthy detach is sub-second; this only bounds a pathological
-/// stuck detach (logged, then teardown proceeds — never hangs).
-const DETACH_AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Dispatcher {
     /// Create and start the dispatcher.
@@ -94,10 +83,6 @@ impl Dispatcher {
             rules,
         ));
 
-        // Capture the adapter LUID before the device is moved into the engine,
-        // so teardown can await its NDIS detach (see `tun_luid` field).
-        let tun_luid = device.tun_luid();
-
         // Build the engine. Hole no longer registers a DnsInterceptor —
         // DNS queries traverse the tunnel like any other traffic, and
         // names are recovered from TLS/HTTP peek at connect time.
@@ -122,7 +107,6 @@ impl Dispatcher {
             cancel,
             driver_handle: Some(driver_handle),
             driver_abort,
-            tun_luid,
         })
     }
 
@@ -153,13 +137,6 @@ impl Dispatcher {
                     self.driver_abort.abort();
                 }
             }
-
-            // The engine task (owner of the `tun::AsyncDevice`) has now ended or
-            // been aborted, so `WintunCloseAdapter` has run (or will when the
-            // aborted task is reclaimed). Await the kernel NDIS detach so the
-            // host is quiescent before the next connect / test (#541) — the
-            // poll only runs after the device close was triggered above.
-            tun_engine::adapter_cleanup::await_adapter_detached(self.tun_luid, DETACH_AWAIT_DEADLINE).await;
         }
 
         debug!("Dispatcher shutdown complete");
@@ -201,27 +178,8 @@ impl Drop for Dispatcher {
                 // `block_in_place` keeps the worker thread available for
                 // other tasks. It panics on a current-thread runtime —
                 // that's why we gated on `MultiThread` above.
-                //
-                // Also await the NDIS detach here: this Drop path is the
-                // abnormal teardown (a `start_inner` error/cancel drops the
-                // dispatcher without `shutdown()`), and a reconnect after it
-                // would otherwise race the prior adapter's detach (#541).
-                let luid = self.tun_luid;
-                let abort = self.driver_abort.clone();
                 tokio::task::block_in_place(|| {
-                    rt.block_on(async {
-                        // Abort the engine if it doesn't drain in 2s so its
-                        // `AsyncDevice` drops and `WintunCloseAdapter` runs —
-                        // otherwise the detach-await below would spin to its full
-                        // deadline waiting for an adapter that was never closed.
-                        if tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-                            .await
-                            .is_err()
-                        {
-                            abort.abort();
-                        }
-                        tun_engine::adapter_cleanup::await_adapter_detached(luid, DETACH_AWAIT_DEADLINE).await;
-                    });
+                    let _ = rt.block_on(tokio::time::timeout(std::time::Duration::from_secs(2), handle));
                 });
             }
             _ => {

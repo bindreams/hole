@@ -814,11 +814,25 @@ impl garter::ChainPlugin for YamuxPlugin {
 async fn probe_tcp_ready(addr: SocketAddr, shutdown: &CancellationToken) -> bool {
     let mut delay = Duration::from_millis(10);
     let max_delay = Duration::from_secs(1);
+    // Per-attempt connect bound. A readiness self-probe must never wedge on a
+    // single hung `connect`: on Windows, a loopback connect can stall for tens
+    // of seconds while the network stack is mid-reconfiguration (e.g. a sibling
+    // TUN adapter's async NDIS detach churning the stack — bindreams/hole#541).
+    // Without a per-attempt bound the probe sticks on that one connect and never
+    // retries, so readiness never fires. Bounding each attempt lets the probe
+    // retry and self-heal the instant the stack settles. The retry is unbounded
+    // (no budget); shutdown is the only exit besides success.
+    let attempt_timeout = Duration::from_secs(3);
+    let mut attempt: u32 = 0;
     loop {
+        attempt += 1;
         tokio::select! {
-            result = TcpStream::connect(addr) => {
-                if result.is_ok() {
-                    return true;
+            result = tokio::time::timeout(attempt_timeout, TcpStream::connect(addr)) => {
+                match result {
+                    Ok(Ok(_)) => return true,
+                    Ok(Err(e)) => tracing::debug!(%addr, attempt, error = %e, "probe_tcp_ready: connect failed, retrying"),
+                    Err(_) => tracing::debug!(%addr, attempt, timeout_s = attempt_timeout.as_secs(),
+                        "probe_tcp_ready: connect attempt timed out, retrying"),
                 }
             }
             () = shutdown.cancelled() => return false,

@@ -318,14 +318,19 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
+          # DIAGNOSTIC (#541): galoshes/garter debug surfaces the fixture chain's
+          # readiness self-probe retries; isolating to the two full-tunnel tests
+          # reproduces the failing e2e_none -> e2e_ws order without the other TUN
+          # tests. Reverted once the probe fix is confirmed.
+          RUST_LOG: "galoshes=debug,garter=debug"
         run: >
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child
-          -E 'package(hole) + package(hole-bridge) + package(hole-common)
+          -E '(package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
               + package(handle-holders) + package(tombstone)
-              + package(hole-test-observability)'
+              + package(hole-test-observability)) & test(/_full_tunnel_roundtrip$/)'
 
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
