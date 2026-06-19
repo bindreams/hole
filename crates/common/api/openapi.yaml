@@ -117,6 +117,70 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/update-apply:
+    post:
+      summary: Apply a verified update (service-manager cutover)
+      description: |
+        The privileged bridge swaps its own binary by rename and restarts the
+        bridge service. The request carries the already-downloaded+verified
+        payload path; the bridge re-verifies before extracting. A lockdown-off
+        update REQUIRES consent=true (informed-consent seam). Returns 200 once
+        the cutover has been kicked off; the actual restart is asynchronous and
+        every GUI self-heals onto the new image.
+      operationId: applyUpdate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApplyRequest"
+      responses:
+        "200":
+          description: Cutover accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "400":
+          description: >-
+            The install destination is invalid (macOS): the `.app` swap target is
+            not a genuine `com.hole.app` bundle, or its volume cannot atomically
+            swap. A destination precondition, distinct from a payload-bytes
+            failure; refused before the marker write
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: A lockdown-off update was requested without consent=true
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: A cutover is already in progress (single-occupancy)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            Payload re-verification failed (signature/hash mismatch or asset not
+            in the manifest) — a corruption/tamper event; the cutover marker is
+            claimed then cleared, so no cutover proceeds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: >-
+            Cutover failed (private-dir resolution, payload staging I/O,
+            marker-write, extract, actor spawn, or a blocking-task panic)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /v1/reload:
     post:
       summary: Reload the proxy with new configuration
@@ -554,3 +618,44 @@ components:
       properties:
         enabled:
           type: boolean
+
+    UpdateApplyRequest:
+      type: object
+      description: "Hand-written in protocol.rs."
+      required:
+        - payload_path
+        - target_version
+        - consent
+        - sha256sums
+        - sha256sums_minisig
+        - asset_name
+      properties:
+        payload_path:
+          type: string
+          description: Path to the downloaded+verified MSI/DMG.
+        target_version:
+          type: string
+        consent:
+          type: boolean
+          description: >-
+            Informed consent that the tunnel may briefly leak during the
+            restart. REQUIRED true for a lockdown-off update; ignored under
+            lockdown-on (the standing cover holds the gap).
+        sha256sums:
+          type: string
+          description: >-
+            The release SHA256SUMS manifest text, so the privileged bridge can
+            re-verify the payload offline before extracting (no network).
+        sha256sums_minisig:
+          type: string
+          description: The minisign signature over sha256sums.
+        asset_name:
+          type: string
+          description: The payload's filename, used to find its hash in sha256sums.
+        app_dest:
+          type: string
+          nullable: true
+          description: >-
+            macOS only: the GUI's current_exe-derived .app swap target. A hint
+            the bridge re-validates (CFBundleIdentifier == com.hole.app) before
+            swapping; never a trust anchor. Null/absent on Windows.

@@ -14,6 +14,22 @@ workspace = true
 name = "hole_bridge"
 harness = false
 
+# Idle helper exe for the privileged-lane cutover tests (a real running image to
+# rename-swap underneath). The `cutover_privileged` integration test reaches it
+# via `CARGO_BIN_EXE_test_idle`, which Cargo injects after building every bin in
+# the package for an integration target.
+[[bin]]
+name = "test_idle"
+path = "src/bin/test_idle.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "test_service"
+path = "src/bin/test_service.rs"
+test = false
+doctest = false
+
 [dependencies]
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
@@ -22,6 +38,10 @@ handle-holders = { path = "../handle-holders" }
 tun-engine = { path = "../tun-engine" }
 dump = { path = "../dump" }
 garter = { path = "../garter" }
+# Single source of truth for the BINDIR name set; the Windows update-cutover
+# swaps every bundled binary, not just hole.exe. No `clap`/`serde` features —
+# the cutover needs only the pure name-set fn.
+xtask-lib = { path = "../../xtask-lib" }
 shadowsocks-service = { version = "1", features = ["local", "local-http", "aead-cipher-2022"] }
 shadowsocks = "=1.24.0"
 hex = "0.4"
@@ -47,6 +67,9 @@ http = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# Robust Info.plist parse (XML + binary) for the macOS .app swap-target identity
+# anchor in cutover::app_dest — a security gate must not hand-roll string search.
+plist = "1"
 # Filter engine dependencies. All except `lru` and `tls-parser` are already
 # pulled in transitively via shadowsocks-service; promoted to direct deps so
 # the filter module can `use` them. Pinned to the same minor versions that
@@ -91,7 +114,9 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
+    "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
     "Win32_System_Threading",
 ] }
 # Used by the ETW consumer in crates/bridge/src/diagnostics/etw.rs.
@@ -123,9 +148,36 @@ plugin-e2e = { path = "../plugin-e2e" }
 rand = "0.10"
 # Used by `test_support::net_discovery` for primary IPv4 detection in TUN tests.
 default-net = "0.22"
+# File-identity (volume serial + file index) for the privileged-lane cutover
+# proofs: the on-disk `Handle` must FLIP across a swap (the GUI self-heal
+# precondition). Same crate `crates/hole` uses for #514 self-heal.
+same-file = "1"
 # Library dep on the workspace task runner so the dist-directory e2e test
 # fixture can call `xtask::run_stage` directly instead of shelling out to
 # `cargo xtask stage`. The path-dep form is deliberate: if `xtask` ever
 # moves, compilation breaks immediately with a clear error rather than
 # silently drifting.
 xtask = { path = "../../xtask" }
+
+# Privileged-lane cutover proofs (real rename/SCM/renamex_np FFI). A skuld
+# harness, like the lib tests; an integration target so Cargo builds + injects
+# the `test_idle` helper bin (`CARGO_BIN_EXE_test_idle`).
+[[test]]
+name = "cutover_privileged"
+path = "tests/cutover_privileged.rs"
+harness = false
+
+# Privileged-lane cutover LEAK proofs (real WFP/pf engage + egress probes:
+# Mullvad-#8470 fail-open, both-covers recovery).
+[[test]]
+name = "cutover_leak_privileged"
+path = "tests/cutover_leak_privileged.rs"
+harness = false
+
+# Privileged-lane WIRE-LEVEL no-leak proof (Windows in-box pktmon capture of the
+# physical egress NIC across the standing lockdown cover). The body is
+# cfg(windows); on other platforms the target is just main() + a cfg'd-out test.
+[[test]]
+name = "cutover_nic_capture_privileged"
+path = "tests/cutover_nic_capture_privileged.rs"
+harness = false

@@ -211,8 +211,10 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
         // required to undo the flush — dropping only the refcount would strand
         // the host with an empty pass-all ruleset. The PR3 cutover treats an
         // engage error as fatal and aborts before stopping the old bridge, so
-        // the tunnel is never torn down uncovered.
-        disengage(&token, state_dir);
+        // the tunnel is never torn down uncovered. No standing cover is being
+        // adopted on this engage-failure path, so the `/etc/pf.conf` restore
+        // (undoing the `-Fa` flush) must run.
+        disengage(&token, state_dir, false);
         return Err(RoutingError::RouteSetup(format!(
             "pfctl load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -229,16 +231,23 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
 impl Drop for Cover {
     fn drop(&mut self) {
         match self.kind {
-            CoverKind::Transient => disengage(&self.token, &self.state_dir),
+            // A user-stop drop never has a standing cover being adopted.
+            CoverKind::Transient => disengage(&self.token, &self.state_dir, false),
             CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
         }
     }
 }
 
-/// Restore the canonical ruleset, drop our enable refcount, clear the file.
-/// Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
-fn disengage(token: &str, state_dir: &Path) {
-    if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
+/// Drop the transient enable refcount + clear the file. When `adopting` is
+/// false, also restore the canonical ruleset (the transient engage did `-Fa`,
+/// flushing host rules, so the restore is mandatory to undo the flush). When a
+/// standing cover is being adopted, skip the `/etc/pf.conf` reload — it would
+/// wipe the standing lockdown ruleset (which is the live main ruleset) before
+/// Adopt. Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
+fn disengage(token: &str, state_dir: &Path, adopting: bool) {
+    if adopting {
+        tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
+    } else if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
         tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
     }
     if let Err(e) = pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
@@ -249,7 +258,7 @@ fn disengage(token: &str, state_dir: &Path) {
     }
 }
 
-pub fn recover_cover(state_dir: &Path) {
+pub fn recover_cover(state_dir: &Path, adopting: bool) {
     let Some(st) = state::load(state_dir) else {
         tracing::debug!("no failclosed-state file, nothing to recover");
         return;
@@ -258,7 +267,7 @@ pub fn recover_cover(state_dir: &Path) {
         was_enabled = st.pf_was_enabled,
         "recovering fail-closed cover from crashed run"
     );
-    disengage(&st.pf_token, state_dir);
+    disengage(&st.pf_token, state_dir, adopting);
 }
 
 // --- lockdown layer ---
@@ -376,36 +385,59 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
     })
 }
 
-/// Sweep: restore the host's pre-lockdown ruleset from the snapshot, drop our pf
-/// refcount, clear the state. The snapshot reload IS the restore — there is no
-/// anchor to flush. Shared by Drop (user-stop) and `recover_lockdown` when the
-/// persisted intent is OFF. Best-effort; logs on failure.
+/// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop
+/// our pf refcount, clear the state. An ABSENT cover (no state file) is `Ok` —
+/// nothing to disengage, so no pfctl is spawned. A PRESENT cover that fails to
+/// restore propagates the error and LEAVES the state file in place, so a retry
+/// (or the next start) still sees the cover rather than reading "disengaged"
+/// while the block persists. Powers the `bridge unlock` escape hatch.
 ///
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
 /// transient cover documents for its `/etc/pf.conf` reload).
-fn lockdown_disengage(state_dir: &Path) {
-    if let Some(st) = lockdown_state::load(state_dir) {
-        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-        if let Err(e) = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "lockdown snapshot restore failed");
-        }
-        if let Err(e) = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER) {
-            tracing::warn!(error = %e, "pfctl -X failed during lockdown disengage");
-        }
+pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+    let Some(st) = lockdown_state::load(state_dir) else {
+        return Ok(()); // No cover engaged — nothing to disengage.
+    };
+    let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?;
+    if !out.status.success() {
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl lockdown restore failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
+    let xout = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER)?;
+    if !xout.status.success() {
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl -X (drop pf refcount) failed: {}",
+            String::from_utf8_lossy(&xout.stderr).trim()
+        )));
+    }
+    // State cleared only after a confirmed restore — a failed clear is the only
+    // remaining best-effort step (the cover is already down).
     if let Err(e) = lockdown_state::clear(state_dir) {
-        tracing::warn!(error = %e, "lockdown-pf-state clear failed during disengage");
+        tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
+    }
+    Ok(())
+}
+
+/// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
+/// no caller to surface an error to.
+fn lockdown_disengage(state_dir: &Path) {
+    if let Err(e) = disengage_lockdown(state_dir) {
+        tracing::warn!(error = %e, "lockdown disengage failed during Drop");
     }
 }
 
-/// Act on a recovery decision for the lockdown cover (called from
-/// `failclosed::recover_lockdown`). `Adopt` (intent ON): KEEP the host
-/// fail-closed — leave the lockdown ruleset + state file in force. The dead
-/// utun name in the `pass out quick on <tun>` line is harmless (matches no live
-/// interface); the next connect's `engage_lockdown` reuses the persisted
-/// snapshot and reloads with the fresh utun name. `Sweep` (intent OFF): full
-/// restore via `lockdown_disengage`. `Noop`: nothing.
+/// Act on a recovery decision for the lockdown cover (the facade routes `Sweep`
+/// through the fail-loud `disengage_lockdown`; this best-effort path remains
+/// correct if called directly). `Adopt` (intent ON): KEEP the host fail-closed —
+/// leave the lockdown ruleset + state file in force. The dead utun name in the
+/// `pass out quick on <tun>` line is harmless (matches no live interface); the
+/// next connect's `engage_lockdown` reuses the persisted snapshot and reloads
+/// with the fresh utun name. `Sweep` (intent OFF): best-effort restore. `Noop`:
+/// nothing.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
     use crate::routing::CoverRecovery::*;
     match decision {

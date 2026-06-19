@@ -32,4 +32,4 @@ skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 
 [build-dependencies]
-xtask-lib = { path = "../../xtask-lib" }
+xtask-lib = { path = "../../xtask-lib", features = ["version"] }

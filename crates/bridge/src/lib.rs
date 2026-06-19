@@ -1,3 +1,4 @@
+pub mod cutover;
 pub mod diagnostics;
 pub mod dispatcher;
 pub mod dns;
