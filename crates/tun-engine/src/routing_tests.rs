@@ -359,7 +359,7 @@ fn recover_without_state_file_is_a_noop() {
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {}, false, || false, |_| {});
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
 
     let log = log.into_inner();
     assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
@@ -378,7 +378,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     state::save(tmp.path(), &persisted_state).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_| {}, false, || false, |_| {});
+    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
@@ -436,7 +436,7 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing, |_| {}, false, || false, |_| {});
+    recover_routes_with(tmp.path(), failing, |_, _| {}, false, || false, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -454,7 +454,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     recover_routes_with(
         tmp.path(),
         capturing_runner(&log),
-        |_| swept.set(true),
+        |_, _| swept.set(true),
         false,
         || false,
         |_| {},
@@ -476,7 +476,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
     recover_routes_with(
         tmp.path(),
         capturing_runner(&log),
-        |_| {},
+        |_, _| {},
         false,
         || true,
         |decision| decided.set(Some(decision)),
@@ -492,7 +492,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
     recover_routes_with(
         tmp.path(),
         capturing_runner(&log),
-        |_| {},
+        |_, _| {},
         true,
         || true,
         |d| decided.set(Some(d)),
@@ -509,12 +509,80 @@ fn recover_lockdown_noop_when_cover_absent() {
     recover_routes_with(
         tmp.path(),
         capturing_runner(&log),
-        |_| {},
+        |_, _| {},
         true,
         || false,
         |d| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
+}
+
+#[skuld::test]
+fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Record the call order and the `adopting` flag passed to sweep_cover.
+    let order: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
+
+    recover_routes_with(
+        dir.path(),
+        |_cmds, _phase| Ok(()),
+        |_state_dir, adopting| {
+            order.borrow_mut().push("sweep_cover");
+            *adopting_seen.borrow_mut() = Some(adopting);
+        },
+        /* lockdown_intent = */ true,
+        /* lockdown_present = */ || true, // standing cover present
+        |decision| {
+            order.borrow_mut().push("lockdown_recover");
+            assert_eq!(decision, CoverRecovery::Adopt);
+        },
+    );
+
+    assert_eq!(
+        *order.borrow(),
+        vec!["lockdown_recover", "sweep_cover"],
+        "lockdown reconcile must run BEFORE the transient sweep"
+    );
+    assert_eq!(
+        *adopting_seen.borrow(),
+        Some(true),
+        "sweep_cover must be told the standing cover is being adopted so it won't clobber it"
+    );
+}
+
+#[skuld::test]
+fn recover_passes_adopting_only_on_adopt() {
+    // The value handed to `sweep_cover` is `adopt` (Adopt decision), NOT mere
+    // cover presence. The discriminating case is Sweep (intent off + cover
+    // present): a standing cover IS present, yet the transient restore must run
+    // (false) because the standing ruleset is being torn down — so passing
+    // "present" instead of "adopting" would wrongly skip the restore.
+    // (intent, present, expected `adopting` passed to sweep_cover)
+    let table = [
+        (true, true, true),    // Adopt -> skip restore
+        (false, true, false),  // Sweep -> restore MUST run despite cover present
+        (true, false, false),  // Noop (absent) -> nothing to adopt
+        (false, false, false), // Noop (absent)
+    ];
+    for (intent, present, expected) in table {
+        let dir = tempfile::tempdir().unwrap();
+        let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
+        recover_routes_with(
+            dir.path(),
+            |_c, _p| Ok(()),
+            |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
+            intent,
+            || present,
+            |_decision| {},
+        );
+        assert_eq!(
+            *adopting_seen.borrow(),
+            Some(expected),
+            "intent={intent} present={present} => sweep_cover adopting must be {expected}"
+        );
+    }
 }
 
 // decide_cover_recovery ===============================================================================================

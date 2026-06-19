@@ -258,7 +258,7 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     lockdown_recover: L,
 ) where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
-    S: FnOnce(&Path),
+    S: FnOnce(&Path, bool),
     P: FnOnce() -> bool,
     L: FnOnce(CoverRecovery),
 {
@@ -307,23 +307,49 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         debug!("no route-state file found, nothing to recover");
     }
 
-    // Sweep any fail-closed cover left by a crashed update cutover. Runs
-    // UNCONDITIONALLY (outside the route-state guard above): a crash can leave a
-    // cover engaged with the routes already torn down, so there is no
+    // Reconcile the standing lockdown cover FIRST. `standing_held` is the
+    // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
+    // whose lifetime is independent of the cover. Deciding/adopting before the
+    // transient sweep means the subsequent sweep can be told a standing cover is
+    // held and must not clobber it. The recover action keeps the host fail-closed
+    // (Adopt) or disengages (Sweep).
+    let standing_held = lockdown_present();
+    let decision = decide_cover_recovery(lockdown_intent, standing_held);
+    let adopt = matches!(decision, CoverRecovery::Adopt);
+    lockdown_recover(decision);
+
+    // Sweep any transient fail-closed cover left by a crashed update cutover.
+    // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
+    // leave a cover engaged with the routes already torn down, so there is no
     // bridge-routes.json, yet the cover persists. The cover is keyed
     // independently — Windows by fixed WFP GUIDs, macOS by bridge-failclosed.json
-    // — and the sweep is idempotent when no cover is present.
-    sweep_cover(state_dir);
-
-    // Reconcile a standing lockdown cover. `prior_present` is the lockdown
-    // cover's OWN evidence (injected probe), NOT the route-state file, whose
-    // lifetime is independent of the cover. The recover action keeps the host
-    // fail-closed (Adopt) or disengages (Sweep).
-    let prior_present = lockdown_present();
-    lockdown_recover(decide_cover_recovery(lockdown_intent, prior_present));
+    // — and the sweep is idempotent when no cover is present. When a standing
+    // lockdown cover is being adopted, the sweep must leave the lockdown ruleset
+    // untouched (macOS: skip the `pfctl -f /etc/pf.conf` reload that would wipe
+    // it) — passed as `adopt`. Note this is `adopt`, NOT `standing_held`: on a
+    // Sweep (intent off, cover present) the standing ruleset is being torn down,
+    // so the transient restore SHOULD run.
+    sweep_cover(state_dir, adopt);
 }
 
 // Routing trait =======================================================================================================
+
+/// A cover RAII guard that can be DISARMED — consumed without disengaging — so
+/// the persistent WFP/pf filters survive a cutover restart; the new bridge
+/// re-adopts them via `decide_cover_recovery == Adopt`. A trait (not an inherent
+/// method) because `RunningState.lockdown` holds the cover behind the
+/// `Routing::Cover` associated type, and an inherent method is not callable
+/// through that type parameter.
+pub trait CoverGuard {
+    /// Persist the underlying filters without disengaging: consume the guard so
+    /// its `Drop` (the disengage) never runs.
+    ///
+    /// PRECONDITION: call only immediately before process exit. Skipping `Drop`
+    /// also skips releasing the guard's other resources (e.g. the Windows WFP
+    /// engine handle), which the kernel reclaims on exit but which a long-lived
+    /// caller would leak per call.
+    fn disarm(self);
+}
 
 /// OS routing: install split-tunnel routes and query routing state.
 ///
@@ -375,8 +401,9 @@ pub trait Routing: Send + Sync {
 
     /// RAII guard returned by [`install_failclosed_cover`](Self::install_failclosed_cover).
     /// Dropping it disengages the fail-closed cover. `Send` so a cutover
-    /// coordinator can hold it across `.await`.
-    type Cover: Send;
+    /// coordinator can hold it across `.await`; [`CoverGuard`] so a cutover stop
+    /// can disarm it (persist-without-disengage).
+    type Cover: Send + CoverGuard;
 
     /// Engage a fail-closed cover: block all egress except loopback and
     /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover

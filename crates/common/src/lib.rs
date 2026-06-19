@@ -5,6 +5,8 @@ pub mod logging;
 pub mod paths;
 pub mod plugin;
 pub mod protocol;
+pub mod update_marker;
+pub mod verify;
 pub mod version;
 
 // Install the workspace test subscriber + panic hook. The dev-dep

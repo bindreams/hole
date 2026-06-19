@@ -1,11 +1,13 @@
-//! The canonical list of files that comprise a runnable hole BINDIR.
+//! Resolve the canonical BINDIR file *set* to host source paths.
 //!
-//! **This is the single source of truth.** The *set* of files lives in
-//! [`bindir_dest_names`]; [`bindir_files`] resolves each to its host source
-//! path. dev-console and `msi-installer/src/msi_installer/__init__.py:stage_files()`
-//! stage via `cargo xtask stage`, and the installer-manifest conformance
-//! tests (WiX, Tauri) derive their expected payload from `bindir_dest_names`
-//! (via `cargo xtask bindir-names`) so the manifests cannot silently drift.
+//! The set itself — [`bindir_dest_names`] + the [`Os`] it keys on — is the
+//! single source of truth and lives in `xtask-lib` (shared with the bridge
+//! cutover + build.rs). This module re-exports it and adds the disk-resolving
+//! [`bindir_files`]. dev-console and
+//! `msi-installer/src/msi_installer/__init__.py:stage_files()` stage via
+//! `cargo xtask stage`; the installer-manifest conformance tests derive their
+//! expected payload from `bindir_dest_names` (via `cargo xtask bindir-names`)
+//! so the manifests cannot silently drift.
 //!
 //! See issue #143 for the motivation.
 
@@ -15,6 +17,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::manifest::Os;
 use crate::Profile;
+
+pub use xtask_lib::bindir::{bindir_dest_names, plugin_sidecar_names};
 
 /// Source kind for a BINDIR entry. Files use hard-link-then-copy;
 /// directory bundles (macOS `.dSYM`) recurse a copy.
@@ -64,47 +68,6 @@ impl BindirFile {
             dest_name: dest_name.into(),
         }
     }
-}
-
-/// On-disk filenames that must sit next to the bridge binary on `os`, in
-/// staging order. **Single source of truth for the BINDIR payload.** Pure:
-/// no disk access, callable for any `os` from any host — so the installer
-/// conformance tests (`cargo xtask bindir-names`) and [`bindir_files`] share
-/// one definition of what ships.
-///
-/// Add or remove a BINDIR file here. `bindir_tests.rs` asserts the exact set
-/// per OS, and the WiX / Tauri conformance tests fail loudly if a manifest
-/// stops covering it.
-pub fn bindir_dest_names(os: Os) -> Vec<String> {
-    let exe = if os == Os::Windows { ".exe" } else { "" };
-    let mut names = vec![format!("hole{exe}")];
-    // Debug symbols, staged alongside the binary so panic backtraces resolve
-    // frame names + line numbers (else `<unknown>`; see #393). The workspace
-    // `[profile.release] debug = "limited"` + `split-debuginfo = "packed"`
-    // produce a portable PDB/dSYM for this purpose.
-    match os {
-        Os::Windows => names.push("hole.pdb".to_string()),
-        Os::Darwin => names.push("hole.dSYM".to_string()),
-        Os::Linux => {}
-    }
-    names.push(format!("ex-ray{exe}"));
-    names.push(format!("galoshes{exe}"));
-    // wintun.dll — Windows-only DLL loaded by the bridge's TUN path.
-    if os == Os::Windows {
-        names.push("wintun.dll".to_string());
-    }
-    // NOTICES.md — Apache-2.0 §4(d) attribution for the bundled galoshes/garter
-    // components; the installer license dialog shows only GPL-3.0 text, so the
-    // NOTICE file must accompany the binaries on disk.
-    names.push("NOTICES.md".to_string());
-    names
-}
-
-/// SIP003 plugin sidecar binaries (no extension) that every installer must
-/// ship next to the bridge so `resolve_plugin_path` finds them. Subset of
-/// [`bindir_dest_names`]; drives the macOS `externalBin` conformance check.
-pub fn plugin_sidecar_names() -> &'static [&'static str] {
-    &["ex-ray", "galoshes"]
 }
 
 /// The host OS as a manifest [`Os`], or an error on a host outside the

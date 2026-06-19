@@ -431,6 +431,56 @@ fn resolve_cli_log_dir_falls_back_to_default_without_override() {
     assert_eq!(resolved, Some(hole_common::logging::default_log_dir()));
 }
 
+// `bridge cutover` / `bridge unlock` parsing ==========================================================================
+
+#[skuld::test]
+fn bridge_cutover_parses_payload_and_target_version() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "cutover",
+        "--payload",
+        "/tmp/x.msi",
+        "--target-version",
+        "0.3.0",
+    ])
+    .expect("parse bridge cutover");
+    let Some(Command::Bridge {
+        action: BridgeAction::Cutover {
+            payload,
+            target_version,
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Cutover");
+    };
+    assert_eq!(payload, std::path::PathBuf::from("/tmp/x.msi"));
+    assert_eq!(target_version, "0.3.0");
+}
+
+#[skuld::test]
+fn bridge_cutover_requires_both_flags() {
+    assert!(
+        Cli::try_parse_from(["hole", "bridge", "cutover", "--payload", "/tmp/x.msi"]).is_err(),
+        "--target-version is required"
+    );
+    assert!(
+        Cli::try_parse_from(["hole", "bridge", "cutover", "--target-version", "0.3.0"]).is_err(),
+        "--payload is required"
+    );
+}
+
+#[skuld::test]
+fn bridge_unlock_takes_no_args() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "unlock"]).expect("parse bridge unlock");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Unlock
+        })
+    ));
+}
+
 #[skuld::test]
 fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
     assert!(resolve_cli_log_dir(&Command::Version).is_none());
