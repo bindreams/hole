@@ -173,12 +173,7 @@ impl DistHarness {
             // `shadowsocks_service` continues to emit its
             // "TCP listening on ..." INFO line that we rely on.
             .env("HOLE_BRIDGE_LOG", "hole_bridge=debug")
-            .env("HOLE_BRIDGE_SELF_TEST", "1")
-            // #541 experiment: skip the WFP/NDIS startup+teardown diagnostics
-            // (the hang-prone netsh/Get-NetAdapter/pnputil shell-outs) to test
-            // whether they're what poisons the next test's galoshes-server
-            // fixture readiness. Removed once the mechanism is confirmed.
-            .env("HOLE_DIAG_SKIP", "1");
+            .env("HOLE_BRIDGE_SELF_TEST", "1");
 
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly

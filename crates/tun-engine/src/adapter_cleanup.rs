@@ -80,6 +80,76 @@ pub fn remove_adapter(_tun_name: &str) {
     // it. No defensive shell-out needed.
 }
 
+/// Wait until the wintun adapter identified by `luid` is fully removed from
+/// the kernel interface table, or `deadline` elapses.
+///
+/// `WintunCloseAdapter` (run when the engine task's `tun::AsyncDevice` drops)
+/// tears down the userspace adapter and signals the driver, but the kernel
+/// NDIS miniport/LWF detach is **asynchronous** and continues after the call
+/// returns. That lingering detach transiently stalls the host network stack
+/// (loopback `connect`, v2ray-core startup) for the NEXT operation — the
+/// bindreams/hole#541 hang (a co-located galoshes-server fixture's readiness)
+/// and a real disconnect→reconnect race (re-creating `hole-tun` by name while
+/// the prior instance is mid-detach). Awaiting the detach makes teardown leave
+/// the host quiescent.
+///
+/// `ConvertInterfaceLuidToIndex` is a synchronous NSI table lookup keyed by the
+/// 64-bit LUID — NOT a WMI/CIM enumeration like `Get-NetAdapter` (the documented
+/// hang vector), so polling it cannot hang. While the interface exists (even
+/// mid-detach) it returns `NO_ERROR`; once the kernel has removed it the lookup
+/// fails (`ERROR_FILE_NOT_FOUND`). That transition is the genuine external OS
+/// event we wait on; `deadline` is the failure-to-human bound (logged, then we
+/// proceed — never hang) and the inter-poll sleep only avoids a busy loop.
+#[cfg(target_os = "windows")]
+pub async fn await_adapter_detached(luid: u64, deadline: std::time::Duration) {
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Foundation::NO_ERROR;
+    use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+
+    // luid 0 is the "no LUID" sentinel (`Device::tun_luid` on platforms/paths
+    // without one). Never query the table for it.
+    if luid == 0 {
+        return;
+    }
+
+    let net_luid = NET_LUID_LH { Value: luid };
+    let start = Instant::now();
+    loop {
+        let mut index = 0u32;
+        // SAFETY: `net_luid` is an initialized LUID; `index` is a valid out-ptr.
+        let err = unsafe { ConvertInterfaceLuidToIndex(&net_luid, &mut index) };
+        if err != NO_ERROR {
+            // Any non-success means the LUID no longer resolves to a live
+            // interface — the detach has completed (or the interface is
+            // otherwise gone). Either way the host is quiescent for `luid`.
+            tracing::debug!(
+                luid,
+                win32_error = err.0,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "wintun adapter NDIS detach complete"
+            );
+            return;
+        }
+        if start.elapsed() >= deadline {
+            tracing::warn!(
+                luid,
+                deadline_ms = deadline.as_millis() as u64,
+                "wintun adapter NDIS detach did not complete within deadline; \
+                 next TUN start or host network op may transiently stall"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// macOS/Unix utun adapters detach synchronously on FD close, so there is no
+/// async detach to await.
+#[cfg(not(target_os = "windows"))]
+pub async fn await_adapter_detached(_luid: u64, _deadline: std::time::Duration) {}
+
 #[cfg(test)]
 #[path = "adapter_cleanup_tests.rs"]
 mod adapter_cleanup_tests;

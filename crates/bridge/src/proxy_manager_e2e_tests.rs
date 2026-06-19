@@ -365,27 +365,14 @@ mod tun {
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-        eprintln!("[#541-diag] bridge spawned; sending Start");
-        // DIAGNOSTIC (bindreams/hole#541): fail-fast bounds so a hang panics
-        // (firing the DistHarness bridge.log dump + the CI `failure()` artifact
-        // upload) instead of running to the 45-min job timeout with no evidence.
-        // Class-2 subprocess failure-bound (bridge + galoshes/ex-ray are
-        // subprocesses). Removed with the real fix.
-        let resp = tokio::time::timeout(Duration::from_secs(120), harness.send(BridgeRequest::Start { config }))
-            .await
-            .expect("[#541-diag] Start did not return within 120s")
-            .expect("send Start");
+        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
-        eprintln!("[#541-diag] Start Ack; running direct_http_get roundtrip");
 
         // Direct TCP to `http.addr` (the primary non-loopback IPv4) —
         // traffic caught by the TUN split routes, tunneled through
         // shadowsocks, and delivered to the HTTP target. This
         // exercises the transparent-proxy path.
-        let response = tokio::time::timeout(Duration::from_secs(120), direct_http_get(http.addr))
-            .await
-            .expect("[#541-diag] full-tunnel roundtrip timed out — response never arrived");
-        eprintln!("[#541-diag] roundtrip returned {} bytes; sending Stop", response.len());
+        let response = direct_http_get(http.addr).await;
         let body = http_response_body(&response).expect("HTTP response has header terminator");
         assert_eq!(
             body,
@@ -393,14 +380,7 @@ mod tun {
             "expected sentinel body, got {response:?}"
         );
 
-        // DIAGNOSTIC (#541): the roundtrip succeeding but the test hanging here
-        // for 19 min (with Start/roundtrip bounded) localized the wedge to Stop
-        // teardown. Bound it so the panic + bridge.log dump surface which
-        // teardown step wedges. Class-2 subprocess failure-bound.
-        let resp = tokio::time::timeout(Duration::from_secs(60), harness.send(BridgeRequest::Stop))
-            .await
-            .expect("[#541-diag] Stop did not return within 60s — teardown wedged")
-            .expect("send Stop");
+        let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
     }
 
@@ -425,11 +405,12 @@ mod tun {
     /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
     /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs elevation.
     ///
-    /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
-    /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs elevation.
-    ///
-    /// TEMPORARILY un-ignored with fail-fast diagnostics (see `run_full_tunnel_e2e`)
-    /// to capture bridge.log evidence for bindreams/hole#541.
+    /// Regression for bindreams/hole#541: this used to hang only when run after
+    /// `e2e_none_full_tunnel_roundtrip` — the prior TUN bridge's `hole-tun`
+    /// teardown returned before the kernel NDIS detach completed, and the
+    /// lingering detach stalled this test's galoshes-server fixture readiness.
+    /// `Dispatcher::shutdown` now awaits the detach (see
+    /// `tun_engine::adapter_cleanup::await_adapter_detached`).
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,

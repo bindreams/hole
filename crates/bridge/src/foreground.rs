@@ -157,11 +157,8 @@ async fn run_inner(
     // Capture WFP + NDIS state after recovery has had a chance to clean
     // up. Each probe emits a one-line INFO (always) + WARN on anomaly +
     // DEBUG detail (gated).
-    // HOLE_DIAG_SKIP: local-investigation escape hatch for boxes where the
-    // NDIS pnputil snapshot hangs (bindreams/hole#542 neighborhood). NOT a
-    // production gate — never set in CI or shipped configs.
     #[cfg(target_os = "windows")]
-    if std::env::var_os("HOLE_DIAG_SKIP").is_none() {
+    {
         if let Err(e) = tokio::task::spawn_blocking(|| crate::diagnostics::wfp::log_snapshot("startup")).await {
             tracing::warn!(error = %e, "wfp startup snapshot task panicked");
         }

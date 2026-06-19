@@ -941,9 +941,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // log-visible on user machines so bug reports carry the verdict
         // without needing debug mode. Bridge owns the diagnostics
         // module; tun-engine's SystemRoutes::drop can't call these.
-        // HOLE_DIAG_SKIP: #541 experiment gate (see foreground.rs).
         #[cfg(target_os = "windows")]
-        if std::env::var_os("HOLE_DIAG_SKIP").is_none() {
+        {
             crate::diagnostics::wfp::log_snapshot("post-teardown");
             crate::diagnostics::ndis::log_snapshot("post-teardown");
         }
