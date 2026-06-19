@@ -31,7 +31,8 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// 4. `8000::/1` via TUN — captures second half of IPv6 space
 /// 5. Server bypass — `<server_ip>` via `original_gateway` (IPv4 server) or `interface_name` (IPv6 server)
 ///
-/// The server bypass (#5) is omitted when `server_ip` is loopback: a loopback
+/// The server bypass (#5) is omitted when `server_ip` is loopback (checked in
+/// canonical form, so an IPv4-mapped `::ffff:127.0.0.1` counts too): a loopback
 /// destination is reached via the kernel's on-link `127.0.0.0/8` route, which is
 /// more specific than the `/1` splits, so it needs no bypass — and a `/32` (or
 /// `/128`) gateway bypass for loopback would hijack all loopback traffic to a
@@ -586,7 +587,7 @@ fn platform_setup_commands(
     // Bypass: server IP via original gateway/interface. Skipped for loopback —
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
-    if !server_ip.is_loopback() {
+    if !server_ip.to_canonical().is_loopback() {
         match server_ip {
             IpAddr::V4(_) => cmds.push(vec![
                 "route".into(),
@@ -653,7 +654,7 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
     ];
 
     // No bypass was installed for a loopback server, so none to delete.
-    if !server_ip.is_loopback() {
+    if !server_ip.to_canonical().is_loopback() {
         match server_ip {
             IpAddr::V4(_) => cmds.push(vec![
                 "route".into(),
@@ -730,7 +731,7 @@ fn platform_setup_commands(
     // Bypass: server IP via original gateway/interface. Skipped for loopback —
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
-    if !server_ip.is_loopback() {
+    if !server_ip.to_canonical().is_loopback() {
         match server_ip {
             IpAddr::V4(_) => cmds.push(vec![
                 "route".into(),
@@ -790,7 +791,7 @@ fn platform_teardown_commands(_tun_name: &str, server_ip: IpAddr, _interface_nam
     ];
 
     // No bypass was installed for a loopback server, so none to delete.
-    if !server_ip.is_loopback() {
+    if !server_ip.to_canonical().is_loopback() {
         match server_ip {
             IpAddr::V4(_) => cmds.push(vec![
                 "route".into(),

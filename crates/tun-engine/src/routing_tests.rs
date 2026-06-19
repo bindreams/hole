@@ -95,7 +95,7 @@ fn setup_bypass_uses_original_gateway() {
 /// So setup yields only the 4 split routes — no 5th bypass command.
 #[skuld::test]
 fn setup_with_loopback_server_has_no_bypass() {
-    for ip in ["127.0.0.1", "::1"] {
+    for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let server_ip: IpAddr = ip.parse().unwrap();
         let cmds = build_setup_commands("utun7", server_ip, ipv4_gateway(), "en0");
         assert_eq!(
@@ -189,7 +189,7 @@ fn teardown_includes_server_bypass() {
 /// installed for a loopback server, so teardown deletes only the 4 splits.
 #[skuld::test]
 fn teardown_with_loopback_server_has_no_bypass() {
-    for ip in ["127.0.0.1", "::1"] {
+    for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let server_ip: IpAddr = ip.parse().unwrap();
         let cmds = build_teardown_commands("utun7", server_ip, "en0");
         assert_eq!(
