@@ -3,35 +3,9 @@ use crate::manifest::Os;
 use crate::Profile;
 use std::fs;
 
-#[skuld::test]
-fn dest_names_per_os_are_exact() {
-    // Exact-equality is intentional: adding a BINDIR file forces an update
-    // here AND in every installer manifest (caught by the conformance tests).
-    assert_eq!(
-        bindir_dest_names(Os::Windows),
-        vec![
-            "hole.exe",
-            "hole.pdb",
-            "ex-ray.exe",
-            "galoshes.exe",
-            "wintun.dll",
-            "NOTICES.md"
-        ]
-    );
-    assert_eq!(
-        bindir_dest_names(Os::Darwin),
-        vec!["hole", "hole.dSYM", "ex-ray", "galoshes", "NOTICES.md"]
-    );
-    assert_eq!(
-        bindir_dest_names(Os::Linux),
-        vec!["hole", "ex-ray", "galoshes", "NOTICES.md"]
-    );
-}
-
-#[skuld::test]
-fn plugin_sidecars_are_ex_ray_and_galoshes() {
-    assert_eq!(plugin_sidecar_names(), &["ex-ray", "galoshes"]);
-}
+// The exact per-OS name set + the sidecar subset are asserted in
+// `xtask-lib/src/bindir_tests.rs` (their definitions moved there). This file
+// keeps the disk-resolving `bindir_files` + CLI-emission tests.
 
 #[skuld::test]
 fn bindir_names_command_emits_json_for_os() {

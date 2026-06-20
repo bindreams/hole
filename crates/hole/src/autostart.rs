@@ -49,16 +49,27 @@ impl ToggleError {
     }
 }
 
+/// Set the OS autostart registration to `enabled`. Unlike [`toggle`], the caller
+/// specifies the target (the dashboard toggle knows it), so this never reads state.
+pub fn set(autostart: &impl Autostart, enabled: bool) -> Result<(), ToggleError> {
+    if enabled {
+        autostart.enable().map_err(ToggleError::Enable)
+    } else {
+        autostart.disable().map_err(ToggleError::Disable)
+    }
+}
+
+/// Read whether OS autostart is currently registered.
+pub fn is_enabled(autostart: &impl Autostart) -> Result<bool, ToggleError> {
+    autostart.is_enabled().map_err(ToggleError::Check)
+}
+
 /// Flip the OS autostart registration to the opposite of its current state.
 /// Returns the new state on success.
 pub fn toggle(autostart: &impl Autostart) -> Result<bool, ToggleError> {
-    if autostart.is_enabled().map_err(ToggleError::Check)? {
-        autostart.disable().map_err(ToggleError::Disable)?;
-        Ok(false)
-    } else {
-        autostart.enable().map_err(ToggleError::Enable)?;
-        Ok(true)
-    }
+    let target = !is_enabled(autostart)?;
+    set(autostart, target)?;
+    Ok(target)
 }
 
 #[cfg(test)]

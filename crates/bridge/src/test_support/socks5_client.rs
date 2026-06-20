@@ -116,18 +116,35 @@ pub(crate) fn http_response_body(response: &[u8]) -> Option<&[u8]> {
         .map(|i| &response[i + 4..])
 }
 
-/// Perform a SOCKS5 UDP ASSOCIATE exchange through `proxy_addr`, send one
-/// encapsulated datagram addressed at `target`, and return the payload of
-/// the first reply (stripped of its 10-byte SOCKS5 UDP header).
+/// Retransmit cadence for [`socks5_udp_associate`]. UDP is best-effort, so a
+/// correct client re-sends an unanswered datagram rather than assuming the
+/// first one is delivered (DNS resolvers and QUIC do the same). This paces how
+/// often a real packet is put back on the wire — observable protocol behavior,
+/// not a re-poll of a locally-owned condition — so it is not the forbidden
+/// synchronize-via-time pattern; `reply_deadline` is the sole failure bound.
+const UDP_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Perform a SOCKS5 UDP ASSOCIATE exchange through `proxy_addr`, relay an
+/// encapsulated datagram addressed at `target`, and return the payload of the
+/// first reply (stripped of its SOCKS5 UDP header).
 ///
 /// Rolls its own wire encoding (does not depend on
-/// `tun_engine::helpers::socks5_udp`) so the test stays independent of
-/// the implementation under test. Times out after 2s waiting for a
-/// reply.
+/// `tun_engine::helpers::socks5_udp`) so the test stays independent of the
+/// implementation under test.
+///
+/// `reply_deadline` bounds the wait for a reply: a class-2 failure-to-human
+/// bound (CONTRIBUTING.md#test-invariants) on an external round-trip — through
+/// the real bridge SOCKS5 relay and, for the galoshes variant, the whole
+/// ex-ray/galoshes plugin chain — that may never return if the chain is wedged.
+/// Size it to absorb the chain's cold first-datagram latency on a loaded
+/// Windows runner (cf. the ~20s per-leg budgets in `plugin-e2e/src/roundtrip.rs`
+/// for the same chain), never tight enough to fire on a healthy-but-slow round-trip.
+/// The datagram is retransmitted every [`UDP_RETRANSMIT_INTERVAL`] within it.
 pub(crate) async fn socks5_udp_associate(
     proxy_addr: SocketAddr,
     target: SocketAddr,
     payload: &[u8],
+    reply_deadline: Duration,
 ) -> io::Result<Vec<u8>> {
     // TCP control channel for the ASSOCIATE lifecycle.
     let mut control = TcpStream::connect(proxy_addr).await?;
@@ -195,12 +212,23 @@ pub(crate) async fn socks5_udp_associate(
     }
     dgram.extend_from_slice(&target.port().to_be_bytes());
     dgram.extend_from_slice(payload);
-    local_udp.send_to(&dgram, relay_addr).await?;
 
+    // Retransmit until a reply arrives or `reply_deadline` elapses.
+    let deadline = tokio::time::Instant::now() + reply_deadline;
     let mut reply = vec![0u8; 65_536];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(2), local_udp.recv_from(&mut reply))
-        .await
-        .map_err(|_| io::Error::other("SOCKS5 UDP reply timeout"))??;
+    let (n, _) = loop {
+        local_udp.send_to(&dgram, relay_addr).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::other("SOCKS5 UDP reply timeout"));
+        }
+        if let Ok(res) =
+            tokio::time::timeout(UDP_RETRANSMIT_INTERVAL.min(remaining), local_udp.recv_from(&mut reply)).await
+        {
+            break res?;
+        }
+        // No reply within this cadence — retransmit.
+    };
 
     // Strip header. Minimum header size for IPv4: 3 + 1 + 4 + 2 = 10 bytes.
     if n < 4 {

@@ -75,6 +75,22 @@ pub(crate) enum StartDecision {
     Fail(String),
 }
 
+/// Single producer of the user-facing bridge-error string, shared by the elevated
+/// and non-elevated paths so they read identically. The bridge message is shown
+/// raw: it is authored by the bridge running as a system account (LocalSystem /
+/// root) with system-scoped paths, and `ProxyConfig` carries no path field, so it
+/// cannot contain user PII (#475). A future change that threads a user path into a
+/// bridge request and echoes it here must revisit this.
+pub(crate) fn bridge_error_toast(message: &str) -> String {
+    format!("Bridge error: {message}")
+}
+
+/// Toast for a transport failure observed AFTER a successful elevation — the
+/// bridge is unreachable, which is not an elevation denial.
+pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
+    format!("Could not reach the Hole bridge after elevation. {detail} See gui.log for details.")
+}
+
 pub(crate) fn outcome_for_start_response(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> StartDecision {
@@ -84,7 +100,7 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            StartErrorKind::Other => StartDecision::Fail(format!("Bridge error: {message}")),
+            StartErrorKind::Other => StartDecision::Fail(bridge_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
@@ -97,7 +113,7 @@ pub(crate) fn outcome_for_stop_response(
 ) -> StartDecision {
     match result {
         Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Stopped),
-        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(format!("Bridge error: {message}")),
+        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(bridge_error_toast(message)),
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
         Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
@@ -403,23 +419,32 @@ impl Drop for TransitionGuard {
     }
 }
 
-/// Elevation bypasses the pooled bridge channel, so on success confirm
-/// the actual state via a tracked Status instead of assuming: the commit
-/// (inside `BridgeLink::send`) updates the tray and the webview, and the
-/// returned outcome — which the caller persists as the last honored
-/// intent — is derived from that confirmed snapshot, never from the
-/// elevated helper's claim of success.
+/// Translate an elevated send into the final outcome, attributing failure
+/// honestly: a propagated bridge error reads identically to the non-elevated
+/// path, a post-elevation transport failure is not a denial, and only a real
+/// `Cancelled`/`LaunchFailure` keeps the elevation framing.
+///
+/// On success, elevation bypassed the pooled bridge channel, so the actual state
+/// is confirmed via a tracked Status: the commit (inside `BridgeLink::send`)
+/// updates the tray and the webview, and the returned outcome — which the caller
+/// persists as the last honored intent — is derived from that confirmed
+/// snapshot, never from the elevated helper's claim of success.
 async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<ToggleOutcome, String> {
-    if crate::elevation::prompt_elevation(app, request).await {
-        let state = app.state::<AppState>();
-        let _ = state.bridge_send(BridgeRequest::Status).await;
-        Ok(if state.proxy_snapshot().running {
-            ToggleOutcome::Running
-        } else {
-            ToggleOutcome::Stopped
-        })
-    } else {
-        Err("Elevation was denied or failed".into())
+    use crate::elevation::ElevationResult;
+    match crate::elevation::prompt_elevation(app, request).await {
+        ElevationResult::Success => {
+            let state = app.state::<AppState>();
+            let _ = state.bridge_send(BridgeRequest::Status).await;
+            Ok(if state.proxy_snapshot().running {
+                ToggleOutcome::Running
+            } else {
+                ToggleOutcome::Stopped
+            })
+        }
+        ElevationResult::BridgeError(message) => Err(bridge_error_toast(&message)),
+        ElevationResult::Transport(detail) => Err(transport_after_elevation_toast(&detail)),
+        ElevationResult::Cancelled => Err("Elevation was cancelled.".into()),
+        ElevationResult::LaunchFailure => Err("The elevated helper could not start. See gui.log for details.".into()),
     }
 }
 
@@ -822,13 +847,41 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Verify integrity and authenticity.
-    let dest_for_verify = dest.clone();
-    let asset_name = info.asset_name.clone();
+    // Fetch the manifest + signature once; they feed BOTH the local verify and
+    // the bridge's offline re-verify (the bridge must not re-fetch).
     let sha256sums_url = info.sha256sums_url.clone();
     let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
+    let manifest_result =
+        tokio::task::spawn_blocking(move || hole::update::fetch_manifest(&sha256sums_url, &sha256sums_minisig_url))
+            .await;
+    let (sha256sums, sha256sums_minisig) = match manifest_result {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            error!("manifest fetch failed: {e}");
+            app.dialog()
+                .message(format!("Update verification failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("manifest fetch task panicked: {e}");
+            return;
+        }
+    };
+
+    // Verify integrity and authenticity locally before handing it to the bridge.
+    let dest_for_verify = dest.clone();
+    let asset_name = info.asset_name.clone();
+    let sums_for_verify = sha256sums.clone();
+    let minisig_for_verify = sha256sums_minisig.clone();
     let verify_result = tokio::task::spawn_blocking(move || {
-        hole::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
+        hole_common::verify::verify_payload_offline(
+            &dest_for_verify,
+            &asset_name,
+            &sums_for_verify,
+            &minisig_for_verify,
+        )
     })
     .await;
 
@@ -848,26 +901,39 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Run installer (interactive mode).
-    let dest_clone = dest.clone();
-    let install_result = tokio::task::spawn_blocking(move || hole::update::run_installer(&dest_clone, false)).await;
+    // Hand the verified payload to the privileged bridge, which owns the cutover
+    // (binary swap + service restart). The GUI does NOT exit — it self-heals onto
+    // the new image via the version-lockstep relaunch once the bridge is back.
+    // For PR2 the tray's existing user-initiated "install update" click is the
+    // gate, so consent is passed true (PR3 wires an explicit dialog).
+    let apply = BridgeRequest::ApplyUpdate {
+        payload_path: dest.clone(),
+        target_version: info.version.to_string(),
+        consent: true,
+        sha256sums,
+        sha256sums_minisig,
+        asset_name: info.asset_name.clone(),
+        app_dest: hole::update::app_dest_hint(),
+    };
+    let result = app.state::<AppState>().bridge_send(apply).await;
+    drop(download_dir);
 
-    match install_result {
-        Ok(Ok(())) => {
-            // On Windows, exit app to let MSI complete.
-            // On macOS, the installer already copied the app.
-            drop(download_dir);
-            app.exit(0);
-        }
-        Ok(Err(e)) => {
-            error!("installation failed: {e}");
+    match result {
+        Ok(BridgeResponse::Ack) => {}
+        Ok(BridgeResponse::Error { message }) => {
+            error!("bridge rejected update: {message}");
             app.dialog()
-                .message(format!("Installation failed: {e}"))
+                .message(format!("Update failed: {message}"))
                 .title("Update Error")
                 .blocking_show();
         }
+        Ok(other) => error!("unexpected bridge response to update apply: {other:?}"),
         Err(e) => {
-            error!("install task panicked: {e}");
+            error!("update apply failed: {e}");
+            app.dialog()
+                .message(format!("Update failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
         }
     }
 }
@@ -1106,6 +1172,46 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), Strin
             Err(format!("Failed to cancel: {e}"))
         }
     }
+}
+
+// Autostart (OS login-item) ===========================================================================================
+
+/// Read whether the GUI is registered to start at OS login. The OS registration
+/// (Windows Run key / macOS LaunchAgent) is the single source of truth; the
+/// dashboard renders this live rather than from config (#457).
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    crate::autostart::is_enabled(&*app.autolaunch()).map_err(|e| {
+        // Full detail (may embed the executable path) → gui.log; the dashboard
+        // toast gets only the PII-free summary.
+        error!("{e}");
+        e.user_message().to_string()
+    })
+}
+
+/// Register or unregister GUI start-at-login through the same `crate::autostart`
+/// seam this tray uses, then re-sync the tray checkmark from the new OS state.
+/// Returns the live OS state (#457).
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    crate::autostart::set(&*manager, enabled).map_err(|e| {
+        error!("{e}");
+        e.user_message().to_string()
+    })?;
+    // A successful flip must re-derive the tray checkmark from live OS state, or
+    // the two surfaces disagree (the inverse of the bug). rebuild_tray_menu
+    // marshals onto the main thread itself.
+    rebuild_tray_menu(&app);
+    // Report live OS state, not the intent — the OS is the single source of truth.
+    // A successful set establishes `enabled` (enable()/disable()'s post-condition),
+    // so a failed read-back falls back to it rather than lying.
+    Ok(crate::autostart::is_enabled(&*manager).unwrap_or_else(|e| {
+        warn!("autostart read-back after set failed: {e}");
+        enabled
+    }))
 }
 
 // Proxy state sync ====================================================================================================
