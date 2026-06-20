@@ -29,21 +29,47 @@ use tracing::{debug, error, info};
 
 // IPC state ===========================================================================================================
 
-/// State for tracking the in-flight start's cancellation token, plus a
-/// "pre-armed" flag that consumes a Cancel arriving before any Start has
-/// registered its token. Held in a `std::sync::Mutex` because all access is
-/// a trivial read/write of a small struct, never held across `.await`, and
-/// the sync lock avoids any coupling with the async proxy mutex.
+/// Opaque per-attempt id minted by the client (a UUIDv4, in practice). The
+/// bridge only ever compares it for equality — never parses or orders it.
+/// Correctness rests on the client minting a fresh, never-reused id per connect
+/// attempt: that uniqueness is what makes a stale pre-arm un-matchable by any
+/// later attempt (#465).
+type AttemptId = String;
+
+/// The `X-Hole-Attempt-Id` request header carrying the per-attempt idempotency
+/// key on `POST /v1/start` and `POST /v1/cancel`.
+const ATTEMPT_ID_HEADER: &str = "x-hole-attempt-id";
+
+/// Read the attempt id from a request's `X-Hole-Attempt-Id` header. An
+/// absent/garbled header yields the empty string — the fail-safe "no identity"
+/// value: a start with an empty id never consumes a pre-arm, and a cancel with
+/// an empty id never arms one.
+fn attempt_id_from(headers: &axum::http::HeaderMap) -> AttemptId {
+    headers
+        .get(ATTEMPT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Per-attempt start-cancellation handoff. Held in a `std::sync::Mutex` because
+/// all access is a trivial read/write of a small struct, never held across
+/// `.await`, and the sync lock avoids any coupling with the async proxy mutex.
+///
+/// The cancel is scoped to a SPECIFIC attempt id (an idempotency key minted by
+/// the GUI per connect attempt and sent on both Start and Cancel). A pre-arm is
+/// therefore a *named* slot: only the start carrying that exact id consumes it,
+/// so a stale arm left by a cancel whose start already finished — or never
+/// arrived — can never silently cancel a later, unrelated attempt (#465).
 #[derive(Default)]
 pub struct StartCancelState {
-    /// Token of the currently-in-flight start, if any. Set by `handle_start`
-    /// before calling `pm.start_cancellable`; cleared on exit.
-    pub token: Option<CancellationToken>,
-    /// Cancel request arrived while no start was in flight. Consumed by the
-    /// very next `handle_start` invocation, which returns `Cancelled`
-    /// without even attempting to start. Handles the race where a cancel
-    /// reaches the bridge before `handle_start` has stored its token.
-    pub pending: bool,
+    /// Id + token of the currently in-flight start, if any. Single-occupancy:
+    /// a concurrent second start is rejected (409) rather than overwriting.
+    pub in_flight: Option<(AttemptId, CancellationToken)>,
+    /// A cancel that found no matching in-flight start pre-arms here, scoped to
+    /// the exact attempt it named. Consumed only by a start carrying the same
+    /// id; superseded (cleared) by any other *proceeding* start. Last-writer-wins.
+    pub pre_armed: Option<AttemptId>,
 }
 
 /// Shared state for IPC handlers, holding the proxy manager and the
@@ -262,21 +288,20 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
 
 async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
+    headers: axum::http::HeaderMap,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Register the cancellation token BEFORE taking the proxy mutex. If a
-    // pre-armed cancel is already queued, consume it and return immediately
-    // without even attempting the start. If a concurrent start is already
-    // in flight, reject this one — the slot is single-occupancy because a
-    // Cancel targets exactly one in-flight start.
+    let attempt_id = attempt_id_from(&headers);
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-        if cs.pending {
-            cs.pending = false;
-            info!("start request consumed pre-armed cancel");
+        // 1. Named consume: only a start carrying the exact armed id is
+        //    cancelled. A stale arm for a different attempt cannot match here.
+        if !attempt_id.is_empty() && cs.pre_armed.as_deref() == Some(attempt_id.as_str()) {
+            cs.pre_armed = None;
+            info!("start request consumed pre-armed cancel for its attempt");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -284,13 +309,11 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
                 }),
             ));
         }
-        if cs.token.is_some() {
-            // A previous handle_start has already registered its token but
-            // not yet cleared it (still running or blocked on proxy.lock()).
-            // Overwriting the slot would orphan the earlier start from any
-            // future Cancel — the Cancel would signal this new token
-            // instead — so we reject the duplicate with 409 Conflict rather
-            // than silently corrupting the slot.
+        // 2. Single-occupancy: reject a concurrent start. Checked BEFORE the
+        //    self-heal below — this ordering is load-bearing, so a *rejected*
+        //    start never wipes a legitimately pending pre-arm. Overwriting the
+        //    slot would also orphan the in-flight start from a future Cancel.
+        if cs.in_flight.is_some() {
             warn!("concurrent start request rejected — another start is already in flight");
             return Err((
                 StatusCode::CONFLICT,
@@ -299,8 +322,15 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
                 }),
             ));
         }
-        debug_assert!(cs.token.is_none(), "start_cancel token slot invariant");
-        cs.token = Some(token.clone());
+        // 3. Self-heal: a proceeding start that did NOT match supersedes any
+        //    stale arm. A start carrying a different id is, by definition, not
+        //    the attempt the cancel targeted, so dropping that arm cannot lose
+        //    a cancel this start should honor — true for every client.
+        if let Some(stale) = cs.pre_armed.take() {
+            debug!(%stale, "superseding a stale pre-arm with a new, unrelated start");
+        }
+        // 4. Register.
+        cs.in_flight = Some((attempt_id.clone(), token.clone()));
     }
 
     let result = {
@@ -308,13 +338,18 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         pm.start_cancellable(&config, token).await
     };
 
-    // Clear the token slot regardless of outcome so the next start starts
-    // with a clean slate. A Cancel arriving during this tiny window between
-    // start_cancellable returning and us clearing the slot would cancel a
-    // token that is already done — harmless.
+    // Clear the slot. Single-occupancy (the 409 above) guarantees it still holds
+    // OUR attempt: no other start can register while in_flight is Some, and
+    // neither cancel nor stop ever nulls it. Assert that contract rather than
+    // branch on it — a violation (e.g. a future relaxation of single-occupancy)
+    // then fails loudly in tests instead of silently masking.
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-        cs.token = None;
+        debug_assert!(
+            matches!(&cs.in_flight, Some((cur, _)) if *cur == attempt_id),
+            "in_flight slot must still hold this attempt at clear"
+        );
+        cs.in_flight = None;
     }
 
     match result {
@@ -335,19 +370,32 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     }
 }
 
-/// Signal the in-flight start's `CancellationToken` if one is registered,
-/// or pre-arm a cancel for the next start otherwise. Always 200 Ack — the
-/// client's intent is recorded regardless.
+/// Cancel the in-flight start IFF it is the attempt this cancel names, else
+/// pre-arm a cancel scoped to that attempt id. Always 200 Ack — the client's
+/// intent is recorded regardless. A cancel with no id (empty header) and no
+/// exact in-flight match is a 200 no-op: it never arms, so it can never affect
+/// an unrelated future start.
 async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
+    headers: axum::http::HeaderMap,
 ) -> Json<EmptyResponse> {
+    let attempt_id = attempt_id_from(&headers);
     let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-    if let Some(t) = &cs.token {
-        info!("cancelling in-flight proxy start");
-        t.cancel();
-    } else {
-        info!("no start in flight — pre-arming cancel for next start");
-        cs.pending = true;
+    match &cs.in_flight {
+        Some((cur, tok)) if !attempt_id.is_empty() && *cur == attempt_id => {
+            info!("cancelling in-flight proxy start for its attempt");
+            tok.cancel();
+        }
+        // A different attempt (or none) is in flight: do NOT cancel it. Pre-arm
+        // for the named attempt — its start is either still coming or already
+        // gone (in which case the arm is inert and self-healed by a later start).
+        _ if !attempt_id.is_empty() => {
+            info!("no matching start in flight — pre-arming cancel for that attempt");
+            cs.pre_armed = Some(attempt_id);
+        }
+        _ => {
+            info!("cancel with no attempt id and no exact in-flight match — no-op");
+        }
     }
     Json(EmptyResponse {})
 }

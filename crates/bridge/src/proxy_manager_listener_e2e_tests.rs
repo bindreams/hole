@@ -63,13 +63,25 @@ fn base_config(ss: &SsServerHandle, local_port: u16, local_port_http: u16) -> Pr
 
 /// Send `Start` and expect `Ack`. Panics on any other response or IPC error.
 async fn start_expect_ack(harness: &mut DistHarness, config: ProxyConfig) {
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 }
 
 /// Send `Start` and expect `BridgeResponse::Error`. Returns the error message.
 async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> String {
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     match resp {
         BridgeResponse::Error { message } => message,
         other => panic!("expected Error, got {other:?}"),

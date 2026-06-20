@@ -140,6 +140,7 @@ fn send_start_receives_ack() {
         let mut client = BridgeClient::connect(&path).await.unwrap();
         let resp = client
             .send(BridgeRequest::Start {
+                attempt_id: "id-123".into(),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -224,8 +225,96 @@ fn send_cancel_receives_ack() {
         let _mock = spawn_mock_bridge(&path).await;
 
         let mut client = BridgeClient::connect(&path).await.unwrap();
-        let resp = client.send(BridgeRequest::Cancel).await.unwrap();
+        let resp = client
+            .send(BridgeRequest::Cancel {
+                attempt_id: "cancel-1".into(),
+            })
+            .await
+            .unwrap();
         assert_eq!(resp, BridgeResponse::Ack);
+    });
+}
+
+#[skuld::test]
+fn start_and_cancel_send_attempt_id_header() {
+    // Start and Cancel must put their attempt_id on the X-Hole-Attempt-Id
+    // request header — the bridge keys start-cancellation on it (#465). A
+    // capturing server records the header the BridgeClient actually sent.
+    rt().block_on(async {
+        let path = test_socket_path("attempt-id-header");
+        let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mk = |route: &'static str, cap: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>| {
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let cap = cap.clone();
+                async move {
+                    let id = headers
+                        .get("x-hole-attempt-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<missing>")
+                        .to_owned();
+                    cap.lock().unwrap().push((route.to_owned(), id));
+                    Json(EmptyResponse {})
+                }
+            })
+        };
+        let router = axum::Router::new()
+            .route(hole_common::protocol::ROUTE_START, mk("start", captured.clone()))
+            .route(hole_common::protocol::ROUTE_CANCEL, mk("cancel", captured.clone()))
+            .layer(axum::middleware::map_response(
+                |mut resp: axum::response::Response| async move {
+                    resp.headers_mut().insert(
+                        "x-hole-bridge-version",
+                        axum::http::HeaderValue::from_static(hole::version::VERSION),
+                    );
+                    resp
+                },
+            ));
+
+        // One pooled BridgeClient connection serves both requests (keep-alive).
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+                let router = router.clone();
+                async move {
+                    use tower::ServiceExt;
+                    let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        client
+            .send(BridgeRequest::Start {
+                config: hole_common::protocol::ProxyConfig::default(),
+                attempt_id: "id-123".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .send(BridgeRequest::Cancel {
+                attempt_id: "id-123".into(),
+            })
+            .await
+            .unwrap();
+
+        drop(client);
+        let _ = server.await;
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                ("start".to_owned(), "id-123".to_owned()),
+                ("cancel".to_owned(), "id-123".to_owned()),
+            ]
+        );
     });
 }
 
@@ -338,6 +427,7 @@ fn server_error_maps_to_bridge_response_error() {
         let mut client = BridgeClient::connect(&path).await.unwrap();
         let resp = client
             .send(BridgeRequest::Start {
+                attempt_id: "id-123".into(),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -561,6 +651,7 @@ async fn start_against_status(
                 local_port_http: 4074,
                 diagnostic_plugin_tap: false,
             },
+            attempt_id: "test-attempt".into(),
         })
         .await
 }

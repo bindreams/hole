@@ -464,16 +464,16 @@ pub(crate) enum Prompts {
 ///
 /// A manual action supersedes the boot-connect intent (#458): consume the latch
 /// so a later reconciler tick can't override the user's explicit choice.
-pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
+pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String) -> Result<ToggleOutcome, String> {
     app.state::<AppState>().take_pending_startup_connect();
-    set_proxy_enabled_inner(app, enable, Prompts::Allowed).await
+    set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
 }
 
 /// The sole non-interactive connect entry — startup auto-connect (#458).
 /// Connect-only by construction (no `enable` param), so silent-disconnect is
 /// unrepresentable; the shared #462 commit tail stays single-sourced.
 async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled_inner(app, true, Prompts::Forbidden).await
+    set_proxy_enabled_inner(app, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
 
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
@@ -493,7 +493,12 @@ async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
 /// bridge-install gate and the elevation fallback): `Allowed` shows the UI;
 /// `Forbidden` (unattended startup) suppresses both and fails passively. The
 /// disconnect path is always interactive (startup never disconnects).
-async fn set_proxy_enabled_inner(app: &AppHandle, enable: bool, prompts: Prompts) -> Result<ToggleOutcome, String> {
+async fn set_proxy_enabled_inner(
+    app: &AppHandle,
+    enable: bool,
+    prompts: Prompts,
+    attempt_id: String,
+) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
     // Bridge install gate: if the user is trying to enable the proxy and
@@ -533,6 +538,7 @@ async fn set_proxy_enabled_inner(app: &AppHandle, enable: bool, prompts: Prompts
     let result: Result<ToggleOutcome, String> = if enable {
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
+            attempt_id,
         };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {
@@ -619,7 +625,10 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!(enable, "tray: connect/disconnect clicked");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                match set_proxy_enabled(&app_handle, enable).await {
+                // Tray-initiated connect has no paired user Cancel, so a fresh
+                // per-attempt id suffices (it will never be matched by a cancel).
+                let attempt_id = uuid::Uuid::new_v4().to_string();
+                match set_proxy_enabled(&app_handle, enable, attempt_id).await {
                     Ok(ToggleOutcome::Running) | Ok(ToggleOutcome::Stopped) => { /* watcher repaints */ }
                     Ok(ToggleOutcome::Cancelled) => {
                         // Tray never initiates Cancel itself, so this is an
@@ -1145,23 +1154,26 @@ fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindo
 /// Cancelled); the frontend distinguishes the three cases in its
 /// connection state machine.
 #[tauri::command]
-pub async fn start_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled(&app, true).await
+pub async fn start_proxy(app: AppHandle, attempt_id: String) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled(&app, true, attempt_id).await
 }
 
-/// Stop the proxy. See [`start_proxy`].
+/// Stop the proxy. See [`start_proxy`]. Stop carries no attempt id (it is not
+/// cancellable), so a fresh placeholder satisfies the shared signature.
 #[tauri::command]
 pub async fn stop_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled(&app, false).await
+    set_proxy_enabled(&app, false, String::new()).await
 }
 
 /// Cancel an in-flight proxy start. Uses `bridge_send_oneshot` so the
 /// cancel can race an in-flight `start_proxy` on the main pooled
-/// bridge connection. Always returns `Ok(())` on a successful bridge
+/// bridge connection. The `attempt_id` (minted by the frontend for this
+/// connect attempt and shared with `start_proxy`) scopes the cancel to that
+/// exact attempt (#465). Always returns `Ok(())` on a successful bridge
 /// round-trip — the bridge's `/v1/cancel` route is idempotent.
 #[tauri::command]
-pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    match state.bridge_send_oneshot(BridgeRequest::Cancel).await {
+pub async fn cancel_proxy(state: tauri::State<'_, AppState>, attempt_id: String) -> Result<(), String> {
+    match state.bridge_send_oneshot(BridgeRequest::Cancel { attempt_id }).await {
         Ok(BridgeResponse::Ack) => Ok(()),
         Ok(other) => {
             warn!("unexpected response to Cancel: {other:?}");

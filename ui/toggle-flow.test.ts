@@ -116,12 +116,12 @@ describe("toggleFromIdle: outcome handling", () => {
       if (cmd === "start_proxy") return Promise.resolve("running");
       return Promise.resolve();
     });
-    await toggleFromIdle(true, h.deps);
+    await toggleFromIdle(true, h.deps, "attempt-xyz");
     expect(h.state).toBe("connected");
     expect(h.updatePublicIp).toHaveBeenCalled();
-    // Explicit intent on the wire (#462): the direction the user chose,
-    // not a directionless toggle the backend has to re-derive.
-    expect(h.invoke).toHaveBeenCalledWith("start_proxy");
+    // Explicit intent on the wire (#462): the direction the user chose, plus
+    // the per-attempt id (#465) so the bridge can scope a matching cancel.
+    expect(h.invoke).toHaveBeenCalledWith("start_proxy", { attemptId: "attempt-xyz" });
   });
 
   it("transitions to `disconnected` on a Cancelled outcome (bridge-side cancel)", async () => {

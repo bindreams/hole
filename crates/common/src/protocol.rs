@@ -35,12 +35,21 @@ impl Default for FilterMetrics {
 pub enum BridgeRequest {
     Start {
         config: ProxyConfig,
+        /// Per-attempt idempotency key minted by the GUI (a UUID). Sent on the
+        /// wire as the `X-Hole-Attempt-Id` header; the bridge scopes
+        /// start-cancellation to it (#465). A struct field, not a
+        /// client-side-only header, so it survives the elevation
+        /// re-serialization path (`encode_request` / `write_request_file`).
+        attempt_id: String,
     },
     Stop,
-    /// Cancel an in-flight `Start`. Idempotent — if no start is in flight, the
-    /// cancel is pre-armed and consumed by the next start. See the
-    /// `/v1/cancel` route in `openapi.yaml`.
-    Cancel,
+    /// Cancel the in-flight `Start` whose `attempt_id` matches, or pre-arm a
+    /// cancel scoped to that attempt. Idempotent — a cancel that finds no
+    /// matching in-flight start is consumed by the next start carrying the same
+    /// id. See the `/v1/cancel` route in `openapi.yaml`.
+    Cancel {
+        attempt_id: String,
+    },
     Status,
     Reload {
         config: ProxyConfig,

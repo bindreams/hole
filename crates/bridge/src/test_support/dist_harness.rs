@@ -570,9 +570,9 @@ impl BridgeIpcClient {
                     parse_bridge_error(resp).await
                 }
             }
-            BridgeRequest::Start { config } => {
+            BridgeRequest::Start { config, attempt_id } => {
                 let body = serde_json::to_vec(&config)?;
-                let resp = self.http_post(ROUTE_START, body).await?;
+                let resp = self.http_post(ROUTE_START, body, Some(&attempt_id)).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -580,15 +580,15 @@ impl BridgeIpcClient {
                 }
             }
             BridgeRequest::Stop => {
-                let resp = self.http_post(ROUTE_STOP, Vec::new()).await?;
+                let resp = self.http_post(ROUTE_STOP, Vec::new(), None).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
                     parse_bridge_error(resp).await
                 }
             }
-            BridgeRequest::Cancel => {
-                let resp = self.http_post(ROUTE_CANCEL, Vec::new()).await?;
+            BridgeRequest::Cancel { attempt_id } => {
+                let resp = self.http_post(ROUTE_CANCEL, Vec::new(), Some(&attempt_id)).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -597,7 +597,7 @@ impl BridgeIpcClient {
             }
             BridgeRequest::Reload { config } => {
                 let body = serde_json::to_vec(&config)?;
-                let resp = self.http_post(ROUTE_RELOAD, body).await?;
+                let resp = self.http_post(ROUTE_RELOAD, body, None).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -640,7 +640,7 @@ impl BridgeIpcClient {
             BridgeRequest::TestServer { entry } => {
                 let req_body = TestServerRequest { entry };
                 let body = serde_json::to_vec(&req_body)?;
-                let resp = self.http_post(ROUTE_TEST_SERVER, body).await?;
+                let resp = self.http_post(ROUTE_TEST_SERVER, body, None).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let parsed: TestServerResponse = serde_json::from_slice(&body)?;
@@ -653,7 +653,7 @@ impl BridgeIpcClient {
             }
             BridgeRequest::SetLockdown { enabled } => {
                 let body = serde_json::to_vec(&LockdownRequest { enabled })?;
-                let resp = self.http_post(ROUTE_LOCKDOWN, body).await?;
+                let resp = self.http_post(ROUTE_LOCKDOWN, body, None).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -678,7 +678,7 @@ impl BridgeIpcClient {
                     asset_name,
                     app_dest,
                 })?;
-                let resp = self.http_post(ROUTE_UPDATE_APPLY, body).await?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, None).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -703,13 +703,17 @@ impl BridgeIpcClient {
         &mut self,
         path: &str,
         body: Vec<u8>,
+        attempt_id: Option<&str>,
     ) -> Result<http::Response<hyper::body::Incoming>, HarnessError> {
-        let req = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method("POST")
             .uri(path)
             .header("host", "localhost")
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)))?;
+            .header("content-type", "application/json");
+        if let Some(id) = attempt_id {
+            builder = builder.header("x-hole-attempt-id", id);
+        }
+        let req = builder.body(Full::new(Bytes::from(body)))?;
         self.sender.ready().await?;
         #[allow(clippy::disallowed_methods)] // ready() called above
         Ok(self.sender.send_request(req).await?)
