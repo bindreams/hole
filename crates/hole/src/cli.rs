@@ -168,6 +168,11 @@ pub(crate) enum BridgeAction {
         /// Read the IPC command from this file instead of --then-send
         #[arg(long, conflicts_with = "then_send")]
         then_send_file: Option<std::path::PathBuf>,
+        /// Write the typed outcome (ElevatedOutcome JSON) here for an elevated
+        /// parent to read back across stripped stdio. Meaningful only with the
+        /// file-based request path, so it conflicts with the base64 channel.
+        #[arg(long, conflicts_with = "then_send")]
+        result_file: Option<std::path::PathBuf>,
     },
     /// Send a single IPC command to the bridge (requires elevation)
     IpcSend {
@@ -177,6 +182,11 @@ pub(crate) enum BridgeAction {
         /// Read the JSON request from this file
         #[arg(long, conflicts_with = "base64")]
         request_file: Option<std::path::PathBuf>,
+        /// Write the typed outcome (ElevatedOutcome JSON) here for an elevated
+        /// parent to read back across stripped stdio. Meaningful only with the
+        /// file-based request path, so it conflicts with the base64 channel.
+        #[arg(long, conflicts_with = "base64")]
+        result_file: Option<std::path::PathBuf>,
     },
     /// Internal: perform the update cutover. On Windows the bridge spawns this
     /// detached as LocalSystem (a service cannot SCM-restart itself); it swaps
@@ -493,11 +503,16 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         BridgeAction::GrantAccess {
             then_send,
             then_send_file,
-        } => handle_grant_access(then_send, then_send_file),
-        BridgeAction::IpcSend { base64, request_file } => match (base64, request_file) {
+            result_file,
+        } => handle_grant_access(then_send, then_send_file, result_file),
+        BridgeAction::IpcSend {
+            base64,
+            request_file,
+            result_file,
+        } => match (base64, request_file) {
             (Some(b64), _) => handle_ipc_send_b64(&b64),
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-                Ok(request) => send_bridge_request(request),
+                Ok(request) => send_bridge_request(request, result_file.as_deref()),
                 Err(e) => {
                     cli_log!(error, "{e}");
                     1
@@ -684,7 +699,11 @@ fn bridge_log_watch(path: &std::path::Path, tail_lines: usize) -> i32 {
 /// `klist purge`/`nltest` only affect Kerberos/AD tickets, not local
 /// group tokens. Adding the user's own SID directly to the DACL provides
 /// immediate access — a user's own SID is always present in their token.
-fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::path::PathBuf>) -> i32 {
+fn handle_grant_access(
+    then_send: Option<String>,
+    then_send_file: Option<std::path::PathBuf>,
+    result_file: Option<std::path::PathBuf>,
+) -> i32 {
     // Create group + add user + (on Windows) write installer SID file.
     if let Err(e) = hole_bridge::ipc::prepare_ipc_access() {
         cli_log!(error, "failed to prepare IPC access: {e}");
@@ -726,7 +745,7 @@ fn handle_grant_access(then_send: Option<String>, then_send_file: Option<std::pa
     match (then_send, then_send_file) {
         (Some(b64), _) => handle_ipc_send_b64(&b64),
         (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-            Ok(request) => send_bridge_request(request),
+            Ok(request) => send_bridge_request(request, result_file.as_deref()),
             Err(e) => {
                 cli_log!(error, "{e}");
                 1
@@ -758,16 +777,27 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
         }
     };
 
-    send_bridge_request(request)
+    send_bridge_request(request, None)
 }
 
-/// Send a `BridgeRequest`, mapping the response to an exit code (0 on
-/// success, 1 on error). Used by `bridge ipc-send` which doesn't print the
-/// response body.
-fn send_bridge_request(request: hole_common::protocol::BridgeRequest) -> i32 {
+/// Send a `BridgeRequest`, mapping the response to an exit code (0 on success,
+/// 1 on error). Used by `bridge ipc-send`, which doesn't print the response
+/// body. When `result_file` is `Some` (the elevated path), also mirror the
+/// typed outcome there for the parent to read back across stripped stdio; the
+/// exit-code map is unchanged and a result-file write failure only logs a warn.
+fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_file: Option<&std::path::Path>) -> i32 {
     use hole_common::protocol::BridgeResponse;
 
-    match send_bridge_request_inner(request) {
+    let inner = send_bridge_request_inner(request);
+
+    if let Some(path) = result_file {
+        let outcome = crate::elevation::classify_elevated_send(&inner);
+        if let Err(e) = crate::elevation::write_result_file(path, &outcome) {
+            cli_log!(warn, "failed to write result file: {e}");
+        }
+    }
+
+    match inner {
         Ok(BridgeResponse::Ack) => 0,
         Ok(BridgeResponse::Status { .. }) => 0,
         Ok(BridgeResponse::Metrics { .. }) => 0,
