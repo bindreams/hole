@@ -11,9 +11,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StatusResponse,
-    TestServerRequest, TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
-    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
-    ROUTE_VERSION,
+    TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL,
+    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    ROUTE_TEST_SERVER, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -82,6 +82,10 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// (`X-Hole-Bridge-Version`) and served at `/v1/version` so a
     /// freshly-updated GUI can detect a still-old bridge.
     pub version: String,
+    /// Service log dir — where the cutover marker is written (GUI-readable).
+    pub log_dir: PathBuf,
+    /// Service state dir — the same-volume parent for the cutover staging.
+    pub state_dir: PathBuf,
 }
 
 // Server ==============================================================================================================
@@ -102,10 +106,12 @@ impl IpcServer {
     /// Removes any stale socket file, creates parent directories, binds with
     /// restrictive initial permissions (umask on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
-    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+    pub fn bind_with_dirs<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
         version: &str,
+        log_dir: PathBuf,
+        state_dir: PathBuf,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -119,6 +125,8 @@ impl IpcServer {
             proxy,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
+            log_dir,
+            state_dir,
         });
         let router = build_router(state, version);
         Ok(Self {
@@ -126,6 +134,19 @@ impl IpcServer {
             router,
             socket_path: path.to_owned(),
         })
+    }
+
+    /// Test-only shim: production calls `bind_with_dirs`. The cutover dirs
+    /// default to a fresh temp dir so per-test markers/staging don't collide
+    /// across the shared skuld process.
+    #[cfg(test)]
+    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<P, R>>>,
+        version: &str,
+    ) -> std::io::Result<Self> {
+        let tmp = tempfile::tempdir()?.keep();
+        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp)
     }
 
     /// Accept and handle one client connection, then return.
@@ -232,6 +253,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
+        .route(ROUTE_UPDATE_APPLY, axum::routing::post(handle_update_apply::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
             move |mut resp: axum::response::Response| {
@@ -400,6 +422,222 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             ))
         }
     }
+}
+
+async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+    Json(req): Json<UpdateApplyRequest>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let log_dir = &state.log_dir;
+
+    // Single-occupancy: refuse a second cutover.
+    if crate::cutover::apply::cutover_in_progress(log_dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                message: "a cutover is already in progress".into(),
+            }),
+        ));
+    }
+
+    let lockdown_on = { state.proxy.lock().await.lockdown_enabled() };
+
+    // Consent seam: a lockdown-off update without explicit consent is refused
+    // with 403 — a client precondition failure (the caller must supply consent),
+    // not a server fault.
+    match crate::cutover::apply::consent_gate(lockdown_on, req.consent) {
+        Ok(()) => {}
+        Err(crate::cutover::apply::ConsentError::Required) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    message: "a lockdown-off update requires explicit consent".into(),
+                }),
+            ));
+        }
+    }
+
+    // macOS destination pre-flight (before the marker): the GUI-supplied `.app`
+    // swap target is a hint, never a trust anchor — the bridge anchors it to a
+    // genuine `com.hole.app` bundle and a swap-capable volume. A bad target or an
+    // unswappable volume is a 400 (caller precondition on the destination,
+    // distinct from a payload-bytes failure), so it precedes the payload stage.
+    // Windows skips it (the SCM install dir is canonical).
+    #[cfg(target_os = "macos")]
+    let app_dest = match crate::cutover::apply::preflight_app_dest(req.app_dest.as_deref().map(std::path::Path::new)) {
+        Ok(dest) => Some(dest),
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: format!("invalid update destination: {e}"),
+                }),
+            ));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let app_dest: Option<std::path::PathBuf> = None;
+
+    // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE resolving or
+    // touching the shared private staging dir. `write_new` is `create-new`: two
+    // concurrent requests cannot both win (the 409 read-check above is only a
+    // fast-path; this is the race-free guard), so ONLY the marker-winner ever
+    // stages a payload. A loser 409s here and never touches the shared staging
+    // dir — otherwise its `stage_payload` (which clears+rewrites the fixed dir)
+    // could clobber the winner's already-verified copy mid-extract, reopening the
+    // verify/use TOCTOU via a privileged write on the loser's behalf.
+    let marker = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: state.version.clone(),
+        to_version: req.target_version.clone(),
+        pid: std::process::id(),
+        started_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
+        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cutover marker write failed: {e}"),
+            )
+        };
+        return Err((code, Json(ErrorResponse { message })));
+    }
+
+    // Stage the caller-supplied payload into a bridge-private, non-attacker-
+    // writable directory, then verify and extract ONLY that copy — never
+    // `req.payload_path` again. This closes the verify/extract TOCTOU: a
+    // hole-group member can pass a genuinely-signed payload (verify passes) and
+    // overwrite the file before extract opens it; copying first makes the verified
+    // bytes the extracted bytes. The marker claimed above guarantees a single
+    // occupant, so the fixed staging path is never raced. The copy and the marker
+    // are cleared on every exit path below.
+    let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("could not resolve private payload dir: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Stage + re-verify on a blocking thread (filesystem copy + minisign/SHA-256),
+    // off the async worker. The GUI is untrusted in the bridge's model, so a
+    // verify failure is a corruption/tamper event the user must see distinctly
+    // (422), while a staging I/O failure is a server fault (500).
+    let source = std::path::PathBuf::from(&req.payload_path);
+    let stage_dir = private_dir.clone();
+    let asset_name = req.asset_name.clone();
+    let sha256sums = req.sha256sums.clone();
+    let sha256sums_minisig = req.sha256sums_minisig.clone();
+    let staged_copy = tokio::task::spawn_blocking(move || {
+        let copy = crate::cutover::extract::stage_payload(&source, &stage_dir).map_err(StageError::Io)?;
+        crate::cutover::extract::reverify(&copy, &asset_name, &sha256sums, &sha256sums_minisig)
+            .map_err(StageError::Verify)?;
+        Ok::<_, StageError>(copy)
+    })
+    .await;
+    let payload = match staged_copy {
+        Ok(Ok(copy)) => copy,
+        Ok(Err(StageError::Verify(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    message: format!("payload verification failed: {e}"),
+                }),
+            ));
+        }
+        Ok(Err(StageError::Io(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("payload staging failed: {e}"),
+                }),
+            ));
+        }
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("payload staging task panicked: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Extract the bare binaries from the PRIVATE copy onto the destination volume.
+    // The extract shells out to a blocking `msiexec`/`hdiutil`, so run it on a
+    // blocking thread to keep it off the async worker. A failure clears the marker
+    // so the GUI does not mask Disconnected forever.
+    let state_dir = state.state_dir.clone();
+    let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
+    let staged = match extracted {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction failed: {e}"),
+                }),
+            ));
+        }
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction task panicked: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
+    // a detached child (returns naturally); macOS runs the actor on a detached
+    // task that SIGTERMs THIS process only after this 200 is on the wire.
+    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
+        let _ = hole_common::update_marker::clear(log_dir);
+        let _ = std::fs::remove_dir_all(&private_dir);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("cutover failed to start: {e}"),
+            }),
+        ));
+    }
+
+    // Best-effort: the extracted images now live on the destination volume, so the
+    // private copy has served its purpose. The next cutover's `stage_payload` also
+    // clears any leftover, so a failure here is harmless.
+    let _ = std::fs::remove_dir_all(&private_dir);
+
+    info!(target_version = %req.target_version, "update cutover kicked off");
+    Ok(Json(EmptyResponse {}))
+}
+
+/// Distinguishes a payload verify failure (422 — corruption/tamper) from a
+/// staging I/O failure (500 — server fault) so the handler maps each to its own
+/// HTTP status after the combined stage+verify blocking step.
+enum StageError {
+    Io(std::io::Error),
+    Verify(hole_common::verify::VerifyError),
 }
 
 async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(

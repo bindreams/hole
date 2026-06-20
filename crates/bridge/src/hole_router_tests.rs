@@ -158,7 +158,6 @@ fn sample_dns_cfg() -> DnsConfig {
         enabled: true,
         servers: vec!["192.0.2.1".parse().unwrap()],
         protocol: DnsProtocol::PlainUdp,
-        intercept_udp53: true,
     }
 }
 

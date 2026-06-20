@@ -221,6 +221,10 @@ impl Drop for MockCover {
     fn drop(&mut self) {}
 }
 
+impl tun_engine::routing::CoverGuard for MockCover {
+    fn disarm(self) {}
+}
+
 struct MockRoutes {
     state_dir: PathBuf,
 }
@@ -429,6 +433,46 @@ async fn post_reload(client: &mut TestClient, config: &ProxyConfig) -> http::Res
     client.send(req).await
 }
 
+async fn post_update_apply(
+    client: &mut TestClient,
+    payload_path: &str,
+    consent: bool,
+) -> http::Response<hyper::body::Incoming> {
+    // Manifest/sig/asset_name are placeholders: the consent (403) and
+    // single-occupancy (409) gates fire BEFORE re-verification, so these tests
+    // never reach the verify step. The 422 path has its own dedicated test.
+    post_update_apply_full(client, payload_path, consent, "x  hole.msi\n", "sig", "hole.msi", None).await
+}
+
+async fn post_update_apply_full(
+    client: &mut TestClient,
+    payload_path: &str,
+    consent: bool,
+    sha256sums: &str,
+    sha256sums_minisig: &str,
+    asset_name: &str,
+    app_dest: Option<&str>,
+) -> http::Response<hyper::body::Incoming> {
+    let body = serde_json::to_vec(&hole_common::protocol::UpdateApplyRequest {
+        payload_path: payload_path.into(),
+        target_version: "0.3.0".into(),
+        consent,
+        sha256sums: sha256sums.into(),
+        sha256sums_minisig: sha256sums_minisig.into(),
+        asset_name: asset_name.into(),
+        app_dest: app_dest.map(|s| s.to_string()),
+    })
+    .unwrap();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(hole_common::protocol::ROUTE_UPDATE_APPLY)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    client.send(req).await
+}
+
 // Tests ===============================================================================================================
 
 #[skuld::test]
@@ -620,6 +664,250 @@ fn lockdown_post_errors_without_state_dir() {
             "lockdown POST without a state_dir must error, not silently succeed"
         );
         let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn update_apply_lockdown_off_without_consent_is_refused() {
+    // The consent seam: a lockdown-off update without consent must be refused
+    // BEFORE any extract/spawn, with 403 (a client precondition failure, not a
+    // server error). `mock_proxy()` defaults lockdown off.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-no-consent");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_update_apply(&mut client, "/tmp/x.msi", false).await;
+        assert_eq!(
+            resp.status(),
+            403,
+            "lockdown-off update without consent must be refused with 403"
+        );
+        let _ = resp.into_body().collect().await;
+        // No marker was written (the refusal preceded the marker write).
+        assert!(hole_common::update_marker::read(&log_dir).is_none());
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn update_apply_with_existing_marker_is_409() {
+    // Single-occupancy: a present marker means a cutover is already in flight.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-409");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        hole_common::update_marker::write(
+            &log_dir,
+            &hole_common::update_marker::MarkerInfo {
+                version: hole_common::update_marker::MARKER_VERSION,
+                from_version: "0.2.0".into(),
+                to_version: "0.3.0".into(),
+                pid: 1,
+                started_at_unix: 0,
+            },
+        )
+        .unwrap();
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the 409 occupancy check (which runs first) is what fires.
+        let resp = post_update_apply(&mut client, "/tmp/x.msi", true).await;
+        assert_eq!(resp.status(), 409, "a second cutover must be rejected");
+        let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// Build a genuine `com.hole.app` bundle under `parent` so the macOS app_dest
+/// pre-flight passes and a test can reach the payload re-verify step. On Windows
+/// there is no app_dest gate, so callers pass `None` instead.
+#[cfg(target_os = "macos")]
+fn make_valid_app_dest(parent: &std::path::Path) -> std::path::PathBuf {
+    let app = parent.join("Hole.app");
+    let contents = app.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::write(
+        contents.join("Info.plist"),
+        "<?xml version=\"1.0\"?>\n<plist><dict>\n<key>CFBundleIdentifier</key>\n<string>com.hole.app</string>\n</dict></plist>\n",
+    )
+    .unwrap();
+    app
+}
+
+#[skuld::test]
+fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
+    // The bridge re-verifies the payload offline before anything irreversible.
+    // A present payload whose manifest is not signed by the production key (the
+    // GUI is untrusted) is refused with 422. The marker is claimed before staging
+    // (single-occupancy), then cleared on the verify failure — so no cutover is
+    // left in progress and no actor is spawned.
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-422");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let payload = payload_dir.path().join("hole.msi");
+        std::fs::write(&payload, b"hello world").unwrap();
+
+        // macOS gates the destination before the payload; supply a genuine bundle
+        // so the re-verify step is what fails here. Windows has no app_dest gate.
+        #[cfg(target_os = "macos")]
+        let app_dest_dir = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let app_dest = make_valid_app_dest(app_dest_dir.path());
+        #[cfg(target_os = "macos")]
+        let app_dest = Some(app_dest.to_string_lossy().into_owned());
+        #[cfg(not(target_os = "macos"))]
+        let app_dest: Option<String> = None;
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the 403/409 gates pass and re-verification is reached;
+        // the manifest is well-formed but not production-signed.
+        let resp = post_update_apply_full(
+            &mut client,
+            &payload.to_string_lossy(),
+            true,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  hole.msi\n",
+            "untrusted comment: forged\nnot-a-real-signature\n",
+            "hole.msi",
+            app_dest.as_deref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 422, "an unverifiable payload must be refused with 422");
+        let _ = resp.into_body().collect().await;
+        // The marker is claimed then cleared on the verify failure — no cutover
+        // is left in progress.
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a verify failure must clear the marker it claimed"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// A post-marker failure must clear the marker (else the GUI masks Disconnected
+/// and a later shutdown wrongly disarms the cover). A non-existent payload passes
+/// consent/409/app_dest, the marker is claimed, then `stage_payload` fails to copy
+/// the source (I/O) → 500 and the marker is cleared. macOS-gated: there the
+/// private staging dir is the per-test `state_dir`, so concurrent tests don't
+/// collide; on Windows it is the shared install dir (production serializes that via
+/// the single global marker, which per-test markers can't reproduce). The extract/
+/// spawn clears are unreachable in-test (they need a production-signed payload) but
+/// use this same proven clear-on-failure pattern.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn update_apply_staging_io_failure_clears_the_marker() {
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-stage-io");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let missing = payload_dir.path().join("does-not-exist.dmg");
+
+        let app_dest_dir = tempfile::tempdir().unwrap();
+        let app_dest = Some(make_valid_app_dest(app_dest_dir.path()).to_string_lossy().into_owned());
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_update_apply_full(
+            &mut client,
+            &missing.to_string_lossy(),
+            true,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9  hole.dmg\n",
+            "untrusted comment: forged\nnot-a-real-signature\n",
+            "hole.dmg",
+            app_dest.as_deref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 500, "a staging I/O failure is a server fault");
+        let _ = resp.into_body().collect().await;
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a post-marker staging failure must clear the marker it claimed"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// macOS: a `.app` swap target whose bundle identity is not `com.hole.app` (a
+/// spoofed `Evil.app`) is refused 400 BEFORE the marker — the bridge anchors the
+/// swap to a root-trusted identity, never the GUI-supplied path. A destination
+/// precondition is distinct from a payload-verify failure (which is 422). Runs on
+/// the macOS unprivileged lane (the rejection precedes any privileged step).
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn update_apply_spoofed_app_dest_is_400_no_marker() {
+    rt().block_on(async {
+        let path = test_socket_path("update-apply-app-dest-422");
+        let log_dir = tempfile::tempdir().unwrap().keep();
+        let payload_dir = tempfile::tempdir().unwrap();
+        let payload = payload_dir.path().join("hole.dmg");
+        std::fs::write(&payload, b"hello world").unwrap();
+
+        // A bundle with a foreign CFBundleIdentifier — the security case.
+        let evil_dir = tempfile::tempdir().unwrap();
+        let evil = evil_dir.path().join("Evil.app");
+        std::fs::create_dir_all(evil.join("Contents").join("MacOS")).unwrap();
+        std::fs::write(
+            evil.join("Contents").join("Info.plist"),
+            "<?xml version=\"1.0\"?>\n<plist><dict>\n<key>CFBundleIdentifier</key>\n<string>com.evil.app</string>\n</dict></plist>\n",
+        )
+        .unwrap();
+
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        // Consent true so the destination gate (not consent/409) is what fires;
+        // the payload/manifest never matter because app_dest is checked first.
+        let resp = post_update_apply_full(
+            &mut client,
+            &payload.to_string_lossy(),
+            true,
+            "deadbeef  hole.dmg\n",
+            "sig",
+            "hole.dmg",
+            Some(&evil.to_string_lossy()),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "a spoofed bundle identity must be refused with 400");
+        let _ = resp.into_body().collect().await;
+        assert!(
+            hole_common::update_marker::read(&log_dir).is_none(),
+            "a destination rejection must not write a marker"
+        );
 
         drop(client);
         handle.abort();

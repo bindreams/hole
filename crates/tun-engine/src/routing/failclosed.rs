@@ -41,6 +41,18 @@ pub struct Cover {
     _inner: platform::Cover,
 }
 
+impl crate::routing::CoverGuard for Cover {
+    /// Persist the underlying filters without disengaging: consumes the guard so
+    /// its `Drop` does not run. The filters are persistent-by-design, so leaving
+    /// them in force across a cutover restart is exactly correct — the new
+    /// bridge re-adopts them. Forgetting the inner guard also skips its other
+    /// teardown (the Windows WFP engine handle close), so call only immediately
+    /// before process exit (see [`CoverGuard::disarm`]).
+    fn disarm(self) {
+        std::mem::forget(self._inner);
+    }
+}
+
 /// Engage the cover blocking all egress except loopback and `server_ip`.
 /// `state_dir` is where macOS persists its enable token for crash recovery
 /// (unused on Windows). On failure the host is left uncovered.
@@ -50,10 +62,13 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
     })
 }
 
-/// Sweep a cover left behind by a crashed run. Idempotent — a no-op when no
-/// cover is present. Called from `routing::recover_routes` at bridge startup.
-pub fn recover_cover(state_dir: &Path) {
-    platform::recover_cover(state_dir);
+/// Sweep a transient cover left behind by a crashed run. Idempotent — a no-op
+/// when no cover is present. Called from `routing::recover_routes` at bridge
+/// startup. When `adopting` is true a standing lockdown cover is being adopted,
+/// so the transient restore must leave the lockdown ruleset in force (macOS
+/// skips the `/etc/pf.conf` reload).
+pub fn recover_cover(state_dir: &Path, adopting: bool) {
+    platform::recover_cover(state_dir, adopting);
 }
 
 /// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
@@ -90,8 +105,28 @@ pub fn engage_lockdown(
 /// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
 /// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
 /// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
+/// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
+/// startup recovery has no caller to act on it.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
-    platform::recover_lockdown(decision, state_dir);
+    use crate::routing::CoverRecovery::*;
+    match decision {
+        Noop | Adopt => platform::recover_lockdown(decision, state_dir),
+        Sweep => {
+            if let Err(e) = disengage_lockdown(state_dir) {
+                tracing::warn!(error = %e, "lockdown sweep could not disengage the cover");
+            }
+        }
+    }
+}
+
+/// Fail-loud disengage of a standing lockdown cover, with no running bridge.
+/// Unlike [`recover_lockdown`]'s best-effort `Sweep`, this PROPAGATES failure so
+/// the `bridge unlock` escape hatch can refuse to claim success (and refuse to
+/// flip the intent off) while the cover is still engaged. An absent cover is
+/// `Ok` (nothing to disengage); a real failure (not elevated / engine open /
+/// pfctl) is `Err`.
+pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+    platform::disengage_lockdown(state_dir)
 }
 
 /// Whether a standing lockdown cover from a prior run is present — the recovery

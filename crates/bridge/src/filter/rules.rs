@@ -15,6 +15,10 @@ use super::matcher::Matcher;
 pub struct CompiledRule {
     pub matcher: Matcher,
     pub action: FilterAction,
+    /// Index of this rule in the user's original `Vec<FilterRule>`. Kept so
+    /// `decide` and the block log report the user's rule number even after
+    /// earlier invalid rules are dropped from `rules`.
+    pub original_index: usize,
 }
 
 /// A compiled ruleset, ready for the filter engine. Lifetime: created
@@ -48,6 +52,7 @@ impl RuleSet {
                 Ok(matcher) => compiled.push(CompiledRule {
                     matcher,
                     action: rule.action,
+                    original_index: i,
                 }),
                 Err(err) => dropped.push(InvalidFilter {
                     index,
@@ -56,12 +61,7 @@ impl RuleSet {
             }
         }
 
-        let has_domain_rules = compiled.iter().any(|r| {
-            matches!(
-                r.matcher,
-                Matcher::ExactDomain(_) | Matcher::SubdomainDomain(_) | Matcher::WildcardDomain(_)
-            )
-        });
+        let has_domain_rules = compiled.iter().any(|r| r.matcher.is_domain());
 
         Self {
             rules: compiled,

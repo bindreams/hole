@@ -109,13 +109,12 @@ describe("init ordering", () => {
           filters: [],
           local_port: 4073,
           local_port_http: 4074,
-          start_on_login: false,
           proxy_server_enabled: true,
           proxy_socks5: true,
           proxy_http: false,
           on_startup: "restore_last_state",
           theme: "dark",
-          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
           diagnostic_plugin_tap: false,
           // Backend-owned fields present in the snapshot — must NOT round-trip.
           enabled: true,
@@ -146,7 +145,6 @@ describe("init ordering", () => {
       "proxy_socks5",
       "selected_server",
       "servers",
-      "start_on_login",
       "theme",
     ]);
     for (const s of settings.servers as Record<string, unknown>[]) {

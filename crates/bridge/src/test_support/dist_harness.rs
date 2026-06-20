@@ -32,8 +32,9 @@ use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, LockdownRequest, MetricsResponse,
-    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN,
-    ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
+    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    ROUTE_UPDATE_APPLY,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -320,8 +321,17 @@ impl Drop for DistHarness {
                         };
                         rt.block_on(async move {
                             let mut client = client;
-                            if client.send(BridgeRequest::Stop).await.is_err() {
-                                return false;
+                            // Bound the Stop send: a WEDGED bridge (a hung
+                            // Start/teardown that never serves Stop) would
+                            // otherwise block this Drop forever — turning a fast
+                            // test failure into an infinite hang (nextest SLOW →
+                            // job timeout), with no panic-dump and no failure()
+                            // artifact. Time-bound, then fall back to kill below.
+                            // Class-2 subprocess failure-bound, not intra-process sync.
+                            match tokio::time::timeout(Duration::from_secs(10), client.send(BridgeRequest::Stop)).await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(_)) | Err(_) => return false,
                             }
                             drop(client);
 
@@ -644,6 +654,31 @@ impl BridgeIpcClient {
             BridgeRequest::SetLockdown { enabled } => {
                 let body = serde_json::to_vec(&LockdownRequest { enabled })?;
                 let resp = self.http_post(ROUTE_LOCKDOWN, body, None).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
+            BridgeRequest::ApplyUpdate {
+                payload_path,
+                target_version,
+                consent,
+                sha256sums,
+                sha256sums_minisig,
+                asset_name,
+                app_dest,
+            } => {
+                let body = serde_json::to_vec(&UpdateApplyRequest {
+                    payload_path: payload_path.to_string_lossy().into_owned(),
+                    target_version,
+                    consent,
+                    sha256sums,
+                    sha256sums_minisig,
+                    asset_name,
+                    app_dest,
+                })?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, None).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {

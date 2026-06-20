@@ -582,6 +582,161 @@ fn absent_version_header_is_version_mismatch() {
     });
 }
 
+// Typed 4xx client errors =============================================================================================
+
+/// Mock serving POST /start with the given 4xx status + `ErrorResponse` body.
+async fn spawn_client_error_bridge(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    use hole_common::protocol::ErrorResponse;
+
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    let router = axum::Router::new()
+        .route(
+            hole_common::protocol::ROUTE_START,
+            axum::routing::post(move || async move {
+                (
+                    status,
+                    Json(ErrorResponse {
+                        message: message.to_string(),
+                    }),
+                )
+            }),
+        )
+        .layer(axum::middleware::map_response(
+            |mut resp: axum::response::Response| async move {
+                resp.headers_mut().insert(
+                    "x-hole-bridge-version",
+                    axum::http::HeaderValue::from_static(hole::version::VERSION),
+                );
+                resp
+            },
+        ));
+    serve_one(listener, router)
+}
+
+/// Drive a POST /start against a 4xx mock and return the typed result.
+async fn start_against_status(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> Result<BridgeResponse, ClientError> {
+    let _mock = spawn_client_error_bridge(path, status, message).await;
+    let mut client = BridgeClient::connect(path).await.unwrap();
+    client
+        .send(BridgeRequest::Start {
+            config: hole_common::protocol::ProxyConfig {
+                server: hole_common::config::ServerEntry {
+                    id: "id".into(),
+                    name: "S".into(),
+                    server: "1.2.3.4".into(),
+                    server_port: 8388,
+                    method: "aes-256-gcm".into(),
+                    password: "pw".into(),
+                    plugin: None,
+                    plugin_opts: None,
+                    validation: None,
+                },
+                local_port: 4073,
+                tunnel_mode: hole_common::protocol::TunnelMode::Full,
+                filters: Vec::new(),
+                dns: hole_common::config::DnsConfig {
+                    enabled: false,
+                    ..hole_common::config::DnsConfig::default()
+                },
+                proxy_socks5: true,
+                proxy_http: false,
+                local_port_http: 4074,
+                diagnostic_plugin_tap: false,
+            },
+            attempt_id: "test-attempt".into(),
+        })
+        .await
+}
+
+#[skuld::test]
+fn forbidden_maps_to_consent_required() {
+    rt().block_on(async {
+        let path = test_socket_path("err403");
+        let result = start_against_status(&path, axum::http::StatusCode::FORBIDDEN, "consent is required").await;
+        match result {
+            Err(ClientError::ConsentRequired { message }) => {
+                assert!(message.contains("consent"), "expected consent message, got: {message}");
+            }
+            other => panic!("expected ConsentRequired, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn conflict_maps_to_cutover_in_progress() {
+    rt().block_on(async {
+        let path = test_socket_path("err409");
+        let result = start_against_status(&path, axum::http::StatusCode::CONFLICT, "a cutover is in progress").await;
+        match result {
+            Err(ClientError::CutoverInProgress { message }) => {
+                assert!(message.contains("cutover"), "expected cutover message, got: {message}");
+            }
+            other => panic!("expected CutoverInProgress, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn unprocessable_maps_to_payload_verification_failed() {
+    rt().block_on(async {
+        let path = test_socket_path("err422");
+        let result = start_against_status(
+            &path,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "hash mismatch on payload",
+        )
+        .await;
+        match result {
+            Err(ClientError::PayloadVerificationFailed { message }) => {
+                assert!(message.contains("mismatch"), "expected verify message, got: {message}");
+            }
+            other => panic!("expected PayloadVerificationFailed, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn bad_request_maps_to_invalid_update_destination() {
+    rt().block_on(async {
+        let path = test_socket_path("err400");
+        let result = start_against_status(
+            &path,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the update install destination is invalid",
+        )
+        .await;
+        match result {
+            Err(ClientError::InvalidUpdateDestination { message }) => {
+                assert!(
+                    message.contains("destination"),
+                    "expected destination message, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidUpdateDestination, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn other_4xx_maps_to_protocol() {
+    rt().block_on(async {
+        let path = test_socket_path("err404");
+        let result = start_against_status(&path, axum::http::StatusCode::NOT_FOUND, "not found").await;
+        assert!(
+            matches!(result, Err(ClientError::Protocol(_))),
+            "expected Protocol, got: {result:?}"
+        );
+    });
+}
+
 #[skuld::test]
 fn send_diagnostics_returns_response() {
     rt().block_on(async {
