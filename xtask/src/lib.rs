@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub use interrupt::install_transparent_interrupt;
+
 use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
@@ -16,6 +18,7 @@ pub mod ci_coverage;
 pub mod ex_ray;
 pub mod galoshes;
 pub mod golangci_lint;
+pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
