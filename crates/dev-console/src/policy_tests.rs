@@ -189,6 +189,20 @@ fn dev_run_file_directives_traces_first_party_debug_deps() {
 }
 
 #[skuld::test]
+fn dev_run_child_env_is_the_three_per_sink_vars() {
+    use std::ffi::OsString;
+    let env = super::dev_run_child_env(std::path::Path::new("/run/dir"), super::DEV_RUN_STDERR_BRIDGE);
+    assert_eq!(
+        env,
+        vec![
+            ("HOLE_LOG_DIR", OsString::from("/run/dir")),
+            ("HOLE_LOG", OsString::from(super::dev_run_file_directives())),
+            ("HOLE_LOG_STDERR", OsString::from(super::DEV_RUN_STDERR_BRIDGE)),
+        ]
+    );
+}
+
+#[skuld::test]
 fn dev_run_subdir_name_is_filesystem_safe() {
     use chrono::{NaiveDate, NaiveDateTime};
     let dt: NaiveDateTime = NaiveDate::from_ymd_opt(2026, 6, 20)

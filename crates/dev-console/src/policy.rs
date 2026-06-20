@@ -192,6 +192,17 @@ pub fn dev_run_file_directives() -> String {
 pub const DEV_RUN_STDERR_BRIDGE: &str = "hole_bridge=info";
 pub const DEV_RUN_STDERR_GUI: &str = "hole=info";
 
+/// The per-sink log env a dev child (bridge or GUI) gets: file=trace into the
+/// run dir, stderr=`stderr_directive` to the terminal. Returned as (name, value)
+/// pairs so the caller applies them with `Command::env`.
+pub fn dev_run_child_env(run_dir: &std::path::Path, stderr_directive: &str) -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        ("HOLE_LOG_DIR", run_dir.as_os_str().to_owned()),
+        ("HOLE_LOG", dev_run_file_directives().into()),
+        ("HOLE_LOG_STDERR", stderr_directive.into()),
+    ]
+}
+
 /// Filesystem-safe, sortable local timestamp for the dev-run subdir.
 pub fn dev_run_subdir_name(now: chrono::NaiveDateTime) -> String {
     now.format("%Y-%m-%d_%H-%M-%S").to_string()

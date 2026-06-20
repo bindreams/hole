@@ -54,6 +54,23 @@ pub(crate) fn is_reaped(child: &Child) -> bool {
     child.id().is_none()
 }
 
+/// Create the per-run dir `<parent>/<name>`. On a same-second collision (the
+/// dir already exists — a concurrent run the Vite-port guard will reject), fall
+/// back to `<name>-<pid>` so the doomed run can't truncate the live run's logs.
+pub(crate) fn create_run_dir(parent: &Path, name: &str, pid: u32) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(parent)?;
+    let primary = parent.join(name);
+    match std::fs::create_dir(&primary) {
+        Ok(()) => Ok(primary),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let alt = parent.join(format!("{name}-{pid}"));
+            std::fs::create_dir_all(&alt)?;
+            Ok(alt)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl BridgeChild {
     fn child_mut(&mut self) -> &mut Child {
         match self {
@@ -142,11 +159,13 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     // Dev-run capture: <repo>/.tmp/dev-run/<datetime>/ with bridge.log +
     // gui.log (trace, native file sinks redirected here) and dev-console.log
     // (this supervisor's status + the runtime mux at info, ANSI stripped).
-    let run_dir = repo_root
-        .join(".tmp")
-        .join("dev-run")
-        .join(crate::policy::dev_run_subdir_name(chrono::Local::now().naive_local()));
-    std::fs::create_dir_all(&run_dir).context("creating dev-run dir")?;
+    let run_parent = repo_root.join(".tmp").join("dev-run");
+    let run_dir = create_run_dir(
+        &run_parent,
+        &crate::policy::dev_run_subdir_name(chrono::Local::now().naive_local()),
+        std::process::id(),
+    )
+    .context("creating dev-run dir")?;
     crate::transcript::set_global(crate::transcript::Transcript::create(&run_dir.join("dev-console.log")));
 
     // 1. Privilege policy (dev.py §5.10) ==============================================================================
@@ -366,9 +385,9 @@ async fn startup_and_supervise(
     cmd.args(&argv[1..]);
     // Per-sink dev logging: file=trace into the run dir, stderr=info to the
     // terminal. These ride the sudo boundary via SUDO_PRESERVE_ENV.
-    cmd.env("HOLE_LOG_DIR", run_dir);
-    cmd.env("HOLE_LOG", crate::policy::dev_run_file_directives());
-    cmd.env("HOLE_LOG_STDERR", crate::policy::DEV_RUN_STDERR_BRIDGE);
+    for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_BRIDGE) {
+        cmd.env(k, v);
+    }
     // stdin=null: an expired sudo timestamp gets EOF and exits non-zero
     // instead of hanging on an invisible prompt (with the setsid TTY detach
     // in spawn_bridge); also the console-corruption discipline every child
@@ -450,9 +469,9 @@ async fn startup_and_supervise(
     cmd.arg("--show-dashboard");
     cmd.env("HOLE_BRIDGE_SOCKET", socket_path);
     cmd.env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
-    cmd.env("HOLE_LOG_DIR", run_dir);
-    cmd.env("HOLE_LOG", crate::policy::dev_run_file_directives());
-    cmd.env("HOLE_LOG_STDERR", crate::policy::DEV_RUN_STDERR_GUI);
+    for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_GUI) {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
     let gui = gui_slot.insert(GroupedChild::spawn(&mut cmd, Nesting::Mark).context("spawning the GUI")?);

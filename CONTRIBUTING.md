@@ -885,6 +885,19 @@ content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
 byte counts (`L2R N bytes, R2L M bytes`) — a load-bearing #248-class diagnostic,
 but expensive (≥1 TRACE line per TCP connection); use for debugging only.
 
+The file and stderr sinks filter independently. `HOLE_LOG` sets the file-sink
+directives; `HOLE_LOG_STDERR` sets the stderr-sink directives (defaults to
+mirroring the file sink when unset); `HOLE_LOG_DIR` overrides the log directory.
+`HOLE_BRIDGE_LOG` stays the bridge's file-sink override and takes precedence over
+`HOLE_LOG`.
+
+### Dev-run capture
+
+`cargo xtask run hole` writes `<repo>/.tmp/dev-run/<datetime>/` per run:
+`bridge.log` and `gui.log` at trace (Hole crates trace, deps debug), plus
+`dev-console.log` (the supervisor transcript and the runtime mux at info). No
+retention — old run dirs are kept until you delete them.
+
 ### Plugin diagnostics
 
 The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:

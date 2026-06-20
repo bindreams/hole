@@ -4,11 +4,38 @@
 //! it needs a password prompt and a real network stack.
 
 use crate::policy::ChildRole;
-use crate::supervise::{is_reaped, teardown_grouped};
+use crate::supervise::{create_run_dir, is_reaped, teardown_grouped};
 use crate::test_child;
 
 use tokio::io::AsyncReadExt as _;
 use tokio::net::TcpListener;
+
+/// A fresh parent yields the plain `<parent>/<name>` leaf.
+#[skuld::test]
+fn create_run_dir_uses_plain_name_when_free() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("dev-run");
+    let dir = create_run_dir(&parent, "2026-06-20_15-30-45", 4242).unwrap();
+    assert_eq!(dir, parent.join("2026-06-20_15-30-45"));
+    assert!(dir.is_dir());
+}
+
+/// A same-second collision (the leaf already exists) falls back to
+/// `<name>-<pid>` so the doomed run can't truncate the live run's logs.
+#[skuld::test]
+fn create_run_dir_falls_back_to_pid_on_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("dev-run");
+    let primary = parent.join("2026-06-20_15-30-45");
+    std::fs::create_dir_all(&primary).unwrap();
+    // Sentinel: the original must survive untouched.
+    std::fs::write(primary.join("dev-console.log"), b"live").unwrap();
+
+    let dir = create_run_dir(&parent, "2026-06-20_15-30-45", 4242).unwrap();
+    assert_eq!(dir, parent.join("2026-06-20_15-30-45-4242"));
+    assert!(dir.is_dir());
+    assert_eq!(std::fs::read(primary.join("dev-console.log")).unwrap(), b"live");
+}
 
 #[skuld::test]
 async fn fake_bridge_satisfies_ready_listener() {
