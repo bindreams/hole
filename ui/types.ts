@@ -44,6 +44,16 @@ export interface FilterRule {
   action: "proxy" | "bypass" | "block";
 }
 
+/// Result of evaluating the Test box input through the bridge filter engine.
+/// Mirrors the Rust `FilterEvaluation` in `crates/hole/src/commands.rs`.
+export interface FilterEvaluation {
+  action: "proxy" | "bypass" | "block";
+  /// Index into config.filters of the matched rule; null = terminal fallback
+  /// (no rule matched, proxied by default).
+  rule_index: number | null;
+  matched_address: string | null;
+}
+
 /// DNS upstream transport. Mirrors the Rust `DnsProtocol` enum in
 /// `crates/common/src/config.rs`. Values are snake_case to match the
 /// serde representation on the wire.
@@ -56,7 +66,6 @@ export interface DnsConfig {
   enabled: boolean;
   servers: string[];
   protocol: DnsProtocol;
-  intercept_udp53: boolean;
 }
 
 export interface Config {
@@ -65,7 +74,6 @@ export interface Config {
   filters: FilterRule[];
   local_port: number;
   local_port_http: number;
-  start_on_login: boolean;
   proxy_server_enabled: boolean;
   proxy_socks5: boolean;
   proxy_http: boolean;
@@ -92,7 +100,6 @@ export interface UiSettings {
   selected_server: string | null;
   local_port: number;
   filters: FilterRule[];
-  start_on_login: boolean;
   on_startup: string;
   theme: string;
   proxy_server_enabled: boolean;

@@ -6,7 +6,6 @@ fn capabilities_are_stable() {
         enabled: true,
         servers: vec!["192.0.2.1".parse().unwrap()],
         protocol: hole_common::config::DnsProtocol::PlainUdp,
-        intercept_udp53: true,
     };
     let fwd = Arc::new(DnsForwarder::new(
         cfg,
@@ -33,7 +32,6 @@ fn serve_tcp_returns_ok_immediately() {
         enabled: true,
         servers: vec!["192.0.2.1".parse().unwrap()],
         protocol: hole_common::config::DnsProtocol::PlainUdp,
-        intercept_udp53: true,
     };
     let fwd = Arc::new(DnsForwarder::new(
         cfg,

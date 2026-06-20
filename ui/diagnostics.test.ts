@@ -30,13 +30,12 @@ function makeServerWithValidation(validation: Server["validation"]): Config {
     filters: [],
     local_port: 1080,
     local_port_http: 1081,
-    start_on_login: false,
     proxy_server_enabled: false,
     proxy_socks5: true,
     proxy_http: false,
     on_startup: "disconnected",
     theme: "dark",
-    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
     diagnostic_plugin_tap: false,
   };
 }

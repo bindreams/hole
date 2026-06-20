@@ -24,12 +24,19 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Build the shell commands to set up split routing.
 ///
-/// Creates five routes:
+/// Creates four or five routes:
 /// 1. `0.0.0.0/1` via TUN — captures first half of IPv4 space
 /// 2. `128.0.0.0/1` via TUN — captures second half of IPv4 space
 /// 3. `::/1` via TUN — captures first half of IPv6 space
 /// 4. `8000::/1` via TUN — captures second half of IPv6 space
 /// 5. Server bypass — `<server_ip>` via `original_gateway` (IPv4 server) or `interface_name` (IPv6 server)
+///
+/// The server bypass (#5) is omitted when `server_ip` is loopback (checked in
+/// canonical form, so an IPv4-mapped `::ffff:127.0.0.1` counts too): a loopback
+/// destination is reached via the kernel's on-link `127.0.0.0/8` route, which is
+/// more specific than the `/1` splits, so it needs no bypass — and a `/32` (or
+/// `/128`) gateway bypass for loopback would hijack all loopback traffic to a
+/// gateway that cannot reach it.
 ///
 /// When `server_ip` is IPv6, `original_gateway` is unused — the bypass route is interface-based
 /// because reliable IPv6 gateway detection is not available on all platforms.
@@ -251,7 +258,7 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     lockdown_recover: L,
 ) where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
-    S: FnOnce(&Path),
+    S: FnOnce(&Path, bool),
     P: FnOnce() -> bool,
     L: FnOnce(CoverRecovery),
 {
@@ -300,23 +307,49 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         debug!("no route-state file found, nothing to recover");
     }
 
-    // Sweep any fail-closed cover left by a crashed update cutover. Runs
-    // UNCONDITIONALLY (outside the route-state guard above): a crash can leave a
-    // cover engaged with the routes already torn down, so there is no
+    // Reconcile the standing lockdown cover FIRST. `standing_held` is the
+    // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
+    // whose lifetime is independent of the cover. Deciding/adopting before the
+    // transient sweep means the subsequent sweep can be told a standing cover is
+    // held and must not clobber it. The recover action keeps the host fail-closed
+    // (Adopt) or disengages (Sweep).
+    let standing_held = lockdown_present();
+    let decision = decide_cover_recovery(lockdown_intent, standing_held);
+    let adopt = matches!(decision, CoverRecovery::Adopt);
+    lockdown_recover(decision);
+
+    // Sweep any transient fail-closed cover left by a crashed update cutover.
+    // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
+    // leave a cover engaged with the routes already torn down, so there is no
     // bridge-routes.json, yet the cover persists. The cover is keyed
     // independently — Windows by fixed WFP GUIDs, macOS by bridge-failclosed.json
-    // — and the sweep is idempotent when no cover is present.
-    sweep_cover(state_dir);
-
-    // Reconcile a standing lockdown cover. `prior_present` is the lockdown
-    // cover's OWN evidence (injected probe), NOT the route-state file, whose
-    // lifetime is independent of the cover. The recover action keeps the host
-    // fail-closed (Adopt) or disengages (Sweep).
-    let prior_present = lockdown_present();
-    lockdown_recover(decide_cover_recovery(lockdown_intent, prior_present));
+    // — and the sweep is idempotent when no cover is present. When a standing
+    // lockdown cover is being adopted, the sweep must leave the lockdown ruleset
+    // untouched (macOS: skip the `pfctl -f /etc/pf.conf` reload that would wipe
+    // it) — passed as `adopt`. Note this is `adopt`, NOT `standing_held`: on a
+    // Sweep (intent off, cover present) the standing ruleset is being torn down,
+    // so the transient restore SHOULD run.
+    sweep_cover(state_dir, adopt);
 }
 
 // Routing trait =======================================================================================================
+
+/// A cover RAII guard that can be DISARMED — consumed without disengaging — so
+/// the persistent WFP/pf filters survive a cutover restart; the new bridge
+/// re-adopts them via `decide_cover_recovery == Adopt`. A trait (not an inherent
+/// method) because `RunningState.lockdown` holds the cover behind the
+/// `Routing::Cover` associated type, and an inherent method is not callable
+/// through that type parameter.
+pub trait CoverGuard {
+    /// Persist the underlying filters without disengaging: consume the guard so
+    /// its `Drop` (the disengage) never runs.
+    ///
+    /// PRECONDITION: call only immediately before process exit. Skipping `Drop`
+    /// also skips releasing the guard's other resources (e.g. the Windows WFP
+    /// engine handle), which the kernel reclaims on exit but which a long-lived
+    /// caller would leak per call.
+    fn disarm(self);
+}
 
 /// OS routing: install split-tunnel routes and query routing state.
 ///
@@ -368,8 +401,9 @@ pub trait Routing: Send + Sync {
 
     /// RAII guard returned by [`install_failclosed_cover`](Self::install_failclosed_cover).
     /// Dropping it disengages the fail-closed cover. `Send` so a cutover
-    /// coordinator can hold it across `.await`.
-    type Cover: Send;
+    /// coordinator can hold it across `.await`; [`CoverGuard`] so a cutover stop
+    /// can disarm it (persist-without-disengage).
+    type Cover: Send + CoverGuard;
 
     /// Engage a fail-closed cover: block all egress except loopback and
     /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
@@ -577,25 +611,29 @@ fn platform_setup_commands(
         ],
     ];
 
-    // Bypass: server IP via original gateway/interface
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "add".into(),
-            format!("{server_ip}"),
-            "mask".into(),
-            "255.255.255.255".into(),
-            format!("{original_gateway}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            format!("{server_ip}/128"),
-            interface_name.into(),
-        ]),
+    // Bypass: server IP via original gateway/interface. Skipped for loopback —
+    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
+    // hijack it).
+    if !server_ip.to_canonical().is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "add".into(),
+                format!("{server_ip}"),
+                "mask".into(),
+                "255.255.255.255".into(),
+                format!("{original_gateway}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                format!("{server_ip}/128"),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -642,23 +680,26 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
         ],
     ];
 
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "delete".into(),
-            format!("{server_ip}"),
-            "mask".into(),
-            "255.255.255.255".into(),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            format!("{server_ip}/128"),
-            interface_name.into(),
-        ]),
+    // No bypass was installed for a loopback server, so none to delete.
+    if !server_ip.to_canonical().is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "delete".into(),
+                format!("{server_ip}"),
+                "mask".into(),
+                "255.255.255.255".into(),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "delete".into(),
+                "route".into(),
+                format!("{server_ip}/128"),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -714,26 +755,30 @@ fn platform_setup_commands(
         ],
     ];
 
-    // Bypass: server IP via original gateway/interface
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-            format!("{original_gateway}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-            "-interface".into(),
-            interface_name.into(),
-        ]),
+    // Bypass: server IP via original gateway/interface. Skipped for loopback —
+    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
+    // hijack it).
+    if !server_ip.to_canonical().is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                format!("{original_gateway}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                "-interface".into(),
+                interface_name.into(),
+            ]),
+        }
     }
 
     cmds
@@ -772,22 +817,25 @@ fn platform_teardown_commands(_tun_name: &str, server_ip: IpAddr, _interface_nam
         ],
     ];
 
-    match server_ip {
-        IpAddr::V4(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-        ]),
-        IpAddr::V6(_) => cmds.push(vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "-host".into(),
-            format!("{server_ip}"),
-        ]),
+    // No bypass was installed for a loopback server, so none to delete.
+    if !server_ip.to_canonical().is_loopback() {
+        match server_ip {
+            IpAddr::V4(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+            ]),
+            IpAddr::V6(_) => cmds.push(vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-inet6".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+            ]),
+        }
     }
 
     cmds

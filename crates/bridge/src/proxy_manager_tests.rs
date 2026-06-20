@@ -346,6 +346,15 @@ impl Drop for MockCover {
     }
 }
 
+impl tun_engine::routing::CoverGuard for MockCover {
+    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
+    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
+    /// cover instead of disengaging it.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
 // MockRouting lockdown instrumentation ================================================================================
 //
 // These exercise the mock seam directly (no ProxyManager) so the later
@@ -1058,6 +1067,49 @@ fn lockdown_engage_failure_tears_down_routes_only() {
     });
 }
 
+#[skuld::test]
+fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
+    rt().block_on(async {
+        // UserStop: the cover Drop disengages (opens the host).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+
+            pm.stop_with(StopReason::UserStop).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "user stop disengages the cover"
+            );
+        }
+        // Cutover: the cover is disarmed (persist-without-disengage) so the
+        // persistent filters survive the restart; routes still tear down.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
+
+            pm.stop_with(StopReason::Cutover).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "cutover does NOT disengage the cover (it is disarmed so the filters persist)"
+            );
+            assert_eq!(
+                st.teardown_calls.load(Ordering::SeqCst),
+                1,
+                "cutover still tears down routes"
+            );
+        }
+    });
+}
+
 // last_error coverage for early-failure paths =========================================================================
 
 #[skuld::test]
@@ -1681,7 +1733,6 @@ mod self_test {
             enabled: true,
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
-            intercept_udp53: true,
         }
     }
 
@@ -1876,7 +1927,6 @@ mod self_test {
                     enabled: true,
                     servers: vec![], // degenerate
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
@@ -1954,7 +2004,6 @@ mod self_test {
                     enabled: false,
                     servers: vec![],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (ep, fwd) = match res {
@@ -1966,10 +2015,9 @@ mod self_test {
             });
     }
 
-    /// the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
-    /// must be constructed whenever DNS is enabled with servers — even if
-    /// `intercept_udp53` is false. `build_local_dns` returns a 2-tuple
-    /// `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
+    /// The in-TUN LocalDnsEndpoint is the sole OS DNS path, so it must be
+    /// constructed whenever DNS is enabled with servers. `build_local_dns`
+    /// returns a 2-tuple `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
     #[skuld::test]
     fn build_local_dns_builds_endpoint_when_enabled() {
         tokio::runtime::Builder::new_current_thread()
@@ -1981,7 +2029,6 @@ mod self_test {
                     enabled: true,
                     servers: vec!["1.1.1.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: false, // legacy flag — endpoint built anyway
                 };
                 let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
                     .await

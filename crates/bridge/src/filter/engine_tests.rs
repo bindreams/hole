@@ -219,3 +219,86 @@ fn block_rule_overrides_locked_defaults() {
         FilterAction::Proxy
     );
 }
+
+// Original-index provenance ===========================================================================================
+
+#[skuld::test]
+fn decide_reports_original_index_when_earlier_rule_dropped() {
+    // Rule #1 is an invalid CIDR (dropped at compile time). The matching
+    // block rule is the user's #2; decide must report 2, not the compacted
+    // compiled position 1.
+    let rs = RuleSet::from_user_rules(&[
+        rule("*", MatchType::Wildcard, FilterAction::Proxy),
+        rule("not-a-cidr", MatchType::Subnet, FilterAction::Block),
+        rule("example.com", MatchType::Exactly, FilterAction::Block),
+    ]);
+    assert_eq!(rs.rules.len(), 2, "the invalid CIDR is dropped");
+    let d = decide(&rs, &conn("1.2.3.4", 443, Some("example.com")));
+    assert_eq!(d.action, FilterAction::Block);
+    assert_eq!(
+        d.rule_index,
+        Some(2),
+        "must be the user's original index, not the compiled one"
+    );
+}
+
+#[skuld::test]
+fn decide_reports_index_zero_for_first_rule() {
+    let rs = RuleSet::from_user_rules(&[rule("*", MatchType::Wildcard, FilterAction::Proxy)]);
+    let d = decide(&rs, &conn("1.2.3.4", 443, Some("anything.com")));
+    assert_eq!(d.rule_index, Some(0));
+}
+
+// decide_test (Filters "Test" box seam) ===============================================================================
+
+fn dom(s: &str) -> TestInput {
+    TestInput::Domain(s.to_string())
+}
+fn ip(s: &str) -> TestInput {
+    TestInput::Ip(s.parse().unwrap())
+}
+
+#[skuld::test]
+fn decide_test_ip_input_matches_only_ip_rules() {
+    let rs = RuleSet::from_user_rules(&[
+        rule("*", MatchType::Wildcard, FilterAction::Proxy),
+        rule("10.0.0.0/8", MatchType::Subnet, FilterAction::Block),
+    ]);
+    let d = decide_test(&rs, &ip("10.1.2.3"));
+    assert_eq!(d.action, FilterAction::Block);
+    assert_eq!(d.rule_index, Some(1));
+}
+
+#[skuld::test]
+fn decide_test_domain_input_does_not_match_subnet_rule() {
+    // The 0.0.0.0/0 hazard: a catch-all IP rule must NOT match a typed domain.
+    let rs = RuleSet::from_user_rules(&[
+        rule("*", MatchType::Wildcard, FilterAction::Proxy),
+        rule("0.0.0.0/0", MatchType::Subnet, FilterAction::Bypass),
+    ]);
+    let d = decide_test(&rs, &dom("example.com"));
+    assert_eq!(
+        d.action,
+        FilterAction::Proxy,
+        "must fall to the wildcard default, not the subnet rule"
+    );
+    assert_eq!(d.rule_index, Some(0));
+}
+
+#[skuld::test]
+fn decide_test_domain_input_matches_domain_rule() {
+    let rs = RuleSet::from_user_rules(&[
+        rule("*", MatchType::Wildcard, FilterAction::Proxy),
+        rule("example.com", MatchType::WithSubdomains, FilterAction::Block),
+    ]);
+    assert_eq!(decide_test(&rs, &dom("api.example.com")).action, FilterAction::Block);
+}
+
+#[skuld::test]
+fn decide_test_ip_input_no_ip_rule_falls_back_to_proxy() {
+    // Single domain-only '*' default: a raw IP matches nothing -> terminal fallback.
+    let rs = RuleSet::from_user_rules(&[rule("*", MatchType::Wildcard, FilterAction::Proxy)]);
+    let d = decide_test(&rs, &ip("9.9.9.9"));
+    assert_eq!(d.action, FilterAction::Proxy);
+    assert_eq!(d.rule_index, None, "the domain-only wildcard does not match a raw IP");
+}

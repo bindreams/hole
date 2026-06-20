@@ -63,6 +63,15 @@ fn parse_pf_enabled_reads_status() {
     assert!(!parse_pf_enabled("Status: Disabled\n"));
 }
 
+#[skuld::test]
+fn disengage_lockdown_absent_cover_is_ok() {
+    // No state file => no cover engaged => Ok (the early return precedes any
+    // pfctl spawn, so this touches no host state). `bridge unlock` on a clean
+    // host must succeed, not fail loud.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(disengage_lockdown(dir.path()).is_ok());
+}
+
 // engage_pf_action (idempotent-enable decision) =======================================================================
 
 #[skuld::test]

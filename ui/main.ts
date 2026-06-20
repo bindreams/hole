@@ -95,7 +95,6 @@ function toUiSettings(c: Config): UiSettings {
     selected_server: c.selected_server,
     local_port: c.local_port,
     filters: c.filters,
-    start_on_login: c.start_on_login,
     on_startup: c.on_startup,
     theme: c.theme,
     proxy_server_enabled: c.proxy_server_enabled,
@@ -117,6 +116,23 @@ export async function saveConfig() {
     console.error("saveConfig failed:", err);
     showToast(`Failed to save config: ${err}`, "error");
   }
+}
+
+/**
+ * Whether the app is registered to start at OS login. The OS is the source of
+ * truth (#457) — the dashboard reads this live, not from config. Rejects on
+ * failure so the caller can surface it.
+ */
+export async function getAutostart(): Promise<boolean> {
+  return await invoke<boolean>("get_autostart");
+}
+
+/**
+ * Set OS start-at-login; resolves to the resulting live state. Rejects with the
+ * backend's PII-free message so the caller can revert and toast (#457).
+ */
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  return await invoke<boolean>("set_autostart", { enabled });
 }
 
 /** Mark the config as having unsaved changes. */

@@ -115,7 +115,13 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
     };
 
     let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
     assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
@@ -169,6 +175,7 @@ fn e2e_metrics_report_tunnel_traffic(
         let resp = harness
             .send(BridgeRequest::Start {
                 config: config_template.clone(),
+                attempt_id: "e2e".into(),
             })
             .await
             .expect("send Start");
@@ -197,7 +204,10 @@ fn e2e_metrics_report_tunnel_traffic(
             ..config_template
         };
         let resp = harness
-            .send(BridgeRequest::Start { config: config2 })
+            .send(BridgeRequest::Start {
+                config: config2,
+                attempt_id: "e2e".into(),
+            })
             .await
             .expect("send Start 2");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
@@ -265,7 +275,13 @@ fn e2e_galoshes_chain_reports_udp_available(
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
         let status = harness.send(BridgeRequest::Status).await.expect("send Status");
@@ -324,18 +340,13 @@ mod tun {
 
     /// TUN tests exercise the bridge's transparent-proxy path: the test
     /// connects directly to the HTTP target's primary non-loopback IPv4
-    /// address, and the TUN routes catch that traffic and tunnel it
+    /// address, and the TUN split routes catch that traffic and tunnel it
     /// through the shadowsocks server.
     ///
-    /// **Critically**: TUN tests must NOT try to connect to anything on
-    /// `127.0.0.1` while the bridge is running, because the bridge
-    /// installs a `route add 127.0.0.1 mask 255.255.255.255 <tun-gw>`
-    /// bypass route (so its own shadowsocks connection to a
-    /// loopback-bound test server can escape the TUN). That bypass
-    /// globally redirects all loopback traffic through the TUN
-    /// adapter, which has no SOCKS5 server on the other side — so any
-    /// attempt to connect to `127.0.0.1:<port>` from the test body
-    /// times out.
+    /// Loopback stays reachable throughout: the test's shadowsocks server is
+    /// loopback-bound, and the bridge installs no gateway bypass for a loopback
+    /// server (loopback is on-link via `127.0.0.0/8`, more specific than the
+    /// `0.0.0.0/1` split — see `tun_engine::routing`).
     async fn direct_http_get(target_addr: SocketAddr) -> Vec<u8> {
         let mut sock = tokio::net::TcpStream::connect(target_addr)
             .await
@@ -365,7 +376,13 @@ mod tun {
         };
 
         let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
-        let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+        let resp = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
         // Direct TCP to `http.addr` (the primary non-loopback IPv4) —
@@ -405,12 +422,13 @@ mod tun {
     /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
     /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs elevation.
     ///
-    /// `#[ignore]`: deterministically hangs — the galoshes-fronted full-tunnel
-    /// chain never completes one half-close, so the SOCKS5-seam
-    /// `copy_bidirectional` waits forever. The no-plugin full-tunnel path
-    /// (`e2e_none_full_tunnel_roundtrip`) passes. See bindreams/hole#541.
+    /// Regression for bindreams/hole#541: this used to hang only when run after
+    /// `e2e_none_full_tunnel_roundtrip`. That test's loopback-bound server made
+    /// the prior bridge install a `127.0.0.1/32 → gateway` bypass route, which
+    /// hijacked all loopback to the gateway and black-holed this test's
+    /// galoshes-server fixture readiness self-probe (a loopback connect). Fixed
+    /// by never bypassing a loopback server (`tun_engine::routing`).
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
-    #[ignore = "galoshes full-tunnel roundtrip hangs (half-close not propagated) — see bindreams/hole#541"]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -449,12 +467,21 @@ fn lifecycle_start_twice_returns_error(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         let resp1 = harness
-            .send(BridgeRequest::Start { config: config.clone() })
+            .send(BridgeRequest::Start {
+                config: config.clone(),
+                attempt_id: "e2e".into(),
+            })
             .await
             .unwrap();
         assert!(matches!(resp1, BridgeResponse::Ack));
 
-        let resp2 = harness.send(BridgeRequest::Start { config }).await.unwrap();
+        let resp2 = harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         // The second start should return an Error response (the bridge
         // maps the ProxyError::AlreadyRunning into a 5xx).
         assert!(
@@ -510,6 +537,7 @@ fn lifecycle_reload_changes_local_port(
         harness
             .send(BridgeRequest::Start {
                 config: config1.clone(),
+                attempt_id: "e2e".into(),
             })
             .await
             .unwrap();
@@ -556,7 +584,13 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
         let state_file = harness.state_dir.path().join("bridge-routes.json");
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
 
         assert!(
             !state_file.exists(),
@@ -613,7 +647,13 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
@@ -662,7 +702,13 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
         };
 
         let mut harness = DistHarness::spawn(dist).await.unwrap();
-        harness.send(BridgeRequest::Start { config }).await.unwrap();
+        harness
+            .send(BridgeRequest::Start {
+                config,
+                attempt_id: "e2e".into(),
+            })
+            .await
+            .unwrap();
         assert_socks5_roundtrip(&mut harness, local_port, http.addr).await;
         harness.send(BridgeRequest::Stop).await.unwrap();
     });
