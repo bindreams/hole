@@ -17,7 +17,9 @@ name = "dev-console"
 path = "src/main.rs"
 
 [dependencies]
+anstream = "1" # strip ANSI when writing the dev-console.log transcript; already in the lockfile (1.0.0, via clap_builder)
 anyhow = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] } # local timestamp for the dev-run dir; already in the lockfile (0.4.44, clock enabled via file-rotate)
 futures-util = { version = "0.3", default-features = false, features = ["std"] } # catch_unwind for the teardown funnel
 kill-group = { version = "0.1", path = "../kill-group" }
 stepstool = { path = "../stepstool" }
