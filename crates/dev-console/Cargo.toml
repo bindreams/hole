@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 license = "GPL-3.0-or-later"
-description = "Dev-mode supervisor: builds the workspace, then runs bridge (elevated) + Vite + GUI with multiplexed colored logs. Replaces scripts/dev.py (#454)."
+description = "Dev-mode supervisor: runs bridge (elevated) + Vite + GUI with multiplexed colored logs. Builds nothing — the xtask cascade does. Replaces scripts/dev.py (#454)."
 
 [lints]
 workspace = true

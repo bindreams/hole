@@ -67,12 +67,13 @@ targets:
     # via msi-installer / tauri, which run their own `cargo build --release`
     # — so `hole` itself is what you build for development and tests.
     #
-    # `cargo xtask run hole` launches dev mode via the dev-console crate.
-    # dev-console runs `cargo xtask build hole` internally so `cargo run -p
-    # dev-console` also works standalone; after this target's build cascade
-    # that inner build is an incremental no-op. dev-console runs unprivileged
-    # and elevates only the bridge — via sudo on POSIX (prompts for your
-    # password), inheriting the elevated token on Windows (#452, #454).
+    # `cargo xtask run hole` launches dev mode via the dev-console crate. The
+    # cascade below builds the workspace; dev-console only supervises — it builds
+    # nothing (#564). `hole.run` rebuilds galoshes with dev-only crash-dumps
+    # before launching, so release/--all builds stay minidump-free (#438).
+    # dev-console runs unprivileged and elevates only the bridge — via sudo on
+    # POSIX (prompts for your password), inheriting the elevated token on
+    # Windows (#452, #454).
     #
     # `--no-default-features` keeps Tauri's `cfg(dev) = true` so the webview
     # loads from the Vite dev server (`http://localhost:1420`) instead of
@@ -84,7 +85,18 @@ targets:
     build:
       - cargo build --workspace --no-default-features --features tombstone/crash-dumps
       - cargo xtask stage --profile debug --out-dir target/debug/dist
-    run: cargo run --package dev-console --quiet
+    run:
+      # Dev-only galoshes minidumps (#438): rebuild galoshes WITH crash-dumps
+      # here, in a run-only step, so `cargo xtask build --all` and the release
+      # installers never link minidump-writer. The cascade above already produced
+      # everything; this step only swaps in the dev galoshes.
+      - process:
+          args: [cargo, xtask, galoshes]
+          environment: { HOLE_CRASH_DUMPS: "1" }
+      # Launch the cascade-built supervisor directly: dev-console builds nothing,
+      # so nothing can overwrite its own running exe (#564). `{exe}` → host suffix;
+      # the relative path resolves against the repo root (see run_step).
+      - process: ["target/debug/dev-console{exe}"]
 
   hole-msi:
     # NOT a dependent of `hole`. The msi-installer Python entry point does its

@@ -16,9 +16,10 @@ use anyhow::{anyhow, bail, Context, Result};
 /// `<repo>/.cache/ex-ray/` by [`super::ex_ray::build`] (which
 /// is what `cargo xtask deps` does just before calling this).
 pub fn build(repo_root: &Path) -> Result<PathBuf> {
-    // Dev-only minidump opt-in (bindreams/hole#438). dev-console sets
-    // HOLE_CRASH_DUMPS=1; release / standalone galoshes builds do not, so
-    // minidump-writer never links into the windows-arm64 galoshes matrix.
+    // Dev-only minidump opt-in (#438). The `hole` target's run: step sets
+    // HOLE_CRASH_DUMPS=1 (run-only, so `--all` / release builds never do);
+    // without it minidump-writer never links — keeping it out of the
+    // windows-arm64 galoshes matrix and every release artifact.
     let mut args: Vec<&str> = vec!["build", "--release", "-p", "galoshes"];
     if std::env::var_os("HOLE_CRASH_DUMPS").is_some() {
         args.push("--features");

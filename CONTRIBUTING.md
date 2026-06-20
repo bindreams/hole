@@ -583,7 +583,7 @@ build graph; `cargo xtask list` prints the target table.
 npm install                  # frontend deps (first time only)
 cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (cached)
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask run hole         # dev mode (= build hole + dev-console)
+cargo xtask run hole         # dev mode (build cascade, then dev-console supervises)
 cargo xtask run hole-tests   # canonical local nextest invocation
 ```
 
@@ -650,10 +650,11 @@ cargo xtask run hole
 > Closing this sudo-invocation path structurally is tracked in #453.
 
 `cargo xtask run hole` launches the [`dev-console`](crates/dev-console/)
-supervisor, which builds the workspace, starts Vite, and launches bridge + GUI
-with multiplexed color-coded logs. `cargo run -p dev-console` works standalone
-too (it runs `cargo xtask build hole` itself). Frontend changes hot-reload via
-Vite HMR; Rust changes need Ctrl+C and re-run.
+supervisor, which starts Vite and launches bridge + GUI with multiplexed
+color-coded logs. dev-console builds nothing — the xtask cascade builds first
+(#564); `cargo run -p dev-console` works standalone against an already-built
+tree. Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and
+re-run.
 
 - **dev-console runs unprivileged and elevates only the bridge.** On macOS it
   prompts for your sudo password once, then `sudo`s just `bridge grant-access` +
