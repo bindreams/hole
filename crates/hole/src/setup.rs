@@ -346,7 +346,9 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     // leaves the user with a healthy data dir for the next attempt).
     if let Some(path) = repair_user_data_dir {
         #[cfg(target_os = "macos")]
-        repair::run(path);
+        if let Ok(u) = hole_bridge::group::resolve_real_user() {
+            repair::run(path, u.uid, u.gid);
+        }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = path; // suppress unused on non-macOS
@@ -549,8 +551,8 @@ async fn poll_bridge_ipc() -> bool {
 /// earlier elevated install (the osascript admin-privileges context
 /// preserves `HOME` from the unprivileged parent, so root-mode CLI helpers
 /// happily wrote `~/Library/Application Support/hole/` and friends as
-/// root). This module walks the tree and `lchown`s every entry back to the
-/// owner of the path's parent.
+/// root). This module walks the tree and `lchown`s every entry to the
+/// caller-supplied `target_uid`/`target_gid` (the resolved interactive user).
 ///
 /// Safety-critical: runs as root, so any symlink confusion is a privilege
 /// escalation primitive. Constraints:
@@ -570,7 +572,7 @@ mod repair {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    pub(super) fn run(path: &Path) {
+    pub(super) fn run(path: &Path, target_uid: u32, target_gid: u32) {
         // Path may not exist (first install on a clean machine) — nothing to do.
         let Ok(top_meta) = std::fs::symlink_metadata(path) else {
             return;
@@ -579,25 +581,6 @@ mod repair {
             cli_log!(warn, "refusing to repair ownership of symlink: {}", path.display());
             return;
         }
-
-        // Resolve parent owner — the user who owns ~/Library/Application Support
-        // by definition.
-        let parent = match path.parent() {
-            Some(p) => p,
-            None => {
-                cli_log!(warn, "cannot determine parent of {}", path.display());
-                return;
-            }
-        };
-        let parent_meta = match std::fs::metadata(parent) {
-            Ok(m) => m,
-            Err(e) => {
-                cli_log!(warn, "cannot stat parent {}: {e}", parent.display());
-                return;
-            }
-        };
-        let target_uid = parent_meta.uid();
-        let target_gid = parent_meta.gid();
 
         // Skip the walk entirely when the tree is already healthy.
         if top_meta.uid() == target_uid && top_meta.gid() == target_gid {
@@ -665,6 +648,25 @@ mod repair {
         );
     }
 }
+
+/// Recovery walk for an elevated, non-`--service` bridge run: reclaim the
+/// user data tree at `path` for `uid`/`gid` (the resolved interactive user).
+/// Thin wrapper over the hardened [`repair::run`] walk; called from the CLI
+/// `bridge run` entrypoint. macOS-only; a no-op everywhere else.
+///
+/// `pub` (not `pub(crate)`) for the same reason as the other `cli.rs`-called
+/// helpers here: `setup` compiles into both the lib and the bin, and the
+/// sole caller lives in the bin-only `cli` module — `pub` keeps the lib
+/// compilation from flagging it as dead code.
+#[cfg(target_os = "macos")]
+pub fn repair_user_data_tree(path: &std::path::Path, uid: u32, gid: u32) {
+    repair::run(path, uid, gid);
+}
+
+/// Non-macOS twin of [`repair_user_data_tree`]: the root-owned-user-tree bug
+/// is macOS-specific (osascript-admin elevation), so this is a no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn repair_user_data_tree(_path: &std::path::Path, _uid: u32, _gid: u32) {}
 
 #[cfg(test)]
 #[path = "setup_tests.rs"]

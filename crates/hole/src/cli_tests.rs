@@ -3,6 +3,29 @@ use clap::Parser;
 use skuld::temp_dir;
 use std::path::Path;
 
+// Elevated-run owner resolution (#572) ================================================================================
+
+#[skuld::test]
+fn user_dirs_derive_from_home_not_env() {
+    use std::path::Path;
+    assert_eq!(
+        super::user_log_dir(Path::new("/Users/alice")),
+        Path::new("/Users/alice/Library/Application Support/hole/logs")
+    );
+    assert_eq!(
+        super::user_state_dir(Path::new("/Users/alice")),
+        Path::new("/Users/alice/Library/Application Support/hole/state")
+    );
+}
+
+#[skuld::test]
+fn service_never_gets_an_owner() {
+    assert!(
+        super::resolved_owner(true).is_none(),
+        "--service must never resolve an owner"
+    );
+}
+
 #[skuld::test]
 fn no_args_means_gui_mode() {
     let cli = Cli::try_parse_from(["hole"]).unwrap();

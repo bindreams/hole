@@ -40,6 +40,8 @@ harness = false
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 hole-bridge = { path = "../bridge" }
+stepstool = { path = "../stepstool" }
+util = { path = "../util" }
 tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
