@@ -1,6 +1,27 @@
-use crate::mux::{is_entry_start, pump, split_lines_universal, Entry, EntryFramer, FramerOutput, StreamMode};
+use crate::mux::{
+    anchor_key, is_entry_start, pump, split_lines_universal, Entry, EntryFramer, FramerOutput, StreamMode,
+};
 
 // Framing core (pure) =================================================================================================
+
+#[skuld::test]
+fn anchor_key_extracts_timestamp_token_or_none() {
+    let keyed = Entry {
+        prefix: "[bridge] ".into(),
+        lines: vec!["2026-01-01T00:00:01Z INFO hi".into()],
+    };
+    assert_eq!(anchor_key(&keyed).as_deref(), Some("2026-01-01T00:00:01Z"));
+    let unkeyed = Entry {
+        prefix: "[  vite] ".into(),
+        lines: vec!["VITE ready".into()],
+    };
+    assert_eq!(anchor_key(&unkeyed), None);
+    let empty = Entry {
+        prefix: "[x] ".into(),
+        lines: vec![],
+    };
+    assert_eq!(anchor_key(&empty), None);
+}
 
 #[skuld::test]
 fn anchor_detection_matches_iso_timestamps_only() {
@@ -91,6 +112,52 @@ fn splits_lf_crlf_and_lone_cr() {
     assert_eq!(pending, b"f");
 }
 
+// Shutdown drain ordering (#568) ======================================================================================
+
+/// At shutdown the printer collects post-`enter_drain` entries and emits them
+/// sorted by ISO timestamp (out-of-order arrival -> in-order output), each entry
+/// still an atomic prefixed block.
+#[skuld::test]
+async fn shutdown_drain_emits_trailing_entries_in_timestamp_order() {
+    use tokio::sync::{mpsc, oneshot};
+    let (tx, rx) = mpsc::channel::<Entry>(16);
+    let (drain_tx, drain_rx) = oneshot::channel();
+    let (_fin_tx, fin_rx) = oneshot::channel(); // held: finalize never fires; rx-close ends collect
+    let mut sink: Vec<u8> = Vec::new();
+
+    drain_tx.send(()).unwrap(); // shutdown begins: everything below is "trailing"
+    tx.send(Entry {
+        prefix: "[client] ".into(),
+        lines: vec!["2026-01-01T00:00:05Z later".into()],
+    })
+    .await
+    .unwrap();
+    tx.send(Entry {
+        prefix: "[bridge] ".into(),
+        lines: vec!["2026-01-01T00:00:01Z earlier".into()],
+    })
+    .await
+    .unwrap();
+    drop(tx); // rx closes -> printer sorts + flushes
+
+    crate::mux::printer(
+        rx,
+        &mut sink,
+        crate::transcript::Transcript::disabled(),
+        drain_rx,
+        fin_rx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(sink).unwrap().lines().collect::<Vec<_>>(),
+        vec![
+            "[bridge] 2026-01-01T00:00:01Z earlier",
+            "[client] 2026-01-01T00:00:05Z later"
+        ],
+    );
+}
+
 // Cross-stream atomicity (ports dev_tests.py:288-354) =================================================================
 
 /// Two entry-buffered streams pumped concurrently into one printer must
@@ -104,6 +171,10 @@ async fn concurrent_streams_never_split_entries() {
         let (b_w, b_r) = tokio::io::duplex(4096);
         let (tx, rx) = tokio::sync::mpsc::channel::<Entry>(64);
         let mut sink: Vec<u8> = Vec::new();
+        // Never-firing control signals: senders held in named locals so a
+        // dropped sender can't fire the receiver and wrongly trigger drain.
+        let (_drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+        let (_fin_tx, fin_rx) = tokio::sync::oneshot::channel();
 
         let pump_a = tokio::spawn(pump(a_r, StreamMode::EntryBuffered, "[bridge] ".into(), tx.clone()));
         let pump_b = tokio::spawn(pump(b_r, StreamMode::EntryBuffered, "[client] ".into(), tx.clone()));
@@ -125,7 +196,13 @@ async fn concurrent_streams_never_split_entries() {
             pump_b,
             // tokio 1.52 implements AsyncWrite for Vec<u8> (and the &mut
             // blanket lifts it) — verified against the vendored tokio source.
-            crate::mux::printer(rx, &mut sink, crate::transcript::Transcript::disabled()),
+            crate::mux::printer(
+                rx,
+                &mut sink,
+                crate::transcript::Transcript::disabled(),
+                drain_rx,
+                fin_rx
+            ),
         );
         let (_, _) = (f1, f2);
         printed.unwrap();
@@ -211,9 +288,15 @@ async fn printer_mirrors_blocks_into_transcript() {
     drop(tx); // close the channel so the printer drains and returns
 
     // `&mut Vec<u8>` implements tokio's AsyncWrite (as
-    // concurrent_streams_never_split_entries already relies on).
+    // concurrent_streams_never_split_entries already relies on). The drain
+    // signals never fire (senders held): the entry is written in phase 1, then
+    // rx-close ends the printer.
+    let (_drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+    let (_fin_tx, fin_rx) = tokio::sync::oneshot::channel();
     let mut term: Vec<u8> = Vec::new();
-    crate::mux::printer(rx, &mut term, transcript).await.unwrap();
+    crate::mux::printer(rx, &mut term, transcript, drain_rx, fin_rx)
+        .await
+        .unwrap();
 
     let t = String::from_utf8(tbuf.lock().unwrap().clone()).unwrap();
     assert_eq!(t, "[bridge] hello\n", "transcript must be ANSI-stripped");
