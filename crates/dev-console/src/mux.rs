@@ -6,6 +6,14 @@
 //! be interleaved with another stream's lines; Vite (no timestamp anchor)
 //! prints per-line. Atomicity is structural: every stream pumps into one
 //! mpsc consumed by a single printer task — one writer, no lock.
+//!
+//! Shutdown ordering (issue #568): in steady state the most-recent entry of an
+//! EntryBuffered stream is deferred until its next anchor or pipe EOF, so the
+//! shutdown burst would otherwise print in pump-EOF order, not time order. The
+//! printer therefore switches to a collect-and-sort phase on `enter_drain`
+//! (fired by the supervisor at shutdown), emitting trailing entries sorted by
+//! ISO timestamp; `finalize` bounds the case where a pump never EOFs. Atomic
+//! multi-line entries are preserved (each sorted unit is a whole entry).
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -37,6 +45,20 @@ pub fn is_entry_start(line: &str) -> bool {
         && b[8].is_ascii_digit()
         && b[9].is_ascii_digit()
         && b[10] == b'T'
+}
+
+/// Sort key for the shutdown drain: the leading ISO timestamp token of an
+/// entry's first line, if that line is an anchor. `None` for anchorless entries
+/// (Vite/PerLine, bare Immediate lines), which the drain sorts AFTER keyed
+/// entries in arrival order. ISO-8601 fixed-format timestamps sort lexically ==
+/// chronologically, so a string key is sufficient.
+pub fn anchor_key(entry: &Entry) -> Option<String> {
+    let first = entry.lines.first()?;
+    if !is_entry_start(first) {
+        return None;
+    }
+    let end = first.find(' ').unwrap_or(first.len());
+    Some(first[..end].to_string())
 }
 
 pub enum FramerOutput {
@@ -180,21 +202,61 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
     }
 }
 
-/// The single writer: receives entries from every pump and writes each as
-/// one contiguous block. One writer == atomic entries (replaces dev.py's
-/// print lock).
-pub async fn printer(mut rx: mpsc::Receiver<Entry>, mut out: impl AsyncWrite + Unpin) -> std::io::Result<()> {
-    while let Some(entry) = rx.recv().await {
-        let mut block = String::new();
-        for line in &entry.lines {
-            block.push_str(&entry.prefix);
-            block.push_str(line);
-            block.push('\n');
+/// The single writer. Phase 1 streams entries in arrival order (one atomic
+/// block each) until `enter_drain` fires. Phase 2 collects the trailing
+/// (deferred final) entries and emits them sorted by ISO timestamp — so the
+/// shutdown burst prints in time order, not pump-EOF order (issue #568) —
+/// bounded by `finalize` for the WarnRecovery case where a pump never EOFs and
+/// `rx` never closes. One writer == atomic entries (replaces dev.py's print
+/// lock).
+pub async fn printer(
+    mut rx: mpsc::Receiver<Entry>,
+    mut out: impl AsyncWrite + Unpin,
+    mut enter_drain: tokio::sync::oneshot::Receiver<()>,
+    mut finalize: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut enter_drain => break,
+            entry = rx.recv() => match entry {
+                Some(e) => write_entry(&mut out, &e).await?,
+                None => return Ok(()), // all streams ended before shutdown
+            }
         }
-        out.write_all(block.as_bytes()).await?;
-        out.flush().await?;
+    }
+    let mut tail = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut finalize => break,
+            entry = rx.recv() => match entry {
+                Some(e) => tail.push(e),
+                None => break, // all reapable pumps EOF'd
+            }
+        }
+    }
+    // Stable: keyed entries first, by timestamp; anchorless entries last, in
+    // arrival order.
+    tail.sort_by_key(|e| {
+        let k = anchor_key(e);
+        (k.is_none(), k)
+    });
+    for e in &tail {
+        write_entry(&mut out, e).await?;
     }
     Ok(())
+}
+
+async fn write_entry(out: &mut (impl AsyncWrite + Unpin), entry: &Entry) -> std::io::Result<()> {
+    let mut block = String::new();
+    for line in &entry.lines {
+        block.push_str(&entry.prefix);
+        block.push_str(line);
+        block.push('\n');
+    }
+    out.write_all(block.as_bytes()).await?;
+    out.flush().await
 }
 
 #[cfg(test)]
