@@ -346,6 +346,15 @@ impl Drop for MockCover {
     }
 }
 
+impl tun_engine::routing::CoverGuard for MockCover {
+    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
+    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
+    /// cover instead of disengaging it.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
 // MockRouting lockdown instrumentation ================================================================================
 //
 // These exercise the mock seam directly (no ProxyManager) so the later
@@ -613,6 +622,93 @@ fn check_health_detects_crashed_task() {
         pm.check_health();
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().unwrap().contains("unexpectedly"));
+    });
+}
+
+// death_reason: path-free GUI/toast surface, distinct from last_error (#470) ==========================================
+
+#[skuld::test]
+fn check_health_sets_path_free_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            pm.death_reason(),
+            Some(DEATH_REASON),
+            "out-of-band death surfaces the sentinel"
+        );
+        assert!(
+            !DEATH_REASON.contains('/') && !DEATH_REASON.contains('\\'),
+            "death reason is path-free"
+        );
+    });
+}
+
+/// The PII guarantee: a failed start records its arbitrary (possibly
+/// path-bearing) error in `last_error` for diagnostics, but NEVER in
+/// `death_reason` — so it can never reach the GUI status/toast.
+#[skuld::test]
+fn failed_start_records_last_error_but_not_death_reason() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::failing_start());
+        let _ = pm.start(&test_config()).await.unwrap_err();
+
+        assert!(
+            pm.last_error().is_some(),
+            "failed start records last_error for diagnostics"
+        );
+        assert_eq!(
+            pm.death_reason(),
+            None,
+            "a failed start is not a death — must not surface to the toast"
+        );
+    });
+}
+
+/// A (re)start supersedes a prior death: the death reason clears so a later
+/// poll cannot re-toast a stale death.
+#[skuld::test]
+fn restart_clears_prior_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+        assert_eq!(pm.death_reason(), Some(DEATH_REASON));
+
+        state.crashed.store(false, Ordering::SeqCst);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.death_reason(), None, "a successful restart clears the death reason");
+    });
+}
+
+/// stop() clears the death reason too (a clean stop is not a death).
+#[skuld::test]
+fn stop_clears_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+        assert_eq!(pm.death_reason(), Some(DEATH_REASON));
+
+        // A fresh start then a clean stop must leave no death reason behind.
+        state.crashed.store(false, Ordering::SeqCst);
+        pm.start(&test_config()).await.unwrap();
+        pm.stop().await.unwrap();
+        assert_eq!(pm.death_reason(), None);
     });
 }
 
@@ -968,6 +1064,49 @@ fn lockdown_engage_failure_tears_down_routes_only() {
             "engage failure tears down routes only; no cover was created"
         );
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[skuld::test]
+fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
+    rt().block_on(async {
+        // UserStop: the cover Drop disengages (opens the host).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+
+            pm.stop_with(StopReason::UserStop).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "user stop disengages the cover"
+            );
+        }
+        // Cutover: the cover is disarmed (persist-without-disengage) so the
+        // persistent filters survive the restart; routes still tear down.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
+
+            pm.stop_with(StopReason::Cutover).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "cutover does NOT disengage the cover (it is disarmed so the filters persist)"
+            );
+            assert_eq!(
+                st.teardown_calls.load(Ordering::SeqCst),
+                1,
+                "cutover still tears down routes"
+            );
+        }
     });
 }
 
@@ -1594,7 +1733,6 @@ mod self_test {
             enabled: true,
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
-            intercept_udp53: true,
         }
     }
 
@@ -1789,7 +1927,6 @@ mod self_test {
                     enabled: true,
                     servers: vec![], // degenerate
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
@@ -1867,7 +2004,6 @@ mod self_test {
                     enabled: false,
                     servers: vec![],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (ep, fwd) = match res {
@@ -1879,10 +2015,9 @@ mod self_test {
             });
     }
 
-    /// the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
-    /// must be constructed whenever DNS is enabled with servers — even if
-    /// `intercept_udp53` is false. `build_local_dns` returns a 2-tuple
-    /// `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
+    /// The in-TUN LocalDnsEndpoint is the sole OS DNS path, so it must be
+    /// constructed whenever DNS is enabled with servers. `build_local_dns`
+    /// returns a 2-tuple `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
     #[skuld::test]
     fn build_local_dns_builds_endpoint_when_enabled() {
         tokio::runtime::Builder::new_current_thread()
@@ -1894,7 +2029,6 @@ mod self_test {
                     enabled: true,
                     servers: vec!["1.1.1.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: false, // legacy flag — endpoint built anyway
                 };
                 let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
                     .await

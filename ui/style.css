@@ -963,6 +963,14 @@ td.del-cell {
   line-height: 1;
 }
 
+/* Invalid-filter badge: the bridge dropped this rule, so it is not enforced (#470). */
+.filter-invalid {
+  margin-left: 0.3rem;
+  color: var(--red);
+  font-size: 0.75rem;
+  cursor: help;
+}
+
 /* Filter table: editable cells -----  */
 .editable-cell {
   cursor: pointer;

@@ -21,14 +21,7 @@ function assertLabelledBy(el: HTMLElement) {
 }
 
 describe("settings toggles", () => {
-  const ids = [
-    "toggle-start-on-login",
-    "toggle-proxy-server",
-    "toggle-socks5",
-    "toggle-http",
-    "toggle-dns-enabled",
-    "toggle-dns-intercept",
-  ];
+  const ids = ["toggle-start-on-login", "toggle-proxy-server", "toggle-socks5", "toggle-http", "toggle-dns-enabled"];
   it.each(ids)("%s is a labelled switch button", (id) => {
     const el = byId(id);
     expect(el.tagName).toBe("BUTTON");
@@ -36,6 +29,11 @@ describe("settings toggles", () => {
     expect(el.getAttribute("role")).toBe("switch");
     expect(el.getAttribute("aria-checked")).toBe("false");
     assertLabelledBy(el);
+  });
+
+  it("has no legacy dns-intercept toggle (#460)", () => {
+    expect(doc.getElementById("toggle-dns-intercept")).toBeNull();
+    expect(doc.getElementById("lbl-dns-intercept")).toBeNull();
   });
 });
 

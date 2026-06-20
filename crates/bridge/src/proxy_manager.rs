@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{Routing, SystemRouting};
+use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
 
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{
@@ -91,11 +91,22 @@ pub enum ProxyState {
     Running,
 }
 
+/// Why the proxy is being stopped, which governs the standing lockdown cover's
+/// fate during teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// User-approved disconnect: disengage the standing cover (opens the host).
+    UserStop,
+    /// Update cutover: the cover must SURVIVE the restart, so it is disarmed
+    /// (persist-without-disengage) instead of dropped. The new bridge adopts it.
+    Cutover,
+}
+
 // Running state =======================================================================================================
 
 /// Per-cycle state owned only while a proxy is running.
 ///
-/// **Tear-down order is load-bearing.** `ProxyManager::stop` runs the
+/// **Tear-down order is load-bearing.** `ProxyManager::stop_with` runs the
 /// shutdown sequence in this order:
 /// 1. `dns_applied.shutdown().await` — restores OS DNS while routes +
 ///    dispatcher + SS are still live so any in-flight OS DNS queries
@@ -104,8 +115,9 @@ pub enum ProxyState {
 /// 3. `plugin_chain` drop — graceful stop via SIGTERM/CTRL_BREAK.
 /// 4. `proxy.stop().await` — releases SS task.
 /// 5. `routes` drop — RAII teardown.
-/// 6. `lockdown` drop — disengage standing cover (user-approved stop opens
-///    the host). Last so the persistent filters outlive routes by Drop order.
+/// 6. `lockdown` — a `UserStop` drops it (disengage; opens the host), a
+///    `Cutover` disarms it (the persistent filters survive the restart). Last
+///    so the persistent filters outlive routes by Drop order.
 ///
 /// `None` fields for SocksOnly mode where routing / dispatcher / DNS are
 /// skipped, or when no plugin is configured.
@@ -128,10 +140,11 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     /// Installed routes. `None` in SocksOnly mode.
     #[allow(dead_code)]
     routes: Option<R::Installed>,
-    /// Standing lockdown cover, engaged only when intent is on (#527). `None`
-    /// when lockdown is off — then behavior is byte-identical to today. Read by
-    /// `lockdown_active()`; disengaged in `stop()` after routes tear down (its
-    /// Drop is the catastrophic safety net).
+    /// Standing lockdown cover, engaged only when intent is on. `None` when
+    /// lockdown is off — then behavior is byte-identical to today. Read by
+    /// `lockdown_active()`; on stop a `UserStop` disengages it and a `Cutover`
+    /// disarms it (the persistent filters survive), both after routes tear down
+    /// (its Drop is the catastrophic safety net).
     lockdown: Option<R::Cover>,
     /// Handle on the running proxy. Drop aborts the task (best-effort);
     /// supported graceful shutdown is via `stop().await` from
@@ -174,12 +187,23 @@ pub struct TrafficMetrics {
 
 // ProxyManager ========================================================================================================
 
+/// The one reason an out-of-band death is reported to the GUI. A `&'static str`
+/// so the status/toast surface is path-free by construction (#470): unlike the
+/// operation-error `last_error`, which can carry a filesystem path or hostname
+/// from a failed start, this can never embed PII.
+pub const DEATH_REASON: &str = "proxy task exited unexpectedly";
+
 pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting, D: Dns = SystemDns> {
     proxy: P,
     routing: R,
     dns: D,
     running: Option<RunningState<P, R, D>>,
     last_error: Option<String>,
+    /// The out-of-band death reason surfaced to the GUI status/toast, distinct
+    /// from `last_error` (which keeps the rich, possibly-PII operation detail
+    /// for diagnostics and the click-path start-error surface). Set only by
+    /// `check_health`; cleared on every start attempt and on stop (#470).
+    death_reason: Option<&'static str>,
     /// Last successfully-started config. Used by `reload` to detect
     /// filter-only changes (hot-swap path vs full restart).
     active_config: Option<ProxyConfig>,
@@ -211,6 +235,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             dns,
             running: None,
             last_error: None,
+            death_reason: None,
             active_config: None,
             udp_proxy_available: true,
             ipv6_bypass_available: true,
@@ -319,6 +344,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The out-of-band death reason for the GUI status/toast (path-free by
+    /// type), or None if the proxy did not die unexpectedly (#470).
+    pub fn death_reason(&self) -> Option<&'static str> {
+        self.death_reason
     }
 
     /// Delegation for `handle_diagnostics`: expose the routing provider's
@@ -434,6 +465,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if self.running.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
+
+        // A (re)start supersedes any prior out-of-band death — clear the death
+        // reason regardless of this attempt's outcome (#470).
+        self.death_reason = None;
 
         // `start_inner` is a free associated function — it does NOT
         // touch `self`, so any cancel-driven unwind leaves `self`
@@ -886,7 +921,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         })
     }
 
+    /// Back-compat shim: a plain stop is a user stop (disengages the cover).
     pub async fn stop(&mut self) -> Result<(), ProxyError> {
+        self.stop_with(StopReason::UserStop).await
+    }
+
+    /// Stop the proxy, choosing the standing lockdown cover's fate from `reason`:
+    /// a [`StopReason::UserStop`] disengages it (opens the host); a
+    /// [`StopReason::Cutover`] disarms it so the persistent filters survive the
+    /// restart and the new bridge re-adopts them. Routes/DNS/proxy/plugin tear
+    /// down identically either way.
+    pub async fn stop_with(&mut self, reason: StopReason) -> Result<(), ProxyError> {
         let Some(state) = self.running.take() else {
             return Ok(());
         };
@@ -931,10 +976,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // 4. Routes tear down via RAII Drop.
         drop(routes);
 
-        // 5. Disengage the standing lockdown cover (user-approved stop opens
-        // the host; the cutover-stop exception is PR2). Dropping the guard
-        // disengages it (Windows: delete WFP filters; macOS: restore pf).
-        drop(lockdown);
+        // 5. Standing lockdown cover. A user stop disengages it (dropping the
+        // guard opens the host: Windows deletes the WFP filters, macOS restores
+        // pf). A cutover disarms it instead — the persistent filters survive the
+        // restart and the new bridge re-adopts them (decide_cover_recovery ==
+        // Adopt). Disarming a `None` cover is a no-op.
+        match (reason, lockdown) {
+            (StopReason::UserStop, lk) => drop(lk),
+            (StopReason::Cutover, Some(lk)) => lk.disarm(),
+            (StopReason::Cutover, None) => {}
+        }
 
         // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
         // related references remain in either layer. Cheap and
@@ -949,6 +1000,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Clear any error from a previous failed start. See issue #142.
         self.last_error = None;
+        self.death_reason = None;
         self.active_config = None;
         self.udp_proxy_available = true;
         self.ipv6_bypass_available = true;
@@ -1013,7 +1065,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if let Some(state) = &self.running {
             if !state.proxy.is_alive() {
                 error!("proxy task exited unexpectedly");
-                self.last_error = Some("proxy task exited unexpectedly".into());
+                self.last_error = Some(DEATH_REASON.into());
+                // Path-free death reason for the GUI status/toast (#470).
+                self.death_reason = Some(DEATH_REASON);
                 self.running = None; // Drop tears down routes + clears state file
                 self.active_config = None;
                 self.udp_proxy_available = true;
@@ -1130,12 +1184,13 @@ mod proxy_manager_tests;
 //   listener-selection tests) run on every Hole platform (Win+mac).
 // - **galoshes-fronted** tests front a galoshes *server* via the garter
 //   `ChainRunner` launcher (`plugin_e2e::ssserver`), which the `SsServerHandle`
-//   fixture keeps alive for the test's lifetime. They run on **macOS**, where
-//   they are reliable. All are gated off the Windows lane pending fixes: the
-//   socks-only WS/IPv6 roundtrips and UDP-associate hit an intermittent Windows
-//   bridge-e2e stall (#542 / #543 for UDP), the full-tunnel TUN test hangs
-//   (#541), and WS-TLS/QUIC are macOS-only anyway (Windows custom-cert limit).
-//   galoshes transport coverage on Windows lives in the `plugin-e2e` crate.
+//   fixture keeps alive for the test's lifetime. The SOCKS5 UDP-associate test
+//   runs on **Win+mac** (its reply-leg flake was fixed in #543). The rest run on
+//   **macOS** only, gated off Windows pending fixes: the socks-only WS/IPv6
+//   roundtrips hit an intermittent Windows bridge-e2e stall (#542), the
+//   full-tunnel TUN test hangs (#541), and WS-TLS/QUIC are macOS-only anyway
+//   (Windows custom-cert limit). Broader galoshes transport coverage on Windows
+//   lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
@@ -1197,10 +1252,8 @@ async fn build_local_dns(
         ipv6_bypass_available,
     ));
 
-    // The in-TUN endpoint is the sole OS DNS path: OS DNS now routes
-    // into hole-tun and is intercepted here, not via a loopback :53 server.
-    // It is built whenever DNS is enabled, independent of `intercept_udp53`
-    // (legacy flag — the in-TUN forwarder is now the mechanism).
+    // The in-TUN endpoint is the sole OS DNS path: OS DNS routes into hole-tun
+    // and is intercepted here, not via a loopback :53 server.
     let endpoint = crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder));
 
     Ok((Some(endpoint), Some(forwarder)))

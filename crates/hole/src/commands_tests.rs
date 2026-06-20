@@ -237,7 +237,7 @@ fn ui_server_entry(id: &str) -> crate::ui_settings::UiServerEntry {
 fn default_ui_settings() -> crate::ui_settings::UiSettings {
     serde_json::from_value(serde_json::json!({
         "servers": [], "selected_server": null, "local_port": 4073,
-        "filters": [], "start_on_login": false, "on_startup": "restore_last_state",
+        "filters": [], "on_startup": "restore_last_state",
         "theme": "dark", "proxy_server_enabled": true, "proxy_socks5": true,
         "proxy_http": false, "dns": AppConfig::default().dns, "local_port_http": 4074,
         "diagnostic_plugin_tap": false
@@ -356,6 +356,131 @@ fn get_diagnostics_unexpected_response_falls_back() {
     let json = map_diagnostics_response(Ok(BridgeResponse::Ack));
     assert_eq!(json["app"], "ok");
     assert_eq!(json["bridge"], "unknown");
+}
+
+// map_status_response (#470) ==========================================================================================
+
+fn status_snap(seq: u64, running: bool, error: Option<&str>) -> crate::state::ProxySnapshot {
+    crate::state::ProxySnapshot {
+        seq,
+        running,
+        error: error.map(Into::into),
+        lockdown_enabled: false,
+        lockdown_active: false,
+    }
+}
+
+/// All seven keys are present on the Status-Ok arm; cosmetics come from the
+/// response, running/state_seq from the snapshot.
+#[skuld::test]
+fn map_status_emits_full_shape_on_status_ok() {
+    let resp = Ok(BridgeResponse::Status {
+        running: true,
+        uptime_secs: 42,
+        error: None,
+        invalid_filters: vec![hole_common::protocol::InvalidFilter {
+            index: 2,
+            error: "bad".into(),
+        }],
+        udp_proxy_available: false,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(7, true, None));
+    for k in [
+        "running",
+        "state_seq",
+        "error",
+        "uptime_secs",
+        "invalid_filters",
+        "udp_proxy_available",
+        "ipv6_bypass_available",
+    ] {
+        assert!(j.get(k).is_some(), "missing key {k}");
+    }
+    assert_eq!(j["running"], true);
+    assert_eq!(j["state_seq"], 7);
+    assert_eq!(j["uptime_secs"], 42);
+    assert_eq!(j["udp_proxy_available"], false);
+    assert_eq!(j["ipv6_bypass_available"], true);
+    assert_eq!(j["invalid_filters"][0]["index"], 2);
+    assert_eq!(j["invalid_filters"][0]["error"], "bad");
+}
+
+/// running/state_seq/error come from the SNAPSHOT, not the response — distinct
+/// values prove the snapshot wins.
+#[skuld::test]
+fn map_status_sources_running_seq_error_from_snap() {
+    let resp = Ok(BridgeResponse::Status {
+        running: true, // response disagrees with the committed snapshot
+        uptime_secs: 0,
+        error: Some("RESPONSE-ERROR".into()),
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(9, false, Some("proxy task exited unexpectedly")));
+    assert_eq!(j["running"], false, "running from snap");
+    assert_eq!(j["state_seq"], 9, "state_seq from snap");
+    assert_eq!(
+        j["error"], "proxy task exited unexpectedly",
+        "error from snap, not the response"
+    );
+}
+
+/// Error arm: caps null (unknown), error from snap, running stale from snap.
+#[skuld::test]
+fn map_status_error_arm_caps_null_error_from_snap() {
+    let j = map_status_response(
+        Ok(BridgeResponse::Error { message: "boom".into() }),
+        status_snap(3, true, None),
+    );
+    assert!(j["udp_proxy_available"].is_null(), "caps unknown on non-Status arm");
+    assert!(j["ipv6_bypass_available"].is_null());
+    assert!(j["error"].is_null(), "error from snap (None), not the response message");
+    assert_eq!(j["running"], true, "running from snap (stale truth)");
+    assert!(
+        j["invalid_filters"].is_null(),
+        "invalid_filters unknown on non-Status arm"
+    );
+    assert_eq!(j["uptime_secs"], 0);
+}
+
+/// Transport error: caps null, running/seq/error from snap.
+#[skuld::test]
+fn map_status_transport_error_caps_null() {
+    let err = ClientError::Connection(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "x"));
+    let j = map_status_response(Err(err), status_snap(1, false, None));
+    assert!(j["udp_proxy_available"].is_null());
+    assert!(j["ipv6_bypass_available"].is_null());
+    assert_eq!(j["running"], false);
+    assert_eq!(j["state_seq"], 1);
+    assert!(j["error"].is_null());
+}
+
+/// PII guard: on a death the mapper emits the snapshot's path-free sentinel,
+/// never the response's (possibly PII) error.
+#[skuld::test]
+fn map_status_death_error_is_the_sentinel_only() {
+    let resp = Ok(BridgeResponse::Status {
+        running: false,
+        uptime_secs: 0,
+        error: Some("/home/user/secret/path failed".into()), // would-be PII on the wire
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    let j = map_status_response(resp, status_snap(4, false, Some("proxy task exited unexpectedly")));
+    assert_eq!(j["error"], "proxy task exited unexpectedly");
+    assert!(
+        !j["error"].as_str().unwrap().contains('/'),
+        "the snapshot error (path-free sentinel) is used, never the response's"
+    );
 }
 
 /// `parse_cf_trace` pulls `ip=` / `loc=` out of Cloudflare's trace body.
@@ -827,4 +952,160 @@ fn apply_import_summary_records_dedup_counts() {
         captured.contains("deduped=2"),
         "expected deduped=2 in summary:\n{captured}"
     );
+}
+
+// evaluate_filter (Filters "Test" box) ================================================================================
+
+use hole_common::config::{FilterAction, FilterRule, MatchType};
+
+fn frule(addr: &str, kind: MatchType, action: FilterAction) -> FilterRule {
+    FilterRule {
+        address: addr.to_string(),
+        matching: kind,
+        action,
+    }
+}
+
+/// The single locked default the UI injects at index 0.
+fn default_rule() -> FilterRule {
+    frule("*", MatchType::Wildcard, FilterAction::Proxy)
+}
+
+#[skuld::test]
+fn evaluate_filter_question_mark_wildcard_matches_single_char() {
+    // Divergence #1: JS escaped '?'; the engine maps it to single-char '.'.
+    let filters = vec![
+        default_rule(),
+        frule("ex?mple.com", MatchType::Wildcard, FilterAction::Block),
+    ];
+    let r = evaluate_filter("example.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Block);
+    assert_eq!(r.rule_index, Some(1));
+    assert_eq!(r.matched_address.as_deref(), Some("ex?mple.com"));
+}
+
+#[skuld::test]
+fn evaluate_filter_canonicalizes_case_trailing_dot_and_idna() {
+    // Divergence #2.
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::WithSubdomains, FilterAction::Block),
+    ];
+    assert_eq!(
+        evaluate_filter("WWW.Example.com".into(), filters.clone()).action,
+        FilterAction::Block
+    );
+    assert_eq!(
+        evaluate_filter("example.com.".into(), filters.clone()).action,
+        FilterAction::Block
+    );
+
+    // Unicode label vs its punycode rule form.
+    let puny = vec![
+        default_rule(),
+        frule("xn--r8jz45g.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    assert_eq!(evaluate_filter("例え.com".into(), puny).action, FilterAction::Block);
+}
+
+#[skuld::test]
+fn evaluate_filter_ipv6_subnet_and_exact() {
+    // Divergence #3.
+    let subnet = vec![
+        default_rule(),
+        frule("2001:db8::/32", MatchType::Subnet, FilterAction::Block),
+    ];
+    assert_eq!(
+        evaluate_filter("2001:db8::1".into(), subnet).action,
+        FilterAction::Block
+    );
+
+    let exact = vec![
+        default_rule(),
+        frule("2001:db8::1", MatchType::Exactly, FilterAction::Bypass),
+    ];
+    let r = evaluate_filter("2001:db8::1".into(), exact);
+    assert_eq!(r.action, FilterAction::Bypass);
+    assert_eq!(r.rule_index, Some(1));
+}
+
+#[skuld::test]
+fn evaluate_filter_domain_rule_does_not_match_raw_ip() {
+    // Divergence #4: a domain rule must not fire on a typed IP.
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::WithSubdomains, FilterAction::Block),
+    ];
+    let r = evaluate_filter("1.2.3.4".into(), filters);
+    assert_eq!(
+        r.action,
+        FilterAction::Proxy,
+        "raw IP matches no domain rule -> terminal fallback"
+    );
+    assert_eq!(r.rule_index, None);
+    assert_eq!(r.matched_address, None);
+}
+
+#[skuld::test]
+fn evaluate_filter_drops_invalid_rules_and_reports_original_index() {
+    // Divergence #5 + index mapping: an invalid with_subdomains-on-IP rule
+    // (#1) is dropped; the real winner is the user's rule #2.
+    let filters = vec![
+        default_rule(),
+        frule("1.2.3.4", MatchType::WithSubdomains, FilterAction::Bypass), // invalid -> dropped
+        frule("blocked.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("blocked.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Block);
+    assert_eq!(
+        r.rule_index,
+        Some(2),
+        "index must skip the dropped rule, naming the user's row"
+    );
+    assert_eq!(r.matched_address.as_deref(), Some("blocked.com"));
+}
+
+#[skuld::test]
+fn evaluate_filter_default_rule_for_unmatched_domain() {
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("other.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Proxy);
+    assert_eq!(r.rule_index, Some(0));
+    assert_eq!(r.matched_address.as_deref(), Some("*"));
+}
+
+#[skuld::test]
+fn evaluate_filter_trims_whitespace_and_tolerates_empty() {
+    // Whitespace trims to a real domain; an empty token does not panic and
+    // matches the wildcard default. The frontend short-circuits empty input
+    // before invoking, but the command must stay total.
+    let filters = vec![default_rule()];
+    let trimmed = evaluate_filter("  example.com  ".into(), filters.clone());
+    assert_eq!(trimmed.action, FilterAction::Proxy);
+    assert_eq!(trimmed.rule_index, Some(0));
+
+    let empty = evaluate_filter("".into(), filters);
+    assert_eq!(empty.action, FilterAction::Proxy);
+    assert_eq!(
+        empty.rule_index,
+        Some(0),
+        "empty token matches the '*' wildcard default"
+    );
+}
+
+/// Lock the wire shape the JS deserializes: snake_case fields, lowercase action.
+#[skuld::test]
+fn evaluate_filter_serializes_with_expected_wire_shape() {
+    let filters = vec![
+        default_rule(),
+        frule("blocked.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("blocked.com".into(), filters);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["action"], "block");
+    assert_eq!(json["rule_index"], 1);
+    assert_eq!(json["matched_address"], "blocked.com");
 }

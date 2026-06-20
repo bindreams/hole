@@ -405,3 +405,177 @@ describe("abandoning a new rule", () => {
     expect(rules().every((r) => r.address !== "")).toBe(true);
   });
 });
+
+describe("invalid_filters badges (#470)", () => {
+  it("badges the row at InvalidFilter.index with the error tooltip", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad pattern" }]);
+    const badge = row(1).querySelector(".filter-invalid")!;
+    expect(badge).toBeTruthy();
+    expect(badge.getAttribute("title")).toBe("Rule not applied: bad pattern");
+    expect(row(2).querySelector(".filter-invalid")).toBeNull();
+    expect(row(0).querySelector(".filter-invalid")).toBeNull();
+  });
+
+  it("clears badges when the list goes empty", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.setInvalidFilters([]);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+  });
+
+  it("keeps the last-known badges when the poll arm is unknown (null)", async () => {
+    // A transient non-Status poll arm carries `null` (the bridge could not
+    // vouch); the badges must persist, mirroring the capability dots — not
+    // blink off on every hiccup.
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.setInvalidFilters(null);
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+  });
+
+  it("append (addRule) does not move existing badges", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    document.getElementById("filter-add-btn")!.click(); // appends an empty row at the end
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+    expect(row(3).querySelector(".filter-invalid")).toBeNull();
+  });
+
+  it("re-applies badges from the cache across a config-reload render", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    mod.renderFilters(); // a config reload re-renders the table
+    expect(row(1).querySelector(".filter-invalid")).toBeTruthy();
+  });
+
+  it("a ruleset mutation bumps the epoch and clears badges synchronously", async () => {
+    const mod = await setup();
+    mod.setInvalidFilters([{ index: 1, error: "bad" }]);
+    const before = mod.filtersEpoch();
+    document.querySelectorAll<HTMLElement>(".filter-del")[0]!.click(); // delete -> persistFilters
+    expect(mod.filtersEpoch()).toBeGreaterThan(before);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+    await flushPersist();
+  });
+
+  it("an index-shifting ensureDefaultRule bumps the epoch and clears badges", async () => {
+    // Config missing the default rule: the next render unshifts it at index 0,
+    // shifting every later index. The stale cache must be dropped (epoch bump),
+    // not painted onto the shifted rows.
+    mainMock.config!.filters = [{ address: "example.com", matching: "exactly", action: "bypass" }];
+    const mod = await setup(); // setup()'s renderFilters already inserted the default
+    mod.setInvalidFilters([{ index: 0, error: "bad" }]);
+    const before = mod.filtersEpoch();
+    mainMock.config!.filters = [{ address: "example.com", matching: "exactly", action: "bypass" }]; // drop default again
+    mod.renderFilters(); // ensureDefaultRule unshifts -> epoch bump
+    expect(mod.filtersEpoch()).toBeGreaterThan(before);
+    expect(document.querySelector(".filter-invalid")).toBeNull();
+    await flushPersist();
+  });
+});
+
+describe("test filtering", () => {
+  function setTestInput(value: string) {
+    const el = document.getElementById("test-input") as HTMLInputElement;
+    el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  const result = () => document.getElementById("test-result")!.textContent;
+
+  it("renders the action and rule label from evaluate_filter", async () => {
+    invokeMock.mockImplementation(async (cmd: unknown) =>
+      cmd === "evaluate_filter" ? { action: "bypass", rule_index: 1, matched_address: "example.com" } : undefined,
+    );
+    await setup();
+    setTestInput("example.com");
+    await flushPersist();
+    expect(invokeMock).toHaveBeenCalledWith("evaluate_filter", {
+      input: "example.com",
+      filters: mainMock.config!.filters,
+    });
+    expect(result()).toBe("Bypass (matched rule #2: example.com)");
+  });
+
+  it("labels the default rule (index 0) specially", async () => {
+    invokeMock.mockImplementation(async (cmd: unknown) =>
+      cmd === "evaluate_filter" ? { action: "proxy", rule_index: 0, matched_address: "*" } : undefined,
+    );
+    await setup();
+    setTestInput("anything.com");
+    await flushPersist();
+    expect(result()).toBe("Proxy (matched default rule)");
+  });
+
+  it("shows the no-matching-rule fallback with the proxy action", async () => {
+    invokeMock.mockImplementation(async (cmd: unknown) =>
+      cmd === "evaluate_filter" ? { action: "proxy", rule_index: null, matched_address: null } : undefined,
+    );
+    await setup();
+    setTestInput("9.9.9.9");
+    await flushPersist();
+    expect(result()).toBe("Proxy (no matching rule)");
+  });
+
+  it("clears the result and does not invoke for empty input", async () => {
+    invokeMock.mockImplementation(async (cmd: unknown) =>
+      cmd === "evaluate_filter" ? { action: "proxy", rule_index: 0, matched_address: "*" } : undefined,
+    );
+    await setup();
+    setTestInput("example.com");
+    await flushPersist();
+    invokeMock.mockClear();
+    setTestInput("");
+    await flushPersist();
+    expect(result()).toBe("");
+    expect(invokeMock).not.toHaveBeenCalledWith("evaluate_filter", expect.anything());
+  });
+
+  it("ignores a stale (out-of-order) response", async () => {
+    // First (slow) call resolves AFTER the second (fast) call. Latest wins.
+    let resolveSlow!: (v: unknown) => void;
+    const slow = new Promise((r) => {
+      resolveSlow = r;
+    });
+    invokeMock
+      .mockImplementationOnce(async (cmd: unknown) => (cmd === "evaluate_filter" ? slow : undefined))
+      .mockImplementation(async (cmd: unknown) =>
+        cmd === "evaluate_filter" ? { action: "block", rule_index: 2, matched_address: "10.0.0.0/8" } : undefined,
+      );
+    await setup();
+    setTestInput("first.com"); // in-flight (slow)
+    setTestInput("second.com"); // resolves first, fast
+    await flushPersist();
+    resolveSlow({ action: "proxy", rule_index: 0, matched_address: "*" }); // stale
+    await flushPersist();
+    expect(result()).toBe("Block (matched rule #3: 10.0.0.0/8)");
+  });
+
+  it("survives an evaluate_filter error without throwing", async () => {
+    invokeMock.mockImplementation(async (cmd: unknown) => {
+      if (cmd === "evaluate_filter") throw "engine boom";
+      return undefined;
+    });
+    await setup();
+    setTestInput("example.com");
+    await flushPersist();
+    expect(result()).toContain("Could not evaluate");
+  });
+
+  it("does not repopulate a cleared box with an in-flight response", async () => {
+    // Type, then clear before the (slow) response lands. The stale verdict
+    // must not overwrite the now-empty box.
+    let resolveSlow!: (v: unknown) => void;
+    const slow = new Promise((r) => {
+      resolveSlow = r;
+    });
+    invokeMock.mockImplementation(async (cmd: unknown) => (cmd === "evaluate_filter" ? slow : undefined));
+    await setup();
+    setTestInput("example.com"); // invoke in-flight (slow)
+    setTestInput(""); // clear the box before it resolves
+    await flushPersist();
+    resolveSlow({ action: "bypass", rule_index: 1, matched_address: "example.com" }); // stale
+    await flushPersist();
+    expect(result()).toBe("");
+  });
+});

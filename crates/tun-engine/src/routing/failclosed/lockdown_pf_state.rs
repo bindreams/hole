@@ -1,6 +1,6 @@
 //! macOS-only persisted state for the STANDING lockdown cover. Distinct file
-//! from `bridge-failclosed.json` (the transient cover, used concurrently by
-//! PR2's cutover): the lockdown cover has an independent lifetime. Records the
+//! from `bridge-failclosed.json` (the transient cover): the lockdown cover has
+//! an independent lifetime, and the cutover engages no transient cover. Records the
 //! pf enable token (replayed to `pfctl -X` on Sweep) and the pre-lockdown
 //! filter (`pfctl -sr`) and translation (`pfctl -sn`) snapshots (re-loaded on
 //! Sweep to restore the host without `-Fa`, matching the engaged-without-flush

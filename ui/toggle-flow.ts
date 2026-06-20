@@ -60,14 +60,18 @@ export interface ToggleDeps {
 /// reconciled by the observation gate once the bridge speaks. Each
 /// transition is owned by an `Operation`; a superseded op's late
 /// continuation is fenced via `op.settle` so it cannot clobber an escape.
-export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps): Promise<void> {
+export async function toggleFromIdle(goingToConnect: boolean, deps: ToggleDeps, attemptId?: string): Promise<void> {
   const op = deps.beginOp();
   op.settle(() => deps.setState(goingToConnect ? "connecting" : "disconnecting"));
 
+  // The connect carries the per-attempt id (#465) so a later Cancel can be
+  // scoped to this exact start; Stop carries none (it is not cancellable).
   const command = goingToConnect ? "start_proxy" : "stop_proxy";
   let outcome: ToggleOutcome;
   try {
-    outcome = await deps.invoke<ToggleOutcome>(command);
+    outcome = goingToConnect
+      ? await deps.invoke<ToggleOutcome>(command, { attemptId })
+      : await deps.invoke<ToggleOutcome>(command);
   } catch (error) {
     console.error(`${command} failed:`, error);
     op.settle(() => {

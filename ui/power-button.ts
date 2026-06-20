@@ -23,6 +23,11 @@ import type { ProxyStatus } from "./types";
 let currentState: ConnectionState = "disconnected";
 let powerBtn: HTMLElement | null = null;
 let statusWord: HTMLElement | null = null;
+// Id of the in-progress connect attempt. Minted when leaving idle to connect
+// and reused for the Cancel fired during that attempt's spinner, so the bridge
+// scopes the cancel to exactly this start and a stale arm can't kill a later one
+// (#465). Module-scoped because start and cancel are two separate clicks.
+let currentAttemptId = "";
 
 /// Fences stale transition continuations: a Tauri invoke() can't be aborted, so
 /// a superseded operation's late result is dropped instead of clobbering the
@@ -54,7 +59,7 @@ async function handlePowerClick(): Promise<void> {
   // against their cancel.
   if (currentState === "connecting") {
     setState("cancelling");
-    invoke("cancel_proxy").catch((err) => console.error("cancel_proxy failed:", err));
+    invoke("cancel_proxy", { attemptId: currentAttemptId }).catch((err) => console.error("cancel_proxy failed:", err));
     return;
   }
 
@@ -82,16 +87,23 @@ async function handlePowerClick(): Promise<void> {
   // effectively on. Retry paths (connection-failed, disconnection-failed)
   // are treated as their base idle states for the purpose of this dispatch.
   const goingToConnect = !isEffectivelyOn(currentState);
-  await toggleFromIdle(goingToConnect, {
-    invoke,
-    getState: () => currentState,
-    setState,
-    updatePublicIp,
-    showToast,
-    getConfig: () => config,
-    loadConfig,
-    beginOp: () => operations.begin(),
-  });
+  if (goingToConnect) {
+    currentAttemptId = crypto.randomUUID();
+  }
+  await toggleFromIdle(
+    goingToConnect,
+    {
+      invoke,
+      getState: () => currentState,
+      setState,
+      updatePublicIp,
+      showToast,
+      getConfig: () => config,
+      loadConfig,
+      beginOp: () => operations.begin(),
+    },
+    currentAttemptId,
+  );
 }
 
 /** Initialize: bind DOM refs + click listener. */
@@ -131,25 +143,40 @@ let lastAppliedSeq = -1;
 export function applyProxyStateObservation(
   seq: number,
   running: boolean,
+  error: string | null = null,
 ): { state: ConnectionState; changed: boolean } {
   if (seq <= lastAppliedSeq) {
     return { state: currentState, changed: false };
   }
-  lastAppliedSeq = seq;
   if (!IDLE_STATES.has(currentState)) {
+    // Mid-transition: do NOT consume this seq. A transition state carries its
+    // own owning IPC promise; consuming the seq here would permanently gate out
+    // the later observation that must reconcile an escaped failed-state once the
+    // bridge settles (the backend bumps seq only on a running CHANGE, so the
+    // same committed truth never re-arrives with a newer seq).
     return { state: currentState, changed: false };
   }
+  lastAppliedSeq = seq;
+  const prior = currentState;
   const polled = stateForPolledRunning(running);
-  if (polled === currentState) {
+  if (polled === prior) {
     return { state: currentState, changed: false };
   }
   setState(polled);
+  // Exactly-once death cue (#470): a genuine on->off transition carrying a
+  // reason. The seq gate fires this once per death seq across BOTH channels
+  // (poll + event), `isEffectivelyOn(prior)` excludes connection-failed and
+  // startup-into-dead, and `error` is non-null only on an out-of-band death
+  // (the path-free sentinel — see commands::map_status_response).
+  if (polled === "disconnected" && isEffectivelyOn(prior) && error != null) {
+    showToast(error, "error");
+  }
   return { state: currentState, changed: true };
 }
 
 /** Update the connection state from a periodic proxy status poll. */
 export function updateProxyStatus(status: ProxyStatus): { state: ConnectionState; changed: boolean } {
-  return applyProxyStateObservation(status.state_seq, !!status.running);
+  return applyProxyStateObservation(status.state_seq, !!status.running, status.error);
 }
 
 /** Returns the current connection state. */

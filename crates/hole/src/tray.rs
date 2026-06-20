@@ -3,12 +3,13 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
+use hole_common::config::StartupBehavior;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ToggleOutcome =======================================================================================================
 
@@ -74,6 +75,22 @@ pub(crate) enum StartDecision {
     Fail(String),
 }
 
+/// Single producer of the user-facing bridge-error string, shared by the elevated
+/// and non-elevated paths so they read identically. The bridge message is shown
+/// raw: it is authored by the bridge running as a system account (LocalSystem /
+/// root) with system-scoped paths, and `ProxyConfig` carries no path field, so it
+/// cannot contain user PII (#475). A future change that threads a user path into a
+/// bridge request and echoes it here must revisit this.
+pub(crate) fn bridge_error_toast(message: &str) -> String {
+    format!("Bridge error: {message}")
+}
+
+/// Toast for a transport failure observed AFTER a successful elevation — the
+/// bridge is unreachable, which is not an elevation denial.
+pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
+    format!("Could not reach the Hole bridge after elevation. {detail} See gui.log for details.")
+}
+
 pub(crate) fn outcome_for_start_response(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> StartDecision {
@@ -83,7 +100,7 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            StartErrorKind::Other => StartDecision::Fail(format!("Bridge error: {message}")),
+            StartErrorKind::Other => StartDecision::Fail(bridge_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
@@ -96,7 +113,7 @@ pub(crate) fn outcome_for_stop_response(
 ) -> StartDecision {
     match result {
         Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Stopped),
-        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(format!("Bridge error: {message}")),
+        Ok(BridgeResponse::Error { message }) => StartDecision::Fail(bridge_error_toast(message)),
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
         Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
@@ -104,9 +121,9 @@ pub(crate) fn outcome_for_stop_response(
 }
 
 /// Sole writer of persisted `config.enabled` (#462): records the last user
-/// intent the bridge honored, as input for a future
-/// `StartupBehavior::RestoreLastState`. Nothing reads it at runtime —
-/// display and direction come from the `ProxyStateCell`.
+/// intent the bridge honored. Read at launch by `startup_should_connect` for
+/// `StartupBehavior::RestoreLastState` (#458); display and direction still come
+/// from the `ProxyStateCell`, never this flag.
 pub(crate) fn persist_intended_enabled(
     config: &std::sync::Mutex<hole_common::config::AppConfig>,
     store: &hole_common::config_store::ConfigStore,
@@ -119,6 +136,17 @@ pub(crate) fn persist_intended_enabled(
     config.enabled = enabled;
     if let Err(e) = store.save(&config) {
         warn!(error = %e, path = %store.path().display(), "failed to persist intended enabled state");
+    }
+}
+
+/// Pure launch-time decision (#458): should the GUI auto-connect now?
+/// `last_enabled` is the persisted last-honored intent (#462), read only here.
+/// The exhaustive match makes a future `StartupBehavior` variant a compile error.
+pub(crate) fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> bool {
+    match behavior {
+        StartupBehavior::DoNotConnect => false,
+        StartupBehavior::RestoreLastState => last_enabled,
+        StartupBehavior::AlwaysConnect => true,
     }
 }
 
@@ -354,10 +382,10 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 
 /// Send a best-effort Stop to the bridge and exit the application.
 ///
-/// Persisted `config.enabled` is deliberately untouched: it is the
-/// write-only record of the last honored intent (the future
-/// `RestoreLastState` input), and the tray renders from bridge Status at
-/// the next launch, never from that flag (#462).
+/// Persisted `config.enabled` is deliberately untouched: it is the record of
+/// the last honored intent (the `RestoreLastState` input read at next launch by
+/// `startup_should_connect`, #458), and the tray renders from bridge Status,
+/// never from that flag (#462).
 async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
@@ -391,24 +419,61 @@ impl Drop for TransitionGuard {
     }
 }
 
-/// Elevation bypasses the pooled bridge channel, so on success confirm
-/// the actual state via a tracked Status instead of assuming: the commit
-/// (inside `BridgeLink::send`) updates the tray and the webview, and the
-/// returned outcome — which the caller persists as the last honored
-/// intent — is derived from that confirmed snapshot, never from the
-/// elevated helper's claim of success.
+/// Translate an elevated send into the final outcome, attributing failure
+/// honestly: a propagated bridge error reads identically to the non-elevated
+/// path, a post-elevation transport failure is not a denial, and only a real
+/// `Cancelled`/`LaunchFailure` keeps the elevation framing.
+///
+/// On success, elevation bypassed the pooled bridge channel, so the actual state
+/// is confirmed via a tracked Status: the commit (inside `BridgeLink::send`)
+/// updates the tray and the webview, and the returned outcome — which the caller
+/// persists as the last honored intent — is derived from that confirmed
+/// snapshot, never from the elevated helper's claim of success.
 async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<ToggleOutcome, String> {
-    if crate::elevation::prompt_elevation(app, request).await {
-        let state = app.state::<AppState>();
-        let _ = state.bridge_send(BridgeRequest::Status).await;
-        Ok(if state.proxy_snapshot().running {
-            ToggleOutcome::Running
-        } else {
-            ToggleOutcome::Stopped
-        })
-    } else {
-        Err("Elevation was denied or failed".into())
+    use crate::elevation::ElevationResult;
+    match crate::elevation::prompt_elevation(app, request).await {
+        ElevationResult::Success => {
+            let state = app.state::<AppState>();
+            let _ = state.bridge_send(BridgeRequest::Status).await;
+            Ok(if state.proxy_snapshot().running {
+                ToggleOutcome::Running
+            } else {
+                ToggleOutcome::Stopped
+            })
+        }
+        ElevationResult::BridgeError(message) => Err(bridge_error_toast(&message)),
+        ElevationResult::Transport(detail) => Err(transport_after_elevation_toast(&detail)),
+        ElevationResult::Cancelled => Err("Elevation was cancelled.".into()),
+        ElevationResult::LaunchFailure => Err("The elevated helper could not start. See gui.log for details.".into()),
     }
+}
+
+/// Whether a connect attempt may surface UI that demands a human: the
+/// bridge-install prompt, the UAC/elevation prompt, an error modal.
+/// `Forbidden` is the unattended startup auto-connect path (#458) — it must
+/// fail passively into the tray's Disconnected state, never block a login on a
+/// modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prompts {
+    Allowed,
+    Forbidden,
+}
+
+/// Interactive connect/disconnect entry — the tray menu items and the
+/// `start_proxy`/`stop_proxy` commands. Delegates with prompts allowed.
+///
+/// A manual action supersedes the boot-connect intent (#458): consume the latch
+/// so a later reconciler tick can't override the user's explicit choice.
+pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String) -> Result<ToggleOutcome, String> {
+    app.state::<AppState>().take_pending_startup_connect();
+    set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
+}
+
+/// The sole non-interactive connect entry — startup auto-connect (#458).
+/// Connect-only by construction (no `enable` param), so silent-disconnect is
+/// unrepresentable; the shared #462 commit tail stays single-sourced.
+async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled_inner(app, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
 
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
@@ -421,20 +486,34 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
 /// the webview, and persisted `config.enabled` records only an intent
 /// the bridge actually honored. On failure, one follow-up Status commits
 /// reality — a failed Disconnect can no longer re-assert "Connected"
-/// over a stopped tunnel.
-/// Used by the tray menu items and the `start_proxy`/`stop_proxy`
-/// commands.
-pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOutcome, String> {
+/// over a stopped tunnel. Used by the tray menu items and the
+/// `start_proxy`/`stop_proxy` commands.
+///
+/// `prompts` is consulted only on the enable path's two prompt sites (the
+/// bridge-install gate and the elevation fallback): `Allowed` shows the UI;
+/// `Forbidden` (unattended startup) suppresses both and fails passively. The
+/// disconnect path is always interactive (startup never disconnects).
+async fn set_proxy_enabled_inner(
+    app: &AppHandle,
+    enable: bool,
+    prompts: Prompts,
+    attempt_id: String,
+) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
     // Bridge install gate: if the user is trying to enable the proxy and
     // the bridge isn't installed yet, prompt for installation BEFORE
     // anything else.
-    if enable
-        && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled
-        && !crate::setup::prompt_bridge_install(app.clone()).await
-    {
-        return Err("The Hole bridge must be installed to connect.".into());
+    if enable && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled {
+        match prompts {
+            Prompts::Allowed => {
+                if !crate::setup::prompt_bridge_install(app.clone()).await {
+                    return Err("The Hole bridge must be installed to connect.".into());
+                }
+            }
+            // Startup must not throw an admin install wizard at a login.
+            Prompts::Forbidden => return Err("The Hole bridge is not installed.".into()),
+        }
     }
 
     // Resolve the start payload BEFORE claiming the transition slot — a
@@ -459,6 +538,7 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOu
     let result: Result<ToggleOutcome, String> = if enable {
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
+            attempt_id,
         };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {
@@ -466,7 +546,14 @@ pub async fn set_proxy_enabled(app: &AppHandle, enable: bool) -> Result<ToggleOu
                 info!(?outcome, "proxy start settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
+            StartDecision::NeedsElevation => match prompts {
+                Prompts::Allowed => elevate_and_confirm(app, request).await,
+                // No UAC at an unattended startup; fail into Disconnected.
+                Prompts::Forbidden => {
+                    debug!("startup auto-connect needs elevation; skipping (unattended)");
+                    Err("Connecting requires elevation, which is unavailable at startup.".into())
+                }
+            },
             StartDecision::Fail(msg) => {
                 error!("proxy start failed: {msg}");
                 Err(msg)
@@ -538,7 +625,10 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!(enable, "tray: connect/disconnect clicked");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                match set_proxy_enabled(&app_handle, enable).await {
+                // Tray-initiated connect has no paired user Cancel, so a fresh
+                // per-attempt id suffices (it will never be matched by a cancel).
+                let attempt_id = uuid::Uuid::new_v4().to_string();
+                match set_proxy_enabled(&app_handle, enable, attempt_id).await {
                     Ok(ToggleOutcome::Running) | Ok(ToggleOutcome::Stopped) => { /* watcher repaints */ }
                     Ok(ToggleOutcome::Cancelled) => {
                         // Tray never initiates Cancel itself, so this is an
@@ -766,13 +856,41 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Verify integrity and authenticity.
-    let dest_for_verify = dest.clone();
-    let asset_name = info.asset_name.clone();
+    // Fetch the manifest + signature once; they feed BOTH the local verify and
+    // the bridge's offline re-verify (the bridge must not re-fetch).
     let sha256sums_url = info.sha256sums_url.clone();
     let sha256sums_minisig_url = info.sha256sums_minisig_url.clone();
+    let manifest_result =
+        tokio::task::spawn_blocking(move || hole::update::fetch_manifest(&sha256sums_url, &sha256sums_minisig_url))
+            .await;
+    let (sha256sums, sha256sums_minisig) = match manifest_result {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            error!("manifest fetch failed: {e}");
+            app.dialog()
+                .message(format!("Update verification failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
+            return;
+        }
+        Err(e) => {
+            error!("manifest fetch task panicked: {e}");
+            return;
+        }
+    };
+
+    // Verify integrity and authenticity locally before handing it to the bridge.
+    let dest_for_verify = dest.clone();
+    let asset_name = info.asset_name.clone();
+    let sums_for_verify = sha256sums.clone();
+    let minisig_for_verify = sha256sums_minisig.clone();
     let verify_result = tokio::task::spawn_blocking(move || {
-        hole::update::verify_asset(&dest_for_verify, &asset_name, &sha256sums_url, &sha256sums_minisig_url)
+        hole_common::verify::verify_payload_offline(
+            &dest_for_verify,
+            &asset_name,
+            &sums_for_verify,
+            &minisig_for_verify,
+        )
     })
     .await;
 
@@ -792,26 +910,39 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Run installer (interactive mode).
-    let dest_clone = dest.clone();
-    let install_result = tokio::task::spawn_blocking(move || hole::update::run_installer(&dest_clone, false)).await;
+    // Hand the verified payload to the privileged bridge, which owns the cutover
+    // (binary swap + service restart). The GUI does NOT exit — it self-heals onto
+    // the new image via the version-lockstep relaunch once the bridge is back.
+    // For PR2 the tray's existing user-initiated "install update" click is the
+    // gate, so consent is passed true (PR3 wires an explicit dialog).
+    let apply = BridgeRequest::ApplyUpdate {
+        payload_path: dest.clone(),
+        target_version: info.version.to_string(),
+        consent: true,
+        sha256sums,
+        sha256sums_minisig,
+        asset_name: info.asset_name.clone(),
+        app_dest: hole::update::app_dest_hint(),
+    };
+    let result = app.state::<AppState>().bridge_send(apply).await;
+    drop(download_dir);
 
-    match install_result {
-        Ok(Ok(())) => {
-            // On Windows, exit app to let MSI complete.
-            // On macOS, the installer already copied the app.
-            drop(download_dir);
-            app.exit(0);
-        }
-        Ok(Err(e)) => {
-            error!("installation failed: {e}");
+    match result {
+        Ok(BridgeResponse::Ack) => {}
+        Ok(BridgeResponse::Error { message }) => {
+            error!("bridge rejected update: {message}");
             app.dialog()
-                .message(format!("Installation failed: {e}"))
+                .message(format!("Update failed: {message}"))
                 .title("Update Error")
                 .blocking_show();
         }
+        Ok(other) => error!("unexpected bridge response to update apply: {other:?}"),
         Err(e) => {
-            error!("install task panicked: {e}");
+            error!("update apply failed: {e}");
+            app.dialog()
+                .message(format!("Update failed: {e}"))
+                .title("Update Error")
+                .blocking_show();
         }
     }
 }
@@ -1023,23 +1154,26 @@ fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindo
 /// Cancelled); the frontend distinguishes the three cases in its
 /// connection state machine.
 #[tauri::command]
-pub async fn start_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled(&app, true).await
+pub async fn start_proxy(app: AppHandle, attempt_id: String) -> Result<ToggleOutcome, String> {
+    set_proxy_enabled(&app, true, attempt_id).await
 }
 
-/// Stop the proxy. See [`start_proxy`].
+/// Stop the proxy. See [`start_proxy`]. Stop carries no attempt id (it is not
+/// cancellable), so a fresh placeholder satisfies the shared signature.
 #[tauri::command]
 pub async fn stop_proxy(app: AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled(&app, false).await
+    set_proxy_enabled(&app, false, String::new()).await
 }
 
 /// Cancel an in-flight proxy start. Uses `bridge_send_oneshot` so the
 /// cancel can race an in-flight `start_proxy` on the main pooled
-/// bridge connection. Always returns `Ok(())` on a successful bridge
+/// bridge connection. The `attempt_id` (minted by the frontend for this
+/// connect attempt and shared with `start_proxy`) scopes the cancel to that
+/// exact attempt (#465). Always returns `Ok(())` on a successful bridge
 /// round-trip — the bridge's `/v1/cancel` route is idempotent.
 #[tauri::command]
-pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    match state.bridge_send_oneshot(BridgeRequest::Cancel).await {
+pub async fn cancel_proxy(state: tauri::State<'_, AppState>, attempt_id: String) -> Result<(), String> {
+    match state.bridge_send_oneshot(BridgeRequest::Cancel { attempt_id }).await {
         Ok(BridgeResponse::Ack) => Ok(()),
         Ok(other) => {
             warn!("unexpected response to Cancel: {other:?}");
@@ -1050,6 +1184,46 @@ pub async fn cancel_proxy(state: tauri::State<'_, AppState>) -> Result<(), Strin
             Err(format!("Failed to cancel: {e}"))
         }
     }
+}
+
+// Autostart (OS login-item) ===========================================================================================
+
+/// Read whether the GUI is registered to start at OS login. The OS registration
+/// (Windows Run key / macOS LaunchAgent) is the single source of truth; the
+/// dashboard renders this live rather than from config (#457).
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    crate::autostart::is_enabled(&*app.autolaunch()).map_err(|e| {
+        // Full detail (may embed the executable path) → gui.log; the dashboard
+        // toast gets only the PII-free summary.
+        error!("{e}");
+        e.user_message().to_string()
+    })
+}
+
+/// Register or unregister GUI start-at-login through the same `crate::autostart`
+/// seam this tray uses, then re-sync the tray checkmark from the new OS state.
+/// Returns the live OS state (#457).
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    crate::autostart::set(&*manager, enabled).map_err(|e| {
+        error!("{e}");
+        e.user_message().to_string()
+    })?;
+    // A successful flip must re-derive the tray checkmark from live OS state, or
+    // the two surfaces disagree (the inverse of the bug). rebuild_tray_menu
+    // marshals onto the main thread itself.
+    rebuild_tray_menu(&app);
+    // Report live OS state, not the intent — the OS is the single source of truth.
+    // A successful set establishes `enabled` (enable()/disable()'s post-condition),
+    // so a failed read-back falls back to it rather than lying.
+    Ok(crate::autostart::is_enabled(&*manager).unwrap_or_else(|e| {
+        warn!("autostart read-back after set failed: {e}");
+        enabled
+    }))
 }
 
 // Proxy state sync ====================================================================================================
@@ -1068,7 +1242,15 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
             if rx.changed().await.is_err() {
                 return; // cell dropped — app teardown
             }
-            let snap = *rx.borrow_and_update();
+            // `watch` coalesces to the latest snapshot. A death (running=false,
+            // error=sentinel) loses its error before this wakes only if a later
+            // commit overwrites it AND flips running back to true — which comes
+            // solely from a Start (slow, user/startup I/O; there is no
+            // auto-reconnect on death), so it cannot land in the wake window. A
+            // coalesced lockdown-only re-commit keeps running=false and the
+            // sticky error, so the death still reaches the webview (#470).
+            // clone: ProxySnapshot owns a String and is no longer Copy.
+            let snap = rx.borrow_and_update().clone();
             rebuild_tray_menu(&app);
             if let Err(e) = app.emit("proxy-state-changed", snap) {
                 warn!(error = %e, "failed to emit proxy-state-changed");
@@ -1087,6 +1269,10 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// the webview's 5s status poll — and synchronizes nothing in-process
 /// (`BridgeLink::send` commits synchronously; no code waits on this
 /// loop). The immediate first tick doubles as the startup reconcile.
+///
+/// Beyond presentation, each tick's Status result drives the one-shot
+/// startup-connect intent (#458): the recorded intent is applied (connect) at
+/// most once — the first time the bridge proves reachable — and never again.
 pub fn spawn_status_reconciler(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1094,10 +1280,89 @@ pub fn spawn_status_reconciler(app: &AppHandle) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            // Result irrelevant: the commit happens inside send.
-            let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+            // The commit happens inside send; the result also drives the
+            // one-shot startup-connect intent (#458).
+            let result = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+            apply_pending_startup_connect(&app, &result);
         }
     });
+}
+
+/// Arm the one-shot startup-connect intent (#458) from the persisted
+/// `on_startup` policy. The status reconciler applies it the first time the
+/// bridge is reachable, so a cold-boot race — the bridge service and the GUI
+/// start as independent OS units with no ordering edge, and the GUI can reach
+/// here before the bridge has bound its socket — can't drop the connect. Runs
+/// once per live GUI instance. Snapshots the two Copy config fields under the
+/// lock and drops the guard.
+pub fn arm_startup_auto_connect(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let (behavior, last_enabled) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.on_startup, cfg.enabled)
+    };
+    if startup_should_connect(behavior, last_enabled) {
+        state.arm_pending_startup_connect();
+    }
+}
+
+/// What the status reconciler should do with a pending startup-connect intent
+/// (#458), given a Status exchange result. The bridge service and the GUI start
+/// as independent OS units with no ordering edge, so the boot connect can race
+/// the bridge's socket bind; this lets the reconciler apply the recorded intent
+/// the first time the bridge proves reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingAction {
+    /// Bridge reachable and idle — connect now and consume the intent.
+    Apply,
+    /// Bridge reachable and already running — intent satisfied; consume it.
+    Drop,
+    /// Readiness unproven (still booting, or a hiccup that says nothing about
+    /// reachability) — keep the intent for a later tick.
+    Retain,
+}
+
+/// Decide the pending startup-connect action from a reconciler `Status` result.
+/// Only a reachable bridge reporting its run state is conclusive; a transport
+/// failure means "not bound yet", and a DACL/version hiccup says nothing about
+/// readiness — both retain so a later tick can apply the intent.
+pub(crate) fn should_apply_pending(
+    result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
+) -> PendingAction {
+    match result {
+        Ok(BridgeResponse::Status { running: false, .. }) => PendingAction::Apply,
+        Ok(BridgeResponse::Status { running: true, .. }) => PendingAction::Drop,
+        _ => PendingAction::Retain,
+    }
+}
+
+/// Apply the one-shot startup-connect intent (#458) against a reconciler Status
+/// result: connect once the bridge is first reachable, drop the intent if it is
+/// already running, retain it while the bridge is still booting. Spawns the
+/// silent connect (the latch is consumed first, so it fires at most once).
+fn apply_pending_startup_connect(app: &AppHandle, status: &Result<BridgeResponse, crate::bridge_client::ClientError>) {
+    let state = app.state::<AppState>();
+    match should_apply_pending(status) {
+        PendingAction::Apply => {
+            if state.take_pending_startup_connect() {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Both arms log at info: failing into the tray's Disconnected
+                    // state is the contract, not an error.
+                    match connect_silently(&app).await {
+                        Ok(outcome) => info!(?outcome, "startup auto-connect settled"),
+                        Err(e) => info!(reason = %e, "startup auto-connect did not connect"),
+                    }
+                });
+            }
+        }
+        // Already running: consume the intent so a later user disconnect can't
+        // be undone by a stale latch.
+        PendingAction::Drop => {
+            state.take_pending_startup_connect();
+        }
+        PendingAction::Retain => {}
+    }
 }
 
 #[cfg(test)]

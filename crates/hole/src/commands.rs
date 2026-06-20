@@ -2,14 +2,17 @@
 
 use crate::bridge_client::ClientError;
 use crate::state::AppState;
-use hole_common::config::{AppConfig, ServerEntry, ValidationState};
+use hole_bridge::filter::{decide_test, RuleSet, TestInput};
+use hole_common::config::{AppConfig, FilterAction, FilterRule, ServerEntry, ValidationState};
 use hole_common::import;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, ProxyConfig, ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT,
 };
 use serde::Serialize;
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
 use tauri::{Emitter, State};
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
@@ -286,71 +289,86 @@ pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), Str
     Ok(())
 }
 
-/// Poll the proxy's status. The exchange itself commits the observation
-/// to the `ProxyStateCell` (inside `BridgeLink::send`); the returned
-/// `running` + `state_seq` come from the committed cell so the frontend
-/// can apply observations monotonically (#462). The remaining fields are
-/// cosmetics from the raw response.
+/// Poll the proxy's status. The exchange commits the observation to the
+/// `ProxyStateCell` (inside `BridgeLink::send`); `running`, `state_seq`, and
+/// `error` all come from the committed snapshot so the frontend applies
+/// observations monotonically (#462) and the death `error` (#470) is the same
+/// string the `proxy-state-changed` event carries — see `map_status_response`.
+/// The remaining fields are cosmetics from the raw response.
 ///
-/// On `PermissionDenied` the cell is NOT committed (a DACL-gated Status
-/// says nothing about the tunnel), so `running` reports the last
-/// committed value while `error` carries the failure — stale truth beats
-/// flapping to false. Every other error arm commits false, so cell and
-/// cosmetics agree.
+/// On `PermissionDenied` the cell is NOT committed (a DACL-gated Status says
+/// nothing about the tunnel), so `running`/`state_seq`/`error` report the last
+/// committed values — stale truth beats flapping to false, and the unchanged
+/// `state_seq` makes the frontend gate drop the observation (no spurious toast).
 #[tauri::command]
 pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let result = state.bridge_send(BridgeRequest::Status).await;
     let snap = state.proxy_snapshot();
-    let mut json = match result {
+    Ok(map_status_response(result, snap))
+}
+
+// Response mappers (extracted for testability) ========================================================================
+
+/// Map a Status exchange + the committed snapshot to the GUI status JSON.
+/// `running`, `state_seq`, and `error` come from the snapshot — the single
+/// committed source of truth, so they agree with the `proxy-state-changed`
+/// event regardless of which channel wins the death-seq race (#470). The
+/// cosmetics come from the response. Capabilities are `null` (unknown) when the
+/// exchange did not return a Status: the bridge cannot vouch for them, and a
+/// `true` default would flicker the connected-state dots on a transient
+/// DACL/transport hiccup.
+fn map_status_response(
+    result: Result<BridgeResponse, ClientError>,
+    snap: crate::state::ProxySnapshot,
+) -> serde_json::Value {
+    let (uptime_secs, invalid_filters, udp, ipv6) = match &result {
         Ok(BridgeResponse::Status {
-            running: _,
             uptime_secs,
-            error,
             invalid_filters,
             udp_proxy_available,
             ipv6_bypass_available,
             ..
-        }) => serde_json::json!({
-            "uptime_secs": uptime_secs,
-            "error": error,
-            "invalid_filters": invalid_filters,
-            "udp_proxy_available": udp_proxy_available,
-            "ipv6_bypass_available": ipv6_bypass_available,
-        }),
+        }) => (
+            *uptime_secs,
+            serde_json::json!(invalid_filters),
+            serde_json::json!(*udp_proxy_available),
+            serde_json::json!(*ipv6_bypass_available),
+        ),
         Ok(BridgeResponse::Error { message }) => {
             warn!(error = %message, "bridge returned error for status");
-            serde_json::json!({
-                "uptime_secs": 0,
-                "error": message,
-                "invalid_filters": [],
-                "udp_proxy_available": true,
-                "ipv6_bypass_available": true,
-            })
+            (
+                0,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
         }
-        Ok(_) => serde_json::json!({
-            "uptime_secs": 0,
-            "error": "unexpected response from bridge",
-            "invalid_filters": [],
-            "udp_proxy_available": true,
-            "ipv6_bypass_available": true,
-        }),
+        Ok(_) => (
+            0,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
         Err(e) => {
-            // Bridge not running or unreachable — not an error for the frontend
-            serde_json::json!({
-                "uptime_secs": 0,
-                "error": format!("bridge unreachable: {e}"),
-                "invalid_filters": [],
-                "udp_proxy_available": true,
-                "ipv6_bypass_available": true,
-            })
+            warn!(error = %e, "bridge unreachable for status");
+            (
+                0,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
         }
     };
-    json["running"] = serde_json::json!(snap.running);
-    json["state_seq"] = serde_json::json!(snap.seq);
-    Ok(json)
+    serde_json::json!({
+        "running": snap.running,
+        "state_seq": snap.seq,
+        "error": snap.error,
+        "uptime_secs": uptime_secs,
+        "invalid_filters": invalid_filters,
+        "udp_proxy_available": udp,
+        "ipv6_bypass_available": ipv6,
+    })
 }
-
-// Response mappers (extracted for testability) ========================================================================
 
 fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_json::Value {
     match result {
@@ -607,6 +625,44 @@ pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), Stri
     };
 
     state.link.reload_if_running(proxy_config).await.map(|_| ())
+}
+
+// Filter Test box =====================================================================================================
+
+/// Result of evaluating a single typed domain/IP against the user's filter
+/// rules. `rule_index` is the index into the user's `config.filters`
+/// (`None` = terminal fallback, no rule matched); `matched_address` is that
+/// rule's address for the UI label.
+#[derive(Debug, Clone, Serialize)]
+pub struct FilterEvaluation {
+    pub action: FilterAction,
+    pub rule_index: Option<usize>,
+    pub matched_address: Option<String>,
+}
+
+/// Evaluate the Filters "Test" box input through the exact engine the tunnel
+/// runs (`decide_test`). Pure: no bridge IPC, no proxy — works whether or not
+/// the proxy is connected. The frontend passes its live `config.filters` (the
+/// rows on screen, including the injected default) so the preview always
+/// matches what the user sees. Invalid rules are dropped by
+/// `RuleSet::from_user_rules`, so they never match — the same as the tunnel.
+#[tauri::command]
+pub fn evaluate_filter(input: String, filters: Vec<FilterRule>) -> FilterEvaluation {
+    let trimmed = input.trim();
+    let ruleset = RuleSet::from_user_rules(&filters);
+    let test_input = match IpAddr::from_str(trimmed) {
+        Ok(ip) => TestInput::Ip(ip),
+        Err(_) => TestInput::Domain(trimmed.to_string()),
+    };
+    let decision = decide_test(&ruleset, &test_input);
+    let matched_address = decision
+        .rule_index
+        .and_then(|i| filters.get(i).map(|r| r.address.clone()));
+    FilterEvaluation {
+        action: decision.action,
+        rule_index: decision.rule_index,
+        matched_address,
+    }
 }
 
 #[cfg(test)]

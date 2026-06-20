@@ -124,11 +124,6 @@ pub struct DnsConfig {
     pub enabled: bool,
     pub servers: Vec<IpAddr>,
     pub protocol: DnsProtocol,
-    /// Legacy field, retained for config back-compat. It no longer gates the
-    /// in-TUN UDP/53 divert: the DNS endpoint is always active when DNS is
-    /// enabled, so every in-tunnel UDP/53 flow is intercepted regardless of
-    /// this value.
-    pub intercept_udp53: bool,
 }
 
 impl Default for DnsConfig {
@@ -140,7 +135,6 @@ impl Default for DnsConfig {
                 IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
             ],
             protocol: DnsProtocol::Https,
-            intercept_udp53: true,
         }
     }
 }
@@ -161,7 +155,6 @@ pub struct AppConfig {
     pub elevation_prompt_shown: bool,
 
     pub filters: Vec<FilterRule>,
-    pub start_on_login: bool,
     pub on_startup: StartupBehavior,
     pub theme: Theme,
     /// Master switch for the user-facing local proxy listeners
@@ -203,7 +196,6 @@ impl Default for AppConfig {
             enabled: false,
             elevation_prompt_shown: false,
             filters: Vec::new(),
-            start_on_login: false,
             on_startup: StartupBehavior::default(),
             theme: Theme::default(),
             proxy_server_enabled: true,

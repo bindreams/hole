@@ -6,6 +6,7 @@ use hole_common::config_store::ConfigStore;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -21,6 +22,11 @@ pub struct AppState {
     /// `test_server` call so a slower test cannot overwrite a faster newer
     /// one. Different entries do NOT contend.
     test_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One-shot startup-connect intent (#458): armed at launch when the
+    /// `on_startup` policy says connect, consumed by the status reconciler the
+    /// first time the bridge proves reachable (so a cold-boot race against the
+    /// bridge's socket bind can't drop the connect).
+    pending_startup_connect: AtomicBool,
 }
 
 // Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
@@ -38,7 +44,21 @@ impl AppState {
             app_handle,
             link: BridgeLink::new(resolve_bridge_socket_path(), self_heal),
             test_locks: tokio::sync::Mutex::new(HashMap::new()),
+            pending_startup_connect: AtomicBool::new(false),
         }
+    }
+
+    /// Arm the one-shot startup-connect intent (#458). Called once at launch
+    /// when `startup_should_connect` is true; the status reconciler applies it.
+    pub fn arm_pending_startup_connect(&self) {
+        self.pending_startup_connect.store(true, Ordering::Release);
+    }
+
+    /// Consume the startup-connect intent, returning whether it was armed.
+    /// Single-shot: a second call returns false, so the reconciler connects at
+    /// most once even if two ticks observe a reachable bridge.
+    pub fn take_pending_startup_connect(&self) -> bool {
+        self.pending_startup_connect.swap(false, Ordering::AcqRel)
     }
 
     /// Fetch (or create on first access) the per-entry async mutex used to
@@ -96,6 +116,10 @@ pub type SelfHealHook = std::sync::Arc<dyn Fn(Option<String>) + Send + Sync>;
 
 pub struct BridgeLink {
     socket_path: PathBuf,
+    /// SERVICE log dir where the privileged bridge writes the update-in-progress
+    /// marker. Cached at construction; overridable for tests (skuld shares a
+    /// process, so per-test markers must not collide on the real system dir).
+    service_log_dir: PathBuf,
     client: tokio::sync::Mutex<Option<BridgeClient>>,
     cell: ProxyStateCell,
     self_heal: SelfHealHook,
@@ -103,8 +127,15 @@ pub struct BridgeLink {
 
 impl BridgeLink {
     pub fn new(socket_path: PathBuf, self_heal: SelfHealHook) -> Self {
+        Self::with_service_log_dir(socket_path, hole_common::update_marker::service_log_dir(), self_heal)
+    }
+
+    /// Construct with an explicit service log dir (tests inject a temp dir so
+    /// per-test markers don't collide across the shared skuld process).
+    pub fn with_service_log_dir(socket_path: PathBuf, service_log_dir: PathBuf, self_heal: SelfHealHook) -> Self {
         Self {
             socket_path,
+            service_log_dir,
             client: tokio::sync::Mutex::new(None),
             cell: ProxyStateCell::new(),
             self_heal,
@@ -113,6 +144,13 @@ impl BridgeLink {
 
     pub fn cell(&self) -> &ProxyStateCell {
         &self.cell
+    }
+
+    /// Whether the privileged bridge has a cutover in flight (its marker is
+    /// present). Read fresh per exchange so the no-surprise-Disconnected window
+    /// opens and closes with the marker.
+    fn update_in_progress(&self) -> bool {
+        hole_common::update_marker::read(&self.service_log_dir).is_some()
     }
 
     /// Drive the self-heal hook if the exchange revealed a version mismatch.
@@ -130,11 +168,11 @@ impl BridgeLink {
         let kind = ReqKind::of(&req);
         let mut guard = self.client.lock().await;
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
-        if let Some(running) = observed_running(kind, &result) {
-            // A Status exchange reveals lockdown too — commit all three
+        if let Some(running) = observed_running(kind, &result, self.update_in_progress()) {
+            // A Status exchange reveals error + lockdown too — commit all three
             // atomically under this lock; other exchanges know only `running`.
             match observed_lockdown(&result) {
-                Some((le, la)) => self.cell.commit_status(running, le, la),
+                Some((le, la)) => self.cell.commit_status(running, observed_error(&result), le, la),
                 None => self.cell.commit(running),
             }
         }
@@ -215,9 +253,9 @@ impl BridgeLink {
         let mut guard = self.client.lock().await;
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
         self.note_mismatch(&status);
-        if let Some(running) = observed_running(ReqKind::Status, &status) {
+        if let Some(running) = observed_running(ReqKind::Status, &status, self.update_in_progress()) {
             match observed_lockdown(&status) {
-                Some((le, la)) => self.cell.commit_status(running, le, la),
+                Some((le, la)) => self.cell.commit_status(running, observed_error(&status), le, la),
                 None => self.cell.commit(running),
             }
         }
@@ -241,10 +279,17 @@ impl BridgeLink {
 /// only when `running` changes; consumers (tray watcher, webview) discard
 /// observations whose seq is not newer than the last applied, which makes
 /// application monotone across the unordered event/poll channels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProxySnapshot {
     pub seq: u64,
     pub running: bool,
+    /// Reason for the most recent running transition, when the bridge reported
+    /// one (#470). Carried on BOTH the poll and the `proxy-state-changed` event
+    /// so whichever channel wins the death-seq race surfaces the same string.
+    /// Only ever the path-free out-of-band-death sentinel or `None` (set by
+    /// `commit_status` from a Status response; cleared by `commit`), so a toast
+    /// of this value cannot leak PII — see `commands::map_status_response`.
+    pub error: Option<String>,
     /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
     /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
@@ -268,6 +313,7 @@ impl ProxyStateCell {
         let (tx, _) = tokio::sync::watch::channel(ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false,
         });
@@ -275,8 +321,10 @@ impl ProxyStateCell {
     }
 
     /// Commit an observed running state. Bumps `seq` (and wakes watchers)
-    /// only when the value actually changes. Preserves the lockdown fields:
-    /// the non-Status paths that call this only know `running`.
+    /// only when the value actually changes. Preserves the lockdown fields
+    /// (the non-Status paths that call this only know `running`) and clears
+    /// `error`: a non-Status running edge (Start/Stop/Cancel) is user-initiated
+    /// and carries no death reason (#470).
     pub fn commit(&self, running: bool) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running {
@@ -285,16 +333,20 @@ impl ProxyStateCell {
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running,
-                ..*snap
+                error: None,
+                lockdown_enabled: snap.lockdown_enabled,
+                lockdown_active: snap.lockdown_active,
             };
             true
         });
     }
 
-    /// Commit a full Status observation (running + lockdown). Bumps `seq`
-    /// (waking watchers) when any field changes. Used by the `Status` arm so
-    /// all three commit atomically under the one client lock.
-    pub fn commit_status(&self, running: bool, lockdown_enabled: bool, lockdown_active: bool) {
+    /// Commit a full Status observation (running + error + lockdown). Bumps
+    /// `seq` (waking watchers) when `running` or a lockdown field changes. Used
+    /// by the `Status` arm so all commit atomically under the one client lock.
+    /// `error` rides the same write — it is meaningful only alongside a running
+    /// edge (a death), so it is not part of the change check.
+    pub fn commit_status(&self, running: bool, error: Option<String>, lockdown_enabled: bool, lockdown_active: bool) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
@@ -305,6 +357,7 @@ impl ProxyStateCell {
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running,
+                error,
                 lockdown_enabled,
                 lockdown_active,
             };
@@ -313,7 +366,7 @@ impl ProxyStateCell {
     }
 
     pub fn snapshot(&self) -> ProxySnapshot {
-        *self.tx.borrow()
+        self.tx.borrow().clone()
     }
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<ProxySnapshot> {
@@ -371,7 +424,14 @@ pub(crate) fn classify_start_error(message: &str) -> StartErrorKind {
 ///   says nothing about the tunnel.
 /// - Transport errors on tracked kinds commit false: an unreachable
 ///   bridge tunnels nothing (the mapping `get_proxy_status` always used).
-pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, ClientError>) -> Option<bool> {
+/// - A transport error WHILE an update cutover is in progress commits
+///   nothing: the bridge is mid-restart, so the gap is expected, not a
+///   Disconnected — hold the last snapshot.
+pub(crate) fn observed_running(
+    kind: ReqKind,
+    result: &Result<BridgeResponse, ClientError>,
+    update_in_progress: bool,
+) -> Option<bool> {
     use ReqKind::*;
     match (kind, result) {
         (Other, _) => None,
@@ -379,6 +439,12 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
         // A version mismatch triggers self-heal; do not flip `running` during
         // the self-heal window (must precede the `(_, Err(_))` catch-all).
         (_, Err(ClientError::VersionMismatch { .. })) => None,
+        // A cutover is in progress (the bridge is mid-restart). A transport
+        // error here is the expected gap, not a Disconnected — hold the last
+        // snapshot. Must precede the `(_, Err(_))` catch-all, like the
+        // VersionMismatch arm: keying on VersionMismatch alone is too late, as
+        // it arrives only after the new bridge answers.
+        (_, Err(_)) if update_in_progress => None,
         (_, Err(_)) => Some(false),
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
@@ -391,6 +457,17 @@ pub(crate) fn observed_running(kind: ReqKind, result: &Result<BridgeResponse, Cl
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),
         (Stop, Ok(BridgeResponse::Error { .. })) => None,
         (_, Ok(_)) => None,
+    }
+}
+
+/// The error a Status exchange revealed, if any. Only a `Status` Ok carries it
+/// (#470); every other exchange yields None. `StatusResponse.error` is the
+/// bridge's path-free `death_reason` (NOT the PII-bearing `last_error`; see
+/// `ProxyManager::DEATH_REASON`), so this can never carry PII to the toast.
+pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Option<String> {
+    match result {
+        Ok(BridgeResponse::Status { error, .. }) => error.clone(),
+        _ => None,
     }
 }
 

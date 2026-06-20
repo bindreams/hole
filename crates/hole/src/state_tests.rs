@@ -12,6 +12,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -24,6 +25,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -34,6 +36,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 2,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -49,10 +52,11 @@ async fn cell_wakes_watchers_only_on_change() {
     cell.commit(true);
     assert!(rx.has_changed().unwrap());
     assert_eq!(
-        *rx.borrow_and_update(),
+        rx.borrow_and_update().clone(),
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false,
         }
@@ -66,7 +70,7 @@ fn commit_status_carries_lockdown_fields() {
     let s0 = cell.snapshot();
     assert!(!s0.lockdown_enabled && !s0.lockdown_active);
     // A Status commit threads both lockdown bools alongside `running`.
-    cell.commit_status(true, true, false);
+    cell.commit_status(true, None, true, false);
     let s1 = cell.snapshot();
     assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
     assert_eq!(s1.seq, 1, "seq bumped on change");
@@ -78,7 +82,7 @@ fn commit_preserves_lockdown_fields() {
     // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
     // a prior Status established (`enabled && !active` is the tray warning state).
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, true, false); // running + lockdown enabled, not active
+    cell.commit_status(true, None, true, false); // running + lockdown enabled, not active
     let before = cell.snapshot();
     assert!(before.lockdown_enabled && !before.lockdown_active);
 
@@ -90,6 +94,86 @@ fn commit_preserves_lockdown_fields() {
         "commit must preserve the lockdown fields, got {after:?}"
     );
     assert_eq!(after.seq, before.seq + 1, "running change bumps seq");
+}
+
+// error field (#470) ==================================================================================================
+
+#[skuld::test]
+fn commit_status_carries_error_on_death() {
+    let cell = ProxyStateCell::new();
+    cell.commit(true); // connected
+    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    let snap = cell.snapshot();
+    assert!(!snap.running);
+    assert_eq!(snap.error.as_deref(), Some("proxy task exited unexpectedly"));
+    assert_eq!(snap.seq, 2, "running change bumps seq");
+}
+
+#[skuld::test]
+fn commit_clears_error_on_non_status_running_change() {
+    // A non-Status running edge (Start/Stop/Cancel) is user-initiated and
+    // carries no death reason — `commit` must clear any prior error.
+    let cell = ProxyStateCell::new();
+    cell.commit_status(true, Some("synthetic".into()), false, false); // running -> true with an error
+    assert_eq!(cell.snapshot().error.as_deref(), Some("synthetic"));
+    cell.commit(false); // clean stop via the non-Status path
+    assert_eq!(cell.snapshot().error, None, "non-Status commit must clear error");
+}
+
+#[skuld::test]
+fn reconnect_clears_death_error() {
+    let cell = ProxyStateCell::new();
+    cell.commit(true);
+    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    cell.commit(true); // reconnect via a Start Ack
+    assert_eq!(cell.snapshot().error, None);
+}
+
+#[skuld::test]
+fn proxy_snapshot_serializes_error() {
+    // The proxy-state-changed event emits the snapshot; the webview reads
+    // `event.payload.error`. Some -> string, None -> null (no skip).
+    let some = serde_json::to_value(ProxySnapshot {
+        seq: 1,
+        running: false,
+        error: Some("boom".into()),
+        lockdown_enabled: false,
+        lockdown_active: false,
+    })
+    .unwrap();
+    assert_eq!(some["error"], "boom");
+    let none = serde_json::to_value(ProxySnapshot {
+        seq: 0,
+        running: false,
+        error: None,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    })
+    .unwrap();
+    assert!(
+        none["error"].is_null(),
+        "None error serializes as null for the TS payload"
+    );
+}
+
+#[skuld::test]
+fn observed_error_only_from_status_ok() {
+    let status = Ok(BridgeResponse::Status {
+        running: false,
+        uptime_secs: 0,
+        error: Some("proxy task exited unexpectedly".into()),
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    assert_eq!(
+        observed_error(&status).as_deref(),
+        Some("proxy task exited unexpectedly")
+    );
+    assert_eq!(observed_error(&Ok(BridgeResponse::Ack)), None);
+    assert_eq!(observed_error(&Err(ClientError::PermissionDenied)), None);
 }
 
 // observed_running ====================================================================================================
@@ -138,8 +222,43 @@ fn observed_running_rules() {
         (Other, Err(transport_err()), None),
     ];
     for (kind, result, expected) in &table {
-        assert_eq!(observed_running(*kind, result), *expected, "{kind:?} / {result:?}");
+        assert_eq!(
+            observed_running(*kind, result, false),
+            *expected,
+            "{kind:?} / {result:?}"
+        );
     }
+}
+
+#[skuld::test]
+fn observed_running_update_in_progress_holds_snapshot() {
+    let transport_err: Result<BridgeResponse, ClientError> = Err(ClientError::Protocol("boom".into()));
+
+    // Marker SET: a transport error commits None (hold last snapshot), not Some(false).
+    for kind in [ReqKind::Status, ReqKind::Start, ReqKind::Stop] {
+        assert_eq!(
+            observed_running(kind, &transport_err, true),
+            None,
+            "{kind:?} marker-set"
+        );
+    }
+    // Marker CLEAR: the existing pessimistic flip stands.
+    for kind in [ReqKind::Status, ReqKind::Start, ReqKind::Stop] {
+        assert_eq!(
+            observed_running(kind, &transport_err, false),
+            Some(false),
+            "{kind:?} no-marker"
+        );
+    }
+    // VersionMismatch precedence unchanged (None regardless of the marker).
+    let vm: Result<BridgeResponse, ClientError> = Err(ClientError::VersionMismatch {
+        bridge: Some("9.9.9".into()),
+    });
+    assert_eq!(observed_running(ReqKind::Status, &vm, false), None);
+    assert_eq!(observed_running(ReqKind::Status, &vm, true), None);
+    // A successful Status still reports truth (marker irrelevant on Ok).
+    let ok: Result<BridgeResponse, ClientError> = Ok(status_resp(true));
+    assert_eq!(observed_running(ReqKind::Status, &ok, true), Some(true));
 }
 
 #[skuld::test]
@@ -211,6 +330,20 @@ fn noop_hook() -> SelfHealHook {
     std::sync::Arc::new(|_| {})
 }
 
+/// Build a `BridgeLink` whose update-marker dir is a unique, never-created temp
+/// path. `BridgeLink::new` would otherwise read the real system service log dir,
+/// where a stray cutover marker would make `update_in_progress()` hold the
+/// snapshot and break these transport-error assertions. A non-existent dir reads
+/// as "no marker" (the `read` ENOENT path), keeping every test hermetic.
+fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
+    let marker_dir = std::env::temp_dir().join(format!(
+        "hole-link-marker-{}-{}",
+        std::process::id(),
+        socket_path.file_name().and_then(|s| s.to_str()).unwrap_or("x")
+    ));
+    BridgeLink::with_service_log_dir(socket_path, marker_dir, self_heal)
+}
+
 /// Serve `router` on `path`, accepting connections in a loop (BridgeLink
 /// reconnects after transport errors, and `send_oneshot` always dials
 /// fresh). Each connection is served on its own task so a parked handler
@@ -258,10 +391,11 @@ async fn start_ack_commits_true() {
     let router = axum::Router::new().route(ROUTE_START, post(|| async { Json(EmptyResponse {}) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     assert!(!link.cell().snapshot().running);
     let resp = link
         .send(BridgeRequest::Start {
+            attempt_id: "x".into(),
             config: test_proxy_config(),
         })
         .await
@@ -272,6 +406,7 @@ async fn start_ack_commits_true() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -297,7 +432,7 @@ async fn version_mismatch_fires_hook_and_does_not_flip_running() {
 
     let fired = Arc::new(AtomicUsize::new(0));
     let fired2 = fired.clone();
-    let link = BridgeLink::new(
+    let link = test_link(
         path,
         Arc::new(move |_| {
             fired2.fetch_add(1, Ordering::SeqCst);
@@ -315,7 +450,7 @@ async fn version_mismatch_fires_hook_and_does_not_flip_running() {
 async fn transport_error_commits_false() {
     let path = test_socket_path("dead");
     let _ = std::fs::remove_file(&path);
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.cell().commit(true); // pretend we believed it was running
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(
@@ -323,9 +458,91 @@ async fn transport_error_commits_false() {
         ProxySnapshot {
             seq: 2,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
+    );
+}
+
+#[skuld::test]
+async fn transport_error_holds_snapshot_while_marker_present() {
+    // End-to-end wiring: a cutover marker in the link's service log dir must make
+    // a transport error hold the last snapshot (no surprise Disconnected),
+    // unlike `transport_error_commits_false` above.
+    let path = test_socket_path("dead-marker");
+    let _ = std::fs::remove_file(&path);
+    let marker_dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(
+        marker_dir.path(),
+        &hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            from_version: "0.2.0".into(),
+            to_version: "0.3.0".into(),
+            pid: std::process::id(),
+            started_at_unix: 0,
+        },
+    )
+    .unwrap();
+    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    link.cell().commit(true); // believed running before the cutover gap
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert_eq!(
+        link.cell().snapshot(),
+        ProxySnapshot {
+            seq: 1,
+            running: true,
+            error: None,
+            lockdown_enabled: false,
+            lockdown_active: false
+        },
+        "marker present => transport error holds the last snapshot"
+    );
+}
+
+#[skuld::test]
+async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
+    // End-to-end: while the cutover marker is present, a failing Status (the
+    // expected restart gap) must NOT flip the cell to Disconnected — no seq bump.
+    // Once the new bridge clears the marker, the same failing Status commits
+    // Disconnected. Proves the marker read flows through `observed_running`,
+    // opening and closing the no-flash window with the marker.
+    let path = test_socket_path("cutover-flash");
+    let _ = std::fs::remove_file(&path); // dead socket: every send is a transport error
+    let marker_dir = tempfile::tempdir().unwrap();
+    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    link.cell().commit(true); // believed Connected before the cutover
+    let seq_connected = link.cell().snapshot().seq;
+
+    // Marker SET: the failing Status must hold the Connected snapshot.
+    hole_common::update_marker::write(
+        marker_dir.path(),
+        &hole_common::update_marker::MarkerInfo {
+            version: hole_common::update_marker::MARKER_VERSION,
+            from_version: "0.2.0".into(),
+            to_version: "0.3.0".into(),
+            pid: std::process::id(),
+            started_at_unix: 0,
+        },
+    )
+    .unwrap();
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert_eq!(
+        link.cell().snapshot().seq,
+        seq_connected,
+        "no Disconnected flash while the marker is set"
+    );
+    assert!(
+        link.cell().snapshot().running,
+        "snapshot still Connected during the gap"
+    );
+
+    // Marker CLEAR: the same failing Status now commits Disconnected.
+    hole_common::update_marker::clear(marker_dir.path()).unwrap();
+    let _ = link.send(BridgeRequest::Status).await.unwrap_err();
+    assert!(
+        !link.cell().snapshot().running,
+        "Disconnected commits once the marker is gone"
     );
 }
 
@@ -338,14 +555,17 @@ async fn oneshot_never_commits() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.cell().commit(true);
-    link.send_oneshot(BridgeRequest::Cancel).await.unwrap();
+    link.send_oneshot(BridgeRequest::Cancel { attempt_id: "x".into() })
+        .await
+        .unwrap();
     assert_eq!(
         link.cell().snapshot(),
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -370,13 +590,14 @@ async fn untracked_requests_never_commit() {
     );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     link.send(BridgeRequest::Metrics).await.unwrap();
     assert_eq!(
         link.cell().snapshot(),
         ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -407,11 +628,12 @@ async fn concurrent_requests_commit_in_bridge_order() {
         .route(ROUTE_STATUS, get(|| async { Json(status_response(true)) }));
     let _mock = serve_router(&path, router).await;
 
-    let link = Arc::new(BridgeLink::new(path, noop_hook()));
+    let link = Arc::new(test_link(path, noop_hook()));
     let a = tokio::spawn({
         let link = link.clone();
         async move {
             link.send(BridgeRequest::Start {
+                attempt_id: "x".into(),
                 config: test_proxy_config(),
             })
             .await
@@ -436,6 +658,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -461,7 +684,7 @@ async fn reload_if_running_skips_when_stopped() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(!reloaded);
     // The resurrection guard: bridge-side `reload` on a stopped proxy
@@ -488,7 +711,7 @@ async fn reload_if_running_reloads_when_running() {
         );
     let _mock = serve_router(&path, router).await;
 
-    let link = BridgeLink::new(path, noop_hook());
+    let link = test_link(path, noop_hook());
     let reloaded = link.reload_if_running(test_proxy_config()).await.unwrap();
     assert!(reloaded);
     assert_eq!(reloads.load(Ordering::SeqCst), 1);
@@ -498,6 +721,7 @@ async fn reload_if_running_reloads_when_running() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }

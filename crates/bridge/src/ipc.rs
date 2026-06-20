@@ -11,9 +11,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StatusResponse,
-    TestServerRequest, TestServerResponse, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
-    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
-    ROUTE_VERSION,
+    TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL,
+    ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
+    ROUTE_TEST_SERVER, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -29,21 +29,47 @@ use tracing::{debug, error, info};
 
 // IPC state ===========================================================================================================
 
-/// State for tracking the in-flight start's cancellation token, plus a
-/// "pre-armed" flag that consumes a Cancel arriving before any Start has
-/// registered its token. Held in a `std::sync::Mutex` because all access is
-/// a trivial read/write of a small struct, never held across `.await`, and
-/// the sync lock avoids any coupling with the async proxy mutex.
+/// Opaque per-attempt id minted by the client (a UUIDv4, in practice). The
+/// bridge only ever compares it for equality — never parses or orders it.
+/// Correctness rests on the client minting a fresh, never-reused id per connect
+/// attempt: that uniqueness is what makes a stale pre-arm un-matchable by any
+/// later attempt (#465).
+type AttemptId = String;
+
+/// The `X-Hole-Attempt-Id` request header carrying the per-attempt idempotency
+/// key on `POST /v1/start` and `POST /v1/cancel`.
+const ATTEMPT_ID_HEADER: &str = "x-hole-attempt-id";
+
+/// Read the attempt id from a request's `X-Hole-Attempt-Id` header. An
+/// absent/garbled header yields the empty string — the fail-safe "no identity"
+/// value: a start with an empty id never consumes a pre-arm, and a cancel with
+/// an empty id never arms one.
+fn attempt_id_from(headers: &axum::http::HeaderMap) -> AttemptId {
+    headers
+        .get(ATTEMPT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Per-attempt start-cancellation handoff. Held in a `std::sync::Mutex` because
+/// all access is a trivial read/write of a small struct, never held across
+/// `.await`, and the sync lock avoids any coupling with the async proxy mutex.
+///
+/// The cancel is scoped to a SPECIFIC attempt id (an idempotency key minted by
+/// the GUI per connect attempt and sent on both Start and Cancel). A pre-arm is
+/// therefore a *named* slot: only the start carrying that exact id consumes it,
+/// so a stale arm left by a cancel whose start already finished — or never
+/// arrived — can never silently cancel a later, unrelated attempt (#465).
 #[derive(Default)]
 pub struct StartCancelState {
-    /// Token of the currently-in-flight start, if any. Set by `handle_start`
-    /// before calling `pm.start_cancellable`; cleared on exit.
-    pub token: Option<CancellationToken>,
-    /// Cancel request arrived while no start was in flight. Consumed by the
-    /// very next `handle_start` invocation, which returns `Cancelled`
-    /// without even attempting to start. Handles the race where a cancel
-    /// reaches the bridge before `handle_start` has stored its token.
-    pub pending: bool,
+    /// Id + token of the currently in-flight start, if any. Single-occupancy:
+    /// a concurrent second start is rejected (409) rather than overwriting.
+    pub in_flight: Option<(AttemptId, CancellationToken)>,
+    /// A cancel that found no matching in-flight start pre-arms here, scoped to
+    /// the exact attempt it named. Consumed only by a start carrying the same
+    /// id; superseded (cleared) by any other *proceeding* start. Last-writer-wins.
+    pub pre_armed: Option<AttemptId>,
 }
 
 /// Shared state for IPC handlers, holding the proxy manager and the
@@ -56,6 +82,10 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// (`X-Hole-Bridge-Version`) and served at `/v1/version` so a
     /// freshly-updated GUI can detect a still-old bridge.
     pub version: String,
+    /// Service log dir — where the cutover marker is written (GUI-readable).
+    pub log_dir: PathBuf,
+    /// Service state dir — the same-volume parent for the cutover staging.
+    pub state_dir: PathBuf,
 }
 
 // Server ==============================================================================================================
@@ -76,10 +106,12 @@ impl IpcServer {
     /// Removes any stale socket file, creates parent directories, binds with
     /// restrictive initial permissions (umask on macOS, DACL on Windows), and
     /// then applies the final OS-level access control (adding the `hole` group).
-    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+    pub fn bind_with_dirs<P: Proxy + 'static, R: Routing + 'static>(
         path: &Path,
         proxy: Arc<Mutex<ProxyManager<P, R>>>,
         version: &str,
+        log_dir: PathBuf,
+        state_dir: PathBuf,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -93,6 +125,8 @@ impl IpcServer {
             proxy,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
+            log_dir,
+            state_dir,
         });
         let router = build_router(state, version);
         Ok(Self {
@@ -100,6 +134,19 @@ impl IpcServer {
             router,
             socket_path: path.to_owned(),
         })
+    }
+
+    /// Test-only shim: production calls `bind_with_dirs`. The cutover dirs
+    /// default to a fresh temp dir so per-test markers/staging don't collide
+    /// across the shared skuld process.
+    #[cfg(test)]
+    pub fn bind<P: Proxy + 'static, R: Routing + 'static>(
+        path: &Path,
+        proxy: Arc<Mutex<ProxyManager<P, R>>>,
+        version: &str,
+    ) -> std::io::Result<Self> {
+        let tmp = tempfile::tempdir()?.keep();
+        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp)
     }
 
     /// Accept and handle one client connection, then return.
@@ -206,6 +253,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
+        .route(ROUTE_UPDATE_APPLY, axum::routing::post(handle_update_apply::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
             move |mut resp: axum::response::Response| {
@@ -229,7 +277,11 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
-        error: pm.last_error().map(|s| s.to_string()),
+        // Death reason only (path-free, #470) — NOT `last_error`, which can
+        // carry a filesystem path/hostname from a failed start and must never
+        // reach the GUI toast. The rich detail stays in `last_error` for
+        // diagnostics (bridge="error") and the click-path start-error surface.
+        error: pm.death_reason().map(|s| s.to_string()),
         invalid_filters: pm.invalid_filters(),
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
@@ -240,21 +292,20 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
 
 async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
+    headers: axum::http::HeaderMap,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Register the cancellation token BEFORE taking the proxy mutex. If a
-    // pre-armed cancel is already queued, consume it and return immediately
-    // without even attempting the start. If a concurrent start is already
-    // in flight, reject this one — the slot is single-occupancy because a
-    // Cancel targets exactly one in-flight start.
+    let attempt_id = attempt_id_from(&headers);
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-        if cs.pending {
-            cs.pending = false;
-            info!("start request consumed pre-armed cancel");
+        // 1. Named consume: only a start carrying the exact armed id is
+        //    cancelled. A stale arm for a different attempt cannot match here.
+        if !attempt_id.is_empty() && cs.pre_armed.as_deref() == Some(attempt_id.as_str()) {
+            cs.pre_armed = None;
+            info!("start request consumed pre-armed cancel for its attempt");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -262,13 +313,11 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
                 }),
             ));
         }
-        if cs.token.is_some() {
-            // A previous handle_start has already registered its token but
-            // not yet cleared it (still running or blocked on proxy.lock()).
-            // Overwriting the slot would orphan the earlier start from any
-            // future Cancel — the Cancel would signal this new token
-            // instead — so we reject the duplicate with 409 Conflict rather
-            // than silently corrupting the slot.
+        // 2. Single-occupancy: reject a concurrent start. Checked BEFORE the
+        //    self-heal below — this ordering is load-bearing, so a *rejected*
+        //    start never wipes a legitimately pending pre-arm. Overwriting the
+        //    slot would also orphan the in-flight start from a future Cancel.
+        if cs.in_flight.is_some() {
             warn!("concurrent start request rejected — another start is already in flight");
             return Err((
                 StatusCode::CONFLICT,
@@ -277,8 +326,15 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
                 }),
             ));
         }
-        debug_assert!(cs.token.is_none(), "start_cancel token slot invariant");
-        cs.token = Some(token.clone());
+        // 3. Self-heal: a proceeding start that did NOT match supersedes any
+        //    stale arm. A start carrying a different id is, by definition, not
+        //    the attempt the cancel targeted, so dropping that arm cannot lose
+        //    a cancel this start should honor — true for every client.
+        if let Some(stale) = cs.pre_armed.take() {
+            debug!(%stale, "superseding a stale pre-arm with a new, unrelated start");
+        }
+        // 4. Register.
+        cs.in_flight = Some((attempt_id.clone(), token.clone()));
     }
 
     let result = {
@@ -286,13 +342,18 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         pm.start_cancellable(&config, token).await
     };
 
-    // Clear the token slot regardless of outcome so the next start starts
-    // with a clean slate. A Cancel arriving during this tiny window between
-    // start_cancellable returning and us clearing the slot would cancel a
-    // token that is already done — harmless.
+    // Clear the slot. Single-occupancy (the 409 above) guarantees it still holds
+    // OUR attempt: no other start can register while in_flight is Some, and
+    // neither cancel nor stop ever nulls it. Assert that contract rather than
+    // branch on it — a violation (e.g. a future relaxation of single-occupancy)
+    // then fails loudly in tests instead of silently masking.
     {
         let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-        cs.token = None;
+        debug_assert!(
+            matches!(&cs.in_flight, Some((cur, _)) if *cur == attempt_id),
+            "in_flight slot must still hold this attempt at clear"
+        );
+        cs.in_flight = None;
     }
 
     match result {
@@ -313,19 +374,32 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     }
 }
 
-/// Signal the in-flight start's `CancellationToken` if one is registered,
-/// or pre-arm a cancel for the next start otherwise. Always 200 Ack — the
-/// client's intent is recorded regardless.
+/// Cancel the in-flight start IFF it is the attempt this cancel names, else
+/// pre-arm a cancel scoped to that attempt id. Always 200 Ack — the client's
+/// intent is recorded regardless. A cancel with no id (empty header) and no
+/// exact in-flight match is a 200 no-op: it never arms, so it can never affect
+/// an unrelated future start.
 async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
+    headers: axum::http::HeaderMap,
 ) -> Json<EmptyResponse> {
+    let attempt_id = attempt_id_from(&headers);
     let mut cs = state.start_cancel.lock().expect("start_cancel poisoned");
-    if let Some(t) = &cs.token {
-        info!("cancelling in-flight proxy start");
-        t.cancel();
-    } else {
-        info!("no start in flight — pre-arming cancel for next start");
-        cs.pending = true;
+    match &cs.in_flight {
+        Some((cur, tok)) if !attempt_id.is_empty() && *cur == attempt_id => {
+            info!("cancelling in-flight proxy start for its attempt");
+            tok.cancel();
+        }
+        // A different attempt (or none) is in flight: do NOT cancel it. Pre-arm
+        // for the named attempt — its start is either still coming or already
+        // gone (in which case the arm is inert and self-healed by a later start).
+        _ if !attempt_id.is_empty() => {
+            info!("no matching start in flight — pre-arming cancel for that attempt");
+            cs.pre_armed = Some(attempt_id);
+        }
+        _ => {
+            info!("cancel with no attempt id and no exact in-flight match — no-op");
+        }
     }
     Json(EmptyResponse {})
 }
@@ -352,6 +426,222 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             ))
         }
     }
+}
+
+async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+    Json(req): Json<UpdateApplyRequest>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let log_dir = &state.log_dir;
+
+    // Single-occupancy: refuse a second cutover.
+    if crate::cutover::apply::cutover_in_progress(log_dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                message: "a cutover is already in progress".into(),
+            }),
+        ));
+    }
+
+    let lockdown_on = { state.proxy.lock().await.lockdown_enabled() };
+
+    // Consent seam: a lockdown-off update without explicit consent is refused
+    // with 403 — a client precondition failure (the caller must supply consent),
+    // not a server fault.
+    match crate::cutover::apply::consent_gate(lockdown_on, req.consent) {
+        Ok(()) => {}
+        Err(crate::cutover::apply::ConsentError::Required) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    message: "a lockdown-off update requires explicit consent".into(),
+                }),
+            ));
+        }
+    }
+
+    // macOS destination pre-flight (before the marker): the GUI-supplied `.app`
+    // swap target is a hint, never a trust anchor — the bridge anchors it to a
+    // genuine `com.hole.app` bundle and a swap-capable volume. A bad target or an
+    // unswappable volume is a 400 (caller precondition on the destination,
+    // distinct from a payload-bytes failure), so it precedes the payload stage.
+    // Windows skips it (the SCM install dir is canonical).
+    #[cfg(target_os = "macos")]
+    let app_dest = match crate::cutover::apply::preflight_app_dest(req.app_dest.as_deref().map(std::path::Path::new)) {
+        Ok(dest) => Some(dest),
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: format!("invalid update destination: {e}"),
+                }),
+            ));
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let app_dest: Option<std::path::PathBuf> = None;
+
+    // Marker FIRST — the atomic single-occupancy CLAIM, BEFORE resolving or
+    // touching the shared private staging dir. `write_new` is `create-new`: two
+    // concurrent requests cannot both win (the 409 read-check above is only a
+    // fast-path; this is the race-free guard), so ONLY the marker-winner ever
+    // stages a payload. A loser 409s here and never touches the shared staging
+    // dir — otherwise its `stage_payload` (which clears+rewrites the fixed dir)
+    // could clobber the winner's already-verified copy mid-extract, reopening the
+    // verify/use TOCTOU via a privileged write on the loser's behalf.
+    let marker = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: state.version.clone(),
+        to_version: req.target_version.clone(),
+        pid: std::process::id(),
+        started_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
+        let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cutover marker write failed: {e}"),
+            )
+        };
+        return Err((code, Json(ErrorResponse { message })));
+    }
+
+    // Stage the caller-supplied payload into a bridge-private, non-attacker-
+    // writable directory, then verify and extract ONLY that copy — never
+    // `req.payload_path` again. This closes the verify/extract TOCTOU: a
+    // hole-group member can pass a genuinely-signed payload (verify passes) and
+    // overwrite the file before extract opens it; copying first makes the verified
+    // bytes the extracted bytes. The marker claimed above guarantees a single
+    // occupant, so the fixed staging path is never raced. The copy and the marker
+    // are cleared on every exit path below.
+    let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("could not resolve private payload dir: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Stage + re-verify on a blocking thread (filesystem copy + minisign/SHA-256),
+    // off the async worker. The GUI is untrusted in the bridge's model, so a
+    // verify failure is a corruption/tamper event the user must see distinctly
+    // (422), while a staging I/O failure is a server fault (500).
+    let source = std::path::PathBuf::from(&req.payload_path);
+    let stage_dir = private_dir.clone();
+    let asset_name = req.asset_name.clone();
+    let sha256sums = req.sha256sums.clone();
+    let sha256sums_minisig = req.sha256sums_minisig.clone();
+    let staged_copy = tokio::task::spawn_blocking(move || {
+        let copy = crate::cutover::extract::stage_payload(&source, &stage_dir).map_err(StageError::Io)?;
+        crate::cutover::extract::reverify(&copy, &asset_name, &sha256sums, &sha256sums_minisig)
+            .map_err(StageError::Verify)?;
+        Ok::<_, StageError>(copy)
+    })
+    .await;
+    let payload = match staged_copy {
+        Ok(Ok(copy)) => copy,
+        Ok(Err(StageError::Verify(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    message: format!("payload verification failed: {e}"),
+                }),
+            ));
+        }
+        Ok(Err(StageError::Io(e))) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("payload staging failed: {e}"),
+                }),
+            ));
+        }
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("payload staging task panicked: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Extract the bare binaries from the PRIVATE copy onto the destination volume.
+    // The extract shells out to a blocking `msiexec`/`hdiutil`, so run it on a
+    // blocking thread to keep it off the async worker. A failure clears the marker
+    // so the GUI does not mask Disconnected forever.
+    let state_dir = state.state_dir.clone();
+    let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
+    let staged = match extracted {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction failed: {e}"),
+                }),
+            ));
+        }
+        Err(e) => {
+            let _ = hole_common::update_marker::clear(log_dir);
+            let _ = std::fs::remove_dir_all(&private_dir);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("update extraction task panicked: {e}"),
+                }),
+            ));
+        }
+    };
+
+    // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
+    // a detached child (returns naturally); macOS runs the actor on a detached
+    // task that SIGTERMs THIS process only after this 200 is on the wire.
+    if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
+        let _ = hole_common::update_marker::clear(log_dir);
+        let _ = std::fs::remove_dir_all(&private_dir);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: format!("cutover failed to start: {e}"),
+            }),
+        ));
+    }
+
+    // Best-effort: the extracted images now live on the destination volume, so the
+    // private copy has served its purpose. The next cutover's `stage_payload` also
+    // clears any leftover, so a failure here is harmless.
+    let _ = std::fs::remove_dir_all(&private_dir);
+
+    info!(target_version = %req.target_version, "update cutover kicked off");
+    Ok(Json(EmptyResponse {}))
+}
+
+/// Distinguishes a payload verify failure (422 — corruption/tamper) from a
+/// staging I/O failure (500 — server fault) so the handler maps each to its own
+/// HTTP status after the combined stage+verify blocking step.
+enum StageError {
+    Io(std::io::Error),
+    Verify(hole_common::verify::VerifyError),
 }
 
 async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(

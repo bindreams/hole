@@ -163,12 +163,6 @@
                     </div>
                   </div>
                 </div>
-                <div class="setting-row">
-                  <span class="setting-label" id="lbl-dns-intercept">Intercept UDP/53 to other servers</span>
-                  <div class="setting-control">
-                    <button type="button" class="toggle" id="toggle-dns-intercept" role="switch" aria-checked="false" aria-labelledby="lbl-dns-intercept"></button>
-                  </div>
-                </div>
               </div>
               <div class="setting-row setting-note">
                 <span class="setting-label">Settings apply on reconnect. Edit the config file to change the DNS server list.</span>
@@ -236,6 +230,16 @@
             <div class="chain-row"><div class="nd unknown" id="diag-vpn-server"></div><div class="nlbl">VPN Server</div></div>
             <div class="vwire"></div>
             <div class="chain-row"><div class="nd unknown" id="diag-internet"></div><div class="nlbl">Internet</div></div>
+          </div>
+        </div>
+
+        <!-- Capabilities (#470): informational only -->
+        <hr class="sb-divider">
+        <div>
+          <div class="lbl diag-lbl">Capabilities</div>
+          <div class="chain" id="capabilities-chain">
+            <div class="chain-row"><div class="nd unknown" id="cap-udp"></div><div class="nlbl">UDP proxy</div></div>
+            <div class="chain-row"><div class="nd unknown" id="cap-ipv6"></div><div class="nlbl">IPv6 bypass</div></div>
           </div>
         </div>
       </div>

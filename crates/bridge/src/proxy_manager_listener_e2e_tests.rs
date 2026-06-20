@@ -63,13 +63,25 @@ fn base_config(ss: &SsServerHandle, local_port: u16, local_port_http: u16) -> Pr
 
 /// Send `Start` and expect `Ack`. Panics on any other response or IPC error.
 async fn start_expect_ack(harness: &mut DistHarness, config: ProxyConfig) {
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 }
 
 /// Send `Start` and expect `BridgeResponse::Error`. Returns the error message.
 async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> String {
-    let resp = harness.send(BridgeRequest::Start { config }).await.expect("send Start");
+    let resp = harness
+        .send(BridgeRequest::Start {
+            config,
+            attempt_id: "e2e".into(),
+        })
+        .await
+        .expect("send Start");
     match resp {
         BridgeResponse::Error { message } => message,
         other => panic!("expected Error, got {other:?}"),
@@ -396,17 +408,18 @@ mod socks_only_udp {
     use crate::test_support::socks5_client::socks5_udp_associate;
     use crate::test_support::udp_echo::UdpEchoServer;
 
+    /// Generous reply budget for the SOCKS5 UDP round-trip — a class-2
+    /// failure-to-human bound sized like the galoshes+ex-ray cold-start budget
+    /// in `plugin-e2e/src/roundtrip.rs`; the client retransmits within it.
+    const UDP_REPLY_DEADLINE: Duration = Duration::from_secs(20);
+
     async fn run_udp_roundtrip(socks_addr: SocketAddr) {
         let echo = UdpEchoServer::start_loopback().await.expect("UDP echo bind");
         wait_for_port(socks_addr, Duration::from_secs(10)).await;
         let payload = b"HOLE-SOCKS-ONLY-UDP";
-        let echoed = tokio::time::timeout(
-            Duration::from_secs(5),
-            socks5_udp_associate(socks_addr, echo.addr, payload),
-        )
-        .await
-        .expect("UDP-ASSOCIATE within 5s")
-        .expect("UDP-ASSOCIATE roundtrip");
+        let echoed = socks5_udp_associate(socks_addr, echo.addr, payload, UDP_REPLY_DEADLINE)
+            .await
+            .expect("UDP-ASSOCIATE roundtrip");
         assert_eq!(echoed, payload, "expected UDP echo to return the payload unchanged");
     }
 
@@ -428,15 +441,7 @@ mod socks_only_udp {
     }
 
     /// galoshes (WS) carries SOCKS5 UDP ASSOCIATE over its yamux mux.
-    ///
-    /// Gated off Windows: the UDP **reply** leg is intermittently lost on the
-    /// Windows CI lane ("SOCKS5 UDP reply timeout"); it runs reliably on macOS.
-    /// See bindreams/hole#543.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC])]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "galoshes SOCKS5 UDP reply leg flaky on Windows CI — see bindreams/hole#543"
-    )]
     fn e2e_socks_only_udp_associate_galoshes(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,

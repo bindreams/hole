@@ -8,7 +8,7 @@ import { error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
-import { initFilters, renderFilters } from "./filters";
+import { filtersEpoch, initFilters, renderFilters, setInvalidFilters } from "./filters";
 import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
 import {
@@ -22,6 +22,7 @@ import { initSettings, renderSettings } from "./settings";
 import {
   applyProxyStateObservation,
   initSidebar,
+  setCapabilityFlags,
   startPublicIpAutoRefresh,
   updateDiagnostics,
   updateMetrics,
@@ -94,7 +95,6 @@ function toUiSettings(c: Config): UiSettings {
     selected_server: c.selected_server,
     local_port: c.local_port,
     filters: c.filters,
-    start_on_login: c.start_on_login,
     on_startup: c.on_startup,
     theme: c.theme,
     proxy_server_enabled: c.proxy_server_enabled,
@@ -118,6 +118,23 @@ export async function saveConfig() {
   }
 }
 
+/**
+ * Whether the app is registered to start at OS login. The OS is the source of
+ * truth (#457) — the dashboard reads this live, not from config. Rejects on
+ * failure so the caller can surface it.
+ */
+export async function getAutostart(): Promise<boolean> {
+  return await invoke<boolean>("get_autostart");
+}
+
+/**
+ * Set OS start-at-login; resolves to the resulting live state. Rejects with the
+ * backend's PII-free message so the caller can revert and toast (#457).
+ */
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  return await invoke<boolean>("set_autostart", { enabled });
+}
+
 /** Mark the config as having unsaved changes. */
 export function setDirty() {
   dirty = true;
@@ -132,6 +149,9 @@ export function isDirty() {
 
 /** Poll proxy status every 5 seconds. */
 async function pollProxyStatus() {
+  // Capture the filters epoch before the round-trip; a mutation during the
+  // fetch invalidates the response's invalid_filters indices (#470).
+  const epoch = filtersEpoch();
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
@@ -144,6 +164,12 @@ async function pollProxyStatus() {
     if (result.changed) {
       updatePublicIp();
     }
+    // Drop a result that resolved after a ruleset mutation — its indices no
+    // longer match the rendered rows.
+    if (epoch === filtersEpoch()) {
+      setInvalidFilters(status.invalid_filters);
+    }
+    setCapabilityFlags(status.udp_proxy_available, status.ipv6_bypass_available, status.running);
   } catch (err) {
     console.error("get_proxy_status failed:", err);
   }
@@ -265,12 +291,18 @@ function setupEventListeners(): Promise<unknown> {
   // Tray- or backend-initiated proxy state changes reach the power
   // button immediately instead of waiting for the 5s poll (#462). Routed
   // through the same seq-monotone, IDLE-guarded application as the poll.
-  const proxyStateReady = listen<{ seq: number; running: boolean }>("proxy-state-changed", (event) => {
-    const result = applyProxyStateObservation(event.payload.seq, event.payload.running);
-    if (result.changed) {
-      updatePublicIp();
-    }
-  });
+  const proxyStateReady = listen<{ seq: number; running: boolean; error: string | null }>(
+    "proxy-state-changed",
+    (event) => {
+      // Pass `error` so a death observed first (or only) via the event still
+      // surfaces the exactly-once toast — the tray reconciler can be the poller
+      // that commits the death (#470).
+      const result = applyProxyStateObservation(event.payload.seq, event.payload.running, event.payload.error);
+      if (result.changed) {
+        updatePublicIp();
+      }
+    },
+  );
 
   // Joined so init() can await registration before the UI becomes
   // interactive — an emit landing before listen() resolves is silently

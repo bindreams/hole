@@ -35,12 +35,21 @@ impl Default for FilterMetrics {
 pub enum BridgeRequest {
     Start {
         config: ProxyConfig,
+        /// Per-attempt idempotency key minted by the GUI (a UUID). Sent on the
+        /// wire as the `X-Hole-Attempt-Id` header; the bridge scopes
+        /// start-cancellation to it (#465). A struct field, not a
+        /// client-side-only header, so it survives the elevation
+        /// re-serialization path (`encode_request` / `write_request_file`).
+        attempt_id: String,
     },
     Stop,
-    /// Cancel an in-flight `Start`. Idempotent — if no start is in flight, the
-    /// cancel is pre-armed and consumed by the next start. See the
-    /// `/v1/cancel` route in `openapi.yaml`.
-    Cancel,
+    /// Cancel the in-flight `Start` whose `attempt_id` matches, or pre-arm a
+    /// cancel scoped to that attempt. Idempotent — a cancel that finds no
+    /// matching in-flight start is consumed by the next start carrying the same
+    /// id. See the `/v1/cancel` route in `openapi.yaml`.
+    Cancel {
+        attempt_id: String,
+    },
     Status,
     Reload {
         config: ProxyConfig,
@@ -54,6 +63,26 @@ pub enum BridgeRequest {
     /// `POST /v1/lockdown`.
     SetLockdown {
         enabled: bool,
+    },
+    /// Apply a verified update via the service-manager cutover. Maps to
+    /// `POST /v1/update-apply`. `consent` is the informed-consent seam: REQUIRED
+    /// true for a lockdown-off update (the standing cover holds the gap under
+    /// lockdown-on).
+    ApplyUpdate {
+        payload_path: PathBuf,
+        target_version: String,
+        consent: bool,
+        /// The release `SHA256SUMS` manifest text the GUI already fetched, so the
+        /// privileged bridge can re-verify the payload offline (no network).
+        sha256sums: String,
+        /// The minisign signature over `sha256sums`.
+        sha256sums_minisig: String,
+        /// The payload's filename, used to find its hash in `sha256sums`.
+        asset_name: String,
+        /// macOS only: the GUI's `current_exe`-derived `.app` swap target. A
+        /// HINT the bridge re-validates (the bundle there must be a genuine
+        /// `com.hole.app`) — never a trust anchor. `None` on Windows.
+        app_dest: Option<String>,
     },
 }
 
@@ -283,6 +312,26 @@ pub struct TestServerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockdownRequest {
     pub enabled: bool,
+}
+
+/// Wire body for `POST /v1/update-apply`. Hand-written (the openapi schema is
+/// doc-only). `payload_path` is the GUI's already-downloaded+verified MSI/DMG;
+/// the bridge re-verifies it offline against the supplied manifest + signature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateApplyRequest {
+    pub payload_path: String,
+    pub target_version: String,
+    pub consent: bool,
+    /// The release `SHA256SUMS` manifest text (for offline re-verification).
+    pub sha256sums: String,
+    /// The minisign signature over `sha256sums`.
+    pub sha256sums_minisig: String,
+    /// The payload's filename, used to find its hash in `sha256sums`.
+    pub asset_name: String,
+    /// macOS only: the GUI's `current_exe`-derived `.app` swap target. A HINT the
+    /// bridge re-validates against `CFBundleIdentifier == com.hole.app` — never a
+    /// trust anchor. `None` on Windows (the SCM install dir is canonical there).
+    pub app_dest: Option<String>,
 }
 
 // Constants ===========================================================================================================

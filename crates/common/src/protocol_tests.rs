@@ -47,6 +47,7 @@ fn version_response_roundtrips_and_route_const_exists() {
 fn bridge_request_start_json_roundtrip() {
     let req = BridgeRequest::Start {
         config: sample_config(),
+        attempt_id: "attempt-1".into(),
     };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
@@ -81,7 +82,9 @@ fn bridge_request_reload_json_roundtrip() {
 
 #[skuld::test]
 fn bridge_request_cancel_json_roundtrip() {
-    let req = BridgeRequest::Cancel;
+    let req = BridgeRequest::Cancel {
+        attempt_id: "attempt-1".into(),
+    };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
@@ -257,6 +260,41 @@ fn bridge_request_set_lockdown_json_roundtrip() {
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
+}
+
+#[skuld::test]
+fn update_apply_request_json_roundtrip() {
+    use crate::protocol::UpdateApplyRequest;
+    // Windows: no app_dest (the SCM install dir is canonical).
+    let req = UpdateApplyRequest {
+        payload_path: "/tmp/x.msi".into(),
+        target_version: "0.3.0".into(),
+        consent: true,
+        sha256sums: "deadbeef  hole.msi\n".into(),
+        sha256sums_minisig: "untrusted comment: x\nsig\n".into(),
+        asset_name: "hole.msi".into(),
+        app_dest: None,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    let decoded: UpdateApplyRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, req);
+
+    // macOS: app_dest carries the GUI's current_exe-derived bundle hint.
+    let mac = UpdateApplyRequest {
+        app_dest: Some("/Applications/Hole.app".into()),
+        ..req
+    };
+    let json = serde_json::to_string(&mac).unwrap();
+    let decoded: UpdateApplyRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, mac);
+}
+
+#[skuld::test]
+fn route_update_apply_path_is_stable() {
+    use crate::protocol::ROUTE_UPDATE_APPLY;
+    // Single-segment so the route-const generator yields a valid ident
+    // (a two-segment path would generate the invalid `ROUTE_UPDATE/APPLY`).
+    assert_eq!(ROUTE_UPDATE_APPLY, "/v1/update-apply");
 }
 
 // New response types --------------------------------------------------------------------------------------------------

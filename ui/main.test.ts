@@ -7,7 +7,16 @@ const callOrder: string[] = [];
 const defaultInvokeImpl = (cmd: string, _args?: unknown) => {
   callOrder.push(`invoke:${cmd}`);
   if (cmd === "get_config") return Promise.resolve({ servers: [], filters: [] });
-  if (cmd === "get_proxy_status") return Promise.resolve({ running: false, state_seq: 0 });
+  if (cmd === "get_proxy_status")
+    return Promise.resolve({
+      running: false,
+      state_seq: 0,
+      uptime_secs: 0,
+      error: null,
+      invalid_filters: [],
+      udp_proxy_available: null,
+      ipv6_bypass_available: null,
+    });
   if (cmd === "get_metrics")
     return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
   if (cmd === "get_diagnostics") return Promise.resolve({});
@@ -29,7 +38,12 @@ vi.mock("@tauri-apps/plugin-log", () => ({
 vi.mock("overlayscrollbars", () => ({ OverlayScrollbars: vi.fn() }));
 vi.mock("flag-icons/css/flag-icons.min.css", () => ({}));
 vi.mock("overlayscrollbars/overlayscrollbars.css", () => ({}));
-vi.mock("./filters", () => ({ initFilters: vi.fn(), renderFilters: vi.fn() }));
+vi.mock("./filters", () => ({
+  initFilters: vi.fn(),
+  renderFilters: vi.fn(),
+  setInvalidFilters: vi.fn(),
+  filtersEpoch: vi.fn().mockReturnValue(0),
+}));
 vi.mock("./import-summary", () => ({ postImportSummary: vi.fn().mockReturnValue(null) }));
 vi.mock("./sections", () => ({ initSections: vi.fn() }));
 vi.mock("./servers", () => ({
@@ -48,6 +62,7 @@ vi.mock("./sidebar", () => ({
   updateProxyStatus: vi.fn().mockReturnValue({ state: "disconnected", changed: false }),
   updatePublicIp: vi.fn().mockResolvedValue(undefined),
   startPublicIpAutoRefresh: vi.fn(),
+  setCapabilityFlags: vi.fn(),
 }));
 vi.mock("./toast", () => ({ showToast: vi.fn() }));
 
@@ -109,19 +124,27 @@ describe("init ordering", () => {
           filters: [],
           local_port: 4073,
           local_port_http: 4074,
-          start_on_login: false,
           proxy_server_enabled: true,
           proxy_socks5: true,
           proxy_http: false,
           on_startup: "restore_last_state",
           theme: "dark",
-          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
           diagnostic_plugin_tap: false,
           // Backend-owned fields present in the snapshot — must NOT round-trip.
           enabled: true,
           elevation_prompt_shown: true,
         });
-      if (cmd === "get_proxy_status") return Promise.resolve({ running: false, state_seq: 0 });
+      if (cmd === "get_proxy_status")
+        return Promise.resolve({
+          running: false,
+          state_seq: 0,
+          uptime_secs: 0,
+          error: null,
+          invalid_filters: [],
+          udp_proxy_available: null,
+          ipv6_bypass_available: null,
+        });
       if (cmd === "get_metrics")
         return Promise.resolve({ bytes_in: 0, bytes_out: 0, speed_in_bps: 0, speed_out_bps: 0, uptime_secs: 0 });
       if (cmd === "get_diagnostics") return Promise.resolve({});
@@ -146,7 +169,6 @@ describe("init ordering", () => {
       "proxy_socks5",
       "selected_server",
       "servers",
-      "start_on_login",
       "theme",
     ]);
     for (const s of settings.servers as Record<string, unknown>[]) {
