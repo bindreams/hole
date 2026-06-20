@@ -1503,7 +1503,9 @@ dependencies = [
 name = "dev-console"
 version = "0.1.0"
 dependencies = [
+ "anstream",
  "anyhow",
+ "chrono",
  "futures-util",
  "hole-test-observability",
  "kill-group",

@@ -8,6 +8,8 @@
 
 use std::process::ExitCode;
 
+#[macro_use]
+pub mod transcript;
 pub mod ansi;
 pub mod banner;
 #[cfg(unix)]

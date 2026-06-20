@@ -2,10 +2,17 @@
 //! branches, as data — testable on any host (the PR #456 strategy-as-data
 //! pattern).
 
-/// Env vars carried across the sudo boundary into the elevated bridge —
-/// log filtering + backtraces. sudo scrubs the environment otherwise,
-/// silently changing dev logging behavior (dev.py §5.9).
-pub const SUDO_PRESERVE_ENV: [&str; 3] = ["RUST_LOG", "RUST_BACKTRACE", "HOLE_BRIDGE_LOG"];
+/// Env vars carried across the sudo boundary into the elevated bridge — log
+/// filtering, backtraces, per-sink levels, and the dev-run log dir. sudo
+/// scrubs the environment otherwise, silently changing dev logging behavior.
+pub const SUDO_PRESERVE_ENV: [&str; 6] = [
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "HOLE_BRIDGE_LOG",
+    "HOLE_LOG",
+    "HOLE_LOG_STDERR",
+    "HOLE_LOG_DIR",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
@@ -146,6 +153,60 @@ pub fn supervision_exit_code(cause: ExitCause) -> u8 {
 /// The POSIX bridge-timeout recovery message, verbatim from dev.py:344-349
 /// (fidelity item 12 demands the exact text; pinned by a test).
 pub const NETWORK_RESET_WARNING: &str = "\x1b[33mThe bridge did not exit within 10s and may still be running as root with routing changes in place.\nRun `sudo scripts/network-reset.py` to restore connectivity.\x1b[0m";
+
+// Dev-run log filtering ===============================================================================================
+
+/// First-party crates pinned to TRACE in the dev-run file logs. Deps stay at
+/// the `debug` default. Mirrors `hole_test_observability::DEFAULT_FILTER`'s
+/// crate list (kept separate: that crate is a dev-dep and `util` is
+/// deliberately Hole-agnostic, so there is no shared home without a heavyweight
+/// dep — a new first-party crate must be added to both lists).
+const DEV_RUN_TRACE_CRATES: &[&str] = &[
+    "hole",
+    "hole_common",
+    "hole_bridge",
+    "tun_engine",
+    "tun_engine_macros",
+    "garter",
+    "garter_bin",
+    "galoshes",
+    "ex_ray",
+    "dump",
+    "dump_macros",
+    "handle_holders",
+];
+
+/// `HOLE_LOG` value for the dev-run file sink: deps at `debug`, first-party at
+/// `trace`.
+pub fn dev_run_file_directives() -> String {
+    let mut s = String::from("debug");
+    for c in DEV_RUN_TRACE_CRATES {
+        s.push(',');
+        s.push_str(c);
+        s.push_str("=trace");
+    }
+    s
+}
+
+/// `HOLE_LOG_STDERR` for the bridge / GUI terminal view — today's info level.
+pub const DEV_RUN_STDERR_BRIDGE: &str = "hole_bridge=info";
+pub const DEV_RUN_STDERR_GUI: &str = "hole=info";
+
+/// The per-sink log env a dev child (bridge or GUI) gets: file=trace into the
+/// run dir, stderr=`stderr_directive` to the terminal. Returned as (name, value)
+/// pairs so the caller applies them with `Command::env`.
+pub fn dev_run_child_env(run_dir: &std::path::Path, stderr_directive: &str) -> Vec<(&'static str, std::ffi::OsString)> {
+    vec![
+        ("HOLE_LOG_DIR", run_dir.as_os_str().to_owned()),
+        ("HOLE_LOG", dev_run_file_directives().into()),
+        ("HOLE_LOG_STDERR", stderr_directive.into()),
+    ]
+}
+
+/// Filesystem-safe, sortable local timestamp for the dev-run subdir.
+pub fn dev_run_subdir_name(now: chrono::NaiveDateTime) -> String {
+    now.format("%Y-%m-%d_%H-%M-%S").to_string()
+}
 
 #[cfg(test)]
 #[path = "policy_tests.rs"]

@@ -140,7 +140,15 @@ async fn shutdown_drain_emits_trailing_entries_in_timestamp_order() {
     .unwrap();
     drop(tx); // rx closes -> printer sorts + flushes
 
-    crate::mux::printer(rx, &mut sink, drain_rx, fin_rx).await.unwrap();
+    crate::mux::printer(
+        rx,
+        &mut sink,
+        crate::transcript::Transcript::disabled(),
+        drain_rx,
+        fin_rx,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         String::from_utf8(sink).unwrap().lines().collect::<Vec<_>>(),
         vec![
@@ -188,7 +196,13 @@ async fn concurrent_streams_never_split_entries() {
             pump_b,
             // tokio 1.52 implements AsyncWrite for Vec<u8> (and the &mut
             // blanket lifts it) — verified against the vendored tokio source.
-            crate::mux::printer(rx, &mut sink, drain_rx, fin_rx),
+            crate::mux::printer(
+                rx,
+                &mut sink,
+                crate::transcript::Transcript::disabled(),
+                drain_rx,
+                fin_rx
+            ),
         );
         let (_, _) = (f1, f2);
         printed.unwrap();
@@ -240,6 +254,57 @@ async fn eof_emits_cr_terminated_empty_line() {
     );
     assert!(rx.recv().await.is_none());
     pump_task.await.unwrap();
+}
+
+// `Entry` is already imported at the top of mux_tests.rs. Async tests use a
+// plain `#[skuld::test]` on an `async fn` (see concurrent_streams_never_split_entries).
+#[skuld::test]
+async fn printer_mirrors_blocks_into_transcript() {
+    use crate::transcript::Transcript;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let tbuf = Arc::new(Mutex::new(Vec::new()));
+    let transcript = Transcript::from_writer(Box::new(SharedBuf(tbuf.clone())));
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Entry>(8);
+    tx.send(Entry {
+        prefix: "\x1b[36m[bridge]\x1b[0m ".to_string(),
+        lines: vec!["hello".to_string()],
+    })
+    .await
+    .unwrap();
+    drop(tx); // close the channel so the printer drains and returns
+
+    // `&mut Vec<u8>` implements tokio's AsyncWrite (as
+    // concurrent_streams_never_split_entries already relies on). The drain
+    // signals never fire (senders held): the entry is written in phase 1, then
+    // rx-close ends the printer.
+    let (_drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+    let (_fin_tx, fin_rx) = tokio::sync::oneshot::channel();
+    let mut term: Vec<u8> = Vec::new();
+    crate::mux::printer(rx, &mut term, transcript, drain_rx, fin_rx)
+        .await
+        .unwrap();
+
+    let t = String::from_utf8(tbuf.lock().unwrap().clone()).unwrap();
+    assert_eq!(t, "[bridge] hello\n", "transcript must be ANSI-stripped");
+    let term_s = String::from_utf8(term).unwrap();
+    assert!(
+        term_s.contains("\x1b[36m[bridge]\x1b[0m hello"),
+        "terminal keeps ANSI: {term_s:?}"
+    );
 }
 
 /// Per-line mode emits without buffering (Vite has no anchors; buffering

@@ -202,16 +202,18 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
     }
 }
 
-/// The single writer. Phase 1 streams entries in arrival order (one atomic
-/// block each) until `enter_drain` fires. Phase 2 collects the trailing
-/// (deferred final) entries and emits them sorted by ISO timestamp — so the
-/// shutdown burst prints in time order, not pump-EOF order (issue #568) —
-/// bounded by `finalize` for the WarnRecovery case where a pump never EOFs and
-/// `rx` never closes. One writer == atomic entries (replaces dev.py's print
-/// lock).
+/// The single writer. Phase 1 streams entries in arrival order (each an atomic
+/// block written to `out` (ANSI kept) and mirrored into `transcript` (ANSI
+/// stripped) for `dev-console.log`) until `enter_drain` fires. Phase 2 collects
+/// the trailing (deferred final) entries and emits them sorted by ISO timestamp
+/// — so the shutdown burst prints in time order, not pump-EOF order (issue
+/// #568) — bounded by `finalize` for the WarnRecovery case where a pump never
+/// EOFs and `rx` never closes. One writer == atomic entries (replaces dev.py's
+/// print lock).
 pub async fn printer(
     mut rx: mpsc::Receiver<Entry>,
     mut out: impl AsyncWrite + Unpin,
+    transcript: crate::transcript::Transcript,
     mut enter_drain: tokio::sync::oneshot::Receiver<()>,
     mut finalize: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
@@ -220,7 +222,7 @@ pub async fn printer(
             biased;
             _ = &mut enter_drain => break,
             entry = rx.recv() => match entry {
-                Some(e) => write_entry(&mut out, &e).await?,
+                Some(e) => write_entry(&mut out, &transcript, &e).await?,
                 None => return Ok(()), // all streams ended before shutdown
             }
         }
@@ -243,12 +245,18 @@ pub async fn printer(
         (k.is_none(), k)
     });
     for e in &tail {
-        write_entry(&mut out, e).await?;
+        write_entry(&mut out, &transcript, e).await?;
     }
     Ok(())
 }
 
-async fn write_entry(out: &mut (impl AsyncWrite + Unpin), entry: &Entry) -> std::io::Result<()> {
+/// Write one entry as a contiguous block to `out` (ANSI kept) and mirror it
+/// into `transcript` (ANSI stripped) for `dev-console.log`.
+async fn write_entry(
+    out: &mut (impl AsyncWrite + Unpin),
+    transcript: &crate::transcript::Transcript,
+    entry: &Entry,
+) -> std::io::Result<()> {
     let mut block = String::new();
     for line in &entry.lines {
         block.push_str(&entry.prefix);
@@ -256,7 +264,9 @@ async fn write_entry(out: &mut (impl AsyncWrite + Unpin), entry: &Entry) -> std:
         block.push('\n');
     }
     out.write_all(block.as_bytes()).await?;
-    out.flush().await
+    out.flush().await?;
+    transcript.write_block(&block);
+    Ok(())
 }
 
 #[cfg(test)]

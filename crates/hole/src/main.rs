@@ -78,7 +78,7 @@ fn launch_gui(show_dashboard: bool) {
     // Determine paths
     let config_dir = dirs::config_dir().expect("no config directory found").join("hole");
     let config_path = config_dir.join("config.json");
-    let log_dir = hole_common::logging::default_log_dir();
+    let log_dir = hole_common::logging::resolve_log_dir(None);
 
     let _log_guard = logging::init(&log_dir);
 

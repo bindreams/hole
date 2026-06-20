@@ -529,3 +529,159 @@ fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
         "log crate event not bridged to tracing file:\n{contents}"
     );
 }
+
+// Tests: per-sink directive resolution ================================================================================
+
+// split_directives ----------------------------------------------------------------------------------------------------
+#[skuld::test]
+fn split_directives_trims_and_drops_blanks() {
+    assert_eq!(
+        super::split_directives("  hole=debug ,, \tshadowsocks_service=trace ,"),
+        vec!["hole=debug".to_string(), "shadowsocks_service=trace".to_string()],
+    );
+}
+
+#[skuld::test]
+fn split_directives_empty_is_empty() {
+    assert!(super::split_directives("   \t ").is_empty());
+}
+
+// resolve_sink_directives_from ----------------------------------------------------------------------------------------
+#[skuld::test]
+fn resolve_defaults_when_nothing_set() {
+    let (file, stderr) = super::resolve_sink_directives_from("hole_bridge=info", None, None, None);
+    assert_eq!(file, vec!["hole_bridge=info".to_string()]);
+    assert_eq!(stderr, file, "stderr mirrors file when HOLE_LOG_STDERR unset");
+}
+
+#[skuld::test]
+fn resolve_component_env_overrides_file_and_stderr_mirrors() {
+    // HOLE_BRIDGE_LOG=debug → file debug; stderr mirrors (back-compat).
+    let (file, stderr) = super::resolve_sink_directives_from("hole_bridge=info", Some("hole_bridge=debug"), None, None);
+    assert_eq!(file, vec!["hole_bridge=debug".to_string()]);
+    assert_eq!(stderr, file);
+}
+
+#[skuld::test]
+fn resolve_component_env_takes_precedence_over_hole_log() {
+    let (file, _stderr) =
+        super::resolve_sink_directives_from("hole_bridge=info", Some("hole_bridge=debug"), Some("hole=trace"), None);
+    assert_eq!(
+        file,
+        vec!["hole_bridge=debug".to_string()],
+        "component env wins over HOLE_LOG"
+    );
+}
+
+#[skuld::test]
+fn resolve_hole_log_used_when_no_component_env() {
+    let (file, _stderr) = super::resolve_sink_directives_from("hole=info", None, Some("debug,hole=trace"), None);
+    assert_eq!(file, vec!["debug".to_string(), "hole=trace".to_string()]);
+}
+
+#[skuld::test]
+fn resolve_stderr_diverges_when_set() {
+    let (file, stderr) =
+        super::resolve_sink_directives_from("hole=info", None, Some("debug,hole=trace"), Some("hole=info"));
+    assert_eq!(file, vec!["debug".to_string(), "hole=trace".to_string()]);
+    assert_eq!(stderr, vec!["hole=info".to_string()]);
+}
+
+#[skuld::test]
+fn resolve_blank_component_env_falls_back() {
+    // A whitespace/comma-only value must not zero out the filter.
+    let (file, _stderr) = super::resolve_sink_directives_from("hole=info", Some(" , "), None, None);
+    assert_eq!(file, vec!["hole=info".to_string()]);
+}
+
+// resolve_log_dir -----------------------------------------------------------------------------------------------------
+#[skuld::test]
+fn resolve_log_dir_prefers_explicit_override() {
+    let got = super::resolve_log_dir_from(
+        Some(std::path::PathBuf::from("/explicit")),
+        Some(std::path::PathBuf::from("/env")),
+    );
+    assert_eq!(got, std::path::PathBuf::from("/explicit"));
+}
+
+#[skuld::test]
+fn resolve_log_dir_uses_env_when_no_override() {
+    let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")));
+    assert_eq!(got, std::path::PathBuf::from("/env"));
+}
+
+#[skuld::test]
+fn resolve_log_dir_falls_back_to_default() {
+    let got = super::resolve_log_dir_from(None, None);
+    assert_eq!(got, super::default_log_dir());
+}
+
+// Per-sink composition ------------------------------------------------------------------------------------------------
+#[derive(Clone)]
+struct CapBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl CapBuf {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+impl std::io::Write for CapBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapBuf {
+    type Writer = CapBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[skuld::test]
+fn file_sink_gets_trace_stderr_does_not() {
+    let file = CapBuf::new();
+    let err = CapBuf::new();
+    let sub = super::compose_subscriber(
+        file.clone(),
+        err.clone(),
+        &["t1_target=trace".to_string()],
+        &["t1_target=info".to_string()],
+    );
+    // Install as the thread-local default via the workspace helper (raw
+    // set_default is clippy-disallowed; hole-common depends on garter, so the
+    // helper is available — cf. the existing `panic_hook_emits_tracing_event`
+    // test). Target-specific directives in `sub` override any ambient RUST_LOG
+    // (caller directives are added after from_env_lossy and win at equal/greater
+    // specificity), so this is deterministic regardless of the environment.
+    let _g = garter::tracing_test::set_default_in_current_thread(sub);
+    tracing::trace!(target: "t1_target", "trace-line");
+    tracing::info!(target: "t1_target", "info-line");
+    let f = file.contents();
+    let e = err.contents();
+    assert!(f.contains("trace-line"), "file missing trace:\n{f}");
+    assert!(f.contains("info-line"), "file missing info:\n{f}");
+    assert!(!e.contains("trace-line"), "stderr leaked trace:\n{e}");
+    assert!(e.contains("info-line"), "stderr missing info:\n{e}");
+}
+
+#[skuld::test]
+fn relay_events_go_to_file_not_stderr() {
+    let file = CapBuf::new();
+    let err = CapBuf::new();
+    let sub = super::compose_subscriber(file.clone(), err.clone(), &["info".to_string()], &["info".to_string()]);
+    let _g = garter::tracing_test::set_default_in_current_thread(sub);
+    tracing::info!(target: "hole::stderr_relay", "relayed-line");
+    drop(_g);
+    assert!(file.contents().contains("relayed-line"), "file dropped relay event");
+    assert!(
+        !err.contents().contains("relayed-line"),
+        "stderr must exclude relay events:\n{}",
+        err.contents()
+    );
+}

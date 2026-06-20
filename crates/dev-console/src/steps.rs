@@ -83,7 +83,7 @@ async fn run_step(
 /// dependency additions pulled from a new commit and leave Vite failing to
 /// resolve the import; ~1s on a healthy tree (dev.py §5.12).
 pub async fn ensure_node_modules(npm: &Path, interrupts: &mut Interrupts) -> Result<()> {
-    println!("{BOLD}Syncing npm dependencies...{RESET}");
+    note!("{BOLD}Syncing npm dependencies...{RESET}");
     let mut cmd = tokio::process::Command::new(npm);
     cmd.args(["install", "--no-audit", "--no-fund"]);
     run_step(cmd, "npm install", false, interrupts).await
