@@ -647,6 +647,11 @@ where
     // intact; native faults are caught here). Idempotent + best-effort;
     // never panics. `kind` labels the marker; `log_dir` is user-readable
     // even for the elevated bridge.
+    //
+    // #572: the crash marker is written by the signal handler at crash time
+    // (signal-safe context — no chown). It is transient, lives in the
+    // user-owned log dir, and is swept on next start, so it is left
+    // root-owned on purpose rather than chowned from an unsafe context.
     tombstone::attach(kind, log_dir);
 
     LogGuard {
