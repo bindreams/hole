@@ -180,10 +180,14 @@ pub async fn pump(mut stream: impl AsyncRead + Unpin, mode: StreamMode, prefix: 
     }
 }
 
-/// The single writer: receives entries from every pump and writes each as
-/// one contiguous block. One writer == atomic entries (replaces dev.py's
-/// print lock).
-pub async fn printer(mut rx: mpsc::Receiver<Entry>, mut out: impl AsyncWrite + Unpin) -> std::io::Result<()> {
+/// The single writer: receives entries from every pump, writes each as one
+/// contiguous block to `out` (terminal, ANSI kept), and mirrors it into
+/// `transcript` (ANSI stripped) for `dev-console.log`.
+pub async fn printer(
+    mut rx: mpsc::Receiver<Entry>,
+    mut out: impl AsyncWrite + Unpin,
+    transcript: crate::transcript::Transcript,
+) -> std::io::Result<()> {
     while let Some(entry) = rx.recv().await {
         let mut block = String::new();
         for line in &entry.lines {
@@ -193,6 +197,7 @@ pub async fn printer(mut rx: mpsc::Receiver<Entry>, mut out: impl AsyncWrite + U
         }
         out.write_all(block.as_bytes()).await?;
         out.flush().await?;
+        transcript.write_block(&block);
     }
     Ok(())
 }
