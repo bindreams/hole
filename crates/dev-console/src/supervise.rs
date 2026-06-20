@@ -174,7 +174,9 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     let cargo = steps::resolve_tool("cargo")?;
     let npm = steps::resolve_tool("npm")?;
     steps::ensure_node_modules(&npm, interrupts).await?;
-    steps::cargo_build(&cargo, interrupts).await?;
+    // No workspace build here: dev-console supervises only (#564). The xtask
+    // cascade built everything; a standalone run reuses the existing build,
+    // which `stage_bindir` (cargo xtask stage) validates.
 
     // 3. Per-pid stage (guard registered BEFORE mkdir; dev.py §5.11) ==================================================
     let stage_guard = steps::StageDirGuard::register(steps::stage_dir_path(std::process::id()));
