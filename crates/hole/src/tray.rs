@@ -91,6 +91,52 @@ pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
     format!("Could not reach the Hole bridge after elevation. {detail} See gui.log for details.")
 }
 
+/// Toast shown when an externally-supervised bridge (`HOLE_BRIDGE_SOCKET`)
+/// denies the connection. Hole will not elevate in this mode: the elevated
+/// `hole bridge ipc-send` helper connects to the default production socket, not
+/// this caller-provided one, so elevation would mis-target (#569). The
+/// underlying permission error still lands in `gui.log`.
+pub(crate) fn external_bridge_denied_toast() -> String {
+    "Permission denied by the bridge. Hole does not elevate an externally-supervised bridge \
+     (HOLE_BRIDGE_SOCKET); ensure your user was granted access to its socket. See gui.log for details."
+        .into()
+}
+
+/// Resolution of a bridge `NeedsElevation` signal, before any UI. Pure so the
+/// matrix (externally-supervised × prompts × disconnect) is unit-tested.
+pub(crate) enum ElevationDecision {
+    /// Run the elevated helper (interactive UAC/osascript).
+    Elevate,
+    /// Do not elevate; fail with this toast.
+    Decline(String),
+}
+
+/// Decide whether a `NeedsElevation` should actually elevate.
+/// - Externally supervised (`HOLE_BRIDGE_SOCKET`): never — the elevated helper
+///   targets the default production socket, not this one (#569). Checked first,
+///   so it overrides the disconnect/prompts rules below.
+/// - Disconnect (when GUI-owned) is always interactive, so it may elevate.
+/// - Connect may elevate only when prompts are allowed; an unattended startup
+///   auto-connect (#458) fails passively instead of throwing UAC at a login.
+pub(crate) fn decide_elevation(
+    externally_supervised: bool,
+    prompts: Prompts,
+    is_disconnect: bool,
+) -> ElevationDecision {
+    if externally_supervised {
+        return ElevationDecision::Decline(external_bridge_denied_toast());
+    }
+    if is_disconnect {
+        return ElevationDecision::Elevate;
+    }
+    match prompts {
+        Prompts::Allowed => ElevationDecision::Elevate,
+        Prompts::Forbidden => {
+            ElevationDecision::Decline("Connecting requires elevation, which is unavailable at startup.".into())
+        }
+    }
+}
+
 pub(crate) fn outcome_for_start_response(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> StartDecision {
@@ -148,6 +194,21 @@ pub(crate) fn startup_should_connect(behavior: StartupBehavior, last_enabled: bo
         StartupBehavior::RestoreLastState => last_enabled,
         StartupBehavior::AlwaysConnect => true,
     }
+}
+
+/// Install-gate decision (#569). The GUI prompts to install the production bridge
+/// service only when it OWNS the bridge lifecycle. When the bridge is externally
+/// supervised (`HOLE_BRIDGE_SOCKET` — dev-console / manual dev run) a live bridge
+/// is already reachable on that socket and the production install state (launchd
+/// plist / SCM service) is irrelevant, so the gate must never fire — otherwise
+/// dev mode demands admin to install a service over an already-running bridge.
+/// `status_fn` is lazy so the production status probe (a stat, and on macOS a
+/// `launchctl` subprocess) is skipped entirely when externally supervised.
+pub(crate) fn should_prompt_install(
+    externally_supervised: bool,
+    status_fn: impl FnOnce() -> crate::setup::BridgeInstallStatus,
+) -> bool {
+    !externally_supervised && status_fn() == crate::setup::BridgeInstallStatus::NotInstalled
 }
 
 // Menu IDs ============================================================================================================
@@ -501,10 +562,16 @@ async fn set_proxy_enabled_inner(
 ) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
-    // Bridge install gate: if the user is trying to enable the proxy and
-    // the bridge isn't installed yet, prompt for installation BEFORE
-    // anything else.
-    if enable && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled {
+    // Bridge install gate: when the GUI owns the bridge lifecycle and no
+    // production service is installed, prompt to install BEFORE anything else.
+    // An externally-supervised bridge (HOLE_BRIDGE_SOCKET, dev) skips this
+    // entirely — it is already reachable on its own socket (#569).
+    if enable
+        && should_prompt_install(
+            state.bridge_is_externally_supervised(),
+            crate::setup::bridge_install_status,
+        )
+    {
         match prompts {
             Prompts::Allowed => {
                 if !crate::setup::prompt_bridge_install(app.clone()).await {
@@ -546,14 +613,17 @@ async fn set_proxy_enabled_inner(
                 info!(?outcome, "proxy start settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => match prompts {
-                Prompts::Allowed => elevate_and_confirm(app, request).await,
-                // No UAC at an unattended startup; fail into Disconnected.
-                Prompts::Forbidden => {
-                    debug!("startup auto-connect needs elevation; skipping (unattended)");
-                    Err("Connecting requires elevation, which is unavailable at startup.".into())
+            StartDecision::NeedsElevation => {
+                match decide_elevation(state.bridge_is_externally_supervised(), prompts, false) {
+                    ElevationDecision::Elevate => elevate_and_confirm(app, request).await,
+                    // Externally-supervised bridge or an unattended startup: no UAC;
+                    // fail into Disconnected.
+                    ElevationDecision::Decline(msg) => {
+                        debug!("proxy start needs elevation but declining: {msg}");
+                        Err(msg)
+                    }
                 }
-            },
+            }
             StartDecision::Fail(msg) => {
                 error!("proxy start failed: {msg}");
                 Err(msg)
@@ -567,7 +637,12 @@ async fn set_proxy_enabled_inner(
                 info!(?outcome, "proxy stop settled");
                 Ok(outcome)
             }
-            StartDecision::NeedsElevation => elevate_and_confirm(app, request).await,
+            StartDecision::NeedsElevation => {
+                match decide_elevation(state.bridge_is_externally_supervised(), prompts, true) {
+                    ElevationDecision::Elevate => elevate_and_confirm(app, request).await,
+                    ElevationDecision::Decline(msg) => Err(msg),
+                }
+            }
             StartDecision::Fail(msg) => {
                 error!("proxy stop failed: {msg}");
                 Err(msg)

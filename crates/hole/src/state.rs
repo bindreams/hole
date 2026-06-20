@@ -27,6 +27,13 @@ pub struct AppState {
     /// first time the bridge proves reachable (so a cold-boot race against the
     /// bridge's socket bind can't drop the connect).
     pending_startup_connect: AtomicBool,
+    /// Whether the bridge is externally supervised — the GUI was pointed at a
+    /// caller-provided socket via `HOLE_BRIDGE_SOCKET` (dev-console / manual dev
+    /// run) instead of the platform default. In that mode the GUI does NOT own
+    /// the bridge lifecycle: it must not prompt to install the production service
+    /// nor elevate, since the elevated helper and the post-install reachability
+    /// poll both target the default production socket, not this one (#569).
+    bridge_externally_supervised: bool,
 }
 
 // Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
@@ -38,13 +45,16 @@ impl AppState {
         // its own). `hole::selfheal` resolves in both the lib and bin units.
         let hook_app = app_handle.clone();
         let self_heal: SelfHealHook = std::sync::Arc::new(move |bridge| hole::selfheal::trigger(&hook_app, bridge));
+        let (socket_path, externally_supervised) =
+            resolve_bridge_socket(std::env::var_os("HOLE_BRIDGE_SOCKET").map(PathBuf::from));
         Self {
             config_store,
             config: Mutex::new(config),
             app_handle,
-            link: BridgeLink::new(resolve_bridge_socket_path(), self_heal),
+            link: BridgeLink::new(socket_path, self_heal),
             test_locks: tokio::sync::Mutex::new(HashMap::new()),
             pending_startup_connect: AtomicBool::new(false),
+            bridge_externally_supervised: externally_supervised,
         }
     }
 
@@ -85,20 +95,29 @@ impl AppState {
         self.link.cell().snapshot()
     }
 
+    /// True when the GUI was pointed at a caller-provided bridge socket via
+    /// `HOLE_BRIDGE_SOCKET` (dev-console / manual dev run); see the field doc.
+    pub fn bridge_is_externally_supervised(&self) -> bool {
+        self.bridge_externally_supervised
+    }
+
     pub fn subscribe_proxy_state(&self) -> tokio::sync::watch::Receiver<ProxySnapshot> {
         self.link.cell().subscribe()
     }
 }
 
-/// Resolve the bridge socket path from `HOLE_BRIDGE_SOCKET` or the
-/// platform default. Read once at `AppState` construction; tests inject
-/// per-test paths directly into `BridgeLink::new` instead (the env var is
-/// process-global and skuld tests may share a process).
-fn resolve_bridge_socket_path() -> PathBuf {
-    std::env::var("HOLE_BRIDGE_SOCKET")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(hole_common::protocol::default_bridge_socket_path)
+/// Resolve the bridge socket path and whether it was externally provided.
+/// `override_path` is the `HOLE_BRIDGE_SOCKET` value (read once at `AppState`
+/// construction; the env var is process-global and skuld tests share a process,
+/// so this takes the value as a parameter to stay purely testable). A non-empty
+/// value ⇒ externally supervised (dev-console / manual dev run); absent or empty
+/// ⇒ the platform default production socket (an empty `HOLE_BRIDGE_SOCKET=` is
+/// malformed and conventionally means unset — never an external "" socket).
+fn resolve_bridge_socket(override_path: Option<PathBuf>) -> (PathBuf, bool) {
+    match override_path.filter(|path| !path.as_os_str().is_empty()) {
+        Some(path) => (path, true),
+        None => (hole_common::protocol::default_bridge_socket_path(), false),
+    }
 }
 
 // BridgeLink ==========================================================================================================
