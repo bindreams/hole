@@ -225,3 +225,39 @@ fn install_gate_prompts_only_when_production_service_absent() {
     assert!(!should_prompt_install(false, || Installed));
     assert!(!should_prompt_install(false, || Running));
 }
+
+// decide_elevation ====================================================================================================
+
+#[skuld::test]
+fn elevation_declined_for_externally_supervised_bridge() {
+    use ElevationDecision::*;
+    // Externally supervised: never elevate — neither connect nor disconnect,
+    // regardless of prompts (the elevated helper would mis-target the default socket).
+    for is_disconnect in [false, true] {
+        for prompts in [Prompts::Allowed, Prompts::Forbidden] {
+            assert!(
+                matches!(decide_elevation(true, prompts, is_disconnect), Decline(_)),
+                "external must decline elevation (disconnect={is_disconnect})"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn elevation_matrix_when_gui_owns_bridge() {
+    use ElevationDecision::*;
+    // Connect, prompts allowed -> elevate.
+    assert!(matches!(decide_elevation(false, Prompts::Allowed, false), Elevate));
+    // Connect, unattended startup -> decline (no UAC at login).
+    assert!(matches!(decide_elevation(false, Prompts::Forbidden, false), Decline(_)));
+    // Disconnect is always interactive -> elevate regardless of prompts.
+    assert!(matches!(decide_elevation(false, Prompts::Allowed, true), Elevate));
+    assert!(matches!(decide_elevation(false, Prompts::Forbidden, true), Elevate));
+}
+
+#[skuld::test]
+fn external_bridge_denied_toast_is_actionable() {
+    let toast = external_bridge_denied_toast();
+    assert!(toast.to_lowercase().contains("permission denied"), "{toast}");
+    assert!(toast.contains("gui.log"), "{toast}");
+}
