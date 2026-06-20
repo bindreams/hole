@@ -602,6 +602,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 &config.server.server,
                 config.server.server_port,
                 state_dir,
+                None,
                 config.diagnostic_plugin_tap,
                 &cancel,
             )
@@ -891,6 +892,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     capture_aliases,
                     apply_aliases,
                     state_dir.map(std::path::Path::to_path_buf),
+                    None,
                     cancel.clone(),
                 )
                 .await

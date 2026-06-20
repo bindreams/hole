@@ -1515,6 +1515,7 @@ fn dns_apply_emits_done_info_log() {
                     vec!["hole-test-nonexistent-iface-xyz".into()],
                     vec![],
                     None,
+                    None,
                     CancellationToken::new(),
                 )
                 .await
@@ -1584,6 +1585,7 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
                     vec!["hole-p4-test-upstream-xyz".into()],
                     vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
+                    None,
                     None,
                     CancellationToken::new(),
                 )

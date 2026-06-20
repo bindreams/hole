@@ -141,6 +141,7 @@ async fn system_dns_apply_aborts_between_calls_on_cancel() {
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
             None,
+            None,
             cancel,
         )
         .await;
@@ -201,6 +202,7 @@ async fn inline_restore_clears_state_file_on_cancel() {
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
             Some(state_dir.clone()),
+            None,
             cancel,
         )
         .await;
@@ -231,6 +233,7 @@ async fn system_dns_apply_one_set_per_apply_alias() {
             ],
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
+            None,
             None,
             cancel,
         )
@@ -271,6 +274,7 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
             vec!["upstream-alias".into()],
             vec!["wintun".into()],
             None,
+            None,
             cancel,
         )
         .await
@@ -305,6 +309,7 @@ async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
             ],
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
+            None,
             None,
             cancel,
         )
@@ -349,6 +354,7 @@ async fn apply_advertises_resolver_ips_not_loopback() {
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
             None,
+            None,
             cancel,
         )
         .await
@@ -386,6 +392,7 @@ async fn apply_advertises_both_v4_and_v6_resolvers() {
             resolvers.clone(),
             vec!["upstream-alias".into()],
             vec!["wintun".into(), "upstream-alias".into()],
+            None,
             None,
             cancel,
         )

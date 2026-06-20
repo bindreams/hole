@@ -97,6 +97,7 @@ pub trait Dns: Send + Sync + 'static {
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
+        owner: Option<(u32, u32)>,
         cancel: CancellationToken,
     ) -> impl std::future::Future<Output = Result<Self::Applied, DnsError>> + Send;
 }
@@ -196,6 +197,7 @@ impl Dns for SystemDns {
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
+        owner: Option<(u32, u32)>,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         apply_windows(
@@ -204,6 +206,7 @@ impl Dns for SystemDns {
             capture_aliases,
             apply_aliases,
             state_dir,
+            owner,
             cancel,
         )
         .await
@@ -216,6 +219,7 @@ impl Dns for SystemDns {
         capture_aliases: Vec<String>,
         apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
+        owner: Option<(u32, u32)>,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         apply_macos(
@@ -224,6 +228,7 @@ impl Dns for SystemDns {
             capture_aliases,
             apply_aliases,
             state_dir,
+            owner,
             cancel,
         )
         .await
@@ -236,6 +241,7 @@ impl Dns for SystemDns {
         _capture_aliases: Vec<String>,
         _apply_aliases: Vec<String>,
         state_dir: Option<PathBuf>,
+        _owner: Option<(u32, u32)>,
         _cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         Ok(SystemDnsApplied {
@@ -261,6 +267,7 @@ async fn apply_windows(
     capture_aliases: Vec<String>,
     apply_aliases: Vec<String>,
     state_dir: Option<PathBuf>,
+    owner: Option<(u32, u32)>,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
@@ -303,7 +310,7 @@ async fn apply_windows(
             advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
-        if let Err(e) = crate::dns_state::save(dir, &state, None) {
+        if let Err(e) = crate::dns_state::save(dir, &state, owner) {
             tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
         }
     }
@@ -397,6 +404,7 @@ async fn apply_macos(
     capture_aliases: Vec<String>,
     apply_aliases: Vec<String>,
     state_dir: Option<PathBuf>,
+    owner: Option<(u32, u32)>,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
@@ -432,7 +440,7 @@ async fn apply_macos(
             advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
-        if let Err(e) = crate::dns_state::save(dir, &state, None) {
+        if let Err(e) = crate::dns_state::save(dir, &state, owner) {
             tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
         }
     }
