@@ -1646,7 +1646,6 @@ mod self_test {
             enabled: true,
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
-            intercept_udp53: true,
         }
     }
 
@@ -1841,7 +1840,6 @@ mod self_test {
                     enabled: true,
                     servers: vec![], // degenerate
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
@@ -1919,7 +1917,6 @@ mod self_test {
                     enabled: false,
                     servers: vec![],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: true,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (ep, fwd) = match res {
@@ -1931,10 +1928,9 @@ mod self_test {
             });
     }
 
-    /// the in-TUN LocalDnsEndpoint is the sole OS DNS path, so it
-    /// must be constructed whenever DNS is enabled with servers — even if
-    /// `intercept_udp53` is false. `build_local_dns` returns a 2-tuple
-    /// `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
+    /// The in-TUN LocalDnsEndpoint is the sole OS DNS path, so it must be
+    /// constructed whenever DNS is enabled with servers. `build_local_dns`
+    /// returns a 2-tuple `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
     #[skuld::test]
     fn build_local_dns_builds_endpoint_when_enabled() {
         tokio::runtime::Builder::new_current_thread()
@@ -1946,7 +1942,6 @@ mod self_test {
                     enabled: true,
                     servers: vec!["1.1.1.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
-                    intercept_udp53: false, // legacy flag — endpoint built anyway
                 };
                 let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
                     .await
