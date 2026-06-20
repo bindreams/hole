@@ -8,42 +8,41 @@ use std::process::Command;
 #[derive(Debug, thiserror::Error)]
 pub enum PrimeSudoError {
     /// sudo itself could not be spawned (not on PATH / not executable).
-    /// Message text = dev.py:489 verbatim.
     #[error("sudo not found on PATH; cannot elevate the bridge ({0})")]
     SudoNotFound(std::io::Error),
-    /// A TTY was available, the interactive prompt ran, and it FAILED
-    /// (wrong password / Ctrl+C at the prompt). Message = dev.py:486.
-    #[error("sudo authentication failed")]
-    AuthFailed,
-    /// No cached credentials and no TTY to prompt on.
+    /// `sudo -v` ran but did not cache credentials: a wrong password, a
+    /// Ctrl+C at the prompt, or no terminal / askpass helper to prompt on.
     #[error(
-        "sudo credentials are unavailable and there is no TTY to prompt on; \
-             run `sudo -v` in this terminal first, or re-run from an interactive shell"
+        "could not cache sudo credentials (wrong password, or no terminal to \
+         prompt on); run `sudo -v` in this terminal first, or re-run from an \
+         interactive shell"
     )]
-    NoTty,
+    PrimingFailed,
 }
 
 /// Prime sudo's credential cache so the immediately-following sudo-wrapped
 /// spawns do not prompt: probe `sudo -n true` (cached cred / NOPASSWD); on
-/// failure run interactive `sudo -v` — but only when stdin is a TTY (a blind
-/// `sudo -v` hangs or fails TTY-less, e.g. on macOS under an IDE runner).
+/// failure run interactive `sudo -v`.
+///
+/// `sudo -v` reads the password from the controlling terminal (`/dev/tty`),
+/// not stdin — so we always attempt it and let sudo prompt (or fall back to
+/// an askpass helper, or fail fast with "a terminal is required" when neither
+/// is available). We deliberately do NOT gate on `isatty(stdin)`: under
+/// `cargo xtask run hole` the orchestrator spawns dev-console with
+/// stdin = /dev/null, so a stdin check is always false even from an
+/// interactive shell (bindreams/hole#567).
 pub fn prime_sudo() -> Result<(), PrimeSudoError> {
-    // SAFETY: isatty has no preconditions.
-    let has_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    prime_sudo_with(Path::new("sudo"), has_tty)
+    prime_sudo_with(Path::new("sudo"))
 }
 
-/// Testable core: `sudo` binary and TTY-ness injected.
-pub fn prime_sudo_with(sudo: &Path, has_tty: bool) -> Result<(), PrimeSudoError> {
+/// Testable core: the `sudo` binary is injected.
+pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
     let probe = Command::new(sudo)
         .args(["-n", "true"])
         .status()
         .map_err(PrimeSudoError::SudoNotFound)?;
     if probe.success() {
         return Ok(());
-    }
-    if !has_tty {
-        return Err(PrimeSudoError::NoTty);
     }
     let interactive = Command::new(sudo)
         .arg("-v")
@@ -52,7 +51,7 @@ pub fn prime_sudo_with(sudo: &Path, has_tty: bool) -> Result<(), PrimeSudoError>
     if interactive.success() {
         Ok(())
     } else {
-        Err(PrimeSudoError::AuthFailed)
+        Err(PrimeSudoError::PrimingFailed)
     }
 }
 
