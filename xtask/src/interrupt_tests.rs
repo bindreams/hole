@@ -1,6 +1,8 @@
-//! Unix-gated and nextest-isolated: run with `cargo nextest run` so each test
-//! is its own process; self-`raise(SIGINT)` would otherwise hit the shared
-//! `cargo test` process (skuld runs in-process). Mirrors
+//! Nextest-isolated: run with `cargo nextest run` so each test is its own
+//! process; self-`raise(SIGINT)` (unix) / CTRL_BREAK to a process group
+//! (windows) would otherwise hit the shared `cargo test` process (skuld runs
+//! in-process). The unix tests are `#[cfg(unix)]`, the CTRL_BREAK e2e is
+//! `#[cfg(windows)]`; `spawn_and_rendezvous` is shared. Mirrors
 //! crates/dev-console/src/interrupts_tests.rs.
 
 /// After installing the transparent handler, a SIGINT must NOT terminate the
@@ -20,16 +22,19 @@ fn transparent_handler_survives_sigint() {
 /// parent's readiness conn (parent announced "about to wait"), the grandchild's
 /// conn (held open by the caller — drop it to release the grandchild), and the
 /// grandchild's pid. Sleep-free: both readiness lines must arrive before we act.
-#[cfg(unix)]
 fn spawn_and_rendezvous() -> (std::process::Child, std::net::TcpStream, std::net::TcpStream, u32) {
     use std::io::{BufRead as _, BufReader};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind control");
     let addr = listener.local_addr().unwrap().to_string();
-    let parent = std::process::Command::new(std::env::current_exe().unwrap())
-        .env(crate::test_child::MODE_ENV, "interrupt-parent")
-        .env(crate::test_child::CONTROL_ENV, &addr)
-        .spawn()
-        .expect("spawn parent-under-test");
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.env(crate::test_child::MODE_ENV, "interrupt-parent")
+        .env(crate::test_child::CONTROL_ENV, &addr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP — parent's group == its pid; CTRL_BREAK to it won't hit the test console
+    }
+    let parent = cmd.spawn().expect("spawn parent-under-test");
 
     let (mut parent_conn, mut child_conn, mut child_pid) = (None, None, None);
     for _ in 0..2 {
@@ -86,5 +91,28 @@ fn child_sigint_disposition_resets_across_exec() {
         status.code(),
         Some(128 + libc::SIGINT),
         "grandchild must inherit the DEFAULT SIGINT disposition across exec (got {status:?})"
+    );
+}
+
+/// Windows analog of `parent_survives_sigint_and_forwards_child_exit`: a
+/// CTRL_BREAK delivered to the launcher's (isolated) process group mid-wait must
+/// not kill it — `ctrlc`'s handler returns TRUE for every console event — so it
+/// keeps waiting and forwards the grandchild's exit code. CTRL_BREAK (not
+/// CTRL_C) because only it can target a single new process group without hitting
+/// the test runner's console.
+#[cfg(windows)]
+#[skuld::test]
+fn parent_survives_ctrl_break_and_forwards_child_exit() {
+    use windows::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    let (mut parent, _parent_conn, child_conn, _child_pid) = spawn_and_rendezvous();
+    // The parent was spawned with CREATE_NEW_PROCESS_GROUP, so its group id == its pid.
+    // SAFETY: FFI call into kernel32; the group id is our live child's pid.
+    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, parent.id()) }.expect("GenerateConsoleCtrlEvent(CTRL_BREAK)");
+    drop(child_conn); // release the grandchild -> it exits CHILD_RELEASE_EXIT
+    let status = parent.wait().expect("wait parent");
+    assert_eq!(
+        status.code(),
+        Some(crate::test_child::CHILD_RELEASE_EXIT),
+        "parent must survive CTRL_BREAK and forward the child's exit code, not die from it (got {status:?})"
     );
 }

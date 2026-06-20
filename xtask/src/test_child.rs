@@ -32,11 +32,14 @@ pub fn maybe_run() {
 fn run_interrupt_parent() -> ! {
     crate::install_transparent_interrupt();
     let addr = std::env::var(CONTROL_ENV).expect("control env");
-    let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-        .env(MODE_ENV, "interrupt-child")
-        .env(CONTROL_ENV, &addr)
-        .spawn()
-        .expect("spawn grandchild");
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.env(MODE_ENV, "interrupt-child").env(CONTROL_ENV, &addr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP — isolate the grandchild from the parent-group CTRL_BREAK
+    }
+    let mut child = cmd.spawn().expect("spawn grandchild");
     // Announce AFTER spawning that we have committed to waiting; the test
     // SIGINTs only after reading this. (The handler was installed before the
     // spawn, so the parent survives wherever the signal lands relative to wait.)
@@ -45,14 +48,28 @@ fn run_interrupt_parent() -> ! {
         conn.write_all(b"P\n").expect("parent readiness");
     }
     let status = child.wait().expect("wait grandchild");
-    let code = match status.code() {
-        Some(c) => c,
-        None => {
-            use std::os::unix::process::ExitStatusExt as _;
-            128 + status.signal().unwrap_or(0)
+    std::process::exit(encode_exit(status));
+}
+
+/// Encode a child's outcome as an exit code the test asserts on: a clean exit
+/// forwards its code; on unix a signal death maps to 128+signum. On Windows a
+/// process always carries an exit code (even a CTRL_BREAK kill), so `code()` is
+/// authoritative.
+fn encode_exit(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        match status.code() {
+            Some(c) => c,
+            None => {
+                use std::os::unix::process::ExitStatusExt as _;
+                128 + status.signal().unwrap_or(0)
+            }
         }
-    };
-    std::process::exit(code);
+    }
+    #[cfg(windows)]
+    {
+        status.code().unwrap_or(-1)
+    }
 }
 
 /// Grandchild: installs NO handler (its disposition reflects what it inherited

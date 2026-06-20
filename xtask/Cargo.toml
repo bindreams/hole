@@ -48,3 +48,6 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # raise()/kill() + SIGINT in signal tests
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_System_Console"] } # GenerateConsoleCtrlEvent in the Ctrl+Break e2e test (#568)
