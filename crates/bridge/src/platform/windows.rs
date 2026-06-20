@@ -99,7 +99,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
-                tun_engine::routing::SystemRouting::new(state_dir.clone()),
+                tun_engine::routing::SystemRouting::new(state_dir.clone(), None),
             )
             .with_state_dir(state_dir.clone()),
         ));

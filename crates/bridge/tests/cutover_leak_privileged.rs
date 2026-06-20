@@ -106,7 +106,7 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     );
 
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path())
+    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
         .expect("engage the real standing lockdown cover");
 
     // Engaged: server permitted (permit beats block-all), others blocked (no leak).

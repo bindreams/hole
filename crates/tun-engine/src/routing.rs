@@ -438,11 +438,14 @@ pub trait Routing: Send + Sync {
 /// `state_dir` where `bridge-routes.json` lives for crash recovery.
 pub struct SystemRouting {
     state_dir: PathBuf,
+    /// uid/gid to chown persisted state files to (an elevated user-scoped run
+    /// hands the real user here); `None` leaves ownership as-is.
+    owner: Option<(u32, u32)>,
 }
 
 impl SystemRouting {
-    pub fn new(state_dir: PathBuf) -> Self {
-        Self { state_dir }
+    pub fn new(state_dir: PathBuf, owner: Option<(u32, u32)>) -> Self {
+        Self { state_dir, owner }
     }
 }
 
@@ -467,7 +470,7 @@ impl Routing for SystemRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        state::save(&self.state_dir, &persisted, None)
+        state::save(&self.state_dir, &persisted, self.owner)
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
         // Install the routes. On failure, defensively tear down whatever
@@ -497,7 +500,7 @@ impl Routing for SystemRouting {
     }
 
     fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError> {
-        failclosed::engage(server_ip, &self.state_dir)
+        failclosed::engage(server_ip, &self.state_dir, self.owner)
     }
 
     fn install_lockdown(
@@ -507,7 +510,7 @@ impl Routing for SystemRouting {
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
         let resolver = failclosed::SystemLuidResolver;
-        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir)
+        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
     }
 }
 

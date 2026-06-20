@@ -122,8 +122,11 @@ async fn run_inner(
     version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
-        ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
-            .with_state_dir(state_dir.to_path_buf()),
+        ProxyManager::new(
+            ShadowsocksProxy::new(),
+            SystemRouting::new(state_dir.to_path_buf(), None),
+        )
+        .with_state_dir(state_dir.to_path_buf()),
     ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
