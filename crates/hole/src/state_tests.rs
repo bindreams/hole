@@ -744,3 +744,13 @@ fn resolve_bridge_socket_default_is_not_external() {
     assert_eq!(path, hole_common::protocol::default_bridge_socket_path());
     assert!(!external, "the platform default ⇒ GUI owns the bridge lifecycle");
 }
+
+#[skuld::test]
+fn resolve_bridge_socket_empty_override_is_not_external() {
+    // An empty HOLE_BRIDGE_SOCKET= is malformed; treat it as unset (production
+    // default, GUI owns the bridge) rather than an external "" socket — otherwise
+    // an empty env var would wrongly skip the install gate.
+    let (path, external) = resolve_bridge_socket(Some(std::path::PathBuf::from("")));
+    assert_eq!(path, hole_common::protocol::default_bridge_socket_path());
+    assert!(!external, "an empty override ⇒ not externally supervised");
+}

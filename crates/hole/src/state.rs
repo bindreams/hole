@@ -109,11 +109,12 @@ impl AppState {
 /// Resolve the bridge socket path and whether it was externally provided.
 /// `override_path` is the `HOLE_BRIDGE_SOCKET` value (read once at `AppState`
 /// construction; the env var is process-global and skuld tests share a process,
-/// so this takes the value as a parameter to stay purely testable). `Some` ⇒
-/// externally supervised (dev-console / manual dev run); `None` ⇒ the platform
-/// default production socket.
+/// so this takes the value as a parameter to stay purely testable). A non-empty
+/// value ⇒ externally supervised (dev-console / manual dev run); absent or empty
+/// ⇒ the platform default production socket (an empty `HOLE_BRIDGE_SOCKET=` is
+/// malformed and conventionally means unset — never an external "" socket).
 fn resolve_bridge_socket(override_path: Option<PathBuf>) -> (PathBuf, bool) {
-    match override_path {
+    match override_path.filter(|path| !path.as_os_str().is_empty()) {
         Some(path) => (path, true),
         None => (hole_common::protocol::default_bridge_socket_path(), false),
     }

@@ -113,8 +113,9 @@ pub(crate) enum ElevationDecision {
 
 /// Decide whether a `NeedsElevation` should actually elevate.
 /// - Externally supervised (`HOLE_BRIDGE_SOCKET`): never — the elevated helper
-///   targets the default production socket, not this one (#569).
-/// - Disconnect is always interactive, so it may elevate.
+///   targets the default production socket, not this one (#569). Checked first,
+///   so it overrides the disconnect/prompts rules below.
+/// - Disconnect (when GUI-owned) is always interactive, so it may elevate.
 /// - Connect may elevate only when prompts are allowed; an unattended startup
 ///   auto-connect (#458) fails passively instead of throwing UAC at a login.
 pub(crate) fn decide_elevation(
