@@ -447,6 +447,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                     &log_dir,
                     ready_notify.as_deref(),
                     hole::version::VERSION,
+                    None, // #572 Task 5 wires the resolved owner here
                 )
             };
 
