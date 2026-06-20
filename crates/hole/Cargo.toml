@@ -41,7 +41,6 @@ hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 hole-bridge = { path = "../bridge" }
 stepstool = { path = "../stepstool" }
-util = { path = "../util" }
 tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
@@ -94,11 +93,19 @@ libc = "0.2"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Test-only: the #572 cross-uid ownership proof drives `util::ownership::chown_path`
+# directly; no non-test `hole` code references the `util` crate.
+util = { path = "../util" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 garter = { path = "../garter" }
 filetime = "0.2"
+
+[[test]]
+name = "elevated_ownership_privileged"
+path = "tests/elevated_ownership_privileged.rs"
+harness = false
 
 [build-dependencies]
 tauri-build = "2"
