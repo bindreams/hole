@@ -13,12 +13,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Exact type of [`crate::logging::init`]. A regression to a different arity
+/// (e.g. dropping `kind` or the trailing `owner`) fails the assertion below.
+type InitFn = fn(&std::path::Path, &'static str, &str, &str, Option<(u32, u32)>) -> crate::logging::LogGuard;
+
 #[skuld::test]
 fn init_signature_takes_kind() {
     // Compile-time guard: init's signature includes a &'static str kind
-    // between log_dir and log_filename. A regression to the old 3-arg form
-    // fails to compile here.
-    let _f: fn(&std::path::Path, &'static str, &str, &str) -> crate::logging::LogGuard = crate::logging::init;
+    // between log_dir and log_filename, and a trailing owner. A regression to
+    // the old form fails to compile here.
+    let _f: InitFn = crate::logging::init;
 }
 
 // Test result format ==================================================================================================

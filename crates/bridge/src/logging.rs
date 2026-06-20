@@ -19,16 +19,16 @@ use std::path::Path;
 /// `EnvFilter::from_env_lossy` inside `init_multi`), so e.g.
 /// `RUST_LOG=shadowsocks_service=trace HOLE_BRIDGE_LOG=hole_bridge=debug`
 /// composes the same way.
-pub fn init(log_dir: &Path) -> LogGuard {
+pub fn init(log_dir: &Path, owner: Option<(u32, u32)>) -> LogGuard {
     let raw = std::env::var("HOLE_BRIDGE_LOG").unwrap_or_else(|_| "hole_bridge=info".to_string());
     let directives = parse_directives(&raw);
     // Empty / whitespace-only env var falls back to the default rather than
     // passing zero directives to `init_multi` (which would let the global
     // INFO default win without any bridge-specific override).
     if directives.is_empty() {
-        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", ["hole_bridge=info"])
+        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", ["hole_bridge=info"], owner)
     } else {
-        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", directives)
+        hole_common::logging::init_multi(log_dir, "bridge", "bridge.log", directives, owner)
     }
 }
 

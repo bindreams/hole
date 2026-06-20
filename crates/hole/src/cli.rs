@@ -296,8 +296,10 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
 /// exactly which subcommands are exempted and [`resolve_cli_log_dir`] for
 /// how the directory is chosen.
 pub(crate) fn dispatch(command: Command) -> ! {
-    let _cli_log_guard =
-        resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info"));
+    let _cli_log_guard = resolve_cli_log_dir(&command).map(|d| {
+        // #572 Task 5 wires the resolved owner here.
+        hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", None)
+    });
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
@@ -405,7 +407,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             ready_notify,
         } => {
             let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
-            let _guard = hole_bridge::logging::init(&log_dir);
+            // #572 Task 5 wires the resolved owner here.
+            let _guard = hole_bridge::logging::init(&log_dir, None);
             tracing::info!("hole bridge starting");
 
             if service && ready_notify.is_some() {

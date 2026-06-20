@@ -492,8 +492,14 @@ const MAX_ROTATED_LOGS: usize = 1;
 /// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
 /// guard that must be held for the process lifetime to ensure logs are
 /// flushed and the relay reader threads stay alive.
-pub fn init(log_dir: &Path, kind: &'static str, log_filename: &str, default_directive: &str) -> LogGuard {
-    init_multi(log_dir, kind, log_filename, [default_directive])
+pub fn init(
+    log_dir: &Path,
+    kind: &'static str,
+    log_filename: &str,
+    default_directive: &str,
+    owner: Option<(u32, u32)>,
+) -> LogGuard {
+    init_multi(log_dir, kind, log_filename, [default_directive], owner)
 }
 
 /// Initialize logging with one or more caller-supplied filter directives.
@@ -512,12 +518,22 @@ pub fn init(log_dir: &Path, kind: &'static str, log_filename: &str, default_dire
 /// `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
 /// `init` accepts only one directive and silently dropping the rest is the
 /// kind of thing that hides production diagnostics (#248).
-pub fn init_multi<I>(log_dir: &Path, kind: &'static str, log_filename: &str, directives: I) -> LogGuard
+pub fn init_multi<I>(
+    log_dir: &Path,
+    kind: &'static str,
+    log_filename: &str,
+    directives: I,
+    owner: Option<(u32, u32)>,
+) -> LogGuard
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
     let _ = std::fs::create_dir_all(log_dir);
+    // The elevated bridge creates `log_dir` as root; hand it to the real user
+    // so they can read `bridge.log` without `sudo` (#572). No-op when `owner`
+    // is `None` (the unprivileged GUI) or off-macOS.
+    util::ownership::chown_if_some(log_dir, owner);
     cleanup_legacy_daily_logs(log_dir, log_filename);
 
     // Order matters: redirect BEFORE constructing the non-blocking stderr
@@ -559,7 +575,16 @@ where
     //
     // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
     // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
-    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(file_appender);
+    // Wrap the size-rotating appender so each rotation re-`chown`s the fresh
+    // root-owned active file back to the real user. `owner = None` is a perfect
+    // passthrough (the `reconcile_owner` early-return); off-macOS it is a no-op.
+    let owned = UserOwnedRotate::new(
+        file_appender,
+        log_dir.join(log_filename),
+        owner,
+        |p: &std::path::Path, uid: u32, gid: u32| util::ownership::chown_path(p, uid, gid),
+    );
+    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(owned);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
     // Global default is INFO so third-party crates (shadowsocks-service,
@@ -696,6 +721,9 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
         && b[8].is_ascii_digit()
         && b[9].is_ascii_digit()
 }
+
+mod owned_rotate;
+use owned_rotate::UserOwnedRotate;
 
 pub(crate) mod yaml_format;
 
