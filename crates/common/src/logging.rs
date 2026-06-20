@@ -142,6 +142,19 @@ pub fn default_log_dir() -> PathBuf {
     crate::paths::default_user_subdir("logs")
 }
 
+/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
+/// else [`default_log_dir`]. A blank `HOLE_LOG_DIR` is ignored.
+pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
+    let env_dir = std::env::var_os("HOLE_LOG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    resolve_log_dir_from(override_dir, env_dir)
+}
+
+fn resolve_log_dir_from(override_dir: Option<PathBuf>, env_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.or(env_dir).unwrap_or_else(default_log_dir)
+}
+
 // Per-sink directive resolution =======================================================================================
 
 /// Split a comma-separated directive value: trim each piece, drop blanks.
