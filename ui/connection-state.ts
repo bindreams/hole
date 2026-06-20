@@ -12,9 +12,9 @@
 export type ConnectionState =
   | "disconnected" //       red,       "Disconnected",       click → start
   | "connecting" //         spinner,   "Connecting...",      click → cancel
-  | "cancelling" //         spinner,   "Cancelling...",      click → no-op
+  | "cancelling" //         spinner,   "Cancelling...",      click → escape (connection-failed)
   | "connected" //          green,     "Connected",          click → stop
-  | "disconnecting" //      spinner,   "Disconnecting...",   click → no-op
+  | "disconnecting" //      spinner,   "Disconnecting...",   click → escape (disconnection-failed)
   | "connection-failed" //  red,       "Connection failed",  click → start (retry)
   | "disconnection-failed"; // green,  "Disconnect failed",  click → stop  (retry)
 
@@ -28,9 +28,9 @@ export const IDLE_STATES = new Set<ConnectionState>([
   "disconnection-failed",
 ]);
 
-/// Transition states show a spinner. The button is not interactive in
-/// `cancelling` or `disconnecting`; `connecting` is the only transition
-/// state where a click fires `cancel_proxy`.
+/// Transition states show a spinner. All three are interactive: a click in
+/// `connecting` fires `cancel_proxy`; a click in `cancelling`/`disconnecting`
+/// escapes a wedged transition (see `power-button.ts` handlePowerClick).
 export const TRANSITION_STATES = new Set<ConnectionState>(["connecting", "disconnecting", "cancelling"]);
 
 /// Backend `ToggleOutcome` (Rust enum, lowercase-serialized).

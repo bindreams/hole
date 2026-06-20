@@ -14,6 +14,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionState } from "./connection-state";
+import { OperationGate } from "./operation";
 import { type ToggleDeps, toggleFromIdle } from "./toggle-flow";
 
 interface Harness {
@@ -22,6 +23,7 @@ interface Harness {
   updatePublicIp: ReturnType<typeof vi.fn<ToggleDeps["updatePublicIp"]>>;
   showToast: ReturnType<typeof vi.fn<ToggleDeps["showToast"]>>;
   loadConfig: ReturnType<typeof vi.fn<ToggleDeps["loadConfig"]>>;
+  gate: OperationGate;
   state: ConnectionState;
   deps: ToggleDeps;
 }
@@ -33,6 +35,7 @@ function makeHarness(): Harness {
     updatePublicIp: vi.fn<ToggleDeps["updatePublicIp"]>().mockResolvedValue(undefined),
     showToast: vi.fn<ToggleDeps["showToast"]>(),
     loadConfig: vi.fn<ToggleDeps["loadConfig"]>().mockResolvedValue(undefined),
+    gate: new OperationGate(),
     state: "disconnected" as ConnectionState,
     deps: undefined as unknown as ToggleDeps,
   };
@@ -49,6 +52,7 @@ function makeHarness(): Harness {
     showToast: h.showToast,
     getConfig: () => null,
     loadConfig: h.loadConfig,
+    beginOp: () => h.gate.begin(),
   };
   return h;
 }
@@ -217,5 +221,34 @@ describe("mark_validated_by_proxy_start failure surfacing", () => {
     // The reload is scoped OUT of the mark's try: a failed mark must not
     // trigger loadConfig (there is no new validation state to pick up).
     expect(h.loadConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("toggleFromIdle: operation fencing (#471)", () => {
+  it("a superseded connect performs no late setState when start_proxy settles", async () => {
+    const h = makeHarness();
+    let resolveStart!: (v: string) => void;
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_proxy") {
+        return new Promise<string>((res) => {
+          resolveStart = res;
+        });
+      }
+      return Promise.resolve();
+    });
+
+    void toggleFromIdle(true, h.deps);
+    await Promise.resolve();
+    expect(h.state).toBe("connecting");
+
+    // The user escapes: a fresh op supersedes the in-flight connect.
+    h.gate.begin();
+    h.setState.mockClear();
+
+    // The hung start now settles — its continuation must write nothing.
+    resolveStart("running");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.setState).not.toHaveBeenCalled();
   });
 });

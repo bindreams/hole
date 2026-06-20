@@ -15,6 +15,7 @@ import {
 } from "./connection-state";
 import { updatePublicIp } from "./ip-display";
 import { config, loadConfig } from "./main";
+import { OperationGate } from "./operation";
 import { showToast } from "./toast";
 import { toggleFromIdle } from "./toggle-flow";
 import type { ProxyStatus } from "./types";
@@ -27,6 +28,11 @@ let statusWord: HTMLElement | null = null;
 // scopes the cancel to exactly this start and a stale arm can't kill a later one
 // (#465). Module-scoped because start and cancel are two separate clicks.
 let currentAttemptId = "";
+
+/// Fences stale transition continuations: a Tauri invoke() can't be aborted, so
+/// a superseded operation's late result is dropped instead of clobbering the
+/// state the user escaped to. See ui/operation.ts.
+const operations = new OperationGate();
 
 function setState(next: ConnectionState): void {
   currentState = next;
@@ -41,20 +47,39 @@ function updateConnectionUI(): void {
 }
 
 async function handlePowerClick(): Promise<void> {
-  // Non-interactive transition states — click is ignored.
-  if (currentState === "cancelling" || currentState === "disconnecting") {
+  // Click during connecting → fire cancel. Stays under the in-flight connect
+  // operation (no new op) so toggle-flow's cancel-race arm still owns it; the
+  // pending start_proxy lives in toggleFromIdle() and `cancel_proxy` races it
+  // on a fresh bridge connection. The rejection is logged only: a cancel
+  // transport failure says nothing about the pending start, which owns the
+  // outcome — the cancel-race arm honors the cancel if the start raced to
+  // success, the connect's catch lands connection-failed if it failed, and
+  // `cancelling` stays interactive so a hung start is one click from escape.
+  // Changing state here would disarm the race arm and strand the user connected
+  // against their cancel.
+  if (currentState === "connecting") {
+    setState("cancelling");
+    invoke("cancel_proxy", { attemptId: currentAttemptId }).catch((err) => console.error("cancel_proxy failed:", err));
     return;
   }
 
-  // Click during connecting → fire cancel. The original start_proxy
-  // promise is still pending in toggleFromIdle(); `cancel_proxy`
-  // races it on a fresh bridge connection so it does not block behind
-  // the in-flight start.
-  if (currentState === "connecting") {
-    setState("cancelling");
-    invoke("cancel_proxy", { attemptId: currentAttemptId }).catch((err) => {
-      console.error("cancel_proxy failed:", err);
-    });
+  // Click in a wedged transition → escape. cancel_proxy/stop_proxy may never
+  // settle (a start hung in an uninterruptible phase, or a stop wedged in the
+  // ordered teardown), so the transition needs an explicit user-driven exit.
+  // Mint a fresh op to fence the wedged continuation, land in the
+  // leak-conservative idle failed-state, and let the observation gate reconcile
+  // the truth: cancelling → connection-failed (never claims the tunnel is up),
+  // disconnecting → disconnection-failed (never claims it is down).
+  if (currentState === "cancelling") {
+    operations.begin();
+    setState("connection-failed");
+    showToast("Cancelling is taking too long. The connection may still come up — try again.", "error");
+    return;
+  }
+  if (currentState === "disconnecting") {
+    operations.begin();
+    setState("disconnection-failed");
+    showToast("Disconnecting is taking too long. The proxy may still be active — try again.", "error");
     return;
   }
 
@@ -75,6 +100,7 @@ async function handlePowerClick(): Promise<void> {
       showToast,
       getConfig: () => config,
       loadConfig,
+      beginOp: () => operations.begin(),
     },
     currentAttemptId,
   );
@@ -122,10 +148,15 @@ export function applyProxyStateObservation(
   if (seq <= lastAppliedSeq) {
     return { state: currentState, changed: false };
   }
-  lastAppliedSeq = seq;
   if (!IDLE_STATES.has(currentState)) {
+    // Mid-transition: do NOT consume this seq. A transition state carries its
+    // own owning IPC promise; consuming the seq here would permanently gate out
+    // the later observation that must reconcile an escaped failed-state once the
+    // bridge settles (the backend bumps seq only on a running CHANGE, so the
+    // same committed truth never re-arrives with a newer seq).
     return { state: currentState, changed: false };
   }
+  lastAppliedSeq = seq;
   const prior = currentState;
   const polled = stateForPolledRunning(running);
   if (polled === prior) {
