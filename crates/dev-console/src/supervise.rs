@@ -262,7 +262,14 @@ async fn supervise_children(
     state_dir: &Path,
 ) -> Result<ExitCode> {
     let (tx, rx) = mpsc::channel::<Entry>(256);
-    let mut printer = tokio::spawn(crate::mux::printer(rx, tokio::io::stdout()));
+    let (enter_drain_tx, enter_drain_rx) = tokio::sync::oneshot::channel();
+    let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
+    let mut printer = tokio::spawn(crate::mux::printer(
+        rx,
+        tokio::io::stdout(),
+        enter_drain_rx,
+        finalize_rx,
+    ));
 
     let mut bridge: Option<BridgeChild> = None;
     let mut vite: Option<GroupedChild> = None;
@@ -273,7 +280,7 @@ async fn supervise_children(
     // below always runs, on panics too.
     // AssertUnwindSafe: after a panic the funnel touches only the slot
     // Options, which are coherent at every await point.
-    let outcome: Result<ExitCause> = match std::panic::AssertUnwindSafe(startup_and_supervise(
+    let caught = std::panic::AssertUnwindSafe(startup_and_supervise(
         interrupts,
         npm,
         bridge_bin,
@@ -286,8 +293,12 @@ async fn supervise_children(
         &mut gui,
     ))
     .catch_unwind()
-    .await
-    {
+    .await;
+    // We are now shutting down: stop streaming so the trailing entries are
+    // collected and emitted in timestamp order (#568). Fired ONCE, before
+    // both the panic-arm shutdown and the normal shutdown.
+    let _ = enter_drain_tx.send(());
+    let outcome: Result<ExitCause> = match caught {
         Ok(outcome) => outcome,
         Err(panic) => {
             // dev.py's `finally` ran on arbitrary exceptions: tear down the
@@ -300,11 +311,18 @@ async fn supervise_children(
     shutdown(bridge.as_mut(), vite.as_mut(), gui.as_mut()).await;
 
     drop(tx);
-    // Class-2 bound (external pipes that may never EOF): the WarnRecovery
-    // bridge is deliberately never killed, so its pump can hold its sender
-    // forever; drain what's buffered, then abandon (dev.py join(timeout=5)).
+    // Drain. The printer is collecting the post-`enter_drain` tail; on rx
+    // close it sorts + flushes. Class-2 bound (external pipes that may never
+    // EOF): the WarnRecovery bridge is deliberately never killed, so its pump
+    // can hold its sender forever and `rx` never closes. On that timeout fire
+    // `finalize` so the printer still sorts + writes what it collected, then
+    // re-bound the flush so a wedged stdout can't hang teardown (dev.py
+    // join(timeout=5)).
     if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
-        printer.abort();
+        let _ = finalize_tx.send(());
+        if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
+            printer.abort();
+        }
     }
 
     let cause = outcome?;

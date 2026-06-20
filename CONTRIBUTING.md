@@ -676,6 +676,11 @@ Vite HMR; Rust changes need Ctrl+C and re-run.
   that ignore the graceful signal for 10s are force-killed with their process
   trees — except the macOS bridge, which sudo cannot force-kill; dev-console
   prints a `network-reset.py` recovery pointer instead.
+- **Multiplexed logs (`mux`).** Steady state streams each child's entries in
+  arrival order, deferring an EntryBuffered stream's most-recent entry until its
+  next anchor or pipe EOF (atomic multi-line framing). At shutdown the printer
+  switches to collect-and-sort, emitting the trailing burst ordered by ISO
+  timestamp instead of pump-EOF order (bindreams/hole#568).
 
 ### Manual workflow
 
