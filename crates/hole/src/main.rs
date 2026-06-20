@@ -180,6 +180,11 @@ fn launch_gui(show_dashboard: bool) {
             // immediate first tick is the startup resync against the
             // bridge's actual state (#462).
             tray::spawn_proxy_state_sync(app.handle());
+            // Record the persisted "On startup" intent (#458); the status
+            // reconciler applies it (silently — no install/elevation/error modal)
+            // the first time the bridge is reachable, so a cold-boot race against
+            // the bridge's socket bind can't drop it.
+            tray::arm_startup_auto_connect(app.handle());
             tray::spawn_status_reconciler(app.handle());
             platform::on_setup(app)?;
             if show_dashboard {

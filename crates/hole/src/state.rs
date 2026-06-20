@@ -6,6 +6,7 @@ use hole_common::config_store::ConfigStore;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -21,6 +22,11 @@ pub struct AppState {
     /// `test_server` call so a slower test cannot overwrite a faster newer
     /// one. Different entries do NOT contend.
     test_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One-shot startup-connect intent (#458): armed at launch when the
+    /// `on_startup` policy says connect, consumed by the status reconciler the
+    /// first time the bridge proves reachable (so a cold-boot race against the
+    /// bridge's socket bind can't drop the connect).
+    pending_startup_connect: AtomicBool,
 }
 
 // Loading (with quarantine, logging, and the #481/#467 recovery dialog data)
@@ -38,7 +44,21 @@ impl AppState {
             app_handle,
             link: BridgeLink::new(resolve_bridge_socket_path(), self_heal),
             test_locks: tokio::sync::Mutex::new(HashMap::new()),
+            pending_startup_connect: AtomicBool::new(false),
         }
+    }
+
+    /// Arm the one-shot startup-connect intent (#458). Called once at launch
+    /// when `startup_should_connect` is true; the status reconciler applies it.
+    pub fn arm_pending_startup_connect(&self) {
+        self.pending_startup_connect.store(true, Ordering::Release);
+    }
+
+    /// Consume the startup-connect intent, returning whether it was armed.
+    /// Single-shot: a second call returns false, so the reconciler connects at
+    /// most once even if two ticks observe a reachable bridge.
+    pub fn take_pending_startup_connect(&self) -> bool {
+        self.pending_startup_connect.swap(false, Ordering::AcqRel)
     }
 
     /// Fetch (or create on first access) the per-entry async mutex used to
