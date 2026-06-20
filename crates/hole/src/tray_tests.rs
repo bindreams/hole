@@ -201,3 +201,27 @@ fn transport_after_elevation_toast_points_to_log() {
     assert!(toast.contains("gui.log"), "{toast}");
     assert!(toast.contains("connection refused"), "{toast}");
 }
+
+// should_prompt_install ===============================================================================================
+
+#[skuld::test]
+fn install_gate_skips_externally_supervised_bridge() {
+    use crate::setup::BridgeInstallStatus::*;
+    // Externally supervised (HOLE_BRIDGE_SOCKET / dev): never prompt, and the
+    // production status probe is never even consulted (it may spawn launchctl).
+    let mut probed = false;
+    assert!(!should_prompt_install(true, || {
+        probed = true;
+        NotInstalled
+    }));
+    assert!(!probed, "external bridge must short-circuit before the status probe");
+}
+
+#[skuld::test]
+fn install_gate_prompts_only_when_production_service_absent() {
+    use crate::setup::BridgeInstallStatus::*;
+    // GUI owns the bridge: prompt iff the production service is absent.
+    assert!(should_prompt_install(false, || NotInstalled));
+    assert!(!should_prompt_install(false, || Installed));
+    assert!(!should_prompt_install(false, || Running));
+}

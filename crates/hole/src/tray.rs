@@ -150,6 +150,21 @@ pub(crate) fn startup_should_connect(behavior: StartupBehavior, last_enabled: bo
     }
 }
 
+/// Install-gate decision (#569). The GUI prompts to install the production bridge
+/// service only when it OWNS the bridge lifecycle. When the bridge is externally
+/// supervised (`HOLE_BRIDGE_SOCKET` — dev-console / manual dev run) a live bridge
+/// is already reachable on that socket and the production install state (launchd
+/// plist / SCM service) is irrelevant, so the gate must never fire — otherwise
+/// dev mode demands admin to install a service over an already-running bridge.
+/// `status_fn` is lazy so the production status probe (a stat, and on macOS a
+/// `launchctl` subprocess) is skipped entirely when externally supervised.
+pub(crate) fn should_prompt_install(
+    externally_supervised: bool,
+    status_fn: impl FnOnce() -> crate::setup::BridgeInstallStatus,
+) -> bool {
+    !externally_supervised && status_fn() == crate::setup::BridgeInstallStatus::NotInstalled
+}
+
 // Menu IDs ============================================================================================================
 
 // Tray menu -----------------------------------------------------------------------------------------------------------
@@ -501,10 +516,16 @@ async fn set_proxy_enabled_inner(
 ) -> Result<ToggleOutcome, String> {
     let state = app.state::<AppState>();
 
-    // Bridge install gate: if the user is trying to enable the proxy and
-    // the bridge isn't installed yet, prompt for installation BEFORE
-    // anything else.
-    if enable && crate::setup::bridge_install_status() == crate::setup::BridgeInstallStatus::NotInstalled {
+    // Bridge install gate: when the GUI owns the bridge lifecycle and no
+    // production service is installed, prompt to install BEFORE anything else.
+    // An externally-supervised bridge (HOLE_BRIDGE_SOCKET, dev) skips this
+    // entirely — it is already reachable on its own socket (#569).
+    if enable
+        && should_prompt_install(
+            state.bridge_is_externally_supervised(),
+            crate::setup::bridge_install_status,
+        )
+    {
         match prompts {
             Prompts::Allowed => {
                 if !crate::setup::prompt_bridge_install(app.clone()).await {
