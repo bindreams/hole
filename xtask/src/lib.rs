@@ -401,7 +401,12 @@ pub fn run_version(group: Option<xtask_lib::version::Group>, check: bool, exact:
 
 pub use xtask_lib::repo_root::repo_root;
 
+#[cfg(all(test, unix))]
+pub mod test_child;
+
 #[cfg(test)]
 fn main() {
+    #[cfg(unix)]
+    test_child::maybe_run();
     skuld::run_all();
 }
