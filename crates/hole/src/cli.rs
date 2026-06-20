@@ -284,7 +284,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
         Command::Bridge {
             action: BridgeAction::Install { log_dir: Some(d), .. },
         } => Some(d.clone()),
-        _ => Some(hole_common::logging::default_log_dir()),
+        _ => Some(hole_common::logging::resolve_log_dir(None)),
     }
 }
 
@@ -404,7 +404,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             state_dir,
             ready_notify,
         } => {
-            let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
+            let log_dir = hole_common::logging::resolve_log_dir(log_dir);
             let _guard = hole_bridge::logging::init(&log_dir);
             tracing::info!("hole bridge starting");
 
