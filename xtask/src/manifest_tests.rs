@@ -796,3 +796,42 @@ fn tests_targets_run_matches_build_minus_no_run() {
         assert!(!run_cmd.contains("--no-run"), "{name:?} run must not contain --no-run");
     }
 }
+
+#[skuld::test]
+fn hole_run_is_dev_mode_build_and_launch() {
+    // #564: dev-console builds nothing. `hole.run` rebuilds galoshes WITH
+    // crash-dumps (dev-only #438 minidumps, kept out of release/--all by living
+    // in a run-only step) then launches the cascade-built dev-console binary
+    // directly (no rebuild → it cannot overwrite its own running exe).
+    let yaml = include_str!("../../build.yaml");
+    let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
+    let t = m.get("hole").expect("hole target missing");
+
+    let mut crash_env = HashMap::new();
+    crash_env.insert("HOLE_CRASH_DUMPS".to_string(), "1".to_string());
+    assert_eq!(
+        t.run,
+        vec![
+            Step::Process {
+                args: vec!["cargo".to_string(), "xtask".to_string(), "galoshes".to_string()],
+                environment: crash_env,
+            },
+            Step::Process {
+                args: vec!["target/debug/dev-console{exe}".to_string()],
+                environment: HashMap::new(),
+            },
+        ]
+    );
+
+    // #438 defense: the crash-dumps env must live ONLY on a run step, never the
+    // build cascade (which `--all` and the release installers execute).
+    for step in &t.build {
+        let environment = match step {
+            Step::Bash { environment, .. } | Step::Process { environment, .. } => environment,
+        };
+        assert!(
+            !environment.contains_key("HOLE_CRASH_DUMPS"),
+            "HOLE_CRASH_DUMPS must not appear in hole's build steps (#438)"
+        );
+    }
+}
