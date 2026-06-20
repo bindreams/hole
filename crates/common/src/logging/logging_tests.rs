@@ -529,3 +529,67 @@ fn log_crate_macros_reach_file(#[fixture(temp_dir)] dir: &Path) {
         "log crate event not bridged to tracing file:\n{contents}"
     );
 }
+
+// Tests: per-sink directive resolution ================================================================================
+
+// split_directives ----------------------------------------------------------------------------------------------------
+#[skuld::test]
+fn split_directives_trims_and_drops_blanks() {
+    assert_eq!(
+        super::split_directives("  hole=debug ,, \tshadowsocks_service=trace ,"),
+        vec!["hole=debug".to_string(), "shadowsocks_service=trace".to_string()],
+    );
+}
+
+#[skuld::test]
+fn split_directives_empty_is_empty() {
+    assert!(super::split_directives("   \t ").is_empty());
+}
+
+// resolve_sink_directives_from ----------------------------------------------------------------------------------------
+#[skuld::test]
+fn resolve_defaults_when_nothing_set() {
+    let (file, stderr) = super::resolve_sink_directives_from("hole_bridge=info", None, None, None);
+    assert_eq!(file, vec!["hole_bridge=info".to_string()]);
+    assert_eq!(stderr, file, "stderr mirrors file when HOLE_LOG_STDERR unset");
+}
+
+#[skuld::test]
+fn resolve_component_env_overrides_file_and_stderr_mirrors() {
+    // HOLE_BRIDGE_LOG=debug → file debug; stderr mirrors (back-compat).
+    let (file, stderr) = super::resolve_sink_directives_from("hole_bridge=info", Some("hole_bridge=debug"), None, None);
+    assert_eq!(file, vec!["hole_bridge=debug".to_string()]);
+    assert_eq!(stderr, file);
+}
+
+#[skuld::test]
+fn resolve_component_env_takes_precedence_over_hole_log() {
+    let (file, _stderr) =
+        super::resolve_sink_directives_from("hole_bridge=info", Some("hole_bridge=debug"), Some("hole=trace"), None);
+    assert_eq!(
+        file,
+        vec!["hole_bridge=debug".to_string()],
+        "component env wins over HOLE_LOG"
+    );
+}
+
+#[skuld::test]
+fn resolve_hole_log_used_when_no_component_env() {
+    let (file, _stderr) = super::resolve_sink_directives_from("hole=info", None, Some("debug,hole=trace"), None);
+    assert_eq!(file, vec!["debug".to_string(), "hole=trace".to_string()]);
+}
+
+#[skuld::test]
+fn resolve_stderr_diverges_when_set() {
+    let (file, stderr) =
+        super::resolve_sink_directives_from("hole=info", None, Some("debug,hole=trace"), Some("hole=info"));
+    assert_eq!(file, vec!["debug".to_string(), "hole=trace".to_string()]);
+    assert_eq!(stderr, vec!["hole=info".to_string()]);
+}
+
+#[skuld::test]
+fn resolve_blank_component_env_falls_back() {
+    // A whitespace/comma-only value must not zero out the filter.
+    let (file, _stderr) = super::resolve_sink_directives_from("hole=info", Some(" , "), None, None);
+    assert_eq!(file, vec!["hole=info".to_string()]);
+}

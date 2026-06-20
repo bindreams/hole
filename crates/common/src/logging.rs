@@ -142,6 +142,67 @@ pub fn default_log_dir() -> PathBuf {
     crate::paths::default_user_subdir("logs")
 }
 
+// Per-sink directive resolution =======================================================================================
+
+/// Split a comma-separated directive value: trim each piece, drop blanks.
+pub fn split_directives(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Resolve `(file_directives, stderr_directives)` from the environment for the
+/// native per-sink logging policy. `default` is the component's built-in file
+/// directive (`hole=info` / `hole_bridge=info`); `component_file_env` is an
+/// optional component-specific override var name (e.g. `HOLE_BRIDGE_LOG`).
+///
+/// File sink: component env, else `HOLE_LOG`, else `default`. Stderr sink:
+/// `HOLE_LOG_STDERR` if set, else mirror the file sink — so with nothing set
+/// both sinks match exactly (production parity).
+pub fn resolve_sink_directives(default: &str, component_file_env: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let component_file = component_file_env.and_then(|name| std::env::var(name).ok());
+    let hole_log = std::env::var("HOLE_LOG").ok();
+    let hole_log_stderr = std::env::var("HOLE_LOG_STDERR").ok();
+    resolve_sink_directives_from(
+        default,
+        component_file.as_deref(),
+        hole_log.as_deref(),
+        hole_log_stderr.as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_sink_directives`] — no env reads, table-testable.
+fn resolve_sink_directives_from(
+    default: &str,
+    component_file: Option<&str>,
+    hole_log: Option<&str>,
+    hole_log_stderr: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+    let file_raw = component_file
+        .and_then(nonblank)
+        .or_else(|| hole_log.and_then(nonblank))
+        .unwrap_or_else(|| default.to_string());
+    let mut file = split_directives(&file_raw);
+    if file.is_empty() {
+        file = split_directives(default);
+    }
+    let stderr = match hole_log_stderr.and_then(nonblank) {
+        Some(raw) => {
+            let s = split_directives(&raw);
+            if s.is_empty() {
+                file.clone()
+            } else {
+                s
+            }
+        }
+        None => file.clone(),
+    };
+    (file, stderr)
+}
+
 // Stdio redirect ======================================================================================================
 
 /// Which standard stream we're redirecting.
