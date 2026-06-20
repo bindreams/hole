@@ -407,7 +407,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 "cannot set lockdown intent: bridge has no state_dir to persist it",
             ))
         })?;
-        lockdown_state::set_enabled(dir, enabled)
+        lockdown_state::set_enabled(dir, enabled, None)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 

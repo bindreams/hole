@@ -12,14 +12,14 @@ fn sample() -> LockdownPfState {
 #[skuld::test]
 fn save_then_load_roundtrips() {
     let tmp = tempfile::tempdir().unwrap();
-    save(tmp.path(), &sample()).unwrap();
+    save(tmp.path(), &sample(), None).unwrap();
     assert_eq!(load(tmp.path()), Some(sample()));
 }
 
 #[skuld::test]
 fn roundtrip_preserves_nat_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
-    save(tmp.path(), &sample()).unwrap();
+    save(tmp.path(), &sample(), None).unwrap();
     assert_eq!(load(tmp.path()).unwrap().nat_snapshot, sample().nat_snapshot);
 }
 
@@ -34,7 +34,7 @@ fn load_rejects_schema_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
     let mut st = sample();
     st.version = SCHEMA_VERSION + 1;
-    save(tmp.path(), &st).unwrap();
+    save(tmp.path(), &st, None).unwrap();
     assert_eq!(load(tmp.path()), None, "future schema must be discarded");
 }
 
@@ -54,7 +54,7 @@ fn load_rejects_unknown_field() {
 #[skuld::test]
 fn clear_removes_file_and_tolerates_absence() {
     let tmp = tempfile::tempdir().unwrap();
-    save(tmp.path(), &sample()).unwrap();
+    save(tmp.path(), &sample(), None).unwrap();
     assert!(tmp.path().join(STATE_FILE_NAME).exists());
     clear(tmp.path()).unwrap();
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());

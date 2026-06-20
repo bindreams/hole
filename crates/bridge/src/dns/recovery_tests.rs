@@ -18,7 +18,7 @@ fn recover_clears_state_file_after_restore() {
         // commands get invoked (safe in CI).
         adapters: Vec::new(),
     };
-    dns_state::save(dir.path(), &state).unwrap();
+    dns_state::save(dir.path(), &state, None).unwrap();
     assert!(dir.path().join(dns_state::STATE_FILE_NAME).exists());
     recover_dns_config(dir.path());
     assert!(!dir.path().join(dns_state::STATE_FILE_NAME).exists());
@@ -74,7 +74,7 @@ fn recover_tolerates_legacy_state_file_with_tun_entry() {
             v6: DnsPrior::None,
         }],
     };
-    dns_state::save(dir.path(), &legacy_state).unwrap();
+    dns_state::save(dir.path(), &legacy_state, None).unwrap();
 
     // Should not panic; should clear the file regardless of whether the
     // TUN restore succeeded (it won't — there's no TUN adapter to

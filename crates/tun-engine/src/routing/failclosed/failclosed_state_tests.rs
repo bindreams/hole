@@ -8,7 +8,7 @@ fn save_then_load_roundtrips() {
         pf_token: "1234567890".into(),
         pf_was_enabled: true,
     };
-    save(tmp.path(), &st).unwrap();
+    save(tmp.path(), &st, None).unwrap();
     assert_eq!(load(tmp.path()), Some(st));
 }
 
@@ -28,7 +28,7 @@ fn load_rejects_schema_mismatch() {
     };
     // `save` writes whatever version the struct carries, so this fabricates a
     // future-version file on disk.
-    save(tmp.path(), &st).unwrap();
+    save(tmp.path(), &st, None).unwrap();
     assert_eq!(load(tmp.path()), None, "future schema must be discarded");
 }
 
@@ -40,7 +40,7 @@ fn clear_removes_file_and_tolerates_absence() {
         pf_token: "9".into(),
         pf_was_enabled: false,
     };
-    save(tmp.path(), &st).unwrap();
+    save(tmp.path(), &st, None).unwrap();
     assert!(tmp.path().join(STATE_FILE_NAME).exists());
     clear(tmp.path()).unwrap();
     assert!(!tmp.path().join(STATE_FILE_NAME).exists());

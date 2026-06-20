@@ -24,7 +24,7 @@ fn sample_ipv6() -> RouteState {
 fn save_then_load_roundtrip_ipv4() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv4();
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -33,7 +33,7 @@ fn save_then_load_roundtrip_ipv4() {
 fn save_then_load_roundtrip_ipv6() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv6();
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -87,7 +87,7 @@ fn clear_missing_is_ok() {
 #[skuld::test]
 fn clear_existing_removes_file() {
     let dir = tempfile::tempdir().unwrap();
-    save(dir.path(), &sample_ipv4()).unwrap();
+    save(dir.path(), &sample_ipv4(), None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
     clear(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
@@ -97,6 +97,6 @@ fn clear_existing_removes_file() {
 fn save_creates_missing_dir() {
     let parent = tempfile::tempdir().unwrap();
     let nested = parent.path().join("a").join("b").join("c");
-    save(&nested, &sample_ipv4()).unwrap();
+    save(&nested, &sample_ipv4(), None).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }

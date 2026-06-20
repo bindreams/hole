@@ -20,7 +20,7 @@ use tun_engine::routing::failclosed::lockdown_state;
 #[skuld::test]
 fn unlock_failing_disengage_does_not_flip_intent() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true).unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
     let result = unlock_with(dir.path(), || {
         Err(std::io::Error::other("cannot disengage / not elevated"))
@@ -36,7 +36,7 @@ fn unlock_failing_disengage_does_not_flip_intent() {
 #[skuld::test]
 fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
-    lockdown_state::set_enabled(dir.path(), true).unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
     let result = unlock_with(dir.path(), || Ok(()));
 

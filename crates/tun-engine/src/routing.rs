@@ -467,7 +467,7 @@ impl Routing for SystemRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        state::save(&self.state_dir, &persisted)
+        state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
         // Install the routes. On failure, defensively tear down whatever

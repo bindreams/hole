@@ -259,7 +259,7 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        route_state::save(&self.state_dir, &persisted)
+        route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
         if self.state.fail_install.load(Ordering::SeqCst) {
@@ -428,7 +428,7 @@ fn new_manager_with_lockdown(
     dir: tempfile::TempDir,
     enabled: bool,
 ) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
-    lockdown_state::set_enabled(dir.path(), enabled).unwrap();
+    lockdown_state::set_enabled(dir.path(), enabled, None).unwrap();
     let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
     (pm, dir)
 }

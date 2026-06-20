@@ -265,6 +265,7 @@ async fn spawn_plugin_runner_at(
                     pid,
                     start_time_unix_ms: start_time,
                 },
+                None,
             ) {
                 tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
             }

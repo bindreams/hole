@@ -7984,6 +7984,7 @@ dependencies = [
  "tracing",
  "tun",
  "tun-engine-macros",
+ "util",
  "windows 0.62.2",
  "wintun-bindings",
 ]

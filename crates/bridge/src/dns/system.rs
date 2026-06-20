@@ -303,7 +303,7 @@ async fn apply_windows(
             advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
-        if let Err(e) = crate::dns_state::save(dir, &state) {
+        if let Err(e) = crate::dns_state::save(dir, &state, None) {
             tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
         }
     }
@@ -432,7 +432,7 @@ async fn apply_macos(
             advertised: advertise_ips.clone(),
             adapters: captured.clone(),
         };
-        if let Err(e) = crate::dns_state::save(dir, &state) {
+        if let Err(e) = crate::dns_state::save(dir, &state, None) {
             tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
         }
     }

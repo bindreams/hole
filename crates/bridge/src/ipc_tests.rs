@@ -180,7 +180,7 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        route_state::save(&self.state_dir, &persisted)
+        route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
         Ok(MockRoutes {
             state_dir: self.state_dir.clone(),

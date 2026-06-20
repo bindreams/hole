@@ -197,6 +197,7 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
             pf_token: token.clone(),
             pf_was_enabled: was_enabled,
         },
+        None,
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
@@ -290,6 +291,7 @@ fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingE
             main_snapshot,
             nat_snapshot: nat_snapshot.clone(),
         },
+        None,
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist lockdown-pf-state: {e}")))?;
     Ok(nat_snapshot)
@@ -338,7 +340,7 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
             };
-            if let Err(e) = lockdown_state::save(state_dir, &fresh) {
+            if let Err(e) = lockdown_state::save(state_dir, &fresh, None) {
                 if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
                     tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
                 }

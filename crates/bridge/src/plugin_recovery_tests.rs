@@ -82,6 +82,7 @@ fn recover_plugins_kills_tracked_process() {
             pid,
             start_time_unix_ms: start_ms,
         },
+        None,
     )
     .unwrap();
 
@@ -122,6 +123,7 @@ fn recover_plugins_skips_reused_pid() {
             pid,
             start_time_unix_ms: 1, // epoch start — definitely wrong
         },
+        None,
     )
     .unwrap();
 
