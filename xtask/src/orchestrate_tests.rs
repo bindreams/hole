@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use clap::Parser;
 
 use crate::manifest::*;
@@ -618,4 +620,45 @@ fn cli_run_requires_target_positional() {
         "expected MissingRequiredArgument, got: {:?}",
         err.kind()
     );
+}
+
+// ===== {exe} token + relative-program resolution (run_step, #564) ====================================================
+
+#[skuld::test]
+fn substitute_exe_maps_token_to_host_suffix() {
+    let out = substitute_exe("target/debug/dev-console{exe}");
+    if cfg!(windows) {
+        assert_eq!(out, "target/debug/dev-console.exe");
+    } else {
+        assert_eq!(out, "target/debug/dev-console");
+    }
+    assert_eq!(substitute_exe("cargo"), "cargo"); // no token → unchanged
+}
+
+#[skuld::test]
+fn resolve_program_absolutizes_relative_paths_against_repo_root() {
+    let root = Path::new(if cfg!(windows) { r"C:\repo" } else { "/repo" });
+    // Relative path WITH separators → joined to repo_root. `Command::current_dir`
+    // does not affect relative *program* resolution (#564).
+    assert_eq!(
+        resolve_program("target/debug/dev-console", root),
+        root.join("target/debug/dev-console")
+    );
+    // Bare command name (no separator) → left for PATH lookup.
+    assert_eq!(resolve_program("cargo", root), PathBuf::from("cargo"));
+    // Absolute path → unchanged.
+    let abs = if cfg!(windows) { r"C:\bin\tool.exe" } else { "/bin/tool" };
+    assert_eq!(resolve_program(abs, root), PathBuf::from(abs));
+}
+
+#[skuld::test]
+fn run_step_bash_substitutes_exe_token() {
+    // Pins that `{exe}` is resolved inside a bash command, not just process args.
+    let dir = tempfile::tempdir().unwrap();
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let step = Step::Bash {
+        command: format!(r#"[ "dev-console{{exe}}" = "dev-console{suffix}" ]"#),
+        environment: Default::default(),
+    };
+    run_step(&step, dir.path()).unwrap();
 }

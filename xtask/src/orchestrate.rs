@@ -16,9 +16,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 #[cfg(windows)]
 use std::io;
-use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -284,6 +282,40 @@ fn relocate_self_windows() -> Result<()> {
 
 // ===== Step execution ================================================================================================
 
+/// Host executable suffix: `.exe` on Windows, empty elsewhere.
+fn exe_suffix() -> &'static str {
+    if cfg!(windows) {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// Substitute the reserved `{exe}` token with the host executable suffix, so a
+/// `build.yaml` step can name a built binary cross-platform — e.g.
+/// `target/debug/dev-console{exe}` → `dev-console.exe` on Windows,
+/// `dev-console` elsewhere.
+pub(crate) fn substitute_exe(s: &str) -> String {
+    s.replace("{exe}", exe_suffix())
+}
+
+/// Resolve a `process:` step's program. A bare command name (no path separator)
+/// is left for PATH lookup; a relative path WITH separators is resolved against
+/// `repo_root` (the step's working directory). This is required because
+/// `Command::current_dir` does NOT affect how a relative *program* path is
+/// resolved — on Windows it resolves against the parent process's cwd (which,
+/// for `cargo xtask`, is wherever the user invoked it). See the
+/// `std::process::Command::current_dir` docs. (#564)
+pub(crate) fn resolve_program(program: &str, repo_root: &Path) -> PathBuf {
+    let has_sep = program.contains('/') || program.contains('\\');
+    let p = Path::new(program);
+    if has_sep && p.is_relative() {
+        repo_root.join(p)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// Execute one [`Step`] from the given working directory.
 ///
 /// CWD is always `repo_root`. The step inherits stdio. On non-zero exit this
@@ -295,17 +327,22 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
             let mut cmd = Command::new(resolve_bash()?);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
-            cmd.arg("-e").arg("-c").arg(command).current_dir(repo_root);
+            cmd.arg("-e")
+                .arg("-c")
+                .arg(substitute_exe(command))
+                .current_dir(repo_root);
             for (k, v) in environment {
                 cmd.env(k, v);
             }
             run(cmd, &format!("bash step: {command}"))
         }
         Step::Process { args, environment } => {
+            let args: Vec<String> = args.iter().map(|a| substitute_exe(a)).collect();
             let (program, rest) = args
                 .split_first()
                 .ok_or_else(|| anyhow!("process step has empty args list"))?;
-            let mut cmd = Command::new(program);
+            let program = resolve_program(program, repo_root);
+            let mut cmd = Command::new(&program);
             cmd.args(rest).current_dir(repo_root);
             for (k, v) in environment {
                 cmd.env(k, v);
