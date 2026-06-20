@@ -18,62 +18,10 @@ use serde::{Deserialize, Deserializer};
 
 // ===== Os / Arch / Platform ==========================================================================================
 
-/// Operating system component of a [`Platform`].
-///
-/// Docker / GOOS-style identifiers: matches the project's release-artifact
-/// naming convention (`hole-<version>-windows-amd64.msi`) and the `matrix.os`
-/// dimension already used in `.github/workflows/ci.yaml`.
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum Os {
-    Windows,
-    Darwin,
-    Linux,
-}
-
-impl Os {
-    /// The host OS, or `None` if running on a platform the manifest doesn't
-    /// know about (FreeBSD, illumos, etc.).
-    pub fn host() -> Option<Self> {
-        if cfg!(target_os = "windows") {
-            Some(Os::Windows)
-        } else if cfg!(target_os = "macos") {
-            Some(Os::Darwin)
-        } else if cfg!(target_os = "linux") {
-            Some(Os::Linux)
-        } else {
-            None
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Os::Windows => "windows",
-            Os::Darwin => "darwin",
-            Os::Linux => "linux",
-        }
-    }
-}
-
-impl fmt::Display for Os {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Os {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "windows" => Ok(Os::Windows),
-            "darwin" => Ok(Os::Darwin),
-            "linux" => Ok(Os::Linux),
-            other => Err(anyhow!(
-                "unknown os {other:?} (expected one of: windows, darwin, linux)"
-            )),
-        }
-    }
-}
+// `Os` lives in `xtask-lib` (the single source of truth shared with the bridge
+// cutover + build.rs, without xtask's clap/glob/ureq machinery). Re-exported so
+// `manifest::Os` keeps resolving for every xtask call site.
+pub use xtask_lib::bindir::Os;
 
 /// CPU architecture component of a [`Platform`].
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Deserialize)]

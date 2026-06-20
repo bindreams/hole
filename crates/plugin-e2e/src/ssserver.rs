@@ -223,8 +223,21 @@ async fn spawn_ss_with_plugin(
         };
         let chain = tokio::spawn(async move { runner.run(env).await });
 
-        match ready_rx.await {
-            Ok(Ok(chain_ready)) => {
+        // Bound readiness: a wedged server plugin chain must FAIL LOUDLY, not
+        // hang the fixture forever — a fixture hang yields no captured output and
+        // wedges the whole serial group (the #197/#518 lesson). The chain becomes
+        // ready in seconds; this generous bound only catches a genuine never-ready.
+        // Class-2 subprocess failure-bound surfaced to a human, not intra-process sync.
+        match tokio::time::timeout(std::time::Duration::from_secs(60), ready_rx).await {
+            Err(_elapsed) => {
+                // Don't `chain.await` here (unlike the Fatal/recv arms below): the
+                // chain is wedged — that's why readiness timed out — so awaiting it
+                // could re-hang. `cancel` signals it; BinaryPlugin's kill_on_drop
+                // reaps the subprocess when the panicking process tears down.
+                cancel.cancel();
+                panic!("server plugin did not become ready within 60s (attempt {attempt})");
+            }
+            Ok(Ok(Ok(chain_ready))) => {
                 return (
                     chain_ready.listen,
                     PluginServer {
@@ -234,7 +247,7 @@ async fn spawn_ss_with_plugin(
                     },
                 );
             }
-            Ok(Err(StartError::BindConflict { addr, errno })) => {
+            Ok(Ok(Err(StartError::BindConflict { addr, errno }))) => {
                 // Adaptive milestone logging (mirrors port_alloc) so a stuck loop
                 // is visible without flooding the happy path.
                 if attempt == 1 || attempt.is_multiple_of(10) {
@@ -249,12 +262,12 @@ async fn spawn_ss_with_plugin(
                 let _ = chain.await;
                 // retry with a fresh public_port
             }
-            Ok(Err(StartError::Fatal { detail, errno })) => {
+            Ok(Ok(Err(StartError::Fatal { detail, errno }))) => {
                 cancel.cancel();
                 let _ = chain.await;
                 panic!("server plugin failed to start: {detail} (errno={errno:?})");
             }
-            Err(_recv) => {
+            Ok(Err(_recv)) => {
                 cancel.cancel();
                 let outcome = chain.await;
                 panic!("server plugin exited before readiness: {outcome:?}");

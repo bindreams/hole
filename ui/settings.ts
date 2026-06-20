@@ -9,7 +9,6 @@ const DNS_DEFAULT: DnsConfig = {
   enabled: true,
   servers: ["1.1.1.1", "1.0.0.1"],
   protocol: "https",
-  intercept_udp53: true,
 };
 
 // Theme management ====================================================================================================
@@ -393,8 +392,8 @@ export function initSettings() {
 }
 
 /**
- * Wire the DNS forwarder controls (enable + intercept toggles and the
- * protocol dropdown). All three persist through `patchDns` because they
+ * Wire the DNS forwarder controls (enable toggle and the protocol
+ * dropdown). Both persist through `patchDns` because they
  * live in the nested `config.dns` object, not top-level config keys. The
  * sub-setting group (`#dns-nested`) mirrors the proxy-server muting
  * pattern: when the enable toggle is off, the nested controls are
@@ -404,7 +403,6 @@ function wireDnsControls() {
   // wireToggle/wireDropdown guard `config` before any visual change,
   // covering the guards the hand-wired versions carried.
   wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));
-  wireToggle("toggle-dns-intercept", (on) => patchDns({ intercept_udp53: on }));
 
   // The protocol dropdown patches config.dns rather than a top-level key;
   // the apply callback absorbs that difference.
@@ -441,7 +439,6 @@ export function renderSettings() {
   // DNS forwarder state.
   const dns = currentDns();
   setToggleState(document.getElementById("toggle-dns-enabled")!, dns.enabled);
-  setToggleState(document.getElementById("toggle-dns-intercept")!, dns.intercept_udp53);
   syncDropdown("select-dns-protocol", "menu-dns-protocol", dns.protocol);
   updateDnsMuting();
 

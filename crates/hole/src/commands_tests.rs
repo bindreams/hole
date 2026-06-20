@@ -828,3 +828,159 @@ fn apply_import_summary_records_dedup_counts() {
         "expected deduped=2 in summary:\n{captured}"
     );
 }
+
+// evaluate_filter (Filters "Test" box) ================================================================================
+
+use hole_common::config::{FilterAction, FilterRule, MatchType};
+
+fn frule(addr: &str, kind: MatchType, action: FilterAction) -> FilterRule {
+    FilterRule {
+        address: addr.to_string(),
+        matching: kind,
+        action,
+    }
+}
+
+/// The single locked default the UI injects at index 0.
+fn default_rule() -> FilterRule {
+    frule("*", MatchType::Wildcard, FilterAction::Proxy)
+}
+
+#[skuld::test]
+fn evaluate_filter_question_mark_wildcard_matches_single_char() {
+    // Divergence #1: JS escaped '?'; the engine maps it to single-char '.'.
+    let filters = vec![
+        default_rule(),
+        frule("ex?mple.com", MatchType::Wildcard, FilterAction::Block),
+    ];
+    let r = evaluate_filter("example.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Block);
+    assert_eq!(r.rule_index, Some(1));
+    assert_eq!(r.matched_address.as_deref(), Some("ex?mple.com"));
+}
+
+#[skuld::test]
+fn evaluate_filter_canonicalizes_case_trailing_dot_and_idna() {
+    // Divergence #2.
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::WithSubdomains, FilterAction::Block),
+    ];
+    assert_eq!(
+        evaluate_filter("WWW.Example.com".into(), filters.clone()).action,
+        FilterAction::Block
+    );
+    assert_eq!(
+        evaluate_filter("example.com.".into(), filters.clone()).action,
+        FilterAction::Block
+    );
+
+    // Unicode label vs its punycode rule form.
+    let puny = vec![
+        default_rule(),
+        frule("xn--r8jz45g.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    assert_eq!(evaluate_filter("例え.com".into(), puny).action, FilterAction::Block);
+}
+
+#[skuld::test]
+fn evaluate_filter_ipv6_subnet_and_exact() {
+    // Divergence #3.
+    let subnet = vec![
+        default_rule(),
+        frule("2001:db8::/32", MatchType::Subnet, FilterAction::Block),
+    ];
+    assert_eq!(
+        evaluate_filter("2001:db8::1".into(), subnet).action,
+        FilterAction::Block
+    );
+
+    let exact = vec![
+        default_rule(),
+        frule("2001:db8::1", MatchType::Exactly, FilterAction::Bypass),
+    ];
+    let r = evaluate_filter("2001:db8::1".into(), exact);
+    assert_eq!(r.action, FilterAction::Bypass);
+    assert_eq!(r.rule_index, Some(1));
+}
+
+#[skuld::test]
+fn evaluate_filter_domain_rule_does_not_match_raw_ip() {
+    // Divergence #4: a domain rule must not fire on a typed IP.
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::WithSubdomains, FilterAction::Block),
+    ];
+    let r = evaluate_filter("1.2.3.4".into(), filters);
+    assert_eq!(
+        r.action,
+        FilterAction::Proxy,
+        "raw IP matches no domain rule -> terminal fallback"
+    );
+    assert_eq!(r.rule_index, None);
+    assert_eq!(r.matched_address, None);
+}
+
+#[skuld::test]
+fn evaluate_filter_drops_invalid_rules_and_reports_original_index() {
+    // Divergence #5 + index mapping: an invalid with_subdomains-on-IP rule
+    // (#1) is dropped; the real winner is the user's rule #2.
+    let filters = vec![
+        default_rule(),
+        frule("1.2.3.4", MatchType::WithSubdomains, FilterAction::Bypass), // invalid -> dropped
+        frule("blocked.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("blocked.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Block);
+    assert_eq!(
+        r.rule_index,
+        Some(2),
+        "index must skip the dropped rule, naming the user's row"
+    );
+    assert_eq!(r.matched_address.as_deref(), Some("blocked.com"));
+}
+
+#[skuld::test]
+fn evaluate_filter_default_rule_for_unmatched_domain() {
+    let filters = vec![
+        default_rule(),
+        frule("example.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("other.com".into(), filters);
+    assert_eq!(r.action, FilterAction::Proxy);
+    assert_eq!(r.rule_index, Some(0));
+    assert_eq!(r.matched_address.as_deref(), Some("*"));
+}
+
+#[skuld::test]
+fn evaluate_filter_trims_whitespace_and_tolerates_empty() {
+    // Whitespace trims to a real domain; an empty token does not panic and
+    // matches the wildcard default. The frontend short-circuits empty input
+    // before invoking, but the command must stay total.
+    let filters = vec![default_rule()];
+    let trimmed = evaluate_filter("  example.com  ".into(), filters.clone());
+    assert_eq!(trimmed.action, FilterAction::Proxy);
+    assert_eq!(trimmed.rule_index, Some(0));
+
+    let empty = evaluate_filter("".into(), filters);
+    assert_eq!(empty.action, FilterAction::Proxy);
+    assert_eq!(
+        empty.rule_index,
+        Some(0),
+        "empty token matches the '*' wildcard default"
+    );
+}
+
+/// Lock the wire shape the JS deserializes: snake_case fields, lowercase action.
+#[skuld::test]
+fn evaluate_filter_serializes_with_expected_wire_shape() {
+    let filters = vec![
+        default_rule(),
+        frule("blocked.com", MatchType::Exactly, FilterAction::Block),
+    ];
+    let r = evaluate_filter("blocked.com".into(), filters);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["action"], "block");
+    assert_eq!(json["rule_index"], 1);
+    assert_eq!(json["matched_address"], "blocked.com");
+}

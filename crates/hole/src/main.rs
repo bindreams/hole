@@ -146,6 +146,7 @@ fn launch_gui(show_dashboard: bool) {
             commands::test_server,
             commands::mark_validated_by_proxy_start,
             commands::reload_proxy_filters,
+            commands::evaluate_filter,
             tray::start_proxy,
             tray::stop_proxy,
             tray::cancel_proxy,

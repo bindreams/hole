@@ -35,7 +35,7 @@ function makeServerWithValidation(validation: Server["validation"]): Config {
     proxy_http: false,
     on_startup: "disconnected",
     theme: "dark",
-    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", intercept_udp53: true },
+    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
     diagnostic_plugin_tap: false,
   };
 }

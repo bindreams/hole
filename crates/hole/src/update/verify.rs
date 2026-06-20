@@ -1,120 +1,30 @@
 // Asset integrity and authenticity verification.
+//
+// The pure offline core (minisign + SHA-256 + manifest parsing) lives in
+// `hole_common::verify` so the privileged bridge can re-verify the same payload
+// without depending on the GUI crate. This module is the GUI's network layer:
+// download the sidecars so both the GUI's local verify and the bridge's
+// re-verify can run the shared offline core against the same manifest.
 
-use std::path::Path;
-
-use sha2::Digest;
+use hole_common::verify::VerifyError;
 
 use super::error::UpdateError;
-
-/// Embedded minisign public key for release verification.
-pub(crate) const MINISIGN_PUBLIC_KEY: &str = "RWR/A9sHYSwUIYkFXgNc9NcHSP+aoWCHusziW4Kwl3vsbApsqy4Wte1Z";
 
 /// Maximum size for sidecar file downloads (1 MiB).
 const SIDECAR_SIZE_LIMIT: u64 = 1024 * 1024;
 
 // Public API ==========================================================================================================
 
-/// Verify a downloaded asset's integrity (SHA-256) and authenticity (minisign).
-///
-/// Downloads the release-level `SHA256SUMS` manifest and its minisign signature,
-/// verifies the signature first (authenticity), then looks up and verifies the
-/// asset's hash (integrity). Both checks must pass.
-///
-/// This is a blocking function — call from `spawn_blocking`.
-pub fn verify_asset(
-    asset_path: &Path,
-    asset_name: &str,
-    sha256sums_url: &str,
-    sha256sums_minisig_url: &str,
-) -> Result<(), UpdateError> {
+/// Download the `SHA256SUMS` manifest and its minisign signature, returning their
+/// texts. The caller passes them to BOTH the local verify and the bridge's
+/// `ApplyUpdate` request, so the bridge can re-verify the same payload offline.
+pub fn fetch_manifest(sha256sums_url: &str, sha256sums_minisig_url: &str) -> Result<(String, String), UpdateError> {
     let sha256sums = download_text(sha256sums_url)?;
     let minisig = download_text(sha256sums_minisig_url)?;
-
-    // Verify signature on the manifest first — if tampered, no point checking hashes.
-    verify_minisig_data(sha256sums.as_bytes(), &minisig, MINISIGN_PUBLIC_KEY)?;
-
-    // Look up this asset's expected hash and verify.
-    let expected_hex = find_hash_in_sha256sums(&sha256sums, asset_name)?;
-    verify_sha256_hash(asset_path, expected_hex)?;
-
-    Ok(())
-}
-
-// SHA-256 verification ================================================================================================
-
-/// Verify a file's SHA-256 hash against an expected hex digest. Pure function (no network).
-pub(crate) fn verify_sha256_hash(asset_path: &Path, expected_hex: &str) -> Result<(), UpdateError> {
-    let actual_hex = sha256_file(asset_path)?;
-    if actual_hex != expected_hex.to_ascii_lowercase() {
-        return Err(UpdateError::HashMismatch {
-            expected: expected_hex.to_string(),
-            actual: actual_hex,
-        });
-    }
-    Ok(())
-}
-
-// Minisign verification ===============================================================================================
-
-/// Verify a minisign signature against data and a public key. Pure function (no network).
-pub(crate) fn verify_minisig_data(data: &[u8], signature_text: &str, public_key_str: &str) -> Result<(), UpdateError> {
-    use minisign_verify::{PublicKey, Signature};
-
-    let pk = PublicKey::from_base64(public_key_str)
-        .map_err(|e| UpdateError::SignatureInvalid(format!("invalid public key: {e}")))?;
-    let sig = Signature::decode(signature_text)
-        .map_err(|e| UpdateError::SignatureInvalid(format!("invalid signature file: {e}")))?;
-
-    pk.verify(data, &sig, false)
-        .map_err(|e| UpdateError::SignatureInvalid(e.to_string()))
-}
-
-// SHA256SUMS parsing ==================================================================================================
-
-/// Look up an asset's hash in a SHA256SUMS manifest.
-///
-/// Expects `sha256sum`-compatible format: `<64-hex-chars>  <filename>` per line.
-/// Matches `asset_name` exactly against the filename field.
-pub(crate) fn find_hash_in_sha256sums<'a>(content: &'a str, asset_name: &str) -> Result<&'a str, UpdateError> {
-    for line in content.lines() {
-        let line = line.trim_end_matches('\r');
-        // sha256sum format: "<hash>  <filename>" (two-space separator).
-        // split_whitespace handles both single and double spaces.
-        let mut parts = line.split_whitespace();
-        let Some(hash) = parts.next() else { continue };
-        let Some(name) = parts.next() else { continue };
-
-        if name == asset_name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(hash);
-        }
-    }
-
-    Err(UpdateError::AssetNotInManifest(asset_name.to_string()))
+    Ok((sha256sums, minisig))
 }
 
 // Helpers =============================================================================================================
-
-/// Compute the SHA-256 hex digest of a file by streaming through the hasher.
-pub(crate) fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_encode(&hasher.finalize()))
-}
-
-/// Encode bytes as lowercase hex.
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// Download a small text file from a URL, with a size limit.
 fn download_text(url: &str) -> Result<String, UpdateError> {
@@ -127,6 +37,13 @@ fn download_text(url: &str) -> Result<String, UpdateError> {
     Ok(text)
 }
 
-#[cfg(test)]
-#[path = "verify_tests.rs"]
-mod verify_tests;
+impl From<VerifyError> for UpdateError {
+    fn from(e: VerifyError) -> Self {
+        match e {
+            VerifyError::SignatureInvalid(m) => UpdateError::SignatureInvalid(m),
+            VerifyError::HashMismatch { expected, actual } => UpdateError::HashMismatch { expected, actual },
+            VerifyError::AssetNotInManifest(name) => UpdateError::AssetNotInManifest(name),
+            VerifyError::Io(e) => UpdateError::Io(e),
+        }
+    }
+}
