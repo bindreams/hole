@@ -1,7 +1,8 @@
 // Settings section: toggle switches, custom dropdowns, theme switching, proxy + DNS forwarder config.
 
-import { config, saveConfig } from "./main";
+import { config, getAutostart, saveConfig, setAutostart } from "./main";
 import { menuKeydown } from "./menu-keys";
+import { showToast } from "./toast";
 import type { DnsConfig, DnsProtocol } from "./types";
 
 const DNS_DEFAULT: DnsConfig = {
@@ -95,6 +96,69 @@ function wireToggle(id: string, apply: (on: boolean) => void) {
     setToggleState(el, on);
     apply(on);
   });
+}
+
+// OS autostart toggle =================================================================================================
+
+const AUTOSTART_TOGGLE_ID = "toggle-start-on-login";
+
+/**
+ * Flip the "Start Hole on login" toggle to `target` OS autostart state (#457).
+ * The OS is the single source of truth: optimistic flip, `set_autostart` through
+ * the same `crate::autostart` seam the tray uses, then commit the state the
+ * backend reports; on failure revert and toast the PII-free reason.
+ */
+export async function applyAutostart(target: boolean): Promise<void> {
+  const el = document.getElementById(AUTOSTART_TOGGLE_ID);
+  if (!el) return;
+  const previous = el.classList.contains("on");
+  setToggleState(el, target); // optimistic
+  try {
+    setToggleState(el, await setAutostart(target));
+  } catch (err) {
+    setToggleState(el, previous); // revert to the true prior state, not an assumed !target
+    showToast(`${err}`, "error");
+  }
+}
+
+/** Wire the toggle click to flip OS autostart. */
+function wireAutostartToggle() {
+  const el = document.getElementById(AUTOSTART_TOGGLE_ID)!;
+  el.addEventListener("click", () => void applyAutostart(!el.classList.contains("on")));
+}
+
+/** Render the toggle from live OS autostart state; unreadable renders unchecked (mirrors the tray). */
+export async function syncAutostartToggle(): Promise<void> {
+  const el = document.getElementById(AUTOSTART_TOGGLE_ID);
+  if (!el) return;
+  try {
+    setToggleState(el, await getAutostart());
+  } catch (err) {
+    setToggleState(el, false);
+    console.error(`getAutostart failed: ${err}`);
+  }
+}
+
+// Re-read live OS autostart state when the dashboard gains focus/visibility. The
+// handler is stashed on `window` so a repeat initSettings() replaces it instead of
+// stacking (prod runs initSettings once per webview; tests share one jsdom).
+declare global {
+  interface Window {
+    __holeAutostartResync?: () => void;
+  }
+}
+
+function installAutostartResync() {
+  if (window.__holeAutostartResync) {
+    window.removeEventListener("focus", window.__holeAutostartResync);
+    document.removeEventListener("visibilitychange", window.__holeAutostartResync);
+  }
+  const resync = () => {
+    if (document.visibilityState !== "hidden") void syncAutostartToggle();
+  };
+  window.__holeAutostartResync = resync;
+  window.addEventListener("focus", resync);
+  document.addEventListener("visibilitychange", resync);
 }
 
 // Dropdown component ==================================================================================================
@@ -282,10 +346,7 @@ function handleClickOutside() {
  */
 export function initSettings() {
   // Toggles.
-  wireToggle("toggle-start-on-login", (on) => {
-    config!.start_on_login = on;
-    saveConfig();
-  });
+  wireAutostartToggle();
   wireToggle("toggle-proxy-server", (on) => {
     config!.proxy_server_enabled = on;
     updateProxyMuting();
@@ -321,6 +382,11 @@ export function initSettings() {
   // DNS forwarder controls.
   wireDnsControls();
 
+  // Autostart reflects live OS state — read once, then re-read on focus/visibility
+  // so a tray- or System-Settings-side change shows up (user-driven events, not a timer).
+  void syncAutostartToggle();
+  installAutostartResync();
+
   // Close dropdowns on click outside.
   handleClickOutside();
 }
@@ -352,8 +418,7 @@ function wireDnsControls() {
 export function renderSettings() {
   if (!config) return;
 
-  // Toggles.
-  setToggleState(document.getElementById("toggle-start-on-login")!, !!config.start_on_login);
+  // Toggles. (The login toggle is OS-backed — see syncAutostartToggle, not config.)
   setToggleState(document.getElementById("toggle-proxy-server")!, !!config.proxy_server_enabled);
   setToggleState(document.getElementById("toggle-socks5")!, !!config.proxy_socks5);
   setToggleState(document.getElementById("toggle-http")!, !!config.proxy_http);

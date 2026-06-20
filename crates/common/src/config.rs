@@ -155,7 +155,6 @@ pub struct AppConfig {
     pub elevation_prompt_shown: bool,
 
     pub filters: Vec<FilterRule>,
-    pub start_on_login: bool,
     pub on_startup: StartupBehavior,
     pub theme: Theme,
     /// Master switch for the user-facing local proxy listeners
@@ -197,7 +196,6 @@ impl Default for AppConfig {
             enabled: false,
             elevation_prompt_shown: false,
             filters: Vec::new(),
-            start_on_login: false,
             on_startup: StartupBehavior::default(),
             theme: Theme::default(),
             proxy_server_enabled: true,

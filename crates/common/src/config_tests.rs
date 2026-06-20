@@ -411,13 +411,22 @@ fn deserialize_old_config_without_new_fields_uses_defaults() {
     let json = r#"{"servers": [], "local_port": 4073, "enabled": false}"#;
     let config: AppConfig = serde_json::from_str(json).unwrap();
     assert!(config.filters.is_empty());
-    assert!(!config.start_on_login);
     assert_eq!(config.on_startup, StartupBehavior::RestoreLastState);
     assert_eq!(config.theme, Theme::Dark);
     assert!(config.proxy_server_enabled);
     assert!(config.proxy_socks5);
     assert!(!config.proxy_http);
     assert_eq!(config.local_port_http, 4074);
+}
+
+#[skuld::test]
+fn deserialize_ignores_removed_start_on_login_key() {
+    // An on-disk config written by an older build still carries start_on_login.
+    // AppConfig has no deny_unknown_fields, so the now-unknown key is ignored
+    // rather than failing the load (#457 removed the field).
+    let json = r#"{"servers": [], "local_port": 4073, "enabled": false, "start_on_login": true}"#;
+    let config: AppConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.local_port, 4073);
 }
 
 #[skuld::test]
@@ -429,7 +438,6 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
             matching: MatchType::Wildcard,
             action: FilterAction::Block,
         }],
-        start_on_login: true,
         on_startup: StartupBehavior::AlwaysConnect,
         theme: Theme::Light,
         proxy_server_enabled: false,
@@ -442,7 +450,6 @@ fn new_config_fields_roundtrip(#[fixture(temp_dir)] dir: &Path) {
     config.save(&path).unwrap();
     let loaded = load(&path);
     assert_eq!(config.filters, loaded.filters);
-    assert_eq!(config.start_on_login, loaded.start_on_login);
     assert_eq!(config.on_startup, loaded.on_startup);
     assert_eq!(config.theme, loaded.theme);
     assert_eq!(config.proxy_server_enabled, loaded.proxy_server_enabled);

@@ -74,7 +74,6 @@ export interface Config {
   filters: FilterRule[];
   local_port: number;
   local_port_http: number;
-  start_on_login: boolean;
   proxy_server_enabled: boolean;
   proxy_socks5: boolean;
   proxy_http: boolean;
@@ -101,7 +100,6 @@ export interface UiSettings {
   selected_server: string | null;
   local_port: number;
   filters: FilterRule[];
-  start_on_login: boolean;
   on_startup: string;
   theme: string;
   proxy_server_enabled: boolean;

@@ -21,16 +21,25 @@ vi.stubGlobal(
 const mainMock: {
   config: Record<string, unknown> | null;
   saveConfig: ReturnType<typeof vi.fn<(...args: unknown[]) => void>>;
+  getAutostart: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
+  setAutostart: ReturnType<typeof vi.fn<(enabled: boolean) => Promise<boolean>>>;
 } = {
   config: null,
   saveConfig: vi.fn<(...args: unknown[]) => void>(),
+  getAutostart: vi.fn<() => Promise<boolean>>(),
+  setAutostart: vi.fn<(enabled: boolean) => Promise<boolean>>(),
 };
 vi.mock("./main", () => ({
   get config() {
     return mainMock.config;
   },
   saveConfig: (...args: unknown[]) => mainMock.saveConfig(...args),
+  getAutostart: () => mainMock.getAutostart(),
+  setAutostart: (enabled: boolean) => mainMock.setAutostart(enabled),
 }));
+
+const toastMock = vi.fn();
+vi.mock("./toast", () => ({ showToast: (...args: unknown[]) => toastMock(...args) }));
 
 const SETTINGS_DOM = `
   <span class="setting-label" id="lbl-start-on-login">Start Hole on login</span>
@@ -87,7 +96,6 @@ const SETTINGS_DOM = `
 
 function freshConfig(): Record<string, unknown> {
   return {
-    start_on_login: false,
     proxy_server_enabled: true,
     proxy_socks5: true,
     proxy_http: false,
@@ -108,30 +116,22 @@ async function setup() {
 
 beforeEach(() => {
   mainMock.saveConfig.mockReset();
+  mainMock.getAutostart.mockReset();
+  mainMock.getAutostart.mockResolvedValue(false);
+  mainMock.setAutostart.mockReset();
+  mainMock.setAutostart.mockImplementation((enabled: boolean) => Promise.resolve(enabled));
+  toastMock.mockReset();
   mainMock.config = freshConfig();
   document.body.innerHTML = SETTINGS_DOM;
   vi.resetModules();
 });
 
 describe("settings toggles", () => {
-  it("renderSettings syncs .on and aria-checked from config", async () => {
+  it("renderSettings syncs .on and aria-checked from config (proxy; login is OS-backed)", async () => {
     await setup();
     const proxy = document.getElementById("toggle-proxy-server")!;
-    const login = document.getElementById("toggle-start-on-login")!;
     expect(proxy.classList.contains("on")).toBe(true);
     expect(proxy.getAttribute("aria-checked")).toBe("true");
-    expect(login.classList.contains("on")).toBe(false);
-    expect(login.getAttribute("aria-checked")).toBe("false");
-  });
-
-  it("click flips class, aria-checked, config, and saves", async () => {
-    await setup();
-    const login = document.getElementById("toggle-start-on-login")!;
-    login.click();
-    expect(login.classList.contains("on")).toBe(true);
-    expect(login.getAttribute("aria-checked")).toBe("true");
-    expect(mainMock.config!.start_on_login).toBe(true);
-    expect(mainMock.saveConfig).toHaveBeenCalledTimes(1);
   });
 
   it("proxy-server toggle drives nested muting", async () => {
@@ -152,6 +152,74 @@ describe("settings toggles", () => {
     expect((mainMock.config!.dns as { enabled: boolean }).enabled).toBe(false);
     expect(enabled.getAttribute("aria-checked")).toBe("false");
     expect(document.getElementById("dns-nested")!.classList.contains("muted")).toBe(true);
+  });
+});
+
+describe("autostart toggle (OS-backed, #457)", () => {
+  it("click drives set_autostart with the flipped target, never saveConfig", async () => {
+    await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    login.click(); // set_autostart(true) is called synchronously before the await
+    expect(mainMock.setAutostart).toHaveBeenCalledWith(true);
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("applyAutostart commits the OS state the backend returns", async () => {
+    mainMock.setAutostart.mockResolvedValue(true);
+    const { applyAutostart } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    await applyAutostart(true);
+    expect(login.classList.contains("on")).toBe(true);
+    expect(login.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("applyAutostart reverts the toggle and toasts on failure", async () => {
+    mainMock.setAutostart.mockRejectedValue("Failed to enable Start at Login. See gui.log for details.");
+    const { applyAutostart } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    await applyAutostart(true);
+    expect(login.classList.contains("on")).toBe(false);
+    expect(login.getAttribute("aria-checked")).toBe("false");
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining("Start at Login"), "error");
+  });
+
+  it("applyAutostart reverts to the true prior state (not !target) on failure", async () => {
+    mainMock.setAutostart.mockRejectedValue("boom");
+    const { applyAutostart } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    login.classList.add("on"); // prior state = on
+    login.setAttribute("aria-checked", "true");
+    await applyAutostart(true); // target == current; an assumed !target would wrongly flip to off
+    expect(login.classList.contains("on")).toBe(true);
+    expect(login.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("syncAutostartToggle reflects the live OS state", async () => {
+    mainMock.getAutostart.mockResolvedValue(true);
+    const { syncAutostartToggle } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    await syncAutostartToggle();
+    expect(login.classList.contains("on")).toBe(true);
+    expect(login.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("syncAutostartToggle renders unchecked when OS state is unreadable", async () => {
+    const { syncAutostartToggle } = await setup();
+    const login = document.getElementById("toggle-start-on-login")!;
+    login.classList.add("on");
+    login.setAttribute("aria-checked", "true");
+    mainMock.getAutostart.mockRejectedValue("registry denied");
+    await syncAutostartToggle();
+    expect(login.classList.contains("on")).toBe(false);
+    expect(login.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("re-init does not stack the focus/visibility re-sync listener", async () => {
+    await setup(); // init #1 registers the resync handler
+    await setup(); // init #2 must REPLACE it, not add a second
+    mainMock.getAutostart.mockClear();
+    window.dispatchEvent(new Event("focus"));
+    expect(mainMock.getAutostart).toHaveBeenCalledTimes(1); // not 2
   });
 });
 

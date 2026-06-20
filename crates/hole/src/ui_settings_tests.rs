@@ -38,7 +38,7 @@ fn ui_entry(id: &str) -> UiServerEntry {
 fn default_settings_json() -> serde_json::Value {
     serde_json::json!({
         "servers": [], "selected_server": null, "local_port": 4073,
-        "filters": [], "start_on_login": false, "on_startup": "restore_last_state",
+        "filters": [], "on_startup": "restore_last_state",
         "theme": "dark", "proxy_server_enabled": true, "proxy_socks5": true,
         "proxy_http": false, "dns": AppConfig::default().dns, "local_port_http": 4074,
         "diagnostic_plugin_tap": false
