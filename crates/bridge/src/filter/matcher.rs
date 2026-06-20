@@ -102,6 +102,16 @@ impl Matcher {
             Matcher::Subnet(net) => net.contains(&canonicalize_ip(conn.dst.ip())),
         }
     }
+
+    /// True for the variants that consult `ConnInfo.domain`. Drives
+    /// `has_domain_rules` (which gates the sniffer) and the Test box's
+    /// domain-input gate.
+    pub(crate) fn is_domain(&self) -> bool {
+        matches!(
+            self,
+            Matcher::ExactDomain(_) | Matcher::SubdomainDomain(_) | Matcher::WildcardDomain(_)
+        )
+    }
 }
 
 // Compilation helpers =================================================================================================

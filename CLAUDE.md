@@ -16,7 +16,7 @@ before editing; the sections linked below are the authoritative source.
 
 - **Single binary, two modes.** GUI (system tray, settings, config) and bridge
   (TUN, routing, shadowsocks-service) selected by CLI args; they speak HTTP/1.1
-  REST (JSON) over a Unix socket (macOS) / named pipe (Windows). →
+  REST (JSON) over an AF_UNIX socket on both platforms (Windows via `socket2`). →
   [CONTRIBUTING.md#architecture](CONTRIBUTING.md#architecture)
 - **Single-instance GUI.** Single-instance via `tauri-plugin-single-instance`
   (`com.hole.app`); CLI subcommands bypass the lock. →
@@ -49,10 +49,14 @@ before editing; the sections linked below are the authoritative source.
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
-- **Fail-closed cover.** `Routing::install_failclosed_cover` engages a leak-free
-  egress block (permit loopback + server IP only) for the update cutover;
-  persistent WFP filters (Win) / self-contained pf ruleset (mac), swept by
-  `recover_routes` on next start. →
+- **Fail-closed covers.** The **standing lockdown** cover
+  (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
+  the bridge **disarms-not-drops** it across the restart and the new bridge
+  re-adopts it (`decide_cover_recovery == Adopt`). The **transient**
+  `install_failclosed_cover` (permit loopback + server only) is a bounded-window
+  RAII guard with **no production caller today** (test seam + recovery target).
+  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
+  by `recover_routes` on next start. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →

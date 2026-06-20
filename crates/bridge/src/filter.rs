@@ -13,7 +13,7 @@ pub mod matcher;
 pub mod rules;
 pub mod sniffer;
 
-pub use engine::{decide, ConnInfo, Decision, L4Proto};
+pub use engine::{decide, decide_test, ConnInfo, Decision, L4Proto, TestInput};
 pub use matcher::Matcher;
 pub use rules::{CompiledRule, RuleSet};
 pub use sniffer::peek;

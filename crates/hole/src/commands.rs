@@ -2,14 +2,17 @@
 
 use crate::bridge_client::ClientError;
 use crate::state::AppState;
-use hole_common::config::{AppConfig, ServerEntry, ValidationState};
+use hole_bridge::filter::{decide_test, RuleSet, TestInput};
+use hole_common::config::{AppConfig, FilterAction, FilterRule, ServerEntry, ValidationState};
 use hole_common::import;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, ProxyConfig, ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT,
 };
 use serde::Serialize;
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
 use tauri::{Emitter, State};
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
@@ -607,6 +610,44 @@ pub async fn reload_proxy_filters(state: State<'_, AppState>) -> Result<(), Stri
     };
 
     state.link.reload_if_running(proxy_config).await.map(|_| ())
+}
+
+// Filter Test box =====================================================================================================
+
+/// Result of evaluating a single typed domain/IP against the user's filter
+/// rules. `rule_index` is the index into the user's `config.filters`
+/// (`None` = terminal fallback, no rule matched); `matched_address` is that
+/// rule's address for the UI label.
+#[derive(Debug, Clone, Serialize)]
+pub struct FilterEvaluation {
+    pub action: FilterAction,
+    pub rule_index: Option<usize>,
+    pub matched_address: Option<String>,
+}
+
+/// Evaluate the Filters "Test" box input through the exact engine the tunnel
+/// runs (`decide_test`). Pure: no bridge IPC, no proxy — works whether or not
+/// the proxy is connected. The frontend passes its live `config.filters` (the
+/// rows on screen, including the injected default) so the preview always
+/// matches what the user sees. Invalid rules are dropped by
+/// `RuleSet::from_user_rules`, so they never match — the same as the tunnel.
+#[tauri::command]
+pub fn evaluate_filter(input: String, filters: Vec<FilterRule>) -> FilterEvaluation {
+    let trimmed = input.trim();
+    let ruleset = RuleSet::from_user_rules(&filters);
+    let test_input = match IpAddr::from_str(trimmed) {
+        Ok(ip) => TestInput::Ip(ip),
+        Err(_) => TestInput::Domain(trimmed.to_string()),
+    };
+    let decision = decide_test(&ruleset, &test_input);
+    let matched_address = decision
+        .rule_index
+        .and_then(|i| filters.get(i).map(|r| r.address.clone()));
+    FilterEvaluation {
+        action: decision.action,
+        rule_index: decision.rule_index,
+        matched_address,
+    }
 }
 
 #[cfg(test)]

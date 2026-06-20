@@ -9,14 +9,9 @@ use tracing::{info, warn};
 /// The user-local log dir holds both GUI and foreground-bridge logs.
 /// Service-mode bridge logs live in system paths and are included when present.
 fn log_dirs() -> Vec<(&'static str, PathBuf)> {
-    #[cfg(target_os = "windows")]
-    let service_dir = PathBuf::from(r"C:\ProgramData\hole\logs");
-    #[cfg(not(target_os = "windows"))]
-    let service_dir = PathBuf::from("/var/log/hole");
-
     vec![
         ("user", hole_common::logging::default_log_dir()),
-        ("service", service_dir),
+        ("service", hole_common::update_marker::service_log_dir()),
     ]
 }
 

@@ -431,6 +431,56 @@ fn resolve_cli_log_dir_falls_back_to_default_without_override() {
     assert_eq!(resolved, Some(hole_common::logging::default_log_dir()));
 }
 
+// `bridge cutover` / `bridge unlock` parsing ==========================================================================
+
+#[skuld::test]
+fn bridge_cutover_parses_payload_and_target_version() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "cutover",
+        "--payload",
+        "/tmp/x.msi",
+        "--target-version",
+        "0.3.0",
+    ])
+    .expect("parse bridge cutover");
+    let Some(Command::Bridge {
+        action: BridgeAction::Cutover {
+            payload,
+            target_version,
+        },
+    }) = cli.command
+    else {
+        panic!("expected Command::Bridge::Cutover");
+    };
+    assert_eq!(payload, std::path::PathBuf::from("/tmp/x.msi"));
+    assert_eq!(target_version, "0.3.0");
+}
+
+#[skuld::test]
+fn bridge_cutover_requires_both_flags() {
+    assert!(
+        Cli::try_parse_from(["hole", "bridge", "cutover", "--payload", "/tmp/x.msi"]).is_err(),
+        "--target-version is required"
+    );
+    assert!(
+        Cli::try_parse_from(["hole", "bridge", "cutover", "--target-version", "0.3.0"]).is_err(),
+        "--payload is required"
+    );
+}
+
+#[skuld::test]
+fn bridge_unlock_takes_no_args() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "unlock"]).expect("parse bridge unlock");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Unlock
+        })
+    ));
+}
+
 #[skuld::test]
 fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
     assert!(resolve_cli_log_dir(&Command::Version).is_none());
@@ -444,4 +494,89 @@ fn resolve_cli_log_dir_returns_none_for_exempt_commands() {
         },
     })
     .is_none());
+}
+
+// --result-file flag (elevated outcome sink) ==========================================================================
+
+#[skuld::test]
+fn ipc_send_parses_result_file_flag() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "ipc-send",
+        "--request-file",
+        "/tmp/req.json",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .expect("parse ipc-send --result-file");
+    let Some(Command::Bridge {
+        action: BridgeAction::IpcSend {
+            request_file,
+            result_file,
+            ..
+        },
+    }) = cli.command
+    else {
+        panic!("expected IpcSend");
+    };
+    assert_eq!(request_file, Some(std::path::PathBuf::from("/tmp/req.json")));
+    assert_eq!(result_file, Some(std::path::PathBuf::from("/tmp/res.json")));
+}
+
+#[skuld::test]
+fn grant_access_parses_result_file_flag() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "grant-access",
+        "--then-send-file",
+        "/tmp/req.json",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .expect("parse grant-access --result-file");
+    let Some(Command::Bridge {
+        action:
+            BridgeAction::GrantAccess {
+                then_send_file,
+                result_file,
+                ..
+            },
+    }) = cli.command
+    else {
+        panic!("expected GrantAccess");
+    };
+    assert_eq!(then_send_file, Some(std::path::PathBuf::from("/tmp/req.json")));
+    assert_eq!(result_file, Some(std::path::PathBuf::from("/tmp/res.json")));
+}
+
+#[skuld::test]
+fn ipc_send_rejects_result_file_with_base64() {
+    // --result-file is the file-path channel only; the b64 path drops it, so the
+    // combination is rejected at parse time rather than silently ignored.
+    assert!(Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "ipc-send",
+        "--base64",
+        "e30=",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .is_err());
+}
+
+#[skuld::test]
+fn grant_access_rejects_result_file_with_then_send() {
+    assert!(Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "grant-access",
+        "--then-send",
+        "e30=",
+        "--result-file",
+        "/tmp/res.json",
+    ])
+    .is_err());
 }

@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { config, saveConfig } from "./main";
 import { menuKeydown } from "./menu-keys";
 import { showToast } from "./toast";
-import type { FilterRule } from "./types";
+import type { FilterEvaluation, FilterRule } from "./types";
 
 // Constants ===========================================================================================================
 
@@ -268,8 +268,8 @@ export function renderFilters() {
     tbody.querySelector<HTMLElement>(`tr[data-index="${index}"] ${restoreControl}`)?.focus({ preventScroll: true });
   }
 
-  // Re-evaluate test filtering after render.
-  evaluateTestFilter();
+  // Re-evaluate test filtering after render (fire-and-forget; async).
+  void evaluateTestFilter();
 }
 
 // In-place address editing ============================================================================================
@@ -777,136 +777,67 @@ function deleteRule(index: number) {
 
 // Test filtering ======================================================================================================
 
+/// Latest-wins guard: evaluateTestFilter fires on every keystroke and from
+/// renderFilters; a slow earlier response must not overwrite a newer one.
+let testSeq = 0;
+
 /**
- * Evaluate a test input against all filter rules and display the result.
+ * Evaluate the test input against the filter rules via the bridge engine and
+ * display the result. Async: the verdict comes from the `evaluate_filter`
+ * command — the same compiled engine the live tunnel runs, so the preview
+ * cannot diverge from what the tunnel will do.
  */
-function evaluateTestFilter() {
+async function evaluateTestFilter() {
   if (!testInput || !testResult) return;
   const input = testInput.value.trim();
 
-  if (!input) {
+  // Bump the generation before the empty-input short-circuit so clearing the
+  // box (or rendering it empty) supersedes any in-flight evaluation —
+  // otherwise a slow response for a previous input could repopulate a box the
+  // user just cleared.
+  const seq = ++testSeq;
+
+  if (!input || !config?.filters || config.filters.length === 0) {
     testResult.innerHTML = "";
     return;
   }
 
-  if (!config?.filters || config.filters.length === 0) {
-    testResult.innerHTML = "";
+  let result: FilterEvaluation;
+  try {
+    result = await invoke<FilterEvaluation>("evaluate_filter", { input, filters: config.filters });
+  } catch (err) {
+    if (seq !== testSeq) return; // superseded by a newer evaluation
+    console.error("evaluate_filter failed:", err);
+    testResult.textContent = "";
+    const span = document.createElement("span");
+    span.className = "match-rule";
+    span.textContent = "Could not evaluate (see logs)";
+    testResult.append(span);
     return;
   }
+  if (seq !== testSeq) return; // superseded by a newer evaluation
 
-  // Evaluate rules top-to-bottom; later rules override.
-  let matchedAction: string | null = null;
-  let matchedRule: FilterRule | null = null;
-  let matchedIndex = -1;
+  const { action, rule_index: ruleIndex, matched_address: matchedAddress } = result;
 
-  for (let i = 0; i < config.filters.length; i++) {
-    const rule = config.filters[i];
-    if (ruleMatches(rule, input)) {
-      matchedAction = rule.action;
-      matchedRule = rule;
-      matchedIndex = i;
-    }
+  // rule_index null is the engine's terminal fallback (no rule matched,
+  // proxied by default) — distinct from matching the '*' default rule (index 0).
+  let inner: string;
+  if (ruleIndex === null) {
+    inner = "no matching rule";
+  } else if (ruleIndex === 0) {
+    inner = "matched default rule";
+  } else {
+    inner = `matched rule #${ruleIndex + 1}: ${matchedAddress}`;
   }
-
-  if (matchedAction === null) {
-    testResult.innerHTML = '<span class="match-rule">No matching rule</span>';
-    return;
-  }
-
-  const actionClass = `match-${matchedAction}`;
-  const actionText = actionLabel(matchedAction);
-  const ruleDesc = matchedIndex === 0 ? "default rule" : `rule #${matchedIndex + 1}: ${matchedRule!.address}`;
 
   testResult.textContent = "";
   const actionSpan = document.createElement("span");
-  actionSpan.className = actionClass;
-  actionSpan.textContent = actionText;
+  actionSpan.className = `match-${action}`;
+  actionSpan.textContent = actionLabel(action);
   const ruleSpan = document.createElement("span");
   ruleSpan.className = "match-rule";
-  ruleSpan.textContent = ` (matched ${ruleDesc})`;
+  ruleSpan.textContent = ` (${inner})`;
   testResult.append(actionSpan, ruleSpan);
-}
-
-/**
- * Check if a filter rule matches the given input string.
- * @param {object} rule - A FilterRule object.
- * @param {string} input - The domain or IP to test.
- * @returns {boolean}
- */
-function ruleMatches(rule: FilterRule, input: string): boolean {
-  const addr = rule.address;
-
-  switch (rule.matching) {
-    case "exactly":
-      return input === addr;
-
-    case "with_subdomains":
-      return input === addr || input.endsWith(`.${addr}`);
-
-    case "wildcard":
-      if (addr === "*") return true;
-      // Convert glob pattern to regex: escape special regex chars, then
-      // replace literal * with .* for glob semantics.
-      try {
-        const escaped = addr.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-        const pattern = `^${escaped.replace(/\*/g, ".*")}$`;
-        return new RegExp(pattern, "i").test(input);
-      } catch {
-        return false;
-      }
-
-    case "subnet":
-      return cidrMatch(input, addr);
-
-    default:
-      return false;
-  }
-}
-
-/**
- * Check if an IP address matches a CIDR range.
- * Supports IPv4 only (e.g. "192.168.0.0/16").
- * @param {string} ip - The IP address to test.
- * @param {string} cidr - The CIDR notation string.
- * @returns {boolean}
- */
-function cidrMatch(ip: string, cidr: string): boolean {
-  const parts = cidr.split("/");
-  if (parts.length !== 2) return false;
-
-  const cidrIp = parseIpv4(parts[0]);
-  const prefixLen = parseInt(parts[1], 10);
-  const testIp = parseIpv4(ip);
-
-  if (cidrIp === null || testIp === null) return false;
-  if (Number.isNaN(prefixLen) || prefixLen < 0 || prefixLen > 32) return false;
-
-  if (prefixLen === 0) return true;
-
-  // Create mask: prefixLen leading 1-bits.
-  // Use unsigned right shift to handle 32-bit properly.
-  const mask = prefixLen === 32 ? 0xffffffff : ~((1 << (32 - prefixLen)) - 1);
-
-  return (cidrIp & mask) === (testIp & mask);
-}
-
-/**
- * Parse an IPv4 address string into a 32-bit integer.
- * @param {string} ip - e.g. "192.168.1.1"
- * @returns {number|null} The 32-bit integer, or null if invalid.
- */
-function parseIpv4(ip: string): number | null {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-
-  let result = 0;
-  for (let i = 0; i < 4; i++) {
-    const n = parseInt(parts[i], 10);
-    if (Number.isNaN(n) || n < 0 || n > 255) return null;
-    // Use unsigned arithmetic via >>> to avoid sign issues.
-    result = ((result << 8) | n) >>> 0;
-  }
-  return result;
 }
 
 // Event handling ======================================================================================================

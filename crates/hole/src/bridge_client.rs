@@ -3,8 +3,9 @@
 use bytes::Bytes;
 use hole_common::protocol::{
     BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, LockdownRequest, MetricsResponse,
-    StatusResponse, TestServerRequest, TestServerResponse, ROUTE_CANCEL, ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN,
-    ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
+    ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
+    ROUTE_UPDATE_APPLY,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -32,6 +33,21 @@ pub enum ClientError {
     /// stamp). Path-free by construction so it can never leak PII to a toast.
     #[error("version mismatch: the Hole bridge is a different version")]
     VersionMismatch { bridge: Option<String> },
+    /// The bridge rejected the update because consent was not granted (403).
+    #[error("the update requires your consent before it can be applied")]
+    ConsentRequired { message: String },
+    /// The bridge rejected the update because a cutover is already running (409).
+    #[error("an update is already in progress")]
+    CutoverInProgress { message: String },
+    /// The bridge re-verified the downloaded payload and it failed the
+    /// minisign/SHA-256 check (422) — corruption or tamper.
+    #[error("the downloaded update could not be verified and was not applied")]
+    PayloadVerificationFailed { message: String },
+    /// The bridge rejected the update's install destination (400) — an invalid
+    /// `.app` swap target or a volume that cannot atomically swap. Distinct from
+    /// a payload-bytes failure so the user is not told the download is corrupt.
+    #[error("the update install destination is invalid")]
+    InvalidUpdateDestination { message: String },
 }
 
 // Client ==============================================================================================================
@@ -211,6 +227,32 @@ impl BridgeClient {
                     parse_bridge_error(resp).await
                 }
             }
+            BridgeRequest::ApplyUpdate {
+                payload_path,
+                target_version,
+                consent,
+                sha256sums,
+                sha256sums_minisig,
+                asset_name,
+                app_dest,
+            } => {
+                let body = serde_json::to_vec(&UpdateApplyRequest {
+                    payload_path: payload_path.to_string_lossy().into_owned(),
+                    target_version,
+                    consent,
+                    sha256sums,
+                    sha256sums_minisig,
+                    asset_name,
+                    app_dest,
+                })
+                .map_err(|e| ClientError::Protocol(e.to_string()))?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
         }
     }
 
@@ -311,26 +353,56 @@ async fn read_body(resp: http::Response<hyper::body::Incoming>) -> Result<Bytes,
         .map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
-/// Map a non-success HTTP response to a `BridgeResponse::Error` (for 5xx)
-/// or a `ClientError::Protocol` (for unexpected status codes like 4xx).
+/// Map a non-success HTTP response to a typed error. Recognised 4xx update
+/// statuses become typed `ClientError` variants so the GUI can render
+/// distinct text; 5xx becomes `BridgeResponse::Error`; any other status is an
+/// opaque protocol error.
 async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Result<BridgeResponse, ClientError> {
     let status = resp.status();
+
+    // Recognised update 4xx — surface as typed variants before the 5xx check so
+    // the bridge's JSON `message` reaches the user instead of collapsing to an
+    // opaque protocol error.
+    if status == http::StatusCode::FORBIDDEN {
+        return Err(ClientError::ConsentRequired {
+            message: error_message(resp).await,
+        });
+    }
+    if status == http::StatusCode::CONFLICT {
+        return Err(ClientError::CutoverInProgress {
+            message: error_message(resp).await,
+        });
+    }
+    if status == http::StatusCode::UNPROCESSABLE_ENTITY {
+        return Err(ClientError::PayloadVerificationFailed {
+            message: error_message(resp).await,
+        });
+    }
+    if status == http::StatusCode::BAD_REQUEST {
+        return Err(ClientError::InvalidUpdateDestination {
+            message: error_message(resp).await,
+        });
+    }
+
     if status.is_server_error() {
-        // 5xx — bridge returned an operational error
-        match read_body(resp).await {
-            Ok(body) => {
-                let err: ErrorResponse = serde_json::from_slice(&body).unwrap_or(ErrorResponse {
-                    message: "unknown error".to_string(),
-                });
-                Ok(BridgeResponse::Error { message: err.message })
-            }
-            Err(_) => Ok(BridgeResponse::Error {
-                message: "failed to read error response".to_string(),
-            }),
-        }
+        // 5xx — bridge returned an operational error.
+        Ok(BridgeResponse::Error {
+            message: error_message(resp).await,
+        })
     } else {
-        // 4xx or other — unexpected, treat as protocol error
+        // Any other 4xx — unexpected, treat as protocol error.
         Err(ClientError::Protocol(format!("unexpected HTTP status: {status}")))
+    }
+}
+
+/// Read the bridge's `ErrorResponse.message` from a body, falling back to a
+/// generic string when the body is unreadable or not the expected shape.
+async fn error_message(resp: http::Response<hyper::body::Incoming>) -> String {
+    match read_body(resp).await {
+        Ok(body) => serde_json::from_slice::<ErrorResponse>(&body)
+            .map(|e| e.message)
+            .unwrap_or_else(|_| "unknown error".to_string()),
+        Err(_) => "failed to read error response".to_string(),
     }
 }
 

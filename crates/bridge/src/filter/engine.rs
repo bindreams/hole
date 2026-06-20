@@ -4,11 +4,11 @@
 //! terminal fallback is `Proxy` — this matches the bridge's
 //! "everything is proxied by default" contract.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use hole_common::config::FilterAction;
 
-use super::rules::RuleSet;
+use super::rules::{CompiledRule, RuleSet};
 
 /// Layer-4 protocol of a connection. The dispatcher branches on this:
 /// TCP flows are peeked for a domain, UDP flows are matched on IP only.
@@ -44,14 +44,16 @@ pub struct Decision {
     pub rule_index: Option<usize>,
 }
 
-/// Run the filter engine for one connection. O(n) in the rule count;
-/// pure function.
-pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
-    for (i, rule) in rules.rules.iter().enumerate().rev() {
-        if rule.matcher.matches(conn) {
+/// Reverse-scan the ruleset and return the action of the first rule for which
+/// `pred` holds (gitignore last-match-wins), reporting that rule's *original*
+/// user index. The terminal fallback is `Proxy` with no index. Both `decide`
+/// and `decide_test` go through here so the two surfaces cannot drift.
+fn first_match(rules: &RuleSet, pred: impl Fn(&CompiledRule) -> bool) -> Decision {
+    for rule in rules.rules.iter().rev() {
+        if pred(rule) {
             return Decision {
                 action: rule.action,
-                rule_index: Some(i),
+                rule_index: Some(rule.original_index),
             };
         }
     }
@@ -60,6 +62,54 @@ pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
     Decision {
         action: FilterAction::Proxy,
         rule_index: None,
+    }
+}
+
+/// Run the filter engine for one connection. O(n) in the rule count;
+/// pure function.
+pub fn decide(rules: &RuleSet, conn: &ConnInfo) -> Decision {
+    first_match(rules, |rule| rule.matcher.matches(conn))
+}
+
+/// A single typed token from the Filters "Test" box: the user enters *either*
+/// a domain *or* an IP, never a full connection — distinct from [`ConnInfo`],
+/// which a real flow fills with both a destination IP and an optional domain.
+#[derive(Debug, Clone)]
+pub enum TestInput {
+    Domain(String),
+    Ip(IpAddr),
+}
+
+/// Decide the filter action for one typed [`TestInput`], mirroring the tunnel's
+/// two matchable surfaces while keeping them mutually exclusive:
+///
+/// - [`TestInput::Ip`] matches only IP/subnet rules (a raw-IP flow carries no
+///   domain), exactly like the dispatcher's raw-IP path.
+/// - [`TestInput::Domain`] matches only domain rules. A typed name has no
+///   destination IP, so IP/subnet rules are skipped — otherwise a `0.0.0.0/0`
+///   rule would match the synthetic placeholder address and mis-report.
+///
+/// `proto` is irrelevant here: [`super::matcher::Matcher::matches`] never reads it.
+pub fn decide_test(rules: &RuleSet, input: &TestInput) -> Decision {
+    match input {
+        TestInput::Ip(addr) => {
+            let conn = ConnInfo {
+                dst: SocketAddr::new(*addr, 0),
+                domain: None,
+                proto: L4Proto::Tcp,
+            };
+            first_match(rules, |rule| rule.matcher.matches(&conn))
+        }
+        TestInput::Domain(name) => {
+            // dst is a placeholder that is never consulted: only domain
+            // matchers run, and they ignore dst.
+            let conn = ConnInfo {
+                dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                domain: Some(name.clone()),
+                proto: L4Proto::Tcp,
+            };
+            first_match(rules, |rule| rule.matcher.is_domain() && rule.matcher.matches(&conn))
+        }
     }
 }
 

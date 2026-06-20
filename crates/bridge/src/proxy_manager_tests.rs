@@ -346,6 +346,15 @@ impl Drop for MockCover {
     }
 }
 
+impl tun_engine::routing::CoverGuard for MockCover {
+    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
+    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
+    /// cover instead of disengaging it.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
 // MockRouting lockdown instrumentation ================================================================================
 //
 // These exercise the mock seam directly (no ProxyManager) so the later
@@ -968,6 +977,49 @@ fn lockdown_engage_failure_tears_down_routes_only() {
             "engage failure tears down routes only; no cover was created"
         );
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[skuld::test]
+fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
+    rt().block_on(async {
+        // UserStop: the cover Drop disengages (opens the host).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+
+            pm.stop_with(StopReason::UserStop).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "user stop disengages the cover"
+            );
+        }
+        // Cutover: the cover is disarmed (persist-without-disengage) so the
+        // persistent filters survive the restart; routes still tear down.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
+
+            pm.stop_with(StopReason::Cutover).await.unwrap();
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "cutover does NOT disengage the cover (it is disarmed so the filters persist)"
+            );
+            assert_eq!(
+                st.teardown_calls.load(Ordering::SeqCst),
+                1,
+                "cutover still tears down routes"
+            );
+        }
     });
 }
 
