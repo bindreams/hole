@@ -582,7 +582,7 @@ describe("power-button wedge escape (#471)", () => {
     );
     const toast = await import("./toast");
     initPowerButton();
-    updateProxyStatus({ running: true, state_seq: 1 });
+    updateProxyStatus(fullStatus({ running: true, state_seq: 1 }));
     expect(getConnectionState()).toBe("connected");
     const btn = document.getElementById("power-btn")!;
     btn.click();
