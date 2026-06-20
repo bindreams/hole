@@ -823,15 +823,18 @@ fn hole_run_is_dev_mode_build_and_launch() {
         ]
     );
 
-    // #438 defense: the crash-dumps env must live ONLY on a run step, never the
-    // build cascade (which `--all` and the release installers execute).
-    for step in &t.build {
-        let environment = match step {
-            Step::Bash { environment, .. } | Step::Process { environment, .. } => environment,
-        };
-        assert!(
-            !environment.contains_key("HOLE_CRASH_DUMPS"),
-            "HOLE_CRASH_DUMPS must not appear in hole's build steps (#438)"
-        );
+    // #438 defense: the crash-dumps env must live ONLY on a run step, never any
+    // target's build cascade (which `--all` and the release installers execute).
+    for target in m.iter() {
+        for step in &target.build {
+            let environment = match step {
+                Step::Bash { environment, .. } | Step::Process { environment, .. } => environment,
+            };
+            assert!(
+                !environment.contains_key("HOLE_CRASH_DUMPS"),
+                "HOLE_CRASH_DUMPS must not appear in any build step (target {:?}, #438)",
+                target.name
+            );
+        }
     }
 }

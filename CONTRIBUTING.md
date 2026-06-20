@@ -583,7 +583,7 @@ build graph; `cargo xtask list` prints the target table.
 npm install                  # frontend deps (first time only)
 cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (cached)
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask run hole         # dev mode (= build hole + dev-console)
+cargo xtask run hole         # dev mode (build cascade, then dev-console supervises)
 cargo xtask run hole-tests   # canonical local nextest invocation
 ```
 
