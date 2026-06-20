@@ -56,6 +56,27 @@ pub fn installing_username() -> io::Result<String> {
     os::installing_username()
 }
 
+/// The real interactive user's identity, resolved from the passwd database.
+///
+/// Built from [`installing_username`] plus a `getpwnam_r(3)` lookup. Used by
+/// elevated non-`--service` bridge processes to write user-owned files.
+#[cfg(target_os = "macos")]
+pub struct RealUser {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: std::path::PathBuf,
+}
+
+/// Resolve the real interactive user's uid/gid/home from the passwd database.
+///
+/// macOS-gated: the sole caller is macOS-only, and the `getpwnam_r` impl lives
+/// in the macOS `os` module.
+#[cfg(target_os = "macos")]
+pub fn resolve_real_user() -> io::Result<RealUser> {
+    os::resolve_real_user()
+}
+
 /// Look up the SID of any account (user or group) as a string (e.g. `S-1-5-21-...`).
 #[cfg(target_os = "windows")]
 pub fn lookup_sid(name: &str) -> io::Result<String> {
@@ -75,7 +96,7 @@ mod os {
     use std::io;
     use std::process::Command;
 
-    use super::{group_exists, GROUP_NAME};
+    use super::{group_exists, RealUser, GROUP_NAME};
 
     pub fn create_group() -> io::Result<()> {
         // EAFP: just try to create. On macOS `dseditgroup -o create` is
@@ -165,6 +186,50 @@ mod os {
         }
 
         Err(io::Error::other("could not determine the installing user"))
+    }
+
+    pub fn resolve_real_user() -> io::Result<RealUser> {
+        let name = super::installing_username()?;
+        let cname = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL"))?;
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            // SAFETY: cname is NUL-terminated; pwd/buf/result outlive the call.
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    cname.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            if result.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no passwd entry for {name}"),
+                ));
+            }
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: pw_dir is a valid C string for a non-null result.
+            let home_bytes = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+            let home = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(home_bytes));
+            return Ok(RealUser {
+                name,
+                uid: pwd.pw_uid,
+                gid: pwd.pw_gid,
+                home,
+            });
+        }
     }
 }
 
