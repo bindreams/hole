@@ -199,7 +199,7 @@ struct MockRouting {
     state: Arc<MockRoutingState>,
     /// Directory where the crash-recovery state file is written. Each
     /// `MockRouting` owns its own `state_dir` — in production,
-    /// `SystemRouting::new(state_dir)` does the same. Tests hand the
+    /// `SystemRouting::new(state_dir, owner)` does the same. Tests hand the
     /// routing a `TempDir` (see `new_manager`) to keep writes isolated.
     state_dir: PathBuf,
     gateway: IpAddr,
