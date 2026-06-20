@@ -615,3 +615,73 @@ fn resolve_log_dir_falls_back_to_default() {
     let got = super::resolve_log_dir_from(None, None);
     assert_eq!(got, super::default_log_dir());
 }
+
+// Per-sink composition ------------------------------------------------------------------------------------------------
+#[derive(Clone)]
+struct CapBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl CapBuf {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+impl std::io::Write for CapBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapBuf {
+    type Writer = CapBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[skuld::test]
+fn file_sink_gets_trace_stderr_does_not() {
+    let file = CapBuf::new();
+    let err = CapBuf::new();
+    let sub = super::compose_subscriber(
+        file.clone(),
+        err.clone(),
+        &["t1_target=trace".to_string()],
+        &["t1_target=info".to_string()],
+    );
+    // Install as the thread-local default via the workspace helper (raw
+    // set_default is clippy-disallowed; hole-common depends on garter, so the
+    // helper is available — cf. the existing `panic_hook_emits_tracing_event`
+    // test). Target-specific directives in `sub` override any ambient RUST_LOG
+    // (caller directives are added after from_env_lossy and win at equal/greater
+    // specificity), so this is deterministic regardless of the environment.
+    let _g = garter::tracing_test::set_default_in_current_thread(sub);
+    tracing::trace!(target: "t1_target", "trace-line");
+    tracing::info!(target: "t1_target", "info-line");
+    let f = file.contents();
+    let e = err.contents();
+    assert!(f.contains("trace-line"), "file missing trace:\n{f}");
+    assert!(f.contains("info-line"), "file missing info:\n{f}");
+    assert!(!e.contains("trace-line"), "stderr leaked trace:\n{e}");
+    assert!(e.contains("info-line"), "stderr missing info:\n{e}");
+}
+
+#[skuld::test]
+fn relay_events_go_to_file_not_stderr() {
+    let file = CapBuf::new();
+    let err = CapBuf::new();
+    let sub = super::compose_subscriber(file.clone(), err.clone(), &["info".to_string()], &["info".to_string()]);
+    let _g = garter::tracing_test::set_default_in_current_thread(sub);
+    tracing::info!(target: "hole::stderr_relay", "relayed-line");
+    drop(_g);
+    assert!(file.contents().contains("relayed-line"), "file dropped relay event");
+    assert!(
+        !err.contents().contains("relayed-line"),
+        "stderr must exclude relay events:\n{}",
+        err.contents()
+    );
+}
