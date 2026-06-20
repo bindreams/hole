@@ -3,6 +3,7 @@
 // graph, stats, IP display, diagnostics, and version footer each live
 // in their own modules.
 
+import { initCapabilities, setCapabilityFlags } from "./capabilities";
 import { initDiagnostics, updateDiagnostics } from "./diagnostics";
 import { initGraph, pushGraphData, renderGraph } from "./graph";
 import { initIpDisplay, startPublicIpAutoRefresh, updatePublicIp } from "./ip-display";
@@ -26,12 +27,14 @@ export function initSidebar(): void {
   initGraph();
   initStats();
   initDiagnostics();
+  initCapabilities();
 }
 
 // Public re-exports for main.ts and other consumers.
 export {
   applyProxyStateObservation,
   getConnectionState,
+  setCapabilityFlags,
   startPublicIpAutoRefresh,
   updateDiagnostics,
   updatePublicIp,

@@ -625,6 +625,93 @@ fn check_health_detects_crashed_task() {
     });
 }
 
+// death_reason: path-free GUI/toast surface, distinct from last_error (#470) ==========================================
+
+#[skuld::test]
+fn check_health_sets_path_free_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            pm.death_reason(),
+            Some(DEATH_REASON),
+            "out-of-band death surfaces the sentinel"
+        );
+        assert!(
+            !DEATH_REASON.contains('/') && !DEATH_REASON.contains('\\'),
+            "death reason is path-free"
+        );
+    });
+}
+
+/// The PII guarantee: a failed start records its arbitrary (possibly
+/// path-bearing) error in `last_error` for diagnostics, but NEVER in
+/// `death_reason` — so it can never reach the GUI status/toast.
+#[skuld::test]
+fn failed_start_records_last_error_but_not_death_reason() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::failing_start());
+        let _ = pm.start(&test_config()).await.unwrap_err();
+
+        assert!(
+            pm.last_error().is_some(),
+            "failed start records last_error for diagnostics"
+        );
+        assert_eq!(
+            pm.death_reason(),
+            None,
+            "a failed start is not a death — must not surface to the toast"
+        );
+    });
+}
+
+/// A (re)start supersedes a prior death: the death reason clears so a later
+/// poll cannot re-toast a stale death.
+#[skuld::test]
+fn restart_clears_prior_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+        assert_eq!(pm.death_reason(), Some(DEATH_REASON));
+
+        state.crashed.store(false, Ordering::SeqCst);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(pm.death_reason(), None, "a successful restart clears the death reason");
+    });
+}
+
+/// stop() clears the death reason too (a clean stop is not a death).
+#[skuld::test]
+fn stop_clears_death_reason() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.start(&test_config()).await.unwrap();
+
+        state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+        assert_eq!(pm.death_reason(), Some(DEATH_REASON));
+
+        // A fresh start then a clean stop must leave no death reason behind.
+        state.crashed.store(false, Ordering::SeqCst);
+        pm.start(&test_config()).await.unwrap();
+        pm.stop().await.unwrap();
+        assert_eq!(pm.death_reason(), None);
+    });
+}
+
 #[skuld::test]
 fn check_health_clears_active_config_so_reload_restarts() {
     // Regression guard: check_health must clear active_config, otherwise

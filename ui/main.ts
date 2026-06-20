@@ -8,7 +8,7 @@ import { error as logError, warn as logWarn } from "@tauri-apps/plugin-log";
 import "flag-icons/css/flag-icons.min.css";
 import { OverlayScrollbars } from "overlayscrollbars";
 import "overlayscrollbars/overlayscrollbars.css";
-import { initFilters, renderFilters } from "./filters";
+import { filtersEpoch, initFilters, renderFilters, setInvalidFilters } from "./filters";
 import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
 import {
@@ -22,6 +22,7 @@ import { initSettings, renderSettings } from "./settings";
 import {
   applyProxyStateObservation,
   initSidebar,
+  setCapabilityFlags,
   startPublicIpAutoRefresh,
   updateDiagnostics,
   updateMetrics,
@@ -148,6 +149,9 @@ export function isDirty() {
 
 /** Poll proxy status every 5 seconds. */
 async function pollProxyStatus() {
+  // Capture the filters epoch before the round-trip; a mutation during the
+  // fetch invalidates the response's invalid_filters indices (#470).
+  const epoch = filtersEpoch();
   try {
     const status = await invoke<ProxyStatus>("get_proxy_status");
     const result = updateProxyStatus(status);
@@ -160,6 +164,12 @@ async function pollProxyStatus() {
     if (result.changed) {
       updatePublicIp();
     }
+    // Drop a result that resolved after a ruleset mutation — its indices no
+    // longer match the rendered rows.
+    if (epoch === filtersEpoch()) {
+      setInvalidFilters(status.invalid_filters);
+    }
+    setCapabilityFlags(status.udp_proxy_available, status.ipv6_bypass_available, status.running);
   } catch (err) {
     console.error("get_proxy_status failed:", err);
   }
@@ -281,12 +291,18 @@ function setupEventListeners(): Promise<unknown> {
   // Tray- or backend-initiated proxy state changes reach the power
   // button immediately instead of waiting for the 5s poll (#462). Routed
   // through the same seq-monotone, IDLE-guarded application as the poll.
-  const proxyStateReady = listen<{ seq: number; running: boolean }>("proxy-state-changed", (event) => {
-    const result = applyProxyStateObservation(event.payload.seq, event.payload.running);
-    if (result.changed) {
-      updatePublicIp();
-    }
-  });
+  const proxyStateReady = listen<{ seq: number; running: boolean; error: string | null }>(
+    "proxy-state-changed",
+    (event) => {
+      // Pass `error` so a death observed first (or only) via the event still
+      // surfaces the exactly-once toast — the tray reconciler can be the poller
+      // that commits the death (#470).
+      const result = applyProxyStateObservation(event.payload.seq, event.payload.running, event.payload.error);
+      if (result.changed) {
+        updatePublicIp();
+      }
+    },
+  );
 
   // Joined so init() can await registration before the UI becomes
   // interactive — an emit landing before listen() resolves is silently

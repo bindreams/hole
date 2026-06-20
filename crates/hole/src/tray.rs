@@ -1242,7 +1242,15 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
             if rx.changed().await.is_err() {
                 return; // cell dropped — app teardown
             }
-            let snap = *rx.borrow_and_update();
+            // `watch` coalesces to the latest snapshot. A death (running=false,
+            // error=sentinel) loses its error before this wakes only if a later
+            // commit overwrites it AND flips running back to true — which comes
+            // solely from a Start (slow, user/startup I/O; there is no
+            // auto-reconnect on death), so it cannot land in the wake window. A
+            // coalesced lockdown-only re-commit keeps running=false and the
+            // sticky error, so the death still reaches the webview (#470).
+            // clone: ProxySnapshot owns a String and is no longer Copy.
+            let snap = rx.borrow_and_update().clone();
             rebuild_tray_menu(&app);
             if let Err(e) = app.emit("proxy-state-changed", snap) {
                 warn!(error = %e, "failed to emit proxy-state-changed");

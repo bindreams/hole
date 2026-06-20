@@ -1448,6 +1448,38 @@ fn diagnostics_bridge_error_after_failed_start() {
     });
 }
 
+/// PII guarantee (#470): a failed start populates `last_error` (which can carry
+/// a path/hostname), but `StatusResponse.error` surfaces only the path-free
+/// death reason — None here, since a failed start is not an out-of-band death.
+/// So the rich error never reaches the GUI toast even though diagnostics see it.
+#[skuld::test]
+fn status_error_excludes_failed_start_detail() {
+    rt().block_on(async {
+        let path = test_socket_path("status-no-pii");
+        let server = IpcServer::bind(&path, gateway_failing_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_start(&mut client, &sample_config(), "t").await;
+        assert_eq!(resp.status(), 500);
+        let _ = resp.into_body().collect().await;
+
+        let status = get_status(&mut client).await;
+        assert_eq!(
+            status.error, None,
+            "failed-start detail must not reach StatusResponse.error"
+        );
+        // Diagnostics still see the failure via last_error (covered by
+        // diagnostics_bridge_error_after_failed_start).
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
 // No dedicated log-capture test for the `error!("proxy start failed")`
 // path (and the analogous `handle_stop`/`handle_reload` calls); the
 // HTTP-500 + error message is covered by `start_failure_returns_error`

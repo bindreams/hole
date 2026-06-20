@@ -289,71 +289,86 @@ pub fn delete_server(state: State<AppState>, entry_id: String) -> Result<(), Str
     Ok(())
 }
 
-/// Poll the proxy's status. The exchange itself commits the observation
-/// to the `ProxyStateCell` (inside `BridgeLink::send`); the returned
-/// `running` + `state_seq` come from the committed cell so the frontend
-/// can apply observations monotonically (#462). The remaining fields are
-/// cosmetics from the raw response.
+/// Poll the proxy's status. The exchange commits the observation to the
+/// `ProxyStateCell` (inside `BridgeLink::send`); `running`, `state_seq`, and
+/// `error` all come from the committed snapshot so the frontend applies
+/// observations monotonically (#462) and the death `error` (#470) is the same
+/// string the `proxy-state-changed` event carries — see `map_status_response`.
+/// The remaining fields are cosmetics from the raw response.
 ///
-/// On `PermissionDenied` the cell is NOT committed (a DACL-gated Status
-/// says nothing about the tunnel), so `running` reports the last
-/// committed value while `error` carries the failure — stale truth beats
-/// flapping to false. Every other error arm commits false, so cell and
-/// cosmetics agree.
+/// On `PermissionDenied` the cell is NOT committed (a DACL-gated Status says
+/// nothing about the tunnel), so `running`/`state_seq`/`error` report the last
+/// committed values — stale truth beats flapping to false, and the unchanged
+/// `state_seq` makes the frontend gate drop the observation (no spurious toast).
 #[tauri::command]
 pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let result = state.bridge_send(BridgeRequest::Status).await;
     let snap = state.proxy_snapshot();
-    let mut json = match result {
+    Ok(map_status_response(result, snap))
+}
+
+// Response mappers (extracted for testability) ========================================================================
+
+/// Map a Status exchange + the committed snapshot to the GUI status JSON.
+/// `running`, `state_seq`, and `error` come from the snapshot — the single
+/// committed source of truth, so they agree with the `proxy-state-changed`
+/// event regardless of which channel wins the death-seq race (#470). The
+/// cosmetics come from the response. Capabilities are `null` (unknown) when the
+/// exchange did not return a Status: the bridge cannot vouch for them, and a
+/// `true` default would flicker the connected-state dots on a transient
+/// DACL/transport hiccup.
+fn map_status_response(
+    result: Result<BridgeResponse, ClientError>,
+    snap: crate::state::ProxySnapshot,
+) -> serde_json::Value {
+    let (uptime_secs, invalid_filters, udp, ipv6) = match &result {
         Ok(BridgeResponse::Status {
-            running: _,
             uptime_secs,
-            error,
             invalid_filters,
             udp_proxy_available,
             ipv6_bypass_available,
             ..
-        }) => serde_json::json!({
-            "uptime_secs": uptime_secs,
-            "error": error,
-            "invalid_filters": invalid_filters,
-            "udp_proxy_available": udp_proxy_available,
-            "ipv6_bypass_available": ipv6_bypass_available,
-        }),
+        }) => (
+            *uptime_secs,
+            serde_json::json!(invalid_filters),
+            serde_json::json!(*udp_proxy_available),
+            serde_json::json!(*ipv6_bypass_available),
+        ),
         Ok(BridgeResponse::Error { message }) => {
             warn!(error = %message, "bridge returned error for status");
-            serde_json::json!({
-                "uptime_secs": 0,
-                "error": message,
-                "invalid_filters": [],
-                "udp_proxy_available": true,
-                "ipv6_bypass_available": true,
-            })
+            (
+                0,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
         }
-        Ok(_) => serde_json::json!({
-            "uptime_secs": 0,
-            "error": "unexpected response from bridge",
-            "invalid_filters": [],
-            "udp_proxy_available": true,
-            "ipv6_bypass_available": true,
-        }),
+        Ok(_) => (
+            0,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
         Err(e) => {
-            // Bridge not running or unreachable — not an error for the frontend
-            serde_json::json!({
-                "uptime_secs": 0,
-                "error": format!("bridge unreachable: {e}"),
-                "invalid_filters": [],
-                "udp_proxy_available": true,
-                "ipv6_bypass_available": true,
-            })
+            warn!(error = %e, "bridge unreachable for status");
+            (
+                0,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
         }
     };
-    json["running"] = serde_json::json!(snap.running);
-    json["state_seq"] = serde_json::json!(snap.seq);
-    Ok(json)
+    serde_json::json!({
+        "running": snap.running,
+        "state_seq": snap.seq,
+        "error": snap.error,
+        "uptime_secs": uptime_secs,
+        "invalid_filters": invalid_filters,
+        "udp_proxy_available": udp,
+        "ipv6_bypass_available": ipv6,
+    })
 }
-
-// Response mappers (extracted for testability) ========================================================================
 
 fn map_metrics_response(result: Result<BridgeResponse, ClientError>) -> serde_json::Value {
     match result {

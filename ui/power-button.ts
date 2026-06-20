@@ -117,6 +117,7 @@ let lastAppliedSeq = -1;
 export function applyProxyStateObservation(
   seq: number,
   running: boolean,
+  error: string | null = null,
 ): { state: ConnectionState; changed: boolean } {
   if (seq <= lastAppliedSeq) {
     return { state: currentState, changed: false };
@@ -125,17 +126,26 @@ export function applyProxyStateObservation(
   if (!IDLE_STATES.has(currentState)) {
     return { state: currentState, changed: false };
   }
+  const prior = currentState;
   const polled = stateForPolledRunning(running);
-  if (polled === currentState) {
+  if (polled === prior) {
     return { state: currentState, changed: false };
   }
   setState(polled);
+  // Exactly-once death cue (#470): a genuine on->off transition carrying a
+  // reason. The seq gate fires this once per death seq across BOTH channels
+  // (poll + event), `isEffectivelyOn(prior)` excludes connection-failed and
+  // startup-into-dead, and `error` is non-null only on an out-of-band death
+  // (the path-free sentinel — see commands::map_status_response).
+  if (polled === "disconnected" && isEffectivelyOn(prior) && error != null) {
+    showToast(error, "error");
+  }
   return { state: currentState, changed: true };
 }
 
 /** Update the connection state from a periodic proxy status poll. */
 export function updateProxyStatus(status: ProxyStatus): { state: ConnectionState; changed: boolean } {
-  return applyProxyStateObservation(status.state_seq, !!status.running);
+  return applyProxyStateObservation(status.state_seq, !!status.running, status.error);
 }
 
 /** Returns the current connection state. */

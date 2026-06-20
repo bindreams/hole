@@ -110,12 +110,34 @@ export interface UiSettings {
   diagnostic_plugin_tap: boolean;
 }
 
+/// A filter rule the bridge compiled and DROPPED (not enforced). `index` is
+/// the rule's position in the submitted ruleset, 1:1 with `config.filters`
+/// (incl. the default rule at index 0). Mirrors the Rust `InvalidFilter` in
+/// `crates/common/src/protocol.rs` (#470).
+export interface InvalidFilter {
+  index: number;
+  error: string;
+}
+
 export interface ProxyStatus {
   running: boolean;
   /// Commit seq of the backend's ProxyStateCell at response time. The
   /// frontend applies observations monotonically by this value; see
   /// `applyProxyStateObservation` in `ui/power-button.ts` (#462).
   state_seq: number;
+  uptime_secs: number;
+  /// Reason for the most recent running transition, when the bridge reported
+  /// one (#470). Non-null only on an out-of-band death (the path-free
+  /// sentinel); drives the exactly-once death toast.
+  error: string | null;
+  /// Filter rules the bridge rejected and is NOT enforcing. `null` when the
+  /// bridge could not vouch this poll (a non-Status arm); the UI keeps the
+  /// last-known list in that case.
+  invalid_filters: InvalidFilter[] | null;
+  /// `null` when the bridge could not vouch for the capability (a non-Status
+  /// poll arm); the UI keeps the last-known value in that case.
+  udp_proxy_available: boolean | null;
+  ipv6_bypass_available: boolean | null;
 }
 
 export interface Metrics {

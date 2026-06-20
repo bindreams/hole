@@ -12,6 +12,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -24,6 +25,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -34,6 +36,7 @@ fn cell_bumps_seq_only_on_change() {
         ProxySnapshot {
             seq: 2,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -49,10 +52,11 @@ async fn cell_wakes_watchers_only_on_change() {
     cell.commit(true);
     assert!(rx.has_changed().unwrap());
     assert_eq!(
-        *rx.borrow_and_update(),
+        rx.borrow_and_update().clone(),
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false,
         }
@@ -66,7 +70,7 @@ fn commit_status_carries_lockdown_fields() {
     let s0 = cell.snapshot();
     assert!(!s0.lockdown_enabled && !s0.lockdown_active);
     // A Status commit threads both lockdown bools alongside `running`.
-    cell.commit_status(true, true, false);
+    cell.commit_status(true, None, true, false);
     let s1 = cell.snapshot();
     assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
     assert_eq!(s1.seq, 1, "seq bumped on change");
@@ -78,7 +82,7 @@ fn commit_preserves_lockdown_fields() {
     // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
     // a prior Status established (`enabled && !active` is the tray warning state).
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, true, false); // running + lockdown enabled, not active
+    cell.commit_status(true, None, true, false); // running + lockdown enabled, not active
     let before = cell.snapshot();
     assert!(before.lockdown_enabled && !before.lockdown_active);
 
@@ -90,6 +94,86 @@ fn commit_preserves_lockdown_fields() {
         "commit must preserve the lockdown fields, got {after:?}"
     );
     assert_eq!(after.seq, before.seq + 1, "running change bumps seq");
+}
+
+// error field (#470) ==================================================================================================
+
+#[skuld::test]
+fn commit_status_carries_error_on_death() {
+    let cell = ProxyStateCell::new();
+    cell.commit(true); // connected
+    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    let snap = cell.snapshot();
+    assert!(!snap.running);
+    assert_eq!(snap.error.as_deref(), Some("proxy task exited unexpectedly"));
+    assert_eq!(snap.seq, 2, "running change bumps seq");
+}
+
+#[skuld::test]
+fn commit_clears_error_on_non_status_running_change() {
+    // A non-Status running edge (Start/Stop/Cancel) is user-initiated and
+    // carries no death reason — `commit` must clear any prior error.
+    let cell = ProxyStateCell::new();
+    cell.commit_status(true, Some("synthetic".into()), false, false); // running -> true with an error
+    assert_eq!(cell.snapshot().error.as_deref(), Some("synthetic"));
+    cell.commit(false); // clean stop via the non-Status path
+    assert_eq!(cell.snapshot().error, None, "non-Status commit must clear error");
+}
+
+#[skuld::test]
+fn reconnect_clears_death_error() {
+    let cell = ProxyStateCell::new();
+    cell.commit(true);
+    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    cell.commit(true); // reconnect via a Start Ack
+    assert_eq!(cell.snapshot().error, None);
+}
+
+#[skuld::test]
+fn proxy_snapshot_serializes_error() {
+    // The proxy-state-changed event emits the snapshot; the webview reads
+    // `event.payload.error`. Some -> string, None -> null (no skip).
+    let some = serde_json::to_value(ProxySnapshot {
+        seq: 1,
+        running: false,
+        error: Some("boom".into()),
+        lockdown_enabled: false,
+        lockdown_active: false,
+    })
+    .unwrap();
+    assert_eq!(some["error"], "boom");
+    let none = serde_json::to_value(ProxySnapshot {
+        seq: 0,
+        running: false,
+        error: None,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    })
+    .unwrap();
+    assert!(
+        none["error"].is_null(),
+        "None error serializes as null for the TS payload"
+    );
+}
+
+#[skuld::test]
+fn observed_error_only_from_status_ok() {
+    let status = Ok(BridgeResponse::Status {
+        running: false,
+        uptime_secs: 0,
+        error: Some("proxy task exited unexpectedly".into()),
+        invalid_filters: vec![],
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    assert_eq!(
+        observed_error(&status).as_deref(),
+        Some("proxy task exited unexpectedly")
+    );
+    assert_eq!(observed_error(&Ok(BridgeResponse::Ack)), None);
+    assert_eq!(observed_error(&Err(ClientError::PermissionDenied)), None);
 }
 
 // observed_running ====================================================================================================
@@ -322,6 +406,7 @@ async fn start_ack_commits_true() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -373,6 +458,7 @@ async fn transport_error_commits_false() {
         ProxySnapshot {
             seq: 2,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -406,6 +492,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         },
@@ -478,6 +565,7 @@ async fn oneshot_never_commits() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -509,6 +597,7 @@ async fn untracked_requests_never_commit() {
         ProxySnapshot {
             seq: 0,
             running: false,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -569,6 +658,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
@@ -631,6 +721,7 @@ async fn reload_if_running_reloads_when_running() {
         ProxySnapshot {
             seq: 1,
             running: true,
+            error: None,
             lockdown_enabled: false,
             lockdown_active: false
         }
