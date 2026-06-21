@@ -284,7 +284,7 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
         Command::Bridge {
             action: BridgeAction::Install { log_dir: Some(d), .. },
         } => Some(d.clone()),
-        _ => Some(hole_common::logging::default_log_dir()),
+        _ => Some(hole_common::logging::resolve_log_dir(None)),
     }
 }
 
@@ -482,18 +482,20 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             #[cfg(not(target_os = "macos"))]
             let owner_ids: Option<(u32, u32)> = None;
 
-            let log_dir = log_dir
-                .or_else(|| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        owner.as_ref().map(|u| user_log_dir(&u.home))
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        None
-                    }
-                })
-                .unwrap_or_else(hole_common::logging::default_log_dir);
+            // Precedence: explicit `--log-dir` or the resolved-user home (for an
+            // elevated user-scoped run) → `HOLE_LOG_DIR` env → default. The chown
+            // happens regardless of which dir wins, since `init_dual` chowns
+            // `log_dir` with `owner_ids`.
+            let log_dir = hole_common::logging::resolve_log_dir(log_dir.or_else(|| {
+                #[cfg(target_os = "macos")]
+                {
+                    owner.as_ref().map(|u| user_log_dir(&u.home))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            }));
             let _guard = hole_bridge::logging::init(&log_dir, owner_ids);
             tracing::info!("hole bridge starting");
 

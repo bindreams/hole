@@ -1297,6 +1297,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix 0.31.2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,7 +1503,9 @@ dependencies = [
 name = "dev-console"
 version = "0.1.0"
 dependencies = [
+ "anstream",
  "anyhow",
+ "chrono",
  "futures-util",
  "hole-test-observability",
  "kill-group",
@@ -2249,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "galoshes"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9586,9 +9599,11 @@ dependencies = [
  "anyhow",
  "cargo_metadata 0.23.1",
  "clap",
+ "ctrlc",
  "flate2",
  "glob",
  "indexmap 2.14.0",
+ "libc",
  "petgraph",
  "serde",
  "serde_json",
@@ -9598,6 +9613,7 @@ dependencies = [
  "tar",
  "tempfile",
  "ureq",
+ "windows 0.62.2",
  "xtask-lib",
  "zip",
 ]

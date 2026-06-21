@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
+    xtask::install_transparent_interrupt();
     let cli = xtask::Cli::parse();
     match xtask::dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,

@@ -142,6 +142,80 @@ pub fn default_log_dir() -> PathBuf {
     crate::paths::default_user_subdir("logs")
 }
 
+/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
+/// else [`default_log_dir`]. A blank `HOLE_LOG_DIR` is ignored.
+pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
+    let env_dir = std::env::var_os("HOLE_LOG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    resolve_log_dir_from(override_dir, env_dir)
+}
+
+fn resolve_log_dir_from(override_dir: Option<PathBuf>, env_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.or(env_dir).unwrap_or_else(default_log_dir)
+}
+
+// Per-sink directive resolution =======================================================================================
+
+/// Split a comma-separated directive value: trim each piece, drop blanks.
+pub fn split_directives(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Resolve `(file_directives, stderr_directives)` from the environment for the
+/// native per-sink logging policy. `default` is the component's built-in file
+/// directive (`hole=info` / `hole_bridge=info`); `component_file_env` is an
+/// optional component-specific override var name (e.g. `HOLE_BRIDGE_LOG`).
+///
+/// File sink: component env, else `HOLE_LOG`, else `default`. Stderr sink:
+/// `HOLE_LOG_STDERR` if set, else mirror the file sink — so with nothing set
+/// both sinks match exactly (production parity).
+pub fn resolve_sink_directives(default: &str, component_file_env: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let component_file = component_file_env.and_then(|name| std::env::var(name).ok());
+    let hole_log = std::env::var("HOLE_LOG").ok();
+    let hole_log_stderr = std::env::var("HOLE_LOG_STDERR").ok();
+    resolve_sink_directives_from(
+        default,
+        component_file.as_deref(),
+        hole_log.as_deref(),
+        hole_log_stderr.as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_sink_directives`] — no env reads, table-testable.
+fn resolve_sink_directives_from(
+    default: &str,
+    component_file: Option<&str>,
+    hole_log: Option<&str>,
+    hole_log_stderr: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+    let file_raw = component_file
+        .and_then(nonblank)
+        .or_else(|| hole_log.and_then(nonblank))
+        .unwrap_or_else(|| default.to_string());
+    let mut file = split_directives(&file_raw);
+    if file.is_empty() {
+        file = split_directives(default);
+    }
+    let stderr = match hole_log_stderr.and_then(nonblank) {
+        Some(raw) => {
+            let s = split_directives(&raw);
+            if s.is_empty() {
+                file.clone()
+            } else {
+                s
+            }
+        }
+        None => file.clone(),
+    };
+    (file, stderr)
+}
+
 // Stdio redirect ======================================================================================================
 
 /// Which standard stream we're redirecting.
@@ -486,9 +560,59 @@ const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 /// With a value of 1, the on-disk layout is `<name>` (current) + `<name>.1` (previous).
 const MAX_ROTATED_LOGS: usize = 1;
 
-/// Initialize logging with one caller-supplied filter directive.
+/// Build one `EnvFilter` from a directive slice: global default `info`,
+/// `RUST_LOG` via `from_env_lossy`, the slice on top, then the
+/// `hole::logging=debug` pin. Built per sink because `EnvFilter` is not Clone.
+fn build_filter(directives: &[String]) -> EnvFilter {
+    let mut f = EnvFilter::builder()
+        .with_default_directive("info".parse().expect("valid directive"))
+        .from_env_lossy();
+    for d in directives {
+        f = f.add_directive(d.parse().expect("valid tracing directive"));
+    }
+    f.add_directive("hole::logging=debug".parse().expect("valid directive"))
+}
+
+/// Compose the two filtered fmt layers over a registry. Generic over the
+/// writers so unit tests can supply capturing buffers and the production
+/// caller supplies non-blocking writers. The stderr layer additionally drops
+/// the relay-target events; the file layer keeps them.
+fn compose_subscriber<FW, SW>(
+    file_writer: FW,
+    stderr_writer: SW,
+    file_directives: &[String],
+    stderr_directives: &[String],
+) -> impl tracing::Subscriber + Send + Sync
+where
+    FW: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+    SW: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::Layer as _;
+
+    let no_relay = tracing_subscriber::filter::filter_fn(|m| {
+        !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
+    });
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_writer)
+        .with_ansi(false)
+        .event_format(yaml_format::YamlFormat)
+        .with_filter(build_filter(file_directives));
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(stderr_writer)
+        .with_ansi(true)
+        .event_format(yaml_format::YamlFormat)
+        .with_filter(no_relay)
+        .with_filter(build_filter(stderr_directives));
+
+    tracing_subscriber::registry().with(file_layer).with(stderr_layer)
+}
+
+/// Initialize logging with one caller-supplied filter directive (both sinks).
 ///
-/// Thin wrapper around [`init_multi`] preserved for callers that only have
+/// Thin wrapper around [`init_dual`] preserved for callers that only have
 /// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
 /// guard that must be held for the process lifetime to ensure logs are
 /// flushed and the relay reader threads stay alive.
@@ -502,16 +626,12 @@ pub fn init(
     init_multi(log_dir, kind, log_filename, [default_directive], owner)
 }
 
-/// Initialize logging with one or more caller-supplied filter directives.
+/// Initialize logging with one or more caller-supplied filter directives
+/// (both sinks).
 ///
 /// Each directive is parsed and added to the env filter via
 /// `EnvFilter::add_directive`, in the order given. Later directives override
 /// earlier ones at equal specificity per `tracing-subscriber`'s rules.
-///
-/// The global default of `info` is set first; `RUST_LOG` (read by
-/// `from_env_lossy`) is layered next; the caller's directives are layered on
-/// top; finally `hole::logging=debug` is pinned so the logging subsystem
-/// itself emits lifecycle events.
 ///
 /// Use this rather than [`init`] when the caller wants to honor a
 /// comma-separated env var like
@@ -529,6 +649,29 @@ where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
+    let v: Vec<String> = directives.into_iter().map(|d| d.as_ref().to_string()).collect();
+    init_dual(log_dir, kind, log_filename, &v, &v, owner)
+}
+
+/// Initialize logging with independent file-sink and stderr-sink directives —
+/// the native per-sink path. The file sink can run at TRACE while stderr stays
+/// at INFO. Creates `log_dir`; returns a guard that must be held for the
+/// process lifetime to ensure logs are flushed and the relay reader threads
+/// stay alive.
+///
+/// The global default of `info` is set per sink (third-party crates emit
+/// useful startup/warning diagnostics without per-crate directives); `RUST_LOG`
+/// is layered next; the sink's directives are layered on top; finally
+/// `hole::logging=debug` is pinned so the logging subsystem itself emits
+/// lifecycle events.
+pub fn init_dual(
+    log_dir: &Path,
+    kind: &'static str,
+    log_filename: &str,
+    file_directives: &[String],
+    stderr_directives: &[String],
+    owner: Option<(u32, u32)>,
+) -> LogGuard {
     let _ = std::fs::create_dir_all(log_dir);
     // The elevated bridge creates `log_dir` as root; hand it to the real user
     // so they can read `bridge.log` without `sudo` (#572). No-op when `owner`
@@ -538,12 +681,8 @@ where
 
     // Order matters: redirect BEFORE constructing the non-blocking stderr
     // writer so the writer targets the saved-original handle, not the pipe.
-    //
-    // `HOLE_LOGGING_DISABLE_REDIRECT` is honored only in dev/test builds
-    // (`debug_assertions`). Tests that call `init()` but don't want a global
-    // FD redirect set it because libtest-mimic prints per-test result lines
-    // to FD 1, and the redirect would eat them. In release builds the env
-    // var is ignored — the FD safety net is non-negotiable in production.
+    // `HOLE_LOGGING_DISABLE_REDIRECT` is honored only in dev/test builds; in
+    // release the FD safety net is non-negotiable (the env var is a no-op).
     let (relays, original_stderr) = if disable_redirect_for_tests() {
         (
             StdioRelayHandles {
@@ -587,54 +726,11 @@ where
     let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(owned);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
-    // Global default is INFO so third-party crates (shadowsocks-service,
-    // hickory, hyper, etc.) emit useful startup/warning diagnostics without
-    // needing per-crate directives. Caller directives are layered on top,
-    // each one independently parseable (e.g. `hole_bridge=debug` and
-    // `shadowsocks_service=trace` together).
-    //
-    // `hole::logging=debug` is the only pin below INFO — it lets the
-    // logging subsystem itself emit debug-level lifecycle events.
-    let mut env_filter = EnvFilter::builder()
-        .with_default_directive("info".parse().expect("valid directive"))
-        .from_env_lossy();
-    for d in directives {
-        env_filter = env_filter.add_directive(d.as_ref().parse().expect("valid tracing directive"));
-    }
-    let env_filter = env_filter.add_directive("hole::logging=debug".parse().expect("valid directive"));
-
-    // Filter that excludes the relay's own events from the stderr layer to
-    // prevent any feedback loop in either direction. The file layer has no
-    // such filter — the whole point is to capture relay events to the file.
-    let no_relay = tracing_subscriber::filter::filter_fn(|m| {
-        !m.target().starts_with("hole::stderr_relay") && !m.target().starts_with("hole::stdout_relay")
-    });
-
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_nb)
-        .with_ansi(false)
-        .event_format(yaml_format::YamlFormat);
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(stderr_nb)
-        .with_ansi(true)
-        .event_format(yaml_format::YamlFormat)
-        .with_filter(no_relay);
-
-    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::Layer;
-    // Sanctioned by clippy.toml `disallowed_methods` (see #301).
-    // Production bridge logger — this is the ONE caller of
-    // `try_init` workspace-wide. Tests use
-    // `hole_test_observability::register!()` instead.
+    // Sanctioned by clippy.toml `disallowed_methods` (see #301): the ONE
+    // production `try_init` workspace-wide. Tests use `register!()`.
     #[allow(clippy::disallowed_methods)]
-    if let Err(e) = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(file_layer)
-        .with(stderr_layer)
-        .try_init()
-    {
+    if let Err(e) = compose_subscriber(file_nb, stderr_nb, file_directives, stderr_directives).try_init() {
         // Subscriber not yet active; write directly to FD 2. Goes through the
         // redirect → relay → file layer once installed elsewhere.
         let _ = writeln!(io::stderr(), "hole: tracing subscriber init failed: {e}");

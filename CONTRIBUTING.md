@@ -583,7 +583,7 @@ build graph; `cargo xtask list` prints the target table.
 npm install                  # frontend deps (first time only)
 cargo xtask deps             # build ex-ray (Go) + download/verify wintun.dll (cached)
 cargo xtask build hole       # deps + cargo build (debug) + stage to target/debug/dist
-cargo xtask run hole         # dev mode (= build hole + dev-console)
+cargo xtask run hole         # dev mode (build cascade, then dev-console supervises)
 cargo xtask run hole-tests   # canonical local nextest invocation
 ```
 
@@ -650,10 +650,11 @@ cargo xtask run hole
 > Closing this sudo-invocation path structurally is tracked in #453.
 
 `cargo xtask run hole` launches the [`dev-console`](crates/dev-console/)
-supervisor, which builds the workspace, starts Vite, and launches bridge + GUI
-with multiplexed color-coded logs. `cargo run -p dev-console` works standalone
-too (it runs `cargo xtask build hole` itself). Frontend changes hot-reload via
-Vite HMR; Rust changes need Ctrl+C and re-run.
+supervisor, which starts Vite and launches bridge + GUI with multiplexed
+color-coded logs. dev-console builds nothing — the xtask cascade builds first
+(#564); `cargo run -p dev-console` works standalone against an already-built
+tree. Frontend changes hot-reload via Vite HMR; Rust changes need Ctrl+C and
+re-run.
 
 - **dev-console runs unprivileged and elevates only the bridge.** On macOS it
   prompts for your sudo password once, then `sudo`s just `bridge grant-access` +
@@ -676,6 +677,11 @@ Vite HMR; Rust changes need Ctrl+C and re-run.
   that ignore the graceful signal for 10s are force-killed with their process
   trees — except the macOS bridge, which sudo cannot force-kill; dev-console
   prints a `network-reset.py` recovery pointer instead.
+- **Multiplexed logs (`mux`).** Steady state streams each child's entries in
+  arrival order, deferring an EntryBuffered stream's most-recent entry until its
+  next anchor or pipe EOF (atomic multi-line framing). At shutdown the printer
+  switches to collect-and-sort, emitting the trailing burst ordered by ISO
+  timestamp instead of pump-EOF order (bindreams/hole#568).
 
 ### Manual workflow
 
@@ -883,6 +889,19 @@ content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
 `hole_bridge=debug,shadowsocks_service=trace` adds shadowsocks-service per-relay
 byte counts (`L2R N bytes, R2L M bytes`) — a load-bearing #248-class diagnostic,
 but expensive (≥1 TRACE line per TCP connection); use for debugging only.
+
+The file and stderr sinks filter independently. `HOLE_LOG` sets the file-sink
+directives; `HOLE_LOG_STDERR` sets the stderr-sink directives (defaults to
+mirroring the file sink when unset); `HOLE_LOG_DIR` overrides the log directory.
+`HOLE_BRIDGE_LOG` stays the bridge's file-sink override and takes precedence over
+`HOLE_LOG`.
+
+### Dev-run capture
+
+`cargo xtask run hole` writes `<repo>/.tmp/dev-run/<datetime>/` per run:
+`bridge.log` and `gui.log` at trace (Hole crates trace, deps debug), plus
+`dev-console.log` (the supervisor transcript and the runtime mux at info). No
+retention — old run dirs are kept until you delete them.
 
 ### Plugin diagnostics
 

@@ -54,6 +54,23 @@ pub(crate) fn is_reaped(child: &Child) -> bool {
     child.id().is_none()
 }
 
+/// Create the per-run dir `<parent>/<name>`. On a same-second collision (the
+/// dir already exists — a concurrent run the Vite-port guard will reject), fall
+/// back to `<name>-<pid>` so the doomed run can't truncate the live run's logs.
+pub(crate) fn create_run_dir(parent: &Path, name: &str, pid: u32) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(parent)?;
+    let primary = parent.join(name);
+    match std::fs::create_dir(&primary) {
+        Ok(()) => Ok(primary),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let alt = parent.join(format!("{name}-{pid}"));
+            std::fs::create_dir_all(&alt)?;
+            Ok(alt)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl BridgeChild {
     fn child_mut(&mut self) -> &mut Child {
         match self {
@@ -115,11 +132,11 @@ pub async fn main() -> ExitCode {
                 // dev.py parity: npm/cargo failures exit with the child's
                 // code and no extra line; stage prints its yellow message.
                 if let Some(msg) = &step.message {
-                    eprintln!("{YELLOW}{msg}{RESET}");
+                    enote!("{YELLOW}{msg}{RESET}");
                 }
                 return ExitCode::from(step.code.clamp(1, 255) as u8);
             }
-            eprintln!("{YELLOW}dev-console: {e:#}{RESET}");
+            enote!("{YELLOW}dev-console: {e:#}{RESET}");
             ExitCode::FAILURE
         }
     }
@@ -139,6 +156,18 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     }
     std::env::set_current_dir(&repo_root).context("cd to repo root")?;
 
+    // Dev-run capture: <repo>/.tmp/dev-run/<datetime>/ with bridge.log +
+    // gui.log (trace, native file sinks redirected here) and dev-console.log
+    // (this supervisor's status + the runtime mux at info, ANSI stripped).
+    let run_parent = repo_root.join(".tmp").join("dev-run");
+    let run_dir = create_run_dir(
+        &run_parent,
+        &crate::policy::dev_run_subdir_name(chrono::Local::now().naive_local()),
+        std::process::id(),
+    )
+    .context("creating dev-run dir")?;
+    crate::transcript::set_global(crate::transcript::Transcript::create(&run_dir.join("dev-console.log")));
+
     // 1. Privilege policy (dev.py §5.10) ==============================================================================
     let euid: Option<u32>;
     #[cfg(unix)]
@@ -155,12 +184,12 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
         {
             #[cfg(windows)]
             if let Err(e) = stepstool::require_elevated() {
-                eprintln!("ERROR: {e}");
+                enote!("ERROR: {e}");
                 return Ok(ExitCode::FAILURE);
             }
         }
         ElevationAction::PosixErrorRoot => {
-            eprintln!(
+            enote!(
                 "ERROR: do not run dev mode as root / under sudo.\n\
                  Run `cargo xtask run hole` (no sudo) — dev-console elevates only the\n\
                  bridge itself. Running as root leaves root-owned files in target/."
@@ -174,7 +203,9 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     let cargo = steps::resolve_tool("cargo")?;
     let npm = steps::resolve_tool("npm")?;
     steps::ensure_node_modules(&npm, interrupts).await?;
-    steps::cargo_build(&cargo, interrupts).await?;
+    // No workspace build here: dev-console supervises only (#564). The xtask
+    // cascade built everything; a standalone run reuses the existing build,
+    // which `stage_bindir` (cargo xtask stage) validates.
 
     // 3. Per-pid stage (guard registered BEFORE mkdir; dev.py §5.11) ==================================================
     let stage_guard = steps::StageDirGuard::register(steps::stage_dir_path(std::process::id()));
@@ -189,7 +220,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 
     // 4. Leaked-vite preflight (Delta 7): vite uses strictPort 1420 ===================================================
     if port_in_use(VITE_PORT).await {
-        eprintln!(
+        enote!(
             "{YELLOW}Port {VITE_PORT} is already in use — a previous dev run's Vite may have \
              leaked. Kill it (or whatever holds the port) and re-run.{RESET}"
         );
@@ -199,22 +230,22 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     // 5. sudo preflight (POSIX; dev.py §5.8) ==========================================================================
     #[cfg(unix)]
     {
-        println!("{BOLD}Dev mode needs root for the bridge — caching sudo credentials...{RESET}");
+        note!("{BOLD}Dev mode needs root for the bridge — caching sudo credentials...{RESET}");
         if let Err(e) = stepstool::prime_sudo() {
-            eprintln!("{YELLOW}{e}{RESET}");
+            enote!("{YELLOW}{e}{RESET}");
             return Ok(ExitCode::FAILURE);
         }
     }
 
     // 6. grant-access via the production path (dev.py §5.15) ==========================================================
-    println!("{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}");
+    note!("{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}");
     let ga = grant_access_argv(Os::host(), &bridge_bin.to_string_lossy());
     let mut cmd = Command::new(&ga[0]);
     cmd.args(&ga[1..]);
     let status = cmd.status().await.context("spawning bridge grant-access")?;
     if !status.success() {
         let code = status.code().unwrap_or(1);
-        eprintln!("{YELLOW}bridge grant-access failed (exit {code}){RESET}");
+        enote!("{YELLOW}bridge grant-access failed (exit {code}){RESET}");
         return Ok(ExitCode::from(code.clamp(1, 255) as u8));
     }
 
@@ -224,12 +255,12 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
         let gid = match crate::group_gate::hole_gid() {
             Ok(g) => g,
             Err(warn) => {
-                eprintln!("{YELLOW}warning: could not look up 'hole' group: {warn}{RESET}");
+                enote!("{YELLOW}warning: could not look up 'hole' group: {warn}{RESET}");
                 None
             }
         };
         if crate::group_gate::missing_hole_group(gid, &crate::group_gate::current_gids()) {
-            eprintln!(
+            enote!(
                 "\n{YELLOW}Added you to the 'hole' group, but your current login session \
                  predates it,\nso the dashboard can't reach the bridge yet. Log out and back \
                  in (or reboot),\nthen run `cargo xtask run hole` again. One-time per machine. \
@@ -241,13 +272,22 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 
     // 8. Banner =======================================================================================================
     let sudo_note = if cfg!(windows) { "" } else { "sudo " };
-    print!(
+    note!(
         "{}",
-        startup_banner(&socket_path, &state_dir, &bridge_bin, &gui_bin, sudo_note)
+        startup_banner(&socket_path, &state_dir, &run_dir, &bridge_bin, &gui_bin, sudo_note).trim_end()
     );
-    println!();
+    note!("");
 
-    supervise_children(interrupts, &npm, &bridge_bin, &gui_bin, &socket_path, &state_dir).await
+    supervise_children(
+        interrupts,
+        &npm,
+        &bridge_bin,
+        &gui_bin,
+        &socket_path,
+        &state_dir,
+        &run_dir,
+    )
+    .await
 }
 
 /// Spawn-and-supervise with a SINGLE exit funnel: whatever the startup or
@@ -260,9 +300,18 @@ async fn supervise_children(
     gui_bin: &Path,
     socket_path: &Path,
     state_dir: &Path,
+    run_dir: &Path,
 ) -> Result<ExitCode> {
     let (tx, rx) = mpsc::channel::<Entry>(256);
-    let mut printer = tokio::spawn(crate::mux::printer(rx, tokio::io::stdout()));
+    let (enter_drain_tx, enter_drain_rx) = tokio::sync::oneshot::channel();
+    let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
+    let mut printer = tokio::spawn(crate::mux::printer(
+        rx,
+        tokio::io::stdout(),
+        crate::transcript::global(),
+        enter_drain_rx,
+        finalize_rx,
+    ));
 
     let mut bridge: Option<BridgeChild> = None;
     let mut vite: Option<GroupedChild> = None;
@@ -273,21 +322,26 @@ async fn supervise_children(
     // below always runs, on panics too.
     // AssertUnwindSafe: after a panic the funnel touches only the slot
     // Options, which are coherent at every await point.
-    let outcome: Result<ExitCause> = match std::panic::AssertUnwindSafe(startup_and_supervise(
+    let caught = std::panic::AssertUnwindSafe(startup_and_supervise(
         interrupts,
         npm,
         bridge_bin,
         gui_bin,
         socket_path,
         state_dir,
+        run_dir,
         &tx,
         &mut bridge,
         &mut vite,
         &mut gui,
     ))
     .catch_unwind()
-    .await
-    {
+    .await;
+    // We are now shutting down: stop streaming so the trailing entries are
+    // collected and emitted in timestamp order (#568). Fired ONCE, before
+    // both the panic-arm shutdown and the normal shutdown.
+    let _ = enter_drain_tx.send(());
+    let outcome: Result<ExitCause> = match caught {
         Ok(outcome) => outcome,
         Err(panic) => {
             // dev.py's `finally` ran on arbitrary exceptions: tear down the
@@ -300,11 +354,18 @@ async fn supervise_children(
     shutdown(bridge.as_mut(), vite.as_mut(), gui.as_mut()).await;
 
     drop(tx);
-    // Class-2 bound (external pipes that may never EOF): the WarnRecovery
-    // bridge is deliberately never killed, so its pump can hold its sender
-    // forever; drain what's buffered, then abandon (dev.py join(timeout=5)).
+    // Drain. The printer is collecting the post-`enter_drain` tail; on rx
+    // close it sorts + flushes. Class-2 bound (external pipes that may never
+    // EOF): the WarnRecovery bridge is deliberately never killed, so its pump
+    // can hold its sender forever and `rx` never closes. On that timeout fire
+    // `finalize` so the printer still sorts + writes what it collected, then
+    // re-bound the flush so a wedged stdout can't hang teardown (dev.py
+    // join(timeout=5)).
     if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
-        printer.abort();
+        let _ = finalize_tx.send(());
+        if tokio::time::timeout(PRINTER_DRAIN_TIMEOUT, &mut printer).await.is_err() {
+            printer.abort();
+        }
     }
 
     let cause = outcome?;
@@ -319,6 +380,7 @@ async fn startup_and_supervise(
     gui_bin: &Path,
     socket_path: &Path,
     state_dir: &Path,
+    run_dir: &Path,
     tx: &mpsc::Sender<Entry>,
     bridge_slot: &mut Option<BridgeChild>,
     vite_slot: &mut Option<GroupedChild>,
@@ -336,6 +398,11 @@ async fn startup_and_supervise(
     );
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
+    // Per-sink dev logging: file=trace into the run dir, stderr=info to the
+    // terminal. These ride the sudo boundary via SUDO_PRESERVE_ENV.
+    for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_BRIDGE) {
+        cmd.env(k, v);
+    }
     // stdin=null: an expired sudo timestamp gets EOF and exits non-zero
     // instead of hanging on an invisible prompt (with the setsid TTY detach
     // in spawn_bridge); also the console-corruption discipline every child
@@ -356,7 +423,7 @@ async fn startup_and_supervise(
             // printer) — dev.py parity: its prints didn't take the print
             // lock either; a rare interleave with a child entry is accepted.
             // dev.py:578-585 (stdout, like dev.py's print):
-            println!(
+            note!(
                 "{YELLOW}Bridge exited with code {} (sudo credentials may have expired, or a \
                  restrictive sudoers env_check/env_delete rejected --preserve-env){RESET}",
                 status.code().unwrap_or(-1)
@@ -368,7 +435,7 @@ async fn startup_and_supervise(
             r.context("ready listener failed")?;
         }
         _ = tokio::time::sleep(SOCKET_READY_TIMEOUT) => {
-            println!("{YELLOW}Bridge did not signal readiness within {}s{RESET}", SOCKET_READY_TIMEOUT.as_secs());
+            note!("{YELLOW}Bridge did not signal readiness within {}s{RESET}", SOCKET_READY_TIMEOUT.as_secs());
             return Ok(ExitCause::StartupFailed);
         }
     }
@@ -389,13 +456,13 @@ async fn startup_and_supervise(
     tokio::select! {
         biased;
         status = vite.child.wait() => {
-            println!("{YELLOW}Vite exited with code {}{RESET}", status?.code().unwrap_or(-1));
+            note!("{YELLOW}Vite exited with code {}{RESET}", status?.code().unwrap_or(-1));
             return Ok(ExitCause::StartupFailed);
         }
         _ = interrupts.recv() => return Ok(ExitCause::Interrupted),
         up = wait_for_port(VITE_PORT, VITE_READY_TIMEOUT) => {
             if !up {
-                println!("{YELLOW}Vite did not start on port {VITE_PORT} within {}s{RESET}", VITE_READY_TIMEOUT.as_secs());
+                note!("{YELLOW}Vite did not start on port {VITE_PORT} within {}s{RESET}", VITE_READY_TIMEOUT.as_secs());
                 return Ok(ExitCause::StartupFailed);
             }
         }
@@ -411,12 +478,15 @@ async fn startup_and_supervise(
         format!("{} {cdp}", existing.trim())
     };
     if !webview_debug_hint().is_empty() {
-        println!("{}", webview_debug_hint());
+        note!("{}", webview_debug_hint());
     }
     let mut cmd = Command::new(gui_bin);
     cmd.arg("--show-dashboard");
     cmd.env("HOLE_BRIDGE_SOCKET", socket_path);
     cmd.env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
+    for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_GUI) {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
     let gui = gui_slot.insert(GroupedChild::spawn(&mut cmd, Nesting::Mark).context("spawning the GUI")?);
@@ -438,15 +508,15 @@ async fn startup_and_supervise(
 fn exited(name: &str, status: std::io::Result<std::process::ExitStatus>) -> ExitCause {
     match status {
         Ok(s) if s.success() => {
-            println!("{YELLOW}{name} exited; shutting down{RESET}");
+            note!("{YELLOW}{name} exited; shutting down{RESET}");
             ExitCause::ChildExitedClean
         }
         Ok(s) => {
-            eprintln!("{YELLOW}{name} exited unexpectedly ({s}){RESET}");
+            enote!("{YELLOW}{name} exited unexpectedly ({s}){RESET}");
             ExitCause::ChildFailed
         }
         Err(e) => {
-            eprintln!("{YELLOW}{name} exited unexpectedly (wait error: {e}){RESET}");
+            enote!("{YELLOW}{name} exited unexpectedly (wait error: {e}){RESET}");
             ExitCause::ChildFailed
         }
     }
@@ -458,7 +528,7 @@ async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChi
     if bridge.is_none() && vite.is_none() && gui.is_none() {
         return;
     }
-    println!("\n{BOLD}Shutting down...{RESET}");
+    note!("\n{BOLD}Shutting down...{RESET}");
     if let Some(bridge) = bridge {
         // dev.py poll() guard (see is_reaped): a reaped bridge means a
         // possibly-recycled pgid — never signal it, and there is nothing
@@ -472,7 +542,7 @@ async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChi
                 .is_err()
             {
                 match grace_timeout_action(ChildRole::Bridge, Os::host()) {
-                    GraceTimeoutAction::WarnRecovery => eprintln!("{NETWORK_RESET_WARNING}"),
+                    GraceTimeoutAction::WarnRecovery => enote!("{NETWORK_RESET_WARNING}"),
                     GraceTimeoutAction::HardKill => bridge.hard_kill().await,
                 }
             }

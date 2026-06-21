@@ -16,6 +16,10 @@ crates/hole/gen/
 # Build cache (xtask deps: v2ray-plugin Go build, wintun download, generated icons)
 /.cache/
 
+# Dev-run logs and Claude scratch (also covered by the user global ignore,
+# pinned here so fresh clones / CI don't see it untracked).
+/.tmp/
+
 # Claude Code
 CLAUDE.local.md
 .claude/*.local.*

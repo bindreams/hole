@@ -1,5 +1,5 @@
-//! Preflight steps: tool resolution, npm install, workspace build, per-pid
-//! staging. Children here run with INHERITED stdio (the user watches
+//! Preflight steps: tool resolution, npm install, per-pid staging. Children
+//! here run with INHERITED stdio (the user watches
 //! cargo/npm output directly) and are not process-grouped — terminal Ctrl+C
 //! reaches the step child via the console group AND resolves our interrupt
 //! watcher: we reap the child and unwind with `Interrupted`, so guards Drop
@@ -83,23 +83,10 @@ async fn run_step(
 /// dependency additions pulled from a new commit and leave Vite failing to
 /// resolve the import; ~1s on a healthy tree (dev.py §5.12).
 pub async fn ensure_node_modules(npm: &Path, interrupts: &mut Interrupts) -> Result<()> {
-    println!("{BOLD}Syncing npm dependencies...{RESET}");
+    note!("{BOLD}Syncing npm dependencies...{RESET}");
     let mut cmd = tokio::process::Command::new(npm);
     cmd.args(["install", "--no-audit", "--no-fund"]);
     run_step(cmd, "npm install", false, interrupts).await
-}
-
-/// `cargo xtask build hole` — walks the build.yaml DAG. When invoked via
-/// `cargo xtask run hole` the cascade just built everything as this same
-/// user, so this is an incremental no-op; it exists so `cargo run -p
-/// dev-console` also works standalone. HOLE_CRASH_DUMPS opts galoshes into
-/// the dev-only minidump feature (#438); never set in release builds.
-pub async fn cargo_build(cargo: &Path, interrupts: &mut Interrupts) -> Result<()> {
-    println!("{BOLD}Building hole (cargo xtask build hole)...{RESET}");
-    let mut cmd = tokio::process::Command::new(cargo);
-    cmd.args(["xtask", "build", "hole"]);
-    cmd.env("HOLE_CRASH_DUMPS", "1");
-    run_step(cmd, "cargo xtask build hole", false, interrupts).await
 }
 
 /// `$TMPDIR/hole-dev-<pid>` — per-pid so concurrent runs don't collide and

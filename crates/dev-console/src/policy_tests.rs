@@ -29,7 +29,7 @@ fn grant_access_argv_posix() {
         argv,
         [
             "sudo",
-            "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG",
+            "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG,HOLE_LOG,HOLE_LOG_STDERR,HOLE_LOG_DIR",
             "/stage/hole",
             "bridge",
             "grant-access"
@@ -58,7 +58,7 @@ fn bridge_argv_posix_includes_ready_notify() {
         argv,
         [
             "sudo",
-            "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG",
+            "--preserve-env=RUST_LOG,RUST_BACKTRACE,HOLE_BRIDGE_LOG,HOLE_LOG,HOLE_LOG_STDERR,HOLE_LOG_DIR",
             "/stage/hole",
             "bridge",
             "run",
@@ -161,4 +161,53 @@ fn network_reset_warning_is_verbatim() {
         "The bridge did not exit within 10s and may still be running as root with routing changes in place."
     ));
     assert!(NETWORK_RESET_WARNING.contains("Run `sudo scripts/network-reset.py` to restore connectivity."));
+}
+
+// Dev-run log filtering ===============================================================================================
+
+#[skuld::test]
+fn sudo_preserve_env_carries_log_vars() {
+    for v in [
+        "RUST_LOG",
+        "RUST_BACKTRACE",
+        "HOLE_BRIDGE_LOG",
+        "HOLE_LOG",
+        "HOLE_LOG_STDERR",
+        "HOLE_LOG_DIR",
+    ] {
+        assert!(super::SUDO_PRESERVE_ENV.contains(&v), "missing {v}");
+    }
+}
+
+#[skuld::test]
+fn dev_run_file_directives_traces_first_party_debug_deps() {
+    let d = super::dev_run_file_directives();
+    assert!(d.starts_with("debug"), "deps default must be debug: {d}");
+    assert!(d.contains("hole_bridge=trace"), "{d}");
+    assert!(d.contains("hole=trace"), "{d}");
+    assert!(d.contains("galoshes=trace"), "{d}");
+}
+
+#[skuld::test]
+fn dev_run_child_env_is_the_three_per_sink_vars() {
+    use std::ffi::OsString;
+    let env = super::dev_run_child_env(std::path::Path::new("/run/dir"), super::DEV_RUN_STDERR_BRIDGE);
+    assert_eq!(
+        env,
+        vec![
+            ("HOLE_LOG_DIR", OsString::from("/run/dir")),
+            ("HOLE_LOG", OsString::from(super::dev_run_file_directives())),
+            ("HOLE_LOG_STDERR", OsString::from(super::DEV_RUN_STDERR_BRIDGE)),
+        ]
+    );
+}
+
+#[skuld::test]
+fn dev_run_subdir_name_is_filesystem_safe() {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let dt: NaiveDateTime = NaiveDate::from_ymd_opt(2026, 6, 20)
+        .unwrap()
+        .and_hms_opt(15, 30, 45)
+        .unwrap();
+    assert_eq!(super::dev_run_subdir_name(dt), "2026-06-20_15-30-45");
 }

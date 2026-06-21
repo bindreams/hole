@@ -1,13 +1,15 @@
 //! Dev-mode supervisor (replaces scripts/dev.py — bindreams/hole#454).
 //!
-//! Builds the workspace, then runs three processes with multiplexed colored
-//! logs: the bridge (real TUN + routing, elevated), the Vite dev server
-//! (frontend HMR on port 1420), and the GUI (Tauri webview loading from
-//! Vite). Runs UNPRIVILEGED; only the bridge is elevated (sudo on POSIX; on
-//! Windows an elevated shell is required and all children inherit the token).
+//! Runs three processes with multiplexed colored logs: the bridge (real TUN +
+//! routing, elevated), the Vite dev server (frontend HMR on port 1420), and the
+//! GUI (Tauri webview loading from Vite). Runs UNPRIVILEGED; only the bridge is
+//! elevated (sudo on POSIX; on Windows an elevated shell is required and all
+//! children inherit the token). Builds nothing — the xtask cascade does (#564).
 
 use std::process::ExitCode;
 
+#[macro_use]
+pub mod transcript;
 pub mod ansi;
 pub mod banner;
 #[cfg(unix)]
