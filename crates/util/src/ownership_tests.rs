@@ -21,6 +21,9 @@ fn chown_path_to_self_is_a_permitted_noop(#[fixture(temp_dir)] dir: &std::path::
 #[skuld::test]
 fn chown_path_to_root_without_privilege_is_eperm(#[fixture(temp_dir)] dir: &std::path::Path) {
     if unsafe { libc::geteuid() } == 0 {
+        // Under root (CI's privileged lane) the chown SUCCEEDS instead of EPERM,
+        // so this direction asserts nothing here; the succeeding-as-root path is
+        // covered by `crates/hole/tests/elevated_ownership_privileged.rs`.
         return;
     }
     let f = dir.join("f");
