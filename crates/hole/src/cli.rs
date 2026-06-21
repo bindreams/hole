@@ -489,16 +489,12 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             // elevated user-scoped run) → `HOLE_LOG_DIR` env → default. The chown
             // happens regardless of which dir wins, since `init_dual` chowns
             // `log_dir` with `owner_ids`.
-            let log_dir = hole_common::logging::resolve_log_dir(log_dir.or_else(|| {
-                #[cfg(target_os = "macos")]
-                {
-                    owner.as_ref().map(|u| user_log_dir(&u.home))
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    None
-                }
-            }));
+            #[cfg(target_os = "macos")]
+            let log_dir = hole_common::logging::resolve_log_dir(
+                log_dir.or_else(|| owner.as_ref().map(|u| user_log_dir(&u.home))),
+            );
+            #[cfg(not(target_os = "macos"))]
+            let log_dir = hole_common::logging::resolve_log_dir(log_dir);
             let _guard = hole_bridge::logging::init(&log_dir, owner_ids);
             tracing::info!("hole bridge starting");
 
@@ -520,18 +516,9 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             // joining against cwd so the service mode doesn't surprise the
             // user with a cwd-relative path (service cwd is `C:\Windows\System32`
             // on Windows or `/` on macOS).
-            let state_dir = state_dir
-                .or_else(|| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        owner.as_ref().map(|u| user_state_dir(&u.home))
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        None
-                    }
-                })
-                .unwrap_or_else(hole_common::paths::default_state_dir);
+            #[cfg(target_os = "macos")]
+            let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
+            let state_dir = state_dir.unwrap_or_else(hole_common::paths::default_state_dir);
             let state_dir = state_dir.canonicalize().unwrap_or_else(|_| {
                 std::env::current_dir()
                     .map(|cwd| cwd.join(&state_dir))

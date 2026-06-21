@@ -666,6 +666,7 @@ pub fn repair_user_data_tree(path: &std::path::Path, uid: u32, gid: u32) {
 /// Non-macOS twin of [`repair_user_data_tree`]: the root-owned-user-tree bug
 /// is macOS-specific (osascript-admin elevation), so this is a no-op.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // sole caller (cli.rs bridge-run path) is macOS-gated; `pub` alone doesn't spare the bin compilation
 pub fn repair_user_data_tree(_path: &std::path::Path, _uid: u32, _gid: u32) {}
 
 #[cfg(test)]
