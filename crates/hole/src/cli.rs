@@ -319,6 +319,7 @@ fn resolved_owner(service: bool) -> Option<hole_bridge::group::RealUser> {
 /// every other platform always gets `None`. Returns `Option<()>` and is only
 /// referenced inside `#[cfg(target_os = "macos")]` blocks.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // exercised by the cross-platform `service_never_gets_an_owner` test; its only lib call sites are macOS-gated
 fn resolved_owner(_service: bool) -> Option<()> {
     None
 }
@@ -334,12 +335,14 @@ fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
 /// Per-user log directory under the resolved user's home, derived from `home`
 /// (never `$HOME`/`dirs`, which under osascript-admin still point at the
 /// invoking user but are easy to get wrong for an elevated process).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // non-test lib callers are macOS-gated; the path test uses it on all platforms
 fn user_log_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Library/Application Support/hole/logs")
 }
 
 /// Per-user state directory under the resolved user's home. See
 /// [`user_log_dir`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Library/Application Support/hole/state")
 }

@@ -7,6 +7,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+// On non-macOS, `reconcile_owner` is a no-op (the wrapper is a transparent
+// passthrough), so every field except `inner` is written-but-never-read there;
+// macOS reads them all. Suppress the dead-code denial off-macOS only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct UserOwnedRotate<S, F>
 where
     S: file_rotate::suffix::SuffixScheme,
