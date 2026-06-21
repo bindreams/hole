@@ -86,6 +86,10 @@ pub struct IpcState<P: Proxy, R: Routing> {
     pub log_dir: PathBuf,
     /// Service state dir — the same-volume parent for the cutover staging.
     pub state_dir: PathBuf,
+    /// Real-user uid/gid for a user-scoped elevated run, so writes into the
+    /// user's profile (e.g. the cutover marker) are chowned back to them.
+    /// `None` for the `--service` daemon, whose dirs are root-owned by design.
+    pub owner: Option<(u32, u32)>,
 }
 
 // Server ==============================================================================================================
@@ -112,6 +116,7 @@ impl IpcServer {
         version: &str,
         log_dir: PathBuf,
         state_dir: PathBuf,
+        owner: Option<(u32, u32)>,
     ) -> std::io::Result<Self> {
         #[cfg(not(test))]
         let listener = LocalListener::bind_restricted(path)?;
@@ -127,6 +132,7 @@ impl IpcServer {
             version: version.to_owned(),
             log_dir,
             state_dir,
+            owner,
         });
         let router = build_router(state, version);
         Ok(Self {
@@ -146,7 +152,7 @@ impl IpcServer {
         version: &str,
     ) -> std::io::Result<Self> {
         let tmp = tempfile::tempdir()?.keep();
-        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp)
+        Self::bind_with_dirs(path, proxy, version, tmp.clone(), tmp, None)
     }
 
     /// Accept and handle one client connection, then return.
@@ -500,7 +506,7 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             .unwrap_or_default()
             .as_secs(),
     };
-    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker) {
+    if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker, state.owner) {
         let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
             (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
         } else {

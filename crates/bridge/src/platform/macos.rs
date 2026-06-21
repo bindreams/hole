@@ -234,6 +234,9 @@ pub fn run(
             version,
             log_dir.to_path_buf(),
             state_dir.to_path_buf(),
+            // The `--service` daemon runs as root and its dirs are root-owned by
+            // design; no real user to chown writes back to.
+            None,
         )?;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();

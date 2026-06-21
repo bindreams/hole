@@ -55,10 +55,15 @@ pub fn service_log_dir() -> PathBuf {
 /// (GUI-readable across the privilege boundary — the default 0o600 from a
 /// root-daemon umask would silently break the cross-privilege read).
 ///
+/// `owner` chowns the persisted marker to the elevated-run user (a user-scoped
+/// elevated bridge writes into the user's profile); `None` for the root daemon,
+/// whose service log dir is root-owned by design. The chown lands on the temp
+/// in [`staged_marker`], whose inode the rename publishes unchanged.
+///
 /// Overwrites an existing marker. For the single-occupancy claim use
 /// [`write_new`], which fails if the marker already exists.
-pub fn write(log_dir: &Path, info: &MarkerInfo) -> io::Result<()> {
-    let tmp = staged_marker(log_dir, info)?;
+pub fn write(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {
+    let tmp = staged_marker(log_dir, info, owner)?;
     std::fs::rename(&tmp, log_dir.join(MARKER_FILE))?;
     Ok(())
 }
@@ -70,8 +75,12 @@ pub fn write(log_dir: &Path, info: &MarkerInfo) -> io::Result<()> {
 /// O_EXCL primitive (`link(2)`/`CreateHardLink` fail `EEXIST`/`ERROR_ALREADY_EXISTS`
 /// when the destination exists), and links the fully-written temp content so a
 /// reader never sees a partial file.
-pub fn write_new(log_dir: &Path, info: &MarkerInfo) -> io::Result<()> {
-    let tmp = staged_marker(log_dir, info)?;
+///
+/// `owner` chowns the marker to the elevated-run user (see [`write`]); `None`
+/// for the root daemon. A lost claim (`AlreadyExists`) only removes its own
+/// staged temp, so the existing marker's ownership is never disturbed.
+pub fn write_new(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<()> {
+    let tmp = staged_marker(log_dir, info, owner)?;
     let final_path = log_dir.join(MARKER_FILE);
     let res = std::fs::hard_link(&tmp, &final_path);
     // The temp is consumed either way (linked-then-unlinked, or cleaned up on a
@@ -84,7 +93,11 @@ pub fn write_new(log_dir: &Path, info: &MarkerInfo) -> io::Result<()> {
 /// cross-privilege mode, returning its path. A unique name (not a fixed `.tmp`)
 /// so two concurrent claims do not corrupt a shared temp. The caller publishes
 /// it (rename = overwrite, hard_link = claim).
-fn staged_marker(log_dir: &Path, info: &MarkerInfo) -> io::Result<PathBuf> {
+///
+/// `owner` chowns the temp BEFORE it is published. Both publishers keep the same
+/// inode (rename moves it, hard_link shares then unlinks the temp name), so the
+/// persisted marker carries this owner; `None` leaves it root-owned for the daemon.
+fn staged_marker(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -> io::Result<PathBuf> {
     std::fs::create_dir_all(log_dir)?;
     let json = serde_json::to_vec(info).map_err(io::Error::other)?;
     let tmp = tempfile::Builder::new()
@@ -97,6 +110,7 @@ fn staged_marker(log_dir: &Path, info: &MarkerInfo) -> io::Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
     }
+    util::ownership::chown_if_some(tmp.path(), owner);
     // Persist the temp (suppress its delete-on-drop) and hand back the path; the
     // caller renames/links it and removes any leftover.
     let (_, path) = tmp.keep().map_err(|e| io::Error::other(e.to_string()))?;

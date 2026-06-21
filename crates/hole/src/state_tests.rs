@@ -482,6 +482,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             pid: std::process::id(),
             started_at_unix: 0,
         },
+        None,
     )
     .unwrap();
     let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
@@ -524,6 +525,7 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
             pid: std::process::id(),
             started_at_unix: 0,
         },
+        None,
     )
     .unwrap();
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();

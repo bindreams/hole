@@ -141,6 +141,7 @@ async fn run_inner(
         version,
         log_dir.to_path_buf(),
         state_dir.to_path_buf(),
+        owner,
     )?;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a

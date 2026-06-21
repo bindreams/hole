@@ -679,7 +679,8 @@ fn update_apply_lockdown_off_without_consent_is_refused() {
     rt().block_on(async {
         let path = test_socket_path("update-apply-no-consent");
         let log_dir = tempfile::tempdir().unwrap().keep();
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -716,9 +717,11 @@ fn update_apply_with_existing_marker_is_409() {
                 pid: 1,
                 started_at_unix: 0,
             },
+            None,
         )
         .unwrap();
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -776,7 +779,8 @@ fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
         #[cfg(not(target_os = "macos"))]
         let app_dest: Option<String> = None;
 
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -830,7 +834,8 @@ fn update_apply_staging_io_failure_clears_the_marker() {
         let app_dest_dir = tempfile::tempdir().unwrap();
         let app_dest = Some(make_valid_app_dest(app_dest_dir.path()).to_string_lossy().into_owned());
 
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -884,7 +889,7 @@ fn update_apply_spoofed_app_dest_is_400_no_marker() {
         )
         .unwrap();
 
-        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone()).unwrap();
+        let server = IpcServer::bind_with_dirs(&path, mock_proxy(), "test", log_dir.clone(), log_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
