@@ -2972,6 +2972,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "skuld",
+ "stepstool",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2987,6 +2988,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "util",
  "uuid",
  "walkdir",
  "windows 0.62.2",
@@ -7997,6 +7999,7 @@ dependencies = [
  "tracing",
  "tun",
  "tun-engine-macros",
+ "util",
  "windows 0.62.2",
  "wintun-bindings",
 ]

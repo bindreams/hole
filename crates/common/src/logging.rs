@@ -616,9 +616,14 @@ where
 /// one directive to pass. Creates `log_dir` if it doesn't exist; returns a
 /// guard that must be held for the process lifetime to ensure logs are
 /// flushed and the relay reader threads stay alive.
-pub fn init(log_dir: &Path, kind: &'static str, log_filename: &str, default_directive: &str) -> LogGuard {
-    let d = [default_directive.to_string()];
-    init_dual(log_dir, kind, log_filename, &d, &d)
+pub fn init(
+    log_dir: &Path,
+    kind: &'static str,
+    log_filename: &str,
+    default_directive: &str,
+    owner: Option<(u32, u32)>,
+) -> LogGuard {
+    init_multi(log_dir, kind, log_filename, [default_directive], owner)
 }
 
 /// Initialize logging with one or more caller-supplied filter directives
@@ -633,13 +638,19 @@ pub fn init(log_dir: &Path, kind: &'static str, log_filename: &str, default_dire
 /// `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace` —
 /// `init` accepts only one directive and silently dropping the rest is the
 /// kind of thing that hides production diagnostics (#248).
-pub fn init_multi<I>(log_dir: &Path, kind: &'static str, log_filename: &str, directives: I) -> LogGuard
+pub fn init_multi<I>(
+    log_dir: &Path,
+    kind: &'static str,
+    log_filename: &str,
+    directives: I,
+    owner: Option<(u32, u32)>,
+) -> LogGuard
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
     let v: Vec<String> = directives.into_iter().map(|d| d.as_ref().to_string()).collect();
-    init_dual(log_dir, kind, log_filename, &v, &v)
+    init_dual(log_dir, kind, log_filename, &v, &v, owner)
 }
 
 /// Initialize logging with independent file-sink and stderr-sink directives —
@@ -659,8 +670,13 @@ pub fn init_dual(
     log_filename: &str,
     file_directives: &[String],
     stderr_directives: &[String],
+    owner: Option<(u32, u32)>,
 ) -> LogGuard {
     let _ = std::fs::create_dir_all(log_dir);
+    // The elevated bridge creates `log_dir` as root; hand it to the real user
+    // so they can read `bridge.log` without `sudo` (#572). No-op when `owner`
+    // is `None` (the unprivileged GUI) or off-macOS.
+    util::ownership::chown_if_some(log_dir, owner);
     cleanup_legacy_daily_logs(log_dir, log_filename);
 
     // Order matters: redirect BEFORE constructing the non-blocking stderr
@@ -688,11 +704,26 @@ pub fn init_dual(
         file_rotate::compression::Compression::None,
         None,
     );
-    // File appender is `lossy(false)`: the proxy-stop teardown burst must never
-    // be truncated or `bridge.log` loses the teardown diagnostic; back-pressure
-    // is bounded by `buffered_lines_limit` (default 128k events). The stderr
-    // writer keeps `lossy(true)`: a wedged terminal must not block the bridge.
-    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(file_appender);
+    // The FILE appender is `lossy(false)`: the proxy-stop teardown burst
+    // (SystemRoutes::drop sequence — route commands, state-file clear,
+    // Remove-NetAdapter — emitted in tens of ms) must never be silently
+    // truncated, or `bridge.log` loses the diagnostic for a teardown that
+    // broke the user's network. Trade-off: a wedged disk (full filesystem,
+    // OneDrive sync stall, AV scan) back-pressures the tracing producer,
+    // bounded by `buffered_lines_limit` (default 128k events).
+    //
+    // The STDERR non-blocking writer keeps `lossy(true)`: a wedged
+    // terminal (Ctrl+S on a console session) MUST NOT block the bridge.
+    // Wrap the size-rotating appender so each rotation re-`chown`s the fresh
+    // root-owned active file back to the real user. `owner = None` is a perfect
+    // passthrough (the `reconcile_owner` early-return); off-macOS it is a no-op.
+    let owned = UserOwnedRotate::new(
+        file_appender,
+        log_dir.join(log_filename),
+        owner,
+        |p: &std::path::Path, uid: u32, gid: u32| util::ownership::chown_path(p, uid, gid),
+    );
+    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(owned);
     let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
 
     use tracing_subscriber::util::SubscriberInitExt;
@@ -712,6 +743,11 @@ pub fn init_dual(
     // intact; native faults are caught here). Idempotent + best-effort;
     // never panics. `kind` labels the marker; `log_dir` is user-readable
     // even for the elevated bridge.
+    //
+    // #572: the crash marker is written by the signal handler at crash time
+    // (signal-safe context — no chown). It is transient, lives in the
+    // user-owned log dir, and is swept on next start, so it is left
+    // root-owned on purpose rather than chowned from an unsafe context.
     tombstone::attach(kind, log_dir);
 
     LogGuard {
@@ -786,6 +822,9 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
         && b[8].is_ascii_digit()
         && b[9].is_ascii_digit()
 }
+
+mod owned_rotate;
+use owned_rotate::UserOwnedRotate;
 
 pub(crate) mod yaml_format;
 

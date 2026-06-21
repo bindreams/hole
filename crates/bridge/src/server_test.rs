@@ -253,6 +253,7 @@ async fn maybe_start_plugin(
         &server_host,
         server_port,
         None,
+        None,
         false,
         &chain_cancel,
     )

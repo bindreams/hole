@@ -247,13 +247,14 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     }
 
     // Phase B: cover ON — the no-leak proof. ==========================================================================
-    lockdown_state::set_enabled(dir.path(), true).expect("persist lockdown intent");
+    lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
     let cover = engage_lockdown(
         server_ip,
         "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
         &SystemLuidResolver,
         &[],
         dir.path(),
+        None,
     )
     .expect("engage the real standing lockdown cover");
 
@@ -300,7 +301,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         // Tear the cover down BEFORE the asserts so a failure never leaves the box
         // severed. The capture verdicts are already in hand.
         drop(cover);
-        lockdown_state::set_enabled(dir.path(), false).ok();
+        lockdown_state::set_enabled(dir.path(), false, None).ok();
         disengage_lockdown(dir.path()).ok();
 
         // Rendezvous: the permitted tail egressed (server permit beats block-all),

@@ -34,13 +34,16 @@ fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
-pub fn save(state_dir: &Path, state: &LockdownPfState) -> std::io::Result<()> {
+pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
+    util::ownership::chown_if_some(state_dir, owner);
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = state_file(state_dir);
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(state_file(state_dir)).map_err(|e| e.error)?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    util::ownership::chown_if_some(&path, owner);
     Ok(())
 }
 

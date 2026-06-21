@@ -105,8 +105,8 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
         "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts"
     );
 
-    lockdown_state::set_enabled(dir.path(), true).unwrap();
-    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path())
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+    let cover = engage_lockdown(server_ip, tun_name, &resolver, &[], dir.path(), None)
         .expect("engage the real standing lockdown cover");
 
     // Engaged: server permitted (permit beats block-all), others blocked (no leak).
@@ -136,7 +136,7 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
 
     // Cleanup: fully disengage via the persisted state (no live guard remains
     // after disarm), restoring egress so the box is left open.
-    lockdown_state::set_enabled(dir.path(), false).unwrap();
+    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
     disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
     assert!(
         connect(NON_PERMITTED).is_ok(),

@@ -180,7 +180,7 @@ pub struct Cover {
     kind: CoverKind,
 }
 
-pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError> {
+pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
     // 1. Read current enabled-state (read-only).
     let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
     let was_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
@@ -197,6 +197,7 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError
             pf_token: token.clone(),
             pf_was_enabled: was_enabled,
         },
+        owner,
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
@@ -276,7 +277,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// them with `token` (persist-before-mutate). Returns the nat snapshot for the
 /// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
 /// refcount) by the caller without leaking the `-E` enable.
-fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingError> {
+fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
     let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
     let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
     let sn = pfctl(&["-sn"], None, PHASE_COVER)?;
@@ -290,6 +291,7 @@ fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingE
             main_snapshot,
             nat_snapshot: nat_snapshot.clone(),
         },
+        owner,
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist lockdown-pf-state: {e}")))?;
     Ok(nat_snapshot)
@@ -309,7 +311,12 @@ fn capture_and_persist(token: &str, state_dir: &Path) -> Result<String, RoutingE
 ///
 /// On load failure the host is restored (`lockdown_disengage`) and Err returned;
 /// the bridge's fail-FATAL caller aborts the start.
-pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> Result<Cover, RoutingError> {
+pub fn engage_lockdown(
+    server_ip: IpAddr,
+    tun_name: &str,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
     // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
     let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
@@ -338,7 +345,7 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
             };
-            if let Err(e) = lockdown_state::save(state_dir, &fresh) {
+            if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
                 if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
                     tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
                 }
@@ -354,7 +361,7 @@ pub fn engage_lockdown(server_ip: IpAddr, tun_name: &str, state_dir: &Path) -> R
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
-            match capture_and_persist(&token, state_dir) {
+            match capture_and_persist(&token, state_dir, owner) {
                 Ok(nat_snapshot) => (token, nat_snapshot),
                 Err(e) => {
                     if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {

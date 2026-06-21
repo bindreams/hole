@@ -20,6 +20,7 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
         "127.0.0.1",
         12345,
         None,
+        None,
         false,
         &cancel,
     )

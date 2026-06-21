@@ -214,6 +214,10 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// State directory for plugin PID crash recovery. `None` in tests
     /// that don't need crash recovery tracking.
     state_dir: Option<std::path::PathBuf>,
+    /// uid/gid to chown persisted state files to. Set by an elevated
+    /// user-scoped run so the real user owns the files; `None` (the
+    /// default, and the `--service` daemon) leaves ownership as-is.
+    state_owner: Option<(u32, u32)>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -240,12 +244,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             udp_proxy_available: true,
             ipv6_bypass_available: true,
             state_dir: None,
+            state_owner: None,
         }
     }
 
     /// Set the state directory for plugin PID crash recovery.
     pub fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.state_dir = Some(dir);
+        self
+    }
+
+    /// Set the owner (uid/gid) that persisted state files are chowned to.
+    pub fn with_state_owner(mut self, owner: Option<(u32, u32)>) -> Self {
+        self.state_owner = owner;
         self
     }
 
@@ -407,7 +418,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 "cannot set lockdown intent: bridge has no state_dir to persist it",
             ))
         })?;
-        lockdown_state::set_enabled(dir, enabled)
+        lockdown_state::set_enabled(dir, enabled, self.state_owner)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 
@@ -485,6 +496,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             &self.dns,
             config,
             self.state_dir.as_deref(),
+            self.state_owner,
             cancel,
         )
         .await;
@@ -583,6 +595,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         dns: &D,
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
+        owner: Option<(u32, u32)>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -602,6 +615,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 &config.server.server,
                 config.server.server_port,
                 state_dir,
+                owner,
                 config.diagnostic_plugin_tap,
                 &cancel,
             )
@@ -891,6 +905,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     capture_aliases,
                     apply_aliases,
                     state_dir.map(std::path::Path::to_path_buf),
+                    owner,
                     cancel.clone(),
                 )
                 .await

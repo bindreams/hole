@@ -16,7 +16,7 @@ fn save_load_roundtrip() {
             },
         ],
     };
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).expect("should load saved state");
     assert_eq!(loaded, state);
 }
@@ -33,8 +33,8 @@ fn append_record_preserves_prior() {
         start_time_unix_ms: 2000,
     };
 
-    append_record(dir.path(), r1.clone()).unwrap();
-    append_record(dir.path(), r2.clone()).unwrap();
+    append_record(dir.path(), r1.clone(), None).unwrap();
+    append_record(dir.path(), r2.clone(), None).unwrap();
 
     let loaded = load(dir.path()).expect("should load after append");
     assert_eq!(loaded.plugins, vec![r1, r2]);
@@ -47,7 +47,7 @@ fn append_record_creates_file_if_missing() {
         pid: 42,
         start_time_unix_ms: 999,
     };
-    append_record(dir.path(), r.clone()).unwrap();
+    append_record(dir.path(), r.clone(), None).unwrap();
 
     let loaded = load(dir.path()).expect("should load after first append");
     assert_eq!(loaded.plugins, vec![r]);
@@ -73,7 +73,7 @@ fn load_version_mismatch_returns_none() {
         version: 999,
         plugins: vec![],
     };
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     assert!(load(dir.path()).is_none());
 }
 
@@ -87,7 +87,7 @@ fn clear_removes_file() {
             start_time_unix_ms: 1,
         }],
     };
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
     clear(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
@@ -118,6 +118,6 @@ fn save_creates_missing_dir() {
         version: SCHEMA_VERSION,
         plugins: vec![],
     };
-    save(&nested, &state).unwrap();
+    save(&nested, &state, None).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }
