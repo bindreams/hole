@@ -178,3 +178,50 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildTLSConfigEch(t *testing.T) {
+	cases := []struct {
+		desc      string
+		echMode   string
+		echDoh    string
+		wantDoh   string
+		wantErr   bool
+		wantInErr string
+	}{
+		{"never with doh: no-op", "never", "https://1.1.1.1/dns-query", "", false, ""},
+		{"auto no doh: cleartext", "auto", "", "", false, ""},
+		{"always no doh: config error", "always", "", "", true, "ech-doh"},
+		{"auto with doh: populated", "auto", "https://dns.google/dns-query", "https://dns.google/dns-query", false, ""},
+		{"always with doh: populated", "always", "https://1.1.1.1/dns-query", "https://1.1.1.1/dns-query", false, ""},
+		{"invalid mode: error", "bogus", "https://1.1.1.1/dns-query", "", true, "ech mode"},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			restoreEch := withEchFlags(t, c.echMode, c.echDoh)
+			defer restoreEch()
+			origHost, origTLS := *host, *tlsEnabled
+			*host, *tlsEnabled = "example.com", true
+			defer func() { *host, *tlsEnabled = origHost, origTLS }()
+
+			tc, err := buildTLSConfig()
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("%s: buildTLSConfig() = nil error, want error mentioning %q", c.desc, c.wantInErr)
+				}
+				if !strings.Contains(err.Error(), c.wantInErr) {
+					t.Fatalf("%s: error %q does not mention %q", c.desc, err.Error(), c.wantInErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: buildTLSConfig() error = %v, want nil", c.desc, err)
+			}
+			if tc.Ech_DOHserver != c.wantDoh {
+				t.Errorf("%s: Ech_DOHserver = %q, want %q", c.desc, tc.Ech_DOHserver, c.wantDoh)
+			}
+			if tc.ServerName != "example.com" {
+				t.Errorf("%s: ServerName = %q, want SNI preserved", c.desc, tc.ServerName)
+			}
+		})
+	}
+}
