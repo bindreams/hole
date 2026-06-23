@@ -91,6 +91,23 @@ const SETTINGS_DOM = `
         <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="https">DNS over HTTPS</button>
       </div>
     </div>
+    <span class="setting-label" id="lbl-dns-provider">Resolver</span>
+    <div class="custom-select-wrap">
+      <button type="button" class="custom-select-btn" id="select-dns-provider" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-dns-provider select-dns-provider">Cloudflare</button>
+      <div class="custom-select-menu" id="menu-dns-provider" role="listbox" aria-labelledby="lbl-dns-provider">
+        <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="cloudflare">Cloudflare</button>
+        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="google">Google</button>
+        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="quad9">Quad9</button>
+        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="opendns">OpenDNS</button>
+        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="adguard">AdGuard</button>
+        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="custom">Custom&hellip;</button>
+      </div>
+    </div>
+    <div class="setting-row" id="row-dns-custom" hidden>
+      <input class="field-input" id="input-dns-servers" type="text" value="1.1.1.1, 1.0.0.1">
+    </div>
+    <span class="setting-label" id="lbl-dns-insecure">Allow insecure bootstrap</span>
+    <button type="button" class="toggle" id="toggle-dns-insecure" role="switch" aria-checked="false" aria-labelledby="lbl-dns-insecure"></button>
   </div>
 `;
 
@@ -103,7 +120,7 @@ function freshConfig(): Record<string, unknown> {
     local_port_http: 4074,
     on_startup: "do_not_connect",
     theme: "dark",
-    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
+    dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", allow_insecure_bootstrap: false },
   };
 }
 
@@ -383,5 +400,108 @@ describe("DNS controls with no config loaded", () => {
     const opt = document.querySelector<HTMLElement>("#menu-dns-protocol .custom-select-opt")!;
     opt.click();
     expect(opt.classList.contains("selected")).toBe(false);
+  });
+});
+
+describe("DNS resolver provider dropdown + custom-IP entry + insecure toggle", () => {
+  it("a known provider IP set selects that provider and hides the custom row", async () => {
+    mainMock.config = freshConfig();
+    mainMock.config!.dns = {
+      enabled: true,
+      servers: ["8.8.8.8", "8.8.4.4"],
+      protocol: "https",
+      allow_insecure_bootstrap: false,
+    };
+    await setup();
+    expect(document.getElementById("select-dns-provider")!.textContent).toBe("Google");
+    expect((document.getElementById("row-dns-custom") as HTMLElement).hidden).toBe(true);
+  });
+
+  it("an unrecognized IP set selects Custom and reveals the typed IPs", async () => {
+    mainMock.config = freshConfig();
+    mainMock.config!.dns = {
+      enabled: true,
+      servers: ["203.0.113.7"],
+      protocol: "https",
+      allow_insecure_bootstrap: false,
+    };
+    await setup();
+    expect(document.getElementById("select-dns-provider")!.textContent).toBe("Custom…");
+    expect((document.getElementById("row-dns-custom") as HTMLElement).hidden).toBe(false);
+    expect((document.getElementById("input-dns-servers") as HTMLInputElement).value).toBe("203.0.113.7");
+  });
+
+  it("picking a provider sets dns.servers to its preset and saves", async () => {
+    await setup();
+    const opt = document.querySelector('#menu-dns-provider [data-value="quad9"]') as HTMLElement;
+    opt.click();
+    expect((mainMock.config!.dns as { servers: string[] }).servers).toEqual(["9.9.9.9", "149.112.112.112"]);
+    expect((document.getElementById("row-dns-custom") as HTMLElement).hidden).toBe(true);
+    expect(mainMock.saveConfig).toHaveBeenCalled();
+  });
+
+  it("picking Custom reveals the input without clobbering servers", async () => {
+    await setup();
+    const opt = document.querySelector('#menu-dns-provider [data-value="custom"]') as HTMLElement;
+    opt.click();
+    expect((document.getElementById("row-dns-custom") as HTMLElement).hidden).toBe(false);
+    expect((mainMock.config!.dns as { servers: string[] }).servers).toEqual(["1.1.1.1"]);
+  });
+
+  it("a valid custom edit parses into dns.servers and saves", async () => {
+    await setup();
+    (document.querySelector('#menu-dns-provider [data-value="custom"]') as HTMLElement).click();
+    changePort("input-dns-servers", "9.9.9.9 , 1.1.1.1");
+    expect((mainMock.config!.dns as { servers: string[] }).servers).toEqual(["9.9.9.9", "1.1.1.1"]);
+    expect((document.getElementById("input-dns-servers") as HTMLInputElement).value).toBe("9.9.9.9, 1.1.1.1");
+    expect(mainMock.saveConfig).toHaveBeenCalled();
+  });
+
+  it("an empty custom list is rejected and the field reverts", async () => {
+    mainMock.config = freshConfig();
+    mainMock.config!.dns = {
+      enabled: true,
+      servers: ["203.0.113.7"],
+      protocol: "https",
+      allow_insecure_bootstrap: false,
+    };
+    await setup();
+    changePort("input-dns-servers", "   ");
+    expect((mainMock.config!.dns as { servers: string[] }).servers).toEqual(["203.0.113.7"]);
+    expect((document.getElementById("input-dns-servers") as HTMLInputElement).value).toBe("203.0.113.7");
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("a malformed custom IP is rejected and the field reverts", async () => {
+    mainMock.config = freshConfig();
+    mainMock.config!.dns = {
+      enabled: true,
+      servers: ["203.0.113.7"],
+      protocol: "https",
+      allow_insecure_bootstrap: false,
+    };
+    await setup();
+    changePort("input-dns-servers", "1.1.1.1, not-an-ip");
+    expect((mainMock.config!.dns as { servers: string[] }).servers).toEqual(["203.0.113.7"]);
+    expect(mainMock.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("renders the insecure toggle from config and patches dns on click", async () => {
+    await setup();
+    const tog = document.getElementById("toggle-dns-insecure")!;
+    expect(tog.getAttribute("aria-checked")).toBe("false");
+    tog.click();
+    expect((mainMock.config!.dns as { allow_insecure_bootstrap: boolean }).allow_insecure_bootstrap).toBe(true);
+    expect(tog.getAttribute("aria-checked")).toBe("true");
+    expect(mainMock.saveConfig).toHaveBeenCalled();
+  });
+
+  it("insecure toggle does not flip when config is null", async () => {
+    mainMock.config = null;
+    const { initSettings } = await import("./settings");
+    initSettings();
+    const tog = document.getElementById("toggle-dns-insecure")!;
+    tog.click();
+    expect(tog.classList.contains("on")).toBe(false);
   });
 });

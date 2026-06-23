@@ -9,6 +9,7 @@ const DNS_DEFAULT: DnsConfig = {
   enabled: true,
   servers: ["1.1.1.1", "1.0.0.1"],
   protocol: "https",
+  allow_insecure_bootstrap: false,
 };
 
 // Theme management ====================================================================================================
@@ -72,7 +73,74 @@ function patchDns(partial: Partial<DnsConfig>) {
   const next: DnsConfig = { ...currentDns(), ...partial };
   config.dns = next;
   updateDnsMuting();
+  updateCustomRowVisibility();
   saveConfig();
+}
+
+// DNS resolver provider ===============================================================================================
+
+const customRow = document.getElementById("row-dns-custom")!;
+const dnsServersInput = document.getElementById("input-dns-servers") as HTMLInputElement;
+
+/** Provider key → resolver IP preset. Mirrors crates/common/src/dns_providers.rs. */
+const DNS_PROVIDERS: Record<string, string[]> = {
+  cloudflare: ["1.1.1.1", "1.0.0.1"],
+  google: ["8.8.8.8", "8.8.4.4"],
+  quad9: ["9.9.9.9", "149.112.112.112"],
+  opendns: ["208.67.222.222", "208.67.220.220"],
+  adguard: ["94.140.14.14", "94.140.15.15"],
+};
+
+/** Reverse-map a server list to a provider key, or "custom" if it matches none. */
+function providerOf(servers: string[]): string {
+  const key = [...servers].sort().join(",");
+  for (const [name, ips] of Object.entries(DNS_PROVIDERS)) {
+    if ([...ips].sort().join(",") === key) return name;
+  }
+  return "custom";
+}
+
+/**
+ * Parse a comma/whitespace-separated resolver list into a validated IP array.
+ * Returns null if empty or any token is not a valid IPv4/IPv6 literal — the
+ * caller reverts the field on null (mirrors the port-input revert pattern).
+ * The bridge is the authoritative validator; this is a UX affordance.
+ */
+function parseResolvers(raw: string): string[] | null {
+  const tokens = raw
+    .split(/[,\s]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return null;
+  for (const t of tokens) {
+    if (!isIpLiteral(t)) return null;
+  }
+  return tokens;
+}
+
+/** Accept dotted-quad IPv4 or a colon-bearing IPv6 literal (loose; bridge is authoritative). */
+function isIpLiteral(s: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (m) return m.slice(1).every((o) => Number(o) <= 255);
+  return s.includes(":") && /^[0-9a-fA-F:]+$/.test(s);
+}
+
+/** Show the custom-IP row only when the active provider is "custom". */
+function updateCustomRowVisibility() {
+  customRow.hidden = providerOf(currentDns().servers) !== "custom";
+}
+
+function wireDnsServersInput() {
+  dnsServersInput.addEventListener("change", () => {
+    if (!config) return;
+    const parsed = parseResolvers(dnsServersInput.value);
+    if (parsed) {
+      patchDns({ servers: parsed });
+      dnsServersInput.value = parsed.join(", ");
+    } else {
+      dnsServersInput.value = currentDns().servers.join(", ");
+    }
+  });
 }
 
 // Toggle component ====================================================================================================
@@ -403,12 +471,28 @@ function wireDnsControls() {
   // wireToggle/wireDropdown guard `config` before any visual change,
   // covering the guards the hand-wired versions carried.
   wireToggle("toggle-dns-enabled", (on) => patchDns({ enabled: on }));
+  wireToggle("toggle-dns-insecure", (on) => patchDns({ allow_insecure_bootstrap: on }));
 
   // The protocol dropdown patches config.dns rather than a top-level key;
   // the apply callback absorbs that difference.
   wireDropdown("select-dns-protocol", "menu-dns-protocol", (value) => {
     patchDns({ protocol: value as DnsProtocol });
   });
+
+  // Provider dropdown: a preset key applies its IP set; "custom" reveals the
+  // free-form input without clobbering the current servers. patchDns refreshes
+  // the custom-row visibility for both arms.
+  wireDropdown("select-dns-provider", "menu-dns-provider", (value) => {
+    if (value === "custom") {
+      updateCustomRowVisibility();
+    } else {
+      patchDns({ servers: DNS_PROVIDERS[value] });
+      dnsServersInput.value = currentDns().servers.join(", ");
+    }
+  });
+
+  // Free-form resolver list (validated, revert-on-invalid) — port-input pattern.
+  wireDnsServersInput();
 }
 
 /**
@@ -439,7 +523,11 @@ export function renderSettings() {
   // DNS forwarder state.
   const dns = currentDns();
   setToggleState(document.getElementById("toggle-dns-enabled")!, dns.enabled);
+  setToggleState(document.getElementById("toggle-dns-insecure")!, dns.allow_insecure_bootstrap);
   syncDropdown("select-dns-protocol", "menu-dns-protocol", dns.protocol);
+  syncDropdown("select-dns-provider", "menu-dns-provider", providerOf(dns.servers));
+  dnsServersInput.value = dns.servers.join(", ");
+  updateCustomRowVisibility();
   updateDnsMuting();
 
   // Theme.
