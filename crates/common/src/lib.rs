@@ -1,5 +1,6 @@
 pub mod config;
 pub mod config_store;
+pub mod dns_providers;
 pub mod import;
 pub mod logging;
 pub mod paths;
@@ -8,6 +9,11 @@ pub mod protocol;
 pub mod update_marker;
 pub mod verify;
 pub mod version;
+
+/// `hole_common::doh_url(ip)` — crate-root alias for the IP→DoH-URL mapping
+/// (the bridge calls this exact path for bootstrap, the in-TUN forwarder, and
+/// the `ech-doh` plugin opt).
+pub use dns_providers::doh_url;
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds
