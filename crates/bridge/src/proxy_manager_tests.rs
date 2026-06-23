@@ -1733,6 +1733,7 @@ mod self_test {
             enabled: true,
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
+            allow_insecure_bootstrap: false,
         }
     }
 
@@ -1927,6 +1928,7 @@ mod self_test {
                     enabled: true,
                     servers: vec![], // degenerate
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
@@ -2004,6 +2006,7 @@ mod self_test {
                     enabled: false,
                     servers: vec![],
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (ep, fwd) = match res {
@@ -2029,6 +2032,7 @@ mod self_test {
                     enabled: true,
                     servers: vec!["1.1.1.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
                     .await

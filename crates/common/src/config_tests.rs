@@ -512,6 +512,7 @@ fn dns_config_roundtrips_via_json(#[fixture(temp_dir)] dir: &Path) {
             enabled: false,
             servers: vec!["9.9.9.9".parse().unwrap(), "149.112.112.112".parse().unwrap()],
             protocol: DnsProtocol::Tls,
+            allow_insecure_bootstrap: false,
         },
         ..Default::default()
     };
@@ -548,6 +549,7 @@ fn dns_config_accepts_mixed_v4_v6_servers() {
         enabled: true,
         servers: vec!["1.1.1.1".parse().unwrap(), "2606:4700:4700::1111".parse().unwrap()],
         protocol: DnsProtocol::Https,
+        allow_insecure_bootstrap: false,
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let parsed: DnsConfig = serde_json::from_str(&json).unwrap();
@@ -641,4 +643,38 @@ fn save_replaces_existing_file_and_leaves_no_temp(#[fixture(temp_dir)] dir: &Pat
     assert_eq!(entries.len(), 1);
     let on_disk: AppConfig = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(on_disk, changed);
+}
+
+// allow_insecure_bootstrap ============================================================================================
+
+#[skuld::test]
+fn dns_config_default_allow_insecure_bootstrap_is_false() {
+    assert!(!DnsConfig::default().allow_insecure_bootstrap);
+}
+
+#[skuld::test]
+fn dns_config_deserializes_missing_allow_insecure_bootstrap_as_false() {
+    // Back-compat: a config written before this field existed must load with
+    // the fail-closed default (false), never error on the absent key.
+    let json = r#"{
+        "enabled": true,
+        "servers": ["1.1.1.1", "1.0.0.1"],
+        "protocol": "https"
+    }"#;
+    let dns: DnsConfig = serde_json::from_str(json).expect("legacy DnsConfig must deserialize");
+    assert!(!dns.allow_insecure_bootstrap, "absent key must default to false");
+    assert!(dns.enabled);
+    assert_eq!(dns.protocol, DnsProtocol::Https);
+}
+
+#[skuld::test]
+fn dns_config_round_trips_allow_insecure_bootstrap() {
+    let dns = DnsConfig {
+        allow_insecure_bootstrap: true,
+        ..DnsConfig::default()
+    };
+    let json = serde_json::to_string(&dns).expect("serialize");
+    let back: DnsConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(dns, back);
+    assert!(back.allow_insecure_bootstrap);
 }
