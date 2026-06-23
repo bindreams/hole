@@ -126,6 +126,13 @@ func parseOptsIntoFlags() {
 		}
 	}
 
+	if c, b := opts.Get("ech"); b {
+		*echMode = c
+	}
+	if c, b := opts.Get("ech-doh"); b {
+		*echDoh = c
+	}
+
 	if *vpn {
 		registerControlFunc()
 	}

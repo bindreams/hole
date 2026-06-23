@@ -107,3 +107,74 @@ func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 		}
 	}
 }
+
+// withEchFlags saves the ech/ech-doh globals, applies values, returns a restore
+// func for defer. parseOptsIntoFlags + generateConfig read these pointers, so
+// tests must leave them as they found them. Mirrors withFlags (config_test.go:58).
+func withEchFlags(t *testing.T, modeV, dohV string) func() {
+	t.Helper()
+	origMode, origDoh := *echMode, *echDoh
+	*echMode, *echDoh = modeV, dohV
+	return func() { *echMode, *echDoh = origMode, origDoh }
+}
+
+// withEnv sets SS_PLUGIN_OPTIONS plus the four SS_* vars parseEnv gates on, for
+// the duration of the test (t.Setenv restores originals on cleanup). It also
+// snapshots and restores the address/port globals that a subsequent
+// parseOptsIntoFlags writes from SS_REMOTE_*/SS_LOCAL_*, so the restore boundary
+// matches the full mutation surface (withEchFlags only covers ech/ech-doh).
+func withEnv(t *testing.T, pluginOptions string) {
+	t.Helper()
+	origLocalAddr, origLocalPort := *localAddr, *localPort
+	origRemoteAddr, origRemotePort := *remoteAddr, *remotePort
+	t.Cleanup(func() {
+		*localAddr, *localPort = origLocalAddr, origLocalPort
+		*remoteAddr, *remotePort = origRemoteAddr, origRemotePort
+	})
+	for k, v := range map[string]string{
+		"SS_REMOTE_HOST":    "example.com",
+		"SS_REMOTE_PORT":    "443",
+		"SS_LOCAL_HOST":     "127.0.0.1",
+		"SS_LOCAL_PORT":     "1984",
+		"SS_PLUGIN_OPTIONS": pluginOptions,
+	} {
+		t.Setenv(k, v)
+	}
+}
+
+func TestEchFlagDefaults(t *testing.T) {
+	if *echMode != "auto" {
+		t.Errorf("ech flag default = %q, want %q", *echMode, "auto")
+	}
+	if *echDoh != "" {
+		t.Errorf("ech-doh flag default = %q, want empty", *echDoh)
+	}
+}
+
+func TestParseOptsIntoFlagsEch(t *testing.T) {
+	cases := []struct {
+		desc     string
+		opts     string
+		wantMode string
+		wantDoh  string
+	}{
+		{"both set", "ech=always;ech-doh=https://1.1.1.1/dns-query", "always", "https://1.1.1.1/dns-query"},
+		{"mode only", "ech=never", "never", ""},
+		{"doh only", "ech-doh=https://dns.google/dns-query", "auto", "https://dns.google/dns-query"},
+		{"neither (defaults)", "", "auto", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			restore := withEchFlags(t, "auto", "")
+			defer restore()
+			withEnv(t, c.opts)
+			parseOptsIntoFlags()
+			if *echMode != c.wantMode {
+				t.Errorf("%s: *echMode = %q, want %q", c.desc, *echMode, c.wantMode)
+			}
+			if *echDoh != c.wantDoh {
+				t.Errorf("%s: *echDoh = %q, want %q", c.desc, *echDoh, c.wantDoh)
+			}
+		})
+	}
+}

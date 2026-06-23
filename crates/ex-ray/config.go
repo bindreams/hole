@@ -52,6 +52,8 @@ var (
 	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
 	version    = flag.Bool("version", false, "Show current version of ex-ray")
 	fwmark     = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
+	echMode    = flag.String("ech", "auto", "ECH (Encrypted Client Hello) mode: auto (opportunistic), always (fail-closed), never.")
+	echDoh     = flag.String("ech-doh", "", "DoH URL used to fetch the ECH config (HTTPS record). Empty disables ECH.")
 )
 
 func homeDir() string {
