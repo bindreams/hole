@@ -227,10 +227,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ByteSniff<S> {
     }
 }
 
-/// Drive a no-verify QUIC handshake. A completed handshake or any peer-origin
-/// `ConnectionError` (`VersionMismatch`/`TransportError`/`Reset`/`*Closed`)
-/// means the server answered ⇒ Reachable; `TimedOut` or the outer deadline
-/// elapsing (no response at all) ⇒ Blocked.
+/// Drive a no-verify QUIC handshake. A completed handshake or a peer-origin
+/// `ConnectionError` (remote-closed (`ConnectionClosed`/`ApplicationClosed`)/`Reset`/`VersionMismatch`/`TransportError`:
+/// peer answered) means the server answered ⇒ Reachable; local-only
+/// `LocallyClosed`/`CidsExhausted` ⇒ Inconclusive; `TimedOut` or the outer
+/// deadline elapsing (no response at all) ⇒ Blocked.
 async fn probe_quic(host: &str, port: u16, sni: &str, deadline: Duration) -> ReachabilityVerdict {
     use quinn::{ClientConfig, ConnectionError, Endpoint};
     let addr = match lookup_host((host, port)).await {
@@ -258,8 +259,9 @@ async fn probe_quic(host: &str, port: u16, sni: &str, deadline: Duration) -> Rea
     let v = match tokio::time::timeout(deadline, connecting).await {
         Ok(Ok(_)) => ReachabilityVerdict::Reachable, // handshake completed
         Ok(Err(ConnectionError::TimedOut)) => ReachabilityVerdict::Blocked, // no response
-        Ok(Err(_)) => ReachabilityVerdict::Reachable, // VersionMismatch/TransportError/Reset/etc: peer responded
-        Err(_) => ReachabilityVerdict::Blocked,      // outer deadline, no response
+        Ok(Err(ConnectionError::LocallyClosed | ConnectionError::CidsExhausted)) => ReachabilityVerdict::Inconclusive, // local-only failure
+        Ok(Err(_)) => ReachabilityVerdict::Reachable, // VersionMismatch/TransportError/(Application|Connection)Closed/Reset: peer answered
+        Err(_) => ReachabilityVerdict::Blocked,       // outer deadline elapsed
     };
     ep.close(0u32.into(), b"");
     v
