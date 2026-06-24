@@ -630,7 +630,8 @@ components:
             Tagged union with `kind` discriminator. Variants:
             reachable {kind, latency_ms}, dns_failed {kind}, tcp_refused {kind},
             tcp_timeout {kind}, plugin_start_failed {kind, detail},
-            tunnel_handshake_failed {kind}, server_cannot_reach_internet {kind},
+            tunnel_handshake_failed {kind}, network_blocked {kind},
+            server_cannot_reach_internet {kind},
             sentinel_mismatch {kind, detail}, internal_error {kind, detail}.
             See protocol.rs::ServerTestOutcome.
 

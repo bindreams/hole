@@ -20,7 +20,7 @@ function statusClassFor(v: ValidationState | null | undefined): "untested" | "ok
   return v.outcome.kind === "reachable" ? "ok" : "fail";
 }
 
-function userMessageFor(o: ServerTestOutcome): string {
+export function userMessageFor(o: ServerTestOutcome): string {
   switch (o.kind) {
     case "reachable":
       return o.latency_ms === LATENCY_VALIDATED_ON_CONNECT
@@ -36,6 +36,8 @@ function userMessageFor(o: ServerTestOutcome): string {
       return `Plugin failed to start: ${o.detail}`;
     case "tunnel_handshake_failed":
       return "Server rejected the connection (wrong password, cipher, or plugin config).";
+    case "network_blocked":
+      return "The network is blocking the connection to this server — the handshake was reset or got no response. This usually means a firewall or censorship; try a different server.";
     case "server_cannot_reach_internet":
       return "Server cannot reach the public internet.";
     case "sentinel_mismatch":

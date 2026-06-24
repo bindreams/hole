@@ -328,3 +328,10 @@ describe("server test failure handling", () => {
     expect(document.querySelector<HTMLButtonElement>(".srv-test")!.disabled).toBe(true);
   });
 });
+
+describe("userMessageFor", () => {
+  it("maps network_blocked to a censorship-aware message", async () => {
+    const { userMessageFor } = await import("./servers");
+    expect(userMessageFor({ kind: "network_blocked" })).toMatch(/firewall or censorship/);
+  });
+});

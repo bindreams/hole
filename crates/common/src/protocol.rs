@@ -244,7 +244,10 @@ impl Default for ProxyConfig {
 /// Granularity ceiling: the shadowsocks protocol does not let a client
 /// distinguish "wrong cipher" from "wrong password" from "v2ray-plugin
 /// handshake rejected at the server side". All three collapse into
-/// `TunnelHandshakeFailed`.
+/// `TunnelHandshakeFailed`. The orthogonal "the network reset/dropped the
+/// transport before any handshake" axis is now separable out-of-band via the
+/// reachability probe (`NetworkBlocked`); see
+/// `crates/bridge/src/reachability.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerTestOutcome {
@@ -272,6 +275,11 @@ pub enum ServerTestOutcome {
     /// wrong password, wrong cipher, and v2ray-plugin handshake rejected at
     /// the server side, indistinguishably.
     TunnelHandshakeFailed,
+    /// Pre-flight reached the server at TCP but the network reset/dropped the
+    /// transport handshake (e.g. DPI range-blocking). Out-of-band signal from
+    /// the reachability probe; distinct from `TunnelHandshakeFailed`
+    /// (credentials/config). See `crates/bridge/src/reachability.rs` / #580.
+    NetworkBlocked,
     /// Tunnel established (server decrypted credentials successfully) but
     /// the upstream sentinel was unreachable through the tunnel. The
     /// shadowsocks server tried to forward our request and either could not

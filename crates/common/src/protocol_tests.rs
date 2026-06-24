@@ -381,6 +381,16 @@ fn bridge_response_diagnostics_roundtrips() {
     assert_eq!(resp, parsed);
 }
 
+// ServerTestOutcome wire compatibility ================================================================================
+
+#[skuld::test]
+fn network_blocked_round_trips() {
+    let o = ServerTestOutcome::NetworkBlocked;
+    let j = serde_json::to_string(&o).unwrap();
+    assert_eq!(j, r#"{"kind":"network_blocked"}"#);
+    assert_eq!(serde_json::from_str::<ServerTestOutcome>(&j).unwrap(), o);
+}
+
 // TunnelMode wire compatibility =======================================================================================
 
 #[skuld::test]
