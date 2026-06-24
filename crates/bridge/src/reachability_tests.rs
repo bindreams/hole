@@ -1,0 +1,171 @@
+// Sanctioned per-test CancellationToken::new (no caller-side token in unit fixtures). See clippy.toml.
+#![allow(clippy::disallowed_methods)]
+use super::*;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+const DL: Duration = Duration::from_secs(3);
+
+// Fixture: accept then drop (RST / FIN with zero app bytes).
+async fn accept_then_reset() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            drop(s);
+        }
+    });
+    addr
+}
+// Fixture: accept, read first-flight, write a few bytes (server "answered").
+//
+// After writing the reply we drain to EOF instead of dropping the socket: on
+// Windows, closing a TCP stream that still holds unread bytes (the rest of the
+// client's first-flight that we didn't read) emits an RST that discards the
+// reply we just wrote, which the probe would then misread as Blocked. Draining
+// until the peer closes lets the reply land first — no timer, pure rendezvous.
+async fn accept_then_answer() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = l.accept().await {
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b).await; // wait for ClientHello / GET first-flight
+            let _ = s.write_all(b"\x15\x03\x03\x00\x02\x02\x28").await; // bytes came back
+            let mut drain = [0u8; 256];
+            while let Ok(n) = s.read(&mut drain).await {
+                if n == 0 {
+                    break; // peer closed: reply has been delivered
+                }
+            }
+        }
+    });
+    addr
+}
+
+// All tests use `#[skuld::test]` (incl. the sync classifier ones): this crate
+// runs a custom skuld harness (`harness = false`) that collects only
+// `#[skuld::test]` functions — plain `#[test]` ones are silently never run.
+// Each carries an explicit `name = "reachability_tests::…"`: skuld reports the
+// bare fn ident as the test name (no module prefix), so the documented
+// `nextest run … reachability_tests` substring filter only matches with it.
+#[skuld::test(name = "reachability_tests::classify_no_plugin_is_raw")]
+fn classify_no_plugin_is_raw() {
+    assert!(matches!(classify_transport(None, None, "ex.com"), ProbeTransport::Raw));
+}
+#[skuld::test(name = "reachability_tests::classify_tls_ws_uses_host_as_sni")]
+fn classify_tls_ws_uses_host_as_sni() {
+    assert!(
+        matches!(classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv"),
+        ProbeTransport::TlsWs { sni } if sni == "h.ex.com")
+    );
+}
+#[skuld::test(name = "reachability_tests::classify_plain_ws_defaults_path_and_host")]
+fn classify_plain_ws_defaults_path_and_host() {
+    match classify_transport(Some("galoshes"), Some("path=/t/x"), "srv.ex.com") {
+        ProbeTransport::PlainWs { host, path } => {
+            assert_eq!(host, "srv.ex.com");
+            assert_eq!(path, "/t/x");
+        }
+        _ => panic!(),
+    }
+}
+#[skuld::test(name = "reachability_tests::classify_quic_forces_quic")]
+fn classify_quic_forces_quic() {
+    assert!(
+        matches!(classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv"),
+        ProbeTransport::Quic { sni } if sni == "h")
+    );
+}
+#[skuld::test(name = "reachability_tests::user_message_is_host_free")]
+fn user_message_is_host_free() {
+    let m = ReachabilityVerdict::Blocked.user_message().unwrap();
+    assert!(m.contains("firewall or censorship"));
+    assert!(ReachabilityVerdict::Reachable.user_message().is_none());
+}
+
+#[skuld::test(name = "reachability_tests::plain_ws_reset_is_blocked")]
+async fn plain_ws_reset_is_blocked() {
+    let a = accept_then_reset().await;
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("path=/x"),
+            DL,
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Blocked
+    );
+}
+#[skuld::test(name = "reachability_tests::plain_ws_answered_is_reachable")]
+async fn plain_ws_answered_is_reachable() {
+    let a = accept_then_answer().await;
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("path=/x"),
+            DL,
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Reachable
+    );
+}
+#[skuld::test(name = "reachability_tests::tls_ws_bytes_back_is_reachable")]
+async fn tls_ws_bytes_back_is_reachable() {
+    let a = accept_then_answer().await;
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            DL,
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Reachable
+    );
+}
+#[skuld::test(name = "reachability_tests::tls_ws_reset_is_blocked")]
+async fn tls_ws_reset_is_blocked() {
+    let a = accept_then_reset().await;
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            DL,
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Blocked
+    );
+}
+#[skuld::test(name = "reachability_tests::closed_port_is_refused_or_timeout")]
+async fn closed_port_is_refused_or_timeout() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    drop(l);
+    let v = probe_server_reachability(&a.ip().to_string(), a.port(), None, None, DL, &CancellationToken::new()).await;
+    assert!(matches!(
+        v,
+        ReachabilityVerdict::TcpRefused | ReachabilityVerdict::TcpTimeout
+    )); // Windows: timeout
+}
+#[skuld::test(name = "reachability_tests::bogus_host_is_dns_failed")]
+async fn bogus_host_is_dns_failed() {
+    assert_eq!(
+        probe_server_reachability("no-such-host.invalid", 443, None, None, DL, &CancellationToken::new()).await,
+        ReachabilityVerdict::DnsFailed
+    );
+}
