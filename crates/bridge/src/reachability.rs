@@ -227,9 +227,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ByteSniff<S> {
     }
 }
 
-// Temporary stub so Task 1 compiles; Task 2 replaces it with a real quinn probe.
-async fn probe_quic(_: &str, _: u16, _: &str, _: Duration) -> ReachabilityVerdict {
-    ReachabilityVerdict::Inconclusive
+/// Drive a no-verify QUIC handshake. A completed handshake or any peer-origin
+/// `ConnectionError` (`VersionMismatch`/`TransportError`/`Reset`/`*Closed`)
+/// means the server answered ⇒ Reachable; `TimedOut` or the outer deadline
+/// elapsing (no response at all) ⇒ Blocked.
+async fn probe_quic(host: &str, port: u16, sni: &str, deadline: Duration) -> ReachabilityVerdict {
+    use quinn::{ClientConfig, ConnectionError, Endpoint};
+    let addr = match lookup_host((host, port)).await {
+        Ok(mut it) => match it.next() {
+            Some(a) => a,
+            None => return ReachabilityVerdict::DnsFailed,
+        },
+        Err(_) => return ReachabilityVerdict::DnsFailed,
+    };
+    let mut ep = match Endpoint::client("0.0.0.0:0".parse().unwrap()) {
+        Ok(e) => e,
+        Err(_) => return ReachabilityVerdict::Inconclusive,
+    };
+    // QUIC needs TLS 1.3 (the default protocol versions include it) + h3 ALPN.
+    let tls = no_verify_tls_config(vec![b"h3".to_vec()]);
+    let qcc = match quinn::crypto::rustls::QuicClientConfig::try_from(tls) {
+        Ok(c) => c,
+        Err(_) => return ReachabilityVerdict::Inconclusive,
+    };
+    ep.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
+    let connecting = match ep.connect(addr, sni) {
+        Ok(c) => c,
+        Err(_) => return ReachabilityVerdict::Inconclusive,
+    };
+    let v = match tokio::time::timeout(deadline, connecting).await {
+        Ok(Ok(_)) => ReachabilityVerdict::Reachable, // handshake completed
+        Ok(Err(ConnectionError::TimedOut)) => ReachabilityVerdict::Blocked, // no response
+        Ok(Err(_)) => ReachabilityVerdict::Reachable, // VersionMismatch/TransportError/Reset/etc: peer responded
+        Err(_) => ReachabilityVerdict::Blocked,      // outer deadline, no response
+    };
+    ep.close(0u32.into(), b"");
+    v
 }
 
 #[cfg(test)]

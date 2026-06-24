@@ -169,3 +169,83 @@ async fn bogus_host_is_dns_failed() {
         ReachabilityVerdict::DnsFailed
     );
 }
+
+// QUIC probe (quinn) ==================================================================================================
+
+// Fixture: a quinn server endpoint with a self-signed cert + `h3` ALPN that
+// accepts connections and immediately drops them. The handshake still
+// completes (the client sees a peer response), so the probe reports Reachable.
+// Returns the bound UDP address; the endpoint is kept alive by the spawned task
+// owning it.
+async fn spawn_quinn_server() -> SocketAddr {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let key_pair = rcgen::KeyPair::generate().expect("rcgen key generation");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("rcgen accepts localhost as a subject name")
+        .self_signed(&key_pair)
+        .expect("rcgen self-sign");
+    let cert_der = CertificateDer::from(cert);
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+    // Explicit ring provider: the workspace rustls is built with
+    // `default-features = false`, so there is no installed process-level
+    // default `CryptoProvider` for `ServerConfig::builder()` to pick up.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports default versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("single-cert server config");
+    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).expect("quic server config"),
+    ));
+
+    let endpoint =
+        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("quinn server endpoint");
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let _ = incoming.await; // complete the handshake, then drop
+            });
+        }
+    });
+    addr
+}
+
+#[skuld::test(name = "reachability_tests::quic_silent_udp_is_blocked")]
+async fn quic_silent_udp_is_blocked() {
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(); // bound, never answers QUIC
+    let a = s.local_addr().unwrap();
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("mode=quic;host=h"),
+            Duration::from_secs(3),
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Blocked
+    );
+}
+#[skuld::test(name = "reachability_tests::quic_server_is_reachable")]
+async fn quic_server_is_reachable() {
+    let a = spawn_quinn_server().await; // rcgen self-signed quinn endpoint that accepts+ignores
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("mode=quic;host=localhost"),
+            Duration::from_secs(5),
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Reachable
+    );
+}
