@@ -327,7 +327,7 @@ func (c *Config) RequireEchSatisfied(cfg *tls.Config) error {
 // an ECH config (its conversion drops EncryptedClientHelloConfigList): it refuses
 // when ech=always (RequireEch) so the dial fails closed instead of writing a
 // cleartext-SNI ClientHello, and warns when ech=auto requested ECH so the
-// cleartext-SNI fallback is observable. engine names the transport.
+// cleartext-SNI fallback is observable.
 func (c *Config) HandleEchUnsupported(engine string) error {
 	if c == nil {
 		return nil
@@ -356,7 +356,7 @@ func (c *Config) GetTLSConfigForClient(opts ...Option) (*tls.Config, error) {
 // GetTLSConfigForUnsupportedClient builds a client *tls.Config for an engine that
 // cannot carry an ECH config (uTLS, hysteria2): it runs HandleEchUnsupported(engine)
 // first — refusing ech=always, warning on ech=auto — so the incapable path is
-// fail-closed by construction like GetTLSConfigForClient. engine names the transport.
+// fail-closed by construction like GetTLSConfigForClient.
 func (c *Config) GetTLSConfigForUnsupportedClient(engine string, opts ...Option) (*tls.Config, error) {
 	if err := c.HandleEchUnsupported(engine); err != nil {
 		return nil, err
