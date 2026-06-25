@@ -91,4 +91,9 @@ message Config {
   // cipher suites to to be offered or accepted.
   // This is an developer option.
   repeated uint32 ciphersuites = 19;
+
+  // If true, ECH is mandatory: when the ECH config cannot be applied (e.g. the
+  // HTTPS-record lookup fails), the handshake fails closed instead of falling
+  // back to a cleartext ServerName.
+  bool require_ech = 20;
 }

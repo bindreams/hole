@@ -225,3 +225,33 @@ func TestBuildTLSConfigEch(t *testing.T) {
 		})
 	}
 }
+
+// RequireEch is set iff ech=always: only "always" promises fail-closed ECH, so
+// only it flips the v2ray-side handshake poison. auto/never leave it false (the
+// no-poison, cleartext-fallback path).
+func TestBuildTLSConfigRequireEch(t *testing.T) {
+	cases := []struct {
+		desc, echMode, echDoh string
+		wantRequire           bool
+	}{
+		{"always sets RequireEch", "always", "https://1.1.1.1/dns-query", true},
+		{"auto does not", "auto", "https://1.1.1.1/dns-query", false},
+		{"never does not", "never", "https://1.1.1.1/dns-query", false},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			restore := withEchFlags(t, c.echMode, c.echDoh)
+			defer restore()
+			origHost, origTLS := *host, *tlsEnabled
+			*host, *tlsEnabled = "example.com", true
+			defer func() { *host, *tlsEnabled = origHost, origTLS }()
+			tc, err := buildTLSConfig()
+			if err != nil {
+				t.Fatalf("%s: buildTLSConfig() error = %v", c.desc, err)
+			}
+			if tc.RequireEch != c.wantRequire {
+				t.Errorf("%s: RequireEch = %v, want %v", c.desc, tc.RequireEch, c.wantRequire)
+			}
+		})
+	}
+}

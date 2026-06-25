@@ -290,7 +290,19 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(c.EchConfig) > 0 || len(c.Ech_DOHserver) > 0 {
 		err := ApplyECH(c, config) //nolint: staticcheck
 		if err != nil {            //nolint: staticcheck
-			newError("unable to set ECH").AtError().Base(err).WriteToLog()
+			if c.RequireEch {
+				// Fail closed: GetTLSConfig's signature is fixed (no error return,
+				// many call sites), so poison the config instead. VerifyConnection
+				// runs on every client handshake after the transcript is built and
+				// before any application data, so a cleartext (non-ECH) handshake is
+				// rejected there and the real ServerName is never usable.
+				config.VerifyConnection = func(tls.ConnectionState) error {
+					return newError("ECH required but not applied").Base(err)
+				}
+				newError("ECH required but not applied; failing closed").AtError().Base(err).WriteToLog()
+			} else {
+				newError("unable to set ECH").AtError().Base(err).WriteToLog()
+			}
 		}
 	}
 

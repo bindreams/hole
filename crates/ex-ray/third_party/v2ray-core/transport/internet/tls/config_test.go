@@ -95,3 +95,27 @@ func BenchmarkCertificateIssuing(b *testing.B) {
 		tlsConfig.Certificates = tlsConfig.Certificates[:lenCerts]
 	}
 }
+
+// With RequireEch, an ApplyECH failure (here: an unreachable DoH server) must
+// install a VerifyConnection hook that rejects every handshake, so the real SNI
+// is never sent in clear. The DoH URL points at a closed port, so ApplyECH
+// fails offline without any network.
+func TestGetTLSConfigRequireEchPoisonsOnApplyFailure(t *testing.T) {
+	c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query", RequireEch: true}
+	cfg := c.GetTLSConfig()
+	if cfg.VerifyConnection == nil {
+		t.Fatal("RequireEch + ApplyECH failure must install a poisoning VerifyConnection hook")
+	}
+	if err := cfg.VerifyConnection(gotls.ConnectionState{}); err == nil {
+		t.Fatal("poisoned VerifyConnection must reject the handshake")
+	}
+}
+
+// Without RequireEch, an ApplyECH failure stays opportunistic: no poison, the
+// handshake proceeds in clear (byte-identical to the no-RequireEch path).
+func TestGetTLSConfigRequireEchAbsentWhenNotSet(t *testing.T) {
+	c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query"}
+	if c.GetTLSConfig().VerifyConnection != nil {
+		t.Fatal("without RequireEch, ApplyECH failure must fall back to cleartext (no poison)")
+	}
+}
