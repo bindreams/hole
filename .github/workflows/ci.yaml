@@ -16,7 +16,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -58,7 +58,7 @@ jobs:
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -136,7 +136,7 @@ jobs:
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
@@ -177,7 +177,7 @@ jobs:
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
@@ -214,7 +214,7 @@ jobs:
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
@@ -266,7 +266,7 @@ jobs:
           - { os: darwin,  arch: amd64, runner: macos-15-intel }
           - { os: darwin,  arch: arm64, runner: macos-latest }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -379,7 +379,7 @@ jobs:
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -407,7 +407,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -551,7 +551,7 @@ jobs:
           - { os: darwin, arch: amd64, runner: macos-15-intel }
           - { os: darwin, arch: arm64, runner: macos-latest }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -605,7 +605,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
