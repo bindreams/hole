@@ -179,15 +179,7 @@ async fn reclassify_blocked(
 ) -> ServerTestOutcome {
     match tunnel_outcome {
         ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
-            if crate::reachability::probe_server_reachability(
-                host,
-                port,
-                plugin,
-                plugin_opts,
-                crate::reachability::PROBE_DEADLINE,
-                cancel,
-            )
-            .await
+            if crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel).await
                 == crate::reachability::ReachabilityVerdict::Blocked
             {
                 ServerTestOutcome::NetworkBlocked

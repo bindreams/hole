@@ -1,5 +1,5 @@
 //! Out-of-band server reachability probe — distinguishes a network-blocked /
-//! reset server from a credential/config failure. See bindreams/hole#580.
+//! reset server from a credential/config failure.
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -12,7 +12,13 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-pub const PROBE_DEADLINE: Duration = Duration::from_secs(6);
+// Per-phase budgets bound the total while preserving the connect-vs-first-flight
+// verdict split: a connect timeout stays `TcpTimeout` (a closed-port SYN-drop),
+// a first-flight no-response stays `Blocked` (a real block). One outer timeout
+// would conflate them. Non-QUIC worst case ≈ CONNECT_DEADLINE + FIRSTFLIGHT_DEADLINE = 6s.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // DNS resolve + TCP connect
+const FIRSTFLIGHT_DEADLINE: Duration = Duration::from_secs(3); // TLS/HTTP first-flight read
+const QUIC_DEADLINE: Duration = Duration::from_secs(6); // whole quinn connect
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReachabilityVerdict {
@@ -72,54 +78,65 @@ pub async fn probe_server_reachability(
     port: u16,
     plugin: Option<&str>,
     plugin_opts: Option<&str>,
-    deadline: Duration,
     cancel: &CancellationToken,
 ) -> ReachabilityVerdict {
     let transport = classify_transport(plugin, plugin_opts, host);
     let v = tokio::select! {
         _ = cancel.cancelled() => ReachabilityVerdict::Inconclusive,
-        v = probe_inner(host, port, &transport, deadline) => v,
+        v = probe_inner(host, port, &transport) => v,
     };
-    debug!(host, port, ?v, "reachability probe"); // full detail to bridge.log; toast gets only user_message()
+    debug!(host, port, ?v, "reachability probe");
     v
 }
 
-async fn probe_inner(host: &str, port: u16, transport: &ProbeTransport, deadline: Duration) -> ReachabilityVerdict {
+async fn probe_inner(host: &str, port: u16, transport: &ProbeTransport) -> ReachabilityVerdict {
     if let ProbeTransport::Quic { sni } = transport {
-        return probe_quic(host, port, sni, deadline).await; // Task 2
+        return probe_quic(host, port, sni).await;
     }
+    // Bound DNS resolve + TCP connect together so the slow-DNS case stays inside
+    // CONNECT_DEADLINE.
+    let stream = match tokio::time::timeout(CONNECT_DEADLINE, connect_tcp(host, port)).await {
+        Err(_) => return ReachabilityVerdict::TcpTimeout, // connect-phase deadline elapsed
+        Ok(Err(v)) => return v,                           // DnsFailed / TcpRefused / TcpTimeout
+        Ok(Ok(s)) => s,
+    };
+    match transport {
+        ProbeTransport::Raw => ReachabilityVerdict::Reachable,
+        ProbeTransport::PlainWs { host, path } => first_flight_http(stream, host, path).await,
+        ProbeTransport::TlsWs { sni } => first_flight_tls(stream, sni).await,
+        ProbeTransport::Quic { .. } => unreachable!(),
+    }
+}
+
+/// Resolve (if `host` is not a literal IP) then TCP-connect. `Err` carries the
+/// terminal verdict (`DnsFailed`/`TcpRefused`/`TcpTimeout`); the caller bounds
+/// the whole thing with `CONNECT_DEADLINE`.
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ReachabilityVerdict> {
     if host.parse::<IpAddr>().is_err() {
         let resolved = match lookup_host((host, port)).await {
             Ok(mut it) => it.next().is_some(),
             Err(_) => false,
         };
         if !resolved {
-            return ReachabilityVerdict::DnsFailed;
+            return Err(ReachabilityVerdict::DnsFailed);
         }
     }
-    let stream = match tokio::time::timeout(deadline, TcpStream::connect((host, port))).await {
-        Err(_) => return ReachabilityVerdict::TcpTimeout,
-        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => return ReachabilityVerdict::TcpRefused,
-        Ok(Err(_)) => return ReachabilityVerdict::TcpTimeout,
-        Ok(Ok(s)) => s,
-    };
-    match transport {
-        ProbeTransport::Raw => ReachabilityVerdict::Reachable,
-        ProbeTransport::PlainWs { host, path } => first_flight_http(stream, host, path, deadline).await,
-        ProbeTransport::TlsWs { sni } => first_flight_tls(stream, sni, deadline).await,
-        ProbeTransport::Quic { .. } => unreachable!(),
+    match TcpStream::connect((host, port)).await {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(ReachabilityVerdict::TcpRefused),
+        Err(_) => Err(ReachabilityVerdict::TcpTimeout),
     }
 }
 
 /// Send the WS-upgrade GET; any bytes back ⇒ Reachable; zero bytes (reset / timeout
 /// / clean EOF / write error) ⇒ Blocked.
-async fn first_flight_http(mut s: TcpStream, host: &str, path: &str, deadline: Duration) -> ReachabilityVerdict {
+async fn first_flight_http(mut s: TcpStream, host: &str, path: &str) -> ReachabilityVerdict {
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
     if s.write_all(req.as_bytes()).await.is_err() {
         return ReachabilityVerdict::Blocked;
     }
     let mut buf = [0u8; 64];
-    match tokio::time::timeout(deadline, s.read(&mut buf)).await {
+    match tokio::time::timeout(FIRSTFLIGHT_DEADLINE, s.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => ReachabilityVerdict::Reachable,
         _ => ReachabilityVerdict::Blocked, // Ok(Ok(0)) clean EOF, Ok(Err) reset, Err timeout
     }
@@ -127,22 +144,24 @@ async fn first_flight_http(mut s: TcpStream, host: &str, path: &str, deadline: D
 
 /// Drive a no-verify TLS handshake; handshake completes OR any server byte arrives
 /// ⇒ Reachable; reset / timeout / clean-EOF with zero bytes ⇒ Blocked.
-async fn first_flight_tls(stream: TcpStream, sni: &str, deadline: Duration) -> ReachabilityVerdict {
+async fn first_flight_tls(stream: TcpStream, sni: &str) -> ReachabilityVerdict {
     use rustls::pki_types::ServerName;
     let saw = Arc::new(AtomicBool::new(false));
     let sniffed = ByteSniff {
         inner: stream,
         saw: saw.clone(),
     };
+    // `ServerName::try_from(String)` parses a DNS name and falls back to an IP
+    // literal, so a manual IP arm would be dead.
     let name = match ServerName::try_from(sni.to_string()) {
         Ok(n) => n,
-        Err(_) => match sni.parse::<IpAddr>() {
-            Ok(ip) => ServerName::IpAddress(ip.into()),
-            Err(_) => return ReachabilityVerdict::Inconclusive,
-        },
+        Err(e) => {
+            debug!(%e, sni, "reachability probe: unparseable SNI");
+            return ReachabilityVerdict::Inconclusive;
+        }
     };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(no_verify_tls_config(vec![b"http/1.1".to_vec()])));
-    match tokio::time::timeout(deadline, connector.connect(name, sniffed)).await {
+    match tokio::time::timeout(FIRSTFLIGHT_DEADLINE, connector.connect(name, sniffed)).await {
         Ok(Ok(_)) => ReachabilityVerdict::Reachable,
         _ if saw.load(Ordering::SeqCst) => ReachabilityVerdict::Reachable,
         _ => ReachabilityVerdict::Blocked,
@@ -150,7 +169,7 @@ async fn first_flight_tls(stream: TcpStream, sni: &str, deadline: Duration) -> R
 }
 
 /// No-verify rustls client config (ring provider), used by the TLS probe.
-/// `alpn` lets the QUIC probe (Task 2) request `h3` instead of `http/1.1`.
+/// `alpn` lets the QUIC probe request `h3` instead of `http/1.1`.
 pub(crate) fn no_verify_tls_config(alpn: Vec<Vec<u8>>) -> rustls::ClientConfig {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -232,7 +251,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ByteSniff<S> {
 /// peer answered) means the server answered ⇒ Reachable; local-only
 /// `LocallyClosed`/`CidsExhausted` ⇒ Inconclusive; `TimedOut` or the outer
 /// deadline elapsing (no response at all) ⇒ Blocked.
-async fn probe_quic(host: &str, port: u16, sni: &str, deadline: Duration) -> ReachabilityVerdict {
+async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
     use quinn::{ClientConfig, ConnectionError, Endpoint};
     let addr = match lookup_host((host, port)).await {
         Ok(mut it) => match it.next() {
@@ -241,30 +260,41 @@ async fn probe_quic(host: &str, port: u16, sni: &str, deadline: Duration) -> Rea
         },
         Err(_) => return ReachabilityVerdict::DnsFailed,
     };
-    let mut ep = match Endpoint::client("0.0.0.0:0".parse().unwrap()) {
+    // Bind the endpoint to the remote's family: quinn rejects a v6 remote on a v4
+    // endpoint, and a wildcard-v6 socket isn't reliably dual-stack on Windows.
+    let bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let mut ep = match Endpoint::client(bind.parse().unwrap()) {
         Ok(e) => e,
-        Err(_) => return ReachabilityVerdict::Inconclusive,
+        Err(e) => {
+            debug!(%e, "quic probe: endpoint bind failed");
+            return ReachabilityVerdict::Inconclusive;
+        }
     };
     // QUIC needs TLS 1.3 (the default protocol versions include it) + h3 ALPN.
     let tls = no_verify_tls_config(vec![b"h3".to_vec()]);
     let qcc = match quinn::crypto::rustls::QuicClientConfig::try_from(tls) {
         Ok(c) => c,
-        Err(_) => return ReachabilityVerdict::Inconclusive,
+        Err(e) => {
+            debug!(%e, "quic probe: client config failed");
+            return ReachabilityVerdict::Inconclusive;
+        }
     };
     ep.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
     let connecting = match ep.connect(addr, sni) {
         Ok(c) => c,
-        Err(_) => return ReachabilityVerdict::Inconclusive,
+        Err(e) => {
+            debug!(%e, "quic probe: connect setup failed");
+            return ReachabilityVerdict::Inconclusive;
+        }
     };
-    let v = match tokio::time::timeout(deadline, connecting).await {
+    // `Drop` owns endpoint teardown; no explicit `ep.close()` on any exit.
+    match tokio::time::timeout(QUIC_DEADLINE, connecting).await {
         Ok(Ok(_)) => ReachabilityVerdict::Reachable, // handshake completed
         Ok(Err(ConnectionError::TimedOut)) => ReachabilityVerdict::Blocked, // no response
         Ok(Err(ConnectionError::LocallyClosed | ConnectionError::CidsExhausted)) => ReachabilityVerdict::Inconclusive, // local-only failure
         Ok(Err(_)) => ReachabilityVerdict::Reachable, // VersionMismatch/TransportError/(Application|Connection)Closed/Reset: peer answered
         Err(_) => ReachabilityVerdict::Blocked,       // outer deadline elapsed
-    };
-    ep.close(0u32.into(), b"");
-    v
+    }
 }
 
 #[cfg(test)]

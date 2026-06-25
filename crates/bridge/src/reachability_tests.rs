@@ -2,12 +2,9 @@
 #![allow(clippy::disallowed_methods)]
 use super::*;
 use std::net::SocketAddr;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-
-const DL: Duration = Duration::from_secs(3);
 
 // Fixture: accept then drop (RST / FIN with zero app bytes).
 async fn accept_then_reset() -> SocketAddr {
@@ -20,8 +17,6 @@ async fn accept_then_reset() -> SocketAddr {
     });
     addr
 }
-// Fixture: accept, read first-flight, write a few bytes (server "answered").
-//
 // After writing the reply we drain to EOF instead of dropping the socket: on
 // Windows, closing a TCP stream that still holds unread bytes (the rest of the
 // client's first-flight that we didn't read) emits an RST that discards the
@@ -96,7 +91,6 @@ async fn plain_ws_reset_is_blocked() {
             a.port(),
             Some("galoshes"),
             Some("path=/x"),
-            DL,
             &CancellationToken::new()
         )
         .await,
@@ -112,7 +106,6 @@ async fn plain_ws_answered_is_reachable() {
             a.port(),
             Some("galoshes"),
             Some("path=/x"),
-            DL,
             &CancellationToken::new()
         )
         .await,
@@ -128,7 +121,6 @@ async fn tls_ws_bytes_back_is_reachable() {
             a.port(),
             Some("galoshes"),
             Some("tls;host=h"),
-            DL,
             &CancellationToken::new()
         )
         .await,
@@ -144,7 +136,6 @@ async fn tls_ws_reset_is_blocked() {
             a.port(),
             Some("galoshes"),
             Some("tls;host=h"),
-            DL,
             &CancellationToken::new()
         )
         .await,
@@ -156,16 +147,26 @@ async fn closed_port_is_refused_or_timeout() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
-    let v = probe_server_reachability(&a.ip().to_string(), a.port(), None, None, DL, &CancellationToken::new()).await;
-    assert!(matches!(
-        v,
-        ReachabilityVerdict::TcpRefused | ReachabilityVerdict::TcpTimeout
-    )); // Windows: timeout
+    let v = probe_server_reachability(&a.ip().to_string(), a.port(), None, None, &CancellationToken::new()).await;
+    // Non-Windows kernels RST a closed port (TcpRefused); Windows GitHub runners
+    // drop inbound SYNs to closed ephemeral loopback ports → TcpTimeout. Both are
+    // correct "port is closed" verdicts. Mirrors server_test_tests.rs preflight.
+    if cfg!(target_os = "windows") {
+        assert!(
+            matches!(v, ReachabilityVerdict::TcpRefused | ReachabilityVerdict::TcpTimeout),
+            "expected TcpRefused or TcpTimeout on Windows, got {v:?}"
+        );
+    } else {
+        assert!(
+            matches!(v, ReachabilityVerdict::TcpRefused),
+            "expected TcpRefused, got {v:?}"
+        );
+    }
 }
 #[skuld::test(name = "reachability_tests::bogus_host_is_dns_failed")]
 async fn bogus_host_is_dns_failed() {
     assert_eq!(
-        probe_server_reachability("no-such-host.invalid", 443, None, None, DL, &CancellationToken::new()).await,
+        probe_server_reachability("no-such-host.invalid", 443, None, None, &CancellationToken::new()).await,
         ReachabilityVerdict::DnsFailed
     );
 }
@@ -175,9 +176,9 @@ async fn bogus_host_is_dns_failed() {
 // Fixture: a quinn server endpoint with a self-signed cert + `h3` ALPN that
 // accepts connections and immediately drops them. The handshake still
 // completes (the client sees a peer response), so the probe reports Reachable.
-// Returns the bound UDP address; the endpoint is kept alive by the spawned task
-// owning it.
-async fn spawn_quinn_server() -> SocketAddr {
+// `bind` selects the family (`127.0.0.1:0` v4 / `[::1]:0` v6). Returns the bound
+// UDP address; the endpoint is kept alive by the spawned task owning it.
+async fn spawn_quinn_server(bind: &str) -> SocketAddr {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     let key_pair = rcgen::KeyPair::generate().expect("rcgen key generation");
@@ -203,8 +204,7 @@ async fn spawn_quinn_server() -> SocketAddr {
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).expect("quic server config"),
     ));
 
-    let endpoint =
-        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("quinn server endpoint");
+    let endpoint = quinn::Endpoint::server(server_config, bind.parse().unwrap()).expect("quinn server endpoint");
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -226,7 +226,6 @@ async fn quic_silent_udp_is_blocked() {
             a.port(),
             Some("galoshes"),
             Some("mode=quic;host=h"),
-            Duration::from_secs(3),
             &CancellationToken::new()
         )
         .await,
@@ -235,17 +234,52 @@ async fn quic_silent_udp_is_blocked() {
 }
 #[skuld::test(name = "reachability_tests::quic_server_is_reachable")]
 async fn quic_server_is_reachable() {
-    let a = spawn_quinn_server().await; // rcgen self-signed quinn endpoint that accepts+ignores
+    let a = spawn_quinn_server("127.0.0.1:0").await; // rcgen self-signed quinn endpoint that accepts+ignores
     assert_eq!(
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
             Some("galoshes"),
             Some("mode=quic;host=localhost"),
-            Duration::from_secs(5),
             &CancellationToken::new()
         )
         .await,
         ReachabilityVerdict::Reachable
+    );
+}
+#[skuld::test(name = "reachability_tests::quic_server_v6_is_reachable")]
+async fn quic_server_v6_is_reachable() {
+    let a = spawn_quinn_server("[::1]:0").await; // IPv6 quinn endpoint — the v4-only-endpoint bug (#580) never probed this
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("mode=quic;host=localhost"),
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Reachable
+    );
+}
+#[skuld::test(name = "reachability_tests::cancel_against_silent_endpoint_is_inconclusive")]
+async fn cancel_against_silent_endpoint_is_inconclusive() {
+    // A bound-but-never-answering UDP socket is a black hole: the QUIC probe
+    // would otherwise sit until QUIC_DEADLINE. Signalling the token first must
+    // short-circuit to Inconclusive via the `cancel.cancelled()` select-arm.
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a = s.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("mode=quic;host=h"),
+            &cancel
+        )
+        .await,
+        ReachabilityVerdict::Inconclusive
     );
 }

@@ -1432,17 +1432,10 @@ async fn diagnose_self_test_failure(
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> Option<String> {
-    crate::reachability::probe_server_reachability(
-        host,
-        port,
-        plugin,
-        plugin_opts,
-        crate::reachability::PROBE_DEADLINE,
-        cancel,
-    )
-    .await
-    .user_message()
-    .map(str::to_owned)
+    crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel)
+        .await
+        .user_message()
+        .map(str::to_owned)
 }
 
 /// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.
