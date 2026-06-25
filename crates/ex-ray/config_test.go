@@ -227,8 +227,7 @@ func TestBuildTLSConfigEch(t *testing.T) {
 }
 
 // RequireEch is set iff ech=always: only "always" promises fail-closed ECH, so
-// only it flips the v2ray-side handshake poison. auto/never leave it false (the
-// no-poison, cleartext-fallback path).
+// only it arms the v2ray-side pre-handshake gate.
 func TestBuildTLSConfigRequireEch(t *testing.T) {
 	cases := []struct {
 		desc, echMode, echDoh string

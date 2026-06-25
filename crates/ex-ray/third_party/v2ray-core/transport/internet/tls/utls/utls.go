@@ -40,6 +40,11 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 		}
 	}
 	tlsConfig := e.config.TlsConfig.GetTLSConfig(options...)
+	// NOTE: this engine does not honor RequireEch and uTLSConfigFromTLSConfig
+	// drops EncryptedClientHelloConfigList, so ECH (fail-closed or otherwise) is
+	// a no-op here. The require-ECH gate lives on the stdlib tls.Engine and the
+	// QUIC dialer; ex-ray never selects this uTLS engine. Carry ECH + the gate
+	// through before routing a require-ECH config here.
 	utlsConfig, err := uTLSConfigFromTLSConfig(tlsConfig)
 	if err != nil {
 		return nil, newError("unable to generate utls config from tls config").Base(err)

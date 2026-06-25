@@ -166,7 +166,16 @@ func (s *clientConnections) openConnection(destAddr net.Addr, config *Config, tl
 		ConnectionIDLength: 12,
 	}
 
-	conn, err := tr.Dial(context.Background(), destAddr, tlsConfig.GetTLSConfig(tls.WithDestination(dest)), quicConfig)
+	gotlsConfig := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+	// QUIC bypasses the TLS security engine, so it gates ECH here: abort before
+	// quic-go hands the ClientHello to the wire when a required ECH config could
+	// not be obtained, so the real SNI is never sent in cleartext.
+	if err := tlsConfig.RequireEchSatisfied(gotlsConfig); err != nil {
+		sysConn.Close()
+		return nil, err
+	}
+
+	conn, err := tr.Dial(context.Background(), destAddr, gotlsConfig, quicConfig)
 	if err != nil {
 		sysConn.Close()
 		return nil, err

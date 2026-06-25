@@ -3,6 +3,7 @@ package quic_test
 import (
 	"context"
 	"crypto/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,5 +220,54 @@ func TestQuicConnectionAuthHeader(t *testing.T) {
 	common.Must2(b2.ReadFullFrom(conn, N))
 	if r := cmp.Diff(b2.Bytes(), b1); r != "" {
 		t.Error(r)
+	}
+}
+
+// The QUIC dialer bypasses the TLS security engine and hands the *tls.Config to
+// quic-go directly, so it must consult the same fail-closed ECH gate. With
+// RequireEch and an unobtainable ECH config (DoH at a closed port), Dial must
+// error before quic-go starts the handshake; no listener exists, so a passing
+// dial would mean the gate did not fire.
+func TestQuicDialRequireEchGatesUnobtainableConfig(t *testing.T) {
+	conn, err := quic.Dial(context.Background(), net.TCPDestination(net.LocalHostIP, udp.PickPort()), &internet.MemoryStreamConfig{
+		ProtocolName:     "quic",
+		ProtocolSettings: &quic.Config{},
+		SecurityType:     "tls",
+		SecuritySettings: &tls.Config{
+			ServerName:    "example.com",
+			Ech_DOHserver: "https://127.0.0.1:1/dns-query",
+			RequireEch:    true,
+		},
+	})
+	if conn != nil {
+		conn.Close()
+		t.Fatal("gated Dial must not return a connection")
+	}
+	// Assert the gate's pre-handshake refusal specifically, not a generic
+	// handshake failure (no listener would also error, masking a missing gate).
+	if err == nil || !strings.Contains(err.Error(), "ECH required") {
+		t.Fatalf("RequireEch + unobtainable ECH config must make Dial return the gate error, got: %v", err)
+	}
+}
+
+// Without RequireEch, an unobtainable ECH config is opportunistic: the gate does
+// not fire, so Dial proceeds past the gate. With no listener the handshake fails
+// later, but the error must not be the gate's pre-handshake refusal.
+func TestQuicDialNoRequireEchDoesNotGate(t *testing.T) {
+	conn, err := quic.Dial(context.Background(), net.TCPDestination(net.LocalHostIP, udp.PickPort()), &internet.MemoryStreamConfig{
+		ProtocolName:     "quic",
+		ProtocolSettings: &quic.Config{},
+		SecurityType:     "tls",
+		SecuritySettings: &tls.Config{
+			ServerName:    "example.com",
+			Ech_DOHserver: "https://127.0.0.1:1/dns-query",
+			AllowInsecure: true,
+		},
+	})
+	if conn != nil {
+		conn.Close()
+	}
+	if err != nil && strings.Contains(err.Error(), "ECH required") {
+		t.Fatalf("without RequireEch, Dial must not hit the ECH gate: %v", err)
 	}
 }

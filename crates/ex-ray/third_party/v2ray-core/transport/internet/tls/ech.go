@@ -41,6 +41,12 @@ func ApplyECH(c *Config, config *tls.Config) error {
 		}
 	}
 
+	// An empty record is unobtainable, not a usable config: leave the list empty
+	// so the dial-path require-ECH gate fires instead of handshaking ECH-less.
+	if len(ECHConfig) == 0 {
+		return newError("empty ECH config")
+	}
+
 	config.EncryptedClientHelloConfigList = ECHConfig
 	return nil
 }

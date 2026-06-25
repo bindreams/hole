@@ -3,11 +3,13 @@ package tls_test
 import (
 	gotls "crypto/tls"
 	"crypto/x509"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/protocol/tls/cert"
+	"github.com/v2fly/v2ray-core/v5/common/serial"
 	. "github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
 
@@ -96,26 +98,88 @@ func BenchmarkCertificateIssuing(b *testing.B) {
 	}
 }
 
-// With RequireEch, an ApplyECH failure (here: an unreachable DoH server) must
-// install a VerifyConnection hook that rejects every handshake, so the real SNI
-// is never sent in clear. The DoH URL points at a closed port, so ApplyECH
-// fails offline without any network.
-func TestGetTLSConfigRequireEchPoisonsOnApplyFailure(t *testing.T) {
+// With RequireEch, the engine must abort the dial when the ECH config can't be
+// obtained, before any ClientHello is written, so the cleartext SNI never hits
+// the wire. The DoH URL points at a closed port, so ApplyECH fails offline
+// (leaving EncryptedClientHelloConfigList nil) without any network; the gate
+// then returns an error from Client instead of constructing the TLS conn.
+func TestEngineClientRequireEchGatesUnobtainableConfig(t *testing.T) {
 	c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query", RequireEch: true}
-	cfg := c.GetTLSConfig()
-	if cfg.VerifyConnection == nil {
-		t.Fatal("RequireEch + ApplyECH failure must install a poisoning VerifyConnection hook")
+	engine, err := NewTLSSecurityEngineFromConfig(c)
+	common.Must(err)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	conn, err := engine.Client(client)
+	if err == nil {
+		t.Fatal("RequireEch + unobtainable ECH config must make Client return an error (no handshake)")
 	}
-	if err := cfg.VerifyConnection(gotls.ConnectionState{}); err == nil {
-		t.Fatal("poisoned VerifyConnection must reject the handshake")
+	if conn != nil {
+		t.Fatal("gated Client must not return a connection")
 	}
 }
 
-// Without RequireEch, an ApplyECH failure stays opportunistic: no poison, the
-// handshake proceeds in clear (byte-identical to the no-RequireEch path).
-func TestGetTLSConfigRequireEchAbsentWhenNotSet(t *testing.T) {
+// Without RequireEch, the same unobtainable ECH config is opportunistic: the
+// gate does not fire and Client returns a conn (the handshake later proceeds in
+// clear). net.Pipe never reads, so no handshake is attempted here.
+func TestEngineClientNoRequireEchDoesNotGate(t *testing.T) {
 	c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query"}
-	if c.GetTLSConfig().VerifyConnection != nil {
-		t.Fatal("without RequireEch, ApplyECH failure must fall back to cleartext (no poison)")
+	engine, err := NewTLSSecurityEngineFromConfig(c)
+	common.Must(err)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	conn, err := engine.Client(client)
+	if err != nil {
+		t.Fatalf("without RequireEch, Client must not gate: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("without RequireEch, Client must return a connection")
+	}
+}
+
+// RequireEch must survive the protobuf wire: ex-ray sets it on the tls.Config,
+// serializes via serial.ToTypedMessage, and v2ray deserializes before reading
+// it. A getter-only struct field with no descriptor would be dropped here.
+func TestConfigRequireEchRoundTrip(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		typed := serial.ToTypedMessage(&Config{ServerName: "example.com", RequireEch: want})
+		msg, err := serial.GetInstanceOf(typed)
+		common.Must(err)
+		got := msg.(*Config).GetRequireEch()
+		if got != want {
+			t.Errorf("RequireEch round-trip = %v, want %v", got, want)
+		}
+	}
+}
+
+// RequireEchSatisfied is the shared gate the dial paths consult. It must error
+// only when RequireEch is set and no ECH config was applied; len(nil)==0 and
+// len(empty)==0 both count as "no config" (an empty-but-non-nil list must not
+// slip through).
+func TestRequireEchSatisfied(t *testing.T) {
+	cases := []struct {
+		desc       string
+		requireEch bool
+		echList    []byte
+		wantErr    bool
+	}{
+		{"required, nil list", true, nil, true},
+		{"required, empty list", true, []byte{}, true},
+		{"required, populated list", true, []byte{0x01}, false},
+		{"not required, nil list", false, nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			cfg := &gotls.Config{EncryptedClientHelloConfigList: c.echList}
+			err := (&Config{RequireEch: c.requireEch}).RequireEchSatisfied(cfg)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("RequireEchSatisfied() err = %v, wantErr %v", err, c.wantErr)
+			}
+		})
 	}
 }

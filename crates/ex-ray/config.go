@@ -115,12 +115,10 @@ func uint32Opt(name string, v int) (uint32, error) {
 	return 0, newError("invalid", name, "(expected 0..4294967295), got:", v)
 }
 
-// buildTLSConfig assembles the v2ray tls.Config for the current flag state,
-// including ECH wiring. SNI stays *host. ECH is armed by setting Ech_DOHserver
-// (which triggers ApplyECH in v2ray's GetTLSConfig); we set it only when
-// ech != "never" AND ech-doh is non-empty. ech=always additionally sets
-// RequireEch, which makes the patched v2ray-core fail the handshake closed
-// rather than fall back to cleartext SNI when ECH can't be applied.
+// buildTLSConfig assembles the v2ray tls.Config: SNI stays *host, ECH is armed
+// by Ech_DOHserver (ech != "never" with a non-empty ech-doh), and ech=always
+// also sets RequireEch so v2ray aborts the dial rather than leak a cleartext SNI
+// when the ECH config can't be obtained.
 //
 // ech=always with an empty ech-doh is a configuration error (mirrors main.go's
 // exit-23 contract): "always" promises fail-closed ECH, impossible without a
@@ -165,8 +163,6 @@ func buildTLSConfig() (*tls.Config, error) {
 		if *echDoh != "" {
 			tlsConfig.Ech_DOHserver = *echDoh
 			if *echMode == "always" {
-				// Fail-closed ECH: the patched v2ray-core rejects the handshake
-				// rather than fall back to a cleartext SNI when ECH can't be applied.
 				tlsConfig.RequireEch = true
 			}
 		} else if *echMode == "always" {

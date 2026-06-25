@@ -288,21 +288,12 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 
 	if len(c.EchConfig) > 0 || len(c.Ech_DOHserver) > 0 {
-		err := ApplyECH(c, config) //nolint: staticcheck
-		if err != nil {            //nolint: staticcheck
-			if c.RequireEch {
-				// Fail closed: GetTLSConfig's signature is fixed (no error return,
-				// many call sites), so poison the config instead. VerifyConnection
-				// runs on every client handshake after the transcript is built and
-				// before any application data, so a cleartext (non-ECH) handshake is
-				// rejected there and the real ServerName is never usable.
-				config.VerifyConnection = func(tls.ConnectionState) error {
-					return newError("ECH required but not applied").Base(err)
-				}
-				newError("ECH required but not applied; failing closed").AtError().Base(err).WriteToLog()
-			} else {
-				newError("unable to set ECH").AtError().Base(err).WriteToLog()
-			}
+		// On failure ApplyECH leaves EncryptedClientHelloConfigList empty; the
+		// per-dial-path RequireEchSatisfied gate then decides whether an
+		// unobtainable ECH config aborts the dial (require_ech) or proceeds in
+		// cleartext (auto).
+		if err := ApplyECH(c, config); err != nil {
+			newError("unable to set ECH").AtError().Base(err).WriteToLog()
 		}
 	}
 
@@ -314,6 +305,17 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 
 	return config
+}
+
+// RequireEchSatisfied reports an error when ech=always (RequireEch) was set but
+// no ECH config was applied, so a client dial path can fail BEFORE the handshake
+// writes a cleartext-SNI ClientHello. cfg is the *crypto/tls.Config built by
+// GetTLSConfig; len==0 catches both a nil and an empty-but-non-nil ECH list.
+func (c *Config) RequireEchSatisfied(cfg *tls.Config) error {
+	if c.RequireEch && len(cfg.EncryptedClientHelloConfigList) == 0 {
+		return newError("ECH required but no ECH config could be obtained; refusing to handshake (would leak cleartext SNI)")
+	}
+	return nil
 }
 
 // Option for building TLS config.
