@@ -391,7 +391,12 @@ func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error)
 		HandshakeIdleTimeout: handshakeIdleTimeout,
 	}
 
-	conn, err := quic.DialAddr(ctx, s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto(NextProtoDQ)), quicConfig)
+	gotlsConfig, err := tlsConfig.GetTLSConfigForClient(tls.WithNextProto(NextProtoDQ))
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := quic.DialAddr(ctx, s.destination.NetAddr(), gotlsConfig, quicConfig)
 	if err != nil {
 		return nil, err
 	}

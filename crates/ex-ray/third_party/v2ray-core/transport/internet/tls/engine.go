@@ -21,10 +21,8 @@ func (e *Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, 
 			return nil, newError("unknown option")
 		}
 	}
-	config := e.config.GetTLSConfig(options...)
-	// Fail-closed ECH gate: abort before tls.Client writes any ClientHello, so a
-	// required-but-unobtainable ECH config never leaks the real SNI in cleartext.
-	if err := e.config.RequireEchSatisfied(config); err != nil {
+	config, err := e.config.GetTLSConfigForClient(options...)
+	if err != nil {
 		return nil, err
 	}
 	tlsConn := Client(conn, config)

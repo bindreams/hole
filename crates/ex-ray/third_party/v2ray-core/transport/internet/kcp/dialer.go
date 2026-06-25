@@ -2,6 +2,7 @@ package kcp
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"io"
 	"sync/atomic"
 
@@ -49,6 +50,17 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 	dest.Network = net.Network_UDP
 	newError("dialing mKCP to ", dest).WriteToLog()
 
+	// Run the factory's ECH gate before dialing, so a required-but-unobtainable
+	// ECH config aborts with no connection to tear down.
+	var gotlsConfig *gotls.Config
+	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
+		c, err := config.GetTLSConfigForClient(tls.WithDestination(dest))
+		if err != nil {
+			return nil, err
+		}
+		gotlsConfig = c
+	}
+
 	transportEnvironment := envctx.EnvironmentFromContext(ctx).(environment.TransportEnvironment)
 	dialer := transportEnvironment.Dialer()
 
@@ -88,8 +100,8 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 
 	var iConn internet.Connection = session
 
-	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
-		iConn = tls.Client(iConn, config.GetTLSConfig(tls.WithDestination(dest)))
+	if gotlsConfig != nil {
+		iConn = tls.Client(iConn, gotlsConfig)
 	}
 
 	return iConn, nil

@@ -32,6 +32,9 @@ func (c *rootCertsCache) load() (*x509.CertPool, error) {
 var rootCerts rootCertsCache
 
 func (c *Config) getCertPool() (*x509.CertPool, error) {
+	if c == nil {
+		return rootCerts.load()
+	}
 	if c.DisableSystemRoot {
 		return c.loadSelfCertPool(Certificate_AUTHORITY_VERIFY)
 	}

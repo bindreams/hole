@@ -84,7 +84,11 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	transportCredentials := insecure.NewCredentials()
 	if tlsConfig != nil {
-		transportCredentials = credentials.NewTLS(tlsConfig.GetTLSConfig(tls.WithDestination(dest)))
+		gotlsConfig, err := tlsConfig.GetTLSConfigForClient(tls.WithDestination(dest))
+		if err != nil {
+			return nil, nil, err
+		}
+		transportCredentials = credentials.NewTLS(gotlsConfig)
 	}
 	dialOptions := []grpc.DialOption{
 		grpc.WithTransportCredentials(transportCredentials),

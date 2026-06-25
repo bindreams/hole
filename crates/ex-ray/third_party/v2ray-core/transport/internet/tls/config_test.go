@@ -157,6 +157,43 @@ func TestConfigRequireEchRoundTrip(t *testing.T) {
 	}
 }
 
+// GetTLSConfigForClient bundles build + the require-ECH gate for client dial
+// paths. require_ech + unobtainable ECH (DoH at a closed port, offline) must
+// fail closed (nil cfg, error) before a cleartext-SNI hello; auto (RequireEch
+// off) must return the cfg; and a nil receiver must build a default cfg like
+// GetTLSConfig does.
+func TestGetTLSConfigForClient(t *testing.T) {
+	t.Run("require_ech unobtainable fails closed", func(t *testing.T) {
+		c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query", RequireEch: true}
+		cfg, err := c.GetTLSConfigForClient()
+		if err == nil {
+			t.Fatal("require_ech + unobtainable ECH must return an error")
+		}
+		if cfg != nil {
+			t.Fatal("failed-closed factory must return a nil config")
+		}
+	})
+	t.Run("auto unobtainable proceeds", func(t *testing.T) {
+		c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query"}
+		cfg, err := c.GetTLSConfigForClient()
+		if err != nil {
+			t.Fatalf("without require_ech the factory must not gate: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("factory must return a config")
+		}
+	})
+	t.Run("nil receiver", func(t *testing.T) {
+		cfg, err := (*Config)(nil).GetTLSConfigForClient()
+		if err != nil {
+			t.Fatalf("nil receiver must not error: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("nil receiver must build a default config")
+		}
+	})
+}
+
 // RequireEchSatisfied is the shared gate the dial paths consult. It must error
 // only when RequireEch is set and no ECH config was applied; len(nil)==0 and
 // len(empty)==0 both count as "no config" (an empty-but-non-nil list must not

@@ -31,6 +31,12 @@ func GetClientTLSConfig(dest net.Destination, streamSettings *internet.MemoryStr
 	if config == nil {
 		return nil, newError(Hy2MustNeedTLS)
 	}
+	// hyClient.TLSConfig carries only RootCAs/ServerName/InsecureSkipVerify/
+	// VerifyPeerCertificate — it cannot carry an ECH config, so like uTLS it fails
+	// closed by refusing when the operator requires ECH.
+	if config.RequireEch {
+		return nil, newError("hysteria2 cannot satisfy ech=always (cannot carry an ECH config); refusing to handshake")
+	}
 	tlsConfig := config.GetTLSConfig(tls.WithDestination(dest))
 
 	return &hyClient.TLSConfig{

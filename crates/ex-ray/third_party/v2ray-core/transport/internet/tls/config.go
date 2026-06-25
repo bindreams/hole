@@ -289,9 +289,8 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 	if len(c.EchConfig) > 0 || len(c.Ech_DOHserver) > 0 {
 		// On failure ApplyECH leaves EncryptedClientHelloConfigList empty; the
-		// per-dial-path RequireEchSatisfied gate then decides whether an
-		// unobtainable ECH config aborts the dial (require_ech) or proceeds in
-		// cleartext (auto).
+		// GetTLSConfigForClient gate then aborts an ech=always dial (require_ech)
+		// or proceeds in cleartext (auto).
 		if err := ApplyECH(c, config); err != nil {
 			newError("unable to set ECH").AtError().Base(err).WriteToLog()
 		}
@@ -312,10 +311,22 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 // writes a cleartext-SNI ClientHello. cfg is the *crypto/tls.Config built by
 // GetTLSConfig; len==0 catches both a nil and an empty-but-non-nil ECH list.
 func (c *Config) RequireEchSatisfied(cfg *tls.Config) error {
-	if c.RequireEch && len(cfg.EncryptedClientHelloConfigList) == 0 {
+	if c != nil && c.RequireEch && len(cfg.EncryptedClientHelloConfigList) == 0 {
 		return newError("ECH required but no ECH config could be obtained; refusing to handshake (would leak cleartext SNI)")
 	}
 	return nil
+}
+
+// GetTLSConfigForClient builds a client *tls.Config and fails closed when
+// ech=always (RequireEch) is set but no ECH config could be obtained, so the
+// dial aborts before a cleartext-SNI ClientHello is written. Client dial paths
+// must call this; server listeners, which send no ClientHello, use GetTLSConfig.
+func (c *Config) GetTLSConfigForClient(opts ...Option) (*tls.Config, error) {
+	config := c.GetTLSConfig(opts...)
+	if err := c.RequireEchSatisfied(config); err != nil {
+		return nil, err
+	}
+	return config, nil
 }
 
 // Option for building TLS config.
