@@ -51,6 +51,8 @@ mod launcher_smoke {
 
 mod roundtrips {
     use plugin_e2e::locators::locate_built_galoshes;
+    #[cfg(not(target_os = "windows"))]
+    use plugin_e2e::roundtrip::NotReachableKind;
     use plugin_e2e::roundtrip::{run_roundtrip, Roundtrip, RoundtripConfig};
     use plugin_e2e::sentinel::start_fake_sentinel;
     use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_PASSWORD};
@@ -174,23 +176,18 @@ mod roundtrips {
 
     /// Assert an ech=always run failed closed by the gate, not a transient. The
     /// gate refuses the upstream TLS dial pre-handshake, so the client plugin
-    /// closes the local link before any salt arrives and the ss reader surfaces a
-    /// deterministic `UnexpectedEof` ("unexpected end of file"). The cold-start
-    /// read-timeout flake (roundtrip.rs `RoundtripConfig`) — the only documented
-    /// confounder among `NotReachable`'s dispositions — is a "timed out" cause and
-    /// must NOT satisfy this; a working tunnel would be `Reachable`, never this arm.
+    /// closes the local link before any reply — the `PeerClosed` disposition,
+    /// covering both the FIN (EOF) and RST (connection reset) teardown races. A
+    /// read-timeout transient is its own `ReadTimeout` kind and must NOT satisfy
+    /// this; a working tunnel would be `Reachable`, never this arm.
     #[cfg(not(target_os = "windows"))]
     fn assert_gate_refusal(outcome: &Roundtrip) {
-        let Roundtrip::NotReachable(cause) = outcome else {
-            panic!("ech=always + unreachable ech-doh must fail closed, got {outcome:?}");
+        let Roundtrip::NotReachable { kind, detail } = outcome else {
+            panic!("ech=always + unreachable ech-doh must fail closed (refuse the tunnel), got {outcome:?}");
         };
         assert!(
-            !cause.contains("timed out"),
-            "fail-closed refusal must not be a timeout-class transient: {cause}"
-        );
-        assert!(
-            cause.contains("unexpected end of file"),
-            "expected the pre-handshake gate refusal disposition, got: {cause}"
+            matches!(kind, NotReachableKind::PeerClosed),
+            "fail-closed refusal must be the peer-closed-pre-reply disposition (not a timeout/transient), got {kind:?}: {detail}"
         );
     }
 
@@ -223,8 +220,7 @@ mod roundtrips {
             .await;
             assert_gate_refusal(&outcome);
 
-            // Negative control: ech=auto (closed DoH unchanged) must still tunnel,
-            // proving the refusal above is the always-gate, not the closed port.
+            // Negative control: ech=auto (closed DoH unchanged) must still tunnel.
             let (svr, _h) = start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
             let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
             let opts = format!("host=cloudfront.com;path=/;tls;cert={cert};ech=auto;{UNREACHABLE_ECH_DOH}");
