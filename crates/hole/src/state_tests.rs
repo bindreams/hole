@@ -1,6 +1,6 @@
 use super::*;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE, NETWORK_BLOCKED_MESSAGE};
 
 // ProxyStateCell ======================================================================================================
 
@@ -210,6 +210,7 @@ fn observed_running_rules() {
         (Start, Ok(BridgeResponse::Ack), Some(true)),
         (Start, Ok(err_resp(CANCELLED_MESSAGE)), Some(false)),
         (Start, Ok(err_resp("proxy already running")), Some(true)),
+        (Start, Ok(err_resp(NETWORK_BLOCKED_MESSAGE)), Some(false)),
         (Start, Ok(err_resp("plugin failed")), Some(false)),
         (Stop, Ok(BridgeResponse::Ack), Some(false)),
         (Stop, Ok(err_resp("teardown failed")), None),
@@ -267,6 +268,10 @@ fn start_error_classification() {
     assert_eq!(
         classify_start_error("proxy already running"),
         StartErrorKind::AlreadyRunning
+    );
+    assert_eq!(
+        classify_start_error(NETWORK_BLOCKED_MESSAGE),
+        StartErrorKind::NetworkBlocked
     );
     assert_eq!(classify_start_error("plugin failed"), StartErrorKind::Other);
 }

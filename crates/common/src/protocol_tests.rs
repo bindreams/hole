@@ -381,6 +381,30 @@ fn bridge_response_diagnostics_roundtrips() {
     assert_eq!(resp, parsed);
 }
 
+// ServerTestOutcome wire compatibility ================================================================================
+
+#[skuld::test]
+fn network_blocked_round_trips() {
+    let o = ServerTestOutcome::NetworkBlocked;
+    let j = serde_json::to_string(&o).unwrap();
+    assert_eq!(j, r#"{"kind":"network_blocked"}"#);
+    assert_eq!(serde_json::from_str::<ServerTestOutcome>(&j).unwrap(), o);
+}
+
+/// The censorship sentence is shown from two sources — the Rust
+/// `NETWORK_BLOCKED_MESSAGE` sentinel (live-Connect) and the TS
+/// `network_blocked` arm in `ui/servers.ts` (Server-Test). They must read
+/// byte-identically; this fails if either side drifts.
+#[skuld::test]
+fn network_blocked_message_matches_ui() {
+    use crate::protocol::NETWORK_BLOCKED_MESSAGE;
+    let servers_ts = include_str!("../../../ui/servers.ts");
+    assert!(
+        servers_ts.contains(NETWORK_BLOCKED_MESSAGE),
+        "ui/servers.ts must contain NETWORK_BLOCKED_MESSAGE verbatim"
+    );
+}
+
 // TunnelMode wire compatibility =======================================================================================
 
 #[skuld::test]

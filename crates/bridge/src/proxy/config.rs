@@ -88,6 +88,13 @@ pub enum ProxyError {
         attempts: u32,
         elapsed_ms: u64,
     },
+    /// The start-time reachability probe found the network is resetting/dropping
+    /// the server handshake (DPI / censorship), distinct from a credential/config
+    /// failure. `Display` is the host-free censorship sentence alone (the shared
+    /// [`hole_common::protocol::NETWORK_BLOCKED_MESSAGE`]); the GUI matches it
+    /// verbatim to render a clean toast.
+    #[error("{}", hole_common::protocol::NETWORK_BLOCKED_MESSAGE)]
+    NetworkBlocked,
 }
 
 // Error conversions from tun-engine ===================================================================================

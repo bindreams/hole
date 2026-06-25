@@ -91,6 +91,16 @@ pub enum BridgeRequest {
 /// wire-compatibility break.
 pub const CANCELLED_MESSAGE: &str = "cancelled";
 
+/// Host-free censorship toast text the bridge writes into `ErrorResponse` when
+/// the reachability probe finds the network is resetting/dropping the server
+/// handshake. The GUI matches it verbatim across the IPC boundary to render the
+/// toast standalone, so — like [`CANCELLED_MESSAGE`] — changing it is a
+/// wire-compatibility break. The duplicated copy in `ui/servers.ts` must stay
+/// byte-identical.
+pub const NETWORK_BLOCKED_MESSAGE: &str = "The network is blocking the connection to this server — the handshake was \
+     reset or got no response. This usually means a firewall or censorship; \
+     try a different server.";
+
 /// Client-side response enum. Used by the GUI client API and elevation flow.
 /// Not part of the wire protocol — the client maps HTTP responses back to
 /// these variants internally.
@@ -244,7 +254,9 @@ impl Default for ProxyConfig {
 /// Granularity ceiling: the shadowsocks protocol does not let a client
 /// distinguish "wrong cipher" from "wrong password" from "v2ray-plugin
 /// handshake rejected at the server side". All three collapse into
-/// `TunnelHandshakeFailed`.
+/// `TunnelHandshakeFailed`. The orthogonal "the network reset/dropped the
+/// transport before any handshake" axis is separable out-of-band via the
+/// reachability probe (`NetworkBlocked`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerTestOutcome {
@@ -272,6 +284,11 @@ pub enum ServerTestOutcome {
     /// wrong password, wrong cipher, and v2ray-plugin handshake rejected at
     /// the server side, indistinguishably.
     TunnelHandshakeFailed,
+    /// Pre-flight reached the server at TCP but the network reset/dropped the
+    /// transport handshake (e.g. DPI range-blocking). Out-of-band signal
+    /// produced by the reachability probe; distinct from `TunnelHandshakeFailed`
+    /// (credentials/config).
+    NetworkBlocked,
     /// Tunnel established (server decrypted credentials successfully) but
     /// the upstream sentinel was unreachable through the tunnel. The
     /// shadowsocks server tried to forward our request and either could not

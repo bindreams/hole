@@ -98,6 +98,10 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
+# QUIC reachability probe. quinn 0.11/quinn-proto 0.11 pin rustls 0.23
+# with the `quic` feature, which unifies additively with the workspace rustls
+# (ring provider) — no second rustls in the tree.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -145,6 +149,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # shadowsocks-service's `server` feature + rcgen + base64 transitively; the
 # bridge's own tests no longer reference those directly after the move (#435).
 plugin-e2e = { path = "../plugin-e2e" }
+# Self-signed cert for the quinn server fixture in reachability_tests.
+rcgen = "0.14"
 rand = "0.10"
 # Used by `test_support::net_discovery` for primary IPv4 detection in TUN tests.
 default-net = "0.22"
