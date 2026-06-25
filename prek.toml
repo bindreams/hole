@@ -1,5 +1,10 @@
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
+# Vendored upstream code is kept pristine; no hook may lint, format, or rewrite
+# it. crates/ex-ray/third_party/v2ray-core is a git-subrepo of pristine v2fly
+# v5.51.2 (build truth via go.mod replace); see its third_party/VENDORING.md.
+exclude = '^crates/ex-ray/third_party/v2ray-core/'
+
 # Local hooks ==========================================================================================================
 
 [[repos]]
@@ -36,7 +41,7 @@ pass_filenames = false
 id = "cargo-clippy"
 name = "cargo clippy"
 # `--no-default-features` is required to keep Tauri in dev mode for the
-# `hole` crate — production mode panics at compile time on missing
+# `hole` crate -- production mode panics at compile time on missing
 # `ui/dist/` because `tauri/custom-protocol` triggers `tauri-codegen`'s
 # embed step. Production lint coverage runs under `clippy-hole` in CI
 # (which uses the same flag). See bindreams/hole#372.
@@ -52,7 +57,7 @@ id = "go-fmt"
 name = "golangci-lint fmt (ex-ray)"
 # prek (0.3.6) has no per-hook working-directory field, so this `cd`s into the
 # Go module via a bash wrapper. golangci-lint is provisioned by
-# `cargo xtask deps` into .cache/ — referenced by absolute path (resolved from
+# `cargo xtask deps` into .cache/ -- referenced by absolute path (resolved from
 # the repo root via `git rev-parse`) so there's no PATH dependency and the hook
 # behaves identically locally and in CI. `fmt --diff` is check-only (the v2
 # formatters/gofumpt run). `crates/ex-ray` is the only Go module today; if a
@@ -68,7 +73,7 @@ pass_filenames = false
 id = "go-lint"
 name = "golangci-lint run (ex-ray)"
 # `run` = the v2 linters (incl. govet, which subsumes `go vet`). `fmt` and `run`
-# are both needed — golangci-lint v2 separates formatting from linting. Same
+# are both needed -- golangci-lint v2 separates formatting from linting. Same
 # bash-wrapper + absolute-cache-path rationale as `go-fmt` above.
 entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" run'"
 language = "system"
