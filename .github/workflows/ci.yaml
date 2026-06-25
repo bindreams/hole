@@ -402,6 +402,26 @@ jobs:
         shell: bash
         run: cargo xtask run plugin-e2e-tests
 
+  # ex-ray Go unit tests (the `ex-ray-tests` build.yaml target). This is the
+  # ONLY CI that runs Go tests: prek runs golangci-lint on the ex-ray wrapper
+  # but excludes third_party/v2ray-core and executes no tests. It gives the ECH
+  # fail-closed gate CI teeth — ex-ray's buildTLSConfig plus the patched vendored
+  # tls/quic/hysteria2 (incl. utls) gate/refuse/round-trip tests. The two ECH
+  # client transports ex-ray can't select (uTLS, hysteria2) are exercised here
+  # since the plugin-e2e roundtrips can only drive ws-tls + QUIC. Single linux
+  # runner: the gate logic is platform-independent (domainsocket is !windows).
+  test-ex-ray:
+    name: Test ex-ray (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Test ex-ray Go (ECH gate)
+        run: cargo xtask run ex-ray-tests
+
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
