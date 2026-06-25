@@ -812,7 +812,33 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 cancel.clone(),
             )
             .await;
-            outcome.into_result(started.elapsed().as_millis() as u64)?;
+            // On a self-test failure, probe the server out-of-band: if the
+            // network is blocking it (reset/no-response), rewrite the toast
+            // reason from the generic forwarder failure to a censorship-aware
+            // one. Threads the existing cooperative `cancel` token (#580).
+            if let Err(err) = outcome.into_result(started.elapsed().as_millis() as u64) {
+                if let ProxyError::ForwarderSelfTestFailed {
+                    attempts, elapsed_ms, ..
+                } = &err
+                {
+                    if let Some(reason) = diagnose_self_test_failure(
+                        &config.server.server,
+                        config.server.server_port,
+                        config.server.plugin.as_deref(),
+                        config.server.plugin_opts.as_deref(),
+                        &cancel,
+                    )
+                    .await
+                    {
+                        return Err(ProxyError::ForwarderSelfTestFailed {
+                            attempts: *attempts,
+                            elapsed_ms: *elapsed_ms,
+                            reason,
+                        });
+                    }
+                }
+                return Err(err);
+            }
         }
 
         // Phase 5: cancel checkpoint before Dispatcher::new (sync, cannot
@@ -1393,6 +1419,30 @@ impl SelfTestOutcome {
             Self::Cancelled => Err(ProxyError::Cancelled),
         }
     }
+}
+
+/// On a forwarder self-test failure, probe the server directly to see whether
+/// the network is blocking it. Returns a better, host-free toast reason, or
+/// `None` to keep the original self-test reason. Full detail (host/verdict)
+/// lands in `bridge.log` via the probe; only `user_message()` reaches the toast.
+async fn diagnose_self_test_failure(
+    host: &str,
+    port: u16,
+    plugin: Option<&str>,
+    plugin_opts: Option<&str>,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    crate::reachability::probe_server_reachability(
+        host,
+        port,
+        plugin,
+        plugin_opts,
+        crate::reachability::PROBE_DEADLINE,
+        cancel,
+    )
+    .await
+    .user_message()
+    .map(str::to_owned)
 }
 
 /// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.

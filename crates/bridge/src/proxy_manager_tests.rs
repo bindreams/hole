@@ -2141,4 +2141,64 @@ mod self_test {
             pm.stop().await.unwrap();
         });
     }
+
+    // Self-test diagnosis (live-Connect reason rewrite) ---------------------------------------------------------------
+    //
+    // `diagnose_self_test_failure` runs the out-of-band reachability probe on a
+    // forwarder self-test failure and yields a host-free toast reason only when
+    // the network is blocking the server. These unit-test the helper directly;
+    // no real TUN / bridge start is needed.
+
+    /// A TLS-transport endpoint that accepts TCP then resets the handshake →
+    /// the probe verdict is `Blocked` → a censorship-aware reason is returned.
+    #[skuld::test(name = "proxy_manager_tests::diagnose_reports_block_for_reset_endpoint")]
+    async fn diagnose_reports_block_for_reset_endpoint() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                drop(s);
+            }
+        });
+        let r = diagnose_self_test_failure(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(r.unwrap().contains("firewall or censorship"));
+    }
+
+    /// A TLS-transport endpoint that answers with bytes → the probe verdict is
+    /// `Reachable` → `None`, so the original self-test reason is kept.
+    #[skuld::test(name = "proxy_manager_tests::diagnose_keeps_reason_when_reachable")]
+    async fn diagnose_keeps_reason_when_reachable() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut b = [0u8; 64];
+                let _ = s.read(&mut b).await; // wait for the probe's ClientHello first-flight
+                let _ = s.write_all(b"\x15\x03\x03\x00\x02\x02\x28").await; // bytes came back
+                let mut drain = [0u8; 256];
+                while let Ok(n) = s.read(&mut drain).await {
+                    if n == 0 {
+                        break; // peer closed: reply has been delivered
+                    }
+                }
+            }
+        });
+        assert!(diagnose_self_test_failure(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await
+        .is_none());
+    }
 }
