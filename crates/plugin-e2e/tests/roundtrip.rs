@@ -62,6 +62,8 @@ mod roundtrips {
     #[cfg(not(target_os = "windows"))]
     use plugin_e2e::certs::{generate_test_certs, path_for_plugin_opts};
     #[cfg(not(target_os = "windows"))]
+    use plugin_e2e::locators::locate_ex_ray;
+    #[cfg(not(target_os = "windows"))]
     use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_quic, start_real_ss_server_with_plugin_ws_tls};
 
     #[skuld::label]
@@ -152,6 +154,127 @@ mod roundtrips {
             )
             .await;
             assert!(matches!(outcome, Roundtrip::Reachable { .. }), "quic: {outcome:?}");
+        });
+    }
+
+    /// ex-ray client built by `cargo xtask ex-ray`. The ECH fail-closed gate
+    /// lives in ex-ray's own client TLS dial paths, so both ends are ex-ray.
+    #[cfg(not(target_os = "windows"))]
+    fn require_ex_ray() -> String {
+        let p = locate_ex_ray();
+        require_binary(&p, "run `cargo xtask ex-ray`");
+        p.to_str().expect("ex-ray path is valid utf-8").to_string()
+    }
+
+    /// Closed-port DoH source: an immediate ECONNREFUSED makes the ECH fetch fail
+    /// without network, so ech=always has no config to satisfy it (matches the
+    /// ex-ray unit tests). The refusal is on the connect result, not a timeout.
+    #[cfg(not(target_os = "windows"))]
+    const UNREACHABLE_ECH_DOH: &str = "ech-doh=https://127.0.0.1:1/dns-query";
+
+    /// ECH fail-closed over WS-TLS (off Windows — see file header). ech=always +
+    /// an unobtainable ECH config must refuse the dial BEFORE any ClientHello, so
+    /// the real SNI never reaches the wire: the tunnel is NotReachable. The
+    /// ech=auto control (same closed DoH) stays Reachable, proving the refusal is
+    /// the always fail-closed gate, not generic breakage from the closed port.
+    #[cfg(not(target_os = "windows"))]
+    #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+    fn ech_always_ws_tls_fails_closed() {
+        let ex_ray = require_ex_ray();
+        rt().block_on(async {
+            let certs = generate_test_certs();
+            let cert = path_for_plugin_opts(&certs.cert_path);
+
+            let (svr, _h) = start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let opts = format!("host=cloudfront.com;path=/;tls;cert={cert};ech=always;{UNREACHABLE_ECH_DOH}");
+            let outcome = run_roundtrip(
+                &ex_ray,
+                Some(&opts),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Roundtrip::NotReachable(_)),
+                "ech=always + unreachable ech-doh must fail closed, got {outcome:?}"
+            );
+
+            // Negative control: a fresh server + sentinel, ech=auto (closed DoH
+            // unchanged) must still tunnel.
+            let (svr, _h) = start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let opts = format!("host=cloudfront.com;path=/;tls;cert={cert};ech=auto;{UNREACHABLE_ECH_DOH}");
+            let outcome = run_roundtrip(
+                &ex_ray,
+                Some(&opts),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Roundtrip::Reachable { .. }),
+                "ech=auto control: {outcome:?}"
+            );
+        });
+    }
+
+    /// ECH fail-closed over QUIC (off Windows — see file header). QUIC's client
+    /// dial path also routes through GetTLSConfigForClient, so the same
+    /// always/auto contract holds as for WS-TLS above.
+    #[cfg(not(target_os = "windows"))]
+    #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+    fn ech_always_quic_fails_closed() {
+        let ex_ray = require_ex_ray();
+        rt().block_on(async {
+            let certs = generate_test_certs();
+            let cert = path_for_plugin_opts(&certs.cert_path);
+
+            let (svr, _h) = start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let opts = format!("host=cloudfront.com;mode=quic;cert={cert};ech=always;{UNREACHABLE_ECH_DOH}");
+            let outcome = run_roundtrip(
+                &ex_ray,
+                Some(&opts),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Roundtrip::NotReachable(_)),
+                "quic ech=always + unreachable ech-doh must fail closed, got {outcome:?}"
+            );
+
+            let (svr, _h) = start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let opts = format!("host=cloudfront.com;mode=quic;cert={cert};ech=auto;{UNREACHABLE_ECH_DOH}");
+            let outcome = run_roundtrip(
+                &ex_ray,
+                Some(&opts),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Roundtrip::Reachable { .. }),
+                "quic ech=auto control: {outcome:?}"
+            );
         });
     }
 }

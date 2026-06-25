@@ -562,10 +562,13 @@ removed because tmpfs is commonly `noexec` (#401).
 
 **Client TLS dial paths must fail closed on ECH.** Every client TLS dial path in
 the vendored `ex-ray/third_party/v2ray-core` must build its config via
-`GetTLSConfigForClient` (ECH-capable transports) or refuse via
-`RefuseIfEchRequiredUnsupported` (ECH-incapable engines: uTLS, hysteria2); a bare
-`GetTLSConfig` on a client path leaks the real SNI in cleartext under
-`ech=always`. Re-verify this on every upstream v2ray-core re-merge.
+`GetTLSConfigForClient` (ECH-capable transports) or `HandleEchUnsupported`
+(ECH-incapable engines: uTLS, hysteria2); a bare `GetTLSConfig` on a client path
+leaks the real SNI in cleartext under `ech=always`. For ex-ray's real transports
+(stdlib TLS over ws/tcp/http + QUIC) the fail-closed behavior is enforced in CI by
+the ECH roundtrip tests in `crates/plugin-e2e/tests/roundtrip.rs` (`ech=always` +
+an unreachable `ech-doh` ⟹ tunnel refused). Re-verify those on an upstream
+v2ray-core re-merge.
 
 ## Prerequisites
 
