@@ -23,8 +23,18 @@ pub fn doh_url(ip: IpAddr) -> String {
     }
 }
 
+/// The resolver IPs [`doh_url`] maps to a known provider (i.e. not the
+/// literal-IP fallback). The bridge's `KnownProvider` table must cover the same
+/// set; a bridge-side test asserts the two agree.
+pub fn provider_ips() -> impl Iterator<Item = IpAddr> {
+    TABLE
+        .iter()
+        .map(|(addr, _)| addr.parse::<IpAddr>().expect("provider table IP literal parses"))
+}
+
 // (resolver IP, provider DoH URL). Mirrors the provider IP set the bridge's
-// `crates/bridge/src/dns/providers.rs` SNI table covers.
+// `crates/bridge/src/dns/providers.rs` SNI table covers (a bridge-side test
+// enforces the two agree).
 const TABLE: &[(&str, &str)] = &[
     ("1.1.1.1", "https://cloudflare-dns.com/dns-query"),
     ("1.0.0.1", "https://cloudflare-dns.com/dns-query"),
