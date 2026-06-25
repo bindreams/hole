@@ -167,16 +167,38 @@ mod roundtrips {
     }
 
     /// Closed-port DoH source: an immediate ECONNREFUSED makes the ECH fetch fail
-    /// without network, so ech=always has no config to satisfy it (matches the
-    /// ex-ray unit tests). The refusal is on the connect result, not a timeout.
+    /// without network, so ech=always has no config to satisfy it. The refusal is
+    /// on the connect result, not a timeout.
     #[cfg(not(target_os = "windows"))]
     const UNREACHABLE_ECH_DOH: &str = "ech-doh=https://127.0.0.1:1/dns-query";
 
+    /// Assert an ech=always run failed closed by the gate, not a transient. The
+    /// gate refuses the upstream TLS dial pre-handshake, so the client plugin
+    /// closes the local link before any salt arrives and the ss reader surfaces a
+    /// deterministic `UnexpectedEof` ("unexpected end of file"). The cold-start
+    /// read-timeout flake (roundtrip.rs `RoundtripConfig`) — the only documented
+    /// confounder among `NotReachable`'s dispositions — is a "timed out" cause and
+    /// must NOT satisfy this; a working tunnel would be `Reachable`, never this arm.
+    #[cfg(not(target_os = "windows"))]
+    fn assert_gate_refusal(outcome: &Roundtrip) {
+        let Roundtrip::NotReachable(cause) = outcome else {
+            panic!("ech=always + unreachable ech-doh must fail closed, got {outcome:?}");
+        };
+        assert!(
+            !cause.contains("timed out"),
+            "fail-closed refusal must not be a timeout-class transient: {cause}"
+        );
+        assert!(
+            cause.contains("unexpected end of file"),
+            "expected the pre-handshake gate refusal disposition, got: {cause}"
+        );
+    }
+
     /// ECH fail-closed over WS-TLS (off Windows — see file header). ech=always +
     /// an unobtainable ECH config must refuse the dial BEFORE any ClientHello, so
-    /// the real SNI never reaches the wire: the tunnel is NotReachable. The
-    /// ech=auto control (same closed DoH) stays Reachable, proving the refusal is
-    /// the always fail-closed gate, not generic breakage from the closed port.
+    /// the real SNI never reaches the wire. The ech=auto control (same closed DoH)
+    /// stays Reachable, proving the refusal is the always fail-closed gate, not
+    /// generic breakage from the closed port.
     #[cfg(not(target_os = "windows"))]
     #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
     fn ech_always_ws_tls_fails_closed() {
@@ -199,13 +221,10 @@ mod roundtrips {
                 &RoundtripConfig::default(),
             )
             .await;
-            assert!(
-                matches!(outcome, Roundtrip::NotReachable(_)),
-                "ech=always + unreachable ech-doh must fail closed, got {outcome:?}"
-            );
+            assert_gate_refusal(&outcome);
 
-            // Negative control: a fresh server + sentinel, ech=auto (closed DoH
-            // unchanged) must still tunnel.
+            // Negative control: ech=auto (closed DoH unchanged) must still tunnel,
+            // proving the refusal above is the always-gate, not the closed port.
             let (svr, _h) = start_real_ss_server_with_plugin_ws_tls(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
             let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
             let opts = format!("host=cloudfront.com;path=/;tls;cert={cert};ech=auto;{UNREACHABLE_ECH_DOH}");
@@ -252,10 +271,7 @@ mod roundtrips {
                 &RoundtripConfig::default(),
             )
             .await;
-            assert!(
-                matches!(outcome, Roundtrip::NotReachable(_)),
-                "quic ech=always + unreachable ech-doh must fail closed, got {outcome:?}"
-            );
+            assert_gate_refusal(&outcome);
 
             let (svr, _h) = start_real_ss_server_with_plugin_quic(TEST_METHOD, TEST_PASSWORD, &ex_ray, &certs).await;
             let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
