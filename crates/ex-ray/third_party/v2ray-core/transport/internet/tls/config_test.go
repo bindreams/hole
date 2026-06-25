@@ -9,10 +9,23 @@ import (
 	"time"
 
 	"github.com/v2fly/v2ray-core/v5/common"
+	"github.com/v2fly/v2ray-core/v5/common/log"
 	"github.com/v2fly/v2ray-core/v5/common/protocol/tls/cert"
 	"github.com/v2fly/v2ray-core/v5/common/serial"
 	. "github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
+
+// captureLog records the last v2ray-core log message so a test can assert a
+// WriteToLog warning fired. discardLog restores a no-op handler afterward
+// (RegisterHandler panics on nil, so cleanup cannot clear it).
+type captureLog struct{ msg string }
+
+func (c *captureLog) Handle(m log.Message) { c.msg = m.String() }
+func (c *captureLog) last() string         { return c.msg }
+
+type discardLog struct{}
+
+func (discardLog) Handle(log.Message) {}
 
 func TestCertificateIssuing(t *testing.T) {
 	certificate := ParseCertificate(cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign)))
@@ -192,6 +205,35 @@ func TestGetTLSConfigForClient(t *testing.T) {
 	})
 }
 
+// GetTLSConfigForUnsupportedClient is the ECH-incapable factory (uTLS, hysteria2):
+// it runs HandleEchUnsupported then GetTLSConfig, so ech=always fails closed (nil
+// cfg, error naming the engine) while ech=auto builds a config.
+func TestGetTLSConfigForUnsupportedClient(t *testing.T) {
+	t.Run("always refuses naming the engine", func(t *testing.T) {
+		c := &Config{ServerName: "example.com", RequireEch: true}
+		cfg, err := c.GetTLSConfigForUnsupportedClient("widget engine")
+		if err == nil {
+			t.Fatal("ech=always on an ECH-incapable engine must fail closed")
+		}
+		if cfg != nil {
+			t.Fatal("failed-closed factory must return a nil config")
+		}
+		if !strings.Contains(err.Error(), "widget engine") {
+			t.Fatalf("error must name the engine, got: %v", err)
+		}
+	})
+	t.Run("auto builds a config", func(t *testing.T) {
+		c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query"}
+		cfg, err := c.GetTLSConfigForUnsupportedClient("widget engine")
+		if err != nil {
+			t.Fatalf("ech=auto must not refuse: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("factory must return a config")
+		}
+	})
+}
+
 // HandleEchUnsupported is the shared policy helper for ECH-incapable engines;
 // the message names the engine and the ech=always token the per-engine refuse
 // tests assert on.
@@ -205,9 +247,17 @@ func TestHandleEchUnsupported(t *testing.T) {
 			t.Fatalf("error must name the engine and ech=always, got: %v", msg)
 		}
 	})
-	t.Run("auto with ECH requested returns nil", func(t *testing.T) {
+	t.Run("auto with ECH requested returns nil and warns", func(t *testing.T) {
+		// The log handler is process-global; this subcase must not run parallel.
+		var sink captureLog
+		log.RegisterHandler(&sink)
+		t.Cleanup(func() { log.RegisterHandler(discardLog{}) })
+
 		if err := (&Config{Ech_DOHserver: "https://127.0.0.1:1/dns-query"}).HandleEchUnsupported("widget engine"); err != nil {
 			t.Fatalf("auto must not refuse (it warns): %v", err)
+		}
+		if msg := sink.last(); !strings.Contains(msg, "widget engine") || !strings.Contains(msg, "ech=auto") {
+			t.Fatalf("auto must warn naming the engine and ech=auto, got: %q", msg)
 		}
 	})
 	t.Run("auto without ECH returns nil", func(t *testing.T) {

@@ -40,10 +40,10 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 		}
 	}
 	// uTLSConfigFromTLSConfig drops EncryptedClientHelloConfigList, so uTLS cannot carry ECH.
-	if err := e.config.TlsConfig.HandleEchUnsupported("uTLS engine"); err != nil {
+	tlsConfig, err := e.config.TlsConfig.GetTLSConfigForUnsupportedClient("uTLS engine", options...)
+	if err != nil {
 		return nil, err
 	}
-	tlsConfig := e.config.TlsConfig.GetTLSConfig(options...)
 	utlsConfig, err := uTLSConfigFromTLSConfig(tlsConfig)
 	if err != nil {
 		return nil, newError("unable to generate utls config from tls config").Base(err)

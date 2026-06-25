@@ -32,10 +32,10 @@ func GetClientTLSConfig(dest net.Destination, streamSettings *internet.MemoryStr
 		return nil, newError(Hy2MustNeedTLS)
 	}
 	// hyClient.TLSConfig has no ECH field, so hysteria2 cannot carry ECH.
-	if err := config.HandleEchUnsupported("hysteria2"); err != nil {
+	tlsConfig, err := config.GetTLSConfigForUnsupportedClient("hysteria2", tls.WithDestination(dest))
+	if err != nil {
 		return nil, err
 	}
-	tlsConfig := config.GetTLSConfig(tls.WithDestination(dest))
 
 	return &hyClient.TLSConfig{
 		RootCAs:               tlsConfig.RootCAs,

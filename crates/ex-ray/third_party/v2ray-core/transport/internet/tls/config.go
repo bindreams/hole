@@ -207,14 +207,11 @@ func (a *alwaysFlushWriter) Write(p []byte) (n int, err error) {
 
 // GetTLSConfig converts this Config into tls.Config.
 //
-// WARNING: this builds a bare config with no ECH fail-closed gate. Use it only
-// where that is correct:
-//   - ECH-capable client dial paths MUST instead use GetTLSConfigForClient, which
-//     fails closed so a required-but-unobtainable ECH config never leaks the real
-//     SNI in cleartext;
-//   - ECH-incapable client engines (uTLS, hysteria2) MUST call HandleEchUnsupported
-//     before this — they cannot carry ECH, so they refuse ech=always (warn on auto);
-//   - server listeners, which send no ClientHello, call this directly.
+// WARNING: this builds a bare config with no ECH fail-closed gate, so client dial
+// paths must NOT call it directly — ECH-capable paths use GetTLSConfigForClient and
+// ECH-incapable engines (uTLS, hysteria2) use GetTLSConfigForUnsupportedClient; both
+// fail closed so a required-but-unobtainable ECH config never leaks the real SNI in
+// cleartext. Only server listeners, which send no ClientHello, call this directly.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	root, err := c.getCertPool()
 	if err != nil {
@@ -354,6 +351,17 @@ func (c *Config) GetTLSConfigForClient(opts ...Option) (*tls.Config, error) {
 		return nil, err
 	}
 	return config, nil
+}
+
+// GetTLSConfigForUnsupportedClient builds a client *tls.Config for an engine that
+// cannot carry an ECH config (uTLS, hysteria2): it runs HandleEchUnsupported(engine)
+// first — refusing ech=always, warning on ech=auto — so the incapable path is
+// fail-closed by construction like GetTLSConfigForClient. engine names the transport.
+func (c *Config) GetTLSConfigForUnsupportedClient(engine string, opts ...Option) (*tls.Config, error) {
+	if err := c.HandleEchUnsupported(engine); err != nil {
+		return nil, err
+	}
+	return c.GetTLSConfig(opts...), nil
 }
 
 // Option for building TLS config.
