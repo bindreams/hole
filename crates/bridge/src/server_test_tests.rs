@@ -8,6 +8,10 @@
 //! The server/sentinel/port helpers live in the crate-wide `test_support`
 //! module so `proxy_manager_e2e_tests.rs` can reuse them.
 
+// Sanctioned per-test CancellationToken::new (no caller-side token in these unit
+// fixtures). See clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use super::{run_server_test, TestConfig};
 use crate::test_support::port_alloc::wait_for_port;
 use crate::test_support::rt;
@@ -21,7 +25,9 @@ use plugin_e2e::ssserver::{
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 /// Build a [`ServerEntry`] for the runner under test.
 fn entry(host: &str, port: u16, method: &str, password: &str) -> ServerEntry {
@@ -446,5 +452,159 @@ fn run_test_returns_tcp_timeout_for_blackhole() {
             matches!(outcome, ServerTestOutcome::TcpTimeout),
             "expected TcpTimeout, got {outcome:?}"
         );
+    });
+}
+// `reclassify_blocked` tests ==========================================================================================
+//
+// These exercise the post-tunnel-failure reclassification helper DIRECTLY: it
+// runs only the out-of-band reachability probe (no plugin / SS server), so the
+// fixtures are two tiny loopback listeners. The probe upgrades a tunnel failure
+// a network block can masquerade as (`TunnelHandshakeFailed` /
+// `ServerCannotReachInternet`) to `NetworkBlocked` iff the probe says `Blocked`;
+// every other outcome passes through untouched.
+
+/// Fixture: accept, then drop the socket (RST / FIN with zero app bytes) — the
+/// probe reads no reply and reports `Blocked`.
+async fn accept_then_reset() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            drop(s);
+        }
+    });
+    addr
+}
+
+/// Fixture: accept, read the first-flight, write a few bytes (server
+/// "answered"), then drain to EOF so the reply lands before the socket closes
+/// (closing with unread bytes RSTs on Windows and discards the reply). The
+/// probe sees bytes back and reports `Reachable`.
+async fn accept_then_answer() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = l.accept().await {
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b).await; // wait for the first-flight
+            let _ = s.write_all(b"\x15\x03\x03\x00\x02\x02\x28").await; // bytes came back
+            let mut drain = [0u8; 256];
+            while let Ok(n) = s.read(&mut drain).await {
+                if n == 0 {
+                    break; // peer closed: reply has been delivered
+                }
+            }
+        }
+    });
+    addr
+}
+
+/// `TunnelHandshakeFailed` + a TLS-WS plugin + a reset endpoint → the probe
+/// confirms the block, so the helper upgrades to `NetworkBlocked`.
+#[skuld::test]
+fn run_test_reclassify_handshake_failed_reset_is_network_blocked() {
+    rt().block_on(async {
+        let addr = accept_then_reset().await;
+        let out = super::reclassify_blocked(
+            ServerTestOutcome::TunnelHandshakeFailed,
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, ServerTestOutcome::NetworkBlocked),
+            "expected NetworkBlocked, got {out:?}"
+        );
+    });
+}
+
+/// `TunnelHandshakeFailed` + a TLS-WS plugin + an answering endpoint → the probe
+/// reports `Reachable`, so the original `TunnelHandshakeFailed` is preserved.
+#[skuld::test]
+fn run_test_reclassify_handshake_failed_answered_stays_handshake_failed() {
+    rt().block_on(async {
+        let addr = accept_then_answer().await;
+        let out = super::reclassify_blocked(
+            ServerTestOutcome::TunnelHandshakeFailed,
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, ServerTestOutcome::TunnelHandshakeFailed),
+            "expected TunnelHandshakeFailed (probe Reachable), got {out:?}"
+        );
+    });
+}
+
+/// `ServerCannotReachInternet` + a TLS-WS plugin + a reset endpoint → upgraded
+/// to `NetworkBlocked`.
+#[skuld::test]
+fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
+    rt().block_on(async {
+        let addr = accept_then_reset().await;
+        let out = super::reclassify_blocked(
+            ServerTestOutcome::ServerCannotReachInternet,
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, ServerTestOutcome::NetworkBlocked),
+            "expected NetworkBlocked, got {out:?}"
+        );
+    });
+}
+
+/// A `Reachable` outcome is not one a block can masquerade as: the probe must
+/// NOT run and the outcome passes through unchanged. Points at a reset endpoint
+/// to prove the probe is never consulted (a probe would have said `Blocked`).
+#[skuld::test]
+fn run_test_reclassify_reachable_passes_through() {
+    rt().block_on(async {
+        let addr = accept_then_reset().await;
+        let out = super::reclassify_blocked(
+            ServerTestOutcome::Reachable { latency_ms: 5 },
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, ServerTestOutcome::Reachable { latency_ms: 5 }),
+            "expected unchanged Reachable, got {out:?}"
+        );
+    });
+}
+
+/// A `PluginStartFailed` outcome passes through unchanged (probe must NOT run).
+#[skuld::test]
+fn run_test_reclassify_plugin_start_failed_passes_through() {
+    rt().block_on(async {
+        let addr = accept_then_reset().await;
+        let out = super::reclassify_blocked(
+            ServerTestOutcome::PluginStartFailed { detail: "x".into() },
+            &addr.ip().to_string(),
+            addr.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        match out {
+            ServerTestOutcome::PluginStartFailed { detail } => assert_eq!(detail, "x"),
+            other => panic!("expected unchanged PluginStartFailed, got {other:?}"),
+        }
     });
 }

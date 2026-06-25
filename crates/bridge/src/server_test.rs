@@ -132,11 +132,25 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         }
     }
 
-    if handshake_timeout_observed {
+    let tunnel_outcome = if handshake_timeout_observed {
         ServerTestOutcome::TunnelHandshakeFailed
     } else {
         ServerTestOutcome::ServerCannotReachInternet
-    }
+    };
+
+    reclassify_blocked(
+        tunnel_outcome,
+        &entry.server,
+        entry.server_port,
+        entry.plugin.as_deref(),
+        entry.plugin_opts.as_deref(),
+        // One-shot probe; no caller-side cancel exists in run_server_test.
+        &{
+            #[allow(clippy::disallowed_methods)] // See clippy.toml: one-shot CancellationToken::new.
+            CancellationToken::new()
+        },
+    )
+    .await
 }
 
 // Helpers -------------------------------------------------------------------------------------------------------------
@@ -148,6 +162,41 @@ enum SentinelOutcome {
     Mismatch { detail: String },
     Timeout,
     Internal(String),
+}
+
+/// If the tunnel test ended in a failure a network block can masquerade as,
+/// probe the server out-of-band and upgrade to [`ServerTestOutcome::NetworkBlocked`]
+/// when the probe confirms the network reset or dropped the connection. Every
+/// other outcome passes through unchanged, so `PluginStartFailed`, `Reachable`,
+/// etc. are preserved and a reachable server can never be falsely blocked.
+async fn reclassify_blocked(
+    tunnel_outcome: ServerTestOutcome,
+    host: &str,
+    port: u16,
+    plugin: Option<&str>,
+    plugin_opts: Option<&str>,
+    cancel: &CancellationToken,
+) -> ServerTestOutcome {
+    match tunnel_outcome {
+        ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
+            if crate::reachability::probe_server_reachability(
+                host,
+                port,
+                plugin,
+                plugin_opts,
+                crate::reachability::PROBE_DEADLINE,
+                cancel,
+            )
+            .await
+                == crate::reachability::ReachabilityVerdict::Blocked
+            {
+                ServerTestOutcome::NetworkBlocked
+            } else {
+                tunnel_outcome
+            }
+        }
+        other => other,
+    }
 }
 
 /// True if the server's public endpoint is reached over UDP rather than TCP,
