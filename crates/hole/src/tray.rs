@@ -88,7 +88,7 @@ pub(crate) fn bridge_error_toast(message: &str) -> String {
 /// Final toast for a bridge Start-error `message`, shared by the live-Connect and
 /// elevated paths so they read identically. A `NetworkBlocked` message is
 /// host-free and self-contained, so it is shown raw; every other rejection is
-/// wrapped by [`bridge_error_toast`] (#580).
+/// wrapped by [`bridge_error_toast`].
 pub(crate) fn start_error_toast(message: &str) -> String {
     use crate::state::{classify_start_error, StartErrorKind};
     match classify_start_error(message) {
@@ -159,7 +159,7 @@ pub(crate) fn outcome_for_start_response(
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
             // NetworkBlocked renders clean, Other is wrapped — both via the one
-            // message→toast producer (#580).
+            // message→toast producer.
             StartErrorKind::NetworkBlocked | StartErrorKind::Other => StartDecision::Fail(start_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),

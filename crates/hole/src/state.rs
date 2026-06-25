@@ -3,7 +3,7 @@
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE, NETWORK_BLOCKED_MESSAGE};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -423,7 +423,7 @@ pub(crate) enum StartErrorKind {
     AlreadyRunning,
     /// The network reset/dropped the server handshake (DPI / censorship). Carried
     /// over IPC as the stable `NETWORK_BLOCKED_MESSAGE` sentinel (like
-    /// `CANCELLED_MESSAGE`); the toast renders that message standalone (#580).
+    /// `CANCELLED_MESSAGE`); the toast renders that message standalone.
     NetworkBlocked,
     Other,
 }
@@ -431,7 +431,7 @@ pub(crate) enum StartErrorKind {
 pub(crate) fn classify_start_error(message: &str) -> StartErrorKind {
     if message == CANCELLED_MESSAGE {
         StartErrorKind::Cancelled
-    } else if message == hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE {
+    } else if message == NETWORK_BLOCKED_MESSAGE {
         StartErrorKind::NetworkBlocked
     } else if message.contains("already running") {
         StartErrorKind::AlreadyRunning

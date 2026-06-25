@@ -150,7 +150,7 @@ pub fn classify_elevated_send(result: &Result<hole_common::protocol::BridgeRespo
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled | StartErrorKind::AlreadyRunning => ElevatedOutcome::Success,
             // NetworkBlocked carries a toast-ready message; the parent renders it
-            // clean via `start_error_toast` (#580).
+            // clean via `start_error_toast`.
             StartErrorKind::NetworkBlocked | StartErrorKind::Other => ElevatedOutcome::BridgeError {
                 message: message.clone(),
             },

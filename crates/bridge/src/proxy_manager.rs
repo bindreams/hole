@@ -805,7 +805,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // each per-attempt forward against it (#397).
         if let Some(fwd) = forwarder.as_ref() {
             // Race an out-of-band reachability probe against the self-test so it
-            // adds NO latency (#580). Skip it under an active fail-closed cover: a
+            // adds NO latency. Skip it under an active fail-closed cover: a
             // standing kill-switch (intent on) blocks non-permitted egress, so a
             // probe would mis-report Hole's OWN lockdown as censorship — keep the
             // original self-test reason. This bridge installs its own cover later
@@ -852,11 +852,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     reason,
                 }) => {
                     let verdict = match probe {
-                        Some((handle, _stop)) => handle.await.ok(),
+                        Some((handle, _stop)) => match handle.await {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::debug!(%e, "reachability probe task did not complete");
+                                None
+                            }
+                        },
                         None => None,
                     };
                     // A cancel that fired during the gate makes the probe return
-                    // Inconclusive; surface it as Cancelled, not a server toast (#580).
+                    // Inconclusive; surface it as Cancelled, not a server toast.
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
@@ -1469,7 +1475,10 @@ fn self_test_error_for(
         Some(v @ (TcpRefused | TcpTimeout)) => ProxyError::ForwarderSelfTestFailed {
             attempts,
             elapsed_ms,
-            reason: v.user_message().unwrap_or_default().to_owned(),
+            reason: v
+                .user_message()
+                .expect("TcpRefused/TcpTimeout always carry a user_message")
+                .to_owned(),
         },
         _ => ProxyError::ForwarderSelfTestFailed {
             attempts,

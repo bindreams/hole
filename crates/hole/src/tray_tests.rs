@@ -7,7 +7,7 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE, NETWORK_BLOCKED_MESSAGE};
 use skuld::temp_dir;
 use std::path::Path;
 use std::sync::Mutex;
@@ -62,19 +62,18 @@ fn start_response_outcomes() {
     assert!(matches!(outcome_for_start_response(&Err(transport_err())), Fail(_)));
 }
 
-/// #580: a `NetworkBlocked` start error renders a CLEAN toast — the host-free
+/// A `NetworkBlocked` start error renders a CLEAN toast — the host-free
 /// censorship sentence standalone, NOT wrapped in `Bridge error:` / attempts
 /// noise — mirroring how `CANCELLED_MESSAGE` is handled by sentinel.
 #[skuld::test]
 fn network_blocked_renders_clean_toast() {
     use StartDecision::*;
-    let resp = Ok(err_resp(hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE));
+    let resp = Ok(err_resp(NETWORK_BLOCKED_MESSAGE));
     let Fail(toast) = outcome_for_start_response(&resp) else {
         panic!("expected StartDecision::Fail with the clean message");
     };
     assert_eq!(
-        toast,
-        hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE,
+        toast, NETWORK_BLOCKED_MESSAGE,
         "the censorship toast must be standalone"
     );
     assert!(!toast.contains("Bridge error:"), "no Bridge error: prefix: {toast}");
@@ -82,10 +81,7 @@ fn network_blocked_renders_clean_toast() {
 
     // The shared message→toast producer (also used by the elevated path) renders
     // NetworkBlocked clean and everything else wrapped.
-    assert_eq!(
-        start_error_toast(hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE),
-        hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE
-    );
+    assert_eq!(start_error_toast(NETWORK_BLOCKED_MESSAGE), NETWORK_BLOCKED_MESSAGE);
     assert_eq!(start_error_toast("plugin failed"), "Bridge error: plugin failed");
 }
 

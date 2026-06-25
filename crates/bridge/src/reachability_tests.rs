@@ -249,7 +249,7 @@ async fn quic_server_is_reachable() {
 }
 #[skuld::test(name = "reachability_tests::quic_server_v6_is_reachable")]
 async fn quic_server_v6_is_reachable() {
-    let a = spawn_quinn_server("[::1]:0").await; // IPv6 quinn endpoint — the v4-only-endpoint bug (#580) never probed this
+    let a = spawn_quinn_server("[::1]:0").await; // IPv6 endpoint: exercises the v6 bind path
     assert_eq!(
         probe_server_reachability(
             &a.ip().to_string(),
