@@ -278,7 +278,7 @@ pub enum ServerTestOutcome {
     /// Pre-flight reached the server at TCP but the network reset/dropped the
     /// transport handshake (e.g. DPI range-blocking). Out-of-band signal from
     /// the reachability probe; distinct from `TunnelHandshakeFailed`
-    /// (credentials/config). See `crates/bridge/src/reachability.rs` / #580.
+    /// (credentials/config). See `crates/bridge/src/reachability.rs`.
     NetworkBlocked,
     /// Tunnel established (server decrypted credentials successfully) but
     /// the upstream sentinel was unreachable through the tunnel. The

@@ -421,12 +421,18 @@ impl ReqKind {
 pub(crate) enum StartErrorKind {
     Cancelled,
     AlreadyRunning,
+    /// The network reset/dropped the server handshake (DPI / censorship). Carried
+    /// over IPC as the stable `NETWORK_BLOCKED_MESSAGE` sentinel (like
+    /// `CANCELLED_MESSAGE`); the toast renders that message standalone (#580).
+    NetworkBlocked,
     Other,
 }
 
 pub(crate) fn classify_start_error(message: &str) -> StartErrorKind {
     if message == CANCELLED_MESSAGE {
         StartErrorKind::Cancelled
+    } else if message == hole_bridge::reachability::NETWORK_BLOCKED_MESSAGE {
+        StartErrorKind::NetworkBlocked
     } else if message.contains("already running") {
         StartErrorKind::AlreadyRunning
     } else {
@@ -470,7 +476,7 @@ pub(crate) fn observed_running(
         (Start, Ok(BridgeResponse::Error { message })) => match classify_start_error(message) {
             StartErrorKind::Cancelled => Some(false),
             // A failed start is rolled back bridge-side.
-            StartErrorKind::Other => Some(false),
+            StartErrorKind::NetworkBlocked | StartErrorKind::Other => Some(false),
             StartErrorKind::AlreadyRunning => Some(true),
         },
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),

@@ -804,6 +804,30 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // observes cancel cooperatively between retry attempts and races
         // each per-attempt forward against it (#397).
         if let Some(fwd) = forwarder.as_ref() {
+            // Race an out-of-band reachability probe against the self-test so it
+            // adds NO latency (#580). Skip it under an active fail-closed cover: a
+            // standing kill-switch (intent on) blocks non-permitted egress, so a
+            // probe would mis-report Hole's OWN lockdown as censorship — keep the
+            // original self-test reason. This bridge installs its own cover later
+            // (after routing.install); at this gate the cover is a pre-existing /
+            // adopted one, and the intent is its honest signal.
+            let cover_active = state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
+            let probe = (!cover_active).then(|| {
+                let host = config.server.server.clone();
+                let port = config.server.server_port;
+                let plugin = config.server.plugin.clone();
+                let opts = config.server.plugin_opts.clone();
+                let pc = cancel.child_token();
+                // Hold a clone to wind the probe down cooperatively on the paths
+                // that don't await its verdict (the task owns the inner `pc`).
+                let stop = pc.clone();
+                let handle = tokio::spawn(async move {
+                    crate::reachability::probe_server_reachability(&host, port, plugin.as_deref(), opts.as_deref(), &pc)
+                        .await
+                });
+                (handle, stop)
+            });
+
             let started = std::time::Instant::now();
             let outcome = run_forwarder_self_test(
                 std::sync::Arc::clone(fwd),
@@ -812,32 +836,39 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 cancel.clone(),
             )
             .await;
-            // On a self-test failure, probe the server out-of-band: if the
-            // network is blocking it (reset/no-response), rewrite the toast
-            // reason from the generic forwarder failure to a censorship-aware
-            // one. Threads the existing cooperative `cancel` token (#580).
-            if let Err(err) = outcome.into_result(started.elapsed().as_millis() as u64) {
-                if let ProxyError::ForwarderSelfTestFailed {
-                    attempts, elapsed_ms, ..
-                } = &err
-                {
-                    if let Some(reason) = diagnose_self_test_failure(
-                        &config.server.server,
-                        config.server.server_port,
-                        config.server.plugin.as_deref(),
-                        config.server.plugin_opts.as_deref(),
-                        &cancel,
-                    )
-                    .await
-                    {
-                        return Err(ProxyError::ForwarderSelfTestFailed {
-                            attempts: *attempts,
-                            elapsed_ms: *elapsed_ms,
-                            reason,
-                        });
+            match outcome.into_result(started.elapsed().as_millis() as u64) {
+                // Self-test passed: cancel the probe token (let the task wind down).
+                Ok(_) => {
+                    if let Some((_, stop)) = probe {
+                        stop.cancel();
                     }
                 }
-                return Err(err);
+                // The forwarder failed: await the concurrent probe's verdict and
+                // reclassify the error. It ran in parallel, so the wait is at most
+                // the probe's remaining budget, not its full duration on top.
+                Err(ProxyError::ForwarderSelfTestFailed {
+                    attempts,
+                    elapsed_ms,
+                    reason,
+                }) => {
+                    let verdict = match probe {
+                        Some((handle, _stop)) => handle.await.ok(),
+                        None => None,
+                    };
+                    // A cancel that fired during the gate makes the probe return
+                    // Inconclusive; surface it as Cancelled, not a server toast (#580).
+                    if cancel.is_cancelled() {
+                        return Err(ProxyError::Cancelled);
+                    }
+                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
+                }
+                // Any other error (e.g. Cancelled): cancel the probe token and propagate.
+                Err(e) => {
+                    if let Some((_, stop)) = probe {
+                        stop.cancel();
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -1421,21 +1452,31 @@ impl SelfTestOutcome {
     }
 }
 
-/// On a forwarder self-test failure, probe the server directly to see whether
-/// the network is blocking it. Returns a better, host-free toast reason, or
-/// `None` to keep the original self-test reason. Full detail (host/verdict)
-/// lands in `bridge.log` via the probe; only `user_message()` reaches the toast.
-async fn diagnose_self_test_failure(
-    host: &str,
-    port: u16,
-    plugin: Option<&str>,
-    plugin_opts: Option<&str>,
-    cancel: &CancellationToken,
-) -> Option<String> {
-    crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel)
-        .await
-        .user_message()
-        .map(str::to_owned)
+/// Map a self-test failure to the `ProxyError` the toast sees, given the
+/// out-of-band reachability `verdict` (`None` when the probe was skipped). A
+/// `Blocked` verdict becomes the typed [`ProxyError::NetworkBlocked`];
+/// `TcpRefused`/`TcpTimeout` rewrite the reason to the probe's `user_message`;
+/// every other verdict keeps the `original` self-test reason.
+fn self_test_error_for(
+    verdict: Option<crate::reachability::ReachabilityVerdict>,
+    attempts: u32,
+    elapsed_ms: u64,
+    original: String,
+) -> ProxyError {
+    use crate::reachability::ReachabilityVerdict::*;
+    match verdict {
+        Some(Blocked) => ProxyError::NetworkBlocked,
+        Some(v @ (TcpRefused | TcpTimeout)) => ProxyError::ForwarderSelfTestFailed {
+            attempts,
+            elapsed_ms,
+            reason: v.user_message().unwrap_or_default().to_owned(),
+        },
+        _ => ProxyError::ForwarderSelfTestFailed {
+            attempts,
+            elapsed_ms,
+            reason: original,
+        },
+    }
 }
 
 /// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.

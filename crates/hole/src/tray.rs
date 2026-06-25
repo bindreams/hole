@@ -85,6 +85,18 @@ pub(crate) fn bridge_error_toast(message: &str) -> String {
     format!("Bridge error: {message}")
 }
 
+/// Final toast for a bridge Start-error `message`, shared by the live-Connect and
+/// elevated paths so they read identically. A `NetworkBlocked` message is
+/// host-free and self-contained, so it is shown raw; every other rejection is
+/// wrapped by [`bridge_error_toast`] (#580).
+pub(crate) fn start_error_toast(message: &str) -> String {
+    use crate::state::{classify_start_error, StartErrorKind};
+    match classify_start_error(message) {
+        StartErrorKind::NetworkBlocked => message.to_string(),
+        _ => bridge_error_toast(message),
+    }
+}
+
 /// Toast for a transport failure observed AFTER a successful elevation — the
 /// bridge is unreachable, which is not an elevation denial.
 pub(crate) fn transport_after_elevation_toast(detail: &str) -> String {
@@ -146,7 +158,9 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            StartErrorKind::Other => StartDecision::Fail(bridge_error_toast(message)),
+            // NetworkBlocked renders clean, Other is wrapped — both via the one
+            // message→toast producer (#580).
+            StartErrorKind::NetworkBlocked | StartErrorKind::Other => StartDecision::Fail(start_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
         Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
@@ -502,7 +516,7 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
                 ToggleOutcome::Stopped
             })
         }
-        ElevationResult::BridgeError(message) => Err(bridge_error_toast(&message)),
+        ElevationResult::BridgeError(message) => Err(start_error_toast(&message)),
         ElevationResult::Transport(detail) => Err(transport_after_elevation_toast(&detail)),
         ElevationResult::Cancelled => Err("Elevation was cancelled.".into()),
         ElevationResult::LaunchFailure => Err("The elevated helper could not start. See gui.log for details.".into()),

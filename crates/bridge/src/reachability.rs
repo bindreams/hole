@@ -20,6 +20,14 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // DNS resolve + TCP 
 const FIRSTFLIGHT_DEADLINE: Duration = Duration::from_secs(3); // TLS/HTTP first-flight read
 const QUIC_DEADLINE: Duration = Duration::from_secs(6); // whole quinn connect
 
+/// Host-free censorship toast text, shared by [`ReachabilityVerdict::user_message`]
+/// and [`crate::proxy::ProxyError::NetworkBlocked`]'s `Display` so the live-Connect
+/// and Server-Test surfaces read identically. The GUI matches this verbatim to
+/// render the toast standalone (see `crates/hole/src/state.rs`).
+pub const NETWORK_BLOCKED_MESSAGE: &str = "The network is blocking the connection to this server — the handshake was \
+     reset or got no response. This usually means a firewall or censorship; \
+     try a different server.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReachabilityVerdict {
     Reachable,
@@ -34,11 +42,7 @@ impl ReachabilityVerdict {
     /// Host/IP-free toast text; `None` means "do not override the existing reason".
     pub fn user_message(&self) -> Option<&'static str> {
         match self {
-            ReachabilityVerdict::Blocked => Some(
-                "The network is blocking the connection to this server — the handshake was \
-                 reset or got no response. This usually means a firewall or censorship; \
-                 try a different server.",
-            ),
+            ReachabilityVerdict::Blocked => Some(NETWORK_BLOCKED_MESSAGE),
             ReachabilityVerdict::TcpRefused => Some("The server refused the connection."),
             ReachabilityVerdict::TcpTimeout => Some("The server did not respond (connection timed out)."),
             _ => None,
