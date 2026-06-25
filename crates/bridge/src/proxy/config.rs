@@ -92,7 +92,7 @@ pub enum ProxyError {
     /// the server handshake (DPI / censorship), distinct from a credential/config
     /// failure. `Display` is the host-free censorship sentence alone (the shared
     /// [`hole_common::protocol::NETWORK_BLOCKED_MESSAGE`]); the GUI matches it
-    /// verbatim to render a clean toast. The IPC round-trips it via `to_string()`.
+    /// verbatim to render a clean toast.
     #[error("{}", hole_common::protocol::NETWORK_BLOCKED_MESSAGE)]
     NetworkBlocked,
 }

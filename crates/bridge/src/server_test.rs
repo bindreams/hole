@@ -15,12 +15,10 @@ use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::relay::socks5::Address;
 use shadowsocks::ProxyClientStream;
-use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -197,17 +195,14 @@ async fn reclassify_blocked(
 /// TCP listener to connect to — so [`run_server_test`] skips it and lets the
 /// full tunnel handshake produce the diagnosis. Covers a direct
 /// v2ray-plugin/ex-ray QUIC server AND a galoshes server (which passes
-/// `mode=quic` through to its embedded ex-ray). Parses the SIP003 options with
-/// the same parser `garter::Mode::from_plugin_options` uses for the `server`
-/// key, so this is config parsing — not a stringified-type-recovery hack. See
+/// `mode=quic` through to its embedded ex-ray). Shares the reachability probe's
+/// transport classifier, so the two agree on what a QUIC endpoint is. See
 /// bindreams/hole#421.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    entry.plugin.is_some()
-        && entry.plugin_opts.as_deref().is_some_and(|opts| {
-            garter::parse_plugin_options(opts)
-                .iter()
-                .any(|(k, v)| k == "mode" && v == "quic")
-        })
+    matches!(
+        crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server),
+        crate::reachability::ProbeTransport::Quic { .. }
+    )
 }
 
 /// DNS-resolve (when needed) and raw-TCP-connect to `host:port`. Returns
@@ -215,24 +210,12 @@ fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
 /// successful connect (the stream is dropped immediately — only the connect
 /// matters).
 async fn preflight(host: &str, port: u16, timeout_dur: Duration) -> Result<(), ServerTestOutcome> {
-    if host.parse::<IpAddr>().is_err() {
-        // Domain name → resolve first so we can distinguish DNS failure from
-        // TCP failure.
-        match lookup_host((host, port)).await {
-            Ok(mut iter) => {
-                if iter.next().is_none() {
-                    return Err(ServerTestOutcome::DnsFailed);
-                }
-            }
-            Err(_) => return Err(ServerTestOutcome::DnsFailed),
-        }
-    }
-
-    match timeout(timeout_dur, TcpStream::connect((host, port))).await {
-        Err(_) => Err(ServerTestOutcome::TcpTimeout),
-        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => Err(ServerTestOutcome::TcpRefused),
-        Ok(Err(_)) => Err(ServerTestOutcome::TcpTimeout),
-        Ok(Ok(_)) => Ok(()),
+    use crate::reachability::ConnectResult;
+    match crate::reachability::resolve_and_connect(host, port, timeout_dur).await {
+        ConnectResult::Connected(_) => Ok(()),
+        ConnectResult::DnsFailed => Err(ServerTestOutcome::DnsFailed),
+        ConnectResult::Refused => Err(ServerTestOutcome::TcpRefused),
+        ConnectResult::Timeout => Err(ServerTestOutcome::TcpTimeout),
     }
 }
 

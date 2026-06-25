@@ -41,11 +41,8 @@ async fn accept_then_answer() -> SocketAddr {
     addr
 }
 
-// All tests use `#[skuld::test]` (incl. the sync classifier ones): this crate
-// runs a custom skuld harness (`harness = false`) that collects only
-// `#[skuld::test]` functions — plain `#[test]` ones are silently never run.
-// Each carries an explicit `name = "reachability_tests::…"`: skuld reports the
-// bare fn ident as the test name (no module prefix), so the documented
+// Each test carries an explicit `name = "reachability_tests::…"`: skuld reports
+// the bare fn ident as the test name (no module prefix), so the documented
 // `nextest run … reachability_tests` substring filter only matches with it.
 #[skuld::test(name = "reachability_tests::classify_no_plugin_is_raw")]
 fn classify_no_plugin_is_raw() {
@@ -75,10 +72,33 @@ fn classify_quic_forces_quic() {
         ProbeTransport::Quic { sni } if sni == "h")
     );
 }
-#[skuld::test(name = "reachability_tests::user_message_is_host_free")]
-fn user_message_is_host_free() {
-    let m = ReachabilityVerdict::Blocked.user_message().unwrap();
-    assert!(m.contains("firewall or censorship"));
+// A `.` flanked by alphanumerics on both sides — the shape of a domain label or
+// IP octet boundary (`ex.com`, `1.2.3.4`). A sentence-final `.` (followed by a
+// space or end-of-string) does not match, so prose passes.
+fn has_host_token(msg: &str) -> bool {
+    let b = msg.as_bytes();
+    (1..b.len().saturating_sub(1))
+        .any(|i| b[i] == b'.' && b[i - 1].is_ascii_alphanumeric() && b[i + 1].is_ascii_alphanumeric())
+}
+
+#[skuld::test(name = "reachability_tests::production_user_messages_are_host_free")]
+fn production_user_messages_are_host_free() {
+    // `self_test_error_for` calls `user_message()` only on these two verdicts;
+    // their text reaches the toast verbatim, so it must name no host/IP.
+    for v in [ReachabilityVerdict::TcpRefused, ReachabilityVerdict::TcpTimeout] {
+        let m = v.user_message().unwrap();
+        assert!(!m.is_empty(), "{v:?} message must be non-empty");
+        assert!(!has_host_token(m), "{v:?} message leaks a host token: {m:?}");
+    }
+    // `Blocked` never reaches `user_message()` in production (it maps to the
+    // typed `NetworkBlocked`), but the same text backs `NetworkBlocked`'s
+    // Display, so it must exist and stay host-free too.
+    let blocked = ReachabilityVerdict::Blocked.user_message().unwrap();
+    assert!(blocked.contains("firewall or censorship"));
+    assert!(
+        !has_host_token(blocked),
+        "Blocked message leaks a host token: {blocked:?}"
+    );
     assert!(ReachabilityVerdict::Reachable.user_message().is_none());
 }
 
@@ -150,7 +170,7 @@ async fn closed_port_is_refused_or_timeout() {
     let v = probe_server_reachability(&a.ip().to_string(), a.port(), None, None, &CancellationToken::new()).await;
     // Non-Windows kernels RST a closed port (TcpRefused); Windows GitHub runners
     // drop inbound SYNs to closed ephemeral loopback ports → TcpTimeout. Both are
-    // correct "port is closed" verdicts. Mirrors server_test_tests.rs preflight.
+    // correct "port is closed" verdicts.
     if cfg!(target_os = "windows") {
         assert!(
             matches!(v, ReachabilityVerdict::TcpRefused | ReachabilityVerdict::TcpTimeout),

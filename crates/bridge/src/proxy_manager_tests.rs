@@ -2221,9 +2221,10 @@ mod self_test {
     }
 
     /// A server config whose `server` points at a closed loopback port, so the
-    /// out-of-band probe (no plugin → Raw transport) terminates fast with
-    /// `TcpRefused` and the self-test gate fails (MockProxy binds no listener for
-    /// the forwarder). Returns the (manager, config) ready to drive the gate.
+    /// out-of-band probe (no plugin → Raw transport) terminates fast with a
+    /// closed-port verdict (`TcpRefused`, or `TcpTimeout` on a Windows runner
+    /// that SYN-drops) and the self-test gate fails (MockProxy binds no listener
+    /// for the forwarder). Returns the (manager, config) ready to drive the gate.
     fn gate_failure_setup(lockdown: bool) -> (ProxyManager<MockProxy, MockRouting>, ProxyConfig, tempfile::TempDir) {
         // A bound-then-dropped listener yields a port that is closed for the test's
         // duration, so a connect there is refused, not accepted.
@@ -2243,7 +2244,7 @@ mod self_test {
         (pm, cfg, dir)
     }
 
-    /// #6 cover-skip: with the lockdown intent ON, the gate must NOT run the probe
+    /// cover-skip: with the lockdown intent ON, the gate must NOT run the probe
     /// (a standing kill-switch cover would block it and we'd mis-report Hole's own
     /// lockdown as censorship). The probe would rewrite the reason to "refused";
     /// with the probe skipped the ORIGINAL self-test reason survives.
@@ -2262,19 +2263,29 @@ mod self_test {
         });
     }
 
-    /// #6 control: with lockdown OFF the probe DOES run, so the same closed-port
-    /// server rewrites the reason to the probe's `TcpRefused` message — proving
-    /// the lockdown-on skip above is load-bearing, not vacuous.
+    /// Control: with lockdown OFF the probe DOES run, so the same closed-port
+    /// server rewrites the reason to the probe's verdict — proving the
+    /// lockdown-on skip above is load-bearing, not vacuous. The closed port is
+    /// refused on most kernels (`TcpRefused`) but SYN-dropped on Windows GitHub
+    /// runners (`TcpTimeout` → "did not respond"); either rewrite proves the
+    /// probe ran.
     #[skuld::test]
     fn lockdown_off_runs_probe_rewrites_reason() {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(false);
             let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
             match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    reason.contains("refused"),
-                    "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
-                ),
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                    let rewritten = if cfg!(target_os = "windows") {
+                        reason.contains("refused") || reason.contains("did not respond")
+                    } else {
+                        reason.contains("refused")
+                    };
+                    assert!(
+                        rewritten,
+                        "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
+                    );
+                }
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
         });

@@ -819,7 +819,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let opts = config.server.plugin_opts.clone();
                 let pc = cancel.child_token();
                 // Hold a clone to wind the probe down cooperatively on the paths
-                // that don't await its verdict (the task owns the inner `pc`).
+                // that don't await its verdict.
                 let stop = pc.clone();
                 let handle = tokio::spawn(async move {
                     crate::reachability::probe_server_reachability(&host, port, plugin.as_deref(), opts.as_deref(), &pc)
@@ -837,7 +837,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             )
             .await;
             match outcome.into_result(started.elapsed().as_millis() as u64) {
-                // Self-test passed: cancel the probe token (let the task wind down).
+                // Self-test passed: cancel the probe token.
                 Ok(_) => {
                     if let Some((_, stop)) = probe {
                         stop.cancel();
@@ -868,7 +868,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     }
                     return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
-                // Any other error (e.g. Cancelled): cancel the probe token and propagate.
+                // Any other error (e.g. Cancelled): stop the probe, propagate as-is.
                 Err(e) => {
                     if let Some((_, stop)) = probe {
                         stop.cancel();

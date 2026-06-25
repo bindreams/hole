@@ -158,8 +158,7 @@ pub(crate) fn outcome_for_start_response(
         Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
             StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
             StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            // NetworkBlocked renders clean, Other is wrapped — both via the one
-            // message→toast producer.
+            // NetworkBlocked renders clean, Other is wrapped — start_error_toast decides.
             StartErrorKind::NetworkBlocked | StartErrorKind::Other => StartDecision::Fail(start_error_toast(message)),
         },
         Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),

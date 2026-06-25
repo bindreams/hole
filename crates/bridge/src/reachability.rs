@@ -16,7 +16,7 @@ use tracing::debug;
 // verdict split: a connect timeout stays `TcpTimeout` (a closed-port SYN-drop),
 // a first-flight no-response stays `Blocked` (a real block). One outer timeout
 // would conflate them. Non-QUIC worst case ≈ CONNECT_DEADLINE + FIRSTFLIGHT_DEADLINE = 6s.
-const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // DNS resolve + TCP connect
+const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // TCP connect (DNS resolve precedes it)
 const FIRSTFLIGHT_DEADLINE: Duration = Duration::from_secs(3); // TLS/HTTP first-flight read
 const QUIC_DEADLINE: Duration = Duration::from_secs(6); // whole quinn connect
 
@@ -42,14 +42,14 @@ impl ReachabilityVerdict {
     }
 }
 
-enum ProbeTransport {
+pub(crate) enum ProbeTransport {
     TlsWs { sni: String },
     PlainWs { host: String, path: String },
     Quic { sni: String },
     Raw,
 }
 
-fn classify_transport(plugin: Option<&str>, plugin_opts: Option<&str>, server_host: &str) -> ProbeTransport {
+pub(crate) fn classify_transport(plugin: Option<&str>, plugin_opts: Option<&str>, server_host: &str) -> ProbeTransport {
     if plugin.is_none() {
         return ProbeTransport::Raw;
     }
@@ -89,12 +89,11 @@ async fn probe_inner(host: &str, port: u16, transport: &ProbeTransport) -> Reach
     if let ProbeTransport::Quic { sni } = transport {
         return probe_quic(host, port, sni).await;
     }
-    // Bound DNS resolve + TCP connect together so the slow-DNS case stays inside
-    // CONNECT_DEADLINE.
-    let stream = match tokio::time::timeout(CONNECT_DEADLINE, connect_tcp(host, port)).await {
-        Err(_) => return ReachabilityVerdict::TcpTimeout, // connect-phase deadline elapsed
-        Ok(Err(v)) => return v,                           // DnsFailed / TcpRefused / TcpTimeout
-        Ok(Ok(s)) => s,
+    let stream = match resolve_and_connect(host, port, CONNECT_DEADLINE).await {
+        ConnectResult::Connected(s) => s,
+        ConnectResult::DnsFailed => return ReachabilityVerdict::DnsFailed,
+        ConnectResult::Refused => return ReachabilityVerdict::TcpRefused,
+        ConnectResult::Timeout => return ReachabilityVerdict::TcpTimeout,
     };
     match transport {
         ProbeTransport::Raw => ReachabilityVerdict::Reachable,
@@ -104,23 +103,34 @@ async fn probe_inner(host: &str, port: u16, transport: &ProbeTransport) -> Reach
     }
 }
 
-/// Resolve (if `host` is not a literal IP) then TCP-connect. `Err` carries the
-/// terminal verdict (`DnsFailed`/`TcpRefused`/`TcpTimeout`); the caller bounds
-/// the whole thing with `CONNECT_DEADLINE`.
-async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ReachabilityVerdict> {
+/// Outcome of [`resolve_and_connect`], shared by the reachability probe and the
+/// server-test preflight so both classify a connect the same way.
+pub(crate) enum ConnectResult {
+    Connected(TcpStream),
+    DnsFailed,
+    Refused,
+    Timeout,
+}
+
+/// Resolve (when `host` is not a literal IP) then TCP-connect within `deadline`.
+/// A resolve miss is [`ConnectResult::DnsFailed`]; a `ConnectionRefused` is
+/// [`ConnectResult::Refused`]; an elapsed `deadline` or any other connect error
+/// is [`ConnectResult::Timeout`]; success carries the stream.
+pub(crate) async fn resolve_and_connect(host: &str, port: u16, deadline: Duration) -> ConnectResult {
     if host.parse::<IpAddr>().is_err() {
         let resolved = match lookup_host((host, port)).await {
             Ok(mut it) => it.next().is_some(),
             Err(_) => false,
         };
         if !resolved {
-            return Err(ReachabilityVerdict::DnsFailed);
+            return ConnectResult::DnsFailed;
         }
     }
-    match TcpStream::connect((host, port)).await {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(ReachabilityVerdict::TcpRefused),
-        Err(_) => Err(ReachabilityVerdict::TcpTimeout),
+    match tokio::time::timeout(deadline, TcpStream::connect((host, port))).await {
+        Err(_) => ConnectResult::Timeout,
+        Ok(Ok(s)) => ConnectResult::Connected(s),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => ConnectResult::Refused,
+        Ok(Err(_)) => ConnectResult::Timeout,
     }
 }
 
@@ -264,7 +274,7 @@ async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
             return ReachabilityVerdict::Inconclusive;
         }
     };
-    // QUIC needs TLS 1.3 (the default protocol versions include it) + h3 ALPN.
+    // QUIC needs TLS 1.3 + h3 ALPN.
     let tls = no_verify_tls_config(vec![b"h3".to_vec()]);
     let qcc = match quinn::crypto::rustls::QuicClientConfig::try_from(tls) {
         Ok(c) => c,
@@ -281,7 +291,7 @@ async fn probe_quic(host: &str, port: u16, sni: &str) -> ReachabilityVerdict {
             return ReachabilityVerdict::Inconclusive;
         }
     };
-    // `Drop` owns endpoint teardown; no explicit `ep.close()` on any exit.
+    // `Drop` owns endpoint teardown.
     match tokio::time::timeout(QUIC_DEADLINE, connecting).await {
         Ok(Ok(_)) => ReachabilityVerdict::Reachable, // handshake completed
         Ok(Err(ConnectionError::TimedOut)) => ReachabilityVerdict::Blocked, // no response
