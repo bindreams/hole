@@ -565,10 +565,14 @@ the vendored `ex-ray/third_party/v2ray-core` must build its config via a factory
 `GetTLSConfigForClient` (ECH-capable transports) or `GetTLSConfigForUnsupportedClient`
 (ECH-incapable engines: uTLS, hysteria2); only server listeners call the bare
 `GetTLSConfig`. A bare `GetTLSConfig` on a client path leaks the real SNI in
-cleartext under `ech=always`. For ex-ray's real transports (stdlib TLS over
-ws/tcp/http + QUIC) the fail-closed behavior is enforced in CI by the ECH roundtrip
-tests in `crates/plugin-e2e/tests/roundtrip.rs` (`ech=always` + an unreachable
-`ech-doh` ⟹ tunnel refused). Re-verify those on an upstream v2ray-core re-merge.
+cleartext under `ech=always`. The factory split is the load-bearing guarantee:
+once a client path goes through a factory, the require-ECH gate cannot be
+bypassed. CI enforces it two ways — the `ech=always` + unreachable-`ech-doh` ⟹
+tunnel-refused roundtrip tests in `crates/plugin-e2e/tests/roundtrip.rs` (ex-ray's
+real ws-tls + QUIC paths), and the `ex-ray-tests` job (`cargo xtask run ex-ray-tests`), whose Go unit tests exercise the per-engine fail-closed/refuse
+behavior in the vendored `transport/internet/{tls,quic,hysteria2}` packages. The
+residual is an upstream v2ray-core re-merge re-introducing a bare `GetTLSConfig`
+on a client path (the vendored tree is lint-excluded): re-verify on every re-merge.
 
 ## Prerequisites
 
