@@ -31,8 +31,8 @@ func GetClientTLSConfig(dest net.Destination, streamSettings *internet.MemoryStr
 	if config == nil {
 		return nil, newError(Hy2MustNeedTLS)
 	}
-	// hyClient.TLSConfig has no ECH field, so refuse rather than send a cleartext-SNI hello.
-	if err := config.RefuseIfEchRequiredUnsupported("hysteria2"); err != nil {
+	// hyClient.TLSConfig has no ECH field, so hysteria2 cannot carry ECH.
+	if err := config.HandleEchUnsupported("hysteria2"); err != nil {
 		return nil, err
 	}
 	tlsConfig := config.GetTLSConfig(tls.WithDestination(dest))

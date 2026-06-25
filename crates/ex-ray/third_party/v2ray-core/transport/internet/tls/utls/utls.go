@@ -39,9 +39,8 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 			return nil, newError("unknown option")
 		}
 	}
-	// uTLSConfigFromTLSConfig drops EncryptedClientHelloConfigList, so uTLS cannot
-	// carry ECH — refuse rather than send a cleartext-SNI hello.
-	if err := e.config.TlsConfig.RefuseIfEchRequiredUnsupported("uTLS engine"); err != nil {
+	// uTLSConfigFromTLSConfig drops EncryptedClientHelloConfigList, so uTLS cannot carry ECH.
+	if err := e.config.TlsConfig.HandleEchUnsupported("uTLS engine"); err != nil {
 		return nil, err
 	}
 	tlsConfig := e.config.TlsConfig.GetTLSConfig(options...)

@@ -207,10 +207,14 @@ func (a *alwaysFlushWriter) Write(p []byte) (n int, err error) {
 
 // GetTLSConfig converts this Config into tls.Config.
 //
-// WARNING: client dial paths must NOT call this directly — use
-// GetTLSConfigForClient, which fails closed when ech=always cannot obtain an ECH
-// config. A bare client handshake here would send the real SNI in cleartext.
-// Server listeners, which send no ClientHello, correctly call this.
+// WARNING: this builds a bare config with no ECH fail-closed gate. Use it only
+// where that is correct:
+//   - ECH-capable client dial paths MUST instead use GetTLSConfigForClient, which
+//     fails closed so a required-but-unobtainable ECH config never leaks the real
+//     SNI in cleartext;
+//   - ECH-incapable client engines (uTLS, hysteria2) MUST call HandleEchUnsupported
+//     before this — they cannot carry ECH, so they refuse ech=always (warn on auto);
+//   - server listeners, which send no ClientHello, call this directly.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	root, err := c.getCertPool()
 	if err != nil {
@@ -322,21 +326,28 @@ func (c *Config) RequireEchSatisfied(cfg *tls.Config) error {
 	return nil
 }
 
-// RefuseIfEchRequiredUnsupported returns an error when ech=always (RequireEch)
-// is set but this transport cannot carry an ECH config (its conversion drops
-// EncryptedClientHelloConfigList), so the dial fails closed instead of sending a
-// cleartext-SNI ClientHello. engine names the transport for the message.
-func (c *Config) RefuseIfEchRequiredUnsupported(engine string) error {
-	if c != nil && c.RequireEch {
+// HandleEchUnsupported applies the ECH policy for a transport that cannot carry
+// an ECH config (its conversion drops EncryptedClientHelloConfigList): it refuses
+// when ech=always (RequireEch) so the dial fails closed instead of writing a
+// cleartext-SNI ClientHello, and warns when ech=auto requested ECH so the
+// cleartext-SNI fallback is observable. engine names the transport.
+func (c *Config) HandleEchUnsupported(engine string) error {
+	if c == nil {
+		return nil
+	}
+	if c.RequireEch {
 		return newError(engine + " cannot satisfy ech=always (cannot carry an ECH config); refusing to handshake")
+	}
+	if len(c.EchConfig) > 0 || len(c.Ech_DOHserver) > 0 {
+		newError(engine + " cannot carry ECH; proceeding with cleartext SNI under ech=auto").AtWarning().WriteToLog()
 	}
 	return nil
 }
 
 // GetTLSConfigForClient builds a client *tls.Config and fails closed when
 // ech=always (RequireEch) is set but no ECH config could be obtained, so the
-// dial aborts before a cleartext-SNI ClientHello is written. Client dial paths
-// must call this; server listeners, which send no ClientHello, use GetTLSConfig.
+// dial aborts before a cleartext-SNI ClientHello is written. ECH-capable client
+// dial paths call this; see GetTLSConfig's warning for the full contract.
 func (c *Config) GetTLSConfigForClient(opts ...Option) (*tls.Config, error) {
 	config := c.GetTLSConfig(opts...)
 	if err := c.RequireEchSatisfied(config); err != nil {
