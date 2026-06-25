@@ -4,6 +4,7 @@ import (
 	gotls "crypto/tls"
 	"crypto/x509"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,10 +159,9 @@ func TestConfigRequireEchRoundTrip(t *testing.T) {
 }
 
 // GetTLSConfigForClient bundles build + the require-ECH gate for client dial
-// paths. require_ech + unobtainable ECH (DoH at a closed port, offline) must
-// fail closed (nil cfg, error) before a cleartext-SNI hello; auto (RequireEch
-// off) must return the cfg; and a nil receiver must build a default cfg like
-// GetTLSConfig does.
+// paths. require_ech + unobtainable ECH must fail closed (nil cfg, error)
+// before a cleartext-SNI hello; auto (RequireEch off) must return the cfg; and
+// a nil receiver must build a default cfg like GetTLSConfig does.
 func TestGetTLSConfigForClient(t *testing.T) {
 	t.Run("require_ech unobtainable fails closed", func(t *testing.T) {
 		c := &Config{ServerName: "example.com", Ech_DOHserver: "https://127.0.0.1:1/dns-query", RequireEch: true}
@@ -190,6 +190,32 @@ func TestGetTLSConfigForClient(t *testing.T) {
 		}
 		if cfg == nil {
 			t.Fatal("nil receiver must build a default config")
+		}
+	})
+}
+
+// RefuseIfEchRequiredUnsupported is the shared refuse helper for ECH-incapable
+// engines. It must error only when RequireEch is set, the message must name the
+// engine and the ech=always token the refuse tests assert on, and a nil receiver
+// must be a no-op.
+func TestRefuseIfEchRequiredUnsupported(t *testing.T) {
+	t.Run("required errors and names engine + ech=always", func(t *testing.T) {
+		err := (&Config{RequireEch: true}).RefuseIfEchRequiredUnsupported("widget engine")
+		if err == nil {
+			t.Fatal("RequireEch must make the helper refuse")
+		}
+		if msg := err.Error(); !strings.Contains(msg, "widget engine") || !strings.Contains(msg, "ech=always") {
+			t.Fatalf("error must name the engine and ech=always, got: %v", msg)
+		}
+	})
+	t.Run("not required returns nil", func(t *testing.T) {
+		if err := (&Config{RequireEch: false}).RefuseIfEchRequiredUnsupported("widget engine"); err != nil {
+			t.Fatalf("without RequireEch the helper must not refuse: %v", err)
+		}
+	})
+	t.Run("nil receiver returns nil", func(t *testing.T) {
+		if err := (*Config)(nil).RefuseIfEchRequiredUnsupported("widget engine"); err != nil {
+			t.Fatalf("nil receiver must not refuse: %v", err)
 		}
 	})
 }

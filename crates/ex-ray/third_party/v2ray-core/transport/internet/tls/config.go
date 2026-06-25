@@ -206,6 +206,11 @@ func (a *alwaysFlushWriter) Write(p []byte) (n int, err error) {
 }
 
 // GetTLSConfig converts this Config into tls.Config.
+//
+// WARNING: client dial paths must NOT call this directly — use
+// GetTLSConfigForClient, which fails closed when ech=always cannot obtain an ECH
+// config. A bare client handshake here would send the real SNI in cleartext.
+// Server listeners, which send no ClientHello, correctly call this.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	root, err := c.getCertPool()
 	if err != nil {
@@ -313,6 +318,17 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 func (c *Config) RequireEchSatisfied(cfg *tls.Config) error {
 	if c != nil && c.RequireEch && len(cfg.EncryptedClientHelloConfigList) == 0 {
 		return newError("ECH required but no ECH config could be obtained; refusing to handshake (would leak cleartext SNI)")
+	}
+	return nil
+}
+
+// RefuseIfEchRequiredUnsupported returns an error when ech=always (RequireEch)
+// is set but this transport cannot carry an ECH config (its conversion drops
+// EncryptedClientHelloConfigList), so the dial fails closed instead of sending a
+// cleartext-SNI ClientHello. engine names the transport for the message.
+func (c *Config) RefuseIfEchRequiredUnsupported(engine string) error {
+	if c != nil && c.RequireEch {
+		return newError(engine + " cannot satisfy ech=always (cannot carry an ECH config); refusing to handshake")
 	}
 	return nil
 }

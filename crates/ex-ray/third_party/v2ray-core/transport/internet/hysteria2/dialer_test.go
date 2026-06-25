@@ -11,8 +11,7 @@ import (
 )
 
 // hyClient.TLSConfig carries no ECH field, so hysteria2 cannot satisfy
-// ech=always and must fail closed by refusing; with require_ech off it builds a
-// client TLS config as before.
+// ech=always and must fail closed by refusing.
 func TestGetClientTLSConfigRequireEch(t *testing.T) {
 	dest := net.TCPDestination(net.LocalHostIP, 443)
 	streamSettings := func(requireEch bool) *internet.MemoryStreamConfig {

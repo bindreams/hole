@@ -39,12 +39,10 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 			return nil, newError("unknown option")
 		}
 	}
-	// The uTLS engine cannot carry ECH: uTLSConfigFromTLSConfig drops
-	// EncryptedClientHelloConfigList. So it fails closed by refusing when the
-	// operator requires ECH rather than hand a cleartext-SNI hello to uTLS.
-	// (Carrying ECH through the conversion is a separate future enhancement.)
-	if e.config.TlsConfig.RequireEch {
-		return nil, newError("uTLS engine cannot satisfy ech=always (cannot carry an ECH config); refusing to handshake")
+	// uTLSConfigFromTLSConfig drops EncryptedClientHelloConfigList, so uTLS cannot
+	// carry ECH — refuse rather than send a cleartext-SNI hello.
+	if err := e.config.TlsConfig.RefuseIfEchRequiredUnsupported("uTLS engine"); err != nil {
+		return nil, err
 	}
 	tlsConfig := e.config.TlsConfig.GetTLSConfig(options...)
 	utlsConfig, err := uTLSConfigFromTLSConfig(tlsConfig)

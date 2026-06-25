@@ -50,8 +50,8 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 	dest.Network = net.Network_UDP
 	newError("dialing mKCP to ", dest).WriteToLog()
 
-	// Run the factory's ECH gate before dialing, so a required-but-unobtainable
-	// ECH config aborts with no connection to tear down.
+	// Gate before dialing, so a required-but-unobtainable ECH config aborts with
+	// no connection to tear down.
 	var gotlsConfig *gotls.Config
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		c, err := config.GetTLSConfigForClient(tls.WithDestination(dest))
