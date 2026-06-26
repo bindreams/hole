@@ -140,6 +140,21 @@ async fn resolve_uses_configured_resolver_not_system() {
 }
 
 #[skuld::test]
+async fn resolve_surfaces_invalid_name_not_no_answer() {
+    // A label > 63 octets is not a valid DNS name; the builder returns
+    // InvalidName, which must reach the caller rather than being downgraded to
+    // NoAnswer. The querier is never consulted because the query never builds.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let q = stub(HashMap::new());
+    let bad = "a".repeat(64);
+    let err = resolve_via_doh_with(&bad, &cfg(vec![resolver], false), q.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(err, BootstrapError::InvalidName);
+    assert!(q.asked.lock().unwrap().is_empty(), "an invalid name must not query DoH");
+}
+
+#[skuld::test]
 async fn resolve_fails_closed_when_no_resolver_answers() {
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
     let q = stub(HashMap::new()); // querier returns None for every server.

@@ -122,21 +122,22 @@ pub async fn resolve_via_doh_with(
 
     // Fixed tx ids: DoH carries the query over an authenticated TLS channel, so
     // transport security — not the 16-bit id — is what defeats off-path spoofing.
+    // Build both queries once: a builder failure is an InvalidName (malformed
+    // hostname), surfaced as-is rather than masked as NoAnswer by the loop.
+    let a_query = build_a_query(host, 0x0001)?;
+    let aaaa_query = build_aaaa_query(host, 0x0002)?;
+
     let mut v6_fallback: Option<IpAddr> = None;
     for &server in &dns.servers {
         let url = hole_common::doh_url(server);
-        if let Ok(q) = build_a_query(host, 0x0001) {
-            if let Some(reply) = querier.query(&url, server, &q).await {
-                if let Some(ip) = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv4) {
-                    return Ok(ip); // IPv4 preferred for bypass-route compatibility.
-                }
+        if let Some(reply) = querier.query(&url, server, &a_query).await {
+            if let Some(ip) = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv4) {
+                return Ok(ip); // IPv4 preferred for bypass-route compatibility.
             }
         }
         if v6_fallback.is_none() {
-            if let Ok(q) = build_aaaa_query(host, 0x0002) {
-                if let Some(reply) = querier.query(&url, server, &q).await {
-                    v6_fallback = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv6);
-                }
+            if let Some(reply) = querier.query(&url, server, &aaaa_query).await {
+                v6_fallback = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv6);
             }
         }
     }
