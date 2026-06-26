@@ -36,11 +36,9 @@ pub enum ProxyError {
     RouteSetup(String),
     #[error("proxy already running")]
     AlreadyRunning,
-    /// The start was cancelled via `CancellationToken` before it could
-    /// complete. The error message is the stable `CANCELLED_MESSAGE`
-    /// constant from `hole_common::protocol` so bridge and client can
-    /// round-trip it exactly. Not set as `last_error` — the user asked
-    /// for the cancel, so it is not a diagnostic failure.
+    /// The start was cancelled via `CancellationToken` before it could complete.
+    /// Not recorded as `last_error` — the user asked for the cancel, so it is not
+    /// a diagnostic failure.
     #[error("cancelled")]
     Cancelled,
     #[error("wintun.dll not found (tried: {})", .tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
@@ -90,11 +88,39 @@ pub enum ProxyError {
     },
     /// The start-time reachability probe found the network is resetting/dropping
     /// the server handshake (DPI / censorship), distinct from a credential/config
-    /// failure. `Display` is the host-free censorship sentence alone (the shared
-    /// [`hole_common::protocol::NETWORK_BLOCKED_MESSAGE`]); the GUI matches it
-    /// verbatim to render a clean toast.
+    /// failure. `Display` is the host-free censorship sentence
+    /// ([`hole_common::protocol::NETWORK_BLOCKED_MESSAGE`]).
     #[error("{}", hole_common::protocol::NETWORK_BLOCKED_MESSAGE)]
     NetworkBlocked,
+}
+
+impl From<&ProxyError> for hole_common::protocol::StartError {
+    fn from(e: &ProxyError) -> Self {
+        use hole_common::protocol::StartError;
+        match e {
+            ProxyError::Cancelled => StartError::Cancelled,
+            ProxyError::AlreadyRunning => StartError::AlreadyRunning,
+            ProxyError::NetworkBlocked => StartError::NetworkBlocked,
+            // Every other start failure is generic; its `Display` is the reason.
+            // Listed exhaustively (no `_`) so a new `ProxyError` variant forces a
+            // deliberate classification choice here.
+            ProxyError::InvalidMethod(_)
+            | ProxyError::InvalidPluginName(_)
+            | ProxyError::Runtime(_)
+            | ProxyError::Gateway(_)
+            | ProxyError::DnsResolution { .. }
+            | ProxyError::RouteSetup(_)
+            | ProxyError::WintunMissing { .. }
+            | ProxyError::WintunLoad { .. }
+            | ProxyError::Plugin(_)
+            | ProxyError::BindRace { .. }
+            | ProxyError::TunnelRequiresSocks5
+            | ProxyError::NoListenersEnabled
+            | ProxyError::DuplicateListenerPort { .. }
+            | ProxyError::InvalidListenerPort { .. }
+            | ProxyError::ForwarderSelfTestFailed { .. } => StartError::Failed { message: e.to_string() },
+        }
+    }
 }
 
 // Error conversions from tun-engine ===================================================================================

@@ -91,12 +91,6 @@ fn bridge_request_cancel_json_roundtrip() {
 }
 
 #[skuld::test]
-fn cancelled_message_constant_is_stable() {
-    // Pins the wire-contract value (see `CANCELLED_MESSAGE` docs in protocol.rs).
-    assert_eq!(CANCELLED_MESSAGE, "cancelled");
-}
-
-#[skuld::test]
 fn bridge_response_ack_json_roundtrip() {
     let resp = BridgeResponse::Ack;
     let json = serde_json::to_vec(&resp).unwrap();
@@ -132,6 +126,38 @@ fn bridge_response_error_json_roundtrip() {
     let json = serde_json::to_vec(&resp).unwrap();
     let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, resp);
+}
+
+// StartError wire compatibility =======================================================================================
+
+#[skuld::test]
+fn start_error_round_trips() {
+    for (e, json) in [
+        (StartError::Cancelled, r#"{"kind":"cancelled"}"#),
+        (StartError::AlreadyRunning, r#"{"kind":"already_running"}"#),
+        (StartError::NetworkBlocked, r#"{"kind":"network_blocked"}"#),
+    ] {
+        assert_eq!(serde_json::to_string(&e).unwrap(), json);
+        assert_eq!(serde_json::from_str::<StartError>(json).unwrap(), e);
+    }
+    let failed = StartError::Failed { message: "boom".into() };
+    assert_eq!(
+        serde_json::to_string(&failed).unwrap(),
+        r#"{"kind":"failed","message":"boom"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<StartError>(r#"{"kind":"failed","message":"boom"}"#).unwrap(),
+        failed
+    );
+}
+
+#[skuld::test]
+fn bridge_response_start_failed_round_trips() {
+    let resp = BridgeResponse::StartFailed(StartError::NetworkBlocked);
+    assert_eq!(
+        serde_json::from_slice::<BridgeResponse>(&serde_json::to_vec(&resp).unwrap()).unwrap(),
+        resp
+    );
 }
 
 /// Ensure old clients that still send `plugin_path` in JSON don't break deserialization.

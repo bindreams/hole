@@ -275,3 +275,21 @@ fn full_mode_pure_vpn_ignores_configured_ports() {
     let ss_config = build_ss_config(&cfg, None, Some(54321)).unwrap();
     assert_eq!(ss_config.local.len(), 1);
 }
+
+#[skuld::test]
+fn proxy_error_converts_to_start_error() {
+    use hole_common::protocol::StartError;
+    assert_eq!(StartError::from(&ProxyError::Cancelled), StartError::Cancelled);
+    assert_eq!(
+        StartError::from(&ProxyError::AlreadyRunning),
+        StartError::AlreadyRunning
+    );
+    assert_eq!(
+        StartError::from(&ProxyError::NetworkBlocked),
+        StartError::NetworkBlocked
+    );
+    match StartError::from(&ProxyError::RouteSetup("nope".into())) {
+        StartError::Failed { message } => assert!(message.contains("nope")),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}

@@ -440,9 +440,8 @@ mod tun {
 
 // Lifecycle matrix ====================================================================================================
 
-/// Test 7: starting twice without stopping returns an error from the
-/// second start. The dist harness exposes the error payload via
-/// `BridgeResponse::Error`.
+/// Test 7: starting twice without stopping returns the typed `AlreadyRunning`
+/// failure from the second start (the dist harness parses the 500 `StartError`).
 #[skuld::test(labels = [DIST_BIN])]
 fn lifecycle_start_twice_returns_error(
     #[fixture(dist_dir)] dist: &Path,
@@ -482,11 +481,13 @@ fn lifecycle_start_twice_returns_error(
             })
             .await
             .unwrap();
-        // The second start should return an Error response (the bridge
-        // maps the ProxyError::AlreadyRunning into a 5xx).
+        // The second start returns the typed AlreadyRunning (500 StartError).
         assert!(
-            matches!(resp2, BridgeResponse::Error { .. }),
-            "expected Error on second start, got {resp2:?}"
+            matches!(
+                resp2,
+                BridgeResponse::StartFailed(hole_common::protocol::StartError::AlreadyRunning)
+            ),
+            "expected StartFailed(AlreadyRunning) on second start, got {resp2:?}"
         );
 
         harness.send(BridgeRequest::Stop).await.unwrap();

@@ -881,6 +881,18 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     send_bridge_request(request, None)
 }
 
+/// CLI disposition for a typed start failure: process exit code + an optional error
+/// line. Cancelled/AlreadyRunning are success-equivalent (0); a block and any other
+/// failure are errors (1). Shared by both CLI start paths so exit codes never diverge.
+pub(crate) fn start_error_cli(e: &hole_common::protocol::StartError) -> (i32, Option<String>) {
+    use hole_common::protocol::StartError;
+    match e {
+        StartError::Cancelled | StartError::AlreadyRunning => (0, None),
+        StartError::NetworkBlocked => (1, Some(hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string())),
+        StartError::Failed { message } => (1, Some(format!("bridge rejected start: {message}"))),
+    }
+}
+
 /// Send a `BridgeRequest`, mapping the response to an exit code (0 on success,
 /// 1 on error). Used by `bridge ipc-send`, which doesn't print the response
 /// body. When `result_file` is `Some` (the elevated path), also mirror the
@@ -908,6 +920,13 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
             cli_log!(error, "bridge error: {message}");
             1
         }
+        Ok(BridgeResponse::StartFailed(e)) => {
+            let (code, log) = start_error_cli(&e);
+            if let Some(line) = log {
+                cli_log!(error, "{line}");
+            }
+            code
+        }
         Err(msg) => {
             cli_log!(error, "{msg}");
             1
@@ -915,21 +934,17 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
     }
 }
 
-/// Underlying request driver. Returns the parsed `BridgeResponse` or a
-/// human-readable error message.
+/// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
+/// `ClientError` (kept typed so the elevated classifier can distinguish a
+/// control-plane `ConcurrentStart` from a transport failure).
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
-) -> Result<hole_common::protocol::BridgeResponse, String> {
+) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
-        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path)
-            .await
-            .map_err(|e| format!("failed to connect to bridge: {e}"))?;
-        client
-            .send(request)
-            .await
-            .map_err(|e| format!("communication error: {e}"))
+        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path).await?;
+        client.send(request).await
     })
 }
 
@@ -985,6 +1000,19 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                 Ok(BridgeResponse::Error { message }) => {
                     cli_log!(error, "bridge rejected start: {message}");
                     1
+                }
+                Ok(BridgeResponse::StartFailed(e)) => {
+                    use hole_common::protocol::StartError;
+                    match &e {
+                        StartError::AlreadyRunning => println!("proxy already running on local_port {local_port}"),
+                        StartError::Cancelled => println!("proxy start cancelled"),
+                        _ => {}
+                    }
+                    let (code, log) = start_error_cli(&e);
+                    if let Some(line) = log {
+                        cli_log!(error, "{line}");
+                    }
+                    code
                 }
                 Ok(other) => {
                     cli_log!(error, "unexpected response: {other:?}");

@@ -85,15 +85,25 @@ pub(crate) fn bridge_error_toast(message: &str) -> String {
     format!("Bridge error: {message}")
 }
 
-/// Final toast for a bridge Start-error `message`, shared by the live-Connect and
-/// elevated paths so they read identically. A `NetworkBlocked` message is
-/// host-free and self-contained, so it is shown raw; every other rejection is
-/// wrapped by [`bridge_error_toast`].
-pub(crate) fn start_error_toast(message: &str) -> String {
-    use crate::state::{classify_start_error, StartErrorKind};
-    match classify_start_error(message) {
-        StartErrorKind::NetworkBlocked => message.to_string(),
-        _ => bridge_error_toast(message),
+/// Toast shown for a concurrent-start rejection (409). Shared by the live-Connect
+/// (`outcome_for_start_response`) and elevated (`elevate_and_confirm`) paths so the
+/// two surfaces read identically.
+pub(crate) const CONCURRENT_START_MESSAGE: &str = "Another start is already in progress.";
+
+/// Final toast for a typed start failure, shared by the live-Connect and elevated
+/// paths so they read identically. `NetworkBlocked` is host-free and self-contained
+/// (shown raw); every other genuine failure is wrapped by [`bridge_error_toast`].
+/// Cancelled/AlreadyRunning are routed to outcomes by callers and don't reach here;
+/// if one does, log it and render a safe generic string rather than panic.
+pub(crate) fn start_error_toast(kind: &hole_common::protocol::StartError) -> String {
+    use hole_common::protocol::StartError;
+    match kind {
+        StartError::NetworkBlocked => hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string(),
+        StartError::Failed { message } => bridge_error_toast(message),
+        StartError::Cancelled | StartError::AlreadyRunning => {
+            warn!(?kind, "start_error_toast reached with a non-failure variant");
+            bridge_error_toast("unexpected start outcome")
+        }
     }
 }
 
@@ -152,17 +162,23 @@ pub(crate) fn decide_elevation(
 pub(crate) fn outcome_for_start_response(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> StartDecision {
-    use crate::state::{classify_start_error, StartErrorKind};
+    use crate::bridge_client::ClientError;
+    use hole_common::protocol::StartError;
     match result {
         Ok(BridgeResponse::Ack) => StartDecision::Outcome(ToggleOutcome::Running),
-        Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
-            StartErrorKind::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
-            StartErrorKind::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
-            // NetworkBlocked renders clean, Other is wrapped — start_error_toast decides.
-            StartErrorKind::NetworkBlocked | StartErrorKind::Other => StartDecision::Fail(start_error_toast(message)),
+        Ok(BridgeResponse::StartFailed(e)) => match e {
+            StartError::Cancelled => StartDecision::Outcome(ToggleOutcome::Cancelled),
+            StartError::AlreadyRunning => StartDecision::Outcome(ToggleOutcome::Running),
+            StartError::NetworkBlocked | StartError::Failed { .. } => StartDecision::Fail(start_error_toast(e)),
         },
-        Ok(_) => StartDecision::Fail("Unexpected response from bridge".into()),
-        Err(crate::bridge_client::ClientError::PermissionDenied) => StartDecision::NeedsElevation,
+        // An unexpected variant on the Start path is a same-build contract breach —
+        // warn and fail gracefully (no panic), never silently treat it as success.
+        Ok(other) => {
+            warn!(?other, "unexpected bridge response on the start path");
+            StartDecision::Fail("Unexpected response from bridge".into())
+        }
+        Err(ClientError::PermissionDenied) => StartDecision::NeedsElevation,
+        Err(ClientError::ConcurrentStart) => StartDecision::Fail(CONCURRENT_START_MESSAGE.into()),
         Err(e) => StartDecision::Fail(format!("Failed to connect to bridge: {e}")),
     }
 }
@@ -515,7 +531,9 @@ async fn elevate_and_confirm(app: &AppHandle, request: BridgeRequest) -> Result<
                 ToggleOutcome::Stopped
             })
         }
-        ElevationResult::BridgeError(message) => Err(start_error_toast(&message)),
+        ElevationResult::StartFailed(error) => Err(start_error_toast(&error)),
+        ElevationResult::ConcurrentStart => Err(CONCURRENT_START_MESSAGE.into()),
+        ElevationResult::BridgeError(message) => Err(bridge_error_toast(&message)),
         ElevationResult::Transport(detail) => Err(transport_after_elevation_toast(&detail)),
         ElevationResult::Cancelled => Err("Elevation was cancelled.".into()),
         ElevationResult::LaunchFailure => Err("The elevated helper could not start. See gui.log for details.".into()),
