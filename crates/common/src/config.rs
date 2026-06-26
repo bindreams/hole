@@ -377,14 +377,13 @@ fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+// Windows (and any non-macOS host): a plain recursive create. Hole only *runs* on
+// Windows and macOS, but the crate stays compilable everywhere so cross-platform
+// tooling (e.g. `xtask`) can reuse its platform-agnostic protocol types without
+// dragging in OS-specific config I/O.
+#[cfg(not(target_os = "macos"))]
 fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir { source })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn ensure_config_dir(_parent: &Path) -> Result<(), ConfigError> {
-    compile_error!("save() is not implemented for this platform");
 }
 
 #[cfg(test)]
