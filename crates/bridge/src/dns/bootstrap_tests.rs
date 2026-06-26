@@ -15,10 +15,10 @@ fn decode(bytes: &[u8]) -> Message {
 fn build_a_query_has_a_question_for_name() {
     let q = build_a_query("example.com", 0x1234).unwrap();
     let msg = decode(&q);
-    assert_eq!(msg.id, 0x1234); // pub field via Deref<Metadata>, not msg.id()
+    assert_eq!(msg.id, 0x1234);
     assert_eq!(msg.op_code, OpCode::Query);
     assert!(msg.recursion_desired);
-    let question = &msg.queries[0]; // pub Vec field, not msg.queries()
+    let question = &msg.queries[0];
     assert_eq!(question.query_type(), RecordType::A);
     assert_eq!(question.name().to_utf8(), "example.com.");
 }
@@ -82,7 +82,7 @@ struct StubQuerier {
 
 #[async_trait]
 impl DohQuerier for StubQuerier {
-    async fn query(&self, _doh_url: &str, server: IpAddr, _wire: &[u8]) -> Option<Vec<u8>> {
+    async fn query(&self, server: IpAddr, _wire: &[u8]) -> Option<Vec<u8>> {
         self.asked.lock().unwrap().push(server);
         self.answer_for.get(&server).cloned()
     }
@@ -235,7 +235,7 @@ fn handoff_host_v6_is_bracketed_and_parses_with_port() {
     let v6 = Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946);
     let ip = IpAddr::V6(v6);
     assert_eq!(handoff_host(ip), format!("[{v6}]"));
-    // The exact string garter builds (chain.rs:227) MUST be a valid SocketAddr;
+    // The exact string garter builds in chain.rs MUST be a valid SocketAddr;
     // a bare (unbracketed) v6 + ":443" would NOT parse.
     let combined = format!("{}:443", handoff_host(ip));
     let sa: SocketAddr = combined.parse().expect("bracketed v6 host:port parses");

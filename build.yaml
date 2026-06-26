@@ -274,10 +274,9 @@ targets:
     # gives the ECH fail-closed gate CI teeth: ex-ray's buildTLSConfig (ech /
     # ech-doh flags, exit-23) plus the patched vendored packages that carry the
     # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
-    # transportcommon). Scoped to the ECH-touching packages, NOT `./...` over the whole vendored tree (its
-    # full suite is upstream's to run, and slow). Gate logic is platform-
-    # independent (domainsocket is !windows, covered on linux); CI runs it once
-    # on linux, platforms wide so `cargo xtask run ex-ray-tests` works anywhere.
+    # transportcommon). Scoped to the ECH-touching packages, not the whole vendored tree (upstream's full suite is slow).
+    # Gate logic is platform-independent (domainsocket is !windows); the matrix is wide so
+    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only linux.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:

@@ -69,15 +69,13 @@ pub fn parse_addrs(reply: &[u8]) -> Vec<IpAddr> {
 
 /// One DoH round-trip seam, mockable in tests. The production impl runs the
 /// query through a `DnsForwarder` pinned to one resolver IP over a DIRECT
-/// connector (tunnel not up). `doh_url` is the provider URL for `server`; the
-/// `DnsForwarder` derives the same URL/SNI internally from its provider table,
-/// so the arg exists for the trait's mock symmetry and logging — production
-/// TLS verification is unchanged.
+/// connector (tunnel not up); the forwarder derives the DoH URL/SNI internally
+/// from `server` via its provider table.
 #[async_trait]
 pub trait DohQuerier: Send + Sync {
     /// Return the wire-format reply, or `None` if this resolver did not answer
     /// (connect/TLS/HTTP failure or a SERVFAIL/answerless reply). Never errors.
-    async fn query(&self, doh_url: &str, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>>;
+    async fn query(&self, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>>;
 }
 
 /// Production querier: a `DnsForwarder` over a `DirectConnector`, restricted to
@@ -88,7 +86,7 @@ struct ForwarderQuerier;
 
 #[async_trait]
 impl DohQuerier for ForwarderQuerier {
-    async fn query(&self, _doh_url: &str, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+    async fn query(&self, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
         // One-server config so the forwarder targets exactly this resolver over
         // DoH. ipv6_bypass_available=true: bootstrap runs before the tunnel, on
         // the host's real stack, so do not suppress IPv6 resolvers.
@@ -129,14 +127,13 @@ pub async fn resolve_via_doh_with(
 
     let mut v6_fallback: Option<IpAddr> = None;
     for &server in &dns.servers {
-        let url = hole_common::doh_url(server);
-        if let Some(reply) = querier.query(&url, server, &a_query).await {
+        if let Some(reply) = querier.query(server, &a_query).await {
             if let Some(ip) = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv4) {
                 return Ok(ip); // IPv4 preferred for bypass-route compatibility.
             }
         }
         if v6_fallback.is_none() {
-            if let Some(reply) = querier.query(&url, server, &aaaa_query).await {
+            if let Some(reply) = querier.query(server, &aaaa_query).await {
                 v6_fallback = parse_addrs(&reply).into_iter().find(IpAddr::is_ipv6);
             }
         }
@@ -165,8 +162,8 @@ pub async fn resolve_via_doh_with(
 }
 
 /// Format a resolved IP as the `server_host` handed to the plugin chain /
-/// bypass. garter recombines it as `format!("{host}:{port}")`
-/// (chain.rs:227), so an IPv6 literal MUST be bracketed or the recombined
+/// bypass. garter recombines it as `format!("{host}:{port}")` in chain.rs, so
+/// an IPv6 literal MUST be bracketed or the recombined
 /// string is an unparseable `addr:port`. V4 is returned plain.
 pub fn handoff_host(ip: IpAddr) -> String {
     match ip {
@@ -187,7 +184,7 @@ pub(crate) fn test_loopback_querier(cert: rustls_pki_types::CertificateDer<'stat
     }
     #[async_trait]
     impl DohQuerier for LoopbackForwarderQuerier {
-        async fn query(&self, _doh_url: &str, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
             let cfg = DnsConfig {
                 enabled: true,
                 servers: vec![server],

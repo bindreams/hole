@@ -109,7 +109,7 @@ impl Drop for PluginChain {
 /// before each `op` call) is what catches the Windows excluded-range
 /// race class here, before the subprocess spawn. The residual
 /// probe-drop-to-subprocess-bind TOCTOU is tracked in bindreams/hole#304.
-#[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
+#[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin_name: &str,
     plugin_path: &str,
@@ -412,8 +412,7 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
 /// - `loglevel=debug` (always): Hole captures plugin stderr via
 ///   `garter::binary` and routes it through the bridge's tracing subscriber,
 ///   so always-on debug is paid in `bridge.log` volume, not user-visible
-///   noise. Catching plugin-side handshake / dial / WebSocket failures has
-///   been the recurring blocker on #248-class tunnel issues.
+///   noise. It captures plugin-side handshake / dial / WebSocket failures.
 /// - `ech-doh=<url>` (when `ech_doh_url` is set): the DoH server ex-ray's ECH
 ///   path fetches the ECHConfigList from. The bridge never injects `ech=<mode>`
 ///   — ex-ray owns the mode (default `auto`).

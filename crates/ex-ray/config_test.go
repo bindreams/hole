@@ -110,7 +110,7 @@ func TestGenerateConfigAcceptsValidDefaults(t *testing.T) {
 
 // withEchFlags saves the ech/ech-doh globals, applies values, returns a restore
 // func for defer. parseOptsIntoFlags + generateConfig read these pointers, so
-// tests must leave them as they found them. Mirrors withFlags (config_test.go:58).
+// tests must leave them as they found them. Mirrors withFlags.
 func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	t.Helper()
 	origMode, origDoh := *echMode, *echDoh

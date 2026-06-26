@@ -480,7 +480,7 @@ fn preflight_path_uses_doh_resolved_ip() {
     struct LoopbackQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for LoopbackQuerier {
-        async fn query(&self, _u: &str, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
             use hickory_proto::op::{Message, MessageType, OpCode, Query};
             use hickory_proto::rr::rdata::A;
             use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -550,7 +550,7 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
     struct FixtureQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for FixtureQuerier {
-        async fn query(&self, _u: &str, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
             use hickory_proto::op::{Message, MessageType, OpCode, Query};
             use hickory_proto::rr::rdata::A;
             use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -609,7 +609,7 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _u: &str, _s: std::net::IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, _s: std::net::IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
@@ -641,7 +641,7 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
 struct Ipv6LoopbackQuerier;
 #[async_trait::async_trait]
 impl crate::dns::bootstrap::DohQuerier for Ipv6LoopbackQuerier {
-    async fn query(&self, _u: &str, _s: std::net::IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+    async fn query(&self, _s: std::net::IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use hickory_proto::rr::rdata::AAAA;
         use hickory_proto::rr::{Name, RData, Record, RecordType};

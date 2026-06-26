@@ -1155,7 +1155,7 @@ fn doh_bootstrap_failure_sets_last_error() {
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _u: &str, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
@@ -1737,7 +1737,7 @@ struct WiringStubQuerier {
 
 #[async_trait::async_trait]
 impl DohQuerier for WiringStubQuerier {
-    async fn query(&self, _doh_url: &str, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use hickory_proto::rr::rdata::A;
         use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -1878,7 +1878,7 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _u: &str, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
