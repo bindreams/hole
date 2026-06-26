@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { message, open } from "@tauri-apps/plugin-dialog";
+import { NETWORK_BLOCKED_MESSAGE } from "./generated";
 import { describeUnknownImportError } from "./import-failure";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
@@ -37,7 +38,7 @@ export function userMessageFor(o: ServerTestOutcome): string {
     case "tunnel_handshake_failed":
       return "Server rejected the connection (wrong password, cipher, or plugin config).";
     case "network_blocked":
-      return "The network is blocking the connection to this server — the handshake was reset or got no response. This usually means a firewall or censorship; try a different server.";
+      return NETWORK_BLOCKED_MESSAGE;
     case "server_cannot_reach_internet":
       return "Server cannot reach the public internet.";
     case "sentinel_mismatch":

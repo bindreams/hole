@@ -17,6 +17,7 @@ pub mod bindir;
 pub mod ci_coverage;
 pub mod ex_ray;
 pub mod galoshes;
+pub mod gen_ui_constants;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
@@ -36,6 +37,9 @@ mod ci_coverage_tests;
 #[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
+#[cfg(test)]
+#[path = "gen_ui_constants_tests.rs"]
+mod gen_ui_constants_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
@@ -183,6 +187,12 @@ pub enum Command {
         #[arg(long)]
         os: Option<manifest::Os>,
     },
+    /// Generate `ui/generated.ts` from Rust constants (single source of truth).
+    GenUiConstants {
+        /// Verify the committed file is up to date instead of writing it.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -240,6 +250,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", render_bindir_names(os));
             Ok(())
         }
+        Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),
     }
 }
 
