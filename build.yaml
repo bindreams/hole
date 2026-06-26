@@ -273,8 +273,8 @@ targets:
     # wrapper but excludes third_party/v2ray-core and runs no tests at all. It
     # gives the ECH fail-closed gate CI teeth: ex-ray's buildTLSConfig (ech /
     # ech-doh flags, exit-23) plus the patched vendored packages that carry the
-    # gate/refuse/round-trip tests (tls incl. utls, quic, hysteria2). Scoped to
-    # the ECH-touching packages, NOT `./...` over the whole vendored tree (its
+    # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
+    # transportcommon). Scoped to the ECH-touching packages, NOT `./...` over the whole vendored tree (its
     # full suite is upstream's to run, and slow). Gate logic is platform-
     # independent (domainsocket is !windows, covered on linux); CI runs it once
     # on linux, platforms wide so `cargo xtask run ex-ray-tests` works anywhere.
@@ -282,7 +282,7 @@ targets:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
       - cd crates/ex-ray && go test ./...
-      - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/...
+      - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/... ./transport/internet/transportcommon/...
 
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a

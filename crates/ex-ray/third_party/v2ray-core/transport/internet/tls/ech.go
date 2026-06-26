@@ -66,8 +66,8 @@ func ApplyECH(c *Config, config *tls.Config) error {
 // best-effort. serverName is the resolved config.ServerName the rejected dial
 // used, so the write keys identically to a future ApplyECH lookup. No-op on empty
 // configs. retry_configs with no keyable domain (IP SNI, no EchQueryDomain) leaves
-// a debug breadcrumb and writes nothing. An absent or expired entry resets to
-// now+600s; an un-expired entry keeps its expiry so a fresh DoH TTL is not clobbered.
+// a debug breadcrumb and writes nothing. Keeps an un-expired entry's expiry so a
+// fresh DoH TTL is not clobbered.
 func RefreshECHCache(c *Config, serverName string, retryConfigs []byte) {
 	if len(retryConfigs) == 0 {
 		return

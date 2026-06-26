@@ -88,6 +88,10 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		if err != nil {
 			return nil, nil, err
 		}
+		// ECH retry (RFC 9849) is intentionally not wired here: gRPC owns the
+		// handshake inside its own credentials, with no security.Engine seam to
+		// observe the rejection, so wiring it needs an upstream gRPC hook. A stale
+		// ECH config falls back to the DoH-cache TTL.
 		transportCredentials = credentials.NewTLS(gotlsConfig)
 	}
 	dialOptions := []grpc.DialOption{
