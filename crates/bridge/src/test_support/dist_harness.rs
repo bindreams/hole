@@ -638,7 +638,10 @@ impl BridgeIpcClient {
                 }
             }
             BridgeRequest::TestServer { entry } => {
-                let req_body = TestServerRequest { entry };
+                let req_body = TestServerRequest {
+                    entry,
+                    dns: hole_common::config::DnsConfig::default(),
+                };
                 let body = serde_json::to_vec(&req_body)?;
                 let resp = self.http_post(ROUTE_TEST_SERVER, body, None).await?;
                 if resp.status().is_success() {

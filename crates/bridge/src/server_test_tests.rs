@@ -49,6 +49,7 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
         sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
         plugin_path_override: None,
+        dns: hole_common::config::DnsConfig::default(),
     }
 }
 
@@ -80,6 +81,11 @@ fn fixture_starts_real_ss_server() {
 
 /// Build a [`TestConfig`] pointing at a single bogus IP for both sentinels.
 /// Used by the pre-flight tests, where the test never reaches Phase 3.
+///
+/// `allow_insecure_bootstrap = true`: these preflight tests use IP-literal or
+/// `.invalid` hosts, so the DoH bootstrap falls through to the OS resolver
+/// rather than calling a live Cloudflare DoH endpoint — the resolution path
+/// the preflight diagnosis already assumed before the bootstrap was wired in.
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
@@ -88,6 +94,10 @@ fn preflight_only_config() -> TestConfig {
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
         plugin_path_override: None,
+        dns: hole_common::config::DnsConfig {
+            allow_insecure_bootstrap: true,
+            ..hole_common::config::DnsConfig::default()
+        },
     }
 }
 
@@ -446,5 +456,53 @@ fn run_test_returns_tcp_timeout_for_blackhole() {
             matches!(outcome, ServerTestOutcome::TcpTimeout),
             "expected TcpTimeout, got {outcome:?}"
         );
+    });
+}
+
+#[skuld::test]
+fn preflight_path_uses_doh_resolved_ip() {
+    use crate::dns::bootstrap::{handoff_host, resolve_via_doh_with, DohQuerier};
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    // resolve_via_doh_with maps the host to loopback; a live listener on that
+    // loopback port makes the subsequent TCP connect in preflight succeed.
+    struct LoopbackQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for LoopbackQuerier {
+        async fn query(&self, _u: &str, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None;
+            }
+            let n = Name::from_ascii("preflight.example.").ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
+            reply.to_vec().ok()
+        }
+    }
+
+    rt().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dns = DnsConfig {
+            enabled: true,
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            protocol: DnsProtocol::Https,
+            allow_insecure_bootstrap: false,
+        };
+        let ip = resolve_via_doh_with("preflight.example", &dns, Arc::new(LoopbackQuerier))
+            .await
+            .unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        // The host preflight connects to is the bracket-safe handoff host.
+        assert!(super::preflight(&handoff_host(ip), port, Duration::from_secs(2))
+            .await
+            .is_ok());
     });
 }

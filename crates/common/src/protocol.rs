@@ -300,6 +300,11 @@ pub const LATENCY_VALIDATED_ON_CONNECT: u64 = 0;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TestServerRequest {
     pub entry: ServerEntry,
+    /// The user's current DNS resolver config, so the bridge can bootstrap the
+    /// server hostname over private DoH (never the OS resolver). `#[serde(default)]`
+    /// → `DnsConfig::default()` for older clients.
+    #[serde(default)]
+    pub dns: crate::config::DnsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

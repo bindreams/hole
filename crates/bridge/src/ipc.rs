@@ -753,7 +753,8 @@ async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
     State(_state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<TestServerRequest>,
 ) -> Json<TestServerResponse> {
-    let cfg = TestConfig::production();
+    let mut cfg = TestConfig::production();
+    cfg.dns = req.dns;
     let outcome = run_server_test(&req.entry, &cfg).await;
     Json(TestServerResponse { outcome })
 }

@@ -41,6 +41,8 @@ pub struct TestConfig {
     /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
     /// upstream v2ray-plugin) without depending on `PATH`.
     pub plugin_path_override: Option<String>,
+    /// User's resolver config for the private-DoH server bootstrap.
+    pub dns: hole_common::config::DnsConfig,
 }
 
 impl TestConfig {
@@ -51,6 +53,7 @@ impl TestConfig {
             sentinel_read_timeout: Duration::from_secs(5),
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],
             plugin_path_override: None,
+            dns: hole_common::config::DnsConfig::default(),
         }
     }
 }
@@ -71,6 +74,20 @@ impl TestConfig {
 pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTestOutcome {
     let started = Instant::now();
 
+    // Resolve the server hostname over PRIVATE DoH (never the OS resolver),
+    // mirroring `start_inner`. Fail-closed unless `dns.allow_insecure_bootstrap`
+    // → on failure return the existing `DnsFailed` outcome (host logged here,
+    // not surfaced). Preflight + plugin handoff use the bracket-safe IP, so the
+    // preflight's own `lookup_host` sees an IP literal and short-circuits.
+    let server_ip = match crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");
+            return ServerTestOutcome::DnsFailed;
+        }
+    };
+    let server_host = crate::dns::bootstrap::handoff_host(server_ip);
+
     // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
     // public endpoint is UDP-only, so a raw TCP connect can't validate it (it
     // would always surface as a false TcpRefused/TcpTimeout). The full tunnel
@@ -78,7 +95,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // QUIC server. See bindreams/hole#421.
     if server_endpoint_is_udp(entry) {
         debug!("server_test: skipping TCP preflight for UDP (quic) server endpoint");
-    } else if let Err(out) = preflight(&entry.server, entry.server_port, cfg.preflight_timeout).await {
+    } else if let Err(out) = preflight(&server_host, entry.server_port, cfg.preflight_timeout).await {
         return out;
     }
 
@@ -88,7 +105,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     };
 
     // Phase 2: spawn plugin if configured. The guard's Drop kills the child.
-    let _plugin_guard = match maybe_start_plugin(entry, &mut svr_cfg, cfg).await {
+    let _plugin_guard = match maybe_start_plugin(entry, &mut svr_cfg, &server_host, cfg).await {
         Ok(p) => p,
         Err(out) => return out,
     };
@@ -220,6 +237,7 @@ fn build_server_config(entry: &ServerEntry) -> Result<ServerConfig, String> {
 async fn maybe_start_plugin(
     entry: &ServerEntry,
     svr_cfg: &mut ServerConfig,
+    server_host: &str,
     cfg: &TestConfig,
 ) -> Result<Option<crate::proxy::plugin::PluginChain>, ServerTestOutcome> {
     let Some(plugin_name) = entry.plugin.as_ref() else {
@@ -231,9 +249,11 @@ async fn maybe_start_plugin(
         .clone()
         .unwrap_or_else(|| resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()));
 
-    let (server_host, server_port) = match svr_cfg.addr() {
-        ServerAddr::SocketAddr(sa) => (sa.ip().to_string(), sa.port()),
-        ServerAddr::DomainName(host, port) => (host.clone(), *port),
+    // Hand the chain the DoH-resolved bracket-safe host (not the entry's
+    // unresolved hostname), so garter recombines a valid `host:port`.
+    let server_port = match svr_cfg.addr() {
+        ServerAddr::SocketAddr(sa) => sa.port(),
+        ServerAddr::DomainName(_host, port) => *port,
     };
 
     // `None` for state_dir: test-server probes are one-shot and die with
@@ -250,7 +270,7 @@ async fn maybe_start_plugin(
         plugin_name,
         &plugin_path,
         entry.plugin_opts.as_deref(),
-        &server_host,
+        server_host,
         server_port,
         None,
         false,
