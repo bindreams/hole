@@ -275,3 +275,16 @@ fn full_mode_pure_vpn_ignores_configured_ports() {
     let ss_config = build_ss_config(&cfg, None, Some(54321)).unwrap();
     assert_eq!(ss_config.local.len(), 1);
 }
+
+#[skuld::test]
+fn doh_bootstrap_display_is_pii_free_and_clear() {
+    use crate::dns::bootstrap::BootstrapError;
+    let e = ProxyError::DohBootstrap(BootstrapError::NoAnswer);
+    let s = e.to_string();
+    assert!(s.contains("secure DNS"), "user-facing wording: {s}");
+    // PII-free by construction: no host, no filesystem path.
+    assert!(
+        !s.contains('/') && !s.contains('\\'),
+        "no filesystem path in toast text: {s}"
+    );
+}

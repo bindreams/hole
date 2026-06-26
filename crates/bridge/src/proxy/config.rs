@@ -32,6 +32,12 @@ pub enum ProxyError {
     Gateway(String),
     #[error("DNS resolution failed for {host}: {source}")]
     DnsResolution { host: String, source: std::io::Error },
+    /// Private DoH bootstrap could not resolve the proxy server's hostname and
+    /// `dns.allow_insecure_bootstrap` is off. PII-free `Display` (the wrapped
+    /// error names neither host nor path) so it is safe to surface verbatim to
+    /// the start-error toast; the hostname is logged at the resolve call site.
+    #[error("{0}")]
+    DohBootstrap(#[from] crate::dns::bootstrap::BootstrapError),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
     #[error("proxy already running")]
