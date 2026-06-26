@@ -6,8 +6,11 @@
 //! real connectivity I/O. The QUIC interop tests that depend on the preflight
 //! skip run on Windows too.
 
-use super::server_endpoint_is_udp;
+use super::{preflight, server_endpoint_is_udp};
 use hole_common::config::ServerEntry;
+use hole_common::protocol::ServerTestOutcome;
+use std::net::SocketAddr;
+use std::time::Duration;
 
 /// A `ServerEntry` with only `plugin` / `plugin_opts` set to the values under
 /// test; every other field is an irrelevant placeholder.
@@ -52,4 +55,44 @@ fn non_quic_endpoint_is_tcp() {
         Some("v2ray-plugin"),
         Some("servermode=quic"),
     )));
+}
+
+// preflight ===========================================================================================================
+//
+// `preflight` takes a resolved `SocketAddr` (DoH already resolved the
+// hostname), so it does no DNS and connects to the raw IP. This is the
+// platform-independent guard for the IPv6 bug: a bracketed-string target would
+// fail `IpAddr::parse` and be mistreated as a hostname.
+
+use crate::test_support::rt;
+use tokio::net::TcpListener;
+
+#[skuld::test]
+fn preflight_connects_to_raw_ipv6_socketaddr() {
+    rt().block_on(async {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        assert!(addr.is_ipv6(), "listener bound to IPv6 loopback");
+        let res = preflight(addr, Duration::from_millis(500)).await;
+        assert!(
+            res.is_ok(),
+            "preflight to a live raw [::1] target must succeed, got {res:?}"
+        );
+    });
+}
+
+#[skuld::test]
+fn preflight_reports_tcp_failure_for_closed_ipv6_port() {
+    rt().block_on(async {
+        // [::1]:1 is a closed IPv6 loopback port — refused or timed out, never DnsFailed.
+        let addr: SocketAddr = "[::1]:1".parse().unwrap();
+        let res = preflight(addr, Duration::from_millis(500)).await;
+        assert!(
+            matches!(
+                res,
+                Err(ServerTestOutcome::TcpRefused) | Err(ServerTestOutcome::TcpTimeout)
+            ),
+            "closed IPv6 port must surface a TCP failure, got {res:?}"
+        );
+    });
 }

@@ -20,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -98,8 +98,8 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // Resolve the server hostname over PRIVATE DoH (never the OS resolver),
     // mirroring `start_inner`. Fail-closed unless `dns.allow_insecure_bootstrap`
     // → on failure return the existing `DnsFailed` outcome (host logged here,
-    // not surfaced). Preflight + plugin handoff use the bracket-safe IP, so the
-    // preflight's own `lookup_host` sees an IP literal and short-circuits.
+    // not surfaced). Preflight connects to the raw resolved IP; only the plugin
+    // handoff uses the bracket-safe `handoff_host` string.
     let resolved = {
         #[cfg(test)]
         {
@@ -129,7 +129,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // QUIC server. See bindreams/hole#421.
     if server_endpoint_is_udp(entry) {
         debug!("server_test: skipping TCP preflight for UDP (quic) server endpoint");
-    } else if let Err(out) = preflight(&server_host, entry.server_port, cfg.preflight_timeout).await {
+    } else if let Err(out) = preflight(SocketAddr::new(server_ip, entry.server_port), cfg.preflight_timeout).await {
         return out;
     }
 
@@ -220,25 +220,13 @@ fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
         })
 }
 
-/// DNS-resolve (when needed) and raw-TCP-connect to `host:port`. Returns
-/// `Err(outcome)` with a granular reason on failure, or `Ok(())` on a
-/// successful connect (the stream is dropped immediately — only the connect
-/// matters).
-async fn preflight(host: &str, port: u16, timeout_dur: Duration) -> Result<(), ServerTestOutcome> {
-    if host.parse::<IpAddr>().is_err() {
-        // Domain name → resolve first so we can distinguish DNS failure from
-        // TCP failure.
-        match lookup_host((host, port)).await {
-            Ok(mut iter) => {
-                if iter.next().is_none() {
-                    return Err(ServerTestOutcome::DnsFailed);
-                }
-            }
-            Err(_) => return Err(ServerTestOutcome::DnsFailed),
-        }
-    }
-
-    match timeout(timeout_dur, TcpStream::connect((host, port))).await {
+/// Raw-TCP-connect to the DoH-resolved `addr`. Returns `Err(outcome)` with a
+/// granular reason on failure, or `Ok(())` on a successful connect (the stream
+/// is dropped immediately — only the connect matters). DNS is already done by
+/// the bootstrap resolver, so this connects to the raw IP (no name lookup,
+/// no bracket parsing).
+async fn preflight(addr: SocketAddr, timeout_dur: Duration) -> Result<(), ServerTestOutcome> {
+    match timeout(timeout_dur, TcpStream::connect(addr)).await {
         Err(_) => Err(ServerTestOutcome::TcpTimeout),
         Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => Err(ServerTestOutcome::TcpRefused),
         Ok(Err(_)) => Err(ServerTestOutcome::TcpTimeout),
@@ -287,9 +275,14 @@ async fn maybe_start_plugin(
 
     // Hand the chain the DoH-resolved bracket-safe host (not the entry's
     // unresolved hostname), so garter recombines a valid `host:port`.
+    // `build_server_config` always emits a `SocketAddr`, so the port is
+    // guaranteed present here.
     let server_port = match svr_cfg.addr() {
         ServerAddr::SocketAddr(sa) => sa.port(),
-        ServerAddr::DomainName(_host, port) => *port,
+        ServerAddr::DomainName(_host, port) => {
+            debug_assert!(false, "build_server_config always emits SocketAddr, got DomainName");
+            *port
+        }
     };
 
     // `None` for state_dir: test-server probes are one-shot and die with
