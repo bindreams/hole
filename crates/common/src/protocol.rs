@@ -369,7 +369,7 @@ pub struct UpdateApplyRequest {
 
 /// Default bridge socket path.
 pub fn default_bridge_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
         PathBuf::from("/var/run/hole-bridge.sock")
     }
