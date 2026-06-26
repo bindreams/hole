@@ -46,7 +46,7 @@ pub struct TestConfig {
     /// Test-only DoH querier override. When present, `run_server_test` resolves
     /// via `resolve_via_doh_with` instead of the production `resolve_via_doh`,
     /// so a test can drive the full preflight path with no OS resolver or
-    /// network. Compiled out of production.
+    /// network.
     #[cfg(test)]
     pub bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
 }
