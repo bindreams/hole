@@ -56,7 +56,12 @@ pub(crate) fn classify_transport(plugin: Option<&str>, plugin_opts: Option<&str>
     let opts = plugin_opts.map(garter::parse_plugin_options).unwrap_or_default();
     let get = |k: &str| opts.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
     let has = |k: &str| opts.iter().any(|(kk, _)| kk == k);
-    let sni = get("host").unwrap_or_else(|| server_host.to_string());
+    // SNI / Host for the probe's first-flight is the connect target (the
+    // DoH-resolved IP — IP-SNI), NEVER the `host=` opt (the real proxy domain).
+    // A failure-only diagnostic must not emit the domain in cleartext, and the
+    // real tunnel hides it via ECH, so a domain-SNI probe would test a path the
+    // client never uses.
+    let sni = server_host.to_string();
     if get("mode").as_deref() == Some("quic") {
         return ProbeTransport::Quic { sni };
     }
