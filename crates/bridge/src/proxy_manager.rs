@@ -680,7 +680,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             crate::proxy::validate_proxy_config(config)?;
             None
         } else {
-            Some(build_ss_config(config, plugin_local, None)?)
+            Some(build_ss_config(config, plugin_local, server_ip, None)?)
         };
 
         // SocksOnly mode: skip everything routing-related (wintun preload,
@@ -807,8 +807,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port_alloc::Protocols::TCP | port_alloc::Protocols::UDP,
                 |port| async move {
-                    let ss_config =
-                        build_ss_config(config, plugin_local, Some(port)).map_err(proxy_start_err_to_io_err)?;
+                    let ss_config = build_ss_config(config, plugin_local, server_ip, Some(port))
+                        .map_err(proxy_start_err_to_io_err)?;
                     proxy.start(ss_config).await.map_err(proxy_start_err_to_io_err)
                 },
             );

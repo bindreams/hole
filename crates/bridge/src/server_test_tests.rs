@@ -531,3 +531,67 @@ fn preflight_path_uses_doh_resolved_ip() {
         );
     });
 }
+
+/// Drives the full `run_server_test` Phase-3 tunnel through the DoH seam for a
+/// BARE-SS (no-plugin) server with a NON-literal host. The real ss-server
+/// fixture is on loopback; only the stub resolves `tunnel.example` to it. A
+/// `Reachable` outcome proves the bare-SS connect dialed the DoH-resolved IP —
+/// if it regressed to the hostname, shadowsocks-rust would OS-resolve
+/// `tunnel.example` (RFC 6761 reserved, non-resolving) and the connect would
+/// fail, never reaching `Reachable`.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+fn bare_ss_tunnel_uses_doh_resolved_ip() {
+    use crate::dns::bootstrap::DohQuerier;
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    // Resolves the A query to the fixture's loopback IP (the production resolver
+    // prefers A, so answering only A is sufficient).
+    struct FixtureQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for FixtureQuerier {
+        async fn query(&self, _u: &str, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None;
+            }
+            let n = Name::from_ascii("tunnel.example.").ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
+            reply.to_vec().ok()
+        }
+    }
+
+    rt().block_on(async {
+        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
+        let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+        let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+
+        // NON-literal host: only the stub can resolve it, and only to the
+        // loopback fixture. The fixture's port is the SS port we dial.
+        let entry = entry("tunnel.example", svr_addr.port(), TEST_METHOD_STR, TEST_PASSWORD);
+        let cfg = TestConfig {
+            dns: DnsConfig {
+                enabled: true,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            },
+            bootstrap_querier: Some(Arc::new(FixtureQuerier)),
+            ..fast_test_config(sentinel_a, sentinel_b)
+        };
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        match outcome {
+            ServerTestOutcome::Reachable { latency_ms } => {
+                assert!(latency_ms >= 1, "latency_ms must be clamped to >= 1");
+            }
+            other => panic!("bare-SS tunnel must dial the DoH-resolved IP and reach the fixture, got {other:?}"),
+        }
+    });
+}

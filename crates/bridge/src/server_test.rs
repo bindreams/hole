@@ -133,7 +133,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         return out;
     }
 
-    let mut svr_cfg = match build_server_config(entry) {
+    let mut svr_cfg = match build_server_config(entry, server_ip) {
         Ok(c) => c,
         Err(detail) => return ServerTestOutcome::InternalError { detail },
     };
@@ -246,16 +246,18 @@ async fn preflight(host: &str, port: u16, timeout_dur: Duration) -> Result<(), S
     }
 }
 
-/// Build a [`ServerConfig`] from a [`ServerEntry`]. The plugin (if any) is
-/// **not** set here — that happens in [`maybe_start_plugin`] after the plugin
-/// has bound a local port.
-fn build_server_config(entry: &ServerEntry) -> Result<ServerConfig, String> {
+/// Build a [`ServerConfig`] from a [`ServerEntry`], dialing the DoH-resolved
+/// `server_ip` (not the hostname) so the bare-SS connect never OS-resolves the
+/// proxy domain. The plugin (if any) is **not** set here — that happens in
+/// [`maybe_start_plugin`], which overrides the address to the plugin's local
+/// port after the plugin has bound it.
+fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerConfig, String> {
     let cipher: CipherKind = entry
         .method
         .parse()
         .map_err(|_| format!("unsupported cipher: {}", entry.method))?;
     ServerConfig::new(
-        (entry.server.as_str(), entry.server_port),
+        ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
         entry.password.clone(),
         cipher,
     )

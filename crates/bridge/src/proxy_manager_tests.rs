@@ -1810,6 +1810,41 @@ fn full_start_resolves_server_ip_via_doh_and_routes_with_it() {
 }
 
 #[skuld::test]
+fn bare_ss_dials_doh_resolved_ip_not_hostname() {
+    // Bare SS (no plugin) with a HOSTNAME server: the shadowsocks ServerConfig
+    // handed to proxy.start must carry the DoH-resolved IP, not the hostname —
+    // otherwise shadowsocks-rust OS-resolves the proxy domain at connect time
+    // and re-leaks it.
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        pm.start(&config).await.unwrap();
+
+        {
+            let guard = proxy_state.last_config.lock().unwrap();
+            let ss_config = guard.as_ref().expect("proxy.start captured a config");
+            match ss_config.server[0].config.addr() {
+                shadowsocks::config::ServerAddr::SocketAddr(addr) => {
+                    assert_eq!(addr.ip(), expected, "bare-SS endpoint must be the resolved IP");
+                    assert_eq!(addr.port(), config.server.server_port);
+                }
+                other => panic!("bare-SS endpoint must be the resolved IP socket, got {other:?}"),
+            }
+        }
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
 fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
     // SocksOnly returns early (no routing), but the plugin-chain handoff still
     // needs the DoH-resolved IP. The plugin binary is nonexistent so the chain
