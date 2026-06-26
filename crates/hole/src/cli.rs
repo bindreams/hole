@@ -921,7 +921,10 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
-            match send_bridge_request_inner(BridgeRequest::TestServer { entry }) {
+            // The dev/admin CLI reads only a ServerEntry file — no AppConfig in
+            // hand — so it bootstraps over the default DoH resolver.
+            let dns = hole_common::config::DnsConfig::default();
+            match send_bridge_request_inner(BridgeRequest::TestServer { entry, dns }) {
                 Ok(BridgeResponse::TestServerResult { outcome }) => {
                     println!("{outcome:#?}");
                     // Reachable is the only "success" outcome; everything else

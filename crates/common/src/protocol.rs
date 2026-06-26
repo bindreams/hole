@@ -58,6 +58,10 @@ pub enum BridgeRequest {
     Diagnostics,
     TestServer {
         entry: ServerEntry,
+        /// The user's current DNS resolver config, so the bridge bootstraps the
+        /// server hostname over the same private DoH a real connect uses (never
+        /// the OS resolver).
+        dns: crate::config::DnsConfig,
     },
     /// Set the standing kill switch intent (last-writer-wins). Maps to
     /// `POST /v1/lockdown`.

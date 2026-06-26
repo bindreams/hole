@@ -202,12 +202,8 @@ impl BridgeClient {
                     parse_bridge_error(resp).await
                 }
             }
-            BridgeRequest::TestServer { entry } => {
-                // dns defaults until the GUI threads the user's configured resolver through TestServer.
-                let req_body = TestServerRequest {
-                    entry,
-                    dns: hole_common::config::DnsConfig::default(),
-                };
+            BridgeRequest::TestServer { entry, dns } => {
+                let req_body = TestServerRequest { entry, dns };
                 let body = serde_json::to_vec(&req_body).map_err(|e| ClientError::Protocol(e.to_string()))?;
                 let resp = self.http_post(ROUTE_TEST_SERVER, body, None).await?;
                 if resp.status().is_success() {
