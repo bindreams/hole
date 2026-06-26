@@ -928,9 +928,11 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
   the #248 diagnostic), `close_kind`, and `tap_conn_id`. On self-test failure the
   bridge emits a breadcrumb to the tap lines (#388). Costs a loopback round-trip
   per byte + a line per connection — not for default operation under load.
-- **Plugin debug logging (always on)** — `inject_plugin_debug_logging` appends
-  `loglevel=debug` to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`; stderr is
-  captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`.
+- **Plugin directive injection** — `inject_plugin_directives` appends
+  `loglevel=debug` (always) and `ech-doh=<resolver-DoH-url>` (when a resolver is
+  configured) to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`/`galoshes`;
+  stderr is captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`. The
+  bridge never injects `ech=<mode>` — ex-ray owns the mode (default `auto`).
 
 ## CLI (dev/admin commands)
 

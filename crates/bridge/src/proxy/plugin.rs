@@ -121,9 +121,7 @@ pub async fn start_plugin_chain(
     cancel: &CancellationToken,
     ech_doh_url: Option<&str>,
 ) -> Result<PluginChain, ProxyError> {
-    // Inject Hole-owned SIP003 directives (`loglevel=debug` always, plus
-    // `ech-doh=<url>` when set) into the plugin's SS_PLUGIN_OPTIONS — see
-    // `inject_plugin_directives`. Unknown plugins pass through unchanged.
+    // Inject Hole-owned SIP003 directives — see `inject_plugin_directives`.
     let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh_url);
     // Resolve the config name to its on-disk binary name before sizing the
     // handoff port — `plugin_alloc_protocols` is keyed by binary name so
@@ -418,8 +416,7 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
 ///   been the recurring blocker on #248-class tunnel issues.
 /// - `ech-doh=<url>` (when `ech_doh_url` is set): the DoH server ex-ray's ECH
 ///   path fetches the ECHConfigList from. The bridge never injects `ech=<mode>`
-///   — ex-ray owns the mode (default `auto`). A `None` url appends no `ech-doh`,
-///   so ECH never activates (the empty-`ech-doh` matrix row).
+///   — ex-ray owns the mode (default `auto`).
 ///
 /// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
 /// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,

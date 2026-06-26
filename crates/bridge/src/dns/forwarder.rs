@@ -266,8 +266,8 @@ pub struct DnsForwarder {
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
     /// Test-only upstream-port override so the cross-module
     /// `bootstrap::test_loopback_querier` e2e can reach an ephemeral DoH
-    /// listener (the `forward_on_port` helper is private to `forwarder_tests`).
-    /// Behind `#[cfg(test)]` so production `forward` stays byte-identical.
+    /// listener. Behind `#[cfg(test)]` so production `forward` stays
+    /// byte-identical.
     #[cfg(test)]
     forced_port: Option<u16>,
 }
