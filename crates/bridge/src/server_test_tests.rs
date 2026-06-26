@@ -84,9 +84,8 @@ fn fixture_starts_real_ss_server() {
 /// Used by the pre-flight tests, where the test never reaches Phase 3.
 ///
 /// Empty `servers` + `allow_insecure_bootstrap = true`: the DoH loop has no
-/// resolver to try, so the bootstrap skips straight to the OS resolver — the
-/// resolution path the preflight diagnosis assumed before the bootstrap was
-/// wired in. No live DoH endpoint is contacted.
+/// resolver to try, so the bootstrap skips straight to the OS resolver. No live
+/// DoH endpoint is contacted.
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {

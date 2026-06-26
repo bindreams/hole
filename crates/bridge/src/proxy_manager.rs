@@ -216,7 +216,7 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     state_dir: Option<std::path::PathBuf>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
-    /// instead of the production `resolve_via_doh`. Compiled out of production.
+    /// instead of the production `resolve_via_doh`.
     #[cfg(test)]
     bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
 }
@@ -252,7 +252,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Test seam: override the DoH bootstrap querier so `start_inner` resolves
     /// the server hostname via `resolve_via_doh_with` (no OS resolver, no
-    /// network). Compiled out of production.
+    /// network).
     #[cfg(test)]
     pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
         self.bootstrap_querier = Some(q);
@@ -617,8 +617,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the configured `dns.servers` — never the OS resolver — for EVERY
         // start (SocksOnly + Full), independent of `dns.enabled`. Fail-closed
         // unless `dns.allow_insecure_bootstrap`. The hostname stays the SNI
-        // name; only the route + plugin handoff use the IP. The host is logged
-        // HERE (not in the error) so the PII-free `DohBootstrap` toast omits it.
+        // name; only the route + plugin handoff use the IP. Host logged here,
+        // not in the error, so the PII-free `DohBootstrap` toast omits it.
         let server_ip = {
             let res = match &bootstrap_querier {
                 Some(q) => {
@@ -639,7 +639,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 plugin_name,
                 &plugin_path,
                 config.server.plugin_opts.as_deref(),
-                &server_host, // bracket-safe IP literal → garter recombines correctly
+                &server_host,
                 config.server.server_port,
                 state_dir,
                 config.diagnostic_plugin_tap,
