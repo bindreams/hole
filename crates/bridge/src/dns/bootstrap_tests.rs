@@ -200,3 +200,29 @@ async fn resolve_returns_literal_ip_unchanged_without_querying() {
     assert_eq!(ip, "198.51.100.9".parse::<IpAddr>().unwrap());
     assert!(q.asked.lock().unwrap().is_empty(), "a literal IP must not query DoH");
 }
+
+// handoff_host ========================================================================================================
+
+use std::net::SocketAddr;
+
+use super::handoff_host;
+
+#[skuld::test]
+fn handoff_host_v4_is_plain() {
+    let ip: IpAddr = "203.0.113.7".parse().unwrap();
+    assert_eq!(handoff_host(ip), "203.0.113.7");
+    // garter's `format!("{host}:{port}")` must parse.
+    assert!(format!("{}:443", handoff_host(ip)).parse::<SocketAddr>().is_ok());
+}
+
+#[skuld::test]
+fn handoff_host_v6_is_bracketed_and_parses_with_port() {
+    let v6 = Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946);
+    let ip = IpAddr::V6(v6);
+    assert_eq!(handoff_host(ip), format!("[{v6}]"));
+    // The exact string garter builds (chain.rs:227) MUST be a valid SocketAddr;
+    // a bare (unbracketed) v6 + ":443" would NOT parse.
+    let combined = format!("{}:443", handoff_host(ip));
+    let sa: SocketAddr = combined.parse().expect("bracketed v6 host:port parses");
+    assert_eq!(sa, SocketAddr::new(ip, 443));
+}

@@ -166,6 +166,17 @@ pub async fn resolve_via_doh_with(
         .ok_or(BootstrapError::NoAnswer)
 }
 
+/// Format a resolved IP as the `server_host` handed to the plugin chain /
+/// bypass. garter recombines it as `format!("{host}:{port}")`
+/// (chain.rs:227), so an IPv6 literal MUST be bracketed or the recombined
+/// string is an unparseable `addr:port`. V4 is returned plain.
+pub fn handoff_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]
 mod bootstrap_tests;
