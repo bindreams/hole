@@ -50,8 +50,7 @@ fn classify_no_plugin_is_raw() {
 }
 #[skuld::test(name = "reachability_tests::classify_tls_ws_sni_is_connect_host_not_opt")]
 fn classify_tls_ws_sni_is_connect_host_not_opt() {
-    // The probe's SNI is the connect host, NEVER the `host=` opt — the
-    // failure-only diagnostic must not emit the proxy domain in cleartext.
+    // A failure-only diagnostic must not emit the proxy domain in cleartext.
     match classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv") {
         ProbeTransport::TlsWs { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
@@ -72,8 +71,7 @@ fn classify_plain_ws_defaults_path_and_host() {
 }
 #[skuld::test(name = "reachability_tests::classify_quic_forces_quic")]
 fn classify_quic_forces_quic() {
-    // `mode=quic` forces the Quic transport; its SNI is the connect host, not
-    // the `host=` opt (same no-domain-leak rule as the TLS-WS probe).
+    // Same no-domain-leak rule as the TLS-WS probe.
     match classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv") {
         ProbeTransport::Quic { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
