@@ -22,6 +22,7 @@ async fn start_with_nonexistent_binary_returns_plugin_error() {
         None,
         false,
         &cancel,
+        None,
     )
     .await;
 

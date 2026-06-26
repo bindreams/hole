@@ -295,6 +295,9 @@ async fn maybe_start_plugin(
     #[allow(clippy::disallowed_methods)]
     // One-shot CLI probe: no caller-side cancel exists. See clippy.toml CancellationToken::new rule.
     let chain_cancel = CancellationToken::new();
+    // ech-doh = the first configured resolver's DoH URL, matching the bootstrap
+    // path; empty `dns.servers` ⇒ no ech-doh ⇒ ECH off.
+    let ech_doh = cfg.dns.servers.first().map(|ip| hole_common::doh_url(*ip));
     let chain = crate::proxy::plugin::start_plugin_chain(
         plugin_name,
         &plugin_path,
@@ -304,6 +307,7 @@ async fn maybe_start_plugin(
         None,
         false,
         &chain_cancel,
+        ech_doh.as_deref(),
     )
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
