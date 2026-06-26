@@ -175,6 +175,33 @@ pub fn handoff_host(ip: IpAddr) -> String {
     }
 }
 
+/// Test-only querier mirroring [`ForwarderQuerier`] but built on the forwarder's
+/// extra-root TLS seam + a fixed upstream port, so the loopback-TLS e2e drives
+/// the REAL `forward_https` + `DirectConnector` + rustls path against an
+/// in-test DoH listener with a self-signed cert.
+#[cfg(test)]
+pub(crate) fn test_loopback_querier(cert: rustls_pki_types::CertificateDer<'static>, port: u16) -> Arc<dyn DohQuerier> {
+    struct LoopbackForwarderQuerier {
+        cert: rustls_pki_types::CertificateDer<'static>,
+        port: u16,
+    }
+    #[async_trait]
+    impl DohQuerier for LoopbackForwarderQuerier {
+        async fn query(&self, _doh_url: &str, server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            let cfg = DnsConfig {
+                enabled: true,
+                servers: vec![server],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            };
+            let fwd =
+                DnsForwarder::new_with_extra_root(cfg, Arc::new(DirectConnector), true, self.cert.clone(), self.port);
+            Some(fwd.forward(wire).await)
+        }
+    }
+    Arc::new(LoopbackForwarderQuerier { cert, port })
+}
+
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]
 mod bootstrap_tests;

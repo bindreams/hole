@@ -264,6 +264,12 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
+    /// Test-only upstream-port override so the cross-module
+    /// `bootstrap::test_loopback_querier` e2e can reach an ephemeral DoH
+    /// listener (the `forward_on_port` helper is private to `forwarder_tests`).
+    /// Behind `#[cfg(test)]` so production `forward` stays byte-identical.
+    #[cfg(test)]
+    forced_port: Option<u16>,
 }
 
 impl DnsForwarder {
@@ -279,6 +285,8 @@ impl DnsForwarder {
             ipv6_bypass_available,
             failure_throttle: Mutex::new(HashMap::new()),
             ipv6_skip_logged: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            forced_port: None,
         }
     }
 
@@ -296,7 +304,17 @@ impl DnsForwarder {
                 continue;
             }
 
-            let target = SocketAddr::new(server, default_port(self.config.protocol));
+            let port = {
+                #[cfg(test)]
+                {
+                    self.forced_port.unwrap_or_else(|| default_port(self.config.protocol))
+                }
+                #[cfg(not(test))]
+                {
+                    default_port(self.config.protocol)
+                }
+            };
+            let target = SocketAddr::new(server, port);
             match self.forward_one(target, query).await {
                 Ok(reply) => return reply,
                 Err(e) => self.log_upstream_failure(server, &e),
@@ -654,6 +672,42 @@ fn build_tls_config() -> ClientConfig {
     // lists — http/1.1 is universally accepted.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config
+}
+
+/// Test-only TLS config: production `webpki_roots` plus one extra trust root,
+/// so the loopback-TLS DoH e2e can verify a self-signed leaf. Compiled out of
+/// production — the real `build_tls_config` verifier is never weakened.
+#[cfg(test)]
+pub(crate) fn build_tls_config_with_extra_root(extra: rustls_pki_types::CertificateDer<'static>) -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots.add(extra).expect("test extra root is a valid cert");
+    let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
+#[cfg(test)]
+impl DnsForwarder {
+    /// Test-only forwarder trusting one extra root, with a fixed upstream port
+    /// so the loopback e2e can target an ephemeral DoH listener. Compiled out
+    /// of production — never weakens the real `webpki_roots` verifier.
+    pub(crate) fn new_with_extra_root(
+        config: DnsConfig,
+        connector: Arc<dyn UpstreamConnector>,
+        ipv6_bypass_available: bool,
+        extra_root: rustls_pki_types::CertificateDer<'static>,
+        forced_port: u16,
+    ) -> Self {
+        let mut s = Self::new(config, connector, ipv6_bypass_available);
+        s.tls_config = Arc::new(build_tls_config_with_extra_root(extra_root));
+        s.forced_port = Some(forced_port);
+        s
+    }
 }
 
 /// Parse a minimal HTTP/1.1 response: `HTTP/1.1 200 ...\r\n` + headers +

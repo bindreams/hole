@@ -3027,6 +3027,7 @@ dependencies = [
  "plist",
  "plugin-e2e",
  "rand 0.10.1",
+ "rcgen",
  "regex",
  "rustls",
  "rustls-pki-types",

@@ -241,3 +241,79 @@ fn handoff_host_v6_is_bracketed_and_parses_with_port() {
     let sa: SocketAddr = combined.parse().expect("bracketed v6 host:port parses");
     assert_eq!(sa, SocketAddr::new(ip, 443));
 }
+
+// Loopback-TLS e2e ====================================================================================================
+
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+/// Stand up a loopback rustls DoH server on 127.0.0.2:<ephemeral> that serves
+/// one canned `application/dns-message` reply, returning the server's cert DER
+/// (for the client trust root) and the bound port. The cert carries an IP SAN
+/// for 127.0.0.2 because `https_target_for` uses IP-SNI for non-table IPs.
+async fn spawn_loopback_doh(reply: Vec<u8>) -> (CertificateDer<'static>, u16) {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    use std::net::Ipv4Addr;
+    use tokio_rustls::TlsAcceptor;
+
+    let san_ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    let mut params = CertificateParams::new(vec![]).unwrap();
+    params.subject_alt_names = vec![SanType::IpAddress(san_ip)];
+    let key = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+
+    let server_cfg =
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+    let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = listener.accept().await {
+            if let Ok(mut tls) = acceptor.accept(tcp).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Drain the POST request (best-effort) then write the HTTP reply.
+                let mut buf = [0u8; 4096];
+                let _ = tls.read(&mut buf).await;
+                let body = reply;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls.write_all(head.as_bytes()).await;
+                let _ = tls.write_all(&body).await;
+                // Graceful TLS shutdown sends `close_notify`; without it rustls's
+                // `read_to_end` on the client errors on the unclean EOF, as a real
+                // DoH server (which closes cleanly) never would.
+                let _ = tls.shutdown().await;
+            }
+        }
+    });
+    (cert_der, port)
+}
+
+#[skuld::test]
+async fn resolve_via_doh_e2e_through_real_forwarder() {
+    let expected = Ipv4Addr::new(203, 0, 113, 42);
+    let reply = a_reply_for("proxy.example", expected);
+    let (cert_der, port) = spawn_loopback_doh(reply).await;
+
+    // Production path: ForwarderQuerier-equivalent built with the test root +
+    // a port override so the DirectConnector reaches the loopback listener.
+    let resolver: IpAddr = "127.0.0.2".parse().unwrap();
+    let ip = super::resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        super::test_loopback_querier(cert_der, port),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ip, IpAddr::V4(expected));
+}
