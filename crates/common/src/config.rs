@@ -377,10 +377,8 @@ fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-// Windows (and any non-macOS host): a plain recursive create. Hole only *runs* on
-// Windows and macOS, but the crate stays compilable everywhere so cross-platform
-// tooling (e.g. `xtask`) can reuse its platform-agnostic protocol types without
-// dragging in OS-specific config I/O.
+// Generic arm so the crate compiles on Linux, where `xtask` reuses the protocol
+// types/consts. Hole itself only runs on Windows + macOS.
 #[cfg(not(target_os = "macos"))]
 fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir { source })
