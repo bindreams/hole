@@ -115,8 +115,7 @@ pub async fn resolve_via_doh_with(
     dns: &DnsConfig,
     querier: Arc<dyn DohQuerier>,
 ) -> Result<IpAddr, BootstrapError> {
-    // A literal IP needs no resolution — return as-is (the start-path
-    // happy-path tests use IP literals and take this fast path).
+    // A literal IP needs no resolution — return as-is.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(ip);
     }

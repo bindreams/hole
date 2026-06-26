@@ -29,7 +29,7 @@ const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: cl
 
 /// Tunable parameters. Production code constructs [`TestConfig::production`].
 /// Tests construct a custom one with shorter timeouts and dynamic sentinels.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TestConfig {
     pub preflight_timeout: Duration,
     pub ss_connect_timeout: Duration,
@@ -43,6 +43,25 @@ pub struct TestConfig {
     pub plugin_path_override: Option<String>,
     /// User's resolver config for the private-DoH server bootstrap.
     pub dns: hole_common::config::DnsConfig,
+    /// Test-only DoH querier override. When present, `run_server_test` resolves
+    /// via `resolve_via_doh_with` instead of the production `resolve_via_doh`,
+    /// so a test can drive the full preflight path with no OS resolver or
+    /// network. Compiled out of production.
+    #[cfg(test)]
+    pub bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+}
+
+impl std::fmt::Debug for TestConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestConfig")
+            .field("preflight_timeout", &self.preflight_timeout)
+            .field("ss_connect_timeout", &self.ss_connect_timeout)
+            .field("sentinel_read_timeout", &self.sentinel_read_timeout)
+            .field("sentinels", &self.sentinels)
+            .field("plugin_path_override", &self.plugin_path_override)
+            .field("dns", &self.dns)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TestConfig {
@@ -54,6 +73,8 @@ impl TestConfig {
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],
             plugin_path_override: None,
             dns: hole_common::config::DnsConfig::default(),
+            #[cfg(test)]
+            bootstrap_querier: None,
         }
     }
 }
@@ -79,7 +100,20 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     // → on failure return the existing `DnsFailed` outcome (host logged here,
     // not surfaced). Preflight + plugin handoff use the bracket-safe IP, so the
     // preflight's own `lookup_host` sees an IP literal and short-circuits.
-    let server_ip = match crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await {
+    let resolved = {
+        #[cfg(test)]
+        {
+            match &cfg.bootstrap_querier {
+                Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&entry.server, &cfg.dns, q.clone()).await,
+                None => crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await
+        }
+    };
+    let server_ip = match resolved {
         Ok(ip) => ip,
         Err(e) => {
             tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");

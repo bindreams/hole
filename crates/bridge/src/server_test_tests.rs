@@ -50,6 +50,7 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
         plugin_path_override: None,
         dns: hole_common::config::DnsConfig::default(),
+        bootstrap_querier: None,
     }
 }
 
@@ -82,10 +83,10 @@ fn fixture_starts_real_ss_server() {
 /// Build a [`TestConfig`] pointing at a single bogus IP for both sentinels.
 /// Used by the pre-flight tests, where the test never reaches Phase 3.
 ///
-/// `allow_insecure_bootstrap = true`: these preflight tests use IP-literal or
-/// `.invalid` hosts, so the DoH bootstrap falls through to the OS resolver
-/// rather than calling a live Cloudflare DoH endpoint — the resolution path
-/// the preflight diagnosis already assumed before the bootstrap was wired in.
+/// Empty `servers` + `allow_insecure_bootstrap = true`: the DoH loop has no
+/// resolver to try, so the bootstrap skips straight to the OS resolver — the
+/// resolution path the preflight diagnosis assumed before the bootstrap was
+/// wired in. No live DoH endpoint is contacted.
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
@@ -95,9 +96,11 @@ fn preflight_only_config() -> TestConfig {
         sentinels: [bogus.to_string(), bogus.to_string()],
         plugin_path_override: None,
         dns: hole_common::config::DnsConfig {
+            servers: Vec::new(),
             allow_insecure_bootstrap: true,
             ..hole_common::config::DnsConfig::default()
         },
+        bootstrap_querier: None,
     }
 }
 
@@ -459,15 +462,22 @@ fn run_test_returns_tcp_timeout_for_blackhole() {
     });
 }
 
+/// Drives the full `run_server_test` resolve→preflight path through the DoH
+/// querier seam. `entry.server` is a NON-literal host that only the stub can
+/// resolve (to loopback). A live loopback listener on `entry.server_port` makes
+/// preflight's TCP connect succeed — but ONLY if `run_server_test` connects to
+/// the DoH-resolved IP. If the wiring regressed to the unresolved hostname,
+/// preflight's `lookup_host("preflight.example")` would fail → `DnsFailed`, so
+/// any non-`DnsFailed`/non-`Tcp*` outcome proves the resolved IP was used.
 #[skuld::test]
 fn preflight_path_uses_doh_resolved_ip() {
-    use crate::dns::bootstrap::{handoff_host, resolve_via_doh_with, DohQuerier};
+    use crate::dns::bootstrap::DohQuerier;
     use hole_common::config::{DnsConfig, DnsProtocol};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
-    // resolve_via_doh_with maps the host to loopback; a live listener on that
-    // loopback port makes the subsequent TCP connect in preflight succeed.
+    // Resolves any A query to loopback so preflight connects to the live
+    // listener; the stub keys on hostname (the production resolver prefers A).
     struct LoopbackQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for LoopbackQuerier {
@@ -488,21 +498,36 @@ fn preflight_path_uses_doh_resolved_ip() {
     }
 
     rt().block_on(async {
+        // Live loopback listener so the post-preflight TCP connect succeeds.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let dns = DnsConfig {
-            enabled: true,
-            servers: vec!["1.1.1.1".parse().unwrap()],
-            protocol: DnsProtocol::Https,
-            allow_insecure_bootstrap: false,
+
+        let entry = entry("preflight.example", port, TEST_METHOD_STR, TEST_PASSWORD);
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cfg = TestConfig {
+            preflight_timeout: Duration::from_millis(500),
+            ss_connect_timeout: Duration::from_millis(500),
+            sentinel_read_timeout: Duration::from_millis(500),
+            sentinels: [bogus.to_string(), bogus.to_string()],
+            plugin_path_override: None,
+            dns: DnsConfig {
+                enabled: true,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            },
+            bootstrap_querier: Some(Arc::new(LoopbackQuerier)),
         };
-        let ip = resolve_via_doh_with("preflight.example", &dns, Arc::new(LoopbackQuerier))
-            .await
-            .unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
-        // The host preflight connects to is the bracket-safe handoff host.
-        assert!(super::preflight(&handoff_host(ip), port, Duration::from_secs(2))
-            .await
-            .is_ok());
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        // Preflight reached + passed the DoH-resolved loopback IP; the listener
+        // is not a real ss-server, so Phase 3 fails — but NOT at DNS or preflight.
+        assert!(
+            !matches!(
+                outcome,
+                ServerTestOutcome::DnsFailed | ServerTestOutcome::TcpRefused | ServerTestOutcome::TcpTimeout
+            ),
+            "preflight must have connected to the DoH-resolved IP, got {outcome:?}"
+        );
     });
 }

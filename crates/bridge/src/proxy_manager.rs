@@ -755,8 +755,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(target_os = "windows")]
         tun_engine::device::wintun::ensure_loaded()?;
 
-        // `server_ip` was resolved above Phase 1 via private DoH.
-
         // Query the OS default gateway via the routing provider.
         let gw_info = routing.default_gateway()?;
 

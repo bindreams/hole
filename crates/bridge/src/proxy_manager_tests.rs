@@ -1773,7 +1773,7 @@ fn doh_config_with_server_host(host: &str, mode: TunnelMode) -> ProxyConfig {
         tunnel_mode: mode,
         filters: Vec::new(),
         dns: hole_common::config::DnsConfig {
-            enabled: false, // skip the forwarder self-test gate (#388)
+            enabled: false, // skip the forwarder self-test gate
             servers: vec!["1.1.1.1".parse().unwrap()],
             protocol: hole_common::config::DnsProtocol::Https,
             allow_insecure_bootstrap: false,

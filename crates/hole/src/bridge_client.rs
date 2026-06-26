@@ -203,8 +203,7 @@ impl BridgeClient {
                 }
             }
             BridgeRequest::TestServer { entry } => {
-                // Part A threads the user's real `dns` through `BridgeRequest::TestServer`;
-                // until then the default carries the always-on DoH bootstrap config.
+                // dns defaults until the GUI threads the user's configured resolver through TestServer.
                 let req_body = TestServerRequest {
                     entry,
                     dns: hole_common::config::DnsConfig::default(),
