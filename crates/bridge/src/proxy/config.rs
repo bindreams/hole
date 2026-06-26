@@ -30,8 +30,6 @@ pub enum ProxyError {
     Runtime(#[from] std::io::Error),
     #[error("gateway detection failed: {0}")]
     Gateway(String),
-    #[error("DNS resolution failed for {host}: {source}")]
-    DnsResolution { host: String, source: std::io::Error },
     /// Private DoH bootstrap could not resolve the proxy server's hostname and
     /// `dns.allow_insecure_bootstrap` is off. PII-free `Display` (the wrapped
     /// error names neither host nor path) so it is safe to surface verbatim to

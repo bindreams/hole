@@ -214,6 +214,11 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// State directory for plugin PID crash recovery. `None` in tests
     /// that don't need crash recovery tracking.
     state_dir: Option<std::path::PathBuf>,
+    /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
+    /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
+    /// instead of the production `resolve_via_doh`. Compiled out of production.
+    #[cfg(test)]
+    bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -240,7 +245,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             udp_proxy_available: true,
             ipv6_bypass_available: true,
             state_dir: None,
+            #[cfg(test)]
+            bootstrap_querier: None,
         }
+    }
+
+    /// Test seam: override the DoH bootstrap querier so `start_inner` resolves
+    /// the server hostname via `resolve_via_doh_with` (no OS resolver, no
+    /// network). Compiled out of production.
+    #[cfg(test)]
+    pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
+        self.bootstrap_querier = Some(q);
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -479,6 +494,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // "uncancellable sync phase" foot-gun where a future that
         // doesn't yield blocks the outer select! from observing cancel.
         debug!("awaiting start_inner");
+        #[cfg(test)]
+        let bootstrap_querier = self.bootstrap_querier.clone();
+        #[cfg(not(test))]
+        let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
+
         let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
             &self.proxy,
             &self.routing,
@@ -486,6 +506,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             config,
             self.state_dir.as_deref(),
             cancel,
+            bootstrap_querier,
         )
         .await;
 
@@ -584,12 +605,31 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         config: &ProxyConfig,
         state_dir: Option<&std::path::Path>,
         cancel: CancellationToken,
+        bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
         // Pre-flight: short-circuit a pre-cancelled token before any work.
         if cancel.is_cancelled() {
             return Err(ProxyError::Cancelled);
         }
+
+        // Resolve the proxy server's hostname to an IP over PRIVATE DoH using
+        // the configured `dns.servers` — never the OS resolver — for EVERY
+        // start (SocksOnly + Full), independent of `dns.enabled`. Fail-closed
+        // unless `dns.allow_insecure_bootstrap`. The hostname stays the SNI
+        // name; only the route + plugin handoff use the IP. The host is logged
+        // HERE (not in the error) so the PII-free `DohBootstrap` toast omits it.
+        let server_ip = {
+            let res = match &bootstrap_querier {
+                Some(q) => {
+                    crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await
+                }
+                None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
+            };
+            res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?
+        };
+        let server_host = crate::dns::bootstrap::handoff_host(server_ip);
+
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
@@ -599,7 +639,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 plugin_name,
                 &plugin_path,
                 config.server.plugin_opts.as_deref(),
-                &config.server.server,
+                &server_host, // bracket-safe IP literal → garter recombines correctly
                 config.server.server_port,
                 state_dir,
                 config.diagnostic_plugin_tap,
@@ -702,7 +742,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 routes: None,
                 lockdown: None,
                 proxy: running_proxy,
-                server_ip: None,
+                server_ip: Some(server_ip),
                 started_at: Instant::now(),
                 udp_proxy_available,
                 ipv6_bypass_available: false,
@@ -715,8 +755,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(target_os = "windows")]
         tun_engine::device::wintun::ensure_loaded()?;
 
-        // Resolve server hostname to IP.
-        let server_ip = resolve_server_ip(&config.server.server, config.server.server_port).await?;
+        // `server_ip` was resolved above Phase 1 via private DoH.
 
         // Query the OS default gateway via the routing provider.
         let gw_info = routing.default_gateway()?;
@@ -1104,35 +1143,6 @@ fn speed_bps(bytes: u64, elapsed: std::time::Duration) -> u64 {
     let bits = bytes as u128 * 8 * 1_000_000_000;
     let nanos = elapsed.as_nanos().max(1);
     u64::try_from(bits / nanos).unwrap_or(u64::MAX)
-}
-
-// DNS resolution ======================================================================================================
-
-async fn resolve_server_ip(host: &str, port: u16) -> Result<IpAddr, ProxyError> {
-    // Try parsing as IP address first (return as-is, including IPv6 literals)
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(ip);
-    }
-
-    // DNS lookup — prefer IPv4 to ensure bypass route compatibility with IPv4 gateway
-    let addrs: Vec<_> = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await
-        .map_err(|e| ProxyError::DnsResolution {
-            host: host.to_owned(),
-            source: e,
-        })?
-        .collect();
-
-    let addr = addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .ok_or_else(|| ProxyError::DnsResolution {
-            host: host.to_owned(),
-            source: std::io::Error::other("no addresses returned"),
-        })?;
-
-    Ok(addr.ip())
 }
 
 /// Stable human-readable label for a `TunnelMode` — used by

@@ -115,16 +115,14 @@ pub async fn resolve_via_doh_with(
     dns: &DnsConfig,
     querier: Arc<dyn DohQuerier>,
 ) -> Result<IpAddr, BootstrapError> {
-    // A literal IP needs no resolution — return as-is (matches
-    // `resolve_server_ip`'s fast path at proxy_manager.rs:1115).
+    // A literal IP needs no resolution — return as-is (the start-path
+    // happy-path tests use IP literals and take this fast path).
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(ip);
     }
 
-    // Fixed tx ids: DoH carries the query over an authenticated TLS channel to
-    // the configured resolver, so transport security — not the 16-bit id — is
-    // what defeats off-path spoofing. Distinct ids per qtype just keep the A
-    // and AAAA rounds independently identifiable.
+    // Fixed tx ids: DoH carries the query over an authenticated TLS channel, so
+    // transport security — not the 16-bit id — is what defeats off-path spoofing.
     let mut v6_fallback: Option<IpAddr> = None;
     for &server in &dns.servers {
         let url = hole_common::doh_url(server);

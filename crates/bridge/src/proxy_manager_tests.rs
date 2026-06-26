@@ -176,6 +176,9 @@ struct MockRoutingState {
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
     teardown_order: std::sync::Mutex<Vec<&'static str>>,
+    /// Last `server_ip` passed to `install`, so a test can assert the bypass
+    /// route received the DoH-resolved IP (not a system-resolved one).
+    last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
 impl Default for MockRoutingState {
@@ -191,6 +194,7 @@ impl Default for MockRoutingState {
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
+            last_install_server_ip: std::sync::Mutex::new(None),
         }
     }
 }
@@ -248,6 +252,7 @@ impl Routing for MockRouting {
         interface_name: &str,
     ) -> Result<MockRoutes, RoutingError> {
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
 
         // Match `SystemRouting::install`'s critical ordering: write the
         // state file BEFORE any route mutation (or in this case, before
@@ -405,6 +410,23 @@ fn new_manager(proxy: MockProxy) -> (ProxyManager<MockProxy, MockRouting>, tempf
     let routing = MockRouting::new(dir.path().to_path_buf());
     let pm = ProxyManager::new(proxy, routing);
     (pm, dir)
+}
+
+/// `new_manager` returning the `MockRoutingState` handle, so a test can read
+/// the `server_ip` that `install` received — without a test-only reader on the
+/// production manager API.
+fn new_manager_capturing(
+    proxy: MockProxy,
+) -> (
+    ProxyManager<MockProxy, MockRouting>,
+    Arc<MockRoutingState>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let pm = ProxyManager::new(proxy, routing);
+    (pm, state, dir)
 }
 
 /// `new_manager` variant that allows supplying a preconfigured `MockRouting`
@@ -1128,21 +1150,29 @@ fn build_config_failure_sets_last_error() {
 }
 
 #[skuld::test]
-fn dns_resolution_failure_sets_last_error() {
+fn doh_bootstrap_failure_sets_last_error() {
+    use crate::dns::bootstrap::DohQuerier;
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _u: &str, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
         let mut config = test_config();
-        // RFC 2606 reserves .invalid for guaranteed-non-resolution.
+        // RFC 2606 reserves .invalid for guaranteed-non-resolution; the stub
+        // querier never answers, so resolve is fail-closed without any network.
         config.server.server = "test.invalid".into();
 
         let err = pm.start(&config).await.unwrap_err();
-        assert!(matches!(err, ProxyError::DnsResolution { .. }));
+        assert!(matches!(err, ProxyError::DohBootstrap(_)), "fail-closed: {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
-        assert!(
-            pm.last_error().is_some(),
-            "resolve_server_ip failure must set last_error"
-        );
-        assert!(pm.last_error().unwrap().contains("test.invalid"));
+        assert!(pm.last_error().is_some(), "DoH bootstrap failure must set last_error");
+        // last_error is the PII-free DohBootstrap Display — host is in the log, not here.
+        assert!(!pm.last_error().unwrap().contains("test.invalid"));
     });
 }
 
@@ -1691,6 +1721,148 @@ fn udp_unavailable_when_chain_reports_empty_transports() {
     // Degenerate (a chain that serves nothing): UDP is not present, so
     // the privacy-preserving default is to drop Proxy-routed UDP.
     assert!(!udp_available_from_chain(Some(garter::Transports::empty())));
+}
+
+// DoH bootstrap wiring ================================================================================================
+
+use crate::dns::bootstrap::DohQuerier;
+use hole_common::protocol::TunnelMode;
+
+/// Stub querier resolving exactly one hostname to one IPv4, used to prove
+/// `start_inner` resolves via DoH (not the OS) and hands the result downstream.
+struct WiringStubQuerier {
+    host: String,
+    ip: IpAddr,
+}
+
+#[async_trait::async_trait]
+impl DohQuerier for WiringStubQuerier {
+    async fn query(&self, _doh_url: &str, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        // Only answer the A query (port-free: the stub keys on hostname).
+        let q = Message::from_vec(wire).ok()?;
+        let question = q.queries.first()?;
+        if question.query_type() != RecordType::A {
+            return None; // force the resolver onto the A path (IPv4-preferred).
+        }
+        let IpAddr::V4(v4) = self.ip else { return None };
+        let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+        reply.add_query(Query::query(n.clone(), RecordType::A));
+        reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+        reply.to_vec().ok()
+    }
+}
+
+fn doh_config_with_server_host(host: &str, mode: TunnelMode) -> ProxyConfig {
+    ProxyConfig {
+        server: ServerEntry {
+            id: "doh-test".into(),
+            name: "doh-test".into(),
+            server: host.into(),
+            server_port: 8388,
+            password: "test".into(),
+            method: "aes-256-gcm".into(),
+            plugin: Some("v2ray-plugin".into()),
+            plugin_opts: Some("host=example.com".into()),
+            validation: None,
+        },
+        local_port: 1080,
+        tunnel_mode: mode,
+        filters: Vec::new(),
+        dns: hole_common::config::DnsConfig {
+            enabled: false, // skip the forwarder self-test gate (#388)
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            protocol: hole_common::config::DnsProtocol::Https,
+            allow_insecure_bootstrap: false,
+        },
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
+        diagnostic_plugin_tap: false,
+    }
+}
+
+#[skuld::test]
+fn full_start_resolves_server_ip_via_doh_and_routes_with_it() {
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        // A configured plugin would spawn a real subprocess; this Full-mode
+        // assertion is about the bypass route, so use a plugin-less config — the
+        // resolve still runs above Phase 1 and feeds routing.install.
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        pm.start(&config).await.unwrap();
+        assert_eq!(
+            *rstate.last_install_server_ip.lock().unwrap(),
+            Some(expected),
+            "bypass route got the DoH-resolved IP"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
+    // SocksOnly returns early (no routing), but the plugin-chain handoff still
+    // needs the DoH-resolved IP. The plugin binary is nonexistent so the chain
+    // fails; we assert the FAILURE is the plugin spawn (resolve already ran and
+    // succeeded) — i.e. NOT a DohBootstrap error.
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::SocksOnly);
+        config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Plugin(_)),
+            "expected plugin-spawn failure AFTER a successful DoH resolve, got {err:?}"
+        );
+        assert!(
+            !matches!(err, ProxyError::DohBootstrap(_)),
+            "resolve must have succeeded via the stub querier, not failed: {err:?}"
+        );
+    });
+}
+
+#[skuld::test]
+fn full_start_fails_closed_when_doh_cannot_resolve() {
+    // A stub that answers nothing → NoAnswer → DohBootstrap, hermetic (no
+    // system DNS or network).
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _u: &str, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+    rt().block_on(async {
+        let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::DohBootstrap(_)),
+            "fail-closed start error: {err:?}"
+        );
+        assert_eq!(
+            *rstate.last_install_server_ip.lock().unwrap(),
+            None,
+            "no route installed on a failed resolve"
+        );
+    });
 }
 
 // Forwarder self-test gate tests ======================================================================================
