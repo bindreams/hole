@@ -18,24 +18,34 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
 
+// echCacheDomain is the single source of the DoH/cache key: echQueryDomain when
+// set, else serverName, and "" when neither resolves to a domain. ApplyECH and
+// RefreshECHCache both key on it so a retry-config refresh lands under the key a
+// future dial reads. Pass the same serverName ApplyECH sees (the resolved
+// config.ServerName) so the keys match.
+func echCacheDomain(echQueryDomain, serverName string) string {
+	domain := echQueryDomain
+	if domain == "" {
+		domain = serverName
+	}
+	if addr := net.ParseAddress(domain); addr.Family().IsDomain() {
+		return addr.Domain()
+	}
+	return ""
+}
+
 func ApplyECH(c *Config, config *tls.Config) error {
 	var ECHConfig []byte
 	var err error
-	var domain string
 
 	if len(c.EchConfig) > 0 {
 		ECHConfig = c.EchConfig
 	} else { // ECH config > DOH lookup
-		if c.EchQueryDomain == "" {
-			domain = config.ServerName
-		} else {
-			domain = c.EchQueryDomain
-		}
-		addr := net.ParseAddress(domain)
-		if !addr.Family().IsDomain() {
+		domain := echCacheDomain(c.EchQueryDomain, config.ServerName)
+		if domain == "" {
 			return newError("Using DOH for ECH needs SNI")
 		}
-		ECHConfig, err = QueryRecord(addr.Domain(), c.Ech_DOHserver)
+		ECHConfig, err = QueryRecord(domain, c.Ech_DOHserver)
 		if err != nil {
 			return err
 		}
@@ -49,6 +59,37 @@ func ApplyECH(c *Config, config *tls.Config) error {
 
 	config.EncryptedClientHelloConfigList = ECHConfig
 	return nil
+}
+
+// RefreshECHCache stores the server's retry_configs so FUTURE dials skip the
+// stale config; the current connection's retry threads them directly, so this is
+// best-effort. serverName is the resolved config.ServerName the rejected dial
+// used, so the write keys identically to a future ApplyECH lookup. No-op on empty
+// configs. retry_configs with no keyable domain (IP SNI, no EchQueryDomain) leaves
+// a debug breadcrumb and writes nothing. An absent or expired entry resets to
+// now+600s; an un-expired entry keeps its expiry so a fresh DoH TTL is not clobbered.
+func RefreshECHCache(c *Config, serverName string, retryConfigs []byte) {
+	if len(retryConfigs) == 0 {
+		return
+	}
+	echQueryDomain := ""
+	if c != nil {
+		echQueryDomain = c.EchQueryDomain
+	}
+	domain := echCacheDomain(echQueryDomain, serverName)
+	if domain == "" {
+		newError("ECH retry_configs received but no SNI domain to key the cache; future dials retry per-connection").AtDebug().WriteToLog()
+		return
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	rec := dnsCache[domain]
+	rec.record = retryConfigs
+	if !rec.expire.After(time.Now()) {
+		rec.expire = time.Now().Add(600 * time.Second)
+	}
+	dnsCache[domain] = rec
 }
 
 type record struct {

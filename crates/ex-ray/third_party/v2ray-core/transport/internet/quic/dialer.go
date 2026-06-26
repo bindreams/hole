@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"sync"
 	"time"
 
@@ -166,16 +167,10 @@ func (s *clientConnections) openConnection(destAddr net.Addr, config *Config, tl
 		ConnectionIDLength: 12,
 	}
 
-	// QUIC bypasses the TLS security engine, so the factory's ECH gate runs here:
-	// abort before quic-go hands the ClientHello to the wire when a required ECH
-	// config could not be obtained, so the real SNI is never sent in cleartext.
-	gotlsConfig, err := tlsConfig.GetTLSConfigForClient(tls.WithDestination(dest))
-	if err != nil {
-		sysConn.Close()
-		return nil, err
-	}
-
-	conn, err := tr.Dial(context.Background(), destAddr, gotlsConfig, quicConfig)
+	// QUIC has no security engine; the seam runs the ECH gate + one-shot retry.
+	conn, err := dialQUICWithECHRetry(tlsConfig, dest, func(cfg *gotls.Config) (*quic.Conn, error) {
+		return tr.Dial(context.Background(), destAddr, cfg, quicConfig)
+	})
 	if err != nil {
 		sysConn.Close()
 		return nil, err

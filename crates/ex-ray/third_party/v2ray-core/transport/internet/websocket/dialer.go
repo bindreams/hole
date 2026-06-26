@@ -18,6 +18,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/features/extension"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/security"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
 
 // Dial dials a WebSocket connection to the given destination.
@@ -58,11 +59,11 @@ func dialWebsocket(ctx context.Context, dest net.Destination, streamSettings *in
 		protocol = "wss"
 
 		dialer.NetDialTLSContext = func(ctx context.Context, network, addr string) (gonet.Conn, error) {
-			conn, err := dialer.NetDial(network, addr)
-			if err != nil {
-				return nil, newError("dial TLS connection failed").Base(err)
-			}
-			conn, err = securityEngine.Client(conn,
+			// Retry once on an ECH rejection with the server's retry_configs
+			// (RFC 9849); the handshake is forced here, before gorilla writes the
+			// WS upgrade, so the retry resolves before any payload.
+			conn, err := tls.DialClientWithECHRetry(securityEngine, tls.TLSConfigFromStreamSettings(streamSettings),
+				func() (net.Conn, error) { return dialer.NetDial(network, addr) },
 				security.OptionWithDestination{Dest: dest},
 				security.OptionWithALPN{ALPNs: []string{"http/1.1"}})
 			if err != nil {

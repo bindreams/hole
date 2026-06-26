@@ -16,6 +16,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/security"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
 
@@ -60,12 +61,14 @@ func getHTTPClient(ctx context.Context, dest net.Destination, securityEngine *se
 			address := net.ParseAddress(rawHost)
 
 			detachedContext := core.ToBackgroundDetachedContext(ctx)
-			pconn, err := internet.DialSystem(detachedContext, net.TCPDestination(address, port), streamSettings.SocketSettings)
-			if err != nil {
-				return nil, err
+			dialRaw := func() (net.Conn, error) {
+				return internet.DialSystem(detachedContext, net.TCPDestination(address, port), streamSettings.SocketSettings)
 			}
 
-			cn, err := (*securityEngine).Client(pconn,
+			// Retry once on an ECH rejection with the server's retry_configs
+			// (RFC 9849); the handshake is forced here, before http2 writes the
+			// request, so the retry resolves before any payload.
+			cn, err := tls.DialClientWithECHRetry(*securityEngine, tls.TLSConfigFromStreamSettings(streamSettings), dialRaw,
 				security.OptionWithDestination{Dest: dest})
 			if err != nil {
 				return nil, err

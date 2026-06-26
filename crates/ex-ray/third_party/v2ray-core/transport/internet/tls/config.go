@@ -403,3 +403,16 @@ func ConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {
 	config := settings.SecuritySettings.(*Config)
 	return config
 }
+
+// TLSConfigFromStreamSettings returns the TLS Config when the security settings
+// are TLS, else nil — without the fail-closed panic of ConfigFromStreamSettings.
+// A client dial path uses this to pass the proto config to the ECH-retry helper
+// even when a non-TLS engine (e.g. uTLS) is selected; the helper uses it only for
+// the best-effort cache refresh, which a non-TLS engine never reaches.
+func TLSConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {
+	if settings == nil {
+		return nil
+	}
+	config, _ := settings.SecuritySettings.(*Config)
+	return config
+}

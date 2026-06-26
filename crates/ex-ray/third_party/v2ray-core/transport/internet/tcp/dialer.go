@@ -9,25 +9,32 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/session"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/security"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
 
 // Dial dials a new TCP connection to the given destination.
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (internet.Connection, error) {
 	newError("dialing TCP to ", dest).WriteToLog(session.ExportIDToError(ctx))
-	conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
-	if err != nil {
-		return nil, err
-	}
 
 	securityEngine, err := security.CreateSecurityEngineFromSettings(ctx, streamSettings)
 	if err != nil {
 		return nil, newError("unable to create security engine").Base(err)
 	}
 
+	dialRaw := func() (net.Conn, error) { return internet.DialSystem(ctx, dest, streamSettings.SocketSettings) }
+
+	var conn net.Conn
 	if securityEngine != nil {
-		conn, err = securityEngine.Client(conn, security.OptionWithDestination{Dest: dest})
+		// Retry once on an ECH rejection with the server's retry_configs (RFC 9849).
+		conn, err = tls.DialClientWithECHRetry(securityEngine, tls.TLSConfigFromStreamSettings(streamSettings), dialRaw,
+			security.OptionWithDestination{Dest: dest})
 		if err != nil {
 			return nil, newError("unable to create security protocol client from security engine").Base(err)
+		}
+	} else {
+		conn, err = dialRaw()
+		if err != nil {
+			return nil, err
 		}
 	}
 

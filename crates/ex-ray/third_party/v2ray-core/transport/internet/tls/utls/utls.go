@@ -35,6 +35,9 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 			}
 		case security.OptionWithDestination:
 			options = append(options, tls.WithDestination(s.Dest))
+		case security.OptionWithECHConfigOverride:
+			// uTLS drops EncryptedClientHelloConfigList and can never send ECH, so
+			// it can never produce an ECH rejection to retry. No-op.
 		default:
 			return nil, newError("unknown option")
 		}

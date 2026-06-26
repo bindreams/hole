@@ -12,6 +12,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/log"
 	"github.com/v2fly/v2ray-core/v5/common/protocol/tls/cert"
 	"github.com/v2fly/v2ray-core/v5/common/serial"
+	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	. "github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
 
@@ -270,6 +271,16 @@ func TestHandleEchUnsupported(t *testing.T) {
 			t.Fatalf("nil receiver must not refuse: %v", err)
 		}
 	})
+}
+
+// TLSConfigFromStreamSettings must return nil (not panic) for non-TLS security
+// settings, so a client dial path can pass it to the ECH-retry helper even when
+// a uTLS engine (whose settings are not a *tls.Config) is selected.
+func TestTLSConfigFromStreamSettingsNonTLSReturnsNil(t *testing.T) {
+	settings := &internet.MemoryStreamConfig{SecuritySettings: struct{ NotATLSConfig bool }{true}}
+	if cfg := TLSConfigFromStreamSettings(settings); cfg != nil {
+		t.Fatalf("non-TLS security settings must yield nil, got %v", cfg)
+	}
 }
 
 // RequireEchSatisfied is the shared gate the dial paths consult. It must error
