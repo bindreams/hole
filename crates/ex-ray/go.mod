@@ -8,6 +8,10 @@ require (
 	google.golang.org/protobuf v1.36.11
 )
 
+// v2ray-core is vendored in-tree (git-subrepo) so it can be patched for ECH
+// robustness; this local copy is the build truth. See third_party/VENDORING.md.
+replace github.com/v2fly/v2ray-core/v5 => ./third_party/v2ray-core
+
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect

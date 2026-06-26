@@ -67,6 +67,10 @@ export interface DnsConfig {
   enabled: boolean;
   servers: string[];
   protocol: DnsProtocol;
+  /// Fail-open opt-out for the always-on DoH bootstrap resolve. Mirrors the
+  /// Rust `DnsConfig.allow_insecure_bootstrap`; `serde(default)` → false when
+  /// a legacy config omits it.
+  allow_insecure_bootstrap: boolean;
 }
 
 export interface Config {

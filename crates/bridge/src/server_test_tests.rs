@@ -55,6 +55,8 @@ fn fast_test_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfi
         sentinel_read_timeout: Duration::from_millis(800),
         sentinels: [sentinel_a.to_string(), sentinel_b.to_string()],
         plugin_path_override: None,
+        dns: hole_common::config::DnsConfig::default(),
+        bootstrap_querier: None,
     }
 }
 
@@ -86,6 +88,10 @@ fn fixture_starts_real_ss_server() {
 
 /// Build a [`TestConfig`] pointing at a single bogus IP for both sentinels.
 /// Used by the pre-flight tests, where the test never reaches Phase 3.
+///
+/// Empty `servers` + `allow_insecure_bootstrap = true`: the DoH loop has no
+/// resolver to try, so the bootstrap skips straight to the OS resolver. No live
+/// DoH endpoint is contacted.
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
@@ -94,6 +100,12 @@ fn preflight_only_config() -> TestConfig {
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
         plugin_path_override: None,
+        dns: hole_common::config::DnsConfig {
+            servers: Vec::new(),
+            allow_insecure_bootstrap: true,
+            ..hole_common::config::DnsConfig::default()
+        },
+        bootstrap_querier: None,
     }
 }
 
@@ -454,6 +466,76 @@ fn run_test_returns_tcp_timeout_for_blackhole() {
         );
     });
 }
+/// Drives the full `run_server_test` resolve→preflight path through the DoH
+/// querier seam. `entry.server` is a NON-literal host that only the stub can
+/// resolve (to loopback). A live loopback listener on `entry.server_port` makes
+/// preflight's TCP connect succeed — but ONLY if `run_server_test` connects to
+/// the DoH-resolved IP. If the wiring regressed to the unresolved hostname,
+/// preflight's `lookup_host("preflight.example")` would fail → `DnsFailed`, so
+/// any non-`DnsFailed`/non-`Tcp*` outcome proves the resolved IP was used.
+#[skuld::test]
+fn preflight_path_uses_doh_resolved_ip() {
+    use crate::dns::bootstrap::DohQuerier;
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    // Resolves any A query to loopback so preflight connects to the live
+    // listener; the stub keys on hostname (the production resolver prefers A).
+    struct LoopbackQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for LoopbackQuerier {
+        async fn query(&self, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None;
+            }
+            let n = Name::from_ascii("preflight.example.").ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
+            reply.to_vec().ok()
+        }
+    }
+
+    rt().block_on(async {
+        // Live loopback listener so the post-preflight TCP connect succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let entry = entry("preflight.example", port, TEST_METHOD_STR, TEST_PASSWORD);
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cfg = TestConfig {
+            preflight_timeout: Duration::from_millis(500),
+            ss_connect_timeout: Duration::from_millis(500),
+            sentinel_read_timeout: Duration::from_millis(500),
+            sentinels: [bogus.to_string(), bogus.to_string()],
+            plugin_path_override: None,
+            dns: DnsConfig {
+                enabled: true,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            },
+            bootstrap_querier: Some(Arc::new(LoopbackQuerier)),
+        };
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        // Preflight reached + passed the DoH-resolved loopback IP; the listener
+        // is not a real ss-server, so Phase 3 fails — but NOT at DNS or preflight.
+        assert!(
+            !matches!(
+                outcome,
+                ServerTestOutcome::DnsFailed | ServerTestOutcome::TcpRefused | ServerTestOutcome::TcpTimeout
+            ),
+            "preflight must have connected to the DoH-resolved IP, got {outcome:?}"
+        );
+    });
+}
+
 // `reclassify_blocked` tests ==========================================================================================
 //
 // These exercise the post-tunnel-failure reclassification helper DIRECTLY: it
@@ -521,6 +603,111 @@ fn run_test_reclassify_handshake_failed_reset_is_network_blocked() {
     });
 }
 
+/// Drives the full `run_server_test` Phase-3 tunnel through the DoH seam for a
+/// BARE-SS (no-plugin) server with a NON-literal host. The real ss-server
+/// fixture is on loopback; only the stub resolves `tunnel.example` to it. A
+/// `Reachable` outcome proves the bare-SS connect dialed the DoH-resolved IP —
+/// if it regressed to the hostname, shadowsocks-rust would OS-resolve
+/// `tunnel.example` (RFC 6761 reserved, non-resolving) and the connect would
+/// fail, never reaching `Reachable`.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+fn bare_ss_tunnel_uses_doh_resolved_ip() {
+    use crate::dns::bootstrap::DohQuerier;
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    // Resolves the A query to the fixture's loopback IP (the production resolver
+    // prefers A, so answering only A is sufficient).
+    struct FixtureQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for FixtureQuerier {
+        async fn query(&self, _s: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None;
+            }
+            let n = Name::from_ascii("tunnel.example.").ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
+            reply.to_vec().ok()
+        }
+    }
+
+    rt().block_on(async {
+        let (svr_addr, _svr_handle) = start_real_ss_server(TEST_METHOD, TEST_PASSWORD).await;
+        let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+        let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+
+        // NON-literal host: only the stub can resolve it, and only to the
+        // loopback fixture. The fixture's port is the SS port we dial.
+        let entry = entry("tunnel.example", svr_addr.port(), TEST_METHOD_STR, TEST_PASSWORD);
+        let cfg = TestConfig {
+            dns: DnsConfig {
+                enabled: true,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            },
+            bootstrap_querier: Some(Arc::new(FixtureQuerier)),
+            ..fast_test_config(sentinel_a, sentinel_b)
+        };
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        match outcome {
+            ServerTestOutcome::Reachable { latency_ms } => {
+                assert!(latency_ms >= 1, "latency_ms must be clamped to >= 1");
+            }
+            other => panic!("bare-SS tunnel must dial the DoH-resolved IP and reach the fixture, got {other:?}"),
+        }
+    });
+}
+
+/// Production-default fail-closed path: `allow_insecure_bootstrap = false` with
+/// a configured resolver that never answers must yield `DnsFailed` with no OS
+/// resolver and no network. Mirrors
+/// `proxy_manager_tests::full_start_fails_closed_when_doh_cannot_resolve`.
+/// Distinct from `run_test_returns_dns_failed_for_unresolvable_host`, which
+/// exercises the `allow_insecure_bootstrap = true` OS-fallback path.
+#[skuld::test]
+fn run_test_fails_closed_when_doh_cannot_resolve() {
+    use crate::dns::bootstrap::DohQuerier;
+    use hole_common::config::{DnsConfig, DnsProtocol};
+
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _s: std::net::IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    rt().block_on(async {
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let entry = entry("proxy.example", 8388, TEST_METHOD_STR, TEST_PASSWORD);
+        let cfg = TestConfig {
+            dns: DnsConfig {
+                enabled: true,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+                protocol: DnsProtocol::Https,
+                allow_insecure_bootstrap: false,
+            },
+            bootstrap_querier: Some(std::sync::Arc::new(NeverQuerier)),
+            ..fast_test_config(bogus, bogus)
+        };
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        assert!(
+            matches!(outcome, ServerTestOutcome::DnsFailed),
+            "fail-closed DoH no-answer must be DnsFailed, got {outcome:?}"
+        );
+    });
+}
+
 /// `TunnelHandshakeFailed` + a TLS-WS plugin + an answering endpoint → the probe
 /// reports `Reachable`, so the original `TunnelHandshakeFailed` is preserved.
 #[skuld::test]
@@ -539,6 +726,73 @@ fn run_test_reclassify_handshake_failed_answered_stays_handshake_failed() {
         assert!(
             matches!(out, ServerTestOutcome::TunnelHandshakeFailed),
             "expected TunnelHandshakeFailed (probe Reachable), got {out:?}"
+        );
+    });
+}
+
+/// Resolves any AAAA query to `::1` so preflight connects to an IPv6 loopback
+/// listener; answers no A so the v6 fallback branch is exercised.
+struct Ipv6LoopbackQuerier;
+#[async_trait::async_trait]
+impl crate::dns::bootstrap::DohQuerier for Ipv6LoopbackQuerier {
+    async fn query(&self, _s: std::net::IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::AAAA;
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        let q = Message::from_vec(wire).ok()?;
+        if q.queries.first()?.query_type() != RecordType::AAAA {
+            return None;
+        }
+        let n = Name::from_ascii("v6.example.").ok()?;
+        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+        reply.add_query(Query::query(n.clone(), RecordType::AAAA));
+        reply.add_answer(Record::from_rdata(
+            n,
+            60,
+            RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+        ));
+        reply.to_vec().ok()
+    }
+}
+
+fn ipv6_doh_config(sentinel_a: SocketAddr, sentinel_b: SocketAddr) -> TestConfig {
+    use hole_common::config::{DnsConfig, DnsProtocol};
+    TestConfig {
+        dns: DnsConfig {
+            enabled: true,
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            protocol: DnsProtocol::Https,
+            allow_insecure_bootstrap: false,
+        },
+        bootstrap_querier: Some(std::sync::Arc::new(Ipv6LoopbackQuerier)),
+        ..fast_test_config(sentinel_a, sentinel_b)
+    }
+}
+
+/// Preflight must connect to the RAW IPv6 address `::1`, not the bracketed
+/// `handoff_host` string. A live `[::1]:port` listener makes the TCP connect
+/// succeed; if `run_server_test` fed `"[::1]"` to preflight, `IpAddr::parse`
+/// would reject the brackets and the value would be (mis)treated as a hostname
+/// — `lookup_host(("[::1]", port))` fails on macOS getaddrinfo → `DnsFailed`.
+/// A non-DnsFailed/non-Tcp outcome proves the raw IP was used.
+#[skuld::test]
+fn preflight_uses_raw_ipv6_not_bracketed_host() {
+    use tokio::net::TcpListener;
+    rt().block_on(async {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let entry = entry("v6.example", port, TEST_METHOD_STR, TEST_PASSWORD);
+        let cfg = ipv6_doh_config(bogus, bogus);
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        assert!(
+            !matches!(
+                outcome,
+                ServerTestOutcome::DnsFailed | ServerTestOutcome::TcpRefused | ServerTestOutcome::TcpTimeout
+            ),
+            "preflight must connect to the raw IPv6 ::1, got {outcome:?}"
         );
     });
 }
@@ -562,6 +816,32 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
             matches!(out, ServerTestOutcome::NetworkBlocked),
             "expected NetworkBlocked, got {out:?}"
         );
+    });
+}
+
+/// The plugin path runs the same IPv6 preflight before spawning the plugin. A
+/// live `[::1]:port` listener makes preflight pass; a bogus plugin name then
+/// fails at spawn → `PluginStartFailed`. Reaching plugin-start proves preflight
+/// connected to the raw IPv6 IP rather than failing `DnsFailed` on the bracket.
+#[skuld::test]
+fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
+    use tokio::net::TcpListener;
+    rt().block_on(async {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut entry = entry("v6.example", port, TEST_METHOD_STR, TEST_PASSWORD);
+        entry.plugin = Some("plugin-that-does-not-exist".into());
+        let cfg = ipv6_doh_config(bogus, bogus);
+
+        let outcome = run_server_test(&entry, &cfg).await;
+        match outcome {
+            ServerTestOutcome::PluginStartFailed { detail } => {
+                assert!(!detail.is_empty(), "detail should describe the failure");
+            }
+            other => panic!("plugin preflight must pass on raw IPv6 then fail at spawn, got {other:?}"),
+        }
     });
 }
 

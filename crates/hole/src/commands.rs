@@ -450,17 +450,21 @@ pub async fn test_server(state: State<'_, AppState>, entry_id: String) -> Result
     let entry_lock = state.entry_test_lock(&entry_id).await;
     let _guard = entry_lock.lock().await;
 
-    // Snapshot the entry under the std::sync::Mutex (no `.await` held).
-    let entry = {
+    // Snapshot the entry and the user's DNS config under the std::sync::Mutex
+    // (no `.await` held), so the test bootstraps over the same resolver a real
+    // connect uses.
+    let (entry, dns) = {
         let cfg = state.config.lock().unwrap();
-        cfg.servers
+        let entry = cfg
+            .servers
             .iter()
             .find(|s| s.id == entry_id)
             .cloned()
-            .ok_or_else(|| format!("no server with id {entry_id}"))?
+            .ok_or_else(|| format!("no server with id {entry_id}"))?;
+        (entry, cfg.dns.clone())
     };
 
-    let outcome = match state.bridge_send(BridgeRequest::TestServer { entry }).await {
+    let outcome = match state.bridge_send(BridgeRequest::TestServer { entry, dns }).await {
         Ok(BridgeResponse::TestServerResult { outcome }) => outcome,
         Ok(_) => ServerTestOutcome::InternalError {
             detail: "unexpected bridge response".into(),

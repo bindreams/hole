@@ -9,6 +9,7 @@
 //! `CancellationToken::new` below carries a sanctioned per-call-site allow
 //! (hole's `clippy.toml` `CancellationToken::new` rule).
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,28 @@ use tokio_util::sync::CancellationToken;
 
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
 
+/// Why a tunnel roundtrip did not reach the sentinel. Classified at each failure
+/// site from its typed source (the `io::Error`/`ErrorKind` or a driver timeout
+/// branch), so callers assert on the disposition instead of parsing `detail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReachableKind {
+    /// Building the ss client config failed (fixture/config error).
+    ServerConfig,
+    /// The ss-client connect to the local plugin failed (non-timeout).
+    ConnectFailed,
+    /// The ss-client connect timed out.
+    ConnectTimeout,
+    /// The peer closed the link before a valid reply — clean EOF, `UnexpectedEof`,
+    /// `ConnectionReset`, `BrokenPipe`, or `ConnectionAborted`. A pre-handshake
+    /// gate refusal surfaces here, whether the close is FIN (EOF) or RST (reset).
+    PeerClosed,
+    /// The read timed out (the documented cold-start flake), distinct from a
+    /// peer close so a fail-closed assert can exclude transient slowness.
+    ReadTimeout,
+    /// Bytes arrived but were not the expected `HTTP` reply.
+    WrongReply,
+}
+
 /// Outcome of a single client roundtrip.
 #[derive(Debug)]
 pub enum Roundtrip {
@@ -33,7 +56,8 @@ pub enum Roundtrip {
     /// The client chain failed to start (plugin spawn / readiness error).
     ChainFailed(String),
     /// The tunnel connect/read failed, timed out, or returned non-HTTP bytes.
-    NotReachable(String),
+    /// `kind` is the typed disposition; `detail` is the human-readable cause.
+    NotReachable { kind: NotReachableKind, detail: String },
 }
 
 /// Tunable timeouts. Every budget here is a failure-to-human bound for a wedged
@@ -154,7 +178,7 @@ async fn run_tunnel(
 ) -> Roundtrip {
     let svr_cfg = match ServerConfig::new(ServerAddr::SocketAddr(listen), password.to_string(), method) {
         Ok(c) => c,
-        Err(e) => return Roundtrip::NotReachable(format!("server config: {e}")),
+        Err(e) => return not_reachable(NotReachableKind::ServerConfig, format!("server config: {e}")),
     };
     let ctx: SharedContext = Context::new_shared(ServerType::Local);
     let target = Address::SocketAddress(sentinel);
@@ -166,8 +190,9 @@ async fn run_tunnel(
     .await
     {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Roundtrip::NotReachable(format!("ss connect: {e}")),
-        Err(_) => return Roundtrip::NotReachable("ss connect timed out".into()),
+        // A timeout could still slip through as an io error here, so classify by kind.
+        Ok(Err(e)) => return not_reachable(kind_from_connect_err(&e), format!("ss connect: {e}")),
+        Err(_) => return not_reachable(NotReachableKind::ConnectTimeout, "ss connect timed out".into()),
     };
 
     let _ = stream.write_all(HEAD_REQUEST).await;
@@ -178,9 +203,40 @@ async fn run_tunnel(
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).max(1);
             Roundtrip::Reachable { latency_ms }
         }
-        Ok(Ok(n)) if n > 0 => Roundtrip::NotReachable(format!("non-HTTP reply: {}", hex::encode(&buf[..n.min(16)]))),
-        Ok(Ok(_)) => Roundtrip::NotReachable("EOF before any reply".into()),
-        Ok(Err(e)) => Roundtrip::NotReachable(format!("read: {e}")),
-        Err(_) => Roundtrip::NotReachable("read timed out".into()),
+        Ok(Ok(n)) if n > 0 => not_reachable(
+            NotReachableKind::WrongReply,
+            format!("non-HTTP reply: {}", hex::encode(&buf[..n.min(16)])),
+        ),
+        Ok(Ok(_)) => not_reachable(NotReachableKind::PeerClosed, "EOF before any reply".into()),
+        Ok(Err(e)) => not_reachable(kind_from_read_err(&e), format!("read: {e}")),
+        Err(_) => not_reachable(NotReachableKind::ReadTimeout, "read timed out".into()),
+    }
+}
+
+fn not_reachable(kind: NotReachableKind, detail: String) -> Roundtrip {
+    Roundtrip::NotReachable { kind, detail }
+}
+
+/// Map an ss-connect `io::Error` to a disposition: an `ErrorKind::TimedOut`
+/// surfacing here is still a connect timeout; everything else is a connect
+/// failure.
+fn kind_from_connect_err(e: &std::io::Error) -> NotReachableKind {
+    match e.kind() {
+        ErrorKind::TimedOut => NotReachableKind::ConnectTimeout,
+        _ => NotReachableKind::ConnectFailed,
+    }
+}
+
+/// Map a read `io::Error` to a disposition. A peer that closes the link
+/// pre-reply surfaces as `UnexpectedEof` (FIN) or `ConnectionReset`/`BrokenPipe`/
+/// `ConnectionAborted` (RST) depending on the teardown race; all are `PeerClosed`.
+fn kind_from_read_err(e: &std::io::Error) -> NotReachableKind {
+    match e.kind() {
+        ErrorKind::TimedOut => NotReachableKind::ReadTimeout,
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionAborted => NotReachableKind::PeerClosed,
+        _ => NotReachableKind::ConnectFailed,
     }
 }

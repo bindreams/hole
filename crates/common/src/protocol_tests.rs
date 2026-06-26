@@ -91,6 +91,30 @@ fn bridge_request_cancel_json_roundtrip() {
 }
 
 #[skuld::test]
+fn bridge_request_test_server_carries_dns_through_roundtrip() {
+    // The Test-Server request must carry the user's DnsConfig so the bridge
+    // bootstraps over the SAME resolver a real connect uses, not the default.
+    let custom_dns = crate::config::DnsConfig {
+        enabled: true,
+        servers: vec!["9.9.9.9".parse().unwrap()],
+        protocol: crate::config::DnsProtocol::Https,
+        allow_insecure_bootstrap: true,
+    };
+    assert_ne!(custom_dns, crate::config::DnsConfig::default());
+    let req = BridgeRequest::TestServer {
+        entry: sample_server(),
+        dns: custom_dns.clone(),
+    };
+    let json = serde_json::to_vec(&req).unwrap();
+    let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
+    assert_eq!(decoded, req);
+    match decoded {
+        BridgeRequest::TestServer { dns, .. } => assert_eq!(dns, custom_dns),
+        other => panic!("expected TestServer, got {other:?}"),
+    }
+}
+
+#[skuld::test]
 fn bridge_response_ack_json_roundtrip() {
     let resp = BridgeResponse::Ack;
     let json = serde_json::to_vec(&resp).unwrap();

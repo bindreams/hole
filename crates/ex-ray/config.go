@@ -52,6 +52,8 @@ var (
 	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
 	version    = flag.Bool("version", false, "Show current version of ex-ray")
 	fwmark     = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
+	echMode    = flag.String("ech", "auto", "ECH (Encrypted Client Hello) mode: auto (opportunistic), always (fail-closed), never.")
+	echDoh     = flag.String("ech-doh", "", "DoH URL used to fetch the ECH config (HTTPS record). Empty disables ECH.")
 )
 
 func homeDir() string {
@@ -111,6 +113,66 @@ func uint32Opt(name string, v int) (uint32, error) {
 		return uint32(v), nil
 	}
 	return 0, newError("invalid", name, "(expected 0..4294967295), got:", v)
+}
+
+// buildTLSConfig assembles the v2ray tls.Config: SNI stays *host, ECH is armed
+// by Ech_DOHserver (ech != "never" with a non-empty ech-doh), and ech=always
+// also sets RequireEch so v2ray aborts the dial rather than leak a cleartext SNI
+// when the ECH config can't be obtained.
+//
+// ech=always with an empty ech-doh is a configuration error (mirrors main.go's
+// exit-23 contract): "always" promises fail-closed ECH, impossible without a
+// DoH source.
+func buildTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{ServerName: *host}
+
+	if *server {
+		certificate := tls.Certificate{}
+		if *cert == "" && *certRaw == "" {
+			*cert = fmt.Sprintf("%s/.acme.sh/%s/fullchain.cer", homeDir(), *host)
+			logWarn("No TLS cert specified, trying", *cert)
+		}
+		var err error
+		certificate.Certificate, err = readCertificate()
+		if err != nil {
+			return nil, newError("failed to read cert").Base(err)
+		}
+		if *key == "" {
+			*key = fmt.Sprintf("%[1]s/.acme.sh/%[2]s/%[2]s.key", homeDir(), *host)
+			logWarn("No TLS key specified, trying", *key)
+		}
+		certificate.Key, err = filesystem.ReadFile(*key)
+		if err != nil {
+			return nil, newError("failed to read key file").Base(err)
+		}
+		tlsConfig.Certificate = []*tls.Certificate{&certificate}
+	} else if *cert != "" || *certRaw != "" {
+		certificate := tls.Certificate{Usage: tls.Certificate_AUTHORITY_VERIFY}
+		var err error
+		certificate.Certificate, err = readCertificate()
+		if err != nil {
+			return nil, newError("failed to read cert").Base(err)
+		}
+		tlsConfig.Certificate = []*tls.Certificate{&certificate}
+	}
+
+	switch *echMode {
+	case "never":
+		// no-op; never touch ECH regardless of ech-doh.
+	case "auto", "always":
+		if *echDoh != "" {
+			tlsConfig.Ech_DOHserver = *echDoh
+			if *echMode == "always" {
+				tlsConfig.RequireEch = true
+			}
+		} else if *echMode == "always" {
+			return nil, newError("ech=always requires ech-doh to be set; refusing to start without a DoH source for fail-closed ECH")
+		}
+	default:
+		return nil, newError("invalid ech mode:", *echMode, "(expected auto, always, or never)")
+	}
+
+	return tlsConfig, nil
 }
 
 func generateConfig() (*core.Config, error) {
@@ -184,36 +246,12 @@ func generateConfig() (*core.Config, error) {
 		streamConfig.SocketSettings = socketConfig
 	}
 	if *tlsEnabled {
-		tlsConfig := tls.Config{ServerName: *host}
-		if *server {
-			certificate := tls.Certificate{}
-			if *cert == "" && *certRaw == "" {
-				*cert = fmt.Sprintf("%s/.acme.sh/%s/fullchain.cer", homeDir(), *host)
-				logWarn("No TLS cert specified, trying", *cert)
-			}
-			certificate.Certificate, err = readCertificate()
-			if err != nil {
-				return nil, newError("failed to read cert").Base(err)
-			}
-			if *key == "" {
-				*key = fmt.Sprintf("%[1]s/.acme.sh/%[2]s/%[2]s.key", homeDir(), *host)
-				logWarn("No TLS key specified, trying", *key)
-			}
-			certificate.Key, err = filesystem.ReadFile(*key)
-			if err != nil {
-				return nil, newError("failed to read key file").Base(err)
-			}
-			tlsConfig.Certificate = []*tls.Certificate{&certificate}
-		} else if *cert != "" || *certRaw != "" {
-			certificate := tls.Certificate{Usage: tls.Certificate_AUTHORITY_VERIFY}
-			certificate.Certificate, err = readCertificate()
-			if err != nil {
-				return nil, newError("failed to read cert").Base(err)
-			}
-			tlsConfig.Certificate = []*tls.Certificate{&certificate}
+		tlsConfig, err := buildTLSConfig()
+		if err != nil {
+			return nil, err
 		}
-		streamConfig.SecurityType = serial.GetMessageType(&tlsConfig)
-		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(&tlsConfig)}
+		streamConfig.SecurityType = serial.GetMessageType(tlsConfig)
+		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(tlsConfig)}
 	}
 
 	apps := []*anypb.Any{

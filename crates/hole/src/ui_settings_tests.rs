@@ -200,3 +200,71 @@ fn apply_replaces_ui_owned_fields() {
     settings.apply(&mut current);
     assert_eq!(current.local_port, 5555);
 }
+
+// `dns` flows wholesale; `allow_insecure_bootstrap` rides along into AppConfig
+// and onward into ProxyConfig.dns (the bridge's bootstrap opt-out).
+
+#[skuld::test]
+fn apply_threads_allow_insecure_bootstrap_into_app_config() {
+    let mut current = AppConfig::default();
+    let mut json = default_settings_json();
+    json["dns"] = serde_json::json!({
+        "enabled": true,
+        "servers": ["1.1.1.1", "1.0.0.1"],
+        "protocol": "https",
+        "allow_insecure_bootstrap": true
+    });
+    let settings: UiSettings = serde_json::from_value(json).unwrap();
+    settings.apply(&mut current);
+    assert!(
+        current.dns.allow_insecure_bootstrap,
+        "the UI-owned allow_insecure_bootstrap must reach AppConfig.dns"
+    );
+}
+
+#[skuld::test]
+fn apply_defaults_allow_insecure_bootstrap_false_when_absent() {
+    // The webview may still send a legacy dns object without the new key;
+    // serde(default) must land it as false, not error.
+    let mut current = AppConfig::default();
+    let mut json = default_settings_json();
+    json["dns"] = serde_json::json!({
+        "enabled": true,
+        "servers": ["1.1.1.1"],
+        "protocol": "https"
+    });
+    let settings: UiSettings = serde_json::from_value(json).unwrap();
+    settings.apply(&mut current);
+    assert!(!current.dns.allow_insecure_bootstrap);
+}
+
+#[skuld::test]
+fn apply_then_build_proxy_config_carries_allow_insecure_bootstrap() {
+    // End-to-end seam: webview payload -> UiSettings::apply -> AppConfig ->
+    // build_proxy_config -> ProxyConfig.dns, which the bridge reads at bootstrap.
+    let mut current = AppConfig {
+        servers: vec![entry("a")],
+        selected_server: Some("a".into()),
+        ..Default::default()
+    };
+    let mut json = default_settings_json();
+    json["servers"] = serde_json::json!([{
+        "id": "a", "name": "Server a", "server": "1.2.3.4",
+        "server_port": 8388, "method": "aes-256-gcm", "password": "pw"
+    }]);
+    json["selected_server"] = serde_json::json!("a");
+    json["dns"] = serde_json::json!({
+        "enabled": true,
+        "servers": ["1.1.1.1", "1.0.0.1"],
+        "protocol": "https",
+        "allow_insecure_bootstrap": true
+    });
+    let settings: UiSettings = serde_json::from_value(json).unwrap();
+    settings.apply(&mut current);
+
+    let proxy = crate::commands::build_proxy_config(&current).expect("selected server present -> proxy config builds");
+    assert!(
+        proxy.dns.allow_insecure_bootstrap,
+        "allow_insecure_bootstrap must reach ProxyConfig.dns through the settings flow"
+    );
+}

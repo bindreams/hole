@@ -129,7 +129,7 @@ describe("init ordering", () => {
           proxy_http: false,
           on_startup: "restore_last_state",
           theme: "dark",
-          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https" },
+          dns: { enabled: true, servers: ["1.1.1.1"], protocol: "https", allow_insecure_bootstrap: false },
           diagnostic_plugin_tap: false,
           // Backend-owned fields present in the snapshot — must NOT round-trip.
           enabled: true,

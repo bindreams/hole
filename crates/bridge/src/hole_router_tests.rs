@@ -158,6 +158,7 @@ fn sample_dns_cfg() -> DnsConfig {
         enabled: true,
         servers: vec!["192.0.2.1".parse().unwrap()],
         protocol: DnsProtocol::PlainUdp,
+        allow_insecure_bootstrap: false,
     }
 }
 

@@ -12,7 +12,7 @@ use shadowsocks::ServerConfig;
 use shadowsocks_service::config::{
     Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -30,8 +30,12 @@ pub enum ProxyError {
     Runtime(#[from] std::io::Error),
     #[error("gateway detection failed: {0}")]
     Gateway(String),
-    #[error("DNS resolution failed for {host}: {source}")]
-    DnsResolution { host: String, source: std::io::Error },
+    /// Private DoH bootstrap could not resolve the proxy server's hostname and
+    /// `dns.allow_insecure_bootstrap` is off. PII-free `Display` (the wrapped
+    /// error names neither host nor path) so it is safe to surface verbatim to
+    /// the start-error toast; the hostname is logged at the resolve call site.
+    #[error("{0}")]
+    DohBootstrap(#[from] crate::dns::bootstrap::BootstrapError),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
     #[error("proxy already running")]
@@ -108,7 +112,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::InvalidPluginName(_)
             | ProxyError::Runtime(_)
             | ProxyError::Gateway(_)
-            | ProxyError::DnsResolution { .. }
+            | ProxyError::DohBootstrap(_)
             | ProxyError::RouteSetup(_)
             | ProxyError::WintunMissing { .. }
             | ProxyError::WintunLoad { .. }
@@ -205,11 +209,16 @@ pub const TUN_DEVICE_NAME: &str = "hole-tun";
 /// endpoint, not part of the shadowsocks protocol. No `PluginConfig` is set
 /// on the `ServerConfig` because Garter owns the plugin lifecycle.
 ///
-/// When `plugin_local` is `None`, the original server address is used as-is
-/// (no plugin, or plugin management is handled elsewhere).
+/// When `plugin_local` is `None` (bare shadowsocks), the endpoint is
+/// `server_ip` — the IP the caller already resolved over private DoH — NOT the
+/// hostname. Shadowsocks has no hostname dependency (no SNI, no cert name; AEAD
+/// keys off password+method), so dialing the resolved IP is equivalent and
+/// avoids shadowsocks-rust re-resolving the proxy domain via the OS resolver at
+/// connect time (which would leak it in plaintext DNS).
 pub fn build_ss_config(
     config: &ProxyConfig,
     plugin_local: Option<SocketAddr>,
+    server_ip: IpAddr,
     internal_socks5_port: Option<u16>,
 ) -> Result<Config, ProxyError> {
     validate_proxy_config(config)?;
@@ -236,11 +245,11 @@ pub fn build_ss_config(
         .parse()
         .map_err(|_| ProxyError::InvalidMethod(entry.method.clone()))?;
 
-    // Build server config. When a plugin chain is running, point ss-service
-    // at the chain's local port instead of the real server.
+    // Bare SS dials the DoH-resolved IP (not the hostname) so shadowsocks-rust
+    // never OS-resolves the proxy domain at connect time.
     let server_addr = match plugin_local {
         Some(addr) => ServerAddr::SocketAddr(addr),
-        None => ServerAddr::DomainName(entry.server.clone(), entry.server_port),
+        None => ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
     };
     let server_config = ServerConfig::new(server_addr, entry.password.clone(), method)
         .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;

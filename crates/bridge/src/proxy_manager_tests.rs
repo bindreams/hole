@@ -177,6 +177,9 @@ struct MockRoutingState {
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
     teardown_order: std::sync::Mutex<Vec<&'static str>>,
+    /// Last `server_ip` passed to `install`, so a test can assert the bypass
+    /// route received the DoH-resolved IP (not a system-resolved one).
+    last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
 impl Default for MockRoutingState {
@@ -192,6 +195,7 @@ impl Default for MockRoutingState {
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
+            last_install_server_ip: std::sync::Mutex::new(None),
         }
     }
 }
@@ -249,6 +253,7 @@ impl Routing for MockRouting {
         interface_name: &str,
     ) -> Result<MockRoutes, RoutingError> {
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
 
         // Match `SystemRouting::install`'s critical ordering: write the
         // state file BEFORE any route mutation (or in this case, before
@@ -406,6 +411,23 @@ fn new_manager(proxy: MockProxy) -> (ProxyManager<MockProxy, MockRouting>, tempf
     let routing = MockRouting::new(dir.path().to_path_buf());
     let pm = ProxyManager::new(proxy, routing);
     (pm, dir)
+}
+
+/// `new_manager` returning the `MockRoutingState` handle, so a test can read
+/// the `server_ip` that `install` received — without a test-only reader on the
+/// production manager API.
+fn new_manager_capturing(
+    proxy: MockProxy,
+) -> (
+    ProxyManager<MockProxy, MockRouting>,
+    Arc<MockRoutingState>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let pm = ProxyManager::new(proxy, routing);
+    (pm, state, dir)
 }
 
 /// `new_manager` variant that allows supplying a preconfigured `MockRouting`
@@ -1129,21 +1151,29 @@ fn build_config_failure_sets_last_error() {
 }
 
 #[skuld::test]
-fn dns_resolution_failure_sets_last_error() {
+fn doh_bootstrap_failure_sets_last_error() {
+    use crate::dns::bootstrap::DohQuerier;
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
         let mut config = test_config();
-        // RFC 2606 reserves .invalid for guaranteed-non-resolution.
+        // RFC 2606 reserves .invalid for guaranteed-non-resolution; the stub
+        // querier never answers, so resolve is fail-closed without any network.
         config.server.server = "test.invalid".into();
 
         let err = pm.start(&config).await.unwrap_err();
-        assert!(matches!(err, ProxyError::DnsResolution { .. }));
+        assert!(matches!(err, ProxyError::DohBootstrap(_)), "fail-closed: {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
-        assert!(
-            pm.last_error().is_some(),
-            "resolve_server_ip failure must set last_error"
-        );
-        assert!(pm.last_error().unwrap().contains("test.invalid"));
+        assert!(pm.last_error().is_some(), "DoH bootstrap failure must set last_error");
+        // last_error is the PII-free DohBootstrap Display — host is in the log, not here.
+        assert!(!pm.last_error().unwrap().contains("test.invalid"));
     });
 }
 
@@ -1696,6 +1726,183 @@ fn udp_unavailable_when_chain_reports_empty_transports() {
     assert!(!udp_available_from_chain(Some(garter::Transports::empty())));
 }
 
+// DoH bootstrap wiring ================================================================================================
+
+use crate::dns::bootstrap::DohQuerier;
+use hole_common::protocol::TunnelMode;
+
+/// Stub querier resolving exactly one hostname to one IPv4, used to prove
+/// `start_inner` resolves via DoH (not the OS) and hands the result downstream.
+struct WiringStubQuerier {
+    host: String,
+    ip: IpAddr,
+}
+
+#[async_trait::async_trait]
+impl DohQuerier for WiringStubQuerier {
+    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        // Only answer the A query (port-free: the stub keys on hostname).
+        let q = Message::from_vec(wire).ok()?;
+        let question = q.queries.first()?;
+        if question.query_type() != RecordType::A {
+            return None; // force the resolver onto the A path (IPv4-preferred).
+        }
+        let IpAddr::V4(v4) = self.ip else { return None };
+        let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+        reply.add_query(Query::query(n.clone(), RecordType::A));
+        reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+        reply.to_vec().ok()
+    }
+}
+
+fn doh_config_with_server_host(host: &str, mode: TunnelMode) -> ProxyConfig {
+    ProxyConfig {
+        server: ServerEntry {
+            id: "doh-test".into(),
+            name: "doh-test".into(),
+            server: host.into(),
+            server_port: 8388,
+            password: "test".into(),
+            method: "aes-256-gcm".into(),
+            plugin: Some("v2ray-plugin".into()),
+            plugin_opts: Some("host=example.com".into()),
+            validation: None,
+        },
+        local_port: 1080,
+        tunnel_mode: mode,
+        filters: Vec::new(),
+        dns: hole_common::config::DnsConfig {
+            enabled: false, // skip the forwarder self-test gate
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            protocol: hole_common::config::DnsProtocol::Https,
+            allow_insecure_bootstrap: false,
+        },
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
+        diagnostic_plugin_tap: false,
+    }
+}
+
+#[skuld::test]
+fn full_start_resolves_server_ip_via_doh_and_routes_with_it() {
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        // A configured plugin would spawn a real subprocess; this Full-mode
+        // assertion is about the bypass route, so use a plugin-less config — the
+        // resolve still runs above Phase 1 and feeds routing.install.
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        pm.start(&config).await.unwrap();
+        assert_eq!(
+            *rstate.last_install_server_ip.lock().unwrap(),
+            Some(expected),
+            "bypass route got the DoH-resolved IP"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn bare_ss_dials_doh_resolved_ip_not_hostname() {
+    // Bare SS (no plugin) with a HOSTNAME server: the shadowsocks ServerConfig
+    // handed to proxy.start must carry the DoH-resolved IP, not the hostname —
+    // otherwise shadowsocks-rust OS-resolves the proxy domain at connect time
+    // and re-leaks it.
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager(proxy);
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        pm.start(&config).await.unwrap();
+
+        {
+            let guard = proxy_state.last_config.lock().unwrap();
+            let ss_config = guard.as_ref().expect("proxy.start captured a config");
+            match ss_config.server[0].config.addr() {
+                shadowsocks::config::ServerAddr::SocketAddr(addr) => {
+                    assert_eq!(addr.ip(), expected, "bare-SS endpoint must be the resolved IP");
+                    assert_eq!(addr.port(), config.server.server_port);
+                }
+                other => panic!("bare-SS endpoint must be the resolved IP socket, got {other:?}"),
+            }
+        }
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
+    // SocksOnly returns early (no routing), but the plugin-chain handoff still
+    // needs the DoH-resolved IP. The plugin binary is nonexistent so the chain
+    // fails; we assert the FAILURE is the plugin spawn (resolve already ran and
+    // succeeded) — i.e. NOT a DohBootstrap error.
+    let expected: IpAddr = "203.0.113.7".parse().unwrap();
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+            host: "proxy.example".into(),
+            ip: expected,
+        }));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::SocksOnly);
+        config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Plugin(_)),
+            "expected plugin-spawn failure AFTER a successful DoH resolve, got {err:?}"
+        );
+        assert!(
+            !matches!(err, ProxyError::DohBootstrap(_)),
+            "resolve must have succeeded via the stub querier, not failed: {err:?}"
+        );
+    });
+}
+
+#[skuld::test]
+fn full_start_fails_closed_when_doh_cannot_resolve() {
+    // A stub that answers nothing → NoAnswer → DohBootstrap, hermetic (no
+    // system DNS or network).
+    struct NeverQuerier;
+    #[async_trait::async_trait]
+    impl DohQuerier for NeverQuerier {
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+    rt().block_on(async {
+        let (mut pm, rstate, _dir) = new_manager_capturing(MockProxy::new());
+        pm.set_bootstrap_querier_for_test(Arc::new(NeverQuerier));
+        let mut config = doh_config_with_server_host("proxy.example", TunnelMode::Full);
+        config.server.plugin = None;
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(
+            matches!(err, ProxyError::DohBootstrap(_)),
+            "fail-closed start error: {err:?}"
+        );
+        assert_eq!(
+            *rstate.last_install_server_ip.lock().unwrap(),
+            None,
+            "no route installed on a failed resolve"
+        );
+    });
+}
+
 // Forwarder self-test gate tests ======================================================================================
 //
 // `start_inner` runs `run_forwarder_self_test` synchronously BEFORE
@@ -1736,6 +1943,7 @@ mod self_test {
             enabled: true,
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
+            allow_insecure_bootstrap: false,
         }
     }
 
@@ -1930,6 +2138,7 @@ mod self_test {
                     enabled: true,
                     servers: vec![], // degenerate
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
                     Err(ProxyError::ForwarderSelfTestFailed {
@@ -2007,6 +2216,7 @@ mod self_test {
                     enabled: false,
                     servers: vec![],
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
                 let (ep, fwd) = match res {
@@ -2032,6 +2242,7 @@ mod self_test {
                     enabled: true,
                     servers: vec!["1.1.1.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
                 };
                 let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
                     .await
@@ -2286,6 +2497,59 @@ mod self_test {
                     assert!(
                         rewritten,
                         "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
+                    );
+                }
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    /// Leak regression: the start-time reachability probe must connect to the
+    /// DoH-resolved IP, never OS-resolve the proxy domain. The server is a
+    /// non-resolvable domain that ONLY the DoH stub maps — to the closed loopback
+    /// port — and lockdown is OFF so the probe runs. Probing the resolved IP hits
+    /// the closed port → `TcpRefused`/`TcpTimeout` → the gate reason is rewritten.
+    /// If the probe regressed to OS-resolving the domain, the lookup would fail →
+    /// `DnsFailed` verdict → `self_test_error_for` keeps the ORIGINAL reason, so
+    /// the rewrite assertion fails.
+    #[skuld::test]
+    fn probe_connects_to_doh_resolved_ip_not_hostname() {
+        rt().block_on(async {
+            // A bound-then-dropped listener: a port closed for the test's duration,
+            // so a connect there is refused (or SYN-dropped → timeout on Windows).
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+                host: "probe-leak.example".into(),
+                ip: closed.ip(),
+            }));
+
+            let mut cfg = test_config();
+            cfg.server.server = "probe-leak.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+            cfg.dns.protocol = hole_common::config::DnsProtocol::Https;
+            cfg.dns.allow_insecure_bootstrap = false;
+
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                    let rewritten = if cfg!(target_os = "windows") {
+                        reason.contains("refused") || reason.contains("did not respond")
+                    } else {
+                        reason.contains("refused")
+                    };
+                    assert!(
+                        rewritten,
+                        "probe must connect to the DoH-resolved IP (closed port → refused/timeout); \
+                         an OS-resolve of the domain would yield DnsFailed and keep the original \
+                         reason, got {reason:?}"
                     );
                 }
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),

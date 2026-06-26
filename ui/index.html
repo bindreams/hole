@@ -163,9 +163,37 @@
                     </div>
                   </div>
                 </div>
+                <div class="setting-row">
+                  <span class="setting-label" id="lbl-dns-provider">Resolver</span>
+                  <div class="setting-control">
+                    <div class="custom-select-wrap">
+                      <button type="button" class="custom-select-btn" id="select-dns-provider" aria-haspopup="listbox" aria-controls="menu-dns-provider" aria-expanded="false" aria-labelledby="lbl-dns-provider select-dns-provider">Cloudflare</button>
+                      <div class="custom-select-menu" id="menu-dns-provider" role="listbox" aria-labelledby="lbl-dns-provider">
+                        <button type="button" class="custom-select-opt selected" role="option" tabindex="-1" aria-selected="true" data-value="cloudflare">Cloudflare</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="google">Google</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="quad9">Quad9</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="opendns">OpenDNS</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="adguard">AdGuard</button>
+                        <button type="button" class="custom-select-opt" role="option" tabindex="-1" aria-selected="false" data-value="custom">Custom&hellip;</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="setting-row" id="row-dns-custom" hidden>
+                  <span class="setting-label" id="lbl-dns-servers">Resolver IPs</span>
+                  <div class="setting-control">
+                    <input class="field-input" id="input-dns-servers" type="text" value="1.1.1.1, 1.0.0.1" aria-labelledby="lbl-dns-servers" placeholder="1.1.1.1, 1.0.0.1">
+                  </div>
+                </div>
+                <div class="setting-row">
+                  <span class="setting-label" id="lbl-dns-insecure">Allow insecure bootstrap</span>
+                  <div class="setting-control">
+                    <button type="button" class="toggle" id="toggle-dns-insecure" role="switch" aria-checked="false" aria-labelledby="lbl-dns-insecure"></button>
+                  </div>
+                </div>
               </div>
               <div class="setting-row setting-note">
-                <span class="setting-label">Settings apply on reconnect. Edit the config file to change the DNS server list.</span>
+                <span class="setting-label">Settings apply on reconnect. The resolver carries DNS over the tunnel and the encrypted-SNI lookup; custom IPs are tried in order, primary first.</span>
               </div>
             </div>
           </div>

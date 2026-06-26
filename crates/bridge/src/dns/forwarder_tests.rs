@@ -109,6 +109,7 @@ fn build_cfg(protocol: DnsProtocol, servers: Vec<IpAddr>) -> DnsConfig {
         enabled: true,
         servers,
         protocol,
+        allow_insecure_bootstrap: false,
     }
 }
 
@@ -190,6 +191,7 @@ async fn plain_udp_primary_fails_secondary_succeeds() {
             enabled: true,
             servers: vec![dead_addr.ip(), live_addr.ip()],
             protocol: DnsProtocol::PlainUdp,
+            allow_insecure_bootstrap: false,
         },
         Arc::new(DirectConnector),
         true,
@@ -248,6 +250,7 @@ async fn ipv6_upstream_skipped_when_no_v6_bypass() {
             enabled: true,
             servers: vec![v6, v4_addr.ip()],
             protocol: DnsProtocol::PlainUdp,
+            allow_insecure_bootstrap: false,
         },
         Arc::new(DirectConnector),
         false, // no v6 bypass

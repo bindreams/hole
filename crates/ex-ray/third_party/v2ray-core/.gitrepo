@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/v2fly/v2ray-core
+	branch = v5.51.2
+	commit = 59950bd0b02c482ee88f4c7fe1aeb1e48db7e286
+	parent = 5a0996b6c45de75002d18f4558d49ddb93807a61
+	method = merge
+	cmdver = 0.4.9

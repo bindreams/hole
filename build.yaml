@@ -266,6 +266,23 @@ targets:
     build: cargo nextest run --no-run -p util
     run: cargo nextest run -p util
 
+  ex-ray-tests:
+    # ex-ray's Go unit tests. Run-only: `go test` compiles + runs in one step,
+    # unlike the nextest `*-tests` targets' --no-run/run split. This is the only
+    # CI that EXERCISES Go tests — prek runs golangci-lint (govet) on the ex-ray
+    # wrapper but excludes third_party/v2ray-core and runs no tests at all. It
+    # gives the ECH fail-closed gate CI teeth: ex-ray's buildTLSConfig (ech /
+    # ech-doh flags, exit-23) plus the patched vendored packages that carry the
+    # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
+    # transportcommon). Scoped to the ECH-touching packages, not the whole vendored tree (upstream's full suite is slow).
+    # Gate logic is platform-independent (domainsocket is !windows); the matrix is wide so
+    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only linux.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run:
+      - cd crates/ex-ray && go test ./...
+      - cd crates/ex-ray/third_party/v2ray-core && go test ./transport/internet/tls/... ./transport/internet/quic/... ./transport/internet/hysteria2/... ./transport/internet/transportcommon/...
+
   # ===== Lint & check targets ==============================================
   # No build phase; the tool's incremental cache is the build. Each is a
   # first-class runnable invoked via `cargo xtask run <name>`, replacing the

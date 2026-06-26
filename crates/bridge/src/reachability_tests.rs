@@ -48,12 +48,16 @@ async fn accept_then_answer() -> SocketAddr {
 fn classify_no_plugin_is_raw() {
     assert!(matches!(classify_transport(None, None, "ex.com"), ProbeTransport::Raw));
 }
-#[skuld::test(name = "reachability_tests::classify_tls_ws_uses_host_as_sni")]
-fn classify_tls_ws_uses_host_as_sni() {
-    assert!(
-        matches!(classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv"),
-        ProbeTransport::TlsWs { sni } if sni == "h.ex.com")
-    );
+#[skuld::test(name = "reachability_tests::classify_tls_ws_sni_is_connect_host_not_opt")]
+fn classify_tls_ws_sni_is_connect_host_not_opt() {
+    // A failure-only diagnostic must not emit the proxy domain in cleartext.
+    match classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv") {
+        ProbeTransport::TlsWs { sni } => {
+            assert_eq!(sni, "srv", "SNI must be the connect host");
+            assert_ne!(sni, "h.ex.com", "SNI must not leak the host= opt (domain)");
+        }
+        _ => panic!("expected TlsWs"),
+    }
 }
 #[skuld::test(name = "reachability_tests::classify_plain_ws_defaults_path_and_host")]
 fn classify_plain_ws_defaults_path_and_host() {
@@ -67,10 +71,14 @@ fn classify_plain_ws_defaults_path_and_host() {
 }
 #[skuld::test(name = "reachability_tests::classify_quic_forces_quic")]
 fn classify_quic_forces_quic() {
-    assert!(
-        matches!(classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv"),
-        ProbeTransport::Quic { sni } if sni == "h")
-    );
+    // Same no-domain-leak rule as the TLS-WS probe.
+    match classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv") {
+        ProbeTransport::Quic { sni } => {
+            assert_eq!(sni, "srv", "SNI must be the connect host");
+            assert_ne!(sni, "h", "SNI must not leak the host= opt");
+        }
+        _ => panic!("expected Quic"),
+    }
 }
 // A `.` flanked by alphanumerics on both sides — the shape of a domain label or
 // IP octet boundary (`ex.com`, `1.2.3.4`). A sentence-final `.` (followed by a

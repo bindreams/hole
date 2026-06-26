@@ -560,6 +560,20 @@ to run on mismatch. At startup galoshes extracts ex-ray to
 set) and probes it for `noexec` (statvfs/statfs) — the Linux `/tmp` fallback was
 removed because tmpfs is commonly `noexec` (#401).
 
+**Client TLS dial paths must fail closed on ECH.** Every client TLS dial path in
+the vendored `ex-ray/third_party/v2ray-core` must build its config via a factory:
+`GetTLSConfigForClient` (ECH-capable transports) or `GetTLSConfigForUnsupportedClient`
+(ECH-incapable engines: uTLS, hysteria2); only server listeners call the bare
+`GetTLSConfig`. A bare `GetTLSConfig` on a client path leaks the real SNI in
+cleartext under `ech=always`. The factory split is the load-bearing guarantee:
+once a client path goes through a factory, the require-ECH gate cannot be
+bypassed. CI enforces it two ways — the `ech=always` + unreachable-`ech-doh` ⟹
+tunnel-refused roundtrip tests in `crates/plugin-e2e/tests/roundtrip.rs` (ex-ray's
+real ws-tls + QUIC paths), and the `ex-ray-tests` job (`cargo xtask run ex-ray-tests`), whose Go unit tests exercise the per-engine fail-closed/refuse
+behavior in the vendored `transport/internet/{tls,quic,hysteria2}` packages. The
+residual is an upstream v2ray-core re-merge re-introducing a bare `GetTLSConfig`
+on a client path (the vendored tree is lint-excluded): re-verify on every re-merge.
+
 ## Prerequisites
 
 - Rust toolchain
@@ -914,9 +928,11 @@ The out-of-process plugin (`ex-ray`, `galoshes`) is otherwise invisible:
   the #248 diagnostic), `close_kind`, and `tap_conn_id`. On self-test failure the
   bridge emits a breadcrumb to the tap lines (#388). Costs a loopback round-trip
   per byte + a line per connection — not for default operation under load.
-- **Plugin debug logging (always on)** — `inject_plugin_debug_logging` appends
-  `loglevel=debug` to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`; stderr is
-  captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`.
+- **Plugin directive injection** — `inject_plugin_directives` appends
+  `loglevel=debug` (always) and `ech-doh=<resolver-DoH-url>` (when a resolver is
+  configured) to `SS_PLUGIN_OPTIONS` for `v2ray-plugin`/`ex-ray`/`galoshes`;
+  stderr is captured via `garter::binary` and filtered by `HOLE_BRIDGE_LOG`. The
+  bridge never injects `ech=<mode>` — ex-ray owns the mode (default `auto`).
 
 ## CLI (dev/admin commands)
 

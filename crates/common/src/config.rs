@@ -124,6 +124,13 @@ pub struct DnsConfig {
     pub enabled: bool,
     pub servers: Vec<IpAddr>,
     pub protocol: DnsProtocol,
+    /// Fail-open opt-out for the always-on DoH bootstrap resolve of the proxy
+    /// server's hostname. When `false` (default), a bootstrap DoH failure is a
+    /// typed, fail-closed error (clear toast); when `true`, the bridge falls
+    /// back to the OS resolver. Independent of `enabled` — bootstrap resolves
+    /// the server even when the in-TUN forwarder is off.
+    #[serde(default)]
+    pub allow_insecure_bootstrap: bool,
 }
 
 impl Default for DnsConfig {
@@ -135,6 +142,7 @@ impl Default for DnsConfig {
                 IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
             ],
             protocol: DnsProtocol::Https,
+            allow_insecure_bootstrap: false,
         }
     }
 }
