@@ -358,9 +358,9 @@ fn send_reload_receives_ack() {
     });
 }
 
-/// Spawn a mock bridge that returns 500 with an ErrorResponse for POST /start.
+/// Spawn a mock bridge that returns a 500 typed `StartError` for POST /start.
 async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
-    use hole_common::protocol::ErrorResponse;
+    use hole_common::protocol::StartError;
 
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
 
@@ -385,7 +385,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
             axum::routing::post(|| async {
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
+                    Json(StartError::Failed {
                         message: "mock start failure".to_string(),
                     }),
                 )
@@ -419,7 +419,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
 }
 
 #[skuld::test]
-fn server_error_maps_to_bridge_response_error() {
+fn start_500_maps_to_typed_start_failed() {
     rt().block_on(async {
         let path = test_socket_path("err500");
         let _mock = spawn_error_bridge(&path).await;
@@ -456,13 +456,13 @@ fn server_error_maps_to_bridge_response_error() {
             .await
             .unwrap();
         match resp {
-            BridgeResponse::Error { message } => {
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed { message }) => {
                 assert!(
                     message.contains("mock start failure"),
                     "expected error message, got: {message}"
                 );
             }
-            other => panic!("expected Error response, got {other:?}"),
+            other => panic!("expected StartFailed(Failed), got {other:?}"),
         }
     });
 }
@@ -584,83 +584,85 @@ fn absent_version_header_is_version_mismatch() {
 
 // Typed 4xx client errors =============================================================================================
 
-/// Mock serving POST /start with the given 4xx status + `ErrorResponse` body.
-async fn spawn_client_error_bridge(
+/// Stamp the bridge version header on every response (so `check_version` passes).
+fn stamp_version(router: axum::Router) -> axum::Router {
+    router.layer(axum::middleware::map_response(
+        |mut resp: axum::response::Response| async move {
+            resp.headers_mut().insert(
+                "x-hole-bridge-version",
+                axum::http::HeaderValue::from_static(hole::version::VERSION),
+            );
+            resp
+        },
+    ))
+}
+
+/// Mock serving `route` (POST) with a fixed status + `ErrorResponse` body.
+async fn spawn_route_error_bridge(
     path: &std::path::Path,
+    route: &'static str,
     status: axum::http::StatusCode,
     message: &'static str,
 ) -> tokio::task::JoinHandle<()> {
     use hole_common::protocol::ErrorResponse;
-
     let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
-    let router = axum::Router::new()
-        .route(
-            hole_common::protocol::ROUTE_START,
-            axum::routing::post(move || async move {
-                (
-                    status,
-                    Json(ErrorResponse {
-                        message: message.to_string(),
-                    }),
-                )
-            }),
-        )
-        .layer(axum::middleware::map_response(
-            |mut resp: axum::response::Response| async move {
-                resp.headers_mut().insert(
-                    "x-hole-bridge-version",
-                    axum::http::HeaderValue::from_static(hole::version::VERSION),
-                );
-                resp
-            },
-        ));
+    let router = stamp_version(axum::Router::new().route(
+        route,
+        axum::routing::post(move || async move {
+            (
+                status,
+                Json(ErrorResponse {
+                    message: message.to_string(),
+                }),
+            )
+        }),
+    ));
     serve_one(listener, router)
 }
 
-/// Drive a POST /start against a 4xx mock and return the typed result.
-async fn start_against_status(
+/// Drive POST /v1/update-apply against a mock — the update route owns the typed
+/// 4xx `ClientError` mappings (`parse_update_error`).
+async fn update_against_status(
     path: &std::path::Path,
     status: axum::http::StatusCode,
     message: &'static str,
 ) -> Result<BridgeResponse, ClientError> {
-    let _mock = spawn_client_error_bridge(path, status, message).await;
+    let _mock = spawn_route_error_bridge(path, hole_common::protocol::ROUTE_UPDATE_APPLY, status, message).await;
     let mut client = BridgeClient::connect(path).await.unwrap();
     client
-        .send(BridgeRequest::Start {
-            config: hole_common::protocol::ProxyConfig {
-                server: hole_common::config::ServerEntry {
-                    id: "id".into(),
-                    name: "S".into(),
-                    server: "1.2.3.4".into(),
-                    server_port: 8388,
-                    method: "aes-256-gcm".into(),
-                    password: "pw".into(),
-                    plugin: None,
-                    plugin_opts: None,
-                    validation: None,
-                },
-                local_port: 4073,
-                tunnel_mode: hole_common::protocol::TunnelMode::Full,
-                filters: Vec::new(),
-                dns: hole_common::config::DnsConfig {
-                    enabled: false,
-                    ..hole_common::config::DnsConfig::default()
-                },
-                proxy_socks5: true,
-                proxy_http: false,
-                local_port_http: 4074,
-                diagnostic_plugin_tap: false,
-            },
-            attempt_id: "test-attempt".into(),
+        .send(BridgeRequest::ApplyUpdate {
+            payload_path: "/tmp/x.msi".into(),
+            target_version: "9.9.9".into(),
+            consent: true,
+            sha256sums: "sums".into(),
+            sha256sums_minisig: "sig".into(),
+            asset_name: "x.msi".into(),
+            app_dest: None,
         })
         .await
+}
+
+/// Drive POST /v1/stop against a mock — a generic non-Start, non-update route
+/// (`parse_generic_error`).
+async fn stop_against_status(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> Result<BridgeResponse, ClientError> {
+    let _mock = spawn_route_error_bridge(path, hole_common::protocol::ROUTE_STOP, status, message).await;
+    let mut client = BridgeClient::connect(path).await.unwrap();
+    client.send(BridgeRequest::Stop).await
 }
 
 #[skuld::test]
 fn forbidden_maps_to_consent_required() {
     rt().block_on(async {
-        let path = test_socket_path("err403");
-        let result = start_against_status(&path, axum::http::StatusCode::FORBIDDEN, "consent is required").await;
+        let result = update_against_status(
+            &test_socket_path("err403"),
+            axum::http::StatusCode::FORBIDDEN,
+            "consent is required",
+        )
+        .await;
         match result {
             Err(ClientError::ConsentRequired { message }) => {
                 assert!(message.contains("consent"), "expected consent message, got: {message}");
@@ -673,8 +675,12 @@ fn forbidden_maps_to_consent_required() {
 #[skuld::test]
 fn conflict_maps_to_cutover_in_progress() {
     rt().block_on(async {
-        let path = test_socket_path("err409");
-        let result = start_against_status(&path, axum::http::StatusCode::CONFLICT, "a cutover is in progress").await;
+        let result = update_against_status(
+            &test_socket_path("err409"),
+            axum::http::StatusCode::CONFLICT,
+            "a cutover is in progress",
+        )
+        .await;
         match result {
             Err(ClientError::CutoverInProgress { message }) => {
                 assert!(message.contains("cutover"), "expected cutover message, got: {message}");
@@ -687,9 +693,8 @@ fn conflict_maps_to_cutover_in_progress() {
 #[skuld::test]
 fn unprocessable_maps_to_payload_verification_failed() {
     rt().block_on(async {
-        let path = test_socket_path("err422");
-        let result = start_against_status(
-            &path,
+        let result = update_against_status(
+            &test_socket_path("err422"),
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "hash mismatch on payload",
         )
@@ -706,9 +711,8 @@ fn unprocessable_maps_to_payload_verification_failed() {
 #[skuld::test]
 fn bad_request_maps_to_invalid_update_destination() {
     rt().block_on(async {
-        let path = test_socket_path("err400");
-        let result = start_against_status(
-            &path,
+        let result = update_against_status(
+            &test_socket_path("err400"),
             axum::http::StatusCode::BAD_REQUEST,
             "the update install destination is invalid",
         )
@@ -726,14 +730,149 @@ fn bad_request_maps_to_invalid_update_destination() {
 }
 
 #[skuld::test]
-fn other_4xx_maps_to_protocol() {
+fn update_other_4xx_maps_to_protocol() {
     rt().block_on(async {
-        let path = test_socket_path("err404");
-        let result = start_against_status(&path, axum::http::StatusCode::NOT_FOUND, "not found").await;
-        assert!(
-            matches!(result, Err(ClientError::Protocol(_))),
-            "expected Protocol, got: {result:?}"
+        let result =
+            update_against_status(&test_socket_path("err404"), axum::http::StatusCode::NOT_FOUND, "nope").await;
+        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+    });
+}
+
+#[skuld::test]
+fn generic_route_5xx_maps_to_error() {
+    rt().block_on(async {
+        let result = stop_against_status(
+            &test_socket_path("stop500"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "stop boom",
+        )
+        .await
+        .unwrap();
+        match result {
+            BridgeResponse::Error { message } => assert!(message.contains("stop boom"), "got {message}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    });
+}
+
+#[skuld::test]
+fn generic_route_4xx_maps_to_protocol() {
+    rt().block_on(async {
+        // A non-Start, non-update route must NOT inherit the update 4xx mappings.
+        let result = stop_against_status(&test_socket_path("stop409"), axum::http::StatusCode::CONFLICT, "nope").await;
+        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+    });
+}
+
+// Typed Start error path ==============================================================================================
+
+/// Mock serving POST /start with a raw (status, body) pair.
+async fn spawn_start_raw(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    body: String,
+) -> tokio::task::JoinHandle<()> {
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    let router = stamp_version(axum::Router::new().route(
+        hole_common::protocol::ROUTE_START,
+        axum::routing::post(move || async move { (status, body) }),
+    ));
+    serve_one(listener, router)
+}
+
+async fn start_raw(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    body: &str,
+) -> Result<BridgeResponse, ClientError> {
+    let _m = spawn_start_raw(path, status, body.to_string()).await;
+    let mut c = BridgeClient::connect(path).await.unwrap();
+    c.send(BridgeRequest::Start {
+        config: hole_common::protocol::ProxyConfig::default(),
+        attempt_id: "a".into(),
+    })
+    .await
+}
+
+#[skuld::test]
+fn start_409_maps_to_concurrent_start() {
+    rt().block_on(async {
+        let r = start_raw(
+            &test_socket_path("s409"),
+            axum::http::StatusCode::CONFLICT,
+            r#"{"message":"start already in progress"}"#,
+        )
+        .await;
+        assert!(matches!(r, Err(ClientError::ConcurrentStart)), "got {r:?}");
+    });
+}
+
+#[skuld::test]
+fn start_500_typed_body_parses() {
+    rt().block_on(async {
+        let r = start_raw(
+            &test_socket_path("s500t"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"kind":"network_blocked"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::NetworkBlocked)
         );
+    });
+}
+
+#[skuld::test]
+fn start_500_unparseable_body_falls_back() {
+    rt().block_on(async {
+        let r = start_raw(
+            &test_socket_path("s500j"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "not json",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed {
+                message: "unknown error".into()
+            })
+        );
+    });
+}
+
+#[skuld::test]
+fn start_500_oversized_body_is_read_failure() {
+    rt().block_on(async {
+        let r = start_raw(
+            &test_socket_path("s500big"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &"x".repeat(2 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r,
+            BridgeResponse::StartFailed(hole_common::protocol::StartError::Failed {
+                message: "failed to read error response".into()
+            })
+        );
+    });
+}
+
+#[skuld::test]
+fn start_unexpected_status_is_protocol_error() {
+    rt().block_on(async {
+        // A framework status (e.g. a body-limit 413) is NOT a typed StartError.
+        let r = start_raw(
+            &test_socket_path("s413"),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "length limit exceeded",
+        )
+        .await;
+        assert!(matches!(r, Err(ClientError::Protocol(_))), "got {r:?}");
     });
 }
 

@@ -377,14 +377,11 @@ fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+// Generic arm so the crate compiles on Linux, where `xtask` reuses the protocol
+// types/consts. Hole itself only runs on Windows + macOS.
+#[cfg(not(target_os = "macos"))]
 fn ensure_config_dir(parent: &Path) -> Result<(), ConfigError> {
     std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir { source })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn ensure_config_dir(_parent: &Path) -> Result<(), ConfigError> {
-    compile_error!("save() is not implemented for this platform");
 }
 
 #[cfg(test)]

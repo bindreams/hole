@@ -10,8 +10,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use hole_common::protocol::{
-    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StatusResponse,
-    TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, CANCELLED_MESSAGE, ROUTE_CANCEL,
+    DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
+    StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
     ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
     ROUTE_TEST_SERVER, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
@@ -296,11 +296,33 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     })
 }
 
+/// Error side of `handle_start`: a control-plane 409 carries a generic
+/// `ErrorResponse`; an actual start failure (500) carries the typed `StartError`.
+enum StartHandlerError {
+    Concurrent,
+    Failed(StartError),
+}
+
+impl axum::response::IntoResponse for StartHandlerError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            StartHandlerError::Concurrent => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "start already in progress".to_string(),
+                }),
+            )
+                .into_response(),
+            StartHandlerError::Failed(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(e)).into_response(),
+        }
+    }
+}
+
 async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     headers: axum::http::HeaderMap,
     Json(config): Json<ProxyConfig>,
-) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<EmptyResponse>, StartHandlerError> {
     let attempt_id = attempt_id_from(&headers);
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
@@ -312,12 +334,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         if !attempt_id.is_empty() && cs.pre_armed.as_deref() == Some(attempt_id.as_str()) {
             cs.pre_armed = None;
             info!("start request consumed pre-armed cancel for its attempt");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    message: CANCELLED_MESSAGE.to_string(),
-                }),
-            ));
+            return Err(StartHandlerError::Failed(StartError::Cancelled));
         }
         // 2. Single-occupancy: reject a concurrent start. Checked BEFORE the
         //    self-heal below — this ordering is load-bearing, so a *rejected*
@@ -325,12 +342,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         //    slot would also orphan the in-flight start from a future Cancel.
         if cs.in_flight.is_some() {
             warn!("concurrent start request rejected — another start is already in flight");
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    message: "start already in progress".to_string(),
-                }),
-            ));
+            return Err(StartHandlerError::Concurrent);
         }
         // 3. Self-heal: a proceeding start that did NOT match supersedes any
         //    stale arm. A start carrying a different id is, by definition, not
@@ -364,18 +376,12 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 
     match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
-        Err(ProxyError::Cancelled) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: CANCELLED_MESSAGE.to_string(),
-            }),
-        )),
         Err(e) => {
-            error!(error = %e, "proxy start failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { message: e.to_string() }),
-            ))
+            // AlreadyRunning is success-equivalent GUI-side; Cancelled is user-asked.
+            if !matches!(e, ProxyError::Cancelled | ProxyError::AlreadyRunning) {
+                error!(error = %e, "proxy start failed");
+            }
+            Err(StartHandlerError::Failed((&e).into()))
         }
     }
 }

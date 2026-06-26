@@ -58,12 +58,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EmptyResponse"
-        "500":
-          description: Failed to start proxy
+        "409":
+          description: A start is already in flight (concurrent-start, control-plane rejection)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: The start failed; the body is the typed StartError
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartError"
 
   /v1/stop:
     post:
@@ -325,6 +331,21 @@ components:
       required:
         - message
       properties:
+        message:
+          type: string
+
+    StartError:
+      type: object
+      description: |
+        Not code-generated; see protocol.rs::StartError. Tagged union with a `kind`
+        discriminator: cancelled, already_running, network_blocked, failed {message}.
+        Concurrent-start is surfaced client-side as ClientError::ConcurrentStart (a
+        generic ErrorResponse on the 409).
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
         message:
           type: string
 

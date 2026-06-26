@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
   "files": {
-    "includes": ["ui/**", "!!ui/dist/**", "tests/**"],
+    "includes": ["ui/**", "!!ui/dist/**", "!!ui/generated.ts", "tests/**"],
     "experimentalScannerIgnores": ["external/**", "target/**", ".worktrees/**", ".superpowers/**"]
   },
   "formatter": {

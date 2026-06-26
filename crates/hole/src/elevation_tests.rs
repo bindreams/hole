@@ -191,8 +191,16 @@ fn result_target() -> tempfile::TempPath {
 }
 
 fn outcome_samples() -> Vec<ElevatedOutcome> {
+    use hole_common::protocol::StartError;
     vec![
         ElevatedOutcome::Success,
+        ElevatedOutcome::StartFailed {
+            error: StartError::NetworkBlocked,
+        },
+        ElevatedOutcome::StartFailed {
+            error: StartError::Failed { message: "boom".into() },
+        },
+        ElevatedOutcome::ConcurrentStart,
         ElevatedOutcome::BridgeError {
             message: "invalid cipher method: aes-999".into(),
         },
@@ -253,13 +261,50 @@ fn read_result_file_garbage_is_err() {
 // classify_elevated_send ==============================================================================================
 
 use super::classify_elevated_send;
-use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
+use crate::bridge_client::ClientError;
+use hole_common::protocol::{BridgeResponse, StartError};
 
 #[skuld::test]
 fn classify_ack_is_success() {
     assert_eq!(
         classify_elevated_send(&Ok(BridgeResponse::Ack)),
         ElevatedOutcome::Success
+    );
+}
+
+#[skuld::test]
+fn classify_unexpected_ok_is_success() {
+    // Any accepted non-error response (e.g. a Status query via ipc-send) means the
+    // bridge honored the request — a success, never a user-facing error.
+    let r = Ok(BridgeResponse::Status {
+        running: true,
+        uptime_secs: 0,
+        error: None,
+        invalid_filters: Vec::new(),
+        udp_proxy_available: true,
+        ipv6_bypass_available: true,
+        lockdown_enabled: false,
+        lockdown_active: false,
+    });
+    assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);
+}
+
+#[skuld::test]
+fn classify_start_failed_network_blocked_is_typed() {
+    let r = Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked));
+    assert_eq!(
+        classify_elevated_send(&r),
+        ElevatedOutcome::StartFailed {
+            error: StartError::NetworkBlocked
+        }
+    );
+}
+
+#[skuld::test]
+fn classify_concurrent_start_is_typed() {
+    assert_eq!(
+        classify_elevated_send(&Err(ClientError::ConcurrentStart)),
+        ElevatedOutcome::ConcurrentStart
     );
 }
 
@@ -278,19 +323,15 @@ fn classify_bridge_error_carries_raw_message() {
 
 #[skuld::test]
 fn classify_bridge_cancel_is_success_not_error() {
-    // The no-relabel guard: a bridge-side cancel must never become a BridgeError
+    // The no-relabel guard: a bridge-side cancel must never become a failure
     // (and thus never a "denied" toast).
-    let r = Ok(BridgeResponse::Error {
-        message: CANCELLED_MESSAGE.into(),
-    });
+    let r = Ok(BridgeResponse::StartFailed(StartError::Cancelled));
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);
 }
 
 #[skuld::test]
 fn classify_already_running_is_success() {
-    let r = Ok(BridgeResponse::Error {
-        message: "proxy already running".into(),
-    });
+    let r = Ok(BridgeResponse::StartFailed(StartError::AlreadyRunning));
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);
 }
 
@@ -311,13 +352,14 @@ fn classify_stop_error_is_bridge_error() {
 
 #[skuld::test]
 fn classify_transport_err_is_transport() {
-    let r: Result<BridgeResponse, String> = Err("failed to connect to bridge: refused".into());
-    assert_eq!(
-        classify_elevated_send(&r),
-        ElevatedOutcome::Transport {
-            detail: "failed to connect to bridge: refused".into()
-        }
-    );
+    let r: Result<BridgeResponse, ClientError> = Err(ClientError::Connection(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "refused",
+    )));
+    match classify_elevated_send(&r) {
+        ElevatedOutcome::Transport { detail } => assert!(detail.contains("refused"), "got {detail}"),
+        other => panic!("expected Transport, got {other:?}"),
+    }
 }
 
 // elevation_result_from ===============================================================================================

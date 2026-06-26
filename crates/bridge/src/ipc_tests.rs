@@ -1033,14 +1033,13 @@ fn start_failure_returns_error() {
         let mut client = TestClient::connect(&path).await;
         let resp = post_start(&mut client, &sample_config(), "t").await;
 
-        assert_eq!(resp.status(), 500);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert!(
-            err.message.contains("mock failure"),
-            "expected mock failure message, got: {}",
-            err.message
-        );
+        match start_error_body(resp).await {
+            StartError::Failed { message } => assert!(
+                message.contains("mock failure"),
+                "expected mock failure message, got: {message}"
+            ),
+            other => panic!("expected StartError::Failed, got {other:?}"),
+        }
 
         drop(client);
         handle.abort();
@@ -1493,12 +1492,11 @@ fn status_error_excludes_failed_start_detail() {
 
 // Cancel tests ========================================================================================================
 
-/// Extract the `message` field from a 500 `ErrorResponse`.
-async fn error_message(resp: http::Response<hyper::body::Incoming>) -> String {
-    assert_eq!(resp.status(), 500, "expected 500 for cancelled start");
+/// Parse the typed `StartError` from a Start-route 500 body.
+async fn start_error_body(resp: http::Response<hyper::body::Incoming>) -> StartError {
+    assert_eq!(resp.status(), 500, "expected 500 for a failed start");
     let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
-    err.message
+    serde_json::from_slice(&body).unwrap()
 }
 
 #[skuld::test]
@@ -1546,7 +1544,7 @@ fn cancel_while_start_in_flight_returns_cancelled() {
         // start_future hangs forever and the test framework's overall
         // timeout surfaces the failure.
         let (_client_a, resp_a) = start_future.await.expect("start task panicked");
-        assert_eq!(error_message(resp_a).await, CANCELLED_MESSAGE);
+        assert_eq!(start_error_body(resp_a).await, StartError::Cancelled);
 
         // Release the gate so the mock's start() future can settle if it
         // is still parked anywhere; harmless no-op if already dropped.
@@ -1580,7 +1578,7 @@ fn cancel_before_start_is_pre_armed_and_consumed() {
         // Start carrying the SAME attempt id A — rejected as cancelled,
         // consuming the named pre-arm.
         let start_resp = post_start(&mut client, &sample_config(), "A").await;
-        assert_eq!(error_message(start_resp).await, CANCELLED_MESSAGE);
+        assert_eq!(start_error_body(start_resp).await, StartError::Cancelled);
 
         // A second start (a different attempt B) with no pre-arm succeeds.
         assert_eq!(consume(post_start(&mut client, &sample_config(), "B").await).await, 200);
@@ -1664,7 +1662,7 @@ fn concurrent_start_is_rejected_with_conflict() {
         // A's start must return Cancelled. If cancellation regresses,
         // a_future hangs and the test framework's timeout surfaces it.
         let (_client_a, a_resp) = a_future.await.expect("A task panicked");
-        assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
+        assert_eq!(start_error_body(a_resp).await, StartError::Cancelled);
 
         gate.notify_one();
         handle.abort();
@@ -1723,7 +1721,7 @@ fn named_prearm_still_cancels_its_own_attempt() {
 
         assert_eq!(consume(post_cancel(&mut client, "A").await).await, 200); // pre-arm A
         let start = post_start(&mut client, &sample_config(), "A").await; // same id
-        assert_eq!(error_message(start).await, CANCELLED_MESSAGE);
+        assert_eq!(start_error_body(start).await, StartError::Cancelled);
         // A fresh attempt afterward succeeds (the arm was a one-shot for A).
         assert_eq!(consume(post_start(&mut client, &sample_config(), "B").await).await, 200);
 
@@ -1838,7 +1836,7 @@ fn concurrent_double_cancel_during_start_both_succeed() {
         // A's start returns Cancelled. If cancellation regresses,
         // a_future hangs and the test framework's timeout surfaces it.
         let (_client_a, a_resp) = a_future.await.expect("A task panicked");
-        assert_eq!(error_message(a_resp).await, CANCELLED_MESSAGE);
+        assert_eq!(start_error_body(a_resp).await, StartError::Cancelled);
 
         gate.notify_one();
         handle.abort();
