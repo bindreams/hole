@@ -997,10 +997,6 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     println!("proxy started on local_port {local_port}");
                     0
                 }
-                Ok(BridgeResponse::Error { message }) => {
-                    cli_log!(error, "bridge rejected start: {message}");
-                    1
-                }
                 Ok(BridgeResponse::StartFailed(e)) => {
                     use hole_common::protocol::StartError;
                     match &e {
