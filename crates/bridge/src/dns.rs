@@ -4,6 +4,7 @@
 //! See `CLAUDE.md` ("UDP policy" + "Crash recovery") for the architectural
 //! context.
 
+pub mod bootstrap;
 pub mod connector;
 pub mod forwarder;
 pub mod providers;
