@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
+#[cfg(target_os = "macos")]
+use skuld::temp_dir;
 
 fn sample_windows_state() -> DnsState {
     DnsState {
@@ -54,7 +56,7 @@ fn sample_macos_state() -> DnsState {
 fn save_then_load_roundtrip_windows() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_windows_state();
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -63,7 +65,7 @@ fn save_then_load_roundtrip_windows() {
 fn save_then_load_roundtrip_macos() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_macos_state();
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -76,7 +78,7 @@ fn save_then_load_roundtrip_empty_advertised() {
         advertised: vec![],
         adapters: vec![],
     };
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -242,7 +244,7 @@ fn save_then_load_roundtrip_ipv6_advertised() {
         advertised: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
         adapters: vec![],
     };
-    save(dir.path(), &state).unwrap();
+    save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -251,10 +253,10 @@ fn save_then_load_roundtrip_ipv6_advertised() {
 fn save_overwrites_prior_file() {
     let dir = tempfile::tempdir().unwrap();
     let first = sample_windows_state();
-    save(dir.path(), &first).unwrap();
+    save(dir.path(), &first, None).unwrap();
 
     let second = sample_macos_state();
-    save(dir.path(), &second).unwrap();
+    save(dir.path(), &second, None).unwrap();
 
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, second);
@@ -265,8 +267,8 @@ fn save_leaves_no_stray_temp_files() {
     // Guards against a future refactor that replaces `NamedTempFile` with
     // a manual write+rename that leaks `.tmpXXX` siblings.
     let dir = tempfile::tempdir().unwrap();
-    save(dir.path(), &sample_windows_state()).unwrap();
-    save(dir.path(), &sample_macos_state()).unwrap();
+    save(dir.path(), &sample_windows_state(), None).unwrap();
+    save(dir.path(), &sample_macos_state(), None).unwrap();
     let entries: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -283,7 +285,7 @@ fn clear_missing_is_ok() {
 #[skuld::test]
 fn clear_existing_removes_file() {
     let dir = tempfile::tempdir().unwrap();
-    save(dir.path(), &sample_windows_state()).unwrap();
+    save(dir.path(), &sample_windows_state(), None).unwrap();
     assert!(dir.path().join(STATE_FILE_NAME).exists());
     clear(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
@@ -293,11 +295,27 @@ fn clear_existing_removes_file() {
 fn save_creates_missing_dir() {
     let parent = tempfile::tempdir().unwrap();
     let nested = parent.path().join("a").join("b").join("c");
-    save(&nested, &sample_windows_state()).unwrap();
+    save(&nested, &sample_windows_state(), None).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }
 
 #[skuld::test]
 fn state_file_name_is_bridge_dns_json() {
     assert_eq!(STATE_FILE_NAME, "bridge-dns.json");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn save_chowns_dir_and_file_when_owner_set(#[fixture(temp_dir)] dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let (uid, gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let state = crate::dns_state::DnsState {
+        version: crate::dns_state::SCHEMA_VERSION,
+        advertised: vec![],
+        adapters: vec![],
+    };
+    crate::dns_state::save(dir, &state, Some((uid, gid))).unwrap();
+    let f = dir.join(crate::dns_state::STATE_FILE_NAME);
+    assert!(f.exists());
+    assert_eq!(std::fs::metadata(&f).unwrap().uid(), uid);
 }

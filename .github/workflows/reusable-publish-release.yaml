@@ -80,7 +80,7 @@ jobs:
 
       # dry-run branch: checkout, install Rust, run dry-run, exit.
       # No draft verification, no crates.io publish, no GitHub release edit.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: ${{ inputs.dry-run && inputs.crates-publish }}
         with:
           fetch-depth: 0
@@ -150,7 +150,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
         with:
           fetch-depth: 0

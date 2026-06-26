@@ -65,7 +65,7 @@ fn post_bind_sweep_clears_marker() {
         started_at_unix: 0,
     };
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &marker).unwrap();
+    hole_common::update_marker::write(dir.path(), &marker, None).unwrap();
     super::sweep_marker(dir.path());
     assert!(hole_common::update_marker::read(dir.path()).is_none());
     super::sweep_marker(dir.path()); // idempotent: absent marker is a no-op

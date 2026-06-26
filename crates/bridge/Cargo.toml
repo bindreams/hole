@@ -98,6 +98,10 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
+# QUIC reachability probe. quinn 0.11/quinn-proto 0.11 pin rustls 0.23
+# with the `quic` feature, which unifies additively with the workspace rustls
+# (ring provider) — no second rustls in the tree.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -144,8 +148,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # sentinel, the garter-based roundtrip driver, binary locators). Brings
 # shadowsocks-service's `server` feature + rcgen + base64 transitively.
 plugin-e2e = { path = "../plugin-e2e" }
-# Loopback-TLS DoH-bootstrap e2e needs an IP-SAN leaf cert (plugin-e2e's
-# `certs` only issues a DNS-SAN cert); declared directly to name `rcgen::`.
+# The loopback-TLS DoH-bootstrap e2e needs an IP-SAN leaf cert (plugin-e2e's
+# `certs` only issues a DNS-SAN cert), and the quinn server fixture in
+# reachability_tests needs a self-signed cert. Declared directly to name `rcgen::`.
 rcgen = "0.14"
 rand = "0.10"
 # Used by `test_support::net_discovery` for primary IPv4 detection in TUN tests.

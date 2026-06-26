@@ -24,9 +24,10 @@ pub fn run(
     log_dir: &Path,
     ready_notify: Option<&str>,
     version: &str,
+    owner: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify, version))
+    rt.block_on(run_inner(socket_path, state_dir, log_dir, ready_notify, version, owner))
 }
 
 /// Resolve when a shutdown signal arrives: Ctrl+C (SIGINT) everywhere,
@@ -120,10 +121,15 @@ async fn run_inner(
     log_dir: &Path,
     ready_notify: Option<&str>,
     version: &str,
+    owner: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
-        ProxyManager::new(ShadowsocksProxy::new(), SystemRouting::new(state_dir.to_path_buf()))
-            .with_state_dir(state_dir.to_path_buf()),
+        ProxyManager::new(
+            ShadowsocksProxy::new(),
+            SystemRouting::new(state_dir.to_path_buf(), owner),
+        )
+        .with_state_dir(state_dir.to_path_buf())
+        .with_state_owner(owner),
     ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
@@ -135,6 +141,7 @@ async fn run_inner(
         version,
         log_dir.to_path_buf(),
         state_dir.to_path_buf(),
+        owner,
     )?;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a

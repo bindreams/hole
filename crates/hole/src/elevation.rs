@@ -118,7 +118,13 @@ pub enum ElevatedOutcome {
     /// Bridge accepted the request (Ack/Status/...) or a bridge-side
     /// cancelled/already-running Start: the confirming Status drives the tray.
     Success,
-    /// Bridge was reached but rejected the request. Raw, toast-ready.
+    /// A typed start failure (NetworkBlocked / Failed); the parent renders it via
+    /// `tray::start_error_toast`.
+    StartFailed { error: hole_common::protocol::StartError },
+    /// A concurrent-start rejection (409): the bridge was reached and refused.
+    ConcurrentStart,
+    /// Bridge was reached but rejected the request (a generic/Stop error). Raw,
+    /// toast-ready.
     BridgeError { message: String },
     /// Ran elevated but could not reach the bridge. Raw, toast-ready.
     Transport { detail: String },
@@ -138,23 +144,32 @@ pub fn read_result_file(path: &std::path::Path) -> std::io::Result<ElevatedOutco
     serde_json::from_str(&content).map_err(std::io::Error::other)
 }
 
-/// Map the child's send result into the on-wire outcome. Classifies on the RAW
-/// bridge message (cancel / already-running tokens are not real failures). The
-/// message is carried verbatim: it is authored by the bridge running as a system
-/// account (LocalSystem / root) with system-scoped paths, and `ProxyConfig`
-/// carries no path field, so it cannot contain user PII (#475).
-pub fn classify_elevated_send(result: &Result<hole_common::protocol::BridgeResponse, String>) -> ElevatedOutcome {
-    use crate::state::{classify_start_error, StartErrorKind};
-    use hole_common::protocol::BridgeResponse;
+/// Map the child's send result into the on-wire outcome the parent reads back. A
+/// typed `StartFailed`/`ConcurrentStart` crosses the result-file boundary so the
+/// parent renders the same toast the non-elevated path would. A bridge message is
+/// carried verbatim: it is authored by the bridge running as a system account with
+/// system-scoped paths, and `ProxyConfig` carries no path field, so it cannot
+/// contain user PII (#475).
+pub fn classify_elevated_send(
+    result: &Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError>,
+) -> ElevatedOutcome {
+    use crate::bridge_client::ClientError;
+    use hole_common::protocol::{BridgeResponse, StartError};
     match result {
-        Ok(BridgeResponse::Error { message }) => match classify_start_error(message) {
-            StartErrorKind::Cancelled | StartErrorKind::AlreadyRunning => ElevatedOutcome::Success,
-            StartErrorKind::Other => ElevatedOutcome::BridgeError {
-                message: message.clone(),
-            },
+        Ok(BridgeResponse::StartFailed(e)) => match e {
+            StartError::Cancelled | StartError::AlreadyRunning => ElevatedOutcome::Success,
+            StartError::NetworkBlocked | StartError::Failed { .. } => ElevatedOutcome::StartFailed { error: e.clone() },
         },
+        Ok(BridgeResponse::Error { message }) => ElevatedOutcome::BridgeError {
+            message: message.clone(),
+        },
+        // Any other accepted response (Ack, or a query result) means the bridge
+        // honored the request — a success.
         Ok(_) => ElevatedOutcome::Success,
-        Err(detail) => ElevatedOutcome::Transport { detail: detail.clone() },
+        Err(ClientError::ConcurrentStart) => ElevatedOutcome::ConcurrentStart,
+        Err(detail) => ElevatedOutcome::Transport {
+            detail: detail.to_string(),
+        },
     }
 }
 
@@ -163,6 +178,8 @@ pub fn classify_elevated_send(result: &Result<hole_common::protocol::BridgeRespo
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElevationResult {
     Success,
+    StartFailed(hole_common::protocol::StartError),
+    ConcurrentStart,
     BridgeError(String),
     Transport(String),
     Cancelled,
@@ -180,6 +197,8 @@ pub fn elevation_result_from(
     if let Some(outcome) = file {
         return match outcome {
             ElevatedOutcome::Success => ElevationResult::Success,
+            ElevatedOutcome::StartFailed { error } => ElevationResult::StartFailed(error),
+            ElevatedOutcome::ConcurrentStart => ElevationResult::ConcurrentStart,
             ElevatedOutcome::BridgeError { message } => ElevationResult::BridgeError(message),
             ElevatedOutcome::Transport { detail } => ElevationResult::Transport(detail),
         };

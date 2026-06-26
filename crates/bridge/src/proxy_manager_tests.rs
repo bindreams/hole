@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
+use crate::reachability::ReachabilityVerdict;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
@@ -203,7 +204,7 @@ struct MockRouting {
     state: Arc<MockRoutingState>,
     /// Directory where the crash-recovery state file is written. Each
     /// `MockRouting` owns its own `state_dir` — in production,
-    /// `SystemRouting::new(state_dir)` does the same. Tests hand the
+    /// `SystemRouting::new(state_dir, owner)` does the same. Tests hand the
     /// routing a `TempDir` (see `new_manager`) to keep writes isolated.
     state_dir: PathBuf,
     gateway: IpAddr,
@@ -264,7 +265,7 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
         };
-        route_state::save(&self.state_dir, &persisted)
+        route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
 
         if self.state.fail_install.load(Ordering::SeqCst) {
@@ -450,7 +451,7 @@ fn new_manager_with_lockdown(
     dir: tempfile::TempDir,
     enabled: bool,
 ) -> (ProxyManager<MockProxy, MockRouting>, tempfile::TempDir) {
-    lockdown_state::set_enabled(dir.path(), enabled).unwrap();
+    lockdown_state::set_enabled(dir.path(), enabled, None).unwrap();
     let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
     (pm, dir)
 }
@@ -1545,6 +1546,7 @@ fn dns_apply_emits_done_info_log() {
                     vec!["hole-test-nonexistent-iface-xyz".into()],
                     vec![],
                     None,
+                    None,
                     CancellationToken::new(),
                 )
                 .await
@@ -1614,6 +1616,7 @@ fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
                     vec!["hole-p4-test-upstream-xyz".into()],
                     vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
+                    None,
                     None,
                     CancellationToken::new(),
                 )
@@ -2351,5 +2354,233 @@ mod self_test {
             assert_eq!(pm.state(), ProxyState::Running);
             pm.stop().await.unwrap();
         });
+    }
+
+    // Self-test verdict → error mapping (live-Connect reason rewrite) -------------------------------------------------
+    //
+    // `self_test_error_for` is the pure mapping from a reachability verdict to the
+    // `ProxyError` surfaced to the toast: `Blocked` becomes the typed
+    // `NetworkBlocked`; `TcpRefused`/`TcpTimeout` rewrite the reason; everything
+    // else keeps the original self-test reason. No real TUN / bridge start needed.
+
+    fn original_reason() -> String {
+        "attempt 3 timed out".to_string()
+    }
+
+    #[skuld::test]
+    fn self_test_error_blocked_is_network_blocked() {
+        let e = self_test_error_for(Some(ReachabilityVerdict::Blocked), 3, 200, original_reason());
+        assert!(
+            matches!(e, ProxyError::NetworkBlocked),
+            "Blocked must map to the typed NetworkBlocked, got {e:?}"
+        );
+    }
+
+    #[skuld::test]
+    fn self_test_error_tcp_refused_rewrites_reason() {
+        let e = self_test_error_for(Some(ReachabilityVerdict::TcpRefused), 3, 200, original_reason());
+        match e {
+            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                assert!(reason.contains("refused"), "got {reason:?}");
+            }
+            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+        }
+    }
+
+    #[skuld::test]
+    fn self_test_error_tcp_timeout_rewrites_reason() {
+        let e = self_test_error_for(Some(ReachabilityVerdict::TcpTimeout), 3, 200, original_reason());
+        match e {
+            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                assert!(reason.contains("did not respond"), "got {reason:?}");
+            }
+            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+        }
+    }
+
+    #[skuld::test]
+    fn self_test_error_reachable_keeps_original() {
+        let e = self_test_error_for(Some(ReachabilityVerdict::Reachable), 3, 200, original_reason());
+        match e {
+            ProxyError::ForwarderSelfTestFailed {
+                reason,
+                attempts,
+                elapsed_ms,
+            } => {
+                assert_eq!(reason, original_reason());
+                assert_eq!(attempts, 3);
+                assert_eq!(elapsed_ms, 200);
+            }
+            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+        }
+    }
+
+    #[skuld::test]
+    fn self_test_error_inconclusive_keeps_original() {
+        let e = self_test_error_for(Some(ReachabilityVerdict::Inconclusive), 3, 200, original_reason());
+        match e {
+            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
+            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+        }
+    }
+
+    #[skuld::test]
+    fn self_test_error_none_keeps_original() {
+        let e = self_test_error_for(None, 3, 200, original_reason());
+        match e {
+            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
+            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+        }
+    }
+
+    /// A server config whose `server` points at a closed loopback port, so the
+    /// out-of-band probe (no plugin → Raw transport) terminates fast with a
+    /// closed-port verdict (`TcpRefused`, or `TcpTimeout` on a Windows runner
+    /// that SYN-drops) and the self-test gate fails (MockProxy binds no listener
+    /// for the forwarder). Returns the (manager, config) ready to drive the gate.
+    fn gate_failure_setup(lockdown: bool) -> (ProxyManager<MockProxy, MockRouting>, ProxyConfig, tempfile::TempDir) {
+        // A bound-then-dropped listener yields a port that is closed for the test's
+        // duration, so a connect there is refused, not accepted.
+        let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe_l.local_addr().unwrap();
+        drop(probe_l);
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+
+        let mut cfg = test_config();
+        cfg.server.server = closed.ip().to_string();
+        cfg.server.server_port = closed.port();
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+        (pm, cfg, dir)
+    }
+
+    /// cover-skip: with the lockdown intent ON, the gate must NOT run the probe
+    /// (a standing kill-switch cover would block it and we'd mis-report Hole's own
+    /// lockdown as censorship). The probe would rewrite the reason to "refused";
+    /// with the probe skipped the ORIGINAL self-test reason survives.
+    #[skuld::test]
+    fn lockdown_on_skips_probe_keeps_original_reason() {
+        rt().block_on(async {
+            let (mut pm, cfg, _dir) = gate_failure_setup(true);
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
+                    !reason.contains("refused"),
+                    "lockdown-on must skip the probe and keep the original reason, got {reason:?}"
+                ),
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    /// Control: with lockdown OFF the probe DOES run, so the same closed-port
+    /// server rewrites the reason to the probe's verdict — proving the
+    /// lockdown-on skip above is load-bearing, not vacuous. The closed port is
+    /// refused on most kernels (`TcpRefused`) but SYN-dropped on Windows GitHub
+    /// runners (`TcpTimeout` → "did not respond"); either rewrite proves the
+    /// probe ran.
+    #[skuld::test]
+    fn lockdown_off_runs_probe_rewrites_reason() {
+        rt().block_on(async {
+            let (mut pm, cfg, _dir) = gate_failure_setup(false);
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                    let rewritten = if cfg!(target_os = "windows") {
+                        reason.contains("refused") || reason.contains("did not respond")
+                    } else {
+                        reason.contains("refused")
+                    };
+                    assert!(
+                        rewritten,
+                        "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
+                    );
+                }
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    /// Leak regression: the start-time reachability probe must connect to the
+    /// DoH-resolved IP, never OS-resolve the proxy domain. The server is a
+    /// non-resolvable domain that ONLY the DoH stub maps — to the closed loopback
+    /// port — and lockdown is OFF so the probe runs. Probing the resolved IP hits
+    /// the closed port → `TcpRefused`/`TcpTimeout` → the gate reason is rewritten.
+    /// If the probe regressed to OS-resolving the domain, the lookup would fail →
+    /// `DnsFailed` verdict → `self_test_error_for` keeps the ORIGINAL reason, so
+    /// the rewrite assertion fails.
+    #[skuld::test]
+    fn probe_connects_to_doh_resolved_ip_not_hostname() {
+        rt().block_on(async {
+            // A bound-then-dropped listener: a port closed for the test's duration,
+            // so a connect there is refused (or SYN-dropped → timeout on Windows).
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(WiringStubQuerier {
+                host: "probe-leak.example".into(),
+                ip: closed.ip(),
+            }));
+
+            let mut cfg = test_config();
+            cfg.server.server = "probe-leak.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+            cfg.dns.protocol = hole_common::config::DnsProtocol::Https;
+            cfg.dns.allow_insecure_bootstrap = false;
+
+            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => {
+                    let rewritten = if cfg!(target_os = "windows") {
+                        reason.contains("refused") || reason.contains("did not respond")
+                    } else {
+                        reason.contains("refused")
+                    };
+                    assert!(
+                        rewritten,
+                        "probe must connect to the DoH-resolved IP (closed port → refused/timeout); \
+                         an OS-resolve of the domain would yield DnsFailed and keep the original \
+                         reason, got {reason:?}"
+                    );
+                }
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    /// End-to-end-ish: a TLS-transport endpoint that accepts TCP then resets the
+    /// handshake → the live probe verdict is `Blocked` → `self_test_error_for`
+    /// yields the typed `NetworkBlocked`.
+    #[skuld::test(name = "proxy_manager_tests::reset_endpoint_maps_to_network_blocked")]
+    async fn reset_endpoint_maps_to_network_blocked() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                drop(s);
+            }
+        });
+        let verdict = crate::reachability::probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some("tls;host=h"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(verdict, ReachabilityVerdict::Blocked);
+        assert!(matches!(
+            self_test_error_for(Some(verdict), 3, 200, original_reason()),
+            ProxyError::NetworkBlocked
+        ));
     }
 }

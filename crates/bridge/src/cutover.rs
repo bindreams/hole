@@ -108,7 +108,7 @@ pub fn unlock() -> std::io::Result<()> {
 /// the intent flips off ONLY after the disengage confirms success.
 fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     disengage()?;
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false)
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
 
 #[cfg(test)]

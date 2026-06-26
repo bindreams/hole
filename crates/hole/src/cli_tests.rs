@@ -3,6 +3,29 @@ use clap::Parser;
 use skuld::temp_dir;
 use std::path::Path;
 
+// Elevated-run owner resolution (#572) ================================================================================
+
+#[skuld::test]
+fn user_dirs_derive_from_home_not_env() {
+    use std::path::Path;
+    assert_eq!(
+        super::user_log_dir(Path::new("/Users/alice")),
+        Path::new("/Users/alice/Library/Application Support/hole/logs")
+    );
+    assert_eq!(
+        super::user_state_dir(Path::new("/Users/alice")),
+        Path::new("/Users/alice/Library/Application Support/hole/state")
+    );
+}
+
+#[skuld::test]
+fn service_never_gets_an_owner() {
+    assert!(
+        super::resolved_owner(true).is_none(),
+        "--service must never resolve an owner"
+    );
+}
+
 #[skuld::test]
 fn no_args_means_gui_mode() {
     let cli = Cli::try_parse_from(["hole"]).unwrap();
@@ -194,6 +217,24 @@ fn file_was_rotated_reports_false_when_path_missing(#[fixture(temp_dir)] dir: &P
     assert!(
         !super::file_was_rotated(&path, &handle).expect("stat missing path"),
         "missing path must map to Ok(false), not an error"
+    );
+}
+
+// start_error_cli disposition =========================================================================================
+
+#[skuld::test]
+fn start_error_cli_disposition() {
+    use hole_common::protocol::StartError;
+    assert_eq!(start_error_cli(&StartError::Cancelled), (0, None));
+    assert_eq!(start_error_cli(&StartError::AlreadyRunning), (0, None));
+    let (code, log) = start_error_cli(&StartError::NetworkBlocked);
+    assert_eq!(
+        (code, log.as_deref()),
+        (1, Some(hole_common::protocol::NETWORK_BLOCKED_MESSAGE))
+    );
+    assert_eq!(
+        start_error_cli(&StartError::Failed { message: "x".into() }),
+        (1, Some("bridge rejected start: x".to_string()))
     );
 }
 

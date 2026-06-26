@@ -1,5 +1,6 @@
 //! Small cross-platform utilities shared across the workspace.
 //!
+//! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`port_alloc`] — ephemeral port allocation with multi-transport
 //!   verification and retry around Windows bind races.
 //! - [`retry`] — exponential-backoff retry helpers + transient-error
@@ -10,6 +11,7 @@
 //! crates without license friction. Nothing here is Hole- or
 //! shadowsocks-specific.
 
+pub mod ownership;
 pub mod port_alloc;
 pub mod retry;
 

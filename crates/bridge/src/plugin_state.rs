@@ -39,27 +39,30 @@ fn state_file(state_dir: &Path) -> PathBuf {
 
 /// Write `state` to `<state_dir>/bridge-plugins.json` atomically.
 /// Same atomic-write pattern as `routing::state::save`.
-pub fn save(state_dir: &Path, state: &PluginState) -> std::io::Result<()> {
+pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
+    util::ownership::chown_if_some(state_dir, owner);
 
     let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
+    let path = state_file(state_dir);
     let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
     tmp.write_all(&json)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(state_file(state_dir)).map_err(|e| e.error)?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    util::ownership::chown_if_some(&path, owner);
     Ok(())
 }
 
 /// Append a single record to the state file. Creates the file if missing.
 /// Reads existing records, merges, atomically writes the result.
-pub fn append_record(state_dir: &Path, record: PluginRecord) -> std::io::Result<()> {
+pub fn append_record(state_dir: &Path, record: PluginRecord, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     let mut state = load(state_dir).unwrap_or(PluginState {
         version: SCHEMA_VERSION,
         plugins: Vec::new(),
     });
     state.plugins.push(record);
-    save(state_dir, &state)
+    save(state_dir, &state, owner)
 }
 
 /// Load the state file. Returns `None` for any error — missing file,

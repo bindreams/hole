@@ -90,14 +90,36 @@ pub enum BridgeRequest {
     },
 }
 
-/// The exact string the bridge writes into `ErrorResponse` when a `Start` is
-/// cancelled; the client matches against it. Changing it is a
-/// wire-compatibility break.
-pub const CANCELLED_MESSAGE: &str = "cancelled";
+/// Host-free censorship toast text shown when the reachability probe finds the
+/// network is resetting/dropping the server handshake. The canonical source of
+/// this sentence.
+pub const NETWORK_BLOCKED_MESSAGE: &str = "The network is blocking the connection to this server — the handshake was \
+     reset or got no response. This usually means a firewall or censorship; \
+     try a different server.";
+
+/// Typed outcome of a failed `POST /v1/start` (the 500 body). The concurrent-start
+/// rejection is a `ClientError::ConcurrentStart`, not a variant here, so `Failed`
+/// is always a genuine `ProxyError`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartError {
+    /// User-cancelled, or a pre-armed cancel consumed this attempt.
+    Cancelled,
+    /// The proxy was already running — idempotent success GUI-side.
+    AlreadyRunning,
+    /// The network reset/dropped the server handshake (DPI / censorship).
+    NetworkBlocked,
+    /// Any other `ProxyError`. `message` is the system-authored, PII-free reason.
+    Failed { message: String },
+}
 
 /// Client-side response enum. Used by the GUI client API and elevation flow.
 /// Not part of the wire protocol — the client maps HTTP responses back to
 /// these variants internally.
+///
+/// Error channels split by operation: `Start` failures are the typed
+/// [`StartFailed`](BridgeResponse::StartFailed); every other operation uses
+/// the stringly `Error { message }`.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum BridgeResponse {
     Ack,
@@ -114,6 +136,8 @@ pub enum BridgeResponse {
     Error {
         message: String,
     },
+    /// Typed `POST /v1/start` failure. See [`StartError`].
+    StartFailed(StartError),
     Metrics {
         bytes_in: u64,
         bytes_out: u64,
@@ -248,7 +272,9 @@ impl Default for ProxyConfig {
 /// Granularity ceiling: the shadowsocks protocol does not let a client
 /// distinguish "wrong cipher" from "wrong password" from "v2ray-plugin
 /// handshake rejected at the server side". All three collapse into
-/// `TunnelHandshakeFailed`.
+/// `TunnelHandshakeFailed`. The orthogonal "the network reset/dropped the
+/// transport before any handshake" axis is separable out-of-band via the
+/// reachability probe (`NetworkBlocked`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerTestOutcome {
@@ -276,6 +302,11 @@ pub enum ServerTestOutcome {
     /// wrong password, wrong cipher, and v2ray-plugin handshake rejected at
     /// the server side, indistinguishably.
     TunnelHandshakeFailed,
+    /// Pre-flight reached the server at TCP but the network reset/dropped the
+    /// transport handshake (e.g. DPI range-blocking). Out-of-band signal
+    /// produced by the reachability probe; distinct from `TunnelHandshakeFailed`
+    /// (credentials/config).
+    NetworkBlocked,
     /// Tunnel established (server decrypted credentials successfully) but
     /// the upstream sentinel was unreachable through the tunnel. The
     /// shadowsocks server tried to forward our request and either could not
@@ -347,7 +378,7 @@ pub struct UpdateApplyRequest {
 
 /// Default bridge socket path.
 pub fn default_bridge_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
         PathBuf::from("/var/run/hole-bridge.sock")
     }

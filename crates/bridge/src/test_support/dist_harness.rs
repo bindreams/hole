@@ -575,8 +575,13 @@ impl BridgeIpcClient {
                 let resp = self.http_post(ROUTE_START, body, Some(&attempt_id)).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
+                } else if resp.status() == http::StatusCode::CONFLICT {
+                    Err(HarnessError("start already in progress".to_string()))
+                } else if resp.status().is_server_error() {
+                    let body = read_body(resp).await?;
+                    Ok(BridgeResponse::StartFailed(serde_json::from_slice(&body)?))
                 } else {
-                    parse_bridge_error(resp).await
+                    Err(HarnessError(format!("unexpected HTTP status: {}", resp.status())))
                 }
             }
             BridgeRequest::Stop => {

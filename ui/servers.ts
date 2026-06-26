@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { message, open } from "@tauri-apps/plugin-dialog";
+import { NETWORK_BLOCKED_MESSAGE } from "./generated";
 import { describeUnknownImportError } from "./import-failure";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
@@ -20,7 +21,7 @@ function statusClassFor(v: ValidationState | null | undefined): "untested" | "ok
   return v.outcome.kind === "reachable" ? "ok" : "fail";
 }
 
-function userMessageFor(o: ServerTestOutcome): string {
+export function userMessageFor(o: ServerTestOutcome): string {
   switch (o.kind) {
     case "reachable":
       return o.latency_ms === LATENCY_VALIDATED_ON_CONNECT
@@ -36,6 +37,8 @@ function userMessageFor(o: ServerTestOutcome): string {
       return `Plugin failed to start: ${o.detail}`;
     case "tunnel_handshake_failed":
       return "Server rejected the connection (wrong password, cipher, or plugin config).";
+    case "network_blocked":
+      return NETWORK_BLOCKED_MESSAGE;
     case "server_cannot_reach_internet":
       return "Server cannot reach the public internet.";
     case "sentinel_mismatch":

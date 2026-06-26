@@ -183,11 +183,27 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         }
     }
 
-    if handshake_timeout_observed {
+    let tunnel_outcome = if handshake_timeout_observed {
         ServerTestOutcome::TunnelHandshakeFailed
     } else {
         ServerTestOutcome::ServerCannotReachInternet
-    }
+    };
+
+    reclassify_blocked(
+        tunnel_outcome,
+        // The DoH-resolved IP, never the proxy domain: the reachability probe
+        // must not OS-resolve the hostname (that would reopen the DNS leak).
+        &server_ip.to_string(),
+        entry.server_port,
+        entry.plugin.as_deref(),
+        entry.plugin_opts.as_deref(),
+        // One-shot probe; no caller-side cancel exists in run_server_test.
+        &{
+            #[allow(clippy::disallowed_methods)] // See clippy.toml: one-shot CancellationToken::new.
+            CancellationToken::new()
+        },
+    )
+    .await
 }
 
 // Helpers -------------------------------------------------------------------------------------------------------------
@@ -201,23 +217,47 @@ enum SentinelOutcome {
     Internal(String),
 }
 
+/// If the tunnel test ended in a failure a network block can masquerade as,
+/// probe the server out-of-band and upgrade to [`ServerTestOutcome::NetworkBlocked`]
+/// when the probe confirms the network reset or dropped the connection. Every
+/// other outcome passes through unchanged, so `PluginStartFailed`, `Reachable`,
+/// etc. are preserved and a reachable server can never be falsely blocked.
+async fn reclassify_blocked(
+    tunnel_outcome: ServerTestOutcome,
+    host: &str,
+    port: u16,
+    plugin: Option<&str>,
+    plugin_opts: Option<&str>,
+    cancel: &CancellationToken,
+) -> ServerTestOutcome {
+    match tunnel_outcome {
+        ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
+            if crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel).await
+                == crate::reachability::ReachabilityVerdict::Blocked
+            {
+                ServerTestOutcome::NetworkBlocked
+            } else {
+                tunnel_outcome
+            }
+        }
+        other => other,
+    }
+}
+
 /// True if the server's public endpoint is reached over UDP rather than TCP,
 /// i.e. the configured plugin negotiates a QUIC transport (`mode=quic`). The
 /// raw TCP preflight probe is meaningless for such an endpoint — there is no
 /// TCP listener to connect to — so [`run_server_test`] skips it and lets the
 /// full tunnel handshake produce the diagnosis. Covers a direct
 /// v2ray-plugin/ex-ray QUIC server AND a galoshes server (which passes
-/// `mode=quic` through to its embedded ex-ray). Parses the SIP003 options with
-/// the same parser `garter::Mode::from_plugin_options` uses for the `server`
-/// key, so this is config parsing — not a stringified-type-recovery hack. See
+/// `mode=quic` through to its embedded ex-ray). Shares the reachability probe's
+/// transport classifier, so the two agree on what a QUIC endpoint is. See
 /// bindreams/hole#421.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    entry.plugin.is_some()
-        && entry.plugin_opts.as_deref().is_some_and(|opts| {
-            garter::parse_plugin_options(opts)
-                .iter()
-                .any(|(k, v)| k == "mode" && v == "quic")
-        })
+    matches!(
+        crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server),
+        crate::reachability::ProbeTransport::Quic { .. }
+    )
 }
 
 /// Raw-TCP-connect to the DoH-resolved `addr`. Returns `Err(outcome)` with a
@@ -304,6 +344,7 @@ async fn maybe_start_plugin(
         entry.plugin_opts.as_deref(),
         server_host,
         server_port,
+        None,
         None,
         false,
         &chain_cancel,

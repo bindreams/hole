@@ -87,8 +87,15 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 
     // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
     // source to exercise the real resolve + `LocalInterface` filter path.
-    let cover = engage_lockdown(server_ip, "Loopback Pseudo-Interface 1", &resolver, &[], dir.path())
-        .expect("engage real WFP lockdown cover");
+    let cover = engage_lockdown(
+        server_ip,
+        "Loopback Pseudo-Interface 1",
+        &resolver,
+        &[],
+        dir.path(),
+        None,
+    )
+    .expect("engage real WFP lockdown cover");
 
     let permitted = connect(PERMITTED);
     let non = connect(NON_PERMITTED);
@@ -157,8 +164,8 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         base_non.err().map(|e| e.kind()),
     );
 
-    let cover =
-        engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path()).expect("engage real pf lockdown cover");
+    let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
+        .expect("engage real pf lockdown cover");
 
     // (a) The live main ruleset carries our authoritative block rule.
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();

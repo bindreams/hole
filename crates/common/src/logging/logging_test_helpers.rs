@@ -203,7 +203,7 @@ fn scenario_log_bridge_to_file() {
     // The redirect would eat the libtest-mimic per-test result lines; we
     // need its diagnostics if the child fails.
     unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
-    let guard = super::init(log_dir, "test", "test.log", "info");
+    let guard = super::init(log_dir, "test", "test.log", "info", None);
     log::info!("from-log-crate-bridge-test");
     // Drop the guard explicitly so the `tracing_appender::NonBlocking`
     // worker thread flushes its in-flight events to disk before the

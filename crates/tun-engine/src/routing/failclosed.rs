@@ -56,9 +56,9 @@ impl crate::routing::CoverGuard for Cover {
 /// Engage the cover blocking all egress except loopback and `server_ip`.
 /// `state_dir` is where macOS persists its enable token for crash recovery
 /// (unused on Windows). On failure the host is left uncovered.
-pub fn engage(server_ip: IpAddr, state_dir: &Path) -> Result<Cover, RoutingError> {
+pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
     Ok(Cover {
-        _inner: platform::engage(server_ip, state_dir)?,
+        _inner: platform::engage(server_ip, state_dir, owner)?,
     })
 }
 
@@ -84,9 +84,11 @@ pub fn engage_lockdown(
     resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
     state_dir: &Path,
+    owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     #[cfg(target_os = "windows")]
     {
+        let _ = owner;
         let luid = resolver.resolve(tun_name)?;
         Ok(Cover {
             _inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
@@ -96,7 +98,7 @@ pub fn engage_lockdown(
     {
         let _ = (resolver, app_ids);
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?,
         })
     }
 }

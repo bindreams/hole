@@ -59,6 +59,13 @@ mod macos {
     fn group_exists_returns_false_for_name_with_nul() {
         assert!(!crate::group::group_exists("foo\0bar"));
     }
+
+    #[skuld::test]
+    fn resolve_real_user_returns_an_absolute_home() {
+        let ru = crate::group::resolve_real_user().expect("resolve current user");
+        assert!(!ru.name.is_empty());
+        assert!(ru.home.is_absolute(), "home must be absolute, got {:?}", ru.home);
+    }
 }
 
 // Cross-platform tests ================================================================================================

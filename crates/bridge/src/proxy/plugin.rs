@@ -117,6 +117,7 @@ pub async fn start_plugin_chain(
     server_host: &str,
     server_port: u16,
     state_dir: Option<&Path>,
+    owner: Option<(u32, u32)>,
     diagnostic_tap: bool,
     cancel: &CancellationToken,
     ech_doh_url: Option<&str>,
@@ -153,6 +154,7 @@ pub async fn start_plugin_chain(
                     server_host,
                     server_port,
                     state_dir,
+                    owner,
                     diagnostic_tap,
                     attempt_cancel,
                 )
@@ -226,7 +228,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// A plugin `StartError::BindConflict` (the only retryable start class)
 /// maps to [`ProxyError::BindRace`] so the outer `bind_ephemeral` retries
 /// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
-#[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 10 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
     plugin_path: &str,
@@ -235,6 +237,7 @@ async fn spawn_plugin_runner_at(
     server_host: &str,
     server_port: u16,
     state_dir: Option<&Path>,
+    owner: Option<(u32, u32)>,
     diagnostic_tap: bool,
     cancel: CancellationToken,
 ) -> Result<
@@ -258,6 +261,7 @@ async fn spawn_plugin_runner_at(
                     pid,
                     start_time_unix_ms: start_time,
                 },
+                owner,
             ) {
                 tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
             }

@@ -24,7 +24,7 @@ fn lockdown_off_without_consent_is_refused() {
 fn concurrent_cutover_detected_via_existing_marker() {
     let dir = tempfile::tempdir().unwrap();
     assert!(!cutover_in_progress(dir.path()), "no marker -> not in progress");
-    hole_common::update_marker::write(dir.path(), &sample_marker()).unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     assert!(cutover_in_progress(dir.path()), "marker present -> in progress (409)");
 }
 
@@ -68,7 +68,7 @@ fn macos_actor_failure_clears_the_injected_log_dir() {
     // bridge.log), NOT re-resolve `service_log_dir()` — a marker stranded in the
     // wrong dir would make the GUI mask Disconnected forever.
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(dir.path(), &sample_marker()).unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     macos::clear_marker_on_actor_failure(Err(std::io::Error::other("swap failed")), dir.path());
     assert!(
         hole_common::update_marker::read(dir.path()).is_none(),

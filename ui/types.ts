@@ -14,6 +14,7 @@ export type ServerTestOutcome =
   | { kind: "tcp_timeout" }
   | { kind: "plugin_start_failed"; detail: string }
   | { kind: "tunnel_handshake_failed" }
+  | { kind: "network_blocked" }
   | { kind: "server_cannot_reach_internet" }
   | { kind: "sentinel_mismatch"; detail: string }
   | { kind: "internal_error"; detail: string };

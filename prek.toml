@@ -121,6 +121,14 @@ pass_filenames = false
 files = "^crates/ex-ray/version\\.toml$"
 
 [[repos.hooks]]
+id = "gen-ui-constants"
+name = "ui/generated.ts up to date with Rust constants"
+entry = "cargo xtask gen-ui-constants --check"
+language = "system"
+pass_filenames = false
+files = "^(ui/generated\\.ts|crates/common/src/protocol\\.rs|xtask/src/gen_ui_constants\\.rs)$"
+
+[[repos.hooks]]
 id = "check-workspace-lints"
 name = "check workspace lints inheritance"
 entry = "python scripts/check-workspace-lints.py"
@@ -183,5 +191,7 @@ hooks = [
 repo = "https://github.com/biomejs/pre-commit"
 rev = "v2.4.10"
 hooks = [
-  { id = "biome-check", additional_dependencies = ["@biomejs/biome@2.1.1"] },
+  # `ui/generated.ts` is machine-generated (gen-ui-constants) — exclude it so biome
+  # never reformats it out of sync with the generator's output.
+  { id = "biome-check", additional_dependencies = ["@biomejs/biome@2.1.1"], exclude = "^ui/generated\\.ts$" },
 ]

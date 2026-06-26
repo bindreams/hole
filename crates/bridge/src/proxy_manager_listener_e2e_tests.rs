@@ -22,7 +22,7 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
 use hole_common::config::ServerEntry;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, StartError, TunnelMode};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -73,7 +73,7 @@ async fn start_expect_ack(harness: &mut DistHarness, config: ProxyConfig) {
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 }
 
-/// Send `Start` and expect `BridgeResponse::Error`. Returns the error message.
+/// Send `Start` and expect a typed `StartFailed(Failed)`. Returns the message.
 async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> String {
     let resp = harness
         .send(BridgeRequest::Start {
@@ -83,8 +83,8 @@ async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> S
         .await
         .expect("send Start");
     match resp {
-        BridgeResponse::Error { message } => message,
-        other => panic!("expected Error, got {other:?}"),
+        BridgeResponse::StartFailed(StartError::Failed { message }) => message,
+        other => panic!("expected StartFailed(Failed), got {other:?}"),
     }
 }
 

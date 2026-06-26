@@ -1,6 +1,6 @@
 use super::*;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeResponse, StartError};
 
 // ProxyStateCell ======================================================================================================
 
@@ -208,9 +208,29 @@ fn observed_running_rules() {
         (Status, Ok(status_resp(true)), Some(true)),
         (Status, Ok(status_resp(false)), Some(false)),
         (Start, Ok(BridgeResponse::Ack), Some(true)),
-        (Start, Ok(err_resp(CANCELLED_MESSAGE)), Some(false)),
-        (Start, Ok(err_resp("proxy already running")), Some(true)),
-        (Start, Ok(err_resp("plugin failed")), Some(false)),
+        (
+            Start,
+            Ok(BridgeResponse::StartFailed(StartError::Cancelled)),
+            Some(false),
+        ),
+        (
+            Start,
+            Ok(BridgeResponse::StartFailed(StartError::AlreadyRunning)),
+            Some(true),
+        ),
+        (
+            Start,
+            Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked)),
+            Some(false),
+        ),
+        (
+            Start,
+            Ok(BridgeResponse::StartFailed(StartError::Failed {
+                message: "plugin failed".into(),
+            })),
+            Some(false),
+        ),
+        (Start, Err(ClientError::ConcurrentStart), None),
         (Stop, Ok(BridgeResponse::Ack), Some(false)),
         (Stop, Ok(err_resp("teardown failed")), None),
         (Start, Err(ClientError::PermissionDenied), None),
@@ -259,16 +279,6 @@ fn observed_running_update_in_progress_holds_snapshot() {
     // A successful Status still reports truth (marker irrelevant on Ok).
     let ok: Result<BridgeResponse, ClientError> = Ok(status_resp(true));
     assert_eq!(observed_running(ReqKind::Status, &ok, true), Some(true));
-}
-
-#[skuld::test]
-fn start_error_classification() {
-    assert_eq!(classify_start_error(CANCELLED_MESSAGE), StartErrorKind::Cancelled);
-    assert_eq!(
-        classify_start_error("proxy already running"),
-        StartErrorKind::AlreadyRunning
-    );
-    assert_eq!(classify_start_error("plugin failed"), StartErrorKind::Other);
 }
 
 // BridgeLink ==========================================================================================================
@@ -482,6 +492,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             pid: std::process::id(),
             started_at_unix: 0,
         },
+        None,
     )
     .unwrap();
     let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
@@ -524,6 +535,7 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
             pid: std::process::id(),
             started_at_unix: 0,
         },
+        None,
     )
     .unwrap();
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();

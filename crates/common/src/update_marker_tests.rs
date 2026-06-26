@@ -12,7 +12,7 @@ fn roundtrip_write_read_clear() {
         pid: 4242,
         started_at_unix: 1_700_000_000,
     };
-    write(dir.path(), &info).unwrap();
+    write(dir.path(), &info, None).unwrap();
 
     let got = read(dir.path()).expect("present -> Some");
     assert_eq!(got, info);
@@ -58,7 +58,7 @@ fn marker_mode_is_world_readable() {
         pid: 1,
         started_at_unix: 0,
     };
-    write(dir.path(), &info).unwrap();
+    write(dir.path(), &info, None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
         .unwrap()
         .permissions()
@@ -77,7 +77,7 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
         started_at_unix: 0,
     };
     // First claim wins and the full content is readable (never a partial file).
-    write_new(dir.path(), &info).unwrap();
+    write_new(dir.path(), &info, None).unwrap();
     assert_eq!(read(dir.path()).expect("present"), info);
 
     // A second claim loses with AlreadyExists (the race-free 409 guard) and does
@@ -86,7 +86,7 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
         to_version: "9.9.9".into(),
         ..info.clone()
     };
-    let err = write_new(dir.path(), &other).unwrap_err();
+    let err = write_new(dir.path(), &other, None).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(read(dir.path()).expect("unchanged").to_version, "0.3.0");
 
@@ -99,7 +99,7 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
 
     // After a clear, the claim is available again.
     clear(dir.path()).unwrap();
-    write_new(dir.path(), &other).unwrap();
+    write_new(dir.path(), &other, None).unwrap();
     assert_eq!(read(dir.path()).expect("re-claimed").to_version, "9.9.9");
 }
 
@@ -115,13 +115,19 @@ fn write_new_marker_mode_is_world_readable() {
         pid: 1,
         started_at_unix: 0,
     };
-    write_new(dir.path(), &info).unwrap();
+    write_new(dir.path(), &info, None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
         .unwrap()
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o644, "the claimed marker must be GUI-readable too");
 }
+
+// The cross-uid proof that `owner` reaches the PUBLISHED marker inode (through
+// rename for `write` and hard_link for `write_new`) needs real root to give the
+// file to another uid; a self-chown here would be vacuous (the temp is already
+// self-owned). It rides the root lane in
+// `crates/hole/tests/elevated_ownership_privileged.rs`.
 
 #[skuld::test]
 fn service_log_dir_matches_log_collector_constants() {

@@ -3,7 +3,7 @@
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, StartError};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -413,27 +413,6 @@ impl ReqKind {
     }
 }
 
-/// The bridge's Start-error taxonomy, classified in exactly one place —
-/// both the runtime-truth axis (`observed_running`) and the user-outcome
-/// axis (`tray::outcome_for_start_response`) consume this; the string
-/// literals must never appear anywhere else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartErrorKind {
-    Cancelled,
-    AlreadyRunning,
-    Other,
-}
-
-pub(crate) fn classify_start_error(message: &str) -> StartErrorKind {
-    if message == CANCELLED_MESSAGE {
-        StartErrorKind::Cancelled
-    } else if message.contains("already running") {
-        StartErrorKind::AlreadyRunning
-    } else {
-        StartErrorKind::Other
-    }
-}
-
 /// What a completed bridge exchange proves about `running`, if anything.
 ///
 /// - Stop+Error commits nothing: the bridge takes the running slot before
@@ -458,6 +437,8 @@ pub(crate) fn observed_running(
         // A version mismatch triggers self-heal; do not flip `running` during
         // the self-heal window (must precede the `(_, Err(_))` catch-all).
         (_, Err(ClientError::VersionMismatch { .. })) => None,
+        // Concurrent start (409): another start owns the running slot, so this says nothing.
+        (_, Err(ClientError::ConcurrentStart)) => None,
         // A cutover is in progress (the bridge is mid-restart). A transport
         // error here is the expected gap, not a Disconnected — hold the last
         // snapshot. Must precede the `(_, Err(_))` catch-all, like the
@@ -467,11 +448,10 @@ pub(crate) fn observed_running(
         (_, Err(_)) => Some(false),
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
-        (Start, Ok(BridgeResponse::Error { message })) => match classify_start_error(message) {
-            StartErrorKind::Cancelled => Some(false),
+        (Start, Ok(BridgeResponse::StartFailed(e))) => match e {
             // A failed start is rolled back bridge-side.
-            StartErrorKind::Other => Some(false),
-            StartErrorKind::AlreadyRunning => Some(true),
+            StartError::Cancelled | StartError::NetworkBlocked | StartError::Failed { .. } => Some(false),
+            StartError::AlreadyRunning => Some(true),
         },
         (Stop, Ok(BridgeResponse::Ack)) => Some(false),
         (Stop, Ok(BridgeResponse::Error { .. })) => None,

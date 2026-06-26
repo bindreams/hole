@@ -288,6 +288,65 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
     }
 }
 
+// Elevated-run owner resolution (#572) ================================================================================
+
+/// Resolve the real interactive user for an elevated, non-`--service` bridge
+/// run. `Some` only when this process is privileged AND not the launchd/SCM
+/// daemon; the daemon (`--service`) and the unprivileged GUI both get `None`,
+/// keeping their logs/state root-owned (the daemon) or self-owned (the GUI).
+///
+/// A resolve failure is non-fatal: log a warning and fall back to `None`, so
+/// the run proceeds with root-owned files rather than aborting.
+#[cfg(target_os = "macos")]
+fn resolved_owner(service: bool) -> Option<hole_bridge::group::RealUser> {
+    if service || !stepstool::is_privileged() {
+        return None;
+    }
+    match hole_bridge::group::resolve_real_user() {
+        Ok(u) => Some(u),
+        Err(e) => {
+            cli_log!(
+                warn,
+                "could not resolve the real user for an elevated run; logs/state stay root-owned: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Non-macOS twin: the elevated-run owner concept is macOS-only (the
+/// osascript-admin elevation is what leaves user-home files root-owned), so
+/// every other platform always gets `None`. Returns `Option<()>` and is only
+/// referenced inside `#[cfg(target_os = "macos")]` blocks.
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)] // exercised by the cross-platform `service_never_gets_an_owner` test; its only lib call sites are macOS-gated
+fn resolved_owner(_service: bool) -> Option<()> {
+    None
+}
+
+/// Extract `(uid, gid)` from a resolved [`RealUser`]. Named `to_ids` (not
+/// `to_uid_gid`/a method) to avoid shadowing the local `owner_ids` binding at
+/// the call site.
+#[cfg(target_os = "macos")]
+fn to_ids(u: &hole_bridge::group::RealUser) -> (u32, u32) {
+    (u.uid, u.gid)
+}
+
+/// Per-user log directory under the resolved user's home, derived from `home`
+/// (never `$HOME`/`dirs`, which under osascript-admin still point at the
+/// invoking user but are easy to get wrong for an elevated process).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // non-test lib callers are macOS-gated; the path test uses it on all platforms
+fn user_log_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library/Application Support/hole/logs")
+}
+
+/// Per-user state directory under the resolved user's home. See
+/// [`user_log_dir`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library/Application Support/hole/state")
+}
+
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
 ///
 /// For write-action subcommands, install a CLI log guard so that
@@ -296,8 +355,19 @@ pub(crate) fn resolve_cli_log_dir(command: &Command) -> Option<std::path::PathBu
 /// exactly which subcommands are exempted and [`resolve_cli_log_dir`] for
 /// how the directory is chosen.
 pub(crate) fn dispatch(command: Command) -> ! {
-    let _cli_log_guard =
-        resolve_cli_log_dir(&command).map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info"));
+    // Owner for the gui-cli.log guard: only for guard-eligible commands
+    // (`should_install_cli_log_guard` excludes `Bridge::Run`, so the daemon
+    // is never touched) and only when this process is privileged.
+    #[cfg(target_os = "macos")]
+    let cli_owner: Option<(u32, u32)> = if should_install_cli_log_guard(&command) && stepstool::is_privileged() {
+        hole_bridge::group::resolve_real_user().ok().map(|u| (u.uid, u.gid))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let cli_owner: Option<(u32, u32)> = None;
+    let _cli_log_guard = resolve_cli_log_dir(&command)
+        .map(|d| hole_common::logging::init(&d, "gui-cli", "gui-cli.log", "hole=info", cli_owner));
     let code = match command {
         Command::Version => {
             println!("hole {}", hole::version::VERSION);
@@ -404,9 +474,37 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             state_dir,
             ready_notify,
         } => {
+            // Resolve the elevated-run owner once: `Some` only for a
+            // privileged, non-`--service` run (the daemon and the
+            // unprivileged GUI both get `None`). The owner picks the
+            // user-home log/state dirs and chowns the files we write.
+            #[cfg(target_os = "macos")]
+            let owner = resolved_owner(service);
+            #[cfg(target_os = "macos")]
+            let owner_ids: Option<(u32, u32)> = owner.as_ref().map(to_ids);
+            #[cfg(not(target_os = "macos"))]
+            let owner_ids: Option<(u32, u32)> = None;
+
+            // Precedence: explicit `--log-dir` or the resolved-user home (for an
+            // elevated user-scoped run) → `HOLE_LOG_DIR` env → default. The chown
+            // happens regardless of which dir wins, since `init_dual` chowns
+            // `log_dir` with `owner_ids`.
+            #[cfg(target_os = "macos")]
+            let log_dir = hole_common::logging::resolve_log_dir(
+                log_dir.or_else(|| owner.as_ref().map(|u| user_log_dir(&u.home))),
+            );
+            #[cfg(not(target_os = "macos"))]
             let log_dir = hole_common::logging::resolve_log_dir(log_dir);
-            let _guard = hole_bridge::logging::init(&log_dir);
+            let _guard = hole_bridge::logging::init(&log_dir, owner_ids);
             tracing::info!("hole bridge starting");
+
+            // Reclaim ownership of an already-existing user data tree that an
+            // earlier elevated run left root-owned. Best-effort; the walk is
+            // hardened (lchown, refuse symlink top, skip nlink>1).
+            #[cfg(target_os = "macos")]
+            if let (Some(u), Some((uid, gid))) = (owner.as_ref(), owner_ids) {
+                crate::setup::repair_user_data_tree(&u.home.join("Library/Application Support/hole"), uid, gid);
+            }
 
             if service && ready_notify.is_some() {
                 cli_log!(error, "--ready-notify is not supported with --service");
@@ -418,6 +516,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             // joining against cwd so the service mode doesn't surprise the
             // user with a cwd-relative path (service cwd is `C:\Windows\System32`
             // on Windows or `/` on macOS).
+            #[cfg(target_os = "macos")]
+            let state_dir = state_dir.or_else(|| owner.as_ref().map(|u| user_state_dir(&u.home)));
             let state_dir = state_dir.unwrap_or_else(hole_common::paths::default_state_dir);
             let state_dir = state_dir.canonicalize().unwrap_or_else(|_| {
                 std::env::current_dir()
@@ -444,6 +544,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                     &log_dir,
                     ready_notify.as_deref(),
                     hole::version::VERSION,
+                    owner_ids,
                 )
             };
 
@@ -780,6 +881,18 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
     send_bridge_request(request, None)
 }
 
+/// CLI disposition for a typed start failure: process exit code + an optional error
+/// line. Cancelled/AlreadyRunning are success-equivalent (0); a block and any other
+/// failure are errors (1). Shared by both CLI start paths so exit codes never diverge.
+pub(crate) fn start_error_cli(e: &hole_common::protocol::StartError) -> (i32, Option<String>) {
+    use hole_common::protocol::StartError;
+    match e {
+        StartError::Cancelled | StartError::AlreadyRunning => (0, None),
+        StartError::NetworkBlocked => (1, Some(hole_common::protocol::NETWORK_BLOCKED_MESSAGE.to_string())),
+        StartError::Failed { message } => (1, Some(format!("bridge rejected start: {message}"))),
+    }
+}
+
 /// Send a `BridgeRequest`, mapping the response to an exit code (0 on success,
 /// 1 on error). Used by `bridge ipc-send`, which doesn't print the response
 /// body. When `result_file` is `Some` (the elevated path), also mirror the
@@ -807,6 +920,13 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
             cli_log!(error, "bridge error: {message}");
             1
         }
+        Ok(BridgeResponse::StartFailed(e)) => {
+            let (code, log) = start_error_cli(&e);
+            if let Some(line) = log {
+                cli_log!(error, "{line}");
+            }
+            code
+        }
         Err(msg) => {
             cli_log!(error, "{msg}");
             1
@@ -814,21 +934,17 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
     }
 }
 
-/// Underlying request driver. Returns the parsed `BridgeResponse` or a
-/// human-readable error message.
+/// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
+/// `ClientError` (kept typed so the elevated classifier can distinguish a
+/// control-plane `ConcurrentStart` from a transport failure).
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
-) -> Result<hole_common::protocol::BridgeResponse, String> {
+) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
-        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path)
-            .await
-            .map_err(|e| format!("failed to connect to bridge: {e}"))?;
-        client
-            .send(request)
-            .await
-            .map_err(|e| format!("communication error: {e}"))
+        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path).await?;
+        client.send(request).await
     })
 }
 
@@ -881,9 +997,18 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     println!("proxy started on local_port {local_port}");
                     0
                 }
-                Ok(BridgeResponse::Error { message }) => {
-                    cli_log!(error, "bridge rejected start: {message}");
-                    1
+                Ok(BridgeResponse::StartFailed(e)) => {
+                    use hole_common::protocol::StartError;
+                    match &e {
+                        StartError::AlreadyRunning => println!("proxy already running on local_port {local_port}"),
+                        StartError::Cancelled => println!("proxy start cancelled"),
+                        _ => {}
+                    }
+                    let (code, log) = start_error_cli(&e);
+                    if let Some(line) = log {
+                        cli_log!(error, "{line}");
+                    }
+                    code
                 }
                 Ok(other) => {
                     cli_log!(error, "unexpected response: {other:?}");

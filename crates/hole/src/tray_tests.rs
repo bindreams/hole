@@ -7,7 +7,7 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeResponse, CANCELLED_MESSAGE};
+use hole_common::protocol::{BridgeResponse, StartError, NETWORK_BLOCKED_MESSAGE};
 use skuld::temp_dir;
 use std::path::Path;
 use std::sync::Mutex;
@@ -38,28 +38,59 @@ fn transport_err() -> ClientError {
 #[skuld::test]
 fn start_response_outcomes() {
     use StartDecision::*;
+    let sf = |e: StartError| outcome_for_start_response(&Ok(BridgeResponse::StartFailed(e)));
     assert!(matches!(
         outcome_for_start_response(&Ok(BridgeResponse::Ack)),
         Outcome(ToggleOutcome::Running)
     ));
+    assert!(matches!(sf(StartError::Cancelled), Outcome(ToggleOutcome::Cancelled)));
     assert!(matches!(
-        outcome_for_start_response(&Ok(err_resp(CANCELLED_MESSAGE))),
-        Outcome(ToggleOutcome::Cancelled)
-    ));
-    assert!(matches!(
-        outcome_for_start_response(&Ok(err_resp("proxy already running"))),
+        sf(StartError::AlreadyRunning),
         Outcome(ToggleOutcome::Running)
     ));
-    assert!(matches!(outcome_for_start_response(&Ok(err_resp("boom"))), Fail(_)));
-    assert!(matches!(
-        outcome_for_start_response(&Ok(BridgeResponse::Ack)),
-        Outcome(ToggleOutcome::Running)
-    ));
+    assert!(matches!(sf(StartError::NetworkBlocked), Fail(_)));
+    assert!(matches!(sf(StartError::Failed { message: "boom".into() }), Fail(_)));
     assert!(matches!(
         outcome_for_start_response(&Err(ClientError::PermissionDenied)),
         NeedsElevation
     ));
+    assert!(matches!(
+        outcome_for_start_response(&Err(ClientError::ConcurrentStart)),
+        Fail(_)
+    ));
     assert!(matches!(outcome_for_start_response(&Err(transport_err())), Fail(_)));
+    // An unexpected variant on the Start path fails gracefully (no panic).
+    assert!(matches!(outcome_for_start_response(&Ok(status_resp(true))), Fail(_)));
+}
+
+/// A `NetworkBlocked` start error renders a CLEAN toast — the host-free censorship
+/// sentence standalone, NOT wrapped in `Bridge error:`.
+#[skuld::test]
+fn network_blocked_renders_clean_toast() {
+    use StartDecision::*;
+    let Fail(toast) = outcome_for_start_response(&Ok(BridgeResponse::StartFailed(StartError::NetworkBlocked))) else {
+        panic!("expected StartDecision::Fail with the clean message");
+    };
+    assert_eq!(
+        toast, NETWORK_BLOCKED_MESSAGE,
+        "the censorship toast must be standalone"
+    );
+    assert!(!toast.contains("Bridge error:"), "no Bridge error: prefix: {toast}");
+    assert!(toast.contains("firewall or censorship"), "{toast}");
+
+    // The shared kind→toast producer (also used by the elevated path) renders
+    // NetworkBlocked clean and Failed wrapped; a non-failure kind degrades safely.
+    assert_eq!(start_error_toast(&StartError::NetworkBlocked), NETWORK_BLOCKED_MESSAGE);
+    assert_eq!(
+        start_error_toast(&StartError::Failed {
+            message: "plugin failed".into()
+        }),
+        "Bridge error: plugin failed"
+    );
+    assert_eq!(
+        start_error_toast(&StartError::Cancelled),
+        "Bridge error: unexpected start outcome"
+    );
 }
 
 #[skuld::test]

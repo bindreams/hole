@@ -12,7 +12,7 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use std::path::Path;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MiB
 
@@ -48,6 +48,9 @@ pub enum ClientError {
     /// a payload-bytes failure so the user is not told the download is corrupt.
     #[error("the update install destination is invalid")]
     InvalidUpdateDestination { message: String },
+    /// The bridge rejected a start because another is already in flight (409).
+    #[error("a start is already in progress")]
+    ConcurrentStart,
 }
 
 // Client ==============================================================================================================
@@ -130,7 +133,7 @@ impl BridgeClient {
                         lockdown_active: status.lockdown_active,
                     })
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::Start { config, attempt_id } => {
@@ -138,8 +141,15 @@ impl BridgeClient {
                 let resp = self.http_post(ROUTE_START, body, Some(&attempt_id)).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
+                } else if resp.status() == http::StatusCode::CONFLICT {
+                    Err(ClientError::ConcurrentStart)
+                } else if resp.status().is_server_error() {
+                    Ok(BridgeResponse::StartFailed(parse_start_error(resp).await))
                 } else {
-                    parse_bridge_error(resp).await
+                    Err(ClientError::Protocol(format!(
+                        "unexpected HTTP status: {}",
+                        resp.status()
+                    )))
                 }
             }
             BridgeRequest::Stop => {
@@ -147,7 +157,7 @@ impl BridgeClient {
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::Cancel { attempt_id } => {
@@ -155,7 +165,7 @@ impl BridgeClient {
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::Reload { config } => {
@@ -164,7 +174,7 @@ impl BridgeClient {
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::Metrics => {
@@ -182,7 +192,7 @@ impl BridgeClient {
                         filter: metrics.filter,
                     })
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::Diagnostics => {
@@ -199,7 +209,7 @@ impl BridgeClient {
                         internet: diag.internet,
                     })
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::TestServer { entry, dns } => {
@@ -214,7 +224,7 @@ impl BridgeClient {
                         outcome: parsed.outcome,
                     })
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::SetLockdown { enabled } => {
@@ -224,7 +234,7 @@ impl BridgeClient {
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_generic_error(resp).await
                 }
             }
             BridgeRequest::ApplyUpdate {
@@ -250,7 +260,7 @@ impl BridgeClient {
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
-                    parse_bridge_error(resp).await
+                    parse_update_error(resp).await
                 }
             }
         }
@@ -360,16 +370,13 @@ async fn read_body(resp: http::Response<hyper::body::Incoming>) -> Result<Bytes,
         .map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
-/// Map a non-success HTTP response to a typed error. Recognised 4xx update
-/// statuses become typed `ClientError` variants so the GUI can render
-/// distinct text; 5xx becomes `BridgeResponse::Error`; any other status is an
-/// opaque protocol error.
-async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Result<BridgeResponse, ClientError> {
+/// Map a non-success response on the **update-apply** route to a typed error. Its
+/// 4xx statuses are update-specific (consent / cutover / payload / destination);
+/// 5xx is a generic operational error; any other status is a protocol error. Only
+/// `ApplyUpdate` uses this — other routes use [`parse_generic_error`], the Start
+/// route has its own bespoke mapping (see the `Start` arm).
+async fn parse_update_error(resp: http::Response<hyper::body::Incoming>) -> Result<BridgeResponse, ClientError> {
     let status = resp.status();
-
-    // Recognised update 4xx — surface as typed variants before the 5xx check so
-    // the bridge's JSON `message` reaches the user instead of collapsing to an
-    // opaque protocol error.
     if status == http::StatusCode::FORBIDDEN {
         return Err(ClientError::ConsentRequired {
             message: error_message(resp).await,
@@ -390,15 +397,44 @@ async fn parse_bridge_error(resp: http::Response<hyper::body::Incoming>) -> Resu
             message: error_message(resp).await,
         });
     }
+    parse_generic_error(resp).await
+}
 
+/// Map a non-success response on a non-Start, non-update route: 5xx →
+/// `BridgeResponse::Error`; any other status → an opaque protocol error.
+async fn parse_generic_error(resp: http::Response<hyper::body::Incoming>) -> Result<BridgeResponse, ClientError> {
+    let status = resp.status();
     if status.is_server_error() {
-        // 5xx — bridge returned an operational error.
         Ok(BridgeResponse::Error {
             message: error_message(resp).await,
         })
     } else {
-        // Any other 4xx — unexpected, treat as protocol error.
         Err(ClientError::Protocol(format!("unexpected HTTP status: {status}")))
+    }
+}
+
+/// Read the Start-500 typed `StartError`, with distinct warn-logged fallbacks for a
+/// read failure vs an unparseable body (an unparseable body is a same-build contract
+/// breach — logged, never panics).
+async fn parse_start_error(resp: http::Response<hyper::body::Incoming>) -> hole_common::protocol::StartError {
+    use hole_common::protocol::StartError;
+    match read_body(resp).await {
+        Ok(body) => match serde_json::from_slice::<StartError>(&body) {
+            Ok(e) => e,
+            Err(e) => {
+                let preview = String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned();
+                warn!(error = %e, body = %preview, "unparseable StartError body (same-build contract breach)");
+                StartError::Failed {
+                    message: "unknown error".to_string(),
+                }
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "failed to read start-error body");
+            StartError::Failed {
+                message: "failed to read error response".to_string(),
+            }
+        }
     }
 }
 
