@@ -493,3 +493,35 @@ fn provider_name_unknown_returns_guid_string() {
     );
     assert_ne!(got, "unknown", "must preserve GUID, not return literal \"unknown\"");
 }
+
+// HOLE_BRIDGE_ETW toggle ==============================================================================================
+
+#[skuld::test]
+fn etw_enabled_from_defaults_on_and_honors_disable_tokens() {
+    use std::ffi::OsString;
+    // Absent → enabled: a production bridge keeps full diagnostics unless an
+    // operator (or the e2e harness) explicitly opts out.
+    assert!(etw_enabled_from(None), "absent env must enable");
+    // Explicit falsey tokens disable — case-insensitive and whitespace-trimmed.
+    for off in ["0", "off", "false", "no", "OFF", "False", "No", "  off  "] {
+        assert!(!etw_enabled_from(Some(OsString::from(off))), "{off:?} must disable");
+    }
+    // Empty and unrecognized values keep diagnostics ON (fail-safe: a typo must
+    // never silently drop observability on a real bridge).
+    for on in ["", "1", "on", "true", "yes", "offf", "garbage", " "] {
+        assert!(
+            etw_enabled_from(Some(OsString::from(on))),
+            "{on:?} must keep ETW enabled"
+        );
+    }
+}
+
+#[skuld::test]
+fn etw_enabled_from_non_utf8_keeps_enabled() {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    // A non-UTF-8 value can't be a disable token, so it must not silently turn
+    // diagnostics off. 0xD800 is an unpaired high surrogate.
+    let bad = OsString::from_wide(&[0xD800]);
+    assert!(etw_enabled_from(Some(bad)), "non-UTF-8 must keep ETW enabled");
+}

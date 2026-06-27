@@ -25,18 +25,21 @@
 //!    crash-recovery snapshots. It:
 //!    a. Sweeps any stale `hole-bridge-etw-*` sessions left by a crashed
 //!    prior bridge instance ([`sweep_stale_sessions`] via the Win32
-//!    `QueryAllTracesW` + `ControlTraceW` APIs).
-//!    b. Builds three [`ferrisetw::Provider`]s with all keywords
+//!    `QueryAllTracesW` + `ControlTraceW` APIs). This always runs — it is
+//!    the crash-recovery invariant, independent of the consumer.
+//!    b. Returns `Ok(None)` if the consumer is disabled via
+//!    `HOLE_BRIDGE_ETW` (see [`etw_enabled_from`]); otherwise continues.
+//!    c. Builds three [`ferrisetw::Provider`]s with all keywords
 //!    enabled. High-volume firehose events are filtered in userspace
 //!    via [`HIGH_VOLUME_TCPIP_EVENTS`] rather than at the kernel
 //!    level — events 1004, 1077, and the rest of the SendPath family
 //!    must stay visible — see [`TCPIP_KEYWORDS`].
-//!    c. Starts a [`ferrisetw::UserTrace`] session named
+//!    d. Starts a [`ferrisetw::UserTrace`] session named
 //!    `hole-bridge-etw-<pid>` with `buffer_size = 256` KB to absorb
 //!    the wider event volume without kernel ring-buffer overrun.
-//!    d. Spawns a dedicated OS thread that calls `process_from_handle`
+//!    e. Spawns a dedicated OS thread that calls `process_from_handle`
 //!    in a blocking loop. This thread runs the per-event callback.
-//!    e. Returns an [`EtwGuard`] that owns the session + the join handle.
+//!    f. Returns `Ok(Some(`[`EtwGuard`]`))` owning the session + join handle.
 //!
 //! 2. The callback ([`handle_event`]) filters by `process_id`, extracts
 //!    a minimal shape-only [`ParsedFields`] struct from the live
@@ -257,13 +260,48 @@ pub enum EtwError {
 
 // Entry point =========================================================================================================
 
+/// Env var gating the per-bridge ETW consumer. Absent → enabled.
+const ETW_ENABLED_ENV: &str = "HOLE_BRIDGE_ETW";
+
+/// Whether the per-bridge ETW consumer should run, given the
+/// `HOLE_BRIDGE_ETW` value. Pure for unit testing.
+///
+/// Default ON (absent / empty / non-UTF-8 / unrecognized → enabled) so a
+/// real bridge keeps full diagnostics; only an explicit `0`/`off`/`false`/
+/// `no` (case-insensitive, trimmed) opts out. The consumer opens a
+/// *system-wide* real-time trace and filters to the bridge PID in userspace
+/// ([`dispatch`]): one production bridge pays that once, but N concurrent
+/// bridges (the e2e harness) each re-parse every other bridge's loopback
+/// events — O(N²), enough to starve a 4-vCPU runner — so the harness opts
+/// out. A kernel-side PID filter would localize it, but ferrisetw's
+/// `EventFilter::ByPids` is "only effective on kernel mode logger session"
+/// and unreliable even there (ferrisetw 1.2.0 `provider/event_filter.rs`;
+/// upstream n4r1b/ferrisetw#51), and this consumer uses `UserTrace`. See
+/// bindreams/hole#542.
+fn etw_enabled_from(value: Option<std::ffi::OsString>) -> bool {
+    match value.as_deref().and_then(|v| v.to_str()) {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        None => true,
+    }
+}
+
 /// Start the ETW consumer. Best-effort — returns `Err` only on
-/// infrastructure failure.
-pub fn start_consumer() -> Result<EtwGuard, EtwError> {
+/// infrastructure failure. Returns `Ok(None)` when the consumer is disabled
+/// via [`ETW_ENABLED_ENV`]; the stale-session sweep still runs (it is the
+/// crash-recovery invariant, not part of the consumer).
+pub fn start_consumer() -> Result<Option<EtwGuard>, EtwError> {
     let bridge_pid = std::process::id();
     let session_name = format!("hole-bridge-etw-{bridge_pid}");
 
+    // Sweep FIRST and unconditionally — the stale-`hole-bridge-etw-*` sweep
+    // is the crash-recovery invariant (CONTRIBUTING.md#crash-recovery),
+    // independent of whether this run goes on to consume.
     sweep_stale_sessions();
+
+    if !etw_enabled_from(std::env::var_os(ETW_ENABLED_ENV)) {
+        info!("etw: consumer disabled via {ETW_ENABLED_ENV}");
+        return Ok(None);
+    }
 
     let tcpip = Provider::by_guid(TCPIP_PROVIDER)
         .any(TCPIP_KEYWORDS)
@@ -322,11 +360,11 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
         .map_err(EtwError::ThreadSpawn)?;
 
     info!(session = %session_name, "etw: consumer started");
-    Ok(EtwGuard {
+    Ok(Some(EtwGuard {
         trace: Some(trace),
         thread: Some(thread),
         session_name,
-    })
+    }))
 }
 
 /// Query the live ETW session via Win32 `ControlTraceW(QUERY)` and log

@@ -174,7 +174,15 @@ impl DistHarness {
             // `shadowsocks_service` continues to emit its
             // "TCP listening on ..." INFO line that we rely on.
             .env("HOLE_BRIDGE_LOG", "hole_bridge=debug")
-            .env("HOLE_BRIDGE_SELF_TEST", "1");
+            .env("HOLE_BRIDGE_SELF_TEST", "1")
+            // Disable the per-bridge ETW consumer. It opens a *system-wide*
+            // real-time trace, so N concurrent DistHarness bridges each
+            // re-parse every other bridge's loopback events (O(N²)) and
+            // starve the CI runner into the multi-minute stall that truncated
+            // the galoshes chain. HOLE_BRIDGE_ETW is a genuine production
+            // opt-out (honored by `diagnostics::etw::start_consumer`), not a
+            // test-only code seam. See bindreams/hole#542.
+            .env("HOLE_BRIDGE_ETW", "0");
 
         // Use the diagnostic wrapper so any `ACCESS_DENIED` / `ETXTBSY`
         // spawn failure (typically Windows Defender scanning the freshly
