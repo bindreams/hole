@@ -21,7 +21,8 @@ require (
 	github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40
 	github.com/miekg/dns v1.1.72
 	github.com/mustafaturan/bus v1.0.2
-	github.com/pelletier/go-toml v1.9.5
+	github.com/pelletier/go-toml v1.2.0
+	github.com/pelletier/go-toml/v2 v2.4.0
 	github.com/pion/dtls/v3 v3.1.2
 	github.com/pion/ice/v4 v4.2.5
 	github.com/pion/logging v0.2.4
