@@ -2,14 +2,14 @@ module github.com/v2fly/v2ray-core/v5
 
 go 1.25.5
 
-toolchain go1.26.1
+toolchain go1.26.4
 
 require (
 	github.com/adrg/xdg v0.5.3
-	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22
-	github.com/go-chi/chi/v5 v5.2.5
+	github.com/apernet/quic-go v0.60.0
+	github.com/go-chi/chi/v5 v5.3.0
 	github.com/go-chi/render v1.0.3
-	github.com/go-playground/validator/v10 v10.30.2
+	github.com/go-playground/validator/v10 v10.30.3
 	github.com/golang-collections/go-datastructures v0.0.0-20150211160725-59788d5eb259
 	github.com/golang/mock v1.6.0
 	github.com/golang/protobuf v1.5.4
@@ -18,23 +18,23 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/improbable-eng/grpc-web v0.15.0
 	github.com/jhump/protoreflect v1.18.0
-	github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40
+	github.com/lunixbochs/struc v0.0.0-20241101090106-8d528fa2c543
 	github.com/miekg/dns v1.1.72
 	github.com/mustafaturan/bus v1.0.2
 	github.com/mustafaturan/bus/v3 v3.0.3
-	github.com/pelletier/go-toml v1.2.0
-	github.com/pelletier/go-toml/v2 v2.4.0
-	github.com/pion/dtls/v3 v3.1.2
-	github.com/pion/ice/v4 v4.2.5
+	github.com/pelletier/go-toml v1.9.5
+	github.com/pelletier/go-toml/v2 v2.4.2
+	github.com/pion/dtls/v3 v3.1.4
+	github.com/pion/ice/v4 v4.2.7
 	github.com/pion/logging v0.2.4
-	github.com/pion/stun/v3 v3.1.2
-	github.com/pion/transport/v2 v2.2.4
+	github.com/pion/stun/v3 v3.1.6
+	github.com/pion/transport/v2 v2.2.10
 	github.com/pion/transport/v4 v4.0.2
-	github.com/pion/webrtc/v4 v4.2.12
+	github.com/pion/webrtc/v4 v4.2.15
 	github.com/pires/go-proxyproto v0.12.0
-	github.com/quic-go/quic-go v0.59.1
+	github.com/quic-go/quic-go v0.60.0
 	github.com/refraction-networking/utls v1.8.2
-	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
+	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771
 	github.com/stretchr/testify v1.11.1
 	github.com/v2fly/BrowserBridge v0.0.0-20210430233438-0570fc1d7d08
 	github.com/v2fly/VSign v0.0.0-20201108000810-e2adc24bf848
@@ -42,15 +42,15 @@ require (
 	github.com/v2fly/ss-bloomring v0.0.0-20210312155135-28617310f63e
 	github.com/v2fly/struc v0.0.0-20241227015403-8e8fa1badfd6
 	github.com/vincent-petithory/dataurl v1.0.0
-	github.com/xiaokangwang/VLite v0.0.0-20220418190619-cff95160a432
+	github.com/xiaokangwang/VLite v0.0.0-20231225174116-75fa4b06e9f2
 	github.com/xssnick/raptorq v1.4.0
-	github.com/xtaci/smux v1.5.24
+	github.com/xtaci/smux v1.5.57
 	go.starlark.net v0.0.0-20230612165344-9532f5667272
-	go4.org/netipx v0.0.0-20230303233057-f1b76eb4bb35
-	golang.org/x/crypto v0.51.0
-	golang.org/x/net v0.54.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.44.0
+	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
+	golang.org/x/crypto v0.53.0
+	golang.org/x/net v0.56.0
+	golang.org/x/sync v0.21.0
+	golang.org/x/sys v0.46.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
