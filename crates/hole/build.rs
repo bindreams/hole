@@ -100,7 +100,7 @@ fn emit_version_env(repo_root: &Path) {
 /// Render size (px) of the runtime Dock icon PNG (`dock_icon.rs`).
 const APP_ICON_PX: u32 = 512;
 
-/// (render size, ICNS element type). The 2x types carry retina pixel counts.
+/// (render size px, ICNS element type).
 const ICNS_ENTRIES: &[(u32, icns::IconType)] = &[
     (16, icns::IconType::RGBA32_16x16),
     (32, icns::IconType::RGBA32_32x32),
@@ -149,7 +149,7 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     std::fs::write(&icns_out, &icns).unwrap();
     println!("cargo:rustc-env=HOLE_ICNS_PATH={}", icns_out.display());
 
-    // Runtime Dock icon (dock_icon.rs); emitted on every host, not just macOS.
+    // Runtime Dock icon (dock_icon.rs).
     render_png(&mac_tree, APP_ICON_PX, &out_dir.join("app-icon.png"));
 
     // PNG fallbacks (referenced unconditionally by tauri.conf.json,
