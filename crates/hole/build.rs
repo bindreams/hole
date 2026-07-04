@@ -100,7 +100,6 @@ fn emit_version_env(repo_root: &Path) {
 /// Render size (px) of the runtime Dock icon PNG (`dock_icon.rs`).
 const APP_ICON_PX: u32 = 512;
 
-/// (render size px, ICNS element type).
 const ICNS_ENTRIES: &[(u32, icns::IconType)] = &[
     (16, icns::IconType::RGBA32_16x16),
     (32, icns::IconType::RGBA32_32x32),

@@ -20,8 +20,6 @@ fn set_menu_bar_mode(app: &tauri::AppHandle, dock_visible: bool) {
 pub fn on_setup(_app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
-        // Dock shows the Hole icon whenever the app is Regular (Dashboard open),
-        // including unbundled runs with no Info.plist icon.
         let mtm = objc2::MainThreadMarker::new().expect("contract: Tauri setup runs on the main thread");
         hole::dock_icon::set_dock_icon(mtm);
         set_menu_bar_mode(_app.handle(), false);

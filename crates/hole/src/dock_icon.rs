@@ -26,10 +26,17 @@ fn is_bundled_exe(exe: &Path) -> bool {
     macos.ends_with("Contents/MacOS") && app.extension().is_some_and(|e| e == "app")
 }
 
-/// Whether the running process is a bundled `.app` — which carries the ICNS the
-/// Dock uses. Only unbundled runs need the runtime override.
+/// Whether the running process is a bundled `.app` (which carries its own Dock ICNS).
 fn running_bundled() -> bool {
-    std::env::current_exe().ok().is_some_and(|exe| is_bundled_exe(&exe))
+    match std::env::current_exe() {
+        Ok(exe) => is_bundled_exe(&exe),
+        // Benign either way (the override is idempotent); default to unbundled, but
+        // trace it so a real bundled install that ever hits this is diagnosable.
+        Err(e) => {
+            tracing::debug!(error = %e, "current_exe() failed; treating process as unbundled for the Dock icon");
+            false
+        }
+    }
 }
 
 /// Decode the compiled-in app icon. Split out to unit-test the NSData→NSImage
@@ -43,13 +50,10 @@ fn decode_app_icon() -> Option<Retained<NSImage>> {
 
 /// Set the Dock icon. Call site: Tauri `setup` (main thread).
 pub fn set_dock_icon(mtm: MainThreadMarker) {
-    // A bundled release already has the multi-resolution ICNS for the Dock; only
-    // unbundled runs (no Info.plist icon) need the runtime override.
     if running_bundled() {
         return;
     }
-    // Cosmetic: a decode failure is near-impossible (build-rendered PNG, decode
-    // test) but must never abort a running VPN — warn and keep the default icon.
+    // Cosmetic: never abort a running VPN over a Dock icon — warn and keep the default.
     let Some(image) = decode_app_icon() else {
         warn!("could not decode the app icon; leaving the default Dock icon");
         return;
