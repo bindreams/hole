@@ -34,6 +34,10 @@ fn main() {
 }
 
 #[cfg(test)]
+#[path = "build_assets_tests.rs"]
+mod build_assets_tests;
+
+#[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 #[skuld::test]
 fn debug_assertions_enabled() {

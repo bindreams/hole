@@ -97,7 +97,34 @@ fn emit_version_env(repo_root: &Path) {
 
 // Icons ===============================================================================================================
 
-fn generate_icons(icons_dir: &Path, out_dir: &Path) {
+/// (render size, ICNS element type). The 2x types carry retina pixel counts.
+const ICNS_ENTRIES: &[(u32, icns::IconType)] = &[
+    (16, icns::IconType::RGBA32_16x16),
+    (32, icns::IconType::RGBA32_32x32),
+    (64, icns::IconType::RGBA32_32x32_2x),
+    (128, icns::IconType::RGBA32_128x128),
+    (256, icns::IconType::RGBA32_256x256),
+    (512, icns::IconType::RGBA32_512x512),
+    (1024, icns::IconType::RGBA32_512x512_2x),
+];
+
+/// Encode a multi-resolution ICNS from the macOS app SVG.
+fn build_icns_bytes(tree: &resvg::usvg::Tree) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut family = icns::IconFamily::new();
+    for &(size, icon_type) in ICNS_ENTRIES {
+        let png = render_png_in_memory(tree, size);
+        let image = icns::Image::read_png(Cursor::new(png)).expect("re-decode rendered PNG");
+        family
+            .add_icon_with_type(&image, icon_type)
+            .unwrap_or_else(|e| panic!("add {icon_type:?} to icns: {e}"));
+    }
+    let mut bytes = Vec::new();
+    family.write(&mut bytes).expect("encode icns");
+    bytes
+}
+
+fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     // Always produce platform-correct ICO and ICNS regardless of host.
     // ICO is consumed by Windows bundles, ICNS by macOS. Reading the
     // wrong SVG into either would silently ship the wrong design on a
@@ -107,12 +134,17 @@ fn generate_icons(icons_dir: &Path, out_dir: &Path) {
     let win_tree = parse_svg(&icons_dir.join("icon-windows.svg"));
     let mac_tree = parse_svg(&icons_dir.join("icon-macos.svg"));
 
-    render_ico(&win_tree, &out_dir.join("icon.ico"));
+    render_ico(&win_tree, &cache_icons_dir.join("icon.ico"));
 
-    // ICNS: render the macOS SVG to 128×128 PNG and wrap in a minimal
-    // ic07 container.
-    let mac_128_png = render_png_in_memory(&mac_tree, 128);
-    write_icns(&out_dir.join("icon.icns"), &mac_128_png);
+    // ICNS: same bytes to the bundled .cache copy (tauri.conf.json) and a
+    // cargo-isolated OUT_DIR copy. The test reads the OUT_DIR copy — .cache is a
+    // repo-root shared path a concurrent build could write mid-read.
+    let icns = build_icns_bytes(&mac_tree);
+    std::fs::write(cache_icons_dir.join("icon.icns"), &icns).unwrap();
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let icns_out = out_dir.join("icon.icns");
+    std::fs::write(&icns_out, &icns).unwrap();
+    println!("cargo:rustc-env=HOLE_ICNS_PATH={}", icns_out.display());
 
     // PNG fallbacks (referenced unconditionally by tauri.conf.json,
     // used as window icon on the host platform). Render from the
@@ -123,7 +155,7 @@ fn generate_icons(icons_dir: &Path, out_dir: &Path) {
         other => panic!("app icon not provided for target_os={other}"),
     };
     for size in [32u32, 128] {
-        render_png(host_tree, size, &out_dir.join(format!("{size}x{size}.png")));
+        render_png(host_tree, size, &cache_icons_dir.join(format!("{size}x{size}.png")));
     }
 }
 
@@ -161,19 +193,6 @@ fn render_ico(tree: &resvg::usvg::Tree, path: &Path) {
     }
     let file = std::fs::File::create(path).unwrap();
     icon_dir.write(file).unwrap();
-}
-
-fn write_icns(path: &Path, png_data: &[u8]) {
-    // Minimal ICNS: magic + size header, then ic07 (128x128 PNG) entry
-    let entry_size = (8 + png_data.len()) as u32;
-    let total_size = 8 + entry_size;
-    let mut buf = Vec::with_capacity(total_size as usize);
-    buf.extend_from_slice(b"icns");
-    buf.extend_from_slice(&total_size.to_be_bytes());
-    buf.extend_from_slice(b"ic07");
-    buf.extend_from_slice(&entry_size.to_be_bytes());
-    buf.extend_from_slice(png_data);
-    std::fs::write(path, buf).unwrap();
 }
 
 // Tray icons ==========================================================================================================
