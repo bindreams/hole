@@ -3,9 +3,10 @@
 // the last two are computed from the selected server's validation
 // state.
 
+import { LATENCY_VALIDATED_ON_CONNECT } from "./generated";
 import { config } from "./main";
 import { statusTooltipFor } from "./servers";
-import { type DiagnosticsData, LATENCY_VALIDATED_ON_CONNECT, type ValidationState } from "./types";
+import type { DiagnosticsData, ValidationState } from "./types";
 
 let DIAG_ELEMENTS: Record<string, HTMLElement | null> = {};
 

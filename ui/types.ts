@@ -1,10 +1,5 @@
 // Shared type definitions for the Hole Dashboard UI.
 
-/// Sentinel value of `latency_ms` meaning "validated by a successful proxy
-/// start, not by an explicit test run". Mirrors the Rust constant
-/// `LATENCY_VALIDATED_ON_CONNECT` in `crates/common/src/protocol.rs`.
-export const LATENCY_VALIDATED_ON_CONNECT = 0;
-
 /// Result of a one-shot test run against a `Server`. Mirrors the Rust
 /// `ServerTestOutcome` enum in `crates/common/src/protocol.rs`.
 export type ServerTestOutcome =
