@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LATENCY_VALIDATED_ON_CONNECT } from "./generated";
 
 const mainMock: {
   config: Record<string, unknown> | null;
@@ -333,5 +334,14 @@ describe("userMessageFor", () => {
   it("maps network_blocked to a censorship-aware message", async () => {
     const { userMessageFor } = await import("./servers");
     expect(userMessageFor({ kind: "network_blocked" })).toMatch(/firewall or censorship/);
+  });
+
+  it("distinguishes the validated-on-connect sentinel from a measured latency", async () => {
+    const { userMessageFor } = await import("./servers");
+    // Use the real constant so a sentinel change can't spuriously fail.
+    expect(userMessageFor({ kind: "reachable", latency_ms: LATENCY_VALIDATED_ON_CONNECT })).toBe(
+      "Validated by a recent successful connect.",
+    );
+    expect(userMessageFor({ kind: "reachable", latency_ms: LATENCY_VALIDATED_ON_CONNECT + 1 })).toMatch(/Round-trip/);
   });
 });

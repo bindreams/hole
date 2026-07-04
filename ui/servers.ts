@@ -2,12 +2,12 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { message, open } from "@tauri-apps/plugin-dialog";
-import { NETWORK_BLOCKED_MESSAGE } from "./generated";
+import { LATENCY_VALIDATED_ON_CONNECT, NETWORK_BLOCKED_MESSAGE } from "./generated";
 import { describeUnknownImportError } from "./import-failure";
 import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
 import { updateDiagnostics } from "./sidebar";
 import { showToast } from "./toast";
-import { LATENCY_VALIDATED_ON_CONNECT, type ServerTestOutcome, type ValidationState } from "./types";
+import type { ServerTestOutcome, ValidationState } from "./types";
 
 // DOM references ======================================================================================================
 

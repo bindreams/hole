@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LATENCY_VALIDATED_ON_CONNECT } from "./generated";
 import type { Config, Server } from "./types";
 
 // We swap the mocked config between tests via a mutable holder so each
@@ -88,7 +89,7 @@ describe("updateDiagnostics", () => {
   it("reachable with real latency → vpn_server + internet both 'ok'", async () => {
     mainMock.config = makeServerWithValidation({
       tested_at: "2026-01-01T00:00:00Z",
-      outcome: { kind: "reachable", latency_ms: 123 },
+      outcome: { kind: "reachable", latency_ms: LATENCY_VALIDATED_ON_CONNECT + 1 },
     });
     const { initDiagnostics, updateDiagnostics } = await import("./diagnostics");
     initDiagnostics();
@@ -103,15 +104,12 @@ describe("updateDiagnostics", () => {
     expect(document.getElementById("diag-internet")!.className).toBe("nd ok");
   });
 
-  it("validated-on-connect (latency=0 sentinel) → vpn_server 'ok' but internet stays 'unknown'", async () => {
-    // LATENCY_VALIDATED_ON_CONNECT is the sentinel for "we know the VPN
-    // handshake succeeded because the connect itself worked, but we
-    // never ran the sentinel HTTP probe." vpn_server should light green;
-    // internet stays gray because we have no positive evidence of
-    // end-to-end reachability through the tunnel.
+  it("validated-on-connect sentinel → vpn_server 'ok' but internet stays 'unknown'", async () => {
+    // No HTTP probe ran, so vpn_server is green (connect succeeded) but
+    // internet stays gray: no positive evidence of end-to-end reachability.
     mainMock.config = makeServerWithValidation({
       tested_at: "2026-01-01T00:00:00Z",
-      outcome: { kind: "reachable", latency_ms: 0 },
+      outcome: { kind: "reachable", latency_ms: LATENCY_VALIDATED_ON_CONNECT },
     });
     const { initDiagnostics, updateDiagnostics } = await import("./diagnostics");
     initDiagnostics();
