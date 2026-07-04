@@ -29,3 +29,15 @@ fn app_icns_has_required_resolutions() {
         assert!(img.width() > 0 && img.height() > 0, "{t:?} decoded empty");
     }
 }
+
+#[skuld::test]
+fn app_icon_png_is_square_hi_res() {
+    // Independent minimum: the Dock icon must be a square, hi-res PNG.
+    const PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png"));
+    let reader = png::Decoder::new(Cursor::new(PNG))
+        .read_info()
+        .expect("app-icon.png must be a valid PNG");
+    let info = reader.info();
+    assert_eq!(info.width, info.height, "app-icon.png must be square");
+    assert!(info.width >= 256, "app-icon.png must be >=256px, got {}", info.width);
+}
