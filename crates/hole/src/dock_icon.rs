@@ -14,8 +14,8 @@ fn app_icon_png() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png"))
 }
 
-/// Decode the compiled-in app icon. Split out so the NSData→NSImage bridge is
-/// unit-testable without a running NSApplication.
+/// Decode the compiled-in app icon. Split out to unit-test the NSData→NSImage
+/// bridge without a running NSApplication.
 fn decode_app_icon() -> Option<Retained<NSImage>> {
     let data = NSData::with_bytes(app_icon_png());
     NSImage::initWithData(NSImage::alloc(), &data)

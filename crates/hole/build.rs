@@ -150,7 +150,6 @@ fn generate_icons(icons_dir: &Path, cache_icons_dir: &Path) {
     println!("cargo:rustc-env=HOLE_ICNS_PATH={}", icns_out.display());
 
     // Runtime Dock icon (dock_icon.rs); emitted on every host, not just macOS.
-    // Reuses `out_dir` from the ICNS block above.
     render_png(&mac_tree, APP_ICON_PX, &out_dir.join("app-icon.png"));
 
     // PNG fallbacks (referenced unconditionally by tauri.conf.json,

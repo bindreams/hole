@@ -89,8 +89,7 @@ walkdir = "2"
 # `relaunch::ArmedWait` uses kqueue (EVFILT_PROC/NOTE_EXIT) to wait on the
 # predecessor's exit during a self-heal relaunch.
 libc = "0.2"
-# Runtime Dock icon (`dock_icon.rs`): set NSApplication.applicationIconImage at
-# startup so unbundled dev runs (no Info.plist) still show the Hole icon.
+# Runtime Dock icon (`dock_icon.rs`): unbundled dev runs (no Info.plist) still show the Hole icon.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSImage"] }
 objc2-foundation = { version = "0.3", features = ["NSData"] }
