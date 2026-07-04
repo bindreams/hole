@@ -1,5 +1,3 @@
-// Platform-specific behavior (macOS dock icon toggling).
-
 /// Single owner of the macOS dock/menu-bar activation policy. `dock_visible`
 /// true → Regular (Dashboard open); false → Accessory (menu-bar only). The
 /// bundle's LSUIElement=true is the Accessory default; this drives the runtime

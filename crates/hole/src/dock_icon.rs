@@ -26,7 +26,7 @@ fn is_bundled_exe(exe: &Path) -> bool {
     macos.ends_with("Contents/MacOS") && app.extension().is_some_and(|e| e == "app")
 }
 
-/// Whether the running process is a bundled `.app` (which carries its own Dock ICNS).
+/// Whether the running process is a bundled `.app`.
 fn running_bundled() -> bool {
     match std::env::current_exe() {
         Ok(exe) => is_bundled_exe(&exe),
@@ -39,8 +39,7 @@ fn running_bundled() -> bool {
     }
 }
 
-/// Decode the compiled-in app icon. Split out to unit-test the NSData→NSImage
-/// bridge without a running NSApplication. `None` for a nil or zero-size image.
+/// Decode the compiled-in app icon. `None` for a nil or zero-size image.
 fn decode_app_icon() -> Option<Retained<NSImage>> {
     let data = NSData::with_bytes(app_icon_png());
     let image = NSImage::initWithData(NSImage::alloc(), &data)?;

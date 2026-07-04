@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 #[skuld::test]
 fn app_icns_has_required_resolutions() {
-    // Read the OUT_DIR copy (HOLE_ICNS_PATH), not shared .cache, which a concurrent build can rewrite mid-read.
+    // Read the OUT_DIR copy (HOLE_ICNS_PATH), not shared .cache.
     const ICNS: &[u8] = include_bytes!(env!("HOLE_ICNS_PATH"));
     let family = icns::IconFamily::read(Cursor::new(ICNS)).expect("icon.icns must parse");
     let have = family.available_icons();
