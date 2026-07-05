@@ -89,9 +89,15 @@ walkdir = "2"
 # `relaunch::ArmedWait` uses kqueue (EVFILT_PROC/NOTE_EXIT) to wait on the
 # predecessor's exit during a self-heal relaunch.
 libc = "0.2"
+# Runtime Dock icon (`dock_icon.rs`): unbundled dev runs (no Info.plist) still show the Hole icon.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSImage"] }
+objc2-foundation = { version = "0.3", features = ["NSData"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
+icns = "0.3"
+png = "0.18"
 hole-test-observability = { path = "../test-observability" }
 # Test-only: the #572 cross-uid ownership proof drives `util::ownership::chown_path`
 # directly; no non-test `hole` code references the `util` crate.
@@ -113,4 +119,5 @@ xtask-lib = { path = "../../xtask-lib", features = ["version"] }
 resvg = "0.47"
 png = "0.18"
 ico = "0.5"
+icns = "0.3"
 serde_json = "1"

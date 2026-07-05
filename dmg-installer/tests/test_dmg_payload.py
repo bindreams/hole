@@ -5,6 +5,7 @@ and #512 defer-1 (hole.dSYM must ship next to the binary so production panic
 backtraces resolve at runtime — parity with the Windows hole.pdb).
 """
 
+import plistlib
 import re
 import subprocess
 from pathlib import Path
@@ -37,6 +38,13 @@ def test_dmg_ships_full_canonical_bindir(installed_app: Path) -> None:
         f"(searched Contents/MacOS + Contents/Resources). Expected (from "
         f"`cargo xtask bindir-names --os darwin`): {sorted(expected)}."
     )
+
+
+def test_bundle_is_menu_bar_app(installed_app: Path) -> None:
+    """The shipped bundle must carry LSUIElement=true (Tauri merges
+    crates/hole/Info.plist), or macOS treats Hole as a regular Dock app."""
+    info = plistlib.loads((installed_app / "Contents" / "Info.plist").read_bytes())
+    assert info.get("LSUIElement") is True, "bundle Info.plist missing LSUIElement=true"
 
 
 def test_dsym_is_sibling_of_binary(installed_app: Path) -> None:

@@ -9,6 +9,8 @@ pub mod bridge_client;
 pub mod cli_log;
 pub mod commands;
 pub mod config_recovery;
+#[cfg(target_os = "macos")]
+pub mod dock_icon;
 pub mod elevation;
 pub mod logging;
 pub mod path_management;
@@ -32,6 +34,10 @@ hole_test_observability::register!();
 fn main() {
     skuld::run_all();
 }
+
+#[cfg(test)]
+#[path = "build_assets_tests.rs"]
+mod build_assets_tests;
 
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
