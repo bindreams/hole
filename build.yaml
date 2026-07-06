@@ -130,8 +130,14 @@ targets:
       # build`'s own release build is then an incremental no-op.
       - cargo build --release -p hole
       - rm -rf .cache/hole.dSYM && cp -RL target/release/hole.dSYM .cache/hole.dSYM
-      # `-v` surfaces the hdiutil stderr tauri-bundler otherwise swallows (#446).
+      # Render the installer background (resvg → background.png + @2x) before assembly.
+      - cargo xtask dmg-background
+      # tauri builds only the ad-hoc-signed Hole.app (bundle.targets = ["app"]); the
+      # DMG itself is assembled deterministically by dmgbuild in the next step — no
+      # Finder/osascript, unlike tauri's bundle_dmg. `-v` keeps the build verbose.
       - npx tauri build -v
+      # dmgbuild wraps Hole.app in the styled DMG, writing .DS_Store directly.
+      - uv run --directory dmg-installer build
 
   hole-dmg-tests:
     # Pytest harness that asserts the produced .app's code signature is

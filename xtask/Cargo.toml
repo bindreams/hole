@@ -43,6 +43,12 @@ serde_yml = "0.0.12"
 indexmap = { version = "2", features = ["serde"] }
 petgraph = "0.8"
 
+# `cargo xtask dmg-background` (macOS DMG installer background render). Same
+# renderer as crates/hole/build.rs; unconditional so the workspace lockfile is
+# identical across platforms.
+resvg = "0.47"
+png = "0.18"
+
 [dev-dependencies]
 skuld = { workspace = true }
 tempfile = "3"
