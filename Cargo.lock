@@ -9674,6 +9674,8 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "petgraph",
+ "png 0.18.1",
+ "resvg",
  "serde",
  "serde_json",
  "serde_yml",

@@ -15,6 +15,7 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod ci_coverage;
+pub mod dmg_background;
 pub mod ex_ray;
 pub mod galoshes;
 pub mod gen_ui_constants;
@@ -34,6 +35,9 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
+#[cfg(test)]
+#[path = "dmg_background_tests.rs"]
+mod dmg_background_tests;
 #[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
@@ -193,6 +197,10 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Render the macOS DMG installer background (`crates/hole/dmg/background.svg`)
+    /// to `.cache/dmg/background.png` + `background@2x.png`. macOS-only; run by
+    /// the `hole-dmg` target before the dmgbuild assembly step.
+    DmgBackground,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -251,6 +259,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),
+        Command::DmgBackground => run_dmg_background(),
     }
 }
 
@@ -288,6 +297,16 @@ pub fn run_galoshes() -> Result<()> {
     let repo_root = repo_root()?;
     let path = galoshes::build(&repo_root)?;
     println!("xtask: galoshes built at {}", path.display());
+    Ok(())
+}
+
+pub fn run_dmg_background() -> Result<()> {
+    let repo_root = repo_root()?;
+    dmg_background::build(&repo_root)?;
+    println!(
+        "xtask: DMG background rendered into {}",
+        repo_root.join(".cache/dmg").display()
+    );
     Ok(())
 }
 
