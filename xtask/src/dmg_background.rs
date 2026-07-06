@@ -60,15 +60,20 @@ pub fn build(repo_root: &Path) -> Result<()> {
     let out_dir = repo_root.join(".cache/dmg");
     std::fs::create_dir_all(&out_dir).context("creating .cache/dmg/")?;
 
-    // SFNS.ttf registers its family as ".SF NS" (the private system-font name),
-    // not "SF Pro" — match that so resvg resolves the loaded face.
-    let mut opt = resvg::usvg::Options {
-        font_family: ".SF NS".to_string(),
-        ..Default::default()
-    };
+    let mut opt = resvg::usvg::Options::default();
     opt.fontdb_mut()
         .load_font_file(SF_PRO_PATH)
         .with_context(|| format!("loading font {SF_PRO_PATH}"))?;
+    // Default font-family-less text to whatever family the loaded face
+    // registered (".SF NS", the private system-font name, today). Derived rather
+    // than hardcoded so text resolution can't silently fail if that name ever
+    // changes — a mismatch here would ship a blank-text background.
+    opt.font_family = opt
+        .fontdb
+        .faces()
+        .next()
+        .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
+        .context("SFNS.ttf registered no font family")?;
 
     for (scale, name) in [(1u32, "background.png"), (2, "background@2x.png")] {
         let (w, h) = (WIDTH * scale, HEIGHT * scale);
