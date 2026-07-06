@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 560" width="660" height="560">
+  <!-- Hole DMG installer background. The two icons ("Hole", "Applications") and
+       their labels are drawn by Finder at appPosition/applicationFolderPosition
+       (196,160)/(464,160); this art fills everything else and must stay clear of
+       those icon zones. Rendered by `cargo xtask dmg-background`.
+       Copy targets macOS 15/26 (Sequoia/Tahoe) Gatekeeper wording — re-review on
+       an OS change or when notarization (#365) removes the block.
+       NOTE: the gear/shield glyphs below are clean hand-drawn stand-ins; swap in
+       exact SF Symbols (gearshape / hand.raised) exports if pixel-exact match is
+       wanted. -->
+  <rect width="660" height="560" fill="#151517"/>
+
+  <!-- drag arrow: solid block, centered (330,160) -->
+  <polygon points="285,150 355,150 355,138 377,160 355,182 355,170 285,170" fill="#a7a7ad"/>
+
+  <g font-family=".SF NS" fill="#f2f2f7">
+    <text x="330" y="296" font-size="22" font-weight="700" text-anchor="middle">Hey!&#8195;Listen!</text>
+
+    <text x="140" y="334" font-size="15">When you first open Hole, you might get this warning:</text>
+
+    <!-- blue quote rule + 2-line quote -->
+    <rect x="140" y="346" width="3" height="46" fill="#409cff"/>
+    <text x="156" y="364" font-size="14.5" fill="#cfcfd6">Apple could not verify &#8216;Hole&#8217; is free of malware</text>
+    <text x="156" y="384" font-size="14.5" fill="#cfcfd6">that may harm your Mac or compromise your privacy.</text>
+
+    <text x="140" y="416" font-size="15" font-weight="600">Don&#8217;t panic!</text>
+
+    <text x="140" y="442" font-size="14.5">1.&#8194; Click &#8220;Done&#8221;;</text>
+
+    <!-- step 2, split around the Settings gear + Privacy shield glyphs -->
+    <text x="140" y="466" font-size="14.5">2.&#8194; Open</text>
+    <g id="glyph-settings" transform="translate(212,461)" fill="#e6e6ea">
+      <g>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(45)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(90)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(135)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(180)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(225)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(270)"/>
+        <rect x="-1.3" y="-8" width="2.6" height="3.4" rx="0.6" transform="rotate(315)"/>
+      </g>
+      <circle r="5.4"/>
+      <circle r="2.2" fill="#151517"/>
+    </g>
+    <text x="228" y="466" font-size="14.5">Settings&#8195;&#8594;</text>
+    <g id="glyph-privacy" transform="translate(318,461)">
+      <path d="M0,-8 L7,-5.3 L7,0.6 C7,4.9 0,7.9 0,7.9 C0,7.9 -7,4.9 -7,0.6 L-7,-5.3 Z" fill="#e6e6ea"/>
+      <path d="M-2.9,-0.3 L-0.7,2 L3.3,-3.3" fill="none" stroke="#151517" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <text x="334" y="466" font-size="14.5">Privacy &amp; Security and scroll down;</text>
+
+    <text x="140" y="490" font-size="14.5">3.&#8194; Click &#8220;Open Anyway&#8221; next to Hole.</text>
+  </g>
+</svg>

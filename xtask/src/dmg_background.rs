@@ -60,8 +60,10 @@ pub fn build(repo_root: &Path) -> Result<()> {
     let out_dir = repo_root.join(".cache/dmg");
     std::fs::create_dir_all(&out_dir).context("creating .cache/dmg/")?;
 
+    // SFNS.ttf registers its family as ".SF NS" (the private system-font name),
+    // not "SF Pro" — match that so resvg resolves the loaded face.
     let mut opt = resvg::usvg::Options {
-        font_family: "SF Pro".to_string(),
+        font_family: ".SF NS".to_string(),
         ..Default::default()
     };
     opt.fontdb_mut()
