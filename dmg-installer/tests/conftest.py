@@ -3,6 +3,7 @@
 import json
 import shutil
 import subprocess
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -89,3 +90,28 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
             ["hdiutil", "detach", "-quiet", str(mount_dir)],
             check=False,
         )
+
+
+@pytest.fixture(scope="module")
+def mounted_dmg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Attach the built DMG read-only and yield the mounted volume root.
+
+    Layout assertions read the volume's `.DS_Store` and `.background.tiff`, which
+    the app-only `installed_app` fixture does not expose.
+    """
+    dmg = dmg_installer.find_built_dmg(REPO_ROOT)
+    mount_dir = tmp_path_factory.mktemp("layout-mount")
+    subprocess.run(
+        ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-quiet", "-mountpoint",
+         str(mount_dir),
+         str(dmg)],
+        check=True,
+    )
+    try:
+        yield mount_dir
+    finally:
+        # Best-effort, but visible: a busy detach leaves a stale mount that can
+        # break the next run's attach — surface it instead of swallowing it.
+        r = subprocess.run(["hdiutil", "detach", str(mount_dir)], capture_output=True, text=True)
+        if r.returncode != 0:
+            warnings.warn(f"hdiutil detach {mount_dir} failed (rc={r.returncode}): {r.stderr.strip()}")
