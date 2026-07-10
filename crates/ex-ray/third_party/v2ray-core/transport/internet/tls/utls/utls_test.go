@@ -63,12 +63,17 @@ type countingConn struct {
 	n  int
 }
 
-func (c *countingConn) Write(b []byte) (int, error) { c.mu.Lock(); c.n += len(b); c.mu.Unlock(); return len(b), nil }
-func (c *countingConn) Read([]byte) (int, error)    { return 0, io.EOF }
-func (c *countingConn) written() int                { c.mu.Lock(); defer c.mu.Unlock(); return c.n }
-func (c *countingConn) Close() error                { return nil }
-func (c *countingConn) LocalAddr() net.Addr         { return nil }
-func (c *countingConn) RemoteAddr() net.Addr        { return nil }
+func (c *countingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.n += len(b)
+	c.mu.Unlock()
+	return len(b), nil
+}
+func (c *countingConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *countingConn) written() int                     { c.mu.Lock(); defer c.mu.Unlock(); return c.n }
+func (c *countingConn) Close() error                     { return nil }
+func (c *countingConn) LocalAddr() net.Addr              { return nil }
+func (c *countingConn) RemoteAddr() net.Addr             { return nil }
 func (c *countingConn) SetDeadline(time.Time) error      { return nil }
 func (c *countingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *countingConn) SetWriteDeadline(time.Time) error { return nil }
