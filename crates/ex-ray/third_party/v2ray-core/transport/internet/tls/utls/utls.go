@@ -126,6 +126,24 @@ func uTLSConfigFromTLSConfig(config *systls.Config) (*utls.Config, error) { // n
 	return uconfig, nil
 }
 
+// presetCarriesECH reports whether the preset's ClientHello template includes an
+// ECH extension slot (a GREASE slot counts — uTLS upgrades it to real ECH). A
+// spec that fails to resolve is logged and treated as non-capable, so a silent
+// ECH downgrade of the pinned preset stays observable.
+func presetCarriesECH(id utls.ClientHelloID) bool {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		newError("uTLS preset spec did not resolve; treating as ECH-incapable").Base(err).AtWarning().WriteToLog()
+		return false
+	}
+	for _, ext := range spec.Extensions {
+		if _, ok := ext.(utls.EncryptedClientHelloExtension); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return NewUTLSSecurityEngineFromConfig(config.(*Config))
