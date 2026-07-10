@@ -7,6 +7,6 @@
 	remote = https://github.com/v2fly/v2ray-core
 	branch = v5.51.2
 	commit = 59950bd0b02c482ee88f4c7fe1aeb1e48db7e286
-	parent = 5a0996b6c45de75002d18f4558d49ddb93807a61
+	parent = be0b5488b5e2bb9cda09522d4110944e984c0934
 	method = merge
 	cmdver = 0.4.9
