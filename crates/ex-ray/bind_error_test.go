@@ -218,9 +218,7 @@ func TestServerStartBindConflictClassifiesQUIC(t *testing.T) {
 
 // Pins the config side of the failure disposition: an absent server cert makes
 // buildV2Ray surface a config error that is NOT a bind_conflict, so main() routes
-// it to fatal/exit-23. That config validation precedes any bind is compiler-
-// enforced — server.Start consumes buildV2Ray's result, so a failed buildV2Ray
-// never reaches the bind.
+// it to fatal/exit-23.
 func TestBuildV2RayMissingCertIsNotBindConflict(t *testing.T) {
 	restore := withFlags(t, 1, 0, true) // server mode
 	defer restore()

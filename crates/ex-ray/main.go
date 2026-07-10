@@ -156,10 +156,9 @@ func buildV2Ray() (core.Server, error) {
 // and server+websocket are both TCP. emitReady reports this as the sitrep
 // `transports`, mirroring the transport generateConfig selects from the same
 // mode/server flags, so the reported transport can never disagree with the one
-// v2ray-core binds. An
-// unknown *mode returns "tcp" here and is then rejected by generateConfig's
-// switch default before emitReady, so no false "ready" can escape. See
-// bindreams/hole#421.
+// v2ray-core binds. An unknown *mode returns "tcp" here and is then rejected by
+// generateConfig's switch default before emitReady, so no false "ready" can
+// escape. See bindreams/hole#421.
 func listenerNetwork() string {
 	if *server && *mode == "quic" {
 		return "udp"
@@ -202,8 +201,8 @@ func main() {
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
 	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
 	// inbound listener's bound port via any public API. Echoing ":0" as
-	// `ready.listen` would be a
-	// silent spec violation (SITREP.md: listen MUST be the bound address).
+	// `ready.listen` would be a silent spec violation (SITREP.md: listen MUST be
+	// the bound address).
 	// Hole always hands ex-ray a concrete pre-allocated port; a port-0 input
 	// is a misconfiguration we fail loudly on rather than mis-report.
 	if *localPort == "0" || *localPort == "" {
@@ -257,8 +256,7 @@ func main() {
 	}()
 
 	// v2ray-core's Start is synchronous through the listener bind, so the
-	// listener is accepting once Start returns nil. The served transport is
-	// `network` (server+quic → "udp", else "tcp").
+	// listener is accepting once Start returns nil.
 	//
 	// localListenAddr is authoritative: ex-ray rejects port 0 (above), so for
 	// every accepted input the requested port == the bound port (v2ray-core
