@@ -1,7 +1,7 @@
 # Vendoring v2ray-core
 
 `v2ray-core/` is a [git-subrepo](https://github.com/ingydotnet/git-subrepo) clone
-of [v2fly/v2ray-core](https://github.com/v2fly/v2ray-core), pinned to **v5.51.2**.
+of [v2fly/v2ray-core](https://github.com/v2fly/v2ray-core), pinned to **v5.52.0**.
 It exists so ex-ray can patch v2ray-core's TLS engine for ECH robustness
 (`retry_configs` re-dial, `ech=always` fail-closed) without waiting on upstream.
 
@@ -43,7 +43,7 @@ the other way around.
 
 ## Bumping the pinned version
 
-The pin is v5.51.2 (`.gitrepo` records the upstream commit). To move it:
+The pin is v5.52.0 (`.gitrepo` records the upstream commit). To move it:
 
 1. `git subrepo pull crates/ex-ray/third_party/v2ray-core -b <new-tag>`
 1. Re-apply / re-review any local patches against the new base (resolve conflicts).

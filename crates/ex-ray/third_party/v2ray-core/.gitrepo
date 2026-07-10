@@ -5,7 +5,7 @@
 ;
 [subrepo]
 	remote = https://github.com/v2fly/v2ray-core
-	branch = v5.51.2
+	branch = v5.52.0
 	commit = 9db9c4bb0cd92d18064f8c430cca641b5c49ea43
 	parent = be0b5488b5e2bb9cda09522d4110944e984c0934
 	method = merge
