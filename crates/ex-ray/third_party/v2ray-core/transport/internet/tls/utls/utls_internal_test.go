@@ -1,9 +1,14 @@
 package utls
 
 import (
+	systls "crypto/tls"
+	"errors"
+	"strings"
 	"testing"
 
 	utls "github.com/refraction-networking/utls"
+
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 )
 
 // presetCarriesECH must be true exactly for presets whose ClientHello template
@@ -41,4 +46,72 @@ func TestDefaultFingerprintResolvesAndCarriesECH(t *testing.T) {
 	if !presetCarriesECH(*preset) {
 		t.Fatal("default fingerprint chrome_auto must be ECH-capable")
 	}
+}
+
+func TestUTLSConfigFromTLSConfigCarriesECH(t *testing.T) {
+	echList := []byte{0x00, 0x05, 0xAA, 0xBB, 0xCC}
+	out, err := uTLSConfigFromTLSConfig(&systls.Config{
+		ServerName:                     "example.com",
+		EncryptedClientHelloConfigList: echList,
+	})
+	if err != nil {
+		t.Fatalf("uTLSConfigFromTLSConfig error: %v", err)
+	}
+	if string(out.EncryptedClientHelloConfigList) != string(echList) {
+		t.Fatalf("ECH list not carried: got %v, want %v", out.EncryptedClientHelloConfigList, echList)
+	}
+	if out.MinVersion != utls.VersionTLS13 {
+		t.Fatalf("ECH requires MinVersion TLS1.3, got 0x%x", out.MinVersion)
+	}
+}
+
+func TestUTLSConfigFromTLSConfigNoECHLeavesVersionUnset(t *testing.T) {
+	out, err := uTLSConfigFromTLSConfig(&systls.Config{ServerName: "example.com"})
+	if err != nil {
+		t.Fatalf("uTLSConfigFromTLSConfig error: %v", err)
+	}
+	if len(out.EncryptedClientHelloConfigList) != 0 {
+		t.Fatalf("no ECH expected, got %v", out.EncryptedClientHelloConfigList)
+	}
+	if out.MinVersion != 0 {
+		t.Fatalf("without ECH, MinVersion must stay unset, got 0x%x", out.MinVersion)
+	}
+}
+
+// normalizeECHRejection must translate a uTLS ECH rejection to the crypto/tls
+// type (preserving RetryConfigList) so DialClientWithECHRetry's errors.As matches
+// it, and pass every other value (including nil) through unchanged.
+func TestNormalizeECHRejection(t *testing.T) {
+	rc := []byte{0x01, 0x02}
+	got := normalizeECHRejection(&utls.ECHRejectionError{RetryConfigList: rc})
+	var gotls *systls.ECHRejectionError
+	if !errors.As(got, &gotls) {
+		t.Fatalf("must normalize to *crypto/tls.ECHRejectionError, got %T", got)
+	}
+	if string(gotls.RetryConfigList) != string(rc) {
+		t.Fatalf("RetryConfigList = %v, want %v", gotls.RetryConfigList, rc)
+	}
+	plain := errors.New("boom")
+	if normalizeECHRejection(plain) != plain {
+		t.Fatal("non-ECH error must pass through unchanged")
+	}
+	if normalizeECHRejection(nil) != nil {
+		t.Fatal("nil must pass through as nil")
+	}
+}
+
+// clientTLSConfig must panic (contract violation) when an ECH override is handed
+// to a non-ECH-capable preset — the retry seam can never produce that, so reaching
+// it is a wiring bug. This drives the impossible input directly so the assertion
+// is exercised in CI.
+func TestClientTLSConfigPanicsOnOverrideForNonECHPreset(t *testing.T) {
+	engine := Engine{config: &Config{TlsConfig: &tls.Config{ServerName: "example.com"}}}
+	defer func() {
+		r := recover()
+		s, ok := r.(string)
+		if !ok || !strings.Contains(s, "contract violation") {
+			t.Fatalf("expected a contract-violation panic, got: %v", r)
+		}
+	}()
+	_, _ = engine.clientTLSConfig(utls.HelloEdge_Auto, []byte{0x01})
 }
