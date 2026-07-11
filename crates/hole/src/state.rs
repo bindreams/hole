@@ -191,7 +191,7 @@ impl BridgeLink {
             // A Status exchange reveals error + lockdown too — commit all three
             // atomically under this lock; other exchanges know only `running`.
             match observed_lockdown(&result) {
-                Some((le, la)) => self.cell.commit_status(running, observed_error(&result), le, la),
+                Some((le, la, blk)) => self.cell.commit_status(running, observed_error(&result), le, la, blk),
                 None => self.cell.commit(running),
             }
         }
@@ -274,7 +274,7 @@ impl BridgeLink {
         self.note_mismatch(&status);
         if let Some(running) = observed_running(ReqKind::Status, &status, self.update_in_progress()) {
             match observed_lockdown(&status) {
-                Some((le, la)) => self.cell.commit_status(running, observed_error(&status), le, la),
+                Some((le, la, blk)) => self.cell.commit_status(running, observed_error(&status), le, la, blk),
                 None => self.cell.commit(running),
             }
         }
@@ -314,6 +314,10 @@ pub struct ProxySnapshot {
     /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
     /// warning state — never silent green.
     pub lockdown_active: bool,
+    /// Whether a covered start (auto-connect) failed and left the host
+    /// fail-closed (blocked, not leaked) while not running — a distinct blocked
+    /// state (Retry / Disconnect), never silent Disconnected.
+    pub blocked_until_connected: bool,
 }
 
 /// Single owner of the GUI's view of "is the proxy running" (#462).
@@ -335,6 +339,7 @@ impl ProxyStateCell {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            blocked_until_connected: false,
         });
         Self { tx }
     }
@@ -355,6 +360,7 @@ impl ProxyStateCell {
                 error: None,
                 lockdown_enabled: snap.lockdown_enabled,
                 lockdown_active: snap.lockdown_active,
+                blocked_until_connected: snap.blocked_until_connected,
             };
             true
         });
@@ -365,11 +371,19 @@ impl ProxyStateCell {
     /// by the `Status` arm so all commit atomically under the one client lock.
     /// `error` rides the same write — it is meaningful only alongside a running
     /// edge (a death), so it is not part of the change check.
-    pub fn commit_status(&self, running: bool, error: Option<String>, lockdown_enabled: bool, lockdown_active: bool) {
+    pub fn commit_status(
+        &self,
+        running: bool,
+        error: Option<String>,
+        lockdown_enabled: bool,
+        lockdown_active: bool,
+        blocked_until_connected: bool,
+    ) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
                 && snap.lockdown_active == lockdown_active
+                && snap.blocked_until_connected == blocked_until_connected
             {
                 return false;
             }
@@ -379,6 +393,7 @@ impl ProxyStateCell {
                 error,
                 lockdown_enabled,
                 lockdown_active,
+                blocked_until_connected,
             };
             true
         });
@@ -470,16 +485,17 @@ pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Op
     }
 }
 
-/// The lockdown (enabled, active) a Status exchange revealed, if any. Only a
-/// `Status` Ok carries them; every other exchange yields None (leave the
-/// snapshot's prior lockdown fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool)> {
+/// The lockdown (enabled, active) + blocked-until-connected flags a Status
+/// exchange revealed, if any. Only a `Status` Ok carries them; every other
+/// exchange yields None (leave the snapshot's prior fields untouched).
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool)> {
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
             lockdown_active,
+            blocked_until_connected,
             ..
-        }) => Some((*lockdown_enabled, *lockdown_active)),
+        }) => Some((*lockdown_enabled, *lockdown_active, *blocked_until_connected)),
         _ => None,
     }
 }

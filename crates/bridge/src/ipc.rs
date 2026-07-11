@@ -293,6 +293,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
         lockdown_active: pm.lockdown_active(),
+        blocked_until_connected: pm.blocked_until_connected(),
     })
 }
 

@@ -31,6 +31,7 @@ fn encode_request_roundtrips() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
+        covered: false,
     };
 
     let b64 = super::encode_request(&request);
@@ -87,6 +88,7 @@ fn write_request_file_roundtrip() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
+        covered: false,
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -131,6 +133,7 @@ fn read_request_file_roundtrip() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
+        covered: false,
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -169,6 +172,7 @@ fn start_attempt_id_survives_request_file_roundtrip() {
     let request = BridgeRequest::Start {
         config: ProxyConfig::default(),
         attempt_id: "elev-attempt-42".into(),
+        covered: false,
     };
     let temp_path = super::write_request_file(&request).unwrap();
     let path = temp_path.to_path_buf();
@@ -285,6 +289,7 @@ fn classify_unexpected_ok_is_success() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     });
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);
 }

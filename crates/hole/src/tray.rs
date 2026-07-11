@@ -637,6 +637,9 @@ async fn set_proxy_enabled_inner(
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
             attempt_id,
+            // Task 8 wires the auto-connect latch to covered=true; a manual
+            // connect stays false (today's fail-open behavior).
+            covered: false,
         };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {

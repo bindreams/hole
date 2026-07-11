@@ -586,6 +586,7 @@ fn status_when_not_running_returns_false() {
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                blocked_until_connected: false,
             }
         );
         drop(client);

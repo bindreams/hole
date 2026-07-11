@@ -325,6 +325,14 @@ components:
           description: >-
             Whether a lockdown cover is currently engaged. `lockdown_enabled &&
             !lockdown_active` is a tray warning state — never silent green.
+        blocked_until_connected:
+          type: boolean
+          default: false
+          description: >-
+            Whether a covered start (auto-connect) failed and left the host
+            fail-closed (blocked, not leaked) while not running. The GUI renders
+            a distinct blocked state with Retry / Disconnect. serde-default false
+            so older clients keep today's behavior.
 
     ErrorResponse:
       type: object

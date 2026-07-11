@@ -187,6 +187,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     }
 }
 

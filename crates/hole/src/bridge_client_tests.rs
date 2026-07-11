@@ -33,6 +33,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
                     lockdown_active: false,
+                    blocked_until_connected: false,
                 })
             }),
         )
@@ -126,6 +127,7 @@ fn send_status_request_receives_response() {
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                blocked_until_connected: false,
             }
         );
     });
@@ -141,6 +143,7 @@ fn send_start_receives_ack() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
+                covered: false,
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -295,6 +298,7 @@ fn start_and_cancel_send_attempt_id_header() {
             .send(BridgeRequest::Start {
                 config: hole_common::protocol::ProxyConfig::default(),
                 attempt_id: "id-123".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -377,6 +381,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
                     lockdown_active: false,
+                    blocked_until_connected: false,
                 })
             }),
         )
@@ -428,6 +433,7 @@ fn start_500_maps_to_typed_start_failed() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
+                covered: false,
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -528,6 +534,7 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                blocked_until_connected: false,
             })
         }),
     );
@@ -790,6 +797,7 @@ async fn start_raw(
     c.send(BridgeRequest::Start {
         config: hole_common::protocol::ProxyConfig::default(),
         attempt_id: "a".into(),
+        covered: false,
     })
     .await
 }

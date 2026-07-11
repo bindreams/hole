@@ -119,6 +119,7 @@ async fn run_socks_only_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget)
         .send(BridgeRequest::Start {
             config,
             attempt_id: "e2e".into(),
+            covered: false,
         })
         .await
         .expect("send Start");
@@ -176,6 +177,7 @@ fn e2e_metrics_report_tunnel_traffic(
             .send(BridgeRequest::Start {
                 config: config_template.clone(),
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .expect("send Start");
@@ -207,6 +209,7 @@ fn e2e_metrics_report_tunnel_traffic(
             .send(BridgeRequest::Start {
                 config: config2,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .expect("send Start 2");
@@ -279,6 +282,7 @@ fn e2e_galoshes_chain_reports_udp_available(
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .expect("send Start");
@@ -380,6 +384,7 @@ mod tun {
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .expect("send Start");
@@ -469,6 +474,7 @@ fn lifecycle_start_twice_returns_error(
             .send(BridgeRequest::Start {
                 config: config.clone(),
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -478,6 +484,7 @@ fn lifecycle_start_twice_returns_error(
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -539,6 +546,7 @@ fn lifecycle_reload_changes_local_port(
             .send(BridgeRequest::Start {
                 config: config1.clone(),
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -589,6 +597,7 @@ fn lifecycle_state_file_absent_in_socks_only_mode(
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -652,6 +661,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();
@@ -707,6 +717,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
             .send(BridgeRequest::Start {
                 config,
                 attempt_id: "e2e".into(),
+                covered: false,
             })
             .await
             .unwrap();

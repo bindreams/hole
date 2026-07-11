@@ -14,7 +14,8 @@ fn cell_bumps_seq_only_on_change() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
     cell.commit(false);
@@ -27,7 +28,8 @@ fn cell_bumps_seq_only_on_change() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
     cell.commit(false);
@@ -38,7 +40,8 @@ fn cell_bumps_seq_only_on_change() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -59,6 +62,7 @@ async fn cell_wakes_watchers_only_on_change() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            blocked_until_connected: false,
         }
     );
 }
@@ -70,7 +74,7 @@ fn commit_status_carries_lockdown_fields() {
     let s0 = cell.snapshot();
     assert!(!s0.lockdown_enabled && !s0.lockdown_active);
     // A Status commit threads both lockdown bools alongside `running`.
-    cell.commit_status(true, None, true, false);
+    cell.commit_status(true, None, true, false, false);
     let s1 = cell.snapshot();
     assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
     assert_eq!(s1.seq, 1, "seq bumped on change");
@@ -82,7 +86,7 @@ fn commit_preserves_lockdown_fields() {
     // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
     // a prior Status established (`enabled && !active` is the tray warning state).
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, None, true, false); // running + lockdown enabled, not active
+    cell.commit_status(true, None, true, false, false); // running + lockdown enabled, not active
     let before = cell.snapshot();
     assert!(before.lockdown_enabled && !before.lockdown_active);
 
@@ -102,7 +106,13 @@ fn commit_preserves_lockdown_fields() {
 fn commit_status_carries_error_on_death() {
     let cell = ProxyStateCell::new();
     cell.commit(true); // connected
-    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    cell.commit_status(
+        false,
+        Some("proxy task exited unexpectedly".into()),
+        false,
+        false,
+        false,
+    );
     let snap = cell.snapshot();
     assert!(!snap.running);
     assert_eq!(snap.error.as_deref(), Some("proxy task exited unexpectedly"));
@@ -114,7 +124,7 @@ fn commit_clears_error_on_non_status_running_change() {
     // A non-Status running edge (Start/Stop/Cancel) is user-initiated and
     // carries no death reason — `commit` must clear any prior error.
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, Some("synthetic".into()), false, false); // running -> true with an error
+    cell.commit_status(true, Some("synthetic".into()), false, false, false); // running -> true with an error
     assert_eq!(cell.snapshot().error.as_deref(), Some("synthetic"));
     cell.commit(false); // clean stop via the non-Status path
     assert_eq!(cell.snapshot().error, None, "non-Status commit must clear error");
@@ -124,7 +134,13 @@ fn commit_clears_error_on_non_status_running_change() {
 fn reconnect_clears_death_error() {
     let cell = ProxyStateCell::new();
     cell.commit(true);
-    cell.commit_status(false, Some("proxy task exited unexpectedly".into()), false, false);
+    cell.commit_status(
+        false,
+        Some("proxy task exited unexpectedly".into()),
+        false,
+        false,
+        false,
+    );
     cell.commit(true); // reconnect via a Start Ack
     assert_eq!(cell.snapshot().error, None);
 }
@@ -139,6 +155,7 @@ fn proxy_snapshot_serializes_error() {
         error: Some("boom".into()),
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     })
     .unwrap();
     assert_eq!(some["error"], "boom");
@@ -148,6 +165,7 @@ fn proxy_snapshot_serializes_error() {
         error: None,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     })
     .unwrap();
     assert!(
@@ -167,6 +185,7 @@ fn observed_error_only_from_status_ok() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     });
     assert_eq!(
         observed_error(&status).as_deref(),
@@ -188,6 +207,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     }
 }
 
@@ -331,6 +351,7 @@ fn status_response(running: bool) -> StatusResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     }
 }
 
@@ -406,6 +427,7 @@ async fn start_ack_commits_true() {
     let resp = link
         .send(BridgeRequest::Start {
             attempt_id: "x".into(),
+            covered: false,
             config: test_proxy_config(),
         })
         .await
@@ -418,7 +440,8 @@ async fn start_ack_commits_true() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -470,7 +493,8 @@ async fn transport_error_commits_false() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -505,7 +529,8 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         },
         "marker present => transport error holds the last snapshot"
     );
@@ -579,7 +604,8 @@ async fn oneshot_never_commits() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -611,7 +637,8 @@ async fn untracked_requests_never_commit() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -646,6 +673,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         async move {
             link.send(BridgeRequest::Start {
                 attempt_id: "x".into(),
+                covered: false,
                 config: test_proxy_config(),
             })
             .await
@@ -672,7 +700,8 @@ async fn concurrent_requests_commit_in_bridge_order() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }
@@ -735,7 +764,8 @@ async fn reload_if_running_reloads_when_running() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false
+            lockdown_active: false,
+            blocked_until_connected: false
         }
     );
 }

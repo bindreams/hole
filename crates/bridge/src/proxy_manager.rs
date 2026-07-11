@@ -198,6 +198,13 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     routing: R,
     dns: D,
     running: Option<RunningState<P, R, D>>,
+    /// A fail-closed cover retained from a covered start (#458 auto-connect /
+    /// post-update reconnect) that failed: the host stays blocked, not leaked,
+    /// while `running` is `None`. The live guard is held here (its `Drop` still
+    /// runs) — released on a user stop/cancel or the next successful start. The
+    /// paired `(server_ip, resolver_ips)` is the engaged permit set, so a
+    /// same-server retry can reuse the guard without re-engaging.
+    blocked_cover: Option<(R::Cover, IpAddr, Vec<IpAddr>)>,
     last_error: Option<String>,
     /// The out-of-band death reason surfaced to the GUI status/toast, distinct
     /// from `last_error` (which keeps the rich, possibly-PII operation detail
@@ -243,6 +250,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             routing,
             dns,
             running: None,
+            blocked_cover: None,
             last_error: None,
             death_reason: None,
             active_config: None,
@@ -411,6 +419,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// signal). Distinct from the persisted intent (`enabled`).
     pub fn lockdown_active(&self) -> bool {
         self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
+    }
+
+    /// Whether a covered start failed and left the host fail-closed (blocked, not
+    /// leaked) while not running — the GUI's distinct blocked state.
+    pub fn blocked_until_connected(&self) -> bool {
+        self.blocked_cover.is_some()
     }
 
     /// Whether the standing kill switch intent is on (from `bridge-lockdown.json`).

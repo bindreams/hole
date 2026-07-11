@@ -565,12 +565,13 @@ impl BridgeIpcClient {
                         ipv6_bypass_available: status.ipv6_bypass_available,
                         lockdown_enabled: status.lockdown_enabled,
                         lockdown_active: status.lockdown_active,
+                        blocked_until_connected: status.blocked_until_connected,
                     })
                 } else {
                     parse_bridge_error(resp).await
                 }
             }
-            BridgeRequest::Start { config, attempt_id } => {
+            BridgeRequest::Start { config, attempt_id, .. } => {
                 let body = serde_json::to_vec(&config)?;
                 let resp = self.http_post(ROUTE_START, body, Some(&attempt_id)).await?;
                 if resp.status().is_success() {
