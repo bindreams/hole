@@ -63,16 +63,6 @@ func TestUTLSConfigFromTLSConfigCarriesECH(t *testing.T) {
 	if out.MinVersion != utls.VersionTLS13 {
 		t.Fatalf("ECH requires MinVersion TLS1.3, got 0x%x", out.MinVersion)
 	}
-	// The rejection-verify hook must be installed so a uTLS ECH rejection surfaces
-	// as *utls.ECHRejectionError instead of aborting on outer-cert verification (see
-	// uTLSConfigFromTLSConfig); it verifies the discarded outer conn, so returning
-	// nil is correct.
-	if out.EncryptedClientHelloRejectionVerify == nil {
-		t.Fatal("ECH must install EncryptedClientHelloRejectionVerify so a rejection reaches the retry seam")
-	}
-	if err := out.EncryptedClientHelloRejectionVerify(utls.ConnectionState{}); err != nil {
-		t.Fatalf("rejection-verify hook must return nil, got %v", err)
-	}
 }
 
 func TestUTLSConfigFromTLSConfigNoECHLeavesVersionUnset(t *testing.T) {
@@ -85,11 +75,6 @@ func TestUTLSConfigFromTLSConfigNoECHLeavesVersionUnset(t *testing.T) {
 	}
 	if out.MinVersion != 0 {
 		t.Fatalf("without ECH, MinVersion must stay unset, got 0x%x", out.MinVersion)
-	}
-	// The rejection-verify hook is ECH-only; a non-ECH dial must keep uTLS's normal
-	// certificate verification (a nil hook leaves it in place).
-	if out.EncryptedClientHelloRejectionVerify != nil {
-		t.Fatal("without ECH, EncryptedClientHelloRejectionVerify must stay nil")
 	}
 }
 

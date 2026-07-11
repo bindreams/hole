@@ -185,18 +185,6 @@ func uTLSConfigFromTLSConfig(config *systls.Config) (*utls.Config, error) { // n
 	// only, so pin the floor explicitly when carrying one.
 	if len(config.EncryptedClientHelloConfigList) > 0 {
 		uconfig.MinVersion = utls.VersionTLS13
-		// On ECH rejection uTLS's default verify checks the outer certificate
-		// against config.ServerName (the concealed inner name) rather than the outer
-		// public_name as crypto/tls does, so it aborts with
-		// CertificateVerificationError and never surfaces the *utls.ECHRejectionError
-		// the retry seam needs (uTLS ignores InsecureSkipVerify on rejection, so the
-		// abort happens even in insecure mode). Install the rejection-verify hook —
-		// which suppresses that broken default — so the rejection reaches
-		// DialClientWithECHRetry, which re-dials with the server's retry_configs; that
-		// surviving connection undergoes full certificate verification against the
-		// real inner name. The rejected handshake is discarded, so not verifying its
-		// throwaway outer certificate does not weaken authentication of the kept one.
-		uconfig.EncryptedClientHelloRejectionVerify = func(utls.ConnectionState) error { return nil }
 	}
 	return uconfig, nil
 }

@@ -12,6 +12,11 @@ require (
 // robustness; this local copy is the build truth. See third_party/VENDORING.md.
 replace github.com/v2fly/v2ray-core/v5 => ./third_party/v2ray-core
 
+// refraction-networking/utls is vendored in-tree (git-subrepo) and patched so an
+// ECH-rejection retry verifies the outer public_name (not the concealed inner
+// name); this local copy is the build truth. See third_party/VENDORING.md.
+replace github.com/refraction-networking/utls => ./third_party/utls
+
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect

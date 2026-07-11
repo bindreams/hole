@@ -110,3 +110,8 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	nhooyr.io/websocket v1.8.6 // indirect
 )
+
+// utls is vendored+patched at ../utls (Hole build truth; needed here so the
+// standalone `go test` of this module also uses the patched copy). A vendoring
+// artifact, not an upstream change; see ../VENDORING.md.
+replace github.com/refraction-networking/utls => ../utls
