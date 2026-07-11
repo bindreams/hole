@@ -1277,7 +1277,7 @@ fn start_cancellable_succeeds_when_not_cancelled() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), token).await.unwrap();
+        pm.start_cancellable(&test_config(), false, token).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         pm.stop().await.unwrap();
     });
@@ -1305,7 +1305,7 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(
@@ -1334,7 +1334,7 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
         let token = CancellationToken::new();
         token.cancel(); // already cancelled before start is even called
 
-        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_none());
@@ -1349,7 +1349,9 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), token.clone()).await.unwrap();
+        pm.start_cancellable(&test_config(), false, token.clone())
+            .await
+            .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
 
         // Late cancel — must not panic, must not mutate proxy state.
@@ -1384,7 +1386,7 @@ fn start_cancellable_dropped_future_runs_guards() {
         // surrounding scope drops `f`, running the drop-safety guards.
         {
             let cfg = test_config();
-            let f = pm.start_cancellable(&cfg, token);
+            let f = pm.start_cancellable(&cfg, false, token);
             tokio::pin!(f);
             tokio::select! {
                 _ = &mut f => panic!("start should not complete while gate is unfired"),
@@ -1462,7 +1464,7 @@ fn pure_vpn_start_cancellable_during_proxy_start() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&config, token).await.unwrap_err();
+        let err = pm.start_cancellable(&config, false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         // No gate release needed: the cancel drops the parked
@@ -2289,7 +2291,10 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
 
             assert!(
                 matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
@@ -2338,7 +2343,10 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
                 "expected ForwarderSelfTestFailed, got {err:?}"
@@ -2359,7 +2367,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, _dir) = new_manager(MockProxy::new());
             // test_config() already has dns.enabled = false.
-            pm.start_cancellable(&test_config(), CancellationToken::new())
+            pm.start_cancellable(&test_config(), false, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(pm.state(), ProxyState::Running);
@@ -2476,7 +2484,10 @@ mod self_test {
     fn lockdown_on_skips_probe_keeps_original_reason() {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
                     !reason.contains("refused"),
@@ -2497,7 +2508,10 @@ mod self_test {
     fn lockdown_off_runs_probe_rewrites_reason() {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(false);
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                     let rewritten = if cfg!(target_os = "windows") {
@@ -2510,6 +2524,201 @@ mod self_test {
                         "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
                     );
                 }
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    // Block-until-connected cover (#553) ==============================================================================
+    //
+    // A covered start (auto-connect intent) engages the fail-closed cover BEFORE
+    // start_inner and, on failure, RETAINS it (host stays blocked). The gate
+    // fixture fails the start deterministically, so these assert engage/disengage
+    // counts + the retained-blocked state via the mock's kind-aware counters.
+
+    /// Gate fixture that also hands back the mock routing state so a test can read
+    /// the transient-cover engage/disengage counters. Server is a closed loopback
+    /// port (IP literal → resolves trivially, no DoH querier needed).
+    fn covered_gate_setup(
+        lockdown: bool,
+    ) -> (
+        ProxyManager<MockProxy, MockRouting>,
+        ProxyConfig,
+        Arc<MockRoutingState>,
+        tempfile::TempDir,
+    ) {
+        let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe_l.local_addr().unwrap();
+        drop(probe_l);
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+        let mut cfg = test_config();
+        cfg.server.server = closed.ip().to_string();
+        cfg.server.server_port = closed.port();
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+        (pm, cfg, st, dir)
+    }
+
+    #[skuld::test]
+    fn covered_start_engages_and_retains_cover_on_failure() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "covered start engages once"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "a failed covered start must RETAIN the cover, not disengage it"
+            );
+            assert!(
+                pm.blocked_until_connected(),
+                "host stays blocked after a failed covered start"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn uncovered_start_never_engages_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "a manual (uncovered) start never engages"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_subsumed_when_lockdown_intent_on() {
+        rt().block_on(async {
+            // Lockdown intent on: the transient cover is subsumed (the standing
+            // lockdown cover holds the line), so we must NOT engage it.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(true);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "lockdown-on subsumes the transient cover"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn user_stop_while_blocked_releases_cover_and_clears_error() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+            pm.stop().await.unwrap();
+            assert!(
+                !pm.blocked_until_connected(),
+                "a user Disconnect opens the blocked host"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "stop disengages the retained cover"
+            );
+            assert!(
+                pm.last_error().is_none(),
+                "Disconnect-from-blocked clears the stale error"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn same_server_retry_reuses_the_held_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            // Retry to the SAME server+resolvers while blocked: reuse the guard.
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "same-server retry reuses the guard (no re-engage)"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "the reused guard is never disengaged"
+            );
+            assert!(pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn different_server_retry_engages_new_and_drops_old() {
+        rt().block_on(async {
+            let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            // Retry to a DIFFERENT server IP while blocked.
+            cfg.server.server = "127.0.0.2".into();
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "a different-server retry engages a fresh cover"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the prior server's cover is dropped"
+            );
+            assert!(pm.blocked_until_connected());
+        });
+    }
+
+    /// The covered start engages the cover before start_inner, so the probe-
+    /// suppression predicate (cover_active) sees the live in-process signal even
+    /// with NO lockdown intent — the original self-test reason survives. Mirrors
+    /// `lockdown_on_skips_probe_keeps_original_reason`; the control is
+    /// `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe runs).
+    #[skuld::test]
+    fn covered_start_without_lockdown_suppresses_probe() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let err = pm.start_cancellable(&cfg, true, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
+                    !reason.contains("refused"),
+                    "a covered start engages a cover, so the probe is skipped and the original reason survives, got {reason:?}"
+                ),
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
         });
@@ -2548,7 +2757,10 @@ mod self_test {
             cfg.dns.protocol = hole_common::config::DnsProtocol::Https;
             cfg.dns.allow_insecure_bootstrap = false;
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                     let rewritten = if cfg!(target_os = "windows") {
