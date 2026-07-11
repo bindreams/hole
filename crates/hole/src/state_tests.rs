@@ -596,7 +596,7 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
     );
 }
 
-// Part B: wedged-cutover surface + clear path =========================================================================
+// Wedged-cutover surface + clear path =================================================================================
 
 // Wedge via transport error → UPDATE_FAILED.
 #[skuld::test]
@@ -626,6 +626,39 @@ async fn wedge_reachable_not_running_surfaces_failure() {
     let _ = link.send(BridgeRequest::Status).await;
     let s = link.cell().snapshot();
     assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+}
+
+// A reachable running:false wedge whose Status reports a lockdown change must
+// surface UPDATE_FAILED AND the new lockdown fields (not the stale prior ones).
+#[skuld::test]
+async fn wedge_reachable_carries_lockdown_change() {
+    let path = test_socket_path("wedge-lockdown");
+    let _m = serve_router(
+        &path,
+        axum::Router::new().route(
+            ROUTE_STATUS,
+            get(|| async {
+                Json(StatusResponse {
+                    running: false,
+                    lockdown_enabled: true,
+                    lockdown_active: false,
+                    ..status_response(false)
+                })
+            }),
+        ),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with(path, dir.path(), Some(false));
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+    assert!(
+        s.lockdown_enabled && !s.lockdown_active,
+        "the wedge Status's lockdown fields must apply, not the stale prior ones"
+    );
 }
 
 // HEALTHY re-read race: marker PRESENT at decision (→ UnmaskFailed) but the
@@ -699,7 +732,7 @@ async fn update_failed_clears_when_marker_gone() {
     let swept = std::env::temp_dir().join(format!("hole-616-clears-nonexistent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&swept);
     let link = super::BridgeLink::with_service_log_dir_and_liveness(path, swept, noop_hook(), liveness_stub(None));
-    link.cell().commit_update_failed(super::UPDATE_FAILED); // seed a prior wedge
+    link.cell().commit_update_failed(super::UPDATE_FAILED, None); // seed a prior wedge
     let _ = link.send(BridgeRequest::Status).await;
     assert!(
         link.cell().snapshot().error.is_none(),
@@ -723,11 +756,34 @@ async fn wedge_via_reload_surfaces_failure() {
 fn commit_update_failed_is_idempotent() {
     let cell = super::ProxyStateCell::new();
     cell.commit(true);
-    cell.commit_update_failed(super::UPDATE_FAILED);
+    cell.commit_update_failed(super::UPDATE_FAILED, None);
     let a = cell.snapshot();
     assert!(!a.running && a.error.as_deref() == Some(super::UPDATE_FAILED));
-    cell.commit_update_failed(super::UPDATE_FAILED);
+    cell.commit_update_failed(super::UPDATE_FAILED, None);
     assert_eq!(cell.snapshot().seq, a.seq);
+}
+
+#[skuld::test]
+fn commit_update_failed_applies_a_lockdown_change() {
+    // A wedge whose Status carried a lockdown change must surface UPDATE_FAILED
+    // AND the new lockdown fields — not preserve the stale prior ones.
+    let cell = super::ProxyStateCell::new();
+    cell.commit_status(true, None, false, false); // connected, no lockdown
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false)));
+    let s = cell.snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+    assert!(
+        s.lockdown_enabled && !s.lockdown_active,
+        "the wedge's lockdown fields apply"
+    );
+    // Re-committing the same wedge + lockdown is idempotent.
+    let seq = s.seq;
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false)));
+    assert_eq!(cell.snapshot().seq, seq);
+    // A lockdown change bumps seq even though running/error are unchanged.
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, true)));
+    let s2 = cell.snapshot();
+    assert!(s2.lockdown_active && s2.seq == seq + 1);
 }
 
 // Real seam, alive, through send(): held.

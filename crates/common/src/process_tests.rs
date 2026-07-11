@@ -16,13 +16,13 @@ fn absent_pid_has_no_start_time() {
 fn live_process_matches_and_alive() {
     let me = std::process::id();
     let start = process_start_time(me).unwrap();
-    assert!(process_matches_and_alive(me, start));
-    assert!(!process_matches_and_alive(me, start + 1)); // PID-reuse guard
-    assert!(!process_matches_and_alive(0, 0));
+    assert_eq!(process_matches_and_alive(me, start), Some(true));
+    assert_eq!(process_matches_and_alive(me, start + 1), Some(false)); // PID-reuse guard
+    assert_eq!(process_matches_and_alive(0, 0), Some(false)); // no such process
 }
 
-// A terminated child whose handle is still open (zombie) reads as NOT alive —
-// for exit code 0 AND a non-zero exit (the exit-FILETIME check is code-agnostic).
+// A terminated child whose handle is still open (zombie) reads as confirmed-dead
+// — for exit code 0 AND a non-zero exit (the exit-FILETIME check is code-agnostic).
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn zombie_process_is_not_alive() {
@@ -31,9 +31,10 @@ fn zombie_process_is_not_alive() {
         let pid = child.id();
         let start = process_start_time(pid).unwrap();
         child.wait().unwrap(); // dead; `child` (handle) kept in scope → unreaped zombie
-        assert!(
-            !process_matches_and_alive(pid, start),
-            "an exited-but-unreaped process must read as dead"
+        assert_eq!(
+            process_matches_and_alive(pid, start),
+            Some(false),
+            "an exited-but-unreaped process must read as confirmed-dead"
         );
         drop(child);
     }

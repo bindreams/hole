@@ -147,6 +147,9 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
 /// marker is a no-op (`Ok`).
 pub fn stamp_driver(log_dir: &Path, driver_pid: u32, driver_start_unix_ms: u64) -> io::Result<()> {
     let Some(mut info) = read(log_dir) else {
+        // Unreachable in the normal sequence (the initiator wrote the marker
+        // before stamping); a warn surfaces the anomaly rather than swallowing it.
+        tracing::warn!(driver_pid, "stamp_driver: no marker present to stamp");
         return Ok(());
     };
     info.driver_pid = driver_pid;

@@ -145,9 +145,10 @@ pub(crate) const UPDATE_FAILED: &str = "The update didn't finish and the connect
 pub type DriverLiveness = std::sync::Arc<dyn Fn(&hole_common::update_marker::MarkerInfo) -> Option<bool> + Send + Sync>;
 
 /// Windows: the driver is alive iff its PID is a running process whose creation
-/// time matches (exit-state + exact-equality). A stored `0` is a poisoned/absent
-/// identity → `None` (unassessed, never confirmed-dead). Off Windows there is no
-/// trackable persistent driver → `None`.
+/// time matches (exit-state + exact-equality); an access-denied/transient probe
+/// failure is `None` (unassessed, never confirmed-dead). A stored `0` is a
+/// poisoned/absent identity → `None`. Off Windows there is no trackable
+/// persistent driver → `None`.
 fn production_driver_liveness() -> DriverLiveness {
     #[cfg(target_os = "windows")]
     {
@@ -155,10 +156,7 @@ fn production_driver_liveness() -> DriverLiveness {
             if m.driver_start_unix_ms == 0 {
                 return None;
             }
-            Some(hole_common::process::process_matches_and_alive(
-                m.driver_pid,
-                m.driver_start_unix_ms,
-            ))
+            hole_common::process::process_matches_and_alive(m.driver_pid, m.driver_start_unix_ms)
         })
     }
     #[cfg(not(target_os = "windows"))]
@@ -176,7 +174,7 @@ pub struct BridgeLink {
     client: tokio::sync::Mutex<Option<BridgeClient>>,
     cell: ProxyStateCell,
     self_heal: SelfHealHook,
-    /// Resolves the cutover driver's liveness (Part B). Production self-wires
+    /// Resolves the cutover driver's liveness. Production self-wires
     /// `production_driver_liveness`; tests inject a stub.
     driver_liveness: DriverLiveness,
 }
@@ -244,7 +242,9 @@ impl BridgeLink {
                 .join(hole_common::update_marker::MARKER_FILE)
                 .exists()
             {
-                self.cell.commit_update_failed(UPDATE_FAILED);
+                // Carry any lockdown fields the triggering Status revealed so a
+                // reachable running:false wedge does not drop a fresh lockdown edge.
+                self.cell.commit_update_failed(UPDATE_FAILED, observed_lockdown(result));
                 return;
             }
             tracing::debug!("cutover marker file gone before commit; treating as a completed cutover");
@@ -468,18 +468,26 @@ impl ProxyStateCell {
     }
 
     /// Commit a wedged-cutover failure: Disconnected + the path-free reason.
-    /// Idempotent — re-committing the same failure does not bump `seq`.
-    pub fn commit_update_failed(&self, reason: &'static str) {
+    /// `lockdown` is `Some((enabled, active))` when the triggering Status carried
+    /// fresh lockdown fields (apply them) and `None` otherwise (preserve prior).
+    /// Idempotent — bumps `seq` only when running, error, or a lockdown field
+    /// actually changes.
+    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool)>) {
         self.tx.send_if_modified(|snap| {
-            if !snap.running && snap.error.as_deref() == Some(reason) {
+            let (le, la) = lockdown.unwrap_or((snap.lockdown_enabled, snap.lockdown_active));
+            if !snap.running
+                && snap.error.as_deref() == Some(reason)
+                && snap.lockdown_enabled == le
+                && snap.lockdown_active == la
+            {
                 return false;
             }
             *snap = ProxySnapshot {
                 seq: snap.seq + 1,
                 running: false,
                 error: Some(reason.to_string()),
-                lockdown_enabled: snap.lockdown_enabled,
-                lockdown_active: snap.lockdown_active,
+                lockdown_enabled: le,
+                lockdown_active: la,
             };
             true
         });
@@ -511,7 +519,7 @@ impl ProxyStateCell {
     }
 }
 
-// Cutover masking decision (Part B) ===================================================================================
+// Cutover masking decision ============================================================================================
 
 /// What the GUI should do with an exchange's observation while a cutover marker
 /// is (or is not) present, given the cutover DRIVER's liveness.

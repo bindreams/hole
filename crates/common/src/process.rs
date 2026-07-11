@@ -10,10 +10,13 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     platform::process_start_time_impl(pid)
 }
 
-/// Whether `pid` is a RUNNING process (not exited or a handle-retained zombie)
-/// whose creation time equals `expected_start_unix_ms`. Windows only; `false`
-/// elsewhere (Part B liveness is Windows-scoped).
-pub fn process_matches_and_alive(pid: u32, expected_start_unix_ms: u64) -> bool {
+/// Liveness of `pid` against a stamped creation time: `Some(true)` a running
+/// process (not exited or a handle-retained zombie) whose creation time equals
+/// `expected_start_unix_ms`; `Some(false)` a genuinely gone / reused / exited
+/// process; `None` unassessed (a transient/access-denied open failure — never
+/// treated as dead, which would false-wedge a healthy update). Windows only;
+/// `None` elsewhere.
+pub fn process_matches_and_alive(pid: u32, expected_start_unix_ms: u64) -> Option<bool> {
     platform::process_matches_and_alive_impl(pid, expected_start_unix_ms)
 }
 
@@ -37,8 +40,50 @@ mod platform {
     /// (grantable across privilege levels, so the unprivileged GUI can query the
     /// SYSTEM cutover child). `None` if the PID does not resolve.
     fn process_times(pid: u32) -> Option<(FILETIME, FILETIME)> {
-        // SAFETY: the handle is checked and closed below.
+        // SAFETY: the handle is checked and closed by `read_process_times`.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        read_process_times(handle)
+    }
+
+    pub fn process_start_time_impl(pid: u32) -> Option<u64> {
+        let (creation, _exit) = process_times(pid)?;
+        filetime_to_unix_ms(creation)
+    }
+
+    pub fn process_matches_and_alive_impl(pid: u32, expected: u64) -> Option<bool> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        // SAFETY: the handle is checked and closed below (via `read_process_times`).
+        let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(h) => h,
+            Err(e) => {
+                // Disambiguate "no such process" (confirmed-dead) from a transient
+                // open failure (access-denied etc. → unassessed). Same codes as
+                // `plugin_recovery::kill_pid`: 87/E_INVALIDARG mean an invalid/absent PID.
+                let code = e.code().0 as u32;
+                return if code == 0x8007_0057 || code == 87 {
+                    Some(false) // genuinely gone/reused
+                } else {
+                    None // access-denied / transient → unassessed, NOT dead
+                };
+            }
+        };
+        let times = read_process_times(handle);
+        let Some((creation, exit)) = times else {
+            // The open succeeded but reading times failed — treat as unassessed.
+            return None;
+        };
+        // A RUNNING process has a zero exit FILETIME; an exited process (even one
+        // kept unreaped by an open handle) has a non-zero exit time. Unambiguous
+        // (no GetExitCodeProcess/STILL_ACTIVE-259 collision). Identity: the
+        // creation FILETIME must match the stamped value.
+        Some(zero(exit) && filetime_to_unix_ms(creation) == Some(expected))
+    }
+
+    /// `GetProcessTimes` on an already-open handle, closing it. Split from the
+    /// PID-open path so `process_matches_and_alive_impl` can disambiguate the
+    /// open failure itself.
+    fn read_process_times(handle: windows::Win32::Foundation::HANDLE) -> Option<(FILETIME, FILETIME)> {
         let (mut creation, mut exit, mut kernel, mut user) = (
             FILETIME::default(),
             FILETIME::default(),
@@ -49,22 +94,6 @@ mod platform {
         let _ = unsafe { CloseHandle(handle) };
         ok.ok()?;
         Some((creation, exit))
-    }
-
-    pub fn process_start_time_impl(pid: u32) -> Option<u64> {
-        let (creation, _exit) = process_times(pid)?;
-        filetime_to_unix_ms(creation)
-    }
-
-    pub fn process_matches_and_alive_impl(pid: u32, expected: u64) -> bool {
-        let Some((creation, exit)) = process_times(pid) else {
-            return false; // reaped/absent → dead
-        };
-        // A RUNNING process has a zero exit FILETIME; an exited process (even one
-        // kept unreaped by an open handle) has a non-zero exit time. Unambiguous
-        // (no GetExitCodeProcess/STILL_ACTIVE-259 collision). Identity: the
-        // creation FILETIME must match the stamped value.
-        zero(exit) && filetime_to_unix_ms(creation) == Some(expected)
     }
 }
 
@@ -88,8 +117,8 @@ mod platform {
         Some(info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000)
     }
 
-    pub fn process_matches_and_alive_impl(_pid: u32, _expected: u64) -> bool {
-        false // Part B liveness is Windows-only
+    pub fn process_matches_and_alive_impl(_pid: u32, _expected: u64) -> Option<bool> {
+        None
     }
 }
 
@@ -113,8 +142,8 @@ mod platform {
         Some(start_secs * 1000 + (starttime_ticks % ticks_per_sec) * 1000 / ticks_per_sec)
     }
 
-    pub fn process_matches_and_alive_impl(_pid: u32, _expected: u64) -> bool {
-        false
+    pub fn process_matches_and_alive_impl(_pid: u32, _expected: u64) -> Option<bool> {
+        None
     }
 }
 
