@@ -133,6 +133,40 @@ fn resolve_bridge_socket(override_path: Option<PathBuf>) -> (PathBuf, bool) {
 /// testable and holds no `AppHandle` of its own.
 pub type SelfHealHook = std::sync::Arc<dyn Fn(Option<String>) + Send + Sync>;
 
+/// The path-free failure reason surfaced when a Windows update cutover wedges —
+/// its driver died mid-swap with the marker still present. GUI-set (not a bridge
+/// death reason), so it flows through `map_status_response` unchanged and cannot
+/// leak PII.
+pub(crate) const UPDATE_FAILED: &str = "The update didn't finish and the connection was lost.";
+
+/// Resolves the cutover DRIVER's liveness from its marker identity: `Some(true)`
+/// alive, `Some(false)` confirmed dead, `None` unassessed. Injected so `BridgeLink`
+/// stays testable and the masking decision stays `#[cfg]`-free.
+pub type DriverLiveness = std::sync::Arc<dyn Fn(&hole_common::update_marker::MarkerInfo) -> Option<bool> + Send + Sync>;
+
+/// Windows: the driver is alive iff its PID is a running process whose creation
+/// time matches (exit-state + exact-equality). A stored `0` is a poisoned/absent
+/// identity → `None` (unassessed, never confirmed-dead). Off Windows there is no
+/// trackable persistent driver → `None`.
+fn production_driver_liveness() -> DriverLiveness {
+    #[cfg(target_os = "windows")]
+    {
+        std::sync::Arc::new(|m: &hole_common::update_marker::MarkerInfo| {
+            if m.driver_start_unix_ms == 0 {
+                return None;
+            }
+            Some(hole_common::process::process_matches_and_alive(
+                m.driver_pid,
+                m.driver_start_unix_ms,
+            ))
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::sync::Arc::new(|_m| None)
+    }
+}
+
 pub struct BridgeLink {
     socket_path: PathBuf,
     /// SERVICE log dir where the privileged bridge writes the update-in-progress
@@ -142,6 +176,9 @@ pub struct BridgeLink {
     client: tokio::sync::Mutex<Option<BridgeClient>>,
     cell: ProxyStateCell,
     self_heal: SelfHealHook,
+    /// Resolves the cutover driver's liveness (Part B). Production self-wires
+    /// `production_driver_liveness`; tests inject a stub.
+    driver_liveness: DriverLiveness,
 }
 
 impl BridgeLink {
@@ -152,12 +189,25 @@ impl BridgeLink {
     /// Construct with an explicit service log dir (tests inject a temp dir so
     /// per-test markers don't collide across the shared skuld process).
     pub fn with_service_log_dir(socket_path: PathBuf, service_log_dir: PathBuf, self_heal: SelfHealHook) -> Self {
+        Self::with_service_log_dir_and_liveness(socket_path, service_log_dir, self_heal, production_driver_liveness())
+    }
+
+    /// Construct with an explicit service log dir AND driver-liveness resolver.
+    /// Tests inject a stub liveness so the mask/unmask/failure arms are driven
+    /// without a real process to probe.
+    pub fn with_service_log_dir_and_liveness(
+        socket_path: PathBuf,
+        service_log_dir: PathBuf,
+        self_heal: SelfHealHook,
+        driver_liveness: DriverLiveness,
+    ) -> Self {
         Self {
             socket_path,
             service_log_dir,
             client: tokio::sync::Mutex::new(None),
             cell: ProxyStateCell::new(),
             self_heal,
+            driver_liveness,
         }
     }
 
@@ -165,11 +215,46 @@ impl BridgeLink {
         &self.cell
     }
 
-    /// Whether the privileged bridge has a cutover in flight (its marker is
-    /// present). Read fresh per exchange so the no-surprise-Disconnected window
-    /// opens and closes with the marker.
-    fn update_in_progress(&self) -> bool {
-        hole_common::update_marker::read(&self.service_log_dir).is_some()
+    /// Read the cutover marker and (if present) resolve its driver's liveness,
+    /// fresh per exchange so the masking window opens and closes with the marker.
+    fn cutover_state(&self) -> (Option<hole_common::update_marker::MarkerInfo>, Option<bool>) {
+        let marker = hole_common::update_marker::read(&self.service_log_dir);
+        let driver_alive = marker.as_ref().and_then(|m| (self.driver_liveness)(m));
+        (marker, driver_alive)
+    }
+
+    /// Commit an exchange's observation under the current cutover decision. On a
+    /// wedged cutover (`UnmaskFailed` + not running) surface `UPDATE_FAILED` —
+    /// but only if the marker FILE is still present at commit: a swept marker
+    /// means the successor won (a completed cutover), so pass through. Any other
+    /// resolved observation retracts a stale `UPDATE_FAILED`.
+    fn commit_observation(
+        &self,
+        decision: CutoverDecision,
+        running: bool,
+        result: &Result<BridgeResponse, ClientError>,
+    ) {
+        if !running && decision == CutoverDecision::UnmaskFailed {
+            // "Successor won" ⇒ the marker FILE is gone. Use `exists()`, not
+            // `read()` (which also returns None for a present-but-corrupt marker)
+            // — a present-but-unparsable marker with a dead driver is a real
+            // wedge, not a completed cutover, so it must still surface the failure.
+            if self
+                .service_log_dir
+                .join(hole_common::update_marker::MARKER_FILE)
+                .exists()
+            {
+                self.cell.commit_update_failed(UPDATE_FAILED);
+                return;
+            }
+            tracing::debug!("cutover marker file gone before commit; treating as a completed cutover");
+        }
+        // A resolved observation retracts any stale wedge failure.
+        self.cell.clear_update_failed(UPDATE_FAILED);
+        match observed_lockdown(result) {
+            Some((le, la)) => self.cell.commit_status(running, observed_error(result), le, la),
+            None => self.cell.commit(running),
+        }
     }
 
     /// Drive the self-heal hook if the exchange revealed a version mismatch.
@@ -186,14 +271,11 @@ impl BridgeLink {
     pub async fn send(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
         let kind = ReqKind::of(&req);
         let mut guard = self.client.lock().await;
+        let (marker, driver_alive) = self.cutover_state();
+        let decision = cutover_decision(marker.as_ref(), driver_alive);
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
-        if let Some(running) = observed_running(kind, &result, self.update_in_progress()) {
-            // A Status exchange reveals error + lockdown too — commit all three
-            // atomically under this lock; other exchanges know only `running`.
-            match observed_lockdown(&result) {
-                Some((le, la)) => self.cell.commit_status(running, observed_error(&result), le, la),
-                None => self.cell.commit(running),
-            }
+        if let Some(running) = observed_running(kind, &result, matches!(decision, CutoverDecision::Mask)) {
+            self.commit_observation(decision, running, &result);
         }
         self.note_mismatch(&result);
         result
@@ -270,13 +352,12 @@ impl BridgeLink {
     /// successful reload.
     pub async fn reload_if_running(&self, config: hole_common::protocol::ProxyConfig) -> Result<bool, String> {
         let mut guard = self.client.lock().await;
+        let (marker, driver_alive) = self.cutover_state();
+        let decision = cutover_decision(marker.as_ref(), driver_alive);
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
         self.note_mismatch(&status);
-        if let Some(running) = observed_running(ReqKind::Status, &status, self.update_in_progress()) {
-            match observed_lockdown(&status) {
-                Some((le, la)) => self.cell.commit_status(running, observed_error(&status), le, la),
-                None => self.cell.commit(running),
-            }
+        if let Some(running) = observed_running(ReqKind::Status, &status, matches!(decision, CutoverDecision::Mask)) {
+            self.commit_observation(decision, running, &status);
         }
         if !matches!(status, Ok(BridgeResponse::Status { running: true, .. })) {
             return Ok(false); // Not running; changes apply on next start.
@@ -305,9 +386,11 @@ pub struct ProxySnapshot {
     /// Reason for the most recent running transition, when the bridge reported
     /// one (#470). Carried on BOTH the poll and the `proxy-state-changed` event
     /// so whichever channel wins the death-seq race surfaces the same string.
-    /// Only ever the path-free out-of-band-death sentinel or `None` (set by
-    /// `commit_status` from a Status response; cleared by `commit`), so a toast
-    /// of this value cannot leak PII — see `commands::map_status_response`.
+    /// Only ever a path-free sentinel or `None`: the bridge's out-of-band-death
+    /// reason (set by `commit_status`; cleared by `commit`) OR the GUI-set
+    /// `UPDATE_FAILED` for a wedged update cutover (set by `commit_update_failed`;
+    /// cleared by `clear_update_failed`). A toast of this value cannot leak PII —
+    /// see `commands::map_status_response`.
     pub error: Option<String>,
     /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
@@ -384,12 +467,77 @@ impl ProxyStateCell {
         });
     }
 
+    /// Commit a wedged-cutover failure: Disconnected + the path-free reason.
+    /// Idempotent — re-committing the same failure does not bump `seq`.
+    pub fn commit_update_failed(&self, reason: &'static str) {
+        self.tx.send_if_modified(|snap| {
+            if !snap.running && snap.error.as_deref() == Some(reason) {
+                return false;
+            }
+            *snap = ProxySnapshot {
+                seq: snap.seq + 1,
+                running: false,
+                error: Some(reason.to_string()),
+                lockdown_enabled: snap.lockdown_enabled,
+                lockdown_active: snap.lockdown_active,
+            };
+            true
+        });
+    }
+
+    /// Clear the sticky wedge reason from the backend snapshot once the cutover
+    /// resolves, even if `running` is unchanged, so subsequent `get_proxy_status`
+    /// polls no longer carry the stale error. The toast itself is transient (fired
+    /// once on the true→false death edge and faded); this is snapshot hygiene, not
+    /// a toast-dismiss. `commit`/`commit_status` don't key change-detection on
+    /// `error`, so this dedicated clear is what retracts it.
+    pub fn clear_update_failed(&self, reason: &'static str) {
+        self.tx.send_if_modified(|snap| {
+            if snap.error.as_deref() != Some(reason) {
+                return false;
+            }
+            snap.seq += 1;
+            snap.error = None;
+            true
+        });
+    }
+
     pub fn snapshot(&self) -> ProxySnapshot {
         self.tx.borrow().clone()
     }
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<ProxySnapshot> {
         self.tx.subscribe()
+    }
+}
+
+// Cutover masking decision (Part B) ===================================================================================
+
+/// What the GUI should do with an exchange's observation while a cutover marker
+/// is (or is not) present, given the cutover DRIVER's liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutoverDecision {
+    /// No cutover in flight (or it resolved) — commit the observation as usual.
+    PassThrough,
+    /// A cutover is in flight and the driver is alive (or unassessed) — hold the
+    /// last snapshot so the restart gap is not a surprise Disconnected.
+    Mask,
+    /// A cutover marker is present but the driver is CONFIRMED dead — the cutover
+    /// is abandoned; unmask and surface the wedged-update failure.
+    UnmaskFailed,
+}
+
+/// Single source of truth for the cutover masking decision. `driver_alive`:
+/// `Some(true)` alive, `Some(false)` confirmed dead, `None` unassessed (macOS or
+/// a poisoned/absent identity). No marker ⇒ PassThrough regardless of liveness.
+pub(crate) fn cutover_decision(
+    marker: Option<&hole_common::update_marker::MarkerInfo>,
+    driver_alive: Option<bool>,
+) -> CutoverDecision {
+    match (marker, driver_alive) {
+        (None, _) => CutoverDecision::PassThrough,
+        (Some(_), Some(false)) => CutoverDecision::UnmaskFailed,
+        (Some(_), _) => CutoverDecision::Mask,
     }
 }
 
@@ -422,9 +570,11 @@ impl ReqKind {
 ///   says nothing about the tunnel.
 /// - Transport errors on tracked kinds commit false: an unreachable
 ///   bridge tunnels nothing (the mapping `get_proxy_status` always used).
-/// - A transport error WHILE an update cutover is in progress commits
+/// - While the cutover mask is active (a marker present with a live/unassessed
+///   driver) both a transport error AND a reachable running:false commit
 ///   nothing: the bridge is mid-restart, so the gap is expected, not a
-///   Disconnected — hold the last snapshot.
+///   Disconnected — hold the last snapshot. The mask is dropped (decision
+///   PassThrough) once the marker is swept or the driver is confirmed dead.
 pub(crate) fn observed_running(
     kind: ReqKind,
     result: &Result<BridgeResponse, ClientError>,
@@ -446,6 +596,11 @@ pub(crate) fn observed_running(
         // it arrives only after the new bridge answers.
         (_, Err(_)) if update_in_progress => None,
         (_, Err(_)) => Some(false),
+        // A reachable running:false DURING a cutover is held (no surprise
+        // Disconnected — e.g. the proxy self-dies via `check_health` while the old
+        // bridge still serves); released once the marker is swept (the decision is
+        // then PassThrough, not Mask). Must precede the general Status-Ok arm.
+        (Status, Ok(BridgeResponse::Status { running: false, .. })) if update_in_progress => None,
         (Status, Ok(BridgeResponse::Status { running, .. })) => Some(*running),
         (Start, Ok(BridgeResponse::Ack)) => Some(true),
         (Start, Ok(BridgeResponse::StartFailed(e))) => match e {

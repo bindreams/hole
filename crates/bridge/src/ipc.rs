@@ -547,7 +547,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
         Ok(d) => d,
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -576,7 +578,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let payload = match staged_copy {
         Ok(Ok(copy)) => copy,
         Ok(Err(StageError::Verify(e))) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -586,7 +590,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Ok(Err(StageError::Io(e))) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -596,7 +602,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -616,7 +624,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let staged = match extracted {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -626,7 +636,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -641,7 +653,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // a detached child (returns naturally); macOS runs the actor on a detached
     // task that SIGTERMs THIS process only after this 200 is on the wire.
     if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
-        let _ = hole_common::update_marker::clear(log_dir);
+        if let Err(e) = hole_common::update_marker::clear(log_dir) {
+            tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+        }
         let _ = std::fs::remove_dir_all(&private_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,

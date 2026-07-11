@@ -369,7 +369,9 @@ mod macos {
             return;
         };
         tracing::error!(error = %e, "macOS cutover failed before restart; clearing marker");
-        let _ = hole_common::update_marker::clear(log_dir);
+        if let Err(ce) = hole_common::update_marker::clear(log_dir) {
+            tracing::warn!(error = %ce, "failed to clear cutover marker on error path");
+        }
     }
 }
 
