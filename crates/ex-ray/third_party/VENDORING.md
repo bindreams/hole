@@ -5,7 +5,7 @@ Two dependencies are vendored in-tree as
 patch them for ECH robustness without waiting on upstream. Both are the build
 truth via `go.mod` `replace` directives.
 
-## `v2ray-core/` — pinned **v5.51.2** ([v2fly/v2ray-core](https://github.com/v2fly/v2ray-core))
+## `v2ray-core/` — pinned **v5.52.0** ([v2fly/v2ray-core](https://github.com/v2fly/v2ray-core))
 
 Patched so ex-ray's TLS engine survives real-world ECH:
 
