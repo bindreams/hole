@@ -302,8 +302,6 @@ func TestSecuritySettingsQuicKeepsPlainTLS(t *testing.T) {
 	}
 }
 
-// senderSecurity returns the outbound sender's first stream security setting from
-// a generated client config.
 func senderSecurity(t *testing.T, cfg *core.Config) *anypb.Any {
 	t.Helper()
 	sender := new(proxyman.SenderConfig)

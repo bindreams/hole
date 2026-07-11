@@ -33,11 +33,9 @@ type Engine struct {
 func (e Engine) clientTLSConfig(preset utls.ClientHelloID, echOverride []byte, options ...tls.Option) (*systls.Config, error) {
 	if !presetCarriesECH(preset) {
 		if len(echOverride) > 0 {
-			// Contract assertion: a non-capable preset can never produce the ECH
-			// rejection that makes the retry seam thread an override, so this is
-			// unreachable. Panic (Go's contract-violation idiom here, matching
-			// common.Must) so a wiring regression trips loudly in CI rather than
-			// silently mis-dialing; a unit test constructs this impossible input.
+			// Unreachable: a non-ECH-capable preset can never produce the ECH rejection
+			// that makes the retry seam thread an override. Panic so a wiring regression
+			// trips loudly rather than silently mis-dialing.
 			panic("utls: ECH override handed to a non-ECH-capable preset (contract violation)")
 		}
 		return e.config.TlsConfig.GetTLSConfigForUnsupportedClient("uTLS engine", options...)
