@@ -1,7 +1,8 @@
-//! Fail-closed network cover: block all egress except loopback and the SS
-//! server IP, as an RAII guard. Used by the update cutover (PR3) to keep the
-//! tunnel leak-free during the brief bridge restart. OS specifics live in the
-//! platform submodules; this facade is `#[cfg]`-free for callers.
+//! Fail-closed network cover: block all egress except loopback, the SS server
+//! IP, and the DoH resolver IPs, as an RAII guard. Its production caller is the
+//! block-until-connected connect gate — held across a covered auto-connect start
+//! so a failed connect leaves the host blocked, not leaked. OS specifics live in
+//! the platform submodules; this facade is `#[cfg]`-free for callers.
 
 use std::net::IpAddr;
 use std::path::Path;
