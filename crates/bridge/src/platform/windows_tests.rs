@@ -32,6 +32,22 @@ fn post_bind_sweep_clears_marker() {
 }
 
 #[skuld::test]
+fn sweep_marker_then_ready_sweeps_before_reporting() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    let marker_gone_when_reported = std::cell::Cell::new(false);
+    super::sweep_marker_then_ready(dir.path(), || {
+        marker_gone_when_reported.set(hole_common::update_marker::read(dir.path()).is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        marker_gone_when_reported.get(),
+        "the marker must be swept before Running is reported"
+    );
+}
+
+#[skuld::test]
 fn restart_failure_actions_configures_restart_on_failure() {
     use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod};
     let fa = super::restart_failure_actions();

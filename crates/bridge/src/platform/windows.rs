@@ -76,22 +76,28 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    // Report running
+    // Report StartPending, NOT Running: the cutover child exits on the SCM
+    // `Running` edge, so `Running` is deferred until after the socket binds AND
+    // the marker is swept (`sweep_marker_then_ready`) — so a healthy update never
+    // presents "marker present + dead driver". No controls accepted while starting.
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
-        wait_hint: Duration::ZERO,
+        wait_hint: Duration::from_secs(30),
         process_id: None,
     })?;
 
-    info!("Windows service started");
+    info!("Windows service starting");
 
     // Build and run the tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async {
+    // `ServiceStatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
+    // deferred `Running` report inside the async block.
+    let status_handle_ready = status_handle;
+    let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
         let state_dir = STATE_DIR_OVERRIDE
             .get()
             .cloned()
@@ -126,6 +132,25 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             state_dir.clone(),
             None,
         )?;
+        // Socket is bound: sweep the cutover marker, then report SCM `Running`. The
+        // cutover child exits on the `Running` edge, so it exits only once the
+        // marker is gone — no "marker present + dead driver" window in a healthy
+        // update. If the sweep somehow fails, the start fails (SCM restarts + retries)
+        // rather than reporting Running with a stale marker.
+        sweep_marker_then_ready(&log_dir, || {
+            status_handle_ready
+                .set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Running,
+                    controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::ZERO,
+                    process_id: None,
+                })
+                .map_err(std::io::Error::other)
+        })?;
+        info!("Windows service started");
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =
@@ -152,12 +177,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
-        // The new bridge is authoritative once it has bound: any update marker is
-        // a completed cutover, so clear it unconditionally (remove-by-path).
-        let log_dir_marker = log_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
-            tracing::warn!(error = %e, "marker sweep task panicked");
-        }
+        // The marker was already swept before the `Running` report above (so the
+        // cutover child exits only once it is gone). No second sweep needed here.
         // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
         // (it fails while an old process still maps the renamed inode).
         if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
@@ -245,6 +266,30 @@ pub(crate) fn sweep_marker(log_dir: &Path) {
     if let Err(e) = hole_common::update_marker::clear(log_dir) {
         tracing::warn!(error = %e, "failed to clear update-in-progress marker");
     }
+}
+
+/// Sweep the completed cutover's marker, verify it is gone, THEN report `Running`
+/// so the cutover child (which exits on the `Running` edge) exits only after the
+/// marker is gone. A healthy update therefore never presents "marker present plus
+/// driver dead" — before this the child is alive (Mask), after it the marker is
+/// already swept (PassThrough).
+///
+/// The `read().is_some()` re-check is defense-in-depth. A remove failure should
+/// never happen (Rust opens files with `FILE_SHARE_DELETE`), yet reporting
+/// `Running` with a stale marker would false-fail the healthy update, so the start
+/// fails instead (SCM restarts and retries the sweep). That impossible branch is
+/// acceptance-observed, not unit-tested.
+fn sweep_marker_then_ready<R: FnOnce() -> std::io::Result<()>>(
+    log_dir: &Path,
+    report_running: R,
+) -> std::io::Result<()> {
+    sweep_marker(log_dir);
+    if hole_common::update_marker::read(log_dir).is_some() {
+        return Err(std::io::Error::other(
+            "cutover marker still present after sweep; refusing to report Running",
+        ));
+    }
+    report_running()
 }
 
 /// Prefix of a rename-away leftover from a cutover swap (`<file>.old-<ver>`); see
