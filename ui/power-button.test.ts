@@ -297,18 +297,18 @@ describe("power-button state machine", () => {
     expect(showToastMock).toHaveBeenCalledWith("proxy task exited unexpectedly", "error");
   });
 
-  // Wedged update cutover (#616): the GUI-set UPDATE_FAILED sentinel arrives as
-  // the `error` on a connected -> disconnected observation and must surface as a
-  // toast exactly like a bridge death reason (it flows through
-  // commands::map_status_response unchanged).
-  it("toasts the update-failed sentinel on a wedged cutover (connected -> disconnected)", async () => {
-    const UPDATE_FAILED = "The update didn't finish and the connection was lost.";
+  // Wedged update cutover: the GUI-set failure sentinel arrives as the `error`
+  // on a connected -> disconnected observation and must surface as a toast
+  // exactly like a bridge death reason. This tests the PLUMBING (the string is
+  // passed through unchanged), so it uses a local error, not the Rust constant.
+  it("toasts the wedged-cutover error on a connected -> disconnected observation", async () => {
+    const err = "test update-failed message";
     const { initPowerButton, applyProxyStateObservation } = await import("./power-button");
     initPowerButton();
     applyProxyStateObservation(1, true); // connected
-    applyProxyStateObservation(2, false, UPDATE_FAILED); // driver died mid-cutover
+    applyProxyStateObservation(2, false, err); // driver died mid-cutover
     expect(showToastMock).toHaveBeenCalledTimes(1);
-    expect(showToastMock).toHaveBeenCalledWith(UPDATE_FAILED, "error");
+    expect(showToastMock).toHaveBeenCalledWith(err, "error");
   });
 
   it("does not re-toast on a re-observation of the same death (frozen seq)", async () => {
