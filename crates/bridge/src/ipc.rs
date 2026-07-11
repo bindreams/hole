@@ -502,16 +502,28 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // dir — otherwise its `stage_payload` (which clears+rewrites the fixed dir)
     // could clobber the winner's already-verified copy mid-extract, reopening the
     // verify/use TOCTOU via a privileged write on the loser's behalf.
-    let marker = hole_common::update_marker::MarkerInfo {
-        version: hole_common::update_marker::MARKER_VERSION,
-        from_version: state.version.clone(),
-        to_version: req.target_version.clone(),
-        pid: std::process::id(),
-        started_at_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    };
+    let self_pid = std::process::id();
+    // A None self-probe is a contract-level surprise (a process can always read
+    // its own creation time), so warn; the stored 0 is treated downstream as an
+    // unassessed identity, never confirmed-dead.
+    let driver_start_unix_ms = hole_common::process::process_start_time(self_pid).unwrap_or_else(|| {
+        tracing::warn!(
+            pid = self_pid,
+            "could not read own process start time for the cutover marker"
+        );
+        0
+    });
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let marker = build_cutover_marker(
+        state.version.clone(),
+        req.target_version.clone(),
+        self_pid,
+        started_at_unix,
+        driver_start_unix_ms,
+    );
     if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker, state.owner) {
         let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
             (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
@@ -535,7 +547,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let private_dir = match crate::cutover::extract::private_payload_dir(&state.state_dir) {
         Ok(d) => d,
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -564,7 +578,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let payload = match staged_copy {
         Ok(Ok(copy)) => copy,
         Ok(Err(StageError::Verify(e))) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -574,7 +590,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Ok(Err(StageError::Io(e))) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -584,7 +602,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -604,7 +624,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     let staged = match extracted {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -614,7 +636,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
             ));
         }
         Err(e) => {
-            let _ = hole_common::update_marker::clear(log_dir);
+            if let Err(e) = hole_common::update_marker::clear(log_dir) {
+                tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+            }
             let _ = std::fs::remove_dir_all(&private_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -629,7 +653,9 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // a detached child (returns naturally); macOS runs the actor on a detached
     // task that SIGTERMs THIS process only after this 200 is on the wire.
     if let Err(e) = crate::cutover::apply::spawn_actor(staged, &req.target_version, app_dest.as_deref(), log_dir) {
-        let _ = hole_common::update_marker::clear(log_dir);
+        if let Err(e) = hole_common::update_marker::clear(log_dir) {
+            tracing::warn!(error = %e, "failed to clear cutover marker on error path");
+        }
         let _ = std::fs::remove_dir_all(&private_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1103,6 +1129,25 @@ fn apply_socket_permissions(path: &Path) {
         if libc::chmod(c_path.as_ptr(), 0o660) != 0 {
             warn!("chmod failed, socket may have incorrect permissions");
         }
+    }
+}
+
+/// Build the cutover marker; extracted so the driver-identity field mapping is
+/// unit-testable.
+fn build_cutover_marker(
+    from_version: String,
+    to_version: String,
+    self_pid: u32,
+    started_at_unix: u64,
+    driver_start_unix_ms: u64,
+) -> hole_common::update_marker::MarkerInfo {
+    hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version,
+        to_version,
+        driver_pid: self_pid,
+        started_at_unix,
+        driver_start_unix_ms,
     }
 }
 

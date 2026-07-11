@@ -44,6 +44,13 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
     use crate::cutover::os::run_cutover;
     use crate::cutover::os::windows::WindowsCutoverOs;
 
+    // Bring an install base predating the restart-on-failure SCM config up to date
+    // as part of the update itself. Best-effort: a failure here must not abort the
+    // cutover (the swap + restart still proceed), so log and continue.
+    if let Err(e) = crate::platform::os::ensure_failure_actions() {
+        tracing::warn!(error = %e, "cutover: could not ensure SCM restart-on-failure config");
+    }
+
     let install_dir = std::env::current_exe()?
         .parent()
         .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
@@ -54,7 +61,23 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         images,
         target_version: target_version.to_string(),
     };
-    run_cutover(&mut os)
+    let result = run_cutover(&mut os);
+    clear_marker_on_cutover_failure(&result, &hole_common::update_marker::service_log_dir());
+    result
+}
+
+/// On a graceful cutover failure clear the marker so a retry is not blocked by
+/// the single-occupancy claim. Load-bearing for the stop/swap sub-case (no new
+/// bridge binds to sweep it); an idempotent second clear for the start-failure
+/// sub-case (the SCM's restart-on-failure also sweeps post-bind). A crash is
+/// covered by the GUI liveness net.
+#[cfg(target_os = "windows")]
+fn clear_marker_on_cutover_failure(result: &std::io::Result<()>, log_dir: &Path) {
+    if result.is_err() {
+        if let Err(e) = hole_common::update_marker::clear(log_dir) {
+            tracing::warn!(error = %e, "cutover child: failed to clear marker on graceful failure");
+        }
+    }
 }
 
 /// Build the rename-swap plan for every bundled binary: each `name` maps from

@@ -5,8 +5,9 @@ fn sample_marker() -> hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 4242,
+        driver_pid: 4242,
         started_at_unix: 1_700_000_000,
+        driver_start_unix_ms: 0,
     }
 }
 
@@ -88,4 +89,62 @@ fn breakaway_only_when_in_job_and_job_permits() {
         "not in a job -> nothing to break out of"
     );
     assert!(!breakaway_decision(false, false));
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_spawned_driver_stamps_when_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    windows::record_spawned_driver(dir.path(), 4242, Some(1_700_000_000_123)).unwrap();
+    let got = hole_common::update_marker::read(dir.path()).unwrap();
+    assert_eq!((got.driver_pid, got.driver_start_unix_ms), (4242, 1_700_000_000_123));
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_spawned_driver_fails_when_child_vanished_or_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
+    assert!(windows::record_spawned_driver(dir.path(), 4242, None).is_err());
+    assert!(
+        windows::record_spawned_driver(dir.path(), 4242, Some(0)).is_err(),
+        "a poisoned 0 start time is rejected"
+    );
+}
+
+// The post-spawn composition (record->resume, kill-on-any-failure): an injected
+// record failure must terminate the still-suspended child AND return Err.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_resume_or_kill_kills_on_record_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("ran.txt");
+    let mut child = windows::spawn_suspended_command(&format!("cmd /c echo x > \"{}\"", sentinel.display())).unwrap();
+    let out = windows::record_resume_or_kill(&mut child, Err(std::io::Error::other("record failed")), || {
+        panic!("resume must not run after a record failure")
+    });
+    assert!(out.is_err(), "a record failure returns Err");
+    // The child was killed while suspended: it never ran, and wait() returns.
+    child.wait().unwrap();
+    assert!(!sentinel.exists(), "the killed suspended child never ran");
+}
+
+// The suspend->resume ordering primitive, asserted POSITIVELY: a suspended child
+// does not run (its sentinel is absent) until resumed, then it runs (sentinel
+// appears). Driven through the `spawn_suspended_command` inner seam so the
+// ordering is testable with an arbitrary observable command.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn spawn_suspended_child_is_frozen_until_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("ran.txt");
+    let mut child = windows::spawn_suspended_command(&format!("cmd /c echo x > \"{}\"", sentinel.display())).unwrap();
+    let pid = child.id();
+    assert!(!sentinel.exists(), "a suspended child must not run before resume");
+    windows::resume_main_thread(pid).unwrap();
+    // Sanctioned external-event wait: a broken resume leaves the child suspended
+    // forever, which the test harness surfaces as a timeout, not a hang here.
+    child.wait().unwrap();
+    assert!(sentinel.exists(), "the child ran only after resume");
 }

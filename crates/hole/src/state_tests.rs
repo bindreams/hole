@@ -1,6 +1,32 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::protocol::{BridgeResponse, StartError};
+use hole_common::update_marker::{MarkerInfo, MARKER_VERSION};
+
+fn sample_marker() -> MarkerInfo {
+    MarkerInfo {
+        version: MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        driver_pid: 4242,
+        started_at_unix: 0,
+        driver_start_unix_ms: 0,
+    }
+}
+
+// CutoverDecision =====================================================================================================
+
+#[skuld::test]
+fn cutover_decision_truth_table() {
+    use super::CutoverDecision::*;
+    let m = sample_marker();
+    assert_eq!(super::cutover_decision(None, None), PassThrough);
+    assert_eq!(super::cutover_decision(None, Some(false)), PassThrough);
+    assert_eq!(super::cutover_decision(None, Some(true)), PassThrough);
+    assert_eq!(super::cutover_decision(Some(&m), Some(true)), Mask);
+    assert_eq!(super::cutover_decision(Some(&m), None), Mask);
+    assert_eq!(super::cutover_decision(Some(&m), Some(false)), UnmaskFailed);
+}
 
 // ProxyStateCell ======================================================================================================
 
@@ -276,9 +302,18 @@ fn observed_running_update_in_progress_holds_snapshot() {
     });
     assert_eq!(observed_running(ReqKind::Status, &vm, false), None);
     assert_eq!(observed_running(ReqKind::Status, &vm, true), None);
-    // A successful Status still reports truth (marker irrelevant on Ok).
+    // A successful Status still reports truth (marker irrelevant on Ok{running:true}).
     let ok: Result<BridgeResponse, ClientError> = Ok(status_resp(true));
     assert_eq!(observed_running(ReqKind::Status, &ok, true), Some(true));
+    // A reachable Ok{running:false} DURING a cutover is masked (held), but flips
+    // to Disconnected once the marker is gone (Step 6b).
+    let ok_false: Result<BridgeResponse, ClientError> = Ok(status_resp(false));
+    assert_eq!(observed_running(ReqKind::Status, &ok_false, true), None, "masking");
+    assert_eq!(
+        observed_running(ReqKind::Status, &ok_false, false),
+        Some(false),
+        "not masking"
+    );
 }
 
 // BridgeLink ==========================================================================================================
@@ -342,9 +377,9 @@ fn noop_hook() -> SelfHealHook {
 
 /// Build a `BridgeLink` whose update-marker dir is a unique, never-created temp
 /// path. `BridgeLink::new` would otherwise read the real system service log dir,
-/// where a stray cutover marker would make `update_in_progress()` hold the
-/// snapshot and break these transport-error assertions. A non-existent dir reads
-/// as "no marker" (the `read` ENOENT path), keeping every test hermetic.
+/// where a stray cutover marker would make the cutover decision `Mask` and hold
+/// the snapshot, breaking these transport-error assertions. A non-existent dir
+/// reads as "no marker" (the `read` ENOENT path), keeping every test hermetic.
 fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
     let marker_dir = std::env::temp_dir().join(format!(
         "hole-link-marker-{}-{}",
@@ -352,6 +387,31 @@ fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
         socket_path.file_name().and_then(|s| s.to_str()).unwrap_or("x")
     ));
     BridgeLink::with_service_log_dir(socket_path, marker_dir, self_heal)
+}
+
+/// A driver-liveness stub reporting a fixed `Option<bool>` regardless of the marker.
+fn liveness_stub(a: Option<bool>) -> DriverLiveness {
+    std::sync::Arc::new(move |_m: &MarkerInfo| a)
+}
+
+/// A `BridgeLink` with an explicit service-log dir AND a stubbed driver liveness.
+fn link_with(path: PathBuf, dir: &std::path::Path, a: Option<bool>) -> BridgeLink {
+    BridgeLink::with_service_log_dir_and_liveness(path, dir.to_path_buf(), noop_hook(), liveness_stub(a))
+}
+
+/// Write the sample cutover marker into `dir`.
+fn marker_in(dir: &std::path::Path) {
+    hole_common::update_marker::write(dir, &sample_marker(), None).unwrap();
+}
+
+/// A liveness stub that reports the driver dead AND sweeps the marker as a side
+/// effect — simulating the successor sweeping the marker between the decision
+/// read and the commit re-read (the "successor won" race the re-read guard covers).
+fn sweeping_dead_stub(dir: PathBuf) -> DriverLiveness {
+    std::sync::Arc::new(move |_m| {
+        let _ = hole_common::update_marker::clear(&dir);
+        Some(false)
+    })
 }
 
 /// Serve `router` on `path`, accepting connections in a loop (BridgeLink
@@ -483,19 +543,8 @@ async fn transport_error_holds_snapshot_while_marker_present() {
     let path = test_socket_path("dead-marker");
     let _ = std::fs::remove_file(&path);
     let marker_dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(
-        marker_dir.path(),
-        &hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
-            from_version: "0.2.0".into(),
-            to_version: "0.3.0".into(),
-            pid: std::process::id(),
-            started_at_unix: 0,
-        },
-        None,
-    )
-    .unwrap();
-    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    marker_in(marker_dir.path());
+    let link = link_with(path, marker_dir.path(), Some(true));
     link.cell().commit(true); // believed running before the cutover gap
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(
@@ -521,23 +570,12 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
     let path = test_socket_path("cutover-flash");
     let _ = std::fs::remove_file(&path); // dead socket: every send is a transport error
     let marker_dir = tempfile::tempdir().unwrap();
-    let link = BridgeLink::with_service_log_dir(path, marker_dir.path().to_path_buf(), noop_hook());
+    let link = link_with(path, marker_dir.path(), Some(true));
     link.cell().commit(true); // believed Connected before the cutover
     let seq_connected = link.cell().snapshot().seq;
 
     // Marker SET: the failing Status must hold the Connected snapshot.
-    hole_common::update_marker::write(
-        marker_dir.path(),
-        &hole_common::update_marker::MarkerInfo {
-            version: hole_common::update_marker::MARKER_VERSION,
-            from_version: "0.2.0".into(),
-            to_version: "0.3.0".into(),
-            pid: std::process::id(),
-            started_at_unix: 0,
-        },
-        None,
-    )
-    .unwrap();
+    marker_in(marker_dir.path());
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(
         link.cell().snapshot().seq,
@@ -556,6 +594,259 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
         !link.cell().snapshot().running,
         "Disconnected commits once the marker is gone"
     );
+}
+
+// Wedged-cutover surface + clear path =================================================================================
+
+// Wedge via transport error → UPDATE_FAILED.
+#[skuld::test]
+async fn wedge_transport_error_surfaces_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(false));
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+}
+
+// Reachable Ok{running:false}, driver dead, marker STILL PRESENT → UPDATE_FAILED.
+#[skuld::test]
+async fn wedge_reachable_not_running_surfaces_failure() {
+    let path = test_socket_path("wedge-reachable");
+    let _m = serve_router(
+        &path,
+        axum::Router::new().route(ROUTE_STATUS, get(|| async { Json(status_response(false)) })),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with(path, dir.path(), Some(false));
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+}
+
+// A reachable running:false wedge whose Status reports a lockdown change must
+// surface UPDATE_FAILED AND the new lockdown fields (not the stale prior ones).
+#[skuld::test]
+async fn wedge_reachable_carries_lockdown_change() {
+    let path = test_socket_path("wedge-lockdown");
+    let _m = serve_router(
+        &path,
+        axum::Router::new().route(
+            ROUTE_STATUS,
+            get(|| async {
+                Json(StatusResponse {
+                    running: false,
+                    lockdown_enabled: true,
+                    lockdown_active: false,
+                    ..status_response(false)
+                })
+            }),
+        ),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with(path, dir.path(), Some(false));
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+    assert!(
+        s.lockdown_enabled && !s.lockdown_active,
+        "the wedge Status's lockdown fields must apply, not the stale prior ones"
+    );
+}
+
+// HEALTHY re-read race: marker PRESENT at decision (→ UnmaskFailed) but the
+// successor sweeps it before commit → the commit-time re-read finds it gone →
+// PassThrough, NO UPDATE_FAILED. Exercises the "successor won" guard: a transport
+// error (dead socket) reaches the failure branch, and a stub that clears the
+// marker when consulted.
+#[skuld::test]
+async fn healthy_swept_before_commit_no_false_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = super::BridgeLink::with_service_log_dir_and_liveness(
+        "/nonexistent/socket".into(),
+        dir.path().to_path_buf(),
+        noop_hook(),
+        sweeping_dead_stub(dir.path().to_path_buf()),
+    );
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(
+        !s.running && s.error.is_none(),
+        "swept marker at commit → no UPDATE_FAILED"
+    );
+}
+
+// Reachable running:false DURING a cutover with a live driver → HELD (masked),
+// no Disconnected flash (observed_running masks Ok{running:false} under Mask).
+#[skuld::test]
+async fn reachable_not_running_during_cutover_holds() {
+    let path = test_socket_path("reachable-live");
+    let _m = serve_router(
+        &path,
+        axum::Router::new().route(ROUTE_STATUS, get(|| async { Json(status_response(false)) })),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with(path, dir.path(), Some(true));
+    link.cell().commit(true);
+    let before = link.cell().snapshot().seq;
+    let _ = link.send(BridgeRequest::Status).await;
+    let s = link.cell().snapshot();
+    assert!(
+        s.running && s.seq == before,
+        "reachable running:false is held during a cutover"
+    );
+}
+
+// Healthy gap, driver alive → hold, no commit.
+#[skuld::test]
+async fn healthy_gap_holds_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(true));
+    link.cell().commit(true);
+    let before = link.cell().snapshot().seq;
+    let _ = link.send(BridgeRequest::Status).await;
+    assert!(link.cell().snapshot().running && link.cell().snapshot().seq == before);
+}
+
+// A stale UPDATE_FAILED is retracted once the cutover resolves (marker gone).
+#[skuld::test]
+async fn update_failed_clears_when_marker_gone() {
+    let path = test_socket_path("failed-clears");
+    let _m = serve_router(
+        &path,
+        axum::Router::new().route(ROUTE_STATUS, get(|| async { Json(status_response(false)) })),
+    )
+    .await;
+    let swept = std::env::temp_dir().join(format!("hole-616-clears-nonexistent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&swept);
+    let link = super::BridgeLink::with_service_log_dir_and_liveness(path, swept, noop_hook(), liveness_stub(None));
+    link.cell().commit_update_failed(super::UPDATE_FAILED, None); // seed a prior wedge
+    let _ = link.send(BridgeRequest::Status).await;
+    assert!(
+        link.cell().snapshot().error.is_none(),
+        "resolved cutover retracts the failure"
+    );
+}
+
+// reload_if_running Status leg also surfaces the wedge.
+#[skuld::test]
+async fn wedge_via_reload_surfaces_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    marker_in(dir.path());
+    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(false));
+    link.cell().commit(true);
+    let _ = link.reload_if_running(test_proxy_config()).await;
+    let s = link.cell().snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+}
+
+#[skuld::test]
+fn commit_update_failed_is_idempotent() {
+    let cell = super::ProxyStateCell::new();
+    cell.commit(true);
+    cell.commit_update_failed(super::UPDATE_FAILED, None);
+    let a = cell.snapshot();
+    assert!(!a.running && a.error.as_deref() == Some(super::UPDATE_FAILED));
+    cell.commit_update_failed(super::UPDATE_FAILED, None);
+    assert_eq!(cell.snapshot().seq, a.seq);
+}
+
+#[skuld::test]
+fn commit_update_failed_applies_a_lockdown_change() {
+    // A wedge whose Status carried a lockdown change must surface UPDATE_FAILED
+    // AND the new lockdown fields — not preserve the stale prior ones.
+    let cell = super::ProxyStateCell::new();
+    cell.commit_status(true, None, false, false); // connected, no lockdown
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false)));
+    let s = cell.snapshot();
+    assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
+    assert!(
+        s.lockdown_enabled && !s.lockdown_active,
+        "the wedge's lockdown fields apply"
+    );
+    // Re-committing the same wedge + lockdown is idempotent.
+    let seq = s.seq;
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false)));
+    assert_eq!(cell.snapshot().seq, seq);
+    // A lockdown change bumps seq even though running/error are unchanged.
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, true)));
+    let s2 = cell.snapshot();
+    assert!(s2.lockdown_active && s2.seq == seq + 1);
+}
+
+// Real seam, alive, through send(): held.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+async fn real_live_driver_holds_via_send() {
+    let me = std::process::id();
+    let start = hole_common::process::process_start_time(me).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(
+        dir.path(),
+        &MarkerInfo {
+            driver_pid: me,
+            driver_start_unix_ms: start,
+            ..sample_marker()
+        },
+        None,
+    )
+    .unwrap();
+    let link = super::BridgeLink::with_service_log_dir_and_liveness(
+        "/nonexistent/socket".into(),
+        dir.path().to_path_buf(),
+        noop_hook(),
+        super::production_driver_liveness(),
+    );
+    link.cell().commit(true);
+    let before = link.cell().snapshot().seq;
+    let _ = link.send(BridgeRequest::Status).await;
+    assert!(link.cell().snapshot().running && link.cell().snapshot().seq == before);
+}
+
+// Real seam, dead (zombie handle retained), through send(): UnmaskFailed once.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+async fn real_dead_driver_unmasks_once() {
+    let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
+    let pid = child.id();
+    let start = hole_common::process::process_start_time(pid).unwrap();
+    child.wait().unwrap(); // dead; `child` (handle) kept in scope below → zombie
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(
+        dir.path(),
+        &MarkerInfo {
+            driver_pid: pid,
+            driver_start_unix_ms: start,
+            ..sample_marker()
+        },
+        None,
+    )
+    .unwrap();
+    let link = super::BridgeLink::with_service_log_dir_and_liveness(
+        "/nonexistent/socket".into(),
+        dir.path().to_path_buf(),
+        noop_hook(),
+        super::production_driver_liveness(),
+    );
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    let first = link.cell().snapshot();
+    assert!(!first.running && first.error.as_deref() == Some(super::UPDATE_FAILED));
+    let _ = link.send(BridgeRequest::Status).await;
+    assert_eq!(link.cell().snapshot().seq, first.seq);
+    drop(child);
 }
 
 #[skuld::test]

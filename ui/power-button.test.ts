@@ -297,6 +297,20 @@ describe("power-button state machine", () => {
     expect(showToastMock).toHaveBeenCalledWith("proxy task exited unexpectedly", "error");
   });
 
+  // Wedged update cutover: the GUI-set failure sentinel arrives as the `error`
+  // on a connected -> disconnected observation and must surface as a toast
+  // exactly like a bridge death reason. This tests the PLUMBING (the string is
+  // passed through unchanged), so it uses a local error, not the Rust constant.
+  it("toasts the wedged-cutover error on a connected -> disconnected observation", async () => {
+    const err = "test update-failed message";
+    const { initPowerButton, applyProxyStateObservation } = await import("./power-button");
+    initPowerButton();
+    applyProxyStateObservation(1, true); // connected
+    applyProxyStateObservation(2, false, err); // driver died mid-cutover
+    expect(showToastMock).toHaveBeenCalledTimes(1);
+    expect(showToastMock).toHaveBeenCalledWith(err, "error");
+  });
+
   it("does not re-toast on a re-observation of the same death (frozen seq)", async () => {
     const { initPowerButton, updateProxyStatus } = await import("./power-button");
     initPowerButton();

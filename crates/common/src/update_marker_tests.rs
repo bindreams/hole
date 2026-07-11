@@ -9,8 +9,9 @@ fn roundtrip_write_read_clear() {
         version: MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 4242,
+        driver_pid: 4242,
         started_at_unix: 1_700_000_000,
+        driver_start_unix_ms: 0,
     };
     write(dir.path(), &info, None).unwrap();
 
@@ -35,8 +36,9 @@ fn schema_mismatch_reads_none() {
         "version": MARKER_VERSION + 1,
         "from_version": "0.3.0",
         "to_version": "0.4.0",
-        "pid": 7,
+        "driver_pid": 7,
         "started_at_unix": 1,
+        "driver_start_unix_ms": 0,
     });
     std::fs::write(dir.path().join(MARKER_FILE), serde_json::to_vec(&future).unwrap()).unwrap();
     assert!(read(dir.path()).is_none(), "unknown schema version -> None");
@@ -55,8 +57,9 @@ fn marker_mode_is_world_readable() {
         version: MARKER_VERSION,
         from_version: "a".into(),
         to_version: "b".into(),
-        pid: 1,
+        driver_pid: 1,
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     };
     write(dir.path(), &info, None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
@@ -73,8 +76,9 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
         version: MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 1,
+        driver_pid: 1,
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     };
     // First claim wins and the full content is readable (never a partial file).
     write_new(dir.path(), &info, None).unwrap();
@@ -112,8 +116,9 @@ fn write_new_marker_mode_is_world_readable() {
         version: MARKER_VERSION,
         from_version: "a".into(),
         to_version: "b".into(),
-        pid: 1,
+        driver_pid: 1,
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     };
     write_new(dir.path(), &info, None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
@@ -128,6 +133,38 @@ fn write_new_marker_mode_is_world_readable() {
 // file to another uid; a self-chown here would be vacuous (the temp is already
 // self-owned). It rides the root lane in
 // `crates/hole/tests/elevated_ownership_privileged.rs`.
+
+#[skuld::test]
+fn stamp_driver_overwrites_only_driver_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &MarkerInfo {
+            version: MARKER_VERSION,
+            from_version: "0.2.0".into(),
+            to_version: "0.3.0".into(),
+            driver_pid: 111,
+            started_at_unix: 1_700_000_000,
+            driver_start_unix_ms: 0,
+        },
+        None,
+    )
+    .unwrap();
+    stamp_driver(dir.path(), 222, 1_700_000_123_456).unwrap();
+    let got = read(dir.path()).unwrap();
+    assert_eq!((got.driver_pid, got.driver_start_unix_ms), (222, 1_700_000_123_456));
+    assert_eq!(
+        (got.from_version.as_str(), got.started_at_unix),
+        ("0.2.0", 1_700_000_000)
+    );
+}
+
+#[skuld::test]
+fn stamp_driver_absent_marker_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    stamp_driver(dir.path(), 1, 1).unwrap();
+    assert!(read(dir.path()).is_none());
+}
 
 #[skuld::test]
 fn service_log_dir_matches_log_collector_constants() {
