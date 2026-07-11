@@ -3,12 +3,18 @@
 // GUI hands it the verified payload over `POST /v1/update-apply`.
 
 pub(crate) mod check;
+mod consent;
 mod download;
 mod error;
 mod periodic;
 mod verify;
 
 pub use check::{check_for_update, UpdateInfo};
+pub use consent::{
+    build_apply_update, check_update_consent, check_update_dialog_body, cli_answer_confirms, cli_consent_decision,
+    tray_consent_decision, CliConsent, TrayConsent, CONSENT_CLI_PROMPT, CONSENT_CLI_REFUSAL, CONSENT_DIALOG_BODY,
+    CONSENT_DIALOG_TITLE, CONSENT_LOCKDOWN_RACED_OFF,
+};
 pub use download::download_asset;
 pub use error::UpdateError;
 pub use periodic::start_update_checker;

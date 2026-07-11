@@ -766,3 +766,44 @@ fn resolve_bridge_socket_empty_override_is_not_external() {
     assert_eq!(path, hole_common::protocol::default_bridge_socket_path());
     assert!(!external, "an empty override ⇒ not externally supervised");
 }
+
+#[skuld::test]
+fn classify_lockdown_is_fail_closed_three_state() {
+    let status = |lockdown_enabled: bool| {
+        Ok(BridgeResponse::Status {
+            running: true,
+            uptime_secs: 0,
+            error: None,
+            invalid_filters: Vec::new(),
+            udp_proxy_available: true,
+            ipv6_bypass_available: true,
+            lockdown_enabled,
+            lockdown_active: lockdown_enabled,
+        })
+    };
+    assert_eq!(
+        super::classify_lockdown(&status(true)),
+        super::LockdownRead::Known {
+            enabled: true,
+            active: true
+        }
+    );
+    assert_eq!(
+        super::classify_lockdown(&status(false)),
+        super::LockdownRead::Known {
+            enabled: false,
+            active: false
+        }
+    );
+    assert_eq!(
+        super::classify_lockdown(&Ok(BridgeResponse::Ack)),
+        super::LockdownRead::WrongReply
+    );
+    assert_eq!(
+        super::classify_lockdown(&Err(ClientError::PermissionDenied)),
+        super::LockdownRead::Unreadable
+    );
+    assert_eq!(super::observed_lockdown(&status(true)), Some((true, true)));
+    assert_eq!(super::observed_lockdown(&Ok(BridgeResponse::Ack)), None);
+    assert_eq!(super::observed_lockdown(&Err(ClientError::PermissionDenied)), None);
+}
