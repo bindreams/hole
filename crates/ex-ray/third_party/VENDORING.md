@@ -24,19 +24,40 @@ repo's linters and formatters (`prek.toml` top-level `exclude`,
 
 ## The fork is a mirror, not a dependency
 
-A `bindreams/v2ray-core` GitHub fork is (or will be) created **only** as a review
-and upstreaming surface. It is never referenced by `go.mod` and is never on the
-build path. Keeping it in sync is a manual step done when a patch is ready for
-human review or for proposing back to v2fly.
+The [`bindreams/v2ray-core`](https://github.com/bindreams/v2ray-core) GitHub fork
+exists **only** as a review and upstreaming surface. It is never referenced by
+`go.mod` and is never on the build path; keeping it in sync is a manual,
+one-directional step (the fork is downstream of the subrepo). It carries two
+first-party patches, extracted on the current pin:
+
+- **`getcertpool-nil-safety`** — guards a nil `*Config` receiver in `getCertPool`
+  (reachable: `GetTLSConfig` calls it before its own `if c == nil` check). Fork
+  PR: [bindreams/v2ray-core#2](https://github.com/bindreams/v2ray-core/pull/2).
+  Its regression test (`config_nil_{other,windows}_test.go`) also lives in-tree.
+- **`ech-fail-closed-retry`** — the ECH fail-closed gate + `retry_configs`
+  recovery (RFC 9849). It depends on the getCertPool fix (the fail-closed client
+  factory exercises the nil-receiver path), so it is **stacked** on it. Fork PR:
+  [bindreams/v2ray-core#3](https://github.com/bindreams/v2ray-core/pull/3).
 
 ## Sync workflow
 
-When a patch lands here and you want it reviewed / upstreamed:
+Patches are reviewed against a dedicated **review base** on the fork, not the
+fork's `master` (which tracks upstream and would swamp the diff):
 
-1. Extract the in-tree delta vs pinned upstream (the commits on top of v5.51.2).
-1. Apply that delta to a feature branch on the `bindreams/v2ray-core` fork.
-1. Open a fork-internal PR (feature -> fork `main`) for human review.
-1. If upstreaming, open a PR from the fork branch to `v2fly/v2ray-core`.
+1. Create `hole/<tag>` on the fork = the pinned upstream tag + **one** labeled
+   `ci: enable fork CI` commit (drops the linter's `github.repository` fork-guard
+   so lint runs; drops the secret-only codecov step). Head branches off this base,
+   so the CI commit never appears in a PR diff.
+1. Branch one feature per patch off `hole/<tag>` — or, for a dependent patch, off
+   the branch it depends on — and apply that patch's delta only.
+1. Open a fork-internal PR per patch targeting its base, so each diff is exactly
+   the patch. On a `pull_request` event GitHub runs the workflow from the
+   head-merged base, so lint/tests run with the fork-guard lifted.
+1. Drive v2ray-core's own `test.yml` + `linter.yml` green. Validate via `lint`,
+   the cross-compile `build` matrix, the patched-package tests, and the macOS
+   `test` job — v5.52.0's heavy `testing/scenarios` integration suite is flaky on
+   hosted runners, independent of any patch.
+1. If upstreaming, reuse the patch branch and PR body against `v2fly/v2ray-core`.
 
 This is one-directional and by hand; the fork is downstream of the subrepo, not
 the other way around.
