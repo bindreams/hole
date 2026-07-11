@@ -65,6 +65,36 @@ pub fn build_apply_update(
     }
 }
 
+pub const CONSENT_CLI_PROMPT: &str = "This update restarts the VPN. With Lockdown off, your traffic briefly goes out unencrypted during the restart.\nContinue? [y/N]: ";
+pub const CONSENT_CLI_REFUSAL: &str = "this update briefly sends your traffic unencrypted during the restart unless Lockdown is on, so it needs confirmation. Re-run in a terminal, or pass --yes to confirm. (Enabling Lockdown avoids this.)";
+
+/// CLI consent action.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CliConsent {
+    Proceed { consent: bool },
+    Prompt,
+    Refuse,
+}
+
+pub fn cli_consent_decision(lockdown_enabled: bool, yes: bool, interactive: bool) -> CliConsent {
+    if lockdown_enabled {
+        return CliConsent::Proceed { consent: false };
+    }
+    if yes {
+        return CliConsent::Proceed { consent: true };
+    }
+    if interactive {
+        return CliConsent::Prompt;
+    }
+    CliConsent::Refuse
+}
+
+/// Whether a read prompt line is an explicit yes; anything else — a bare Enter, an
+/// EOF empty line, `n` — declines (default-deny [y/N]).
+pub fn cli_answer_confirms(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 #[cfg(test)]
 #[path = "consent_tests.rs"]
 mod consent_tests;

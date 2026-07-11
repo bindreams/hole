@@ -64,3 +64,25 @@ fn build_apply_update_maps_every_field() {
         BridgeRequest::ApplyUpdate { consent: false, .. }
     ));
 }
+
+#[skuld::test]
+fn cli_consent_decision_carries_the_consent_value() {
+    use CliConsent::*;
+    assert_eq!(cli_consent_decision(true, false, false), Proceed { consent: false });
+    assert_eq!(cli_consent_decision(true, true, true), Proceed { consent: false });
+    assert_eq!(cli_consent_decision(false, true, false), Proceed { consent: true });
+    assert_eq!(cli_consent_decision(false, false, true), Prompt);
+    assert_eq!(cli_consent_decision(false, false, false), Refuse);
+}
+
+#[skuld::test]
+fn cli_answer_confirms_only_on_explicit_yes() {
+    // Explicit yes, incl. the LF/CRLF shapes read_line delivers.
+    for line in ["y", "yes", "Y", "YES ", " y ", "Yes", "y\n", "yes\r\n"] {
+        assert!(cli_answer_confirms(line), "{line:?} should confirm");
+    }
+    // Not an explicit yes; "" is EOF, "\n" is a bare Enter.
+    for line in ["", "\n", "\r\n", "n", "no", "yeah", "yep", "garbage"] {
+        assert!(!cli_answer_confirms(line), "{line:?} should decline");
+    }
+}

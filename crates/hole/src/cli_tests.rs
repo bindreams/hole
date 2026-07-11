@@ -116,7 +116,7 @@ fn dispatch_exempts_bridge_log_from_cli_log_guard() {
 
 #[skuld::test]
 fn dispatch_installs_cli_log_guard_for_write_actions() {
-    assert!(should_install_cli_log_guard(&Command::Upgrade));
+    assert!(should_install_cli_log_guard(&Command::Upgrade { yes: false }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Install {
             log_dir: None,
@@ -152,6 +152,16 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
             config_file: std::path::PathBuf::from("/tmp/x.json"),
         },
     }));
+}
+
+#[skuld::test]
+fn upgrade_parses_yes_flag() {
+    let long = Cli::try_parse_from(["hole", "upgrade", "--yes"]).unwrap();
+    assert!(matches!(long.command, Some(Command::Upgrade { yes: true })));
+    let short = Cli::try_parse_from(["hole", "upgrade", "-y"]).unwrap();
+    assert!(matches!(short.command, Some(Command::Upgrade { yes: true })));
+    let default = Cli::try_parse_from(["hole", "upgrade"]).unwrap();
+    assert!(matches!(default.command, Some(Command::Upgrade { yes: false })));
 }
 
 // Tests: bridge_log_watch rotation detection ==========================================================================
