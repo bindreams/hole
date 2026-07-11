@@ -14,8 +14,6 @@ fn check_update_consent_polarity() {
 
 #[skuld::test]
 fn check_update_dialog_body_discloses_leak_only_when_lockdown_off() {
-    // Derive the expectation from the single source of truth (the disclosure const),
-    // so a rephrase can't silently drop the disclosure past the test.
     let off = check_update_dialog_body("1.2.3", false);
     assert!(
         off.contains("1.2.3") && off.contains(CHECK_LEAK_DISCLOSURE),
@@ -25,6 +23,20 @@ fn check_update_dialog_body_discloses_leak_only_when_lockdown_off() {
     assert!(
         on.contains("1.2.3") && !on.contains(CHECK_LEAK_DISCLOSURE),
         "on must not disclose a leak"
+    );
+}
+
+#[skuld::test]
+fn check_leak_disclosure_names_the_leak() {
+    // Pin the security-relevant wording so a rephrase that stops naming the
+    // Lockdown-off condition or the cleartext leak fails the build.
+    assert!(
+        CHECK_LEAK_DISCLOSURE.contains("Lockdown"),
+        "must name the Lockdown condition"
+    );
+    assert!(
+        CHECK_LEAK_DISCLOSURE.contains("unencrypted"),
+        "must name the cleartext leak"
     );
 }
 

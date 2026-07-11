@@ -920,8 +920,7 @@ async fn handle_uninstall_helper(app: AppHandle) {
 }
 
 /// Read the bridge's lockdown intent fresh, failing closed to `false` (⇒ require
-/// consent) on any unreadable reply, logging the transport-error and wrong-reply
-/// cases distinctly.
+/// consent) on any unreadable reply.
 async fn read_lockdown_fresh(app: &AppHandle) -> bool {
     let status = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
     match crate::state::classify_lockdown(&status) {
@@ -1155,7 +1154,7 @@ async fn handle_check_for_updates(app: AppHandle) {
                 .blocking_show();
 
             if confirmed {
-                // Consent decided here (merged dialog); reuse the install handler.
+                // Consent already decided by the merged dialog above.
                 let update_state = app.state::<hole::update::UpdateState>();
                 update_state.tx.send_replace(Some(info));
                 handle_install_update_from_tray(app, Some(hole::update::check_update_consent(lockdown_enabled))).await;

@@ -803,7 +803,6 @@ fn classify_lockdown_is_fail_closed_three_state() {
         super::classify_lockdown(&Err(ClientError::PermissionDenied)),
         super::LockdownRead::Unreadable
     );
-    // observed_lockdown delegates to classify_lockdown; guard all three arms.
     assert_eq!(super::observed_lockdown(&status(true)), Some((true, true)));
     assert_eq!(super::observed_lockdown(&Ok(BridgeResponse::Ack)), None);
     assert_eq!(super::observed_lockdown(&Err(ClientError::PermissionDenied)), None);

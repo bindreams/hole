@@ -8,7 +8,6 @@ pub const CONSENT_DIALOG_TITLE: &str = "Install Update";
 pub const CONSENT_DIALOG_BODY: &str = "Installing this update restarts the VPN.\n\nWith Lockdown off, your internet traffic briefly goes out unencrypted while the VPN restarts.\n\nInstall this update?";
 pub const CONSENT_LOCKDOWN_RACED_OFF: &str = "Lockdown changed during the update. Please try installing again.";
 
-/// Tray consent action (badge path).
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrayConsent {
     Proceed { consent: bool },
@@ -29,13 +28,12 @@ pub fn check_update_consent(lockdown_enabled: bool) -> bool {
     !lockdown_enabled
 }
 
-/// The leak disclosure the lockdown-off check dialog embeds — a single source of
-/// truth shared by `check_update_dialog_body` and its test.
+/// The leak disclosure embedded in the lockdown-off check dialog.
 const CHECK_LEAK_DISCLOSURE: &str =
     "Installing it restarts the VPN. With Lockdown off, your traffic briefly goes out unencrypted while the VPN restarts.";
 
-/// Body for the tray "Check for Updates" dialog; lockdown-off folds in the leak
-/// disclosure so that path shows one dialog.
+/// Body for the tray "Check for Updates" dialog; the lockdown-off branch folds
+/// in the leak disclosure so that path needs only one dialog.
 pub fn check_update_dialog_body(version: &str, lockdown_enabled: bool) -> String {
     if lockdown_enabled {
         format!("Version {version} is available.\n\nWould you like to install it now?")
@@ -68,7 +66,6 @@ pub fn build_apply_update(
 pub const CONSENT_CLI_PROMPT: &str = "This update restarts the VPN. With Lockdown off, your traffic briefly goes out unencrypted during the restart.\nContinue? [y/N]: ";
 pub const CONSENT_CLI_REFUSAL: &str = "this update briefly sends your traffic unencrypted during the restart unless Lockdown is on, so it needs confirmation. Re-run in a terminal, or pass --yes to confirm. (Enabling Lockdown avoids this.)";
 
-/// CLI consent action.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliConsent {
     Proceed { consent: bool },

@@ -426,7 +426,7 @@ fn handle_upgrade(yes: bool) -> i32 {
                 return 1;
             }
 
-            // Gate consent at send time: read lockdown fresh and disclose the leak.
+            // Read lockdown fresh at send time — not the cached snapshot.
             use std::io::{IsTerminal, Write};
             let status = send_bridge_request_inner(hole_common::protocol::BridgeRequest::Status);
             let lockdown_enabled = match crate::state::classify_lockdown(&status) {
