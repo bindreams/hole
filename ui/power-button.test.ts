@@ -297,6 +297,20 @@ describe("power-button state machine", () => {
     expect(showToastMock).toHaveBeenCalledWith("proxy task exited unexpectedly", "error");
   });
 
+  // Wedged update cutover (#616): the GUI-set UPDATE_FAILED sentinel arrives as
+  // the `error` on a connected -> disconnected observation and must surface as a
+  // toast exactly like a bridge death reason (it flows through
+  // commands::map_status_response unchanged).
+  it("toasts the update-failed sentinel on a wedged cutover (connected -> disconnected)", async () => {
+    const UPDATE_FAILED = "The update didn't finish and the connection was lost.";
+    const { initPowerButton, applyProxyStateObservation } = await import("./power-button");
+    initPowerButton();
+    applyProxyStateObservation(1, true); // connected
+    applyProxyStateObservation(2, false, UPDATE_FAILED); // driver died mid-cutover
+    expect(showToastMock).toHaveBeenCalledTimes(1);
+    expect(showToastMock).toHaveBeenCalledWith(UPDATE_FAILED, "error");
+  });
+
   it("does not re-toast on a re-observation of the same death (frozen seq)", async () => {
     const { initPowerButton, updateProxyStatus } = await import("./power-button");
     initPowerButton();
