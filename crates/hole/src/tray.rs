@@ -284,7 +284,6 @@ struct TrayActions {
     status: &'static str,
     action_id: &'static str,
     action_text: &'static str,
-    /// Whether to also show the explicit "Go Offline (unblock)" item.
     show_go_offline: bool,
 }
 
@@ -813,8 +812,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!("tray: retry clicked from the blocked state");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                // A covered retry: re-attempt under the held cover (same escape
-                // semantics as the auto-connect latch — stays blocked on failure).
+                // Covered retry: re-attempt under the held cover (stays blocked on failure).
                 match connect_silently(&app_handle).await {
                     Ok(outcome) => info!(?outcome, "blocked-state retry settled"),
                     Err(reason) => info!(%reason, "blocked-state retry did not connect"),
@@ -1498,11 +1496,20 @@ pub(crate) enum PendingAction {
 /// Decide the pending startup-connect action from a reconciler `Status` result.
 /// Only a reachable bridge reporting its run state is conclusive; a transport
 /// failure means "not bound yet", and a DACL/version hiccup says nothing about
-/// readiness — both retain so a later tick can apply the intent.
+/// readiness — both retain so a later tick can apply the intent. A host left
+/// fail-closed by a failed covered start (`blocked_until_connected`) is NOT idle
+/// to re-apply against: the intent is retained so a re-armed latch can never
+/// auto-fire against a deliberately-blocked host (defense-in-depth — the latch is
+/// single-consumption today).
 pub(crate) fn should_apply_pending(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> PendingAction {
     match result {
+        Ok(BridgeResponse::Status {
+            running: false,
+            blocked_until_connected: true,
+            ..
+        }) => PendingAction::Retain,
         Ok(BridgeResponse::Status { running: false, .. }) => PendingAction::Apply,
         Ok(BridgeResponse::Status { running: true, .. }) => PendingAction::Drop,
         _ => PendingAction::Retain,

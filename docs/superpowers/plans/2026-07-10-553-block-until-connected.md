@@ -18,11 +18,20 @@ defer):**
 
 - pre-login / GUI-launch→Start (no bridge op yet).
 - the pre-DoH-resolve instant of a *fresh* covered start (one encrypted DoH RTT
-  before the cover engages) and the equivalent instant of a *different-server*
-  retry (a same-server retry reuses the held cover with no window — below).
+  before the cover engages). A retry while blocked reuses the single held cover
+  (no window); a retry to a *different* server runs under it fail-closed (the new
+  server is not permitted, so the connect fails and the host stays blocked — the
+  user Disconnects to switch servers). Repointing the held cover in place so a
+  different-server retry can connect is a tracked follow-up.
 - bridge crash while blocked (the existing `recover_cover` sweeps it open on next
   start; standing lockdown is the crash-durable opt-in).
 - macOS reboot-durability.
+
+**Accepted UX scope (disclosed, not silently deferred):** the blocked state is
+rendered in the **tray** (status + Retry / Go-Offline); a distinct **dashboard**
+blocked indicator is deferred to bindreams/hole#625 (the bridge enforces the
+protection and the dashboard truthfully shows "Disconnected", never a false
+"Connected"). The user chose minimal-correct / tray-first for the beta.
 
 **Architecture:** The transient cover (`Routing::install_failclosed_cover`,
 permit loopback + server, block all else) gains DoH-resolver-IP permits. The

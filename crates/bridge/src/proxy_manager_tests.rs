@@ -2677,14 +2677,18 @@ mod self_test {
     }
 
     #[skuld::test]
-    fn different_server_retry_engages_new_and_drops_old() {
+    fn different_server_retry_reuses_held_cover_stays_fail_closed() {
         rt().block_on(async {
+            // The transient cover is a global singleton: a different-server retry
+            // must NOT engage a second cover (that would self-clobber the shared
+            // WFP GUIDs / pf ruleset and fail OPEN). It reuses the single held
+            // guard — the new server is simply not permitted, so the retry stays
+            // fail-closed.
             let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            // Retry to a DIFFERENT server IP while blocked.
             cfg.server.server = "127.0.0.2".into();
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
@@ -2692,13 +2696,13 @@ mod self_test {
                 .unwrap_err();
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
-                2,
-                "a different-server retry engages a fresh cover"
+                1,
+                "a different-server retry must reuse the held singleton, never engage a second"
             );
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
-                1,
-                "the prior server's cover is dropped"
+                0,
+                "the held cover is never disengaged mid-retry (no fall-open)"
             );
             assert!(pm.blocked_until_connected());
         });

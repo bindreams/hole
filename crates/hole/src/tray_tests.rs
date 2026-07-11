@@ -222,6 +222,32 @@ fn status_resp(running: bool) -> BridgeResponse {
     }
 }
 
+fn status_resp_blocked() -> BridgeResponse {
+    match status_resp(false) {
+        BridgeResponse::Status {
+            uptime_secs,
+            error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
+            lockdown_enabled,
+            lockdown_active,
+            ..
+        } => BridgeResponse::Status {
+            running: false,
+            uptime_secs,
+            error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
+            lockdown_enabled,
+            lockdown_active,
+            blocked_until_connected: true,
+        },
+        other => other,
+    }
+}
+
 #[skuld::test]
 fn should_apply_pending_rules() {
     use PendingAction::*;
@@ -241,6 +267,10 @@ fn should_apply_pending_rules() {
         // Reachable but the bridge errored on Status -> keep the intent.
         (Ok(err_resp("busy")), Retain),
         (Ok(BridgeResponse::Ack), Retain),
+        // Not running but fail-closed by a failed covered start -> NOT idle to
+        // re-apply against; retain so a re-armed latch can't auto-fire against a
+        // deliberately-blocked host.
+        (Ok(status_resp_blocked()), Retain),
     ];
     for (result, expected) in &table {
         assert_eq!(should_apply_pending(result), *expected, "{result:?}");

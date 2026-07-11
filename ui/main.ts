@@ -295,10 +295,9 @@ function setupEventListeners(): Promise<unknown> {
     seq: number;
     running: boolean;
     error: string | null;
-    // Also serialized by the backend ProxySnapshot; the power button only needs
-    // running/error today. `blocked_until_connected` (a covered auto-connect
-    // failed → host fail-closed while not running) is surfaced via the tray's
-    // Retry / Go-Offline items; a distinct dashboard blocked state is a follow-up.
+    // The backend also serializes lockdown/blocked fields; this listener uses
+    // only running/error. The blocked state is surfaced in the tray; a distinct
+    // dashboard blocked state is tracked in bindreams/hole#625.
     lockdown_enabled?: boolean;
     lockdown_active?: boolean;
     blocked_until_connected?: boolean;
