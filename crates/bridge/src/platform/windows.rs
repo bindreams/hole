@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
     ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
@@ -403,8 +403,13 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
 
     service.set_description(SERVICE_DESCRIPTION)?;
-    drop(service);
-    ensure_failure_actions()?;
+    // Auto-restart is hardening, applied on the just-created handle (no re-open,
+    // which can race SCM propagation right after create_service). Best-effort: the
+    // service is installed regardless — failing the whole install (an MSI custom
+    // action) over the restart config would be worse than shipping without it.
+    if let Err(e) = apply_failure_actions(&service) {
+        warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
+    }
     info!("Windows service installed");
     Ok(())
 }
@@ -424,19 +429,23 @@ fn restart_failure_actions() -> ServiceFailureActions {
     }
 }
 
-/// Apply the restart-on-failure SCM config to the installed `HoleBridge` service:
-/// the `Restart` action plus the non-crash-failures flag (so a graceful
-/// `Stopped(1)` from a failed bind is restarted too, while a clean `Stopped(0)`
-/// user/cutover stop is not). Idempotent — a re-apply just re-writes the same
-/// config. Called by `install()` for a fresh install and by the cutover child so
-/// an install base predating this config is brought up to date as part of the
-/// update itself.
+/// Write the restart-on-failure SCM config to an open `HoleBridge` handle (needs
+/// `CHANGE_CONFIG`): the `Restart` action plus the non-crash-failures flag (so a
+/// graceful `Stopped(1)` from a failed bind is restarted too, while a clean
+/// `Stopped(0)` user/cutover stop is not).
+fn apply_failure_actions(service: &windows_service::service::Service) -> Result<(), windows_service::Error> {
+    service.update_failure_actions(restart_failure_actions())?;
+    service.set_failure_actions_on_non_crash_failures(true)
+}
+
+/// Open the installed `HoleBridge` service and apply the restart-on-failure
+/// config. Idempotent (a re-apply re-writes the same config). Called by the
+/// cutover child so an install base predating this config is brought up to date
+/// as part of the update itself.
 pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
-    service.update_failure_actions(restart_failure_actions())?;
-    service.set_failure_actions_on_non_crash_failures(true)?;
-    Ok(())
+    apply_failure_actions(&service)
 }
 
 /// Stop and uninstall the bridge Windows Service.
