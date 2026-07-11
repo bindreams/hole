@@ -54,7 +54,23 @@ pub fn run_detached(payload: &Path, target_version: &str) -> std::io::Result<()>
         images,
         target_version: target_version.to_string(),
     };
-    run_cutover(&mut os)
+    let result = run_cutover(&mut os);
+    clear_marker_on_cutover_failure(&result, &hole_common::update_marker::service_log_dir());
+    result
+}
+
+/// On a graceful cutover failure clear the marker so a retry is not blocked by
+/// the single-occupancy claim. Load-bearing for the stop/swap sub-case (no new
+/// bridge binds to sweep it); an idempotent second clear for the start-failure
+/// sub-case (Part A's restart also sweeps post-bind). A crash is covered by the
+/// GUI liveness net.
+#[cfg(target_os = "windows")]
+fn clear_marker_on_cutover_failure(result: &std::io::Result<()>, log_dir: &Path) {
+    if result.is_err() {
+        if let Err(e) = hole_common::update_marker::clear(log_dir) {
+            tracing::warn!(error = %e, "cutover child: failed to clear marker on graceful failure");
+        }
+    }
 }
 
 /// Build the rename-swap plan for every bundled binary: each `name` maps from

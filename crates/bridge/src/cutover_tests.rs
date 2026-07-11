@@ -49,6 +49,25 @@ fn unlock_successful_disengage_flips_intent_off() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
+fn clear_marker_on_failure_clears_only_on_err() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = hole_common::update_marker::MarkerInfo {
+        version: hole_common::update_marker::MARKER_VERSION,
+        from_version: "0.2.0".into(),
+        to_version: "0.3.0".into(),
+        driver_pid: 1,
+        started_at_unix: 0,
+        driver_start_unix_ms: 0,
+    };
+    hole_common::update_marker::write(dir.path(), &m, None).unwrap();
+    clear_marker_on_cutover_failure(&Ok(()), dir.path());
+    assert!(hole_common::update_marker::read(dir.path()).is_some());
+    clear_marker_on_cutover_failure(&Err(std::io::Error::other("boom")), dir.path());
+    assert!(hole_common::update_marker::read(dir.path()).is_none());
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
 fn find_staged_exe_locates_hole_exe_in_nested_tree() {
     // An MSI admin-install lays the exe into a versioned subtree, so the finder
     // must recurse, not look at a fixed depth.
