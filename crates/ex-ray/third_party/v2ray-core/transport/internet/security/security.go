@@ -35,8 +35,8 @@ func (a OptionWithDestination) isSecurityOption() {
 // OptionWithECHConfigOverride forces the engine's client config to carry these
 // ECH configs (EncryptedClientHelloConfigList), bypassing the DoH cache. It is
 // the race-free seam for an ECH-rejection retry: the server's retry_configs are
-// threaded directly into the retry connection. An engine that cannot carry ECH
-// (uTLS) treats it as a no-op.
+// threaded directly into the retry connection. The standard TLS and uTLS engines
+// honor it (uTLS for an ECH-capable preset).
 type OptionWithECHConfigOverride struct {
 	Configs []byte
 }

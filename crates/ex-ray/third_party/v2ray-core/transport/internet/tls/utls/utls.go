@@ -3,6 +3,7 @@ package utls
 import (
 	"context"
 	systls "crypto/tls"
+	"errors"
 
 	utls "github.com/refraction-networking/utls"
 
@@ -25,8 +26,33 @@ type Engine struct {
 	config *Config
 }
 
+// clientTLSConfig builds the *crypto/tls.Config for a uTLS client dial. An
+// ECH-capable preset routes through the fail-closed gate, or carries a retry
+// override directly (provably non-empty, so the gate would pass). A preset whose
+// ClientHello cannot hold an ECH extension keeps the unsupported-engine path.
+func (e Engine) clientTLSConfig(preset utls.ClientHelloID, echOverride []byte, options ...tls.Option) (*systls.Config, error) {
+	if !presetCarriesECH(preset) {
+		if len(echOverride) > 0 {
+			// Unreachable: a non-ECH-capable preset can never produce the ECH rejection
+			// that makes the retry seam thread an override. Panic so a wiring regression
+			// trips loudly rather than silently mis-dialing.
+			panic("utls: ECH override handed to a non-ECH-capable preset (contract violation)")
+		}
+		return e.config.TlsConfig.GetTLSConfigForUnsupportedClient("uTLS engine", options...)
+	}
+	if len(echOverride) > 0 {
+		cfg := e.config.TlsConfig.GetTLSConfig(options...)
+		// The branch guard (override non-empty) is itself the fail-closed
+		// guarantee: the ECH list is set, so this cannot yield a cleartext-SNI dial.
+		cfg.EncryptedClientHelloConfigList = echOverride
+		return cfg, nil
+	}
+	return e.config.TlsConfig.GetTLSConfigForClient(options...)
+}
+
 func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, error) {
 	var options []tls.Option
+	var echOverride []byte
 	for _, v := range opts {
 		switch s := v.(type) {
 		case security.OptionWithALPN:
@@ -36,20 +62,10 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 		case security.OptionWithDestination:
 			options = append(options, tls.WithDestination(s.Dest))
 		case security.OptionWithECHConfigOverride:
-			// uTLS drops EncryptedClientHelloConfigList and can never send ECH, so
-			// it can never produce an ECH rejection to retry. No-op.
+			echOverride = s.Configs
 		default:
 			return nil, newError("unknown option")
 		}
-	}
-	// uTLSConfigFromTLSConfig drops EncryptedClientHelloConfigList, so uTLS cannot carry ECH.
-	tlsConfig, err := e.config.TlsConfig.GetTLSConfigForUnsupportedClient("uTLS engine", options...)
-	if err != nil {
-		return nil, err
-	}
-	utlsConfig, err := uTLSConfigFromTLSConfig(tlsConfig)
-	if err != nil {
-		return nil, newError("unable to generate utls config from tls config").Base(err)
 	}
 
 	preset, err := nameToUTLSPreset(e.config.Imitate)
@@ -57,22 +73,37 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 		return nil, newError("unable to get utls preset from name").Base(err)
 	}
 
+	tlsConfig, err := e.clientTLSConfig(*preset, echOverride, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	utlsConfig, err := uTLSConfigFromTLSConfig(tlsConfig)
+	if err != nil {
+		return nil, newError("unable to generate utls config from tls config").Base(err)
+	}
+
+	// NoSNI and ECH are mutually exclusive: ECH needs the outer SNI (the
+	// public_name), which NoSNI strips. A generic utls.Config can set both, so
+	// reject the contradiction rather than emit a broken hello.
+	if e.config.NoSNI && len(tlsConfig.EncryptedClientHelloConfigList) > 0 {
+		return nil, newError("uTLS NoSNI cannot be combined with ECH (ECH requires the outer SNI)")
+	}
+
 	utlsClientConn := utls.UClient(conn, utlsConfig, *preset)
 
 	if e.config.NoSNI {
-		err = utlsClientConn.RemoveSNIExtension()
-		if err != nil {
+		if err := utlsClientConn.RemoveSNIExtension(); err != nil {
 			return nil, newError("unable to remove server name indication from utls client hello").Base(err)
 		}
 	}
 
-	err = utlsClientConn.BuildHandshakeState()
-	if err != nil {
+	if err := utlsClientConn.BuildHandshakeState(); err != nil {
 		return nil, newError("unable to build utls handshake state").Base(err)
 	}
 
-	// ALPN is necessary for protocols like websocket to work. The uTLS setting may be overwritten on call into
-	// BuildHandshakeState, so we need to check the original tls settings.
+	// BuildHandshakeState may overwrite the uTLS ALPN setting, so reconcile
+	// against the original tls settings.
 	if tlsConfig.NextProtos != nil {
 		for n, v := range utlsClientConn.Extensions {
 			if aplnExtension, ok := v.(*utls.ALPNExtension); ok {
@@ -88,15 +119,14 @@ func (e Engine) Client(conn net.Conn, opts ...security.Option) (security.Conn, e
 		}
 	}
 
-	err = utlsClientConn.BuildHandshakeState()
-	if err != nil {
+	if err := utlsClientConn.BuildHandshakeState(); err != nil {
 		return nil, newError("unable to build utls handshake state after modification").Base(err)
 	}
 
-	err = utlsClientConn.Handshake()
-	if err != nil {
-		return nil, newError("unable to finish utls handshake").Base(err)
-	}
+	// Deferred handshake, matching the standard tls engine's lazy contract. The
+	// caller drives it (DialClientWithECHRetry, or a generic driver on first I/O);
+	// ECH-rejection normalization on Handshake/Read/Write reaches the retry seam
+	// whichever path fires.
 	return uTLSClientConnection{utlsClientConn}, nil
 }
 
@@ -111,19 +141,68 @@ func (u uTLSClientConnection) GetConnectionApplicationProtocol() (string, error)
 	return u.ConnectionState().NegotiatedProtocol, nil
 }
 
+// normalizeECHRejection translates a uTLS ECH rejection to the crypto/tls type so
+// errors.As in DialClientWithECHRetry matches it; confines the utls import to this
+// subpackage. Non-ECH errors and nil pass through unchanged.
+func normalizeECHRejection(err error) error {
+	var echRej *utls.ECHRejectionError
+	if errors.As(err, &echRej) {
+		return &systls.ECHRejectionError{RetryConfigList: echRej.RetryConfigList}
+	}
+	return err
+}
+
+func (u uTLSClientConnection) Handshake() error {
+	return normalizeECHRejection(u.UConn.Handshake())
+}
+
+func (u uTLSClientConnection) Read(b []byte) (int, error) {
+	n, err := u.UConn.Read(b)
+	return n, normalizeECHRejection(err)
+}
+
+func (u uTLSClientConnection) Write(b []byte) (int, error) {
+	n, err := u.UConn.Write(b)
+	return n, normalizeECHRejection(err)
+}
+
 func uTLSConfigFromTLSConfig(config *systls.Config) (*utls.Config, error) { // nolint: unparam
 	uconfig := &utls.Config{
-		Rand:                  config.Rand,
-		Time:                  config.Time,
-		RootCAs:               config.RootCAs,
-		NextProtos:            config.NextProtos,
-		ServerName:            config.ServerName,
-		VerifyPeerCertificate: config.VerifyPeerCertificate,
-		InsecureSkipVerify:    config.InsecureSkipVerify,
-		ClientAuth:            utls.ClientAuthType(config.ClientAuth),
-		ClientCAs:             config.ClientCAs,
+		Rand:                           config.Rand,
+		Time:                           config.Time,
+		RootCAs:                        config.RootCAs,
+		NextProtos:                     config.NextProtos,
+		ServerName:                     config.ServerName,
+		VerifyPeerCertificate:          config.VerifyPeerCertificate,
+		InsecureSkipVerify:             config.InsecureSkipVerify,
+		ClientAuth:                     utls.ClientAuthType(config.ClientAuth),
+		ClientCAs:                      config.ClientCAs,
+		EncryptedClientHelloConfigList: config.EncryptedClientHelloConfigList,
+	}
+	// uTLS rejects an ECH config paired with a sub-1.3 version; ECH is TLS 1.3
+	// only, so pin the floor explicitly when carrying one.
+	if len(config.EncryptedClientHelloConfigList) > 0 {
+		uconfig.MinVersion = utls.VersionTLS13
 	}
 	return uconfig, nil
+}
+
+// presetCarriesECH reports whether the preset's ClientHello template includes an
+// ECH extension slot (a GREASE slot counts — uTLS upgrades it to real ECH). A
+// spec that fails to resolve is logged and treated as non-capable, so a silent
+// ECH downgrade of the pinned preset stays observable.
+func presetCarriesECH(id utls.ClientHelloID) bool {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		newError("uTLS preset spec did not resolve; treating as ECH-incapable").Base(err).AtWarning().WriteToLog()
+		return false
+	}
+	for _, ext := range spec.Extensions {
+		if _, ok := ext.(utls.EncryptedClientHelloExtension); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func init() {

@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/refraction-networking/utls
+	branch = v1.8.2
+	commit = 8fe0b08e9a0e7e2d08b268f451f2c79962e6acd0
+	parent = 52a578fe2b2e2c9189980114c6e09d56d9c246ba
+	method = merge
+	cmdver = 0.4.9

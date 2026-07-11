@@ -11,10 +11,11 @@ linters:
     - unconvert
     - gosec
   exclusions:
-    # third_party/v2ray-core is vendored pristine upstream code (a separate Go
-    # module reached via go.mod replace). It is not ours to lint or restyle.
+    # third_party/{v2ray-core,utls} are vendored pristine upstream code (separate
+    # Go modules reached via go.mod replace). Not ours to lint or restyle.
     paths:
       - third_party/v2ray-core
+      - third_party/utls
 
 formatters:
   # gofumpt is a strict superset of gofmt. `golangci-lint fmt` formats; the
@@ -23,6 +24,7 @@ formatters:
   enable:
     - gofumpt
   exclusions:
-    # Keep the vendored module pristine - never reformat upstream code.
+    # Keep the vendored modules pristine - never reformat upstream code.
     paths:
       - third_party/v2ray-core
+      - third_party/utls
