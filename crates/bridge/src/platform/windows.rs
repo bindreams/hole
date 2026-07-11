@@ -362,10 +362,14 @@ fn service_state_dir() -> PathBuf {
 ///
 /// The service is registered to run
 /// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`
-/// with auto-start, then `ensure_failure_actions` applies the restart-on-failure
-/// SCM config. An install base that predates that config picks it up on the next
-/// update instead (the cutover child re-applies it — see `cutover::run_detached`),
-/// so a bare `install()` is not the only path that provisions it.
+/// with auto-start, then `apply_failure_actions` writes the restart-on-failure
+/// SCM config directly on the just-created handle — best-effort (warn-and-continue),
+/// since a SCM hiccup must not fail the install itself. This deliberately avoids
+/// `ensure_failure_actions` (which re-opens the service and propagates errors);
+/// that stricter re-open path is reserved for the cutover child's post-update
+/// refresh (see `cutover::run_detached`), which also brings an install base that
+/// predates this config up to date — so a bare `install()` is not the only path
+/// that provisions it.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
