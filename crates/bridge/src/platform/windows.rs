@@ -132,11 +132,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             state_dir.clone(),
             None,
         )?;
-        // Socket is bound: sweep the cutover marker, then report SCM `Running`. The
-        // cutover child exits on the `Running` edge, so it exits only once the
-        // marker is gone — no "marker present + dead driver" window in a healthy
-        // update. If the sweep somehow fails, the start fails (SCM restarts + retries)
-        // rather than reporting Running with a stale marker.
+        // Socket is bound: sweep the marker, then report Running (see sweep_marker_then_ready).
         sweep_marker_then_ready(&log_dir, || {
             status_handle_ready
                 .set_service_status(ServiceStatus {
@@ -177,8 +173,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
         }
-        // The marker was already swept before the `Running` report above (so the
-        // cutover child exits only once it is gone). No second sweep needed here.
         // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
         // (it fails while an old process still maps the renamed inode).
         if let Err(e) = tokio::task::spawn_blocking(sweep_old_binaries_in_install_dir).await {
@@ -274,16 +268,25 @@ pub(crate) fn sweep_marker(log_dir: &Path) {
 /// driver dead" — before this the child is alive (Mask), after it the marker is
 /// already swept (PassThrough).
 ///
-/// The `read().is_some()` re-check is defense-in-depth. A remove failure should
-/// never happen (Rust opens files with `FILE_SHARE_DELETE`), yet reporting
+/// The `read().is_some()` re-check guards the reachable case of an external
+/// process holding the marker open without `FILE_SHARE_DELETE`: reporting
 /// `Running` with a stale marker would false-fail the healthy update, so the start
-/// fails instead (SCM restarts and retries the sweep). That impossible branch is
-/// acceptance-observed, not unit-tested.
+/// fails instead (SCM restarts and retries the sweep).
 fn sweep_marker_then_ready<R: FnOnce() -> std::io::Result<()>>(
     log_dir: &Path,
     report_running: R,
 ) -> std::io::Result<()> {
-    sweep_marker(log_dir);
+    sweep_marker_then_ready_with(|| sweep_marker(log_dir), log_dir, report_running)
+}
+
+/// [`sweep_marker_then_ready`] with the sweep injected so the marker-survives-sweep
+/// branch is unit-testable (a no-op sweep leaves the marker present).
+fn sweep_marker_then_ready_with<S: FnOnce(), R: FnOnce() -> std::io::Result<()>>(
+    sweep: S,
+    log_dir: &Path,
+    report_running: R,
+) -> std::io::Result<()> {
+    sweep();
     if hole_common::update_marker::read(log_dir).is_some() {
         return Err(std::io::Error::other(
             "cutover marker still present after sweep; refusing to report Running",
@@ -359,7 +362,10 @@ fn service_state_dir() -> PathBuf {
 ///
 /// The service is registered to run
 /// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`
-/// with auto-start.
+/// with auto-start, then `ensure_failure_actions` applies the restart-on-failure
+/// SCM config. An install base that predates that config picks it up on the next
+/// update instead (the cutover child re-applies it — see `cutover::run_detached`),
+/// so a bare `install()` is not the only path that provisions it.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -397,12 +403,8 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
 
     service.set_description(SERVICE_DESCRIPTION)?;
-    service.update_failure_actions(restart_failure_actions())?;
-    // Also restart on a graceful Stopped with a NON-ZERO exit — run_service reports
-    // Stopped(1) on any bind/runtime failure, which SCM would otherwise NOT treat
-    // as a failure. This covers the failed-start wedge (a swapped-in bridge that
-    // fails to bind). A clean Stopped(0) (user stop / cutover stop) is not restarted.
-    service.set_failure_actions_on_non_crash_failures(true)?;
+    drop(service);
+    ensure_failure_actions()?;
     info!("Windows service installed");
     Ok(())
 }
@@ -420,6 +422,21 @@ fn restart_failure_actions() -> ServiceFailureActions {
             delay: std::time::Duration::from_secs(1),
         }]),
     }
+}
+
+/// Apply the restart-on-failure SCM config to the installed `HoleBridge` service:
+/// the `Restart` action plus the non-crash-failures flag (so a graceful
+/// `Stopped(1)` from a failed bind is restarted too, while a clean `Stopped(0)`
+/// user/cutover stop is not). Idempotent — a re-apply just re-writes the same
+/// config. Called by `install()` for a fresh install and by the cutover child so
+/// an install base predating this config is brought up to date as part of the
+/// update itself.
+pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+    service.update_failure_actions(restart_failure_actions())?;
+    service.set_failure_actions_on_non_crash_failures(true)?;
+    Ok(())
 }
 
 /// Stop and uninstall the bridge Windows Service.

@@ -63,8 +63,8 @@ pub fn start_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
         match a.wait_callback()? {
             Observed::Running => return Ok(()),
             // A terminal Stopped means the service stopped instead of reaching
-            // Running — a failed start. Give up (the cutover child then clears
-            // the marker + exits; Part A's restart re-drives a transient failure).
+            // Running — a failed start. Give up (the cutover child then clears the
+            // marker + exits; the SCM's restart-on-failure re-drives a transient one).
             Observed::Stopped => {
                 return Err(std::io::Error::other(
                     "service stopped before reaching Running (failed start)",

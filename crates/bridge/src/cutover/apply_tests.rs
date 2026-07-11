@@ -113,6 +113,23 @@ fn record_spawned_driver_fails_when_child_vanished_or_zero() {
     );
 }
 
+// The post-spawn composition (record->resume, kill-on-any-failure): an injected
+// record failure must terminate the still-suspended child AND return Err.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_resume_or_kill_kills_on_record_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("ran.txt");
+    let mut child = windows::spawn_suspended_command(&format!("cmd /c echo x > \"{}\"", sentinel.display())).unwrap();
+    let out = windows::record_resume_or_kill(&mut child, Err(std::io::Error::other("record failed")), || {
+        panic!("resume must not run after a record failure")
+    });
+    assert!(out.is_err(), "a record failure returns Err");
+    // The child was killed while suspended: it never ran, and wait() returns.
+    child.wait().unwrap();
+    assert!(!sentinel.exists(), "the killed suspended child never ran");
+}
+
 // The suspend->resume ordering primitive, asserted POSITIVELY: a suspended child
 // does not run (its sentinel is absent) until resumed, then it runs (sentinel
 // appears). Driven through the `spawn_suspended_command` inner seam so the

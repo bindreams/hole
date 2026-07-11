@@ -64,11 +64,12 @@ pub fn preflight_app_dest(app_dest: Option<&Path>) -> std::io::Result<std::path:
 
 /// Kick off the cutover actor and return immediately, BEFORE any self-restart.
 ///
-/// - Windows: spawn the DETACHED LocalSystem `hole bridge cutover` child (a
-///   service cannot SCM-restart itself); it outlives this process and drives
-///   stop → swap → start. Returns once the child is spawned. `app_dest`/`log_dir`
-///   are unused (the SCM install dir is canonical; the detached child leaves the
-///   marker for the next bridge's post-bind sweep).
+/// - Windows: spawn the DETACHED LocalSystem `hole bridge cutover` child SUSPENDED
+///   (a service cannot SCM-restart itself), stamp its identity into `log_dir`'s
+///   marker, then resume it; it outlives this process and drives stop → swap →
+///   start. Returns once the child is running. `app_dest` is unused (the SCM
+///   install dir is canonical); the marker is left for the next bridge's post-bind
+///   sweep.
 /// - macOS: build the inline actor and run it on a DETACHED tokio task so the
 ///   200 flushes before the actor SIGTERMs this very process. The task is never
 ///   joined — the process is about to be killed and the new bridge takes over.
@@ -86,18 +87,12 @@ pub fn spawn_actor(
         // Spawn the detached child SUSPENDED, stamp the frozen child's identity
         // into the marker, then resume it — the marker names the driver before the
         // child can act. Any pre-resume failure kills the child (logged) and
-        // returns Err so the ipc.rs caller clears the marker and 500s; the child
+        // returns Err so the caller clears the marker and returns 500; the child
         // never ran.
         let mut child = windows::spawn_suspended_child(&staged, target_version)?;
         let pid = child.id();
-        if let Err(e) = windows::record_spawned_driver(log_dir, pid, hole_common::process::process_start_time(pid))
-            .and_then(|()| windows::resume_main_thread(pid))
-        {
-            if let Err(ke) = child.kill() {
-                tracing::warn!(pid, error = %ke, "failed to kill the suspended cutover child after a pre-resume failure");
-            }
-            return Err(e);
-        }
+        let record = windows::record_spawned_driver(log_dir, pid, hole_common::process::process_start_time(pid));
+        windows::record_resume_or_kill(&mut child, record, || windows::resume_main_thread(pid))?;
         // Dropping `child` closes our handle without killing the now-running process.
         Ok(())
     }
@@ -154,7 +149,7 @@ mod windows {
     /// `0` is the poisoned sentinel the GUI reads as unassessed (a permanent mask
     /// on a dead driver), so treat `Some(0)` (and `None`) as a failure — the
     /// caller then kills the child and clears the marker rather than stamping a
-    /// poisoned identity. Table-testable.
+    /// poisoned identity.
     pub(super) fn record_spawned_driver(
         log_dir: &std::path::Path,
         child_pid: u32,
@@ -166,6 +161,27 @@ mod windows {
                 "could not record a valid cutover child start time",
             )),
         }
+    }
+
+    /// Post-spawn composition for the suspended cutover child: apply `record`
+    /// (stamp the marker), then `resume`. On ANY failure kill the still-suspended
+    /// child (logged) and return the Err — the child never ran. Extracted so the
+    /// spawn->stamp->resume->kill-on-failure sequence is testable with an injected
+    /// record/resume.
+    pub(super) fn record_resume_or_kill(
+        child: &mut std::process::Child,
+        record: std::io::Result<()>,
+        resume: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let outcome = record.and_then(|()| resume());
+        if let Err(e) = &outcome {
+            let pid = child.id();
+            if let Err(ke) = child.kill() {
+                tracing::warn!(pid, error = %ke, "failed to kill the suspended cutover child after a pre-resume failure");
+            }
+            tracing::warn!(pid, error = %e, "cutover child pre-resume failure; child killed");
+        }
+        outcome
     }
 
     /// The suspended-spawn creation flags: DETACHED + NO_WINDOW + SUSPENDED, plus

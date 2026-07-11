@@ -1132,8 +1132,8 @@ fn apply_socket_permissions(path: &Path) {
     }
 }
 
-/// Build the cutover marker. Extracted so the driver-identity field mapping —
-/// the anchor of Part B's liveness net — is unit-testable.
+/// Build the cutover marker; extracted so the driver-identity field mapping is
+/// unit-testable.
 fn build_cutover_marker(
     from_version: String,
     to_version: String,

@@ -48,6 +48,26 @@ fn sweep_marker_then_ready_sweeps_before_reporting() {
 }
 
 #[skuld::test]
+fn sweep_marker_then_ready_errs_when_marker_survives_sweep() {
+    // An external holder can leave the marker present after the sweep attempt.
+    // Inject a no-op sweep so the marker survives: the helper must return Err and
+    // NEVER report Running (which would false-fail a healthy update).
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    let reported = std::cell::Cell::new(false);
+    let out = super::sweep_marker_then_ready_with(
+        || {}, // no-op sweep: the marker is NOT removed
+        dir.path(),
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    );
+    assert!(out.is_err(), "a surviving marker must fail the start");
+    assert!(!reported.get(), "Running must never be reported with a stale marker");
+}
+
+#[skuld::test]
 fn restart_failure_actions_configures_restart_on_failure() {
     use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod};
     let fa = super::restart_failure_actions();
