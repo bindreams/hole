@@ -1,5 +1,6 @@
 //! Privileged-lane real-engage verification for the standing lockdown cover
-//! (#527). Unlike the pure builder unit tests (`windows_tests` / `macos_tests`,
+//! (#527) and the transient block-until-connected cover (#553). Unlike the pure
+//! builder unit tests (`windows_tests` / `macos_tests`,
 //! the #165 isolation contract), these engage the REAL OS cover (Windows: live
 //! FWPM; macOS: live pf) and prove at runtime that it is SELECTIVE: it permits
 //! the configured server IP and blocks all other egress, then restores on
@@ -25,10 +26,11 @@
 //! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
 //! `serial = TUN` only serializes within one binary.
 //!
-//! COUPLED NAMES: that group's filter matches these tests by the name prefixes
-//! `windows_lockdown_permits_server_ip_` and `macos_lockdown_permits_server_ip_`.
-//! Renaming a prefix WITHOUT updating `.config/nextest.toml` drops the test from
-//! the group → a silent cross-binary race with the bridge's live-egress
+//! COUPLED NAMES: that group's filter matches these tests by the name substrings
+//! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
+//! and `failclosed_permits_` (the #553 transient-cover tests). Renaming one
+//! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
+//! silent cross-binary race with the bridge's live-egress
 //! `e2e_none_full_tunnel_roundtrip`. Change both together.
 
 use super::*;
