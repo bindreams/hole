@@ -26,7 +26,7 @@ require (
 	github.com/pion/ice/v4 v4.2.7
 	github.com/pion/logging v0.2.4
 	github.com/pion/stun/v3 v3.1.6
-	github.com/pion/transport/v2 v2.2.10
+	github.com/pion/transport/v2 v2.2.4
 	github.com/pion/transport/v4 v4.0.2
 	github.com/pion/webrtc/v4 v4.2.16
 	github.com/pires/go-proxyproto v0.12.0
