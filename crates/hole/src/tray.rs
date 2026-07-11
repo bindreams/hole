@@ -1498,9 +1498,9 @@ pub(crate) enum PendingAction {
 /// failure means "not bound yet", and a DACL/version hiccup says nothing about
 /// readiness — both retain so a later tick can apply the intent. A host left
 /// fail-closed by a failed covered start (`blocked_until_connected`) is NOT idle
-/// to re-apply against: the intent is retained so a re-armed latch can never
-/// auto-fire against a deliberately-blocked host (defense-in-depth — the latch is
-/// single-consumption today).
+/// to re-apply against: the bridge holds that blocked state independently of any
+/// GUI, so a fresh GUI instance re-arming the latch could otherwise observe a
+/// deliberately-blocked host as idle and auto-fire against it. Retain instead.
 pub(crate) fn should_apply_pending(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> PendingAction {

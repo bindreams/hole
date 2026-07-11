@@ -54,15 +54,36 @@ impl crate::routing::CoverGuard for Cover {
     }
 }
 
+/// The number of DoH resolver IPs the transient cover permits. Structural on
+/// Windows: recovery deletes the cover's filters by fixed GUID (a bounded budget,
+/// `windows.rs::swept_transient_guids`) because the WFP sublayer is SHARED with
+/// the lockdown cover — enumerate-and-delete would take out lockdown's filters
+/// too. The facade caps both platforms here so they permit the same set. DoH
+/// configs realistically carry one or two resolvers; a truncation is logged and
+/// is fail-safe (the extra resolver is blocked, never leaked).
+pub const MAX_RESOLVER_PERMITS: usize = 8;
+
 /// Engage the cover blocking all egress except loopback, `server_ip`, and the
-/// DoH `resolver_ips`. `state_dir` is where macOS persists its enable token for
-/// crash recovery (unused on Windows). On failure the host is left uncovered.
+/// DoH `resolver_ips` (capped at [`MAX_RESOLVER_PERMITS`]). `state_dir` is where
+/// macOS persists its enable token for crash recovery (unused on Windows). On
+/// failure the host is left uncovered.
 pub fn engage(
     server_ip: IpAddr,
     resolver_ips: &[IpAddr],
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
+    let resolver_ips = if resolver_ips.len() > MAX_RESOLVER_PERMITS {
+        tracing::warn!(
+            configured = resolver_ips.len(),
+            cap = MAX_RESOLVER_PERMITS,
+            "more DoH resolvers than the fail-closed cover budget; the extra resolvers are not permitted \
+             while the cover holds (fail-safe: blocked, never leaked)"
+        );
+        &resolver_ips[..MAX_RESOLVER_PERMITS]
+    } else {
+        resolver_ips
+    };
     Ok(Cover {
         _inner: platform::engage(server_ip, resolver_ips, state_dir, owner)?,
     })

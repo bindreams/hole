@@ -27,7 +27,7 @@ defer):**
   start; standing lockdown is the crash-durable opt-in).
 - macOS reboot-durability.
 
-**Accepted UX scope (disclosed, not silently deferred):** the blocked state is
+**Accepted UX scope:** the blocked state is
 rendered in the **tray** (status + Retry / Go-Offline); a distinct **dashboard**
 blocked indicator is deferred to bindreams/hole#625 (the bridge enforces the
 protection and the dashboard truthfully shows "Disconnected", never a false
@@ -318,12 +318,17 @@ Implementation notes:
   (`feat(bridge): block-until-connected fail-closed cover for auto-connect`,
   body `Closes #553`); watch CI green via `gh-ci`. Do NOT merge.
 
-## Follow-ups to file
+## Follow-ups (filed)
 
-- Full always-on posture (persisted boot cover / pre-login, crash+reboot
-  durability, generalize the already-multi-cover `recover_routes_with` into a
-  reconciler registry).
-- macOS lockdown reboot-durability (`Adopt` re-enables nothing).
+- **bindreams/hole#619** — full always-on posture: persisted boot cover
+  (pre-login), crash+reboot durability, generalize the already-multi-cover
+  `recover_routes_with` into a reconciler registry, and the macOS composable
+  cover. This subsumes the accepted fail-open windows above (pre-login,
+  pre-DoH-resolve instant, crash-sweeps-open, macOS reboot) **and** the
+  different-server-retry in-place repoint (so a Retry to a new server can connect
+  without a Disconnect-first).
+- **bindreams/hole#625** — distinct dashboard blocked-state rendering (tray-only
+  today).
+- macOS lockdown reboot-durability (`Adopt` re-enables nothing) — **#617**.
 - macOS lockdown ruleset omits resolver permits → adopted-cover reconnect wedges
-  the DoH bootstrap (small diff atop this PR's resolver work; defaulting to defer
-  to keep this PR off the hardened lockdown cover — flagged to the user).
+  the DoH bootstrap — **#618**.

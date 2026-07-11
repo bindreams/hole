@@ -2708,6 +2708,93 @@ mod self_test {
         });
     }
 
+    #[skuld::test]
+    fn covered_start_success_releases_cover() {
+        rt().block_on(async {
+            // A covered start that SUCCEEDS releases the cover (the tunnel is the
+            // protection now) — blocked_until_connected must be false.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
+            pm.start_cancellable(&test_config(), true, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(pm.state(), ProxyState::Running);
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1, "covered start engages");
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "success releases the cover"
+            );
+            assert!(!pm.blocked_until_connected());
+            pm.stop().await.unwrap();
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_cancel_releases_cover() {
+        rt().block_on(async {
+            // A user cancel of a covered start releases the cover (same trust as a
+            // disconnect), NOT retains it.
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+            let token = CancellationToken::new();
+            let cancel_clone = token.clone();
+            tokio::spawn(async move {
+                entered_rx.await.expect("MockProxy::start never entered");
+                cancel_clone.cancel();
+            });
+            let err = pm.start_cancellable(&test_config(), true, token).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "covered start engages before the cancel"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "cancel releases the cover"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "a cancelled covered start does not leave the host blocked"
+            );
+            gate.notify_one();
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_engage_failure_proceeds_uncovered() {
+        rt().block_on(async {
+            // If the OS cover install FAILS on a fresh covered start, the bridge
+            // warns and proceeds UNCOVERED (aborting would leave the user
+            // unconnected AND unprotected) — no cover is retained, so the host is
+            // not (falsely) reported blocked.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            st.fail_cover.store(true, Ordering::SeqCst);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "the engage failed, so none is counted"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "a failed engage retains no cover — host is not reported blocked"
+            );
+        });
+    }
+
     /// The covered start engages the cover before start_inner, so the probe-
     /// suppression predicate (cover_active) sees the live in-process signal even
     /// with NO lockdown intent — the original self-test reason survives. Mirrors

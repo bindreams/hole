@@ -1,6 +1,14 @@
 # #553: Block-until-connected (unified fail-closed cover)
 
-**Status:** design locked (user decisions 2026-07-10) — proceeding to plan.
+> **⚠️ SUPERSEDED — NOT the shipped design.** This spec describes the *full
+> unified* design (bridge-persisted intent, lockdown-shaped TUN-permitting cover,
+> engaged at bridge service start, crash/reboot-durable). What shipped for the
+> beta is the **minimal-correct transient-cover** scope, authored in
+> [`docs/superpowers/plans/2026-07-10-553-block-until-connected.md`](../plans/2026-07-10-553-block-until-connected.md)
+> (user-ratified). The unified design here is deferred to **bindreams/hole#619**
+> (full always-on posture). Read the plan, not this file, for the shipped #553.
+
+**Status:** SUPERSEDED by the 2026-07-10 minimal-correct plan (unified design → #619).
 **Issue:** bindreams/hole#553 — ratified privacy blocker for the next beta.
 **Approach:** Unified (bridge-persisted intent + lockdown-shaped cover, one
 mechanism). **Failure mode:** stay blocked (fail-closed). Supersedes the earlier

@@ -47,7 +47,9 @@ pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ips: &[IpAddr]) -> String {
          pass in quick on lo0 all\n\
          pass out quick from any to {server_ip}\n"
     );
-    for ip in resolver_ips {
+    // Capped to match the Windows recovery budget (see
+    // `failclosed::MAX_RESOLVER_PERMITS`) so both platforms permit the same set.
+    for ip in resolver_ips.iter().take(super::MAX_RESOLVER_PERMITS) {
         ruleset.push_str(&format!("pass out quick from any to {ip}\n"));
     }
     ruleset

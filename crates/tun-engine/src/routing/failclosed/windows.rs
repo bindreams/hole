@@ -118,11 +118,9 @@ fn cover_resolver_guid(index: usize, v6: bool) -> GUID {
     GUID::from_u128(base ^ salt)
 }
 
-/// Resolver-permit GUID budget recovery sweeps. DoH configs realistically carry
-/// one or two resolver IPs; 8 is ample headroom. Sweeping a superset is
-/// idempotent, and a resolver beyond the budget is simply not permitted
-/// (fail-safe: its DoH is blocked, never leaked).
-const MAX_RESOLVERS: usize = 8;
+/// Resolver-permit GUID budget recovery sweeps — the shared cover cap (the
+/// facade caps the engaged list to match; see `failclosed::MAX_RESOLVER_PERMITS`).
+const MAX_RESOLVERS: usize = super::MAX_RESOLVER_PERMITS;
 
 /// Every transient-cover filter GUID a recovery `delete_all` must remove: the
 /// ten fixed GUIDs + the per-resolver permit GUIDs (both families across the
