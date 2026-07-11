@@ -19,10 +19,13 @@ replace github.com/refraction-networking/utls => ./third_party/utls
 
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/pires/go-proxyproto v0.12.0 // indirect
 	github.com/quic-go/quic-go v0.59.1 // indirect
+	github.com/refraction-networking/utls v1.8.2 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
 	golang.org/x/mod v0.35.0 // indirect

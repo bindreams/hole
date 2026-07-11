@@ -30,6 +30,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/quic"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/websocket"
 )
 
@@ -175,6 +176,25 @@ func buildTLSConfig() (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// chrome_auto tracks the newest Chrome the vendored uTLS knows and is
+// ECH-capable, so SNI concealment composes with the mimicked fingerprint.
+const defaultFingerprint = "chrome_auto"
+
+// securitySettings returns the stream's security proto message. A client
+// websocket dial wraps the tls.Config in the uTLS engine; server listeners and
+// quic keep the bare tls.Config — a server sends no ClientHello, and quic
+// hard-requires a *tls.Config (it manages its own TLS+ECH).
+func securitySettings(tlsConfig *tls.Config) proto.Message {
+	if !*server && *mode == "websocket" {
+		return &utls.Config{
+			TlsConfig: tlsConfig,
+			Imitate:   defaultFingerprint,
+			ForceAlpn: utls.ForcedALPN_TRANSPORT_PREFERENCE_TAKE_PRIORITY,
+		}
+	}
+	return tlsConfig
+}
+
 func generateConfig() (*core.Config, error) {
 	lport, err := net.PortFromString(*localPort)
 	if err != nil {
@@ -250,8 +270,9 @@ func generateConfig() (*core.Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		streamConfig.SecurityType = serial.GetMessageType(tlsConfig)
-		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(tlsConfig)}
+		sec := securitySettings(tlsConfig)
+		streamConfig.SecurityType = serial.GetMessageType(sec)
+		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(sec)}
 	}
 
 	apps := []*anypb.Any{
