@@ -545,8 +545,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let cover: Option<R::Cover> = if covered && !lockdown_on {
             self.engage_or_reuse_blocking_cover(server_ip, &resolvers)
         } else {
-            // Not covered / lockdown-on: release any stale blocked cover.
-            self.blocked_cover.take();
+            // Not covered / lockdown-on: release any stale blocked cover. Dropping
+            // it here opens egress until the standing lockdown cover engages at
+            // routing.install — for a covered retry after the user enabled lockdown
+            // mid-blocked-state this is a brief open window (disclosed; the clean
+            // transient→lockdown handoff is the composable cover in #619). A manual
+            // (uncovered) connect is fail-open by design, so no window is opened
+            // that wasn't already accepted.
+            if covered && self.blocked_cover.take().is_some() {
+                warn!(
+                    "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
+                     uncovered until the standing lockdown cover engages at connect (see #619)"
+                );
+            } else {
+                self.blocked_cover.take();
+            }
             None
         };
         let blocking_engaged = cover.is_some();
@@ -635,18 +648,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Engage (or reuse) the block-until-connected cover for a covered, lockdown-
-    /// off start. The transient cover is a GLOBAL SINGLETON — Windows keys it on
-    /// fixed WFP GUIDs + a shared provider/sublayer; macOS is the singular pf main
-    /// ruleset + a single `bridge-failclosed.json`. So there is only ever ONE
-    /// guard: a held cover (a prior failed covered start) is REUSED, never joined
-    /// by a second — constructing a second over the same global objects would
-    /// self-clobber on Drop and fail OPEN. A retry to a DIFFERENT server/resolver
-    /// set runs under the held cover fail-closed: the new server is not permitted,
-    /// so the connect fails and the host stays blocked (the user releases via
-    /// Disconnect to switch servers — repointing the held cover in place is a
-    /// tracked follow-up). Only a fresh covered start with no held cover engages;
-    /// an engage failure there warns and proceeds UNCOVERED (aborting would leave
-    /// the user unconnected AND unprotected), surfaced via `last_error`.
+    /// off start. The transient cover is a global singleton (fixed WFP GUIDs +
+    /// shared sublayer on Windows, single pf main ruleset on macOS), so a held
+    /// cover is always REUSED — constructing a second over the same global objects
+    /// would self-clobber on Drop and fail OPEN. A different-server retry runs
+    /// under the held cover fail-closed (the new server is not permitted). Only a
+    /// fresh covered start with no held cover engages; an engage failure there
+    /// warns and proceeds UNCOVERED (aborting would leave the user unconnected AND
+    /// unprotected), surfaced via `last_error`.
     fn engage_or_reuse_blocking_cover(&mut self, server_ip: IpAddr, resolvers: &[IpAddr]) -> Option<R::Cover> {
         if let Some(held) = self.blocked_cover.take() {
             return Some(held);

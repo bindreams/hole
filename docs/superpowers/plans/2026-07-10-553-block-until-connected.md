@@ -26,6 +26,10 @@ defer):**
 - bridge crash while blocked (the existing `recover_cover` sweeps it open on next
   start; standing lockdown is the crash-durable opt-in).
 - macOS reboot-durability.
+- a covered retry issued *after* the user enabled lockdown while a transient cover
+  was held: the held cover is released (warned) and egress is briefly open until
+  the standing lockdown cover engages at connect. A rare state-transition edge;
+  the clean transient→lockdown handoff is the composable cover in #619.
 
 **Accepted UX scope:** the blocked state is
 rendered in the **tray** (status + Retry / Go-Offline); a distinct **dashboard**

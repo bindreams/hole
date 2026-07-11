@@ -181,6 +181,10 @@ struct MockRoutingState {
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// Last `(server_ip, resolver_ips)` passed to `install_failclosed_cover`, so a
+    /// test can assert the manager sources the resolver permit set from
+    /// `config.dns.servers`.
+    last_cover_permit_set: std::sync::Mutex<Option<(IpAddr, Vec<IpAddr>)>>,
 }
 
 impl Default for MockRoutingState {
@@ -198,6 +202,7 @@ impl Default for MockRoutingState {
             fail_cover: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
+            last_cover_permit_set: std::sync::Mutex::new(None),
         }
     }
 }
@@ -297,14 +302,11 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(
-        &self,
-        _server_ip: IpAddr,
-        _resolver_ips: &[IpAddr],
-    ) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(&self, server_ip: IpAddr, resolver_ips: &[IpAddr]) -> Result<MockCover, RoutingError> {
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
         }
+        *self.state.last_cover_permit_set.lock().unwrap() = Some((server_ip, resolver_ips.to_vec()));
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -2791,6 +2793,39 @@ mod self_test {
             assert!(
                 !pm.blocked_until_connected(),
                 "a failed engage retains no cover — host is not reported blocked"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_cover_permits_server_and_config_resolvers() {
+        rt().block_on(async {
+            // The cover's permit set must be exactly the start-phase egress targets
+            // the manager sources from config: the resolved server IP (plugin +
+            // self-test onward connect) and every `config.dns.servers` entry (the
+            // DoH / ECH bootstrap). A regression passing the wrong slice would
+            // silently block the DoH re-resolve on every covered retry.
+            let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
+            let resolvers = vec!["9.9.9.9".parse().unwrap(), "1.0.0.1".parse().unwrap()];
+            cfg.dns.servers = resolvers.clone();
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let (server_ip, permitted_resolvers) = st
+                .last_cover_permit_set
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the covered start engaged the cover");
+            assert_eq!(
+                server_ip,
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "the DoH-resolved server IP is permitted"
+            );
+            assert_eq!(
+                permitted_resolvers, resolvers,
+                "the cover permits exactly the config's DoH resolvers (the start-phase bootstrap egress)"
             );
         });
     }

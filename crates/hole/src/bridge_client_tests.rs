@@ -323,6 +323,80 @@ fn start_and_cancel_send_attempt_id_header() {
 }
 
 #[skuld::test]
+fn start_covered_sends_x_hole_covered_header() {
+    // The load-bearing wire seam of #553: a covered Start must emit
+    // `x-hole-covered: true`; a manual (covered:false) Start must OMIT it (the
+    // bridge treats absence as fail-open). If this regressed, every auto-connect
+    // would silently fail OPEN with the suite still green.
+    rt().block_on(async {
+        let path = test_socket_path("covered-header");
+        let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let router = axum::Router::new()
+            .route(
+                hole_common::protocol::ROUTE_START,
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    let cap = cap.clone();
+                    async move {
+                        let v = headers
+                            .get("x-hole-covered")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<absent>")
+                            .to_owned();
+                        cap.lock().unwrap().push(v);
+                        Json(EmptyResponse {})
+                    }
+                }),
+            )
+            .layer(axum::middleware::map_response(
+                |mut resp: axum::response::Response| async move {
+                    resp.headers_mut().insert(
+                        "x-hole-bridge-version",
+                        axum::http::HeaderValue::from_static(hole::version::VERSION),
+                    );
+                    resp
+                },
+            ));
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |req: http::Request<Incoming>| {
+                let router = router.clone();
+                async move {
+                    use tower::ServiceExt;
+                    let resp = router.oneshot(req.map(axum::body::Body::new)).await.unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+
+        let mut client = BridgeClient::connect(&path).await.unwrap();
+        for covered in [true, false] {
+            client
+                .send(BridgeRequest::Start {
+                    config: hole_common::protocol::ProxyConfig::default(),
+                    attempt_id: "id".into(),
+                    covered,
+                })
+                .await
+                .unwrap();
+        }
+        drop(client);
+        let _ = server.await;
+        assert_eq!(
+            captured.lock().unwrap().clone(),
+            vec!["true".to_owned(), "<absent>".to_owned()],
+            "covered:true sends x-hole-covered:true; covered:false omits the header"
+        );
+    });
+}
+
+#[skuld::test]
 fn send_reload_receives_ack() {
     rt().block_on(async {
         let path = test_socket_path("reload");

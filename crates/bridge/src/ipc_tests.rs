@@ -392,6 +392,27 @@ async fn post_start(
     client.send(req).await
 }
 
+/// `post_start` that carries the `X-Hole-Covered: true` header — the wire flag
+/// that tells the bridge this is an auto-connect and the fail-closed cover must
+/// stay engaged while the attempt is in flight (#553).
+async fn post_start_covered(
+    client: &mut TestClient,
+    config: &ProxyConfig,
+    attempt_id: &str,
+) -> http::Response<hyper::body::Incoming> {
+    let body_bytes = serde_json::to_vec(config).unwrap();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(ROUTE_START)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header(ATTEMPT_ID_HEADER, attempt_id)
+        .header("x-hole-covered", "true")
+        .body(Full::new(Bytes::from(body_bytes)))
+        .unwrap();
+    client.send(req).await
+}
+
 async fn post_stop(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
     let req = http::Request::builder()
         .method("POST")
@@ -1046,6 +1067,50 @@ fn start_failure_returns_error() {
             other => panic!("expected StartError::Failed, got {other:?}"),
         }
 
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn covered_header_retains_cover_after_failed_start() {
+    // The bridge-side half of the #553 wire seam: a failed Start carrying
+    // `X-Hole-Covered: true` must leave the host fail-closed (status reports
+    // blocked_until_connected=true), while the same failure WITHOUT the header
+    // must not (a manual start falls open). If handle_start stopped reading the
+    // header, both would report false and the leak would be silent.
+    rt().block_on(async {
+        // Covered: header present -> cover retained -> blocked.
+        let path = test_socket_path("covered-blocks");
+        let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        consume(post_start_covered(&mut client, &sample_config(), "t").await).await;
+        let status = get_status(&mut client).await;
+        assert!(
+            status.blocked_until_connected,
+            "covered start that failed must stay fail-closed"
+        );
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+
+        // Control: no header -> manual start -> falls open.
+        let path = test_socket_path("uncovered-open");
+        let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        consume(post_start(&mut client, &sample_config(), "t").await).await;
+        let status = get_status(&mut client).await;
+        assert!(
+            !status.blocked_until_connected,
+            "manual start that failed must not stay fail-closed"
+        );
         drop(client);
         handle.abort();
         let _ = handle.await;
