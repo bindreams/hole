@@ -1,14 +1,12 @@
 package main
 
 import (
-	"errors"
 	"net"
-	"syscall"
 	"testing"
 )
 
-// TestListenerNetwork verifies the inbound-transport decision that drives BOTH
-// the confirming-probe network and the sitrep `transports` value. Only
+// TestListenerNetwork verifies the inbound-transport decision that drives the
+// sitrep `transports` value (and mirrors the transport v2ray-core binds). Only
 // server+quic binds a UDP listener (the quic inbound faces the remote client);
 // every other combination — client mode (plain TCP dokodemo inbound) and
 // server+websocket — is TCP. An unknown mode resolves to "tcp" here and is
@@ -43,45 +41,9 @@ func TestListenerNetwork(t *testing.T) {
 	}
 }
 
-// TestConfirmingProbeBindsFreePort checks the happy path: a probe on an
-// OS-assigned ephemeral port binds and releases cleanly for both networks.
-func TestConfirmingProbeBindsFreePort(t *testing.T) {
-	for _, network := range []string{"tcp", "udp"} {
-		t.Run(network, func(t *testing.T) {
-			if err := confirmingProbe(network, "127.0.0.1:0"); err != nil {
-				t.Fatalf("confirmingProbe(%q, port 0) = %v, want nil", network, err)
-			}
-		})
-	}
-}
-
-// TestConfirmingProbeSelectsNetwork proves each branch binds the right
-// protocol. Holding a TCP listener occupies its port for TCP but leaves the
-// identically-numbered UDP port free (the two port spaces are independent), so:
-//   - confirmingProbe("tcp", addr) MUST conflict and unwrap to a syscall.Errno
-//     (the bind_conflict signal the host maps onto its retry policy), and
-//   - confirmingProbe("udp", addr) MUST succeed.
-func TestConfirmingProbeSelectsNetwork(t *testing.T) {
-	ln, addr := reserveTCPPortWithFreeUDP(t)
-	defer func() { _ = ln.Close() }()
-
-	tcpErr := confirmingProbe("tcp", addr)
-	if tcpErr == nil {
-		t.Fatalf("confirmingProbe(tcp, %s) = nil, want a bind conflict on the held TCP port", addr)
-	}
-	var se syscall.Errno
-	if !errors.As(tcpErr, &se) {
-		t.Fatalf("confirmingProbe(tcp, %s) error %v does not unwrap to syscall.Errno (bind_conflict contract)", addr, tcpErr)
-	}
-
-	if udpErr := confirmingProbe("udp", addr); udpErr != nil {
-		t.Fatalf("confirmingProbe(udp, %s) = %v, want nil (UDP port space is independent of the held TCP port)", addr, udpErr)
-	}
-}
-
 // reserveTCPPortWithFreeUDP returns a held TCP listener whose port is also
-// confirmed bindable for UDP, so a subsequent confirmingProbe("udp", addr) in
-// the test cannot flake on a Windows independent-excluded-port-range mismatch
+// confirmed bindable for UDP, so the TCP bind-conflict pin test cannot flake
+// on a Windows independent-excluded-port-range mismatch
 // (TCP and UDP maintain separate Hyper-V/WSL/Docker reservation tables — the
 // exact race hole_common::port_alloc::bind_ephemeral exists to absorb on the
 // Rust side). It binds TCP on an OS-assigned port, verifies the same port binds
