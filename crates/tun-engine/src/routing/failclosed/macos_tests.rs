@@ -10,7 +10,7 @@ fn v6() -> IpAddr {
 
 #[skuld::test]
 fn ruleset_blocks_all_outbound() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), &[]);
     assert!(
         r.contains("block") && r.contains("out") && r.contains("all"),
         "ruleset must block all outbound:\n{r}"
@@ -19,13 +19,13 @@ fn ruleset_blocks_all_outbound() {
 
 #[skuld::test]
 fn ruleset_passes_loopback() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), &[]);
     assert!(r.contains("lo0"), "ruleset must pass loopback:\n{r}");
 }
 
 #[skuld::test]
 fn ruleset_passes_server_ip() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), &[]);
     assert!(r.contains("203.0.113.7"), "ruleset must pass server IP:\n{r}");
 }
 
@@ -33,7 +33,7 @@ fn ruleset_passes_server_ip() {
 fn ruleset_pass_rules_are_quick() {
     // `quick` makes the pass rules win over the earlier block-all without
     // relying on pf's last-match semantics.
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), &[]);
     for line in r.lines().filter(|l| l.trim_start().starts_with("pass")) {
         assert!(line.contains("quick"), "pass rule must be quick: {line}");
     }
@@ -41,8 +41,26 @@ fn ruleset_pass_rules_are_quick() {
 
 #[skuld::test]
 fn ruleset_handles_ipv6_server() {
-    let r = build_pf_ruleset(v6());
+    let r = build_pf_ruleset(v6(), &[]);
     assert!(r.contains("2001:db8::1"), "ipv6 server must appear:\n{r}");
+}
+
+#[skuld::test]
+fn ruleset_passes_resolver_ips_with_quick() {
+    // The DoH bootstrap must reach the configured resolver IPs while the cover
+    // holds; each resolver gets its own `quick` pass. The resolver IP is distinct
+    // from the server IP so the pre-existing server pass cannot satisfy this.
+    let resolver_v4: IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    assert_ne!(resolver_v4, v4());
+    let r = build_pf_ruleset(v4(), &[resolver_v4, resolver_v6]);
+    for ip in ["1.1.1.1", "2606:4700:4700::1111"] {
+        let pass = r
+            .lines()
+            .find(|l| l.trim_start().starts_with("pass") && l.contains(ip))
+            .unwrap_or_else(|| panic!("resolver pass for {ip} missing:\n{r}"));
+        assert!(pass.contains("quick"), "resolver pass must be quick: {pass}");
+    }
 }
 
 #[skuld::test]

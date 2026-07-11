@@ -34,15 +34,23 @@ use super::lockdown_pf_state as lockdown_state;
 ///
 /// `set block-policy drop` silently drops blocked packets (no RST/ICMP).
 /// `block out all` is the fail-closed default; the `quick` pass rules for
-/// loopback and the server IP win without depending on pf's last-match rule.
-pub fn build_pf_ruleset(server_ip: IpAddr) -> String {
-    format!(
+/// loopback, the server IP, and the DoH `resolver_ips` win without depending on
+/// pf's last-match rule. Resolver permits let the bootstrap that resolves the
+/// server hostname (and a stay-blocked retry's re-resolve) reach the configured
+/// resolvers while the cover holds. The `to {ip}` form carries a v6 address as
+/// written (mirroring the server permit).
+pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ips: &[IpAddr]) -> String {
+    let mut ruleset = format!(
         "set block-policy drop\n\
          block out all\n\
          pass out quick on lo0 all\n\
          pass in quick on lo0 all\n\
          pass out quick from any to {server_ip}\n"
-    )
+    );
+    for ip in resolver_ips {
+        ruleset.push_str(&format!("pass out quick from any to {ip}\n"));
+    }
+    ruleset
 }
 
 /// Normalize a snapshot fragment to end in exactly one `\n`. Empty stays empty
@@ -180,7 +188,12 @@ pub struct Cover {
     kind: CoverKind,
 }
 
-pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ips: &[IpAddr],
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
     // 1. Read current enabled-state (read-only).
     let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
     let was_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
@@ -202,7 +215,7 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) ->
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
     // 4. Flush all + load our self-contained blocking ruleset from stdin.
-    let ruleset = build_pf_ruleset(server_ip);
+    let ruleset = build_pf_ruleset(server_ip, resolver_ips);
     let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
         // A *failed engage* is the sole place this module fails OPEN on its own

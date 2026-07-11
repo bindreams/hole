@@ -173,6 +173,7 @@ struct MockRoutingState {
     lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
+    fail_cover: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -194,6 +195,7 @@ impl Default for MockRoutingState {
             lockdown_engage_calls: AtomicU32::new(0),
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
+            fail_cover: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
         }
@@ -295,7 +297,14 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(
+        &self,
+        _server_ip: IpAddr,
+        _resolver_ips: &[IpAddr],
+    ) -> Result<MockCover, RoutingError> {
+        if self.state.fail_cover.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock cover failure".into()));
+        }
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -958,7 +967,9 @@ fn mock_cover_engage_disengage_never_spawns() {
     let routing = MockRouting::new(dir.path().to_path_buf());
     let st = routing.state();
     for _ in 0..10 {
-        let cover = routing.install_failclosed_cover("1.2.3.4".parse().unwrap()).unwrap();
+        let cover = routing
+            .install_failclosed_cover("1.2.3.4".parse().unwrap(), &[])
+            .unwrap();
         drop(cover);
     }
 

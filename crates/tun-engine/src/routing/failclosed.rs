@@ -53,12 +53,17 @@ impl crate::routing::CoverGuard for Cover {
     }
 }
 
-/// Engage the cover blocking all egress except loopback and `server_ip`.
-/// `state_dir` is where macOS persists its enable token for crash recovery
-/// (unused on Windows). On failure the host is left uncovered.
-pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
+/// Engage the cover blocking all egress except loopback, `server_ip`, and the
+/// DoH `resolver_ips`. `state_dir` is where macOS persists its enable token for
+/// crash recovery (unused on Windows). On failure the host is left uncovered.
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ips: &[IpAddr],
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
     Ok(Cover {
-        _inner: platform::engage(server_ip, state_dir, owner)?,
+        _inner: platform::engage(server_ip, resolver_ips, state_dir, owner)?,
     })
 }
 

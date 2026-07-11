@@ -493,10 +493,13 @@ fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
-pub fn engage(server_ip: IpAddr, _state_dir: &Path, _owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
-    // Task 1 keeps the transient engage resolver-free (behavior-preserving);
-    // Task 3 threads the real resolver IPs through the facade + trait.
-    let spec = build_cover_spec(server_ip, &[]);
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ips: &[IpAddr],
+    _state_dir: &Path,
+    _owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
+    let spec = build_cover_spec(server_ip, resolver_ips);
     unsafe {
         // A NON-dynamic engine session (`session = None`): a dynamic session
         // would auto-delete our filters when this process exits, reopening the
