@@ -82,8 +82,24 @@ pub fn spawn_actor(
 ) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let _ = (app_dest, log_dir);
-        windows::spawn_detached_child(&staged, target_version)
+        let _ = app_dest;
+        // Spawn the detached child SUSPENDED, stamp the frozen child's identity
+        // into the marker, then resume it — the marker names the driver before the
+        // child can act. Any pre-resume failure kills the child (logged) and
+        // returns Err so the ipc.rs caller clears the marker and 500s; the child
+        // never ran.
+        let mut child = windows::spawn_suspended_child(&staged, target_version)?;
+        let pid = child.id();
+        if let Err(e) = windows::record_spawned_driver(log_dir, pid, hole_common::process::process_start_time(pid))
+            .and_then(|()| windows::resume_main_thread(pid))
+        {
+            if let Err(ke) = child.kill() {
+                tracing::warn!(pid, error = %ke, "failed to kill the suspended cutover child after a pre-resume failure");
+            }
+            return Err(e);
+        }
+        // Dropping `child` closes our handle without killing the now-running process.
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
@@ -112,8 +128,10 @@ pub fn breakaway_decision(in_job: bool, job_permits_breakaway: bool) -> bool {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    //! Detached-child spawn with the conditional job-breakaway probe. Raw
-    //! JobObject FFI is sanctioned here per the #165 isolation contract.
+    //! Suspended-child spawn (so the initiator can stamp the frozen child's
+    //! identity into the marker before it can act), the conditional job-breakaway
+    //! probe, and the ToolHelp thread-resume. Raw JobObject/ToolHelp FFI is
+    //! sanctioned here per the #165 isolation contract.
     #![allow(clippy::disallowed_methods)]
 
     use std::os::windows::process::CommandExt;
@@ -125,30 +143,139 @@ mod windows {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     };
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        GetCurrentProcess, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
     };
 
     use super::breakaway_decision;
     use crate::cutover::extract::ExtractedImages;
 
-    pub fn spawn_detached_child(staged: &ExtractedImages, target_version: &str) -> std::io::Result<()> {
-        let exe = std::env::current_exe()?;
-        let mut flags = DETACHED_PROCESS.0 | CREATE_NO_WINDOW.0;
+    /// Overwrite the marker's driver identity with the freshly-spawned child's
+    /// PID + start time. A real Windows creation FILETIME is never 0; a stamped
+    /// `0` is the poisoned sentinel the GUI reads as unassessed (a permanent mask
+    /// on a dead driver), so treat `Some(0)` (and `None`) as a failure — the
+    /// caller then kills the child and clears the marker rather than stamping a
+    /// poisoned identity. Table-testable.
+    pub(super) fn record_spawned_driver(
+        log_dir: &std::path::Path,
+        child_pid: u32,
+        start: Option<u64>,
+    ) -> std::io::Result<()> {
+        match start {
+            Some(s) if s != 0 => hole_common::update_marker::stamp_driver(log_dir, child_pid, s),
+            _ => Err(std::io::Error::other(
+                "could not record a valid cutover child start time",
+            )),
+        }
+    }
+
+    /// The suspended-spawn creation flags: DETACHED + NO_WINDOW + SUSPENDED, plus
+    /// CREATE_BREAKAWAY_FROM_JOB only when this process's job permits it.
+    fn suspended_creation_flags() -> u32 {
+        let mut flags = DETACHED_PROCESS.0 | CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0;
         if breakaway_decision(process_in_job(), job_permits_breakaway()) {
             flags |= CREATE_BREAKAWAY_FROM_JOB.0;
         }
-        std::process::Command::new(exe)
-            .args([
-                "bridge",
-                "cutover",
-                "--payload",
-                &staged.staging_dir.to_string_lossy(),
-                "--target-version",
-                target_version,
-            ])
-            .creation_flags(flags)
-            .spawn()?;
-        Ok(())
+        flags
+    }
+
+    /// Apply the suspended creation flags to `cmd` and spawn it. The single main
+    /// thread is left suspended; the caller stamps the marker, then resumes it via
+    /// [`resume_main_thread`].
+    fn spawn_suspended(mut cmd: std::process::Command) -> std::io::Result<std::process::Child> {
+        cmd.creation_flags(suspended_creation_flags()).spawn()
+    }
+
+    /// Spawn the detached LocalSystem `hole bridge cutover` child SUSPENDED. It
+    /// outlives this process and drives stop -> swap -> start once resumed.
+    pub(super) fn spawn_suspended_child(
+        staged: &ExtractedImages,
+        target_version: &str,
+    ) -> std::io::Result<std::process::Child> {
+        let exe = std::env::current_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "bridge",
+            "cutover",
+            "--payload",
+            &staged.staging_dir.to_string_lossy(),
+            "--target-version",
+            target_version,
+        ]);
+        spawn_suspended(cmd)
+    }
+
+    /// Spawn an arbitrary command line SUSPENDED. The first whitespace-delimited
+    /// token is the program; the remainder is appended verbatim (`raw_arg`, no
+    /// re-quoting). A test seam so the suspend->resume ordering can be driven with
+    /// an observable command; the real cutover payload goes through
+    /// [`spawn_suspended_child`].
+    #[cfg(test)]
+    pub(super) fn spawn_suspended_command(cmdline: &str) -> std::io::Result<std::process::Child> {
+        let (program, rest) = match cmdline.split_once(char::is_whitespace) {
+            Some((p, r)) => (p, r.trim_start()),
+            None => (cmdline, ""),
+        };
+        let mut cmd = std::process::Command::new(program);
+        if !rest.is_empty() {
+            cmd.raw_arg(rest);
+        }
+        spawn_suspended(cmd)
+    }
+
+    /// Resume the (single) suspended main thread of `pid`. A `CREATE_SUSPENDED`
+    /// process has exactly one thread, itself suspended; find it by owner PID via
+    /// a ToolHelp thread snapshot, open it with `THREAD_SUSPEND_RESUME`, and
+    /// `ResumeThread` (which returns `u32::MAX` on failure). `OpenThread` errors
+    /// are surfaced too, so a resume that could not fire returns `Err` (the caller
+    /// kills the still-suspended child rather than leaking it).
+    pub(super) fn resume_main_thread(pid: u32) -> std::io::Result<()> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+        // SAFETY: the snapshot handle is checked and closed below.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .map_err(|e| std::io::Error::other(format!("thread snapshot: {e}")))?;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut outcome: std::io::Result<()> = Err(std::io::Error::other("cutover child's main thread not found"));
+        // SAFETY: `snap` is a live snapshot; `entry.dwSize` is set per contract.
+        if unsafe { Thread32First(snap, &mut entry) }.is_ok() {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    // SAFETY: a valid thread id from the snapshot.
+                    match unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) } {
+                        Ok(h) => {
+                            // SAFETY: `h` is a live thread handle; closed right after.
+                            let prev = unsafe { ResumeThread(h) };
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
+                            outcome = if prev == u32::MAX {
+                                Err(std::io::Error::last_os_error())
+                            } else {
+                                Ok(())
+                            };
+                        }
+                        Err(e) => outcome = Err(std::io::Error::other(format!("OpenThread: {e}"))),
+                    }
+                    break;
+                }
+                // SAFETY: `snap`/`entry` stay valid across the enumeration.
+                if unsafe { Thread32Next(snap, &mut entry) }.is_err() {
+                    break;
+                }
+            }
+        }
+        // SAFETY: `snap` is a live handle opened above.
+        unsafe {
+            let _ = CloseHandle(snap);
+        }
+        outcome
     }
 
     fn current_process() -> HANDLE {
