@@ -792,7 +792,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!("tray: install update requested");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                handle_install_update_from_tray(app_handle).await;
+                handle_install_update_from_tray(app_handle, None).await;
             });
         }
         ID_LOCKDOWN => {
@@ -919,8 +919,26 @@ async fn handle_uninstall_helper(app: AppHandle) {
     }
 }
 
-async fn handle_install_update_from_tray(app: AppHandle) {
-    use tauri_plugin_dialog::DialogExt;
+/// Read the bridge's lockdown intent fresh, failing closed to `false` (⇒ require
+/// consent) on any unreadable reply, logging the transport-error and wrong-reply
+/// cases distinctly.
+async fn read_lockdown_fresh(app: &AppHandle) -> bool {
+    let status = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
+    match crate::state::classify_lockdown(&status) {
+        crate::state::LockdownRead::Known { enabled, .. } => enabled,
+        crate::state::LockdownRead::WrongReply => {
+            warn!("consent gate: Status returned an unexpected reply ({status:?}); treating lockdown as off");
+            false
+        }
+        crate::state::LockdownRead::Unreadable => {
+            warn!("consent gate: Status read failed ({status:?}); treating lockdown as off");
+            false
+        }
+    }
+}
+
+async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Option<bool>) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     // Get update info from update state.
     let update_state = app.state::<hole::update::UpdateState>();
@@ -1016,20 +1034,37 @@ async fn handle_install_update_from_tray(app: AppHandle) {
         }
     }
 
-    // Hand the verified payload to the privileged bridge, which owns the cutover
-    // (binary swap + service restart). The GUI does NOT exit — it self-heals onto
-    // the new image via the version-lockstep relaunch once the bridge is back.
-    // For PR2 the tray's existing user-initiated "install update" click is the
-    // gate, so consent is passed true (PR3 wires an explicit dialog).
-    let apply = BridgeRequest::ApplyUpdate {
-        payload_path: dest.clone(),
-        target_version: info.version.to_string(),
-        consent: true,
+    let consent = match precomputed_consent {
+        Some(consent) => consent,
+        None => match hole::update::tray_consent_decision(read_lockdown_fresh(&app).await) {
+            hole::update::TrayConsent::Proceed { consent } => consent,
+            hole::update::TrayConsent::AskUser => {
+                let confirmed = app
+                    .dialog()
+                    .message(hole::update::CONSENT_DIALOG_BODY)
+                    .title(hole::update::CONSENT_DIALOG_TITLE)
+                    .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Cancel".into()))
+                    .blocking_show();
+                if !confirmed {
+                    info!("user declined lockdown-off update consent");
+                    return;
+                }
+                true
+            }
+        },
+    };
+
+    // The privileged bridge owns the cutover (binary swap + service restart); the
+    // GUI does not exit but self-heals onto the new image via version-lockstep relaunch.
+    let apply = hole::update::build_apply_update(
+        dest.clone(),
+        info.version.to_string(),
         sha256sums,
         sha256sums_minisig,
-        asset_name: info.asset_name.clone(),
-        app_dest: hole::update::app_dest_hint(),
-    };
+        info.asset_name.clone(),
+        hole::update::app_dest_hint(),
+        consent,
+    );
     let result = app.state::<AppState>().bridge_send(apply).await;
     drop(download_dir);
 
@@ -1043,6 +1078,13 @@ async fn handle_install_update_from_tray(app: AppHandle) {
                 .blocking_show();
         }
         Ok(other) => error!("unexpected bridge response to update apply: {other:?}"),
+        Err(crate::bridge_client::ClientError::ConsentRequired { message }) => {
+            warn!("bridge 403 on update apply (lockdown raced off): {message}");
+            app.dialog()
+                .message(hole::update::CONSENT_LOCKDOWN_RACED_OFF)
+                .title("Update Error")
+                .blocking_show();
+        }
         Err(e) => {
             error!("update apply failed: {e}");
             app.dialog()
@@ -1101,21 +1143,24 @@ async fn handle_check_for_updates(app: AppHandle) {
 
     match result {
         Ok(Ok(Some(info))) => {
+            let lockdown_enabled = read_lockdown_fresh(&app).await;
             let confirmed = app
                 .dialog()
-                .message(format!(
-                    "Version {} is available.\n\nWould you like to install it now?",
-                    info.version
+                .message(hole::update::check_update_dialog_body(
+                    &info.version.to_string(),
+                    lockdown_enabled,
                 ))
                 .title("Update Available")
                 .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
                 .blocking_show();
 
             if confirmed {
-                // Store the update info and reuse the install handler.
+                // Consent decided here (merged dialog); reuse the install handler.
                 let update_state = app.state::<hole::update::UpdateState>();
                 update_state.tx.send_replace(Some(info));
-                handle_install_update_from_tray(app).await;
+                handle_install_update_from_tray(app, Some(hole::update::check_update_consent(lockdown_enabled))).await;
+            } else {
+                info!("user declined the available update at the check dialog");
             }
         }
         Ok(Ok(None)) => {

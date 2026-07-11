@@ -470,17 +470,38 @@ pub(crate) fn observed_error(result: &Result<BridgeResponse, ClientError>) -> Op
     }
 }
 
-/// The lockdown (enabled, active) a Status exchange revealed, if any. Only a
-/// `Status` Ok carries them; every other exchange yields None (leave the
-/// snapshot's prior lockdown fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool)> {
+/// Advisory read of the bridge's lockdown intent: decides which dialog/copy and
+/// consent value to offer. The bridge's `consent_gate` 403 is the authoritative gate;
+/// `Unreadable`/`WrongReply` fail closed to require-consent.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LockdownRead {
+    Known { enabled: bool, active: bool },
+    Unreadable,
+    WrongReply,
+}
+
+pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> LockdownRead {
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
             lockdown_active,
             ..
-        }) => Some((*lockdown_enabled, *lockdown_active)),
-        _ => None,
+        }) => LockdownRead::Known {
+            enabled: *lockdown_enabled,
+            active: *lockdown_active,
+        },
+        Ok(_) => LockdownRead::WrongReply,
+        Err(_) => LockdownRead::Unreadable,
+    }
+}
+
+/// The lockdown (enabled, active) a Status exchange revealed, if any. Only a
+/// `Status` Ok carries them; every other exchange yields None (leave the
+/// snapshot's prior lockdown fields untouched).
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool)> {
+    match classify_lockdown(result) {
+        LockdownRead::Known { enabled, active } => Some((enabled, active)),
+        LockdownRead::Unreadable | LockdownRead::WrongReply => None,
     }
 }
 
