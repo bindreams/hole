@@ -235,10 +235,10 @@ impl BridgeLink {
         result: &Result<BridgeResponse, ClientError>,
     ) {
         if !running && decision == CutoverDecision::UnmaskFailed {
-            // "Successor won" ⇒ the marker FILE is gone. Use `exists()`, not
-            // `read()` (which also returns None for a present-but-corrupt marker)
-            // — a present-but-unparsable marker with a dead driver is a real
-            // wedge, not a completed cutover, so it must still surface the failure.
+            // "Successor won" ⇒ the marker FILE is gone. A presence check, not
+            // `read()`: the wedge test is "did a cutover complete", which is the
+            // file's existence, not a parseable schema — robust across a from->to
+            // version bump mid-cutover (matching `clear`'s remove-by-path).
             if self
                 .service_log_dir
                 .join(hole_common::update_marker::MARKER_FILE)

@@ -377,9 +377,9 @@ fn noop_hook() -> SelfHealHook {
 
 /// Build a `BridgeLink` whose update-marker dir is a unique, never-created temp
 /// path. `BridgeLink::new` would otherwise read the real system service log dir,
-/// where a stray cutover marker would make `update_in_progress()` hold the
-/// snapshot and break these transport-error assertions. A non-existent dir reads
-/// as "no marker" (the `read` ENOENT path), keeping every test hermetic.
+/// where a stray cutover marker would make the cutover decision `Mask` and hold
+/// the snapshot, breaking these transport-error assertions. A non-existent dir
+/// reads as "no marker" (the `read` ENOENT path), keeping every test hermetic.
 fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
     let marker_dir = std::env::temp_dir().join(format!(
         "hole-link-marker-{}-{}",
