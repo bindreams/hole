@@ -5,8 +5,9 @@ fn sample_marker() -> hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 4242,
+        driver_pid: 4242,
         started_at_unix: 1_700_000_000,
+        driver_start_unix_ms: 0,
     }
 }
 

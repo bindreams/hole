@@ -489,8 +489,9 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             version: hole_common::update_marker::MARKER_VERSION,
             from_version: "0.2.0".into(),
             to_version: "0.3.0".into(),
-            pid: std::process::id(),
+            driver_pid: std::process::id(),
             started_at_unix: 0,
+            driver_start_unix_ms: 0,
         },
         None,
     )
@@ -532,8 +533,9 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
             version: hole_common::update_marker::MARKER_VERSION,
             from_version: "0.2.0".into(),
             to_version: "0.3.0".into(),
-            pid: std::process::id(),
+            driver_pid: std::process::id(),
             started_at_unix: 0,
+            driver_start_unix_ms: 0,
         },
         None,
     )

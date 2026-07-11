@@ -60,8 +60,9 @@ fn cutover_marker_is_chowned_to_owner_under_root() {
         version: MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: to.into(),
-        pid: std::process::id(),
+        driver_pid: std::process::id(),
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     };
     let root = unsafe { libc::geteuid() } == 0;
     let (nuid, ngid) = nobody();
