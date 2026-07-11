@@ -108,6 +108,34 @@ fn appid_filter_guid(index: usize, v6: bool) -> GUID {
 /// ignored), so an unused App-ID slot is harmless.
 const MAX_APPID_BINARIES: usize = 4;
 
+/// Derive a deterministic transient-cover resolver-permit GUID per (resolver
+/// index, family). Distinct namespace from [`appid_filter_guid`] and the fixed
+/// GUID arrays; collision-freedom is asserted by
+/// `all_swept_guids_are_mutually_distinct`.
+fn cover_resolver_guid(index: usize, v6: bool) -> GUID {
+    let base = 0x7a2c_9e51_3b8d_4f60_a100_5c6d_7e8f_0000u128;
+    let salt = ((index as u128) << 8) | (v6 as u128);
+    GUID::from_u128(base ^ salt)
+}
+
+/// Resolver-permit GUID budget recovery sweeps. DoH configs realistically carry
+/// one or two resolver IPs; 8 is ample headroom. Sweeping a superset is
+/// idempotent, and a resolver beyond the budget is simply not permitted
+/// (fail-safe: its DoH is blocked, never leaked).
+const MAX_RESOLVERS: usize = 8;
+
+/// Every transient-cover filter GUID a recovery `delete_all` must remove: the
+/// ten fixed GUIDs + the per-resolver permit GUIDs (both families across the
+/// budget). Mirrors [`swept_lockdown_guids`] for the lockdown cover.
+fn swept_transient_guids() -> Vec<GUID> {
+    let mut guids: Vec<GUID> = FILTER_GUIDS.to_vec();
+    for i in 0..MAX_RESOLVERS {
+        guids.push(cover_resolver_guid(i, false));
+        guids.push(cover_resolver_guid(i, true));
+    }
+    guids
+}
+
 /// Every lockdown filter GUID a full Sweep must delete: the ten fixed
 /// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
 /// separately by `delete_all`.)
@@ -212,14 +240,16 @@ pub const BLOCK_WEIGHT: u8 = 0;
 /// Permits loopback on CONNECT *and* RECV_ACCEPT (loopback connects authorize on
 /// both ALE directions) by the loopback address range (127.0.0.0/8, ::1/128) on
 /// all four layers, plus the IS_LOOPBACK flag on CONNECT as belt-and-suspenders,
-/// plus the server IP on CONNECT; blocks all else on CONNECT only (egress kill
-/// switch). Pure — no FFI; `engage` submits it in one transaction.
-pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
+/// plus the server IP and the DoH `resolver_ips` on CONNECT; blocks all else on
+/// CONNECT only (egress kill switch). Each RemoteIp permit lands on the CONNECT
+/// layer matching its own family. Pure — no FFI; `engage` submits it in one
+/// transaction.
+pub fn build_cover_spec(server_ip: IpAddr, resolver_ips: &[IpAddr]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
         IpAddr::V6(_) => Layer::ConnectV6,
     };
-    let filters = vec![
+    let mut filters = vec![
         FilterSpec {
             guid: FILTER_GUIDS[0],
             layer: Layer::ConnectV4,
@@ -284,21 +314,21 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             condition: Condition::RemoteIp(server_ip),
             weight: PERMIT_WEIGHT,
         },
-        FilterSpec {
-            guid: FILTER_GUIDS[4],
-            layer: Layer::ConnectV4,
-            action: Action::Block,
-            condition: Condition::Any,
-            weight: BLOCK_WEIGHT,
-        },
-        FilterSpec {
-            guid: FILTER_GUIDS[5],
-            layer: Layer::ConnectV6,
-            action: Action::Block,
-            condition: Condition::Any,
-            weight: BLOCK_WEIGHT,
-        },
     ];
+    // DoH resolver permits: the bootstrap that resolves the server hostname (and
+    // a stay-blocked retry's re-resolve) must reach the configured resolver IPs
+    // while the cover holds. One permit per resolver on its own family's CONNECT
+    // layer. Capped at MAX_RESOLVERS so recovery sweeps a fixed GUID budget with
+    // no runtime state; a resolver beyond the cap is not permitted (fail-safe).
+    for (i, &ip) in resolver_ips.iter().take(MAX_RESOLVERS).enumerate() {
+        let (layer, v6) = match ip {
+            IpAddr::V4(_) => (Layer::ConnectV4, false),
+            IpAddr::V6(_) => (Layer::ConnectV6, true),
+        };
+        filters.push(permit(cover_resolver_guid(i, v6), layer, Condition::RemoteIp(ip)));
+    }
+    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4));
+    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
@@ -464,7 +494,9 @@ fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage(server_ip: IpAddr, _state_dir: &Path, _owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
-    let spec = build_cover_spec(server_ip);
+    // Task 1 keeps the transient engage resolver-free (behavior-preserving);
+    // Task 3 threads the real resolver IPs through the facade + trait.
+    let spec = build_cover_spec(server_ip, &[]);
     unsafe {
         // A NON-dynamic engine session (`session = None`): a dynamic session
         // would auto-delete our filters when this process exits, reopening the
@@ -881,7 +913,7 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// ignored (recovery runs even when no cover is present).
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    for g in FILTER_GUIDS {
+    for g in swept_transient_guids() {
         let _ = FwpmFilterDeleteByKey0(engine, &g);
     }
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);

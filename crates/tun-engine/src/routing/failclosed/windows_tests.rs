@@ -13,7 +13,7 @@ fn spec_blocks_egress_only_on_both_v4_and_v6_layers() {
     // The block-all is an egress kill switch: CONNECT only. Blocking RECV_ACCEPT
     // would make it an inbound firewall (out of scope, and inconsistent with the
     // macOS `set skip on lo0` egress-only model).
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     assert!(s
         .filters
         .iter()
@@ -38,7 +38,7 @@ fn spec_permits_loopback_on_all_four_ale_layers() {
     // permit loopback on both ALE directions, V4 and V6. The deterministic
     // matcher is the address range (LoopbackNet) on ALL FOUR layers; the
     // IS_LOOPBACK flag isn't reliably set on CI's elevated lane.
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     for layer in [
         Layer::ConnectV4,
         Layer::ConnectV6,
@@ -56,7 +56,7 @@ fn spec_permits_loopback_on_all_four_ale_layers() {
 
 #[skuld::test]
 fn spec_permits_v4_server_on_v4_layer_only() {
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     let server_permits: Vec<_> = s
         .filters
         .iter()
@@ -69,7 +69,7 @@ fn spec_permits_v4_server_on_v4_layer_only() {
 
 #[skuld::test]
 fn spec_permits_v6_server_on_v6_layer_only() {
-    let s = build_cover_spec(v6());
+    let s = build_cover_spec(v6(), &[]);
     let server_permits: Vec<_> = s
         .filters
         .iter()
@@ -79,6 +79,35 @@ fn spec_permits_v6_server_on_v6_layer_only() {
     assert_eq!(server_permits[0].layer, Layer::ConnectV6);
 }
 
+#[skuld::test]
+fn spec_permits_resolvers_on_matching_family_layer() {
+    // The DoH bootstrap must reach the configured resolver IPs while the cover is
+    // engaged, so each resolver gets a permit on the CONNECT layer matching its
+    // own address family (v4 -> ConnectV4, v6 -> ConnectV6), never both — a v4
+    // RemoteIp on the v6 layer is a never-matching dead filter. Mirrors the
+    // server permit.
+    let resolver_v4: IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    let s = build_cover_spec(v4(), &[resolver_v4, resolver_v6]);
+
+    let permit_for = |ip: IpAddr| -> Vec<&FilterSpec> {
+        s.filters
+            .iter()
+            .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::RemoteIp(x) if x == ip))
+            .collect()
+    };
+
+    let v4p = permit_for(resolver_v4);
+    assert_eq!(v4p.len(), 1, "exactly one permit for the v4 resolver");
+    assert_eq!(v4p[0].layer, Layer::ConnectV4);
+    assert_eq!(v4p[0].weight, PERMIT_WEIGHT);
+
+    let v6p = permit_for(resolver_v6);
+    assert_eq!(v6p.len(), 1, "exactly one permit for the v6 resolver");
+    assert_eq!(v6p[0].layer, Layer::ConnectV6);
+    assert_eq!(v6p[0].weight, PERMIT_WEIGHT);
+}
+
 // Arbitration within our single sublayer is pure weight (no CLEAR_ACTION_RIGHT on
 // any filter): the permits must outweigh block-all, else block-all wins and the
 // cover blocks everything. A compile-time invariant, not a runtime check.
@@ -86,7 +115,7 @@ const _: () = assert!(PERMIT_WEIGHT > BLOCK_WEIGHT);
 
 #[skuld::test]
 fn permit_filters_outweigh_block() {
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     for f in &s.filters {
         match f.action {
             Action::Permit => assert_eq!(f.weight, PERMIT_WEIGHT),
@@ -97,7 +126,7 @@ fn permit_filters_outweigh_block() {
 
 #[skuld::test]
 fn spec_uses_the_fixed_hole_guids() {
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     assert_eq!(s.provider, PROVIDER_GUID);
     assert_eq!(s.sublayer, SUBLAYER_GUID);
 }
@@ -187,7 +216,7 @@ fn lockdown_spec_permits_outweigh_block() {
 #[skuld::test]
 fn lockdown_spec_uses_distinct_guids_from_transient_cover() {
     let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
-    let cover = build_cover_spec(v4());
+    let cover = build_cover_spec(v4(), &[]);
     let lock_guids: std::collections::HashSet<_> = lock.filters.iter().map(|f| f.guid).collect();
     let cover_guids: std::collections::HashSet<_> = cover.filters.iter().map(|f| f.guid).collect();
     assert!(
@@ -233,13 +262,13 @@ fn all_swept_guids_are_mutually_distinct() {
     // distinct: two filters sharing a key means the second add
     // silently clobbers the first (FwpmFilterAdd0 keys on filterKey). GUID
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
-    let mut all: Vec<GUID> = FILTER_GUIDS.to_vec();
+    let mut all: Vec<GUID> = swept_transient_guids(); // fixed transient + resolver budget
     all.extend(swept_lockdown_guids());
     let unique: std::collections::HashSet<GUID> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
         all.len(),
-        "every filter GUID (transient + lockdown + App-ID) must be distinct"
+        "every filter GUID (transient + resolver + lockdown + App-ID) must be distinct"
     );
 }
 
@@ -339,7 +368,7 @@ fn both_specs_permit_loopback_recv_accept_by_address_range() {
     // so the 127.0.0.0/8 or ::1/128 range matches. The matching family per layer:
     // V4 range on RecvAcceptV4, V6 range on RecvAcceptV6.
     for s in [
-        build_cover_spec(v4()),
+        build_cover_spec(v4(), &[]),
         build_lockdown_spec(v4(), luid(), &[plugin_path()]),
     ] {
         assert!(
@@ -366,7 +395,7 @@ fn loopback_recv_accept_permits_are_in_both_sweep_floors() {
     // (swept_lockdown_guids) must both delete them, but Adopt must keep them.
     // The transient cover wires its RECV_ACCEPT loopback GUIDs from FILTER_GUIDS,
     // so iterating the array sweeps them; assert they actually appear in the spec.
-    let cover = build_cover_spec(v4());
+    let cover = build_cover_spec(v4(), &[]);
     let cover_guids: std::collections::HashSet<GUID> = cover.filters.iter().map(|f| f.guid).collect();
     assert!(
         cover_guids.contains(&FILTER_GUIDS[6]),
@@ -392,13 +421,20 @@ fn loopback_recv_accept_permits_are_in_both_sweep_floors() {
 fn every_emitted_filter_guid_is_in_its_sweep_set() {
     // Structural fail-closed invariant: any filter a cover installs must be
     // deletable by recovery, else a crash leaks an unswept block across restarts.
-    // Transient -> delete_all iterates FILTER_GUIDS; lockdown -> swept_lockdown_guids.
+    // Transient -> delete_all iterates swept_transient_guids (fixed GUIDs +
+    // resolver budget); lockdown -> swept_lockdown_guids.
+    let transient_swept: std::collections::HashSet<GUID> = swept_transient_guids().into_iter().collect();
     for ip in [v4(), v6()] {
-        let cover = build_cover_spec(ip);
+        // Exercise resolver permits of both families so their derived GUIDs are
+        // covered by the sweep-set assertion, not just the fixed filters.
+        let cover = build_cover_spec(
+            ip,
+            &["1.1.1.1".parse().unwrap(), "2606:4700:4700::1111".parse().unwrap()],
+        );
         for f in &cover.filters {
             assert!(
-                FILTER_GUIDS.contains(&f.guid),
-                "transient filter {:?} ({:?}) is not in FILTER_GUIDS",
+                transient_swept.contains(&f.guid),
+                "transient filter {:?} ({:?}) is not in swept_transient_guids",
                 f.guid,
                 f.layer
             );
@@ -425,7 +461,7 @@ fn both_specs_permit_loopback_by_address_range_at_connect() {
     // block-all. An address-range permit keyed on the connect's DESTINATION
     // matches deterministically: 127.0.0.0/8 on CONNECT V4, ::1/128 on CONNECT V6.
     for s in [
-        build_cover_spec(v4()),
+        build_cover_spec(v4(), &[]),
         build_lockdown_spec(v4(), luid(), &[plugin_path()]),
     ] {
         let v4_net = s.filters.iter().any(|f| {
@@ -454,7 +490,7 @@ fn flag_loopback_permits_are_kept_only_on_connect() {
     // the address-range ones (don't churn them). At RECV_ACCEPT the flag is
     // dropped in favor of the deterministic address-range permit, because the
     // flag doesn't match there on CI's elevated lane.
-    let s = build_cover_spec(v4());
+    let s = build_cover_spec(v4(), &[]);
     let flag_permits: Vec<_> = s
         .filters
         .iter()
@@ -480,7 +516,7 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
     // the transient sweep (delete_all iterates FILTER_GUIDS) and the lockdown
     // sweep (swept_lockdown_guids) must both delete them. They must also be
     // distinct from every prior GUID (a shared key silently clobbers).
-    let cover = build_cover_spec(v4());
+    let cover = build_cover_spec(v4(), &[]);
     for f in cover
         .filters
         .iter()
