@@ -32,6 +32,19 @@ fn post_bind_sweep_clears_marker() {
 }
 
 #[skuld::test]
+fn restart_failure_actions_configures_restart_on_failure() {
+    use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod};
+    let fa = super::restart_failure_actions();
+    assert!(fa
+        .actions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|a| a.action_type == ServiceActionType::Restart));
+    assert!(matches!(fa.reset_period, ServiceFailureResetPeriod::After(d) if !d.is_zero()));
+}
+
+#[skuld::test]
 fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
     let dir = tempfile::tempdir().unwrap();
     let old1 = dir.path().join("hole.exe.old-0.0.0");

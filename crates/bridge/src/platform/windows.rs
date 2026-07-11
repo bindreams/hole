@@ -6,8 +6,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
-    ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+    ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
+    ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -351,8 +352,29 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
 
     service.set_description(SERVICE_DESCRIPTION)?;
+    service.update_failure_actions(restart_failure_actions())?;
+    // Also restart on a graceful Stopped with a NON-ZERO exit — run_service reports
+    // Stopped(1) on any bind/runtime failure, which SCM would otherwise NOT treat
+    // as a failure. This covers the failed-start wedge (a swapped-in bridge that
+    // fails to bind). A clean Stopped(0) (user stop / cutover stop) is not restarted.
+    service.set_failure_actions_on_non_crash_failures(true)?;
     info!("Windows service installed");
     Ok(())
+}
+
+/// Restart-on-failure SCM actions. Fires on a crash / non-zero exit, not a
+/// graceful `Stopped(0)`. `reset_period` is finite so a run of crashes keeps
+/// restarting (the counter resets after a day without a failure).
+fn restart_failure_actions() -> ServiceFailureActions {
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86_400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: std::time::Duration::from_secs(1),
+        }]),
+    }
 }
 
 /// Stop and uninstall the bridge Windows Service.
