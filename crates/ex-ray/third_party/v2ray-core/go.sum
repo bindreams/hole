@@ -338,6 +338,7 @@ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9G
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/mustafaturan/bus v1.0.2 h1:2x3ErwZ0uUPwwZ5ZZoknEQprdaxr68Yl3mY8jDye1Ws=
 github.com/mustafaturan/bus v1.0.2/go.mod h1:h7gfehm8TThv4Dcaa+wDQG7r7j6p74v+7ftr0Rq9i1Q=
+github.com/mustafaturan/bus/v3 v3.0.3/go.mod h1:JVCyq6Pb6S/IGI6LrzKH5vlBZ9ifsd1Js+wd4Y2+7Xg=
 github.com/mustafaturan/monoton v0.3.1/go.mod h1:FOnE7NV3s3EWPXb8/7+/OSdiMBbdlkV0Lz8p1dc+vy8=
 github.com/mustafaturan/monoton v1.0.0 h1:8SCej+JiNn0lyps7V+Jzc1CRAkDR4EZPWrTupQ61YCQ=
 github.com/mustafaturan/monoton v1.0.0/go.mod h1:FOnE7NV3s3EWPXb8/7+/OSdiMBbdlkV0Lz8p1dc+vy8=
