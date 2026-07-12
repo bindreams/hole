@@ -1,6 +1,6 @@
 [package]
 name = "dump"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
 description = "YAML-shaped representation for logging, analogous to Python's dump() alongside str()/repr()."
