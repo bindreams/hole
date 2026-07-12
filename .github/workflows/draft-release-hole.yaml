@@ -59,8 +59,9 @@ jobs:
       - name: Create local tag for build
         run: git tag "releases/hole/v${{ needs.validate.outputs.version }}"
 
+      # Required by both bundle builds — hole-msi (Windows) and hole-dmg
+      # (Darwin dmg-installer) — so it must run on every matrix target.
       - uses: astral-sh/setup-uv@v8.2.0
-        if: matrix.os == 'windows'
 
       - uses: ./.github/actions/setup-build
 
