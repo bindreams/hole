@@ -2715,13 +2715,13 @@ mod self_test {
     }
 
     #[skuld::test]
-    fn different_server_retry_reuses_held_cover_stays_fail_closed() {
+    fn different_server_retry_releases_stale_cover_and_re_engages_fresh() {
         rt().block_on(async {
-            // The transient cover is a global singleton: a different-server retry
-            // must NOT engage a second cover (that would self-clobber the shared
-            // WFP GUIDs / pf ruleset and fail OPEN). It reuses the single held
-            // guard — the new server is simply not permitted, so the retry stays
-            // fail-closed.
+            // A retry to a DIFFERENT server must release the stale cover (it permits
+            // only the OLD server) BEFORE resolving/connecting the new one, then
+            // engage a FRESH cover permitting the new server. Sequential drop-then-
+            // engage — never a second cover over the held singleton. The new start
+            // fails, so the host stays blocked, now on the new server.
             let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
@@ -2733,16 +2733,21 @@ mod self_test {
                 .await
                 .unwrap_err();
             assert_eq!(
-                st.cover_engage_calls.load(Ordering::SeqCst),
+                st.cover_disengage_calls.load(Ordering::SeqCst),
                 1,
-                "a different-server retry must reuse the held singleton, never engage a second"
+                "the stale cover for the old server is released before re-resolving"
             );
             assert_eq!(
-                st.cover_disengage_calls.load(Ordering::SeqCst),
-                0,
-                "the held cover is never disengaged mid-retry (no fall-open)"
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "a fresh cover is engaged for the new server"
             );
-            assert!(pm.blocked_until_connected());
+            assert_eq!(
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some("127.0.0.2".parse().unwrap()),
+                "the fresh cover permits the new server IP"
+            );
+            assert!(pm.blocked_until_connected(), "still blocked, now on the new server");
         });
     }
 
@@ -2834,26 +2839,36 @@ mod self_test {
     }
 
     #[skuld::test]
-    fn covered_start_cover_permits_the_resolved_server_ip() {
+    fn covered_start_cover_permits_the_doh_resolved_ip_not_the_hostname() {
         rt().block_on(async {
-            // The cover must permit exactly the resolved server IP — the onward
-            // connect target (plugin + self-test). A regression passing the wrong
-            // value would block the very connection the block-until-connected gate
-            // is waiting to succeed.
-            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            // The cover must permit the DoH-RESOLVED IP, not the server hostname —
+            // the onward connect target (plugin + self-test) dials the IP. A hostname
+            // server routed through the querier makes the resolved IP (203.0.113.9)
+            // provably distinct from the config's server string, so a regression
+            // handing the wrong value to the cover is caught (not a 127==127 no-op).
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            let permitted = st
-                .last_cover_server_ip
-                .lock()
-                .unwrap()
-                .expect("the covered start engaged the cover");
             assert_eq!(
-                permitted,
-                cfg.server.server.parse::<IpAddr>().unwrap(),
-                "the cover permits exactly the resolved server IP"
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some(resolved),
+                "the cover permits the DoH-resolved IP, not the hostname"
             );
         });
     }
@@ -2923,6 +2938,97 @@ mod self_test {
                 after_first,
                 "the covered retry reuses the resolved IP and does NOT re-query DoH under the cover"
             );
+        });
+    }
+
+    /// A DoH stub mapping several hostnames to IPv4s (and counting queries), so a
+    /// test can drive a switch between two different-hostname servers.
+    struct MappingQuerier {
+        map: std::collections::HashMap<String, std::net::Ipv4Addr>,
+        queries: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for MappingQuerier {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let q = Message::from_vec(wire).ok()?;
+            let question = q.queries.first()?;
+            if question.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let name = question.name().to_string();
+            let ip = *self.map.get(name.trim_end_matches('.'))?;
+            let n = Name::from_ascii(&name).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
+            reply.to_vec().ok()
+        }
+    }
+
+    #[skuld::test]
+    fn different_hostname_retry_re_resolves_uncovered_and_re_engages() {
+        rt().block_on(async {
+            // The wedge fix: a covered start blocked on server A, then a retry to a
+            // DIFFERENT hostname B, must RELEASE A's cover before resolving B — else
+            // DoH under A's cover is blocked and B never resolves (permanent wedge) —
+            // then engage a FRESH cover permitting B's resolved IP. The mock cover is
+            // a no-op guard, so this asserts the ordering that prevents the real
+            // wedge: re-resolution happened + the cover now permits B.
+            let ip_a: IpAddr = "203.0.113.10".parse().unwrap();
+            let ip_b: IpAddr = "203.0.113.20".parse().unwrap();
+            let querier = Arc::new(MappingQuerier {
+                map: std::collections::HashMap::from([
+                    ("proxy-a.example".to_string(), std::net::Ipv4Addr::new(203, 0, 113, 10)),
+                    ("proxy-b.example".to_string(), std::net::Ipv4Addr::new(203, 0, 113, 20)),
+                ]),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+
+            cfg.server.server = "proxy-a.example".into();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_server_ip.lock().unwrap(), Some(ip_a));
+            let queries_after_a = querier.queries.load(Ordering::SeqCst);
+
+            cfg.server.server = "proxy-b.example".into();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                querier.queries.load(Ordering::SeqCst) > queries_after_a,
+                "the different-hostname retry must RE-RESOLVE (uncovered), never wedge on the stale cover"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the stale cover for server A is released before re-resolving"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "a fresh cover is engaged for server B"
+            );
+            assert_eq!(
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some(ip_b),
+                "the fresh cover permits server B's resolved IP"
+            );
+            assert!(pm.blocked_until_connected(), "still blocked, now on server B");
         });
     }
 

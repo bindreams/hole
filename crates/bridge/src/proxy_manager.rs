@@ -527,11 +527,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
 
-        // Resolve the server IP over private DoH. A covered retry for the SAME
-        // server reuses the IP the held cover already permits — re-resolving under
-        // the cover would be blocked (the cover permits the server IP, not the DoH
-        // resolvers), wedging the retry. A changed server (or no held cover) resolves
-        // afresh; a changed server then stays fail-closed at connect (not permitted).
+        // A held cover permits only the OLD server IP, so a start for a DIFFERENT
+        // server must release it BEFORE resolving — DoH under the stale cover would
+        // be blocked (the resolvers aren't permitted) and wedge. A same-server
+        // (re)start keeps the cover and reuses the IP it already permits.
+        let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
+        if stale && self.blocked.take().is_some() {
+            warn!("start for a different server while blocked: releasing the held cover before re-resolving");
+        }
+
+        // Resolve the server IP over private DoH. A same-server retry under the held
+        // cover reuses the IP the cover permits (no DoH — the cover blocks the
+        // resolvers); every other case resolves uncovered.
         let server_ip = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
             Some(b) => b.server_ip,
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
@@ -539,6 +546,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Err(e) => {
                     if !matches!(e, ProxyError::Cancelled) {
                         self.last_error = Some(e.to_string());
+                        // A covered start that can't resolve has no IP to permit, so no
+                        // cover can engage: the block-until-connected intent falls open
+                        // here — logged so the gap is visible, not silent.
+                        if covered {
+                            warn!(error = %e, "covered start could not resolve the server; host NOT blocked (no IP to permit)");
+                        }
                     }
                     return Err(e);
                 }
@@ -556,13 +569,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
         if covered && !lockdown_on {
-            // Reuse the held singleton if present; a fresh engage records the
-            // (host, server_ip) it permits so a retry reuses the IP. The transient
-            // cover is a global singleton (fixed WFP GUIDs / single pf ruleset), so
-            // constructing a second over the same objects would self-clobber on Drop
-            // and fail OPEN — engage only when none is held. An engage failure warns
-            // and proceeds UNCOVERED (aborting would leave the user unconnected AND
-            // unprotected), surfaced via last_error.
+            // Reuse the held singleton if present (a same-server retry); otherwise
+            // engage fresh for the resolved IP. The transient cover is a global
+            // singleton, so we never construct a second over the same objects. An
+            // engage failure warns and proceeds UNCOVERED (aborting would leave the
+            // user unconnected AND unprotected), surfaced via last_error.
             if self.blocked.is_none() {
                 match self.routing.install_failclosed_cover(server_ip) {
                     Ok(cover) => {
@@ -588,10 +599,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                      uncovered until the standing lockdown cover engages at connect"
                 );
             }
-        } else {
-            // Manual (uncovered) connect: fail-open by design. Release any stale
-            // blocked cover — no window is opened that wasn't already accepted.
-            self.blocked = None;
+        } else if self.blocked.take().is_some() {
+            // Manual (uncovered) connect or reload-while-blocked: fail-open by
+            // design. Releasing the held cover opens egress — logged so the fail-open
+            // has a visible disposition, never a silent drop.
+            warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
         }
         let blocking_engaged = self.blocked.is_some();
 

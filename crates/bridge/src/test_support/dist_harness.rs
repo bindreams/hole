@@ -571,9 +571,17 @@ impl BridgeIpcClient {
                     parse_bridge_error(resp).await
                 }
             }
-            BridgeRequest::Start { config, attempt_id, .. } => {
+            BridgeRequest::Start {
+                config,
+                attempt_id,
+                covered,
+            } => {
                 let body = serde_json::to_vec(&config)?;
-                let resp = self.http_post(ROUTE_START, body, Some(&attempt_id)).await?;
+                let mut headers: Vec<(&str, &str)> = vec![("x-hole-attempt-id", attempt_id.as_str())];
+                if covered {
+                    headers.push(("x-hole-covered", "true"));
+                }
+                let resp = self.http_post(ROUTE_START, body, &headers).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else if resp.status() == http::StatusCode::CONFLICT {
@@ -586,7 +594,7 @@ impl BridgeIpcClient {
                 }
             }
             BridgeRequest::Stop => {
-                let resp = self.http_post(ROUTE_STOP, Vec::new(), None).await?;
+                let resp = self.http_post(ROUTE_STOP, Vec::new(), &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -594,7 +602,9 @@ impl BridgeIpcClient {
                 }
             }
             BridgeRequest::Cancel { attempt_id } => {
-                let resp = self.http_post(ROUTE_CANCEL, Vec::new(), Some(&attempt_id)).await?;
+                let resp = self
+                    .http_post(ROUTE_CANCEL, Vec::new(), &[("x-hole-attempt-id", attempt_id.as_str())])
+                    .await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -603,7 +613,7 @@ impl BridgeIpcClient {
             }
             BridgeRequest::Reload { config } => {
                 let body = serde_json::to_vec(&config)?;
-                let resp = self.http_post(ROUTE_RELOAD, body, None).await?;
+                let resp = self.http_post(ROUTE_RELOAD, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -646,7 +656,7 @@ impl BridgeIpcClient {
             BridgeRequest::TestServer { entry, dns } => {
                 let req_body = TestServerRequest { entry, dns };
                 let body = serde_json::to_vec(&req_body)?;
-                let resp = self.http_post(ROUTE_TEST_SERVER, body, None).await?;
+                let resp = self.http_post(ROUTE_TEST_SERVER, body, &[]).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let parsed: TestServerResponse = serde_json::from_slice(&body)?;
@@ -659,7 +669,7 @@ impl BridgeIpcClient {
             }
             BridgeRequest::SetLockdown { enabled } => {
                 let body = serde_json::to_vec(&LockdownRequest { enabled })?;
-                let resp = self.http_post(ROUTE_LOCKDOWN, body, None).await?;
+                let resp = self.http_post(ROUTE_LOCKDOWN, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -684,7 +694,7 @@ impl BridgeIpcClient {
                     asset_name,
                     app_dest,
                 })?;
-                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, None).await?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -709,15 +719,15 @@ impl BridgeIpcClient {
         &mut self,
         path: &str,
         body: Vec<u8>,
-        attempt_id: Option<&str>,
+        headers: &[(&str, &str)],
     ) -> Result<http::Response<hyper::body::Incoming>, HarnessError> {
         let mut builder = http::Request::builder()
             .method("POST")
             .uri(path)
             .header("host", "localhost")
             .header("content-type", "application/json");
-        if let Some(id) = attempt_id {
-            builder = builder.header("x-hole-attempt-id", id);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let req = builder.body(Full::new(Bytes::from(body)))?;
         self.sender.ready().await?;
