@@ -2717,11 +2717,11 @@ mod self_test {
     #[skuld::test]
     fn different_server_retry_releases_stale_cover_and_re_engages_fresh() {
         rt().block_on(async {
-            // A retry to a DIFFERENT server must release the stale cover (it permits
-            // only the OLD server) BEFORE resolving/connecting the new one, then
-            // engage a FRESH cover permitting the new server. Sequential drop-then-
-            // engage — never a second cover over the held singleton. The new start
-            // fails, so the host stays blocked, now on the new server.
+            // End-state for a literal-IP server switch (no DoH — both are literals):
+            // a retry to a DIFFERENT server releases the stale cover (it permits only
+            // the OLD server) and engages a FRESH cover permitting the new one, never
+            // a second cover over the held singleton. The release-before-DoH ORDERING
+            // is proven separately by `different_hostname_retry_re_resolves_uncovered…`.
             let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
@@ -2735,7 +2735,7 @@ mod self_test {
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
                 1,
-                "the stale cover for the old server is released before re-resolving"
+                "the stale cover for the old server is released"
             );
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
@@ -2844,8 +2844,7 @@ mod self_test {
             // The cover must permit the DoH-RESOLVED IP, not the server hostname —
             // the onward connect target (plugin + self-test) dials the IP. A hostname
             // server routed through the querier makes the resolved IP (203.0.113.9)
-            // provably distinct from the config's server string, so a regression
-            // handing the wrong value to the cover is caught (not a 127==127 no-op).
+            // provably distinct from the config's server string.
             let resolved: IpAddr = "203.0.113.9".parse().unwrap();
             let querier = Arc::new(CountingQuerier {
                 host: "proxy.example".into(),
@@ -2973,12 +2972,11 @@ mod self_test {
     #[skuld::test]
     fn different_hostname_retry_re_resolves_uncovered_and_re_engages() {
         rt().block_on(async {
-            // The wedge fix: a covered start blocked on server A, then a retry to a
-            // DIFFERENT hostname B, must RELEASE A's cover before resolving B — else
-            // DoH under A's cover is blocked and B never resolves (permanent wedge) —
-            // then engage a FRESH cover permitting B's resolved IP. The mock cover is
-            // a no-op guard, so this asserts the ordering that prevents the real
-            // wedge: re-resolution happened + the cover now permits B.
+            // A covered start blocked on server A, then a retry to a DIFFERENT hostname
+            // B, must RELEASE A's cover before resolving B (else DoH under A's cover is
+            // blocked and B never resolves), then engage a FRESH cover permitting B's
+            // resolved IP. The mock cover is a no-op guard, so this asserts the ordering
+            // via observable side-effects: re-resolution happened + cover now permits B.
             let ip_a: IpAddr = "203.0.113.10".parse().unwrap();
             let ip_b: IpAddr = "203.0.113.20".parse().unwrap();
             let querier = Arc::new(MappingQuerier {

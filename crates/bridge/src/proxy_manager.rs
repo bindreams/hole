@@ -529,16 +529,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // A held cover permits only the OLD server IP, so a start for a DIFFERENT
         // server must release it BEFORE resolving — DoH under the stale cover would
-        // be blocked (the resolvers aren't permitted) and wedge. A same-server
-        // (re)start keeps the cover and reuses the IP it already permits.
+        // be blocked (the resolvers aren't permitted) and wedge.
         let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
-        if stale && self.blocked.take().is_some() {
+        if stale {
+            debug_assert!(self.blocked.is_some(), "stale implies a held cover");
+            self.blocked.take();
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
         // Resolve the server IP over private DoH. A same-server retry under the held
-        // cover reuses the IP the cover permits (no DoH — the cover blocks the
-        // resolvers); every other case resolves uncovered.
+        // cover reuses the cached IP (the cover blocks the resolvers).
         let server_ip = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
             Some(b) => b.server_ip,
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
@@ -569,11 +569,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
         if covered && !lockdown_on {
-            // Reuse the held singleton if present (a same-server retry); otherwise
-            // engage fresh for the resolved IP. The transient cover is a global
-            // singleton, so we never construct a second over the same objects. An
-            // engage failure warns and proceeds UNCOVERED (aborting would leave the
-            // user unconnected AND unprotected), surfaced via last_error.
+            // The transient cover is a global singleton — never construct a second
+            // over the same objects. An engage failure proceeds UNCOVERED (aborting
+            // would leave the user unconnected AND unprotected), surfaced via last_error.
             if self.blocked.is_none() {
                 match self.routing.install_failclosed_cover(server_ip) {
                     Ok(cover) => {

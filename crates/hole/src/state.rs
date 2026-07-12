@@ -344,14 +344,17 @@ impl ProxyStateCell {
         Self { tx }
     }
 
-    /// Commit an observed running state. Bumps `seq` (and wakes watchers)
-    /// only when the value actually changes. Preserves the lockdown fields
-    /// (the non-Status paths that call this only know `running`) and clears
-    /// `error`: a non-Status running edge (Start/Stop/Cancel) is user-initiated
-    /// and carries no death reason (#470).
+    /// Commit an observed running state. Bumps `seq` (and wakes watchers) only when
+    /// something changes. Preserves the lockdown fields (the non-Status paths that
+    /// call this only know `running`); clears `error` (a running edge is
+    /// user-initiated, no death reason); and clears `blocked_until_connected`. The
+    /// callers are settled non-Status Acks (Start/Stop/Cancel) — the bridge has
+    /// dropped the transient cover — so a Go-Offline from the blocked state
+    /// (`running` already false) must still clear the flag and repaint, not
+    /// short-circuit and leave the tray showing "Blocked".
     pub fn commit(&self, running: bool) {
         self.tx.send_if_modified(|snap| {
-            if snap.running == running {
+            if snap.running == running && !snap.blocked_until_connected {
                 return false;
             }
             *snap = ProxySnapshot {
@@ -360,7 +363,7 @@ impl ProxyStateCell {
                 error: None,
                 lockdown_enabled: snap.lockdown_enabled,
                 lockdown_active: snap.lockdown_active,
-                blocked_until_connected: snap.blocked_until_connected,
+                blocked_until_connected: false,
             };
             true
         });

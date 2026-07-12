@@ -100,6 +100,31 @@ fn commit_preserves_lockdown_fields() {
     assert_eq!(after.seq, before.seq + 1, "running change bumps seq");
 }
 
+#[skuld::test]
+fn commit_clears_blocked_on_a_settled_running_edge() {
+    // Go-Offline from the blocked state (running=false, blocked=true) sends Stop;
+    // the Ack commits running=false. Running is ALREADY false, so without clearing
+    // blocked this would short-circuit and leave the tray showing "Blocked" until
+    // the next Status poll. A settled running edge resolves the transient blocked
+    // sub-state, so commit clears the flag AND bumps seq to repaint immediately.
+    let cell = ProxyStateCell::new();
+    cell.commit_status(false, None, false, false, true); // enter the blocked state
+    let before = cell.snapshot();
+    assert!(before.blocked_until_connected, "precondition: blocked");
+
+    cell.commit(false); // the Stop Ack — running already false
+    let after = cell.snapshot();
+    assert!(
+        !after.blocked_until_connected,
+        "a settled Stop clears the blocked flag, got {after:?}"
+    );
+    assert_eq!(
+        after.seq,
+        before.seq + 1,
+        "clearing blocked bumps seq to repaint the tray"
+    );
+}
+
 // error field (#470) ==================================================================================================
 
 #[skuld::test]
