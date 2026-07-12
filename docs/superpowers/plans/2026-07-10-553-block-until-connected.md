@@ -1,5 +1,19 @@
 # #553 Block-until-connected (minimal-correct, beta scope) — Implementation Plan
 
+> **Superseded during code review (resolver-permit approach → reuse-resolved-IP):**
+> Tasks 1–3 below generalized the transient cover to permit the DoH resolver IPs
+> so a stay-blocked retry could re-resolve under the cover. A code-review finding
+> showed that scheme wedges when >8 resolvers are configured (the cover permitted
+> a fixed prefix while DoH iterates the full list). The user chose to drop
+> resolver permits entirely: a covered retry now **reuses the server IP resolved
+> on the first (uncovered) attempt** (`ProxyManager.blocked: Option<BlockedStart>`
+> carries `(cover, host, server_ip)`), so no DoH runs under the cover and the
+> cover permits only loopback + server + block-all. `cover_resolver_guid`,
+> `MAX_RESOLVER_PERMITS`, and the per-resolver pf rules are gone. Separately,
+> `stop_with(Cutover)` now **disarms** (not drops) a held transient cover so its
+> filters survive the restart gap fail-closed. See the final commits on this
+> branch for the shipped shape; the resolver-permit task text below is historical.
+
 **Goal:** A covered connect that fails leaves the host **blocked, not leaked**,
 for as long as the bridge process is alive — closing the widest routine leak
 (auto-connect / post-update-reconnect failing mid-start). The user escapes via
