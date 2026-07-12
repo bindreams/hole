@@ -405,17 +405,16 @@ pub trait Routing: Send + Sync {
     /// can disarm it (persist-without-disengage).
     type Cover: Send + CoverGuard;
 
-    /// Engage a fail-closed cover: block all egress except loopback, `server_ip`,
-    /// and the DoH `resolver_ips`. Returns an RAII guard whose Drop disengages it.
-    /// The cover survives a process crash (Windows: persistent WFP filters keyed
-    /// by fixed GUID; macOS: pf enable token persisted to `bridge-failclosed.json`)
-    /// and is swept by [`recover_routes`] on the next start. Does NOT permit the
-    /// TUN interface — its production caller is the #553 block-until-connected
-    /// connect gate, which holds it only until the tunnel comes up. The resolver
-    /// permits let the connect's DoH bootstrap (and a stay-blocked retry's
-    /// re-resolve) reach the configured resolvers while the cover holds.
-    fn install_failclosed_cover(&self, server_ip: IpAddr, resolver_ips: &[IpAddr])
-        -> Result<Self::Cover, RoutingError>;
+    /// Engage a fail-closed cover: block all egress except loopback and
+    /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
+    /// survives a process crash (Windows: persistent WFP filters keyed by fixed
+    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
+    /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
+    /// interface — the block-until-connected connect gate holds it only until the
+    /// tunnel comes up. It permits the resolved `server_ip`, not the DoH resolvers:
+    /// a stay-blocked retry reuses the already-resolved IP rather than re-resolving
+    /// under the cover.
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError>;
 
     /// Engage the STANDING lockdown cover for this connected session: permit
     /// loopback + the `tun_name` interface + the onward server connection (and,
@@ -502,12 +501,8 @@ impl Routing for SystemRouting {
         get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
     }
 
-    fn install_failclosed_cover(
-        &self,
-        server_ip: IpAddr,
-        resolver_ips: &[IpAddr],
-    ) -> Result<Self::Cover, RoutingError> {
-        failclosed::engage(server_ip, resolver_ips, &self.state_dir, self.owner)
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError> {
+        failclosed::engage(server_ip, &self.state_dir, self.owner)
     }
 
     fn install_lockdown(

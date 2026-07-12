@@ -46,11 +46,6 @@ const TUN: skuld::Label;
 const PERMITTED: &str = "1.1.1.1:443";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
-// A third routable host engaged as a DoH resolver IP, so the transient
-// block-until-connected cover's resolver permit is proven distinct from the
-// server permit.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-const RESOLVER: &str = "9.9.9.9:443";
 
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover with
 /// `server_ip = 1.1.1.1` and proves it is SELECTIVE: egress to the permitted
@@ -212,50 +207,42 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     );
 }
 
-/// Windows real-engage verification for the transient block-until-connected cover
-/// (#553). Engages the REAL WFP transient cover with `server_ip = 1.1.1.1` and a
-/// resolver permit for `9.9.9.9`, and proves it is SELECTIVE: egress to the
-/// permitted server IP AND the resolver IP stay Ok (each permit beats block-all —
-/// catches the block-everything arbitration bug AND proves the resolver permit is
-/// wired) while a non-permitted host is blocked (no leak). Drop restores egress.
+/// Windows real-engage verification for the transient block-until-connected
+/// cover. Engages the REAL WFP transient cover with `server_ip = 1.1.1.1` and
+/// proves it is SELECTIVE: egress to the permitted server IP stays Ok (the permit
+/// beats block-all — catches the block-everything arbitration bug) while a
+/// non-permitted host is blocked (no leak). Drop restores egress.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn windows_failclosed_permits_server_and_resolver_blocks_other_egress() {
+fn windows_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
 
     // External-event probe with a graceful failure bound: the timeout is the
     // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    // Baseline (PRE-cover): all three hosts reachable — self-validates the probe so
-    // a network blip is never a false pass.
-    let (bp, br, bn) = (connect(PERMITTED), connect(RESOLVER), connect(NON_PERMITTED));
+    // Baseline (PRE-cover): both hosts reachable — self-validates the probe so a
+    // network blip is never a false pass.
+    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
     assert!(
-        bp.is_ok() && br.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all three hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {NON_PERMITTED}={:?}",
+        bp.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
         bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
         bn.err().map(|e| e.kind()),
     );
 
-    let cover = engage(server_ip, &[resolver_ip], dir.path(), None).expect("engage real WFP transient cover");
+    let cover = engage(server_ip, dir.path(), None).expect("engage real WFP transient cover");
 
-    let (p, r, n) = (connect(PERMITTED), connect(RESOLVER), connect(NON_PERMITTED));
+    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
     assert!(
         p.is_ok(),
         "server-IP permit must beat block-all: {PERMITTED}={:?}",
         p.err().map(|e| e.kind())
-    );
-    assert!(
-        r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
     );
     assert!(
         n.is_err(),
@@ -270,58 +257,46 @@ fn windows_failclosed_permits_server_and_resolver_blocks_other_egress() {
     );
 }
 
-/// macOS real-engage verification for the transient block-until-connected cover
-/// (#553). Engages the REAL pf transient cover (`block out all` with `quick`
-/// permits for loopback, the server IP, and the resolver IP), proves (a) the live
-/// ruleset carries our block + resolver pass, (b) it is SELECTIVE, and (c) Drop
-/// restores `/etc/pf.conf`.
+/// macOS real-engage verification for the transient block-until-connected cover.
+/// Engages the REAL pf transient cover (`block out all` with `quick` permits for
+/// loopback and the server IP), proves (a) the live ruleset carries our block,
+/// (b) it is SELECTIVE, and (c) Drop restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn macos_failclosed_permits_server_and_resolver_blocks_other_egress() {
+fn macos_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
-    let (bp, br, bn) = (connect(PERMITTED), connect(RESOLVER), connect(NON_PERMITTED));
+    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
     assert!(
-        bp.is_ok() && br.is_ok() && bn.is_ok(),
-        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all three hosts; \
-         {PERMITTED}={:?} {RESOLVER}={:?} {NON_PERMITTED}={:?}",
+        bp.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
         bp.err().map(|e| e.kind()),
-        br.err().map(|e| e.kind()),
         bn.err().map(|e| e.kind()),
     );
 
-    let cover = engage(server_ip, &[resolver_ip], dir.path(), None).expect("engage real pf transient cover");
+    let cover = engage(server_ip, dir.path(), None).expect("engage real pf transient cover");
 
-    // (a) The live ruleset carries our block-all + the resolver pass.
+    // (a) The live ruleset carries our block-all.
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
         rules.contains("block") && rules.contains("all"),
         "ruleset must carry the block:\n{rules}"
     );
-    assert!(
-        rules.contains("9.9.9.9"),
-        "ruleset must carry the resolver pass:\n{rules}"
-    );
 
-    let (p, r, n) = (connect(PERMITTED), connect(RESOLVER), connect(NON_PERMITTED));
+    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
     assert!(
         p.is_ok(),
         "server-IP permit must beat block-all: {PERMITTED}={:?}",
         p.err().map(|e| e.kind())
-    );
-    assert!(
-        r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
     );
     assert!(
         n.is_err(),

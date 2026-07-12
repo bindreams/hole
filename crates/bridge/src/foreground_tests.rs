@@ -141,7 +141,7 @@ impl Routing for StubRouting {
             ipv6_available: false,
         })
     }
-    fn install_failclosed_cover(&self, _: IpAddr, _: &[IpAddr]) -> Result<StubCover, RoutingError> {
+    fn install_failclosed_cover(&self, _: IpAddr) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
     fn install_lockdown(&self, _: IpAddr, _: &str, _: &[PathBuf]) -> Result<StubCover, RoutingError> {

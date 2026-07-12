@@ -181,10 +181,9 @@ struct MockRoutingState {
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
-    /// Last `(server_ip, resolver_ips)` passed to `install_failclosed_cover`, so a
-    /// test can assert the manager sources the resolver permit set from
-    /// `config.dns.servers`.
-    last_cover_permit_set: std::sync::Mutex<Option<(IpAddr, Vec<IpAddr>)>>,
+    /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
+    /// the cover permits exactly the resolved server IP.
+    last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
 impl Default for MockRoutingState {
@@ -202,7 +201,7 @@ impl Default for MockRoutingState {
             fail_cover: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
-            last_cover_permit_set: std::sync::Mutex::new(None),
+            last_cover_server_ip: std::sync::Mutex::new(None),
         }
     }
 }
@@ -302,11 +301,11 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(&self, server_ip: IpAddr, resolver_ips: &[IpAddr]) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<MockCover, RoutingError> {
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
         }
-        *self.state.last_cover_permit_set.lock().unwrap() = Some((server_ip, resolver_ips.to_vec()));
+        *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -969,9 +968,7 @@ fn mock_cover_engage_disengage_never_spawns() {
     let routing = MockRouting::new(dir.path().to_path_buf());
     let st = routing.state();
     for _ in 0..10 {
-        let cover = routing
-            .install_failclosed_cover("1.2.3.4".parse().unwrap(), &[])
-            .unwrap();
+        let cover = routing.install_failclosed_cover("1.2.3.4".parse().unwrap()).unwrap();
         drop(cover);
     }
 
@@ -2590,6 +2587,45 @@ mod self_test {
     }
 
     #[skuld::test]
+    fn cutover_while_blocked_disarms_the_transient_cover_user_stop_disengages() {
+        rt().block_on(async {
+            // A covered start that failed holds the transient cover (host blocked).
+            // A cutover must DISARM it — persist the fail-closed filters across the
+            // restart gap — never disengage; a user Disconnect disengages (opens the
+            // host). Mirrors stop_with_cutover_disarms_lockdown for the standing cover.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert!(pm.blocked_until_connected());
+            pm.stop_with(StopReason::Cutover).await.unwrap();
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "cutover disarms the held cover (filters persist across the restart), never disengages"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "the manager releases the cover either way — the disarm keeps only the OS filters"
+            );
+
+            // User-stop branch, fresh manager: a Disconnect disengages (opens host).
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            pm.stop_with(StopReason::UserStop).await.unwrap();
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "a user Disconnect disengages the held cover"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
     fn uncovered_start_never_engages_cover() {
         rt().block_on(async {
             let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
@@ -2798,34 +2834,94 @@ mod self_test {
     }
 
     #[skuld::test]
-    fn covered_start_cover_permits_server_and_config_resolvers() {
+    fn covered_start_cover_permits_the_resolved_server_ip() {
         rt().block_on(async {
-            // The cover's permit set must be exactly the start-phase egress targets
-            // the manager sources from config: the resolved server IP (plugin +
-            // self-test onward connect) and every `config.dns.servers` entry (the
-            // DoH / ECH bootstrap). A regression passing the wrong slice would
-            // silently block the DoH re-resolve on every covered retry.
-            let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
-            let resolvers = vec!["9.9.9.9".parse().unwrap(), "1.0.0.1".parse().unwrap()];
-            cfg.dns.servers = resolvers.clone();
+            // The cover must permit exactly the resolved server IP — the onward
+            // connect target (plugin + self-test). A regression passing the wrong
+            // value would block the very connection the block-until-connected gate
+            // is waiting to succeed.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
             let _ = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            let (server_ip, permitted_resolvers) = st
-                .last_cover_permit_set
+            let permitted = st
+                .last_cover_server_ip
                 .lock()
                 .unwrap()
-                .clone()
                 .expect("the covered start engaged the cover");
             assert_eq!(
-                server_ip,
-                "127.0.0.1".parse::<IpAddr>().unwrap(),
-                "the DoH-resolved server IP is permitted"
+                permitted,
+                cfg.server.server.parse::<IpAddr>().unwrap(),
+                "the cover permits exactly the resolved server IP"
             );
+        });
+    }
+
+    /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
+    /// retry reuses the resolved IP instead of re-querying under the held cover.
+    struct CountingQuerier {
+        host: String,
+        ip: IpAddr,
+        queries: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for CountingQuerier {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let IpAddr::V4(v4) = self.ip else { return None };
+            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+            reply.to_vec().ok()
+        }
+    }
+
+    #[skuld::test]
+    fn covered_retry_reuses_the_resolved_ip_without_re_querying_doh() {
+        rt().block_on(async {
+            // A covered start resolves the server hostname via DoH (uncovered),
+            // engages the cover, and fails (host blocked). The cover permits the
+            // resolved IP, NOT the DoH resolvers, so a retry MUST reuse the cached
+            // IP — re-querying DoH under the held cover would be blocked and wedge
+            // the retry. We observe reuse via the DoH querier's call count.
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: "203.0.113.9".parse().unwrap(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let after_first = querier.queries.load(Ordering::SeqCst);
+            assert!(after_first >= 1, "the first covered start resolves via DoH");
+            assert!(pm.blocked_until_connected(), "the failed covered start holds the cover");
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
             assert_eq!(
-                permitted_resolvers, resolvers,
-                "the cover permits exactly the config's DoH resolvers (the start-phase bootstrap egress)"
+                querier.queries.load(Ordering::SeqCst),
+                after_first,
+                "the covered retry reuses the resolved IP and does NOT re-query DoH under the cover"
             );
         });
     }

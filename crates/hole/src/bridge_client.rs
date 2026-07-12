@@ -143,7 +143,11 @@ impl BridgeClient {
                 covered,
             } => {
                 let body = serde_json::to_vec(&config).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                let resp = self.http_post(ROUTE_START, body, Some(&attempt_id), covered).await?;
+                let mut headers: Vec<(&str, &str)> = vec![("x-hole-attempt-id", attempt_id.as_str())];
+                if covered {
+                    headers.push(("x-hole-covered", "true"));
+                }
+                let resp = self.http_post(ROUTE_START, body, &headers).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else if resp.status() == http::StatusCode::CONFLICT {
@@ -158,7 +162,7 @@ impl BridgeClient {
                 }
             }
             BridgeRequest::Stop => {
-                let resp = self.http_post(ROUTE_STOP, Vec::new(), None, false).await?;
+                let resp = self.http_post(ROUTE_STOP, Vec::new(), &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -167,7 +171,7 @@ impl BridgeClient {
             }
             BridgeRequest::Cancel { attempt_id } => {
                 let resp = self
-                    .http_post(ROUTE_CANCEL, Vec::new(), Some(&attempt_id), false)
+                    .http_post(ROUTE_CANCEL, Vec::new(), &[("x-hole-attempt-id", attempt_id.as_str())])
                     .await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
@@ -177,7 +181,7 @@ impl BridgeClient {
             }
             BridgeRequest::Reload { config } => {
                 let body = serde_json::to_vec(&config).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                let resp = self.http_post(ROUTE_RELOAD, body, None, false).await?;
+                let resp = self.http_post(ROUTE_RELOAD, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -222,7 +226,7 @@ impl BridgeClient {
             BridgeRequest::TestServer { entry, dns } => {
                 let req_body = TestServerRequest { entry, dns };
                 let body = serde_json::to_vec(&req_body).map_err(|e| ClientError::Protocol(e.to_string()))?;
-                let resp = self.http_post(ROUTE_TEST_SERVER, body, None, false).await?;
+                let resp = self.http_post(ROUTE_TEST_SERVER, body, &[]).await?;
                 if resp.status().is_success() {
                     let body = read_body(resp).await?;
                     let parsed: TestServerResponse =
@@ -237,7 +241,7 @@ impl BridgeClient {
             BridgeRequest::SetLockdown { enabled } => {
                 let body = serde_json::to_vec(&LockdownRequest { enabled })
                     .map_err(|e| ClientError::Protocol(e.to_string()))?;
-                let resp = self.http_post(ROUTE_LOCKDOWN, body, None, false).await?;
+                let resp = self.http_post(ROUTE_LOCKDOWN, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -263,7 +267,7 @@ impl BridgeClient {
                     app_dest,
                 })
                 .map_err(|e| ClientError::Protocol(e.to_string()))?;
-                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, None, false).await?;
+                let resp = self.http_post(ROUTE_UPDATE_APPLY, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
                 } else {
@@ -281,18 +285,17 @@ impl BridgeClient {
         Ok(resp)
     }
 
-    /// POST counterpart to [`http_get`](Self::http_get). `attempt_id`, when
-    /// present, is sent as the `X-Hole-Attempt-Id` header (Start/Cancel only).
-    /// `covered` sends the `X-Hole-Covered` header (Start only) so the bridge
-    /// engages a stay-blocked cover for an auto-connect intent.
+    /// POST counterpart to [`http_get`](Self::http_get). `headers` are attached
+    /// verbatim; the transport is otherwise header-agnostic — each `send` arm
+    /// supplies the per-request headers it needs (Start/Cancel the
+    /// `X-Hole-Attempt-Id`, an auto-connect Start the `X-Hole-Covered`).
     async fn http_post(
         &mut self,
         path: &str,
         body: Vec<u8>,
-        attempt_id: Option<&str>,
-        covered: bool,
+        headers: &[(&str, &str)],
     ) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
-        let resp = self.http_post_unchecked(path, body, attempt_id, covered).await?;
+        let resp = self.http_post_unchecked(path, body, headers).await?;
         self.check_version(&resp)?;
         Ok(resp)
     }
@@ -319,19 +322,15 @@ impl BridgeClient {
         &mut self,
         path: &str,
         body: Vec<u8>,
-        attempt_id: Option<&str>,
-        covered: bool,
+        headers: &[(&str, &str)],
     ) -> Result<http::Response<hyper::body::Incoming>, ClientError> {
         let mut builder = http::Request::builder()
             .method("POST")
             .uri(path)
             .header("host", "localhost")
             .header("content-type", "application/json");
-        if let Some(id) = attempt_id {
-            builder = builder.header("x-hole-attempt-id", id);
-        }
-        if covered {
-            builder = builder.header("x-hole-covered", "true");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let req = builder
             .body(Full::new(Bytes::from(body)))
