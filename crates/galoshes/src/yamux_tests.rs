@@ -15,8 +15,9 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client, run_server, ClientBoundAddrs,
-    FrameAccumulator, StreamTag, DEFAULT_UDP_TIMEOUT,
+    connect_delay, connect_retrying, deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client,
+    run_server, ClientBoundAddrs, FrameAccumulator, StreamTag, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
+    REMOTE_BACKOFF_MAX,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -407,5 +408,88 @@ async fn tcp_full_response_survives_client_half_close() {
     app.read_to_end(&mut got).await.expect("read response to EOF");
     assert_eq!(got, RESPONSE, "the full response must survive a client half-close");
 
+    shutdown.cancel();
+}
+
+// Connect-cadence policy (#550) ---------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn connect_delay_is_tight_and_constant_for_a_loopback_peer() {
+    // A loopback peer is a co-located hop that comes up within startup; every
+    // attempt polls on the same tight cadence, so nothing is stalled behind a
+    // grown backoff once it binds.
+    for addr in ["127.0.0.1:9000", "[::1]:9000"] {
+        let remote: SocketAddr = addr.parse().unwrap();
+        for attempt in [0u32, 1, 5, 20, 1000] {
+            assert_eq!(
+                connect_delay(remote, attempt),
+                LOOPBACK_CONNECT_RETRY,
+                "{addr} @ {attempt}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn connect_delay_backs_off_exponentially_for_a_routable_remote() {
+    // Golden literals, independent of the impl's formula: 100 ms doubling,
+    // capped at 30 s.
+    let remote: SocketAddr = "203.0.113.7:443".parse().unwrap();
+    let expected_ms = [
+        100u64, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 30000, 30000, 30000,
+    ];
+    for (attempt, ms) in expected_ms.iter().enumerate() {
+        assert_eq!(
+            connect_delay(remote, attempt as u32),
+            Duration::from_millis(*ms),
+            "@ {attempt}"
+        );
+    }
+    // Saturates at the cap for huge attempt counts (no overflow panic).
+    assert_eq!(connect_delay(remote, u32::MAX), REMOTE_BACKOFF_MAX);
+}
+
+#[skuld::test]
+async fn connect_retrying_returns_the_stream_when_the_peer_is_up() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    assert!(connect_retrying(addr, &shutdown).await.is_some());
+}
+
+#[skuld::test]
+async fn connect_retrying_returns_none_when_shutdown_fires() {
+    // Bound-but-not-listening: connects are refused (so the loop is in its
+    // retry path) and the port can't be stolen by a parallel test. A
+    // pre-cancelled token makes the loop take its shutdown branch — no clock.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = sock.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    assert!(connect_retrying(addr, &shutdown).await.is_none());
+}
+
+#[skuld::test]
+async fn connect_retrying_retries_until_the_peer_listens() {
+    // Reserve the port bound-but-not-listening so early connects refuse (and
+    // no parallel test can steal it), then `listen` to bring the peer up. The
+    // client must retry across the gap and connect — a real event rendezvous
+    // (await the task), never a timed guess.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = sock.local_addr().unwrap();
+
+    let shutdown = CancellationToken::new();
+    let token = shutdown.clone();
+    let handle = tokio::spawn(async move { connect_retrying(addr, &token).await });
+
+    tokio::task::yield_now().await; // bias the first attempt to fail before listen
+    let _listener = sock.listen(1024).unwrap();
+
+    assert!(
+        handle.await.unwrap().is_some(),
+        "must connect once the peer starts listening"
+    );
     shutdown.cancel();
 }

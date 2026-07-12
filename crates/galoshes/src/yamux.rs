@@ -337,20 +337,59 @@ async fn relay_udp_server(mut yamux_stream: yamux::Stream, remote: SocketAddr) -
 
 // Client mode =========================================================================================================
 
-async fn connect_with_backoff(addr: SocketAddr, shutdown: &CancellationToken) -> Option<TcpStream> {
-    let mut delay = Duration::from_millis(100);
-    let max_delay = Duration::from_secs(30);
+/// Retry cadence for a **loopback** peer — a hop on the same host (e.g.
+/// ex-ray's local listener). A loopback connect is cheap and its peer comes up
+/// within startup, so poll on a fixed tight cadence: backoff exists to spare a
+/// *network*, and there is none here. Small enough that the first stream isn't
+/// stalled once the peer binds, large enough not to busy-spin on the immediate
+/// `ECONNREFUSED` a loopback returns.
+pub(crate) const LOOPBACK_CONNECT_RETRY: Duration = Duration::from_millis(10);
 
+/// Exponential-backoff bounds for a **routable** peer that may be genuinely
+/// down for a while, so repeated attempts don't hammer the network.
+pub(crate) const REMOTE_BACKOFF_BASE: Duration = Duration::from_millis(100);
+pub(crate) const REMOTE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Delay before connect attempt `attempt` to `remote`: loopback peers poll on
+/// a fixed tight cadence; routable peers back off exponentially, capped.
+pub(crate) fn connect_delay(remote: SocketAddr, attempt: u32) -> Duration {
+    if remote.ip().is_loopback() {
+        LOOPBACK_CONNECT_RETRY
+    } else {
+        REMOTE_BACKOFF_BASE
+            .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
+            .min(REMOTE_BACKOFF_MAX)
+    }
+}
+
+/// Connect to `addr`, retrying until it succeeds or `shutdown` fires. Retries
+/// are unbounded by design — the peer (a chain sibling or a real server) is
+/// expected to come up. While it is down, work sent to the client's local
+/// listener waits in the OS accept backlog / UDP recv buffer (bounded by the
+/// retry cadence) until the connection is established; nothing is dropped here.
+pub(crate) async fn connect_retrying(addr: SocketAddr, shutdown: &CancellationToken) -> Option<TcpStream> {
+    let mut attempt: u32 = 0;
     loop {
         match TcpStream::connect(addr).await {
             Ok(stream) => return Some(stream),
             Err(e) => {
-                tracing::warn!(error = %e, delay_ms = delay.as_millis(), "connection failed, retrying");
+                let delay = connect_delay(addr, attempt);
+                match (addr.ip().is_loopback(), attempt) {
+                    // A loopback sibling a beat late is normal startup: log once,
+                    // then stay quiet at the tight cadence (no log storm).
+                    (true, 0) => tracing::debug!(%addr, error = %e, "peer not up yet, retrying"),
+                    (true, _) => {}
+                    // A routable peer may be genuinely down: warn each attempt
+                    // (the backoff throttles this to at most ~one line per 30 s).
+                    (false, _) => {
+                        tracing::warn!(%addr, error = %e, delay_ms = delay.as_millis(), "connection failed, retrying")
+                    }
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = shutdown.cancelled() => return None,
                 }
-                delay = (delay * 2).min(max_delay);
+                attempt = attempt.saturating_add(1);
             }
         }
     }
@@ -498,7 +537,7 @@ pub(crate) async fn run_client(
 
     loop {
         // Connect to the remote yamux server.
-        let tcp = match connect_with_backoff(remote, &shutdown).await {
+        let tcp = match connect_retrying(remote, &shutdown).await {
             Some(s) => s,
             None => return Ok(()), // shutdown requested
         };
