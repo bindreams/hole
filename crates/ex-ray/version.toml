@@ -2,4 +2,4 @@
 # rather than in a Cargo.toml because the crate has no Rust manifest. It is
 # a NEW product and does NOT inherit the retired v2ray-plugin group's
 # version lineage — it starts fresh at 0.1.0. Plain strict semver only.
-version = "0.1.0"
+version = "0.2.0"
