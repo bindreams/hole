@@ -388,9 +388,9 @@ async fn post_start(
     client.send(req).await
 }
 
-/// `post_start` that carries the `X-Hole-Covered: true` header — the wire flag
-/// that tells the bridge this is an auto-connect and the fail-closed cover must
-/// stay engaged while the attempt is in flight (#553).
+/// `post_start` that carries `X-Hole-Covered: true`, signalling an auto-connect
+/// so the bridge engages a fail-closed cover that stays blocked while the attempt
+/// is in flight.
 async fn post_start_covered(
     client: &mut TestClient,
     config: &ProxyConfig,
@@ -1071,7 +1071,7 @@ fn start_failure_returns_error() {
 
 #[skuld::test]
 fn covered_header_retains_cover_after_failed_start() {
-    // The bridge-side half of the #553 wire seam: a failed Start carrying
+    // Wire-seam test: a failed Start carrying
     // `X-Hole-Covered: true` must leave the host fail-closed (status reports
     // blocked_until_connected=true), while the same failure WITHOUT the header
     // must not (a manual start falls open). If handle_start stopped reading the

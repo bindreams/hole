@@ -326,7 +326,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 ) -> Result<Json<EmptyResponse>, StartHandlerError> {
     let attempt_id = attempt_id_from(&headers);
     // The `X-Hole-Covered` header marks an auto-connect intent, so the bridge
-    // engages a fail-closed cover that stays blocked on failure (#553).
+    // engages a fail-closed cover that stays blocked on failure.
     let covered = headers
         .get("x-hole-covered")
         .and_then(|v| v.to_str().ok())

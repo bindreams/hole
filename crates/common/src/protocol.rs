@@ -41,12 +41,11 @@ pub enum BridgeRequest {
         /// client-side-only header, so it survives the elevation
         /// re-serialization path (`encode_request` / `write_request_file`).
         attempt_id: String,
-        /// Whether this start represents an intent to be connected (the #458
-        /// auto-connect latch / post-update reconnect), so the bridge engages a
-        /// fail-closed cover that stays blocked on failure. Sent on the wire as
-        /// the `X-Hole-Covered` header (like `attempt_id`); a struct field so it
-        /// survives the elevation re-serialization path. serde-default false so a
-        /// manual connect and older payloads keep today's fail-open behavior.
+        /// Whether this start represents an auto-connect intent, so the bridge
+        /// engages a fail-closed cover that stays blocked on failure. Sent on the
+        /// wire as the `X-Hole-Covered` header (like `attempt_id`); a struct field
+        /// so it survives the elevation re-serialization path. serde-default false
+        /// so a manual connect and older payloads keep today's fail-open behavior.
         #[serde(default)]
         covered: bool,
     },

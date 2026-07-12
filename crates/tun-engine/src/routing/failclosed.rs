@@ -1,8 +1,7 @@
 //! Fail-closed network cover: block all egress except loopback and the SS server
-//! IP, as an RAII guard. The block-until-connected connect gate holds it across a
-//! covered auto-connect start so a failed connect leaves the host blocked, not
-//! leaked. OS specifics live in the platform submodules; this facade is
-//! `#[cfg]`-free for callers.
+//! IP, as an RAII guard held across a connect attempt so a failed connect leaves
+//! the host blocked, not leaked. OS specifics live in the platform submodules;
+//! this facade is `#[cfg]`-free for callers.
 
 use std::net::IpAddr;
 use std::path::Path;

@@ -2528,7 +2528,7 @@ mod self_test {
         });
     }
 
-    // Block-until-connected cover (#553) ==============================================================================
+    // Block-until-connected cover =====================================================================================
     //
     // A covered start (auto-connect intent) engages the fail-closed cover BEFORE
     // start_inner and, on failure, RETAINS it (host stays blocked). The gate

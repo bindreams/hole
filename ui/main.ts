@@ -295,9 +295,9 @@ function setupEventListeners(): Promise<unknown> {
     seq: number;
     running: boolean;
     error: string | null;
-    // The backend also serializes lockdown/blocked fields; this listener uses
-    // only running/error. The blocked state is surfaced in the tray; a distinct
-    // dashboard blocked state is tracked in bindreams/hole#625.
+    // The backend also serializes lockdown/blocked fields; this listener uses only
+    // running/error. The blocked state is surfaced in the tray; the dashboard
+    // blocked state is deferred (#625).
     lockdown_enabled?: boolean;
     lockdown_active?: boolean;
     blocked_until_connected?: boolean;

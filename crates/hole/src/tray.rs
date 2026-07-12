@@ -276,10 +276,9 @@ fn lockdown_menu_label(enabled: bool, active: bool) -> String {
 
 /// The status line + primary action a tray menu should render, from the observed
 /// state. Pure so `tray_tests` cover the blocked-state UX without Tauri. `blocked`
-/// (a covered start failed → host fail-closed while not running) is a distinct
-/// state — never silent Disconnected — offering Retry (covered re-connect) plus a
-/// Go-Offline that releases the cover. It applies only when not running and not
-/// mid-transition (a live transition or a running proxy takes precedence).
+/// (a covered start failed → host fail-closed while not running) applies only when
+/// not running and not mid-transition (a live transition or a running proxy takes
+/// precedence).
 struct TrayActions {
     status: &'static str,
     action_id: &'static str,
@@ -606,16 +605,13 @@ pub(crate) enum Prompts {
 /// so a later reconciler tick can't override the user's explicit choice.
 pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String) -> Result<ToggleOutcome, String> {
     app.state::<AppState>().take_pending_startup_connect();
-    // A manual connect is fail-open (covered=false): the user clicked Connect and
-    // is not yet protected; only the auto-connect intent stays blocked on failure.
+    // Manual connect is fail-open (covered=false): the user consents to the open window.
     set_proxy_enabled_inner(app, enable, false, Prompts::Allowed, attempt_id).await
 }
 
-/// The sole non-interactive connect entry — startup auto-connect (#458).
-/// Connect-only by construction (no `enable` param), so silent-disconnect is
-/// unrepresentable; the shared #462 commit tail stays single-sourced. This is
-/// the block-until-connected intent, so it starts covered (stays blocked on
-/// failure).
+/// The sole non-interactive connect entry — startup auto-connect. Connect-only by
+/// construction (no `enable` param), so silent-disconnect is unrepresentable; the
+/// shared commit tail stays single-sourced.
 async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
     set_proxy_enabled_inner(app, true, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
