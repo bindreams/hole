@@ -22,13 +22,15 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - name: Checkout codebase
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -50,9 +52,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
-        if: runner.os == 'Linux'
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: runner.os == 'Linux' && env.CODECOV_TOKEN != ''
         with:
           slug: ${{ github.repository }}
           verbose: true

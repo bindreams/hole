@@ -32,6 +32,55 @@ fn post_bind_sweep_clears_marker() {
 }
 
 #[skuld::test]
+fn sweep_marker_then_ready_sweeps_before_reporting() {
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    let marker_gone_when_reported = std::cell::Cell::new(false);
+    super::sweep_marker_then_ready(dir.path(), || {
+        marker_gone_when_reported.set(hole_common::update_marker::read(dir.path()).is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        marker_gone_when_reported.get(),
+        "the marker must be swept before Running is reported"
+    );
+}
+
+#[skuld::test]
+fn sweep_marker_then_ready_errs_when_marker_survives_sweep() {
+    // An external holder can leave the marker present after the sweep attempt.
+    // Inject a no-op sweep so the marker survives: the helper must return Err and
+    // NEVER report Running (which would false-fail a healthy update).
+    let dir = tempfile::tempdir().unwrap();
+    hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
+    let reported = std::cell::Cell::new(false);
+    let out = super::sweep_marker_then_ready_with(
+        || {}, // no-op sweep: the marker is NOT removed
+        dir.path(),
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    );
+    assert!(out.is_err(), "a surviving marker must fail the start");
+    assert!(!reported.get(), "Running must never be reported with a stale marker");
+}
+
+#[skuld::test]
+fn restart_failure_actions_configures_restart_on_failure() {
+    use windows_service::service::{ServiceActionType, ServiceFailureResetPeriod};
+    let fa = super::restart_failure_actions();
+    assert!(fa
+        .actions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|a| a.action_type == ServiceActionType::Restart));
+    assert!(matches!(fa.reset_period, ServiceFailureResetPeriod::After(d) if !d.is_zero()));
+}
+
+#[skuld::test]
 fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
     let dir = tempfile::tempdir().unwrap();
     let old1 = dir.path().join("hole.exe.old-0.0.0");

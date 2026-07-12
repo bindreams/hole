@@ -61,8 +61,9 @@ fn post_bind_sweep_clears_marker() {
         version: hole_common::update_marker::MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 1,
+        driver_pid: 1,
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     };
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &marker, None).unwrap();

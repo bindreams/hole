@@ -4,10 +4,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo,
-    ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+    ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
+    ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -75,22 +76,28 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    // Report running
+    // Report StartPending, NOT Running: the cutover child exits on the SCM
+    // `Running` edge, so `Running` is deferred until after the socket binds AND
+    // the marker is swept (`sweep_marker_then_ready`) — so a healthy update never
+    // presents "marker present + dead driver". No controls accepted while starting.
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
-        wait_hint: Duration::ZERO,
+        wait_hint: Duration::from_secs(30),
         process_id: None,
     })?;
 
-    info!("Windows service started");
+    info!("Windows service starting");
 
     // Build and run the tokio runtime
     let rt = tokio::runtime::Runtime::new()?;
-    let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async {
+    // `ServiceStatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
+    // deferred `Running` report inside the async block.
+    let status_handle_ready = status_handle;
+    let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
         let state_dir = STATE_DIR_OVERRIDE
             .get()
             .cloned()
@@ -125,6 +132,21 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             state_dir.clone(),
             None,
         )?;
+        // Socket is bound: sweep the marker, then report Running (see sweep_marker_then_ready).
+        sweep_marker_then_ready(&log_dir, || {
+            status_handle_ready
+                .set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Running,
+                    controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::ZERO,
+                    process_id: None,
+                })
+                .map_err(std::io::Error::other)
+        })?;
+        info!("Windows service started");
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =
@@ -150,12 +172,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let log_dir_sweep = log_dir.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || tombstone::sweep(&log_dir_sweep)).await {
             tracing::warn!(error = %e, "crash sweep task panicked");
-        }
-        // The new bridge is authoritative once it has bound: any update marker is
-        // a completed cutover, so clear it unconditionally (remove-by-path).
-        let log_dir_marker = log_dir.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || sweep_marker(&log_dir_marker)).await {
-            tracing::warn!(error = %e, "marker sweep task panicked");
         }
         // Sweep `hole.exe.old-*` left by a prior cutover swap's best-effort delete
         // (it fails while an old process still maps the renamed inode).
@@ -246,6 +262,39 @@ pub(crate) fn sweep_marker(log_dir: &Path) {
     }
 }
 
+/// Sweep the completed cutover's marker, verify it is gone, THEN report `Running`
+/// so the cutover child (which exits on the `Running` edge) exits only after the
+/// marker is gone. A healthy update therefore never presents "marker present plus
+/// driver dead" — before this the child is alive (Mask), after it the marker is
+/// already swept (PassThrough).
+///
+/// The `read().is_some()` re-check guards the reachable case of an external
+/// process holding the marker open without `FILE_SHARE_DELETE`: reporting
+/// `Running` with a stale marker would false-fail the healthy update, so the start
+/// fails instead (SCM restarts and retries the sweep).
+fn sweep_marker_then_ready<R: FnOnce() -> std::io::Result<()>>(
+    log_dir: &Path,
+    report_running: R,
+) -> std::io::Result<()> {
+    sweep_marker_then_ready_with(|| sweep_marker(log_dir), log_dir, report_running)
+}
+
+/// [`sweep_marker_then_ready`] with the sweep injected so the marker-survives-sweep
+/// branch is unit-testable (a no-op sweep leaves the marker present).
+fn sweep_marker_then_ready_with<S: FnOnce(), R: FnOnce() -> std::io::Result<()>>(
+    sweep: S,
+    log_dir: &Path,
+    report_running: R,
+) -> std::io::Result<()> {
+    sweep();
+    if hole_common::update_marker::read(log_dir).is_some() {
+        return Err(std::io::Error::other(
+            "cutover marker still present after sweep; refusing to report Running",
+        ));
+    }
+    report_running()
+}
+
 /// Prefix of a rename-away leftover from a cutover swap (`<file>.old-<ver>`); see
 /// `cutover::os::windows::old_name`.
 const OLD_BINARY_PREFIX: &str = "hole.exe.old-";
@@ -313,7 +362,14 @@ fn service_state_dir() -> PathBuf {
 ///
 /// The service is registered to run
 /// `<binary_path> bridge run --service --log-dir <log> --state-dir <state>`
-/// with auto-start.
+/// with auto-start, then `apply_failure_actions` writes the restart-on-failure
+/// SCM config directly on the just-created handle — best-effort (warn-and-continue),
+/// since a SCM hiccup must not fail the install itself. This deliberately avoids
+/// `ensure_failure_actions` (which re-opens the service and propagates errors);
+/// that stricter re-open path is reserved for the cutover child's post-update
+/// refresh (see `cutover::run_detached`), which also brings an install base that
+/// predates this config up to date — so a bare `install()` is not the only path
+/// that provisions it.
 pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -351,8 +407,49 @@ pub fn install(binary_path: &Path) -> Result<(), windows_service::Error> {
     let service = manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
 
     service.set_description(SERVICE_DESCRIPTION)?;
+    // Auto-restart is hardening, applied on the just-created handle (no re-open,
+    // which can race SCM propagation right after create_service). Best-effort: the
+    // service is installed regardless — failing the whole install (an MSI custom
+    // action) over the restart config would be worse than shipping without it.
+    if let Err(e) = apply_failure_actions(&service) {
+        warn!(error = %e, "could not configure SCM restart-on-failure; service installed without auto-restart");
+    }
     info!("Windows service installed");
     Ok(())
+}
+
+/// Restart-on-failure SCM actions. Fires on a crash / non-zero exit, not a
+/// graceful `Stopped(0)`. `reset_period` is finite so a run of crashes keeps
+/// restarting (the counter resets after a day without a failure).
+fn restart_failure_actions() -> ServiceFailureActions {
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86_400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: std::time::Duration::from_secs(1),
+        }]),
+    }
+}
+
+/// Write the restart-on-failure SCM config to an open `HoleBridge` handle (needs
+/// `CHANGE_CONFIG`): the `Restart` action plus the non-crash-failures flag (so a
+/// graceful `Stopped(1)` from a failed bind is restarted too, while a clean
+/// `Stopped(0)` user/cutover stop is not).
+fn apply_failure_actions(service: &windows_service::service::Service) -> Result<(), windows_service::Error> {
+    service.update_failure_actions(restart_failure_actions())?;
+    service.set_failure_actions_on_non_crash_failures(true)
+}
+
+/// Open the installed `HoleBridge` service and apply the restart-on-failure
+/// config. Idempotent (a re-apply re-writes the same config). Called by the
+/// cutover child so an install base predating this config is brought up to date
+/// as part of the update itself.
+pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+    apply_failure_actions(&service)
 }
 
 /// Stop and uninstall the bridge Windows Service.
@@ -427,8 +524,9 @@ fn test_marker() -> hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
         from_version: "0.2.0".into(),
         to_version: "0.3.0".into(),
-        pid: 1,
+        driver_pid: 1,
         started_at_unix: 0,
+        driver_start_unix_ms: 0,
     }
 }
 

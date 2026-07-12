@@ -1,9 +1,9 @@
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
 # Vendored upstream code is kept pristine; no hook may lint, format, or rewrite
-# it. crates/ex-ray/third_party/v2ray-core is a git-subrepo of pristine v2fly
-# v5.51.2 (build truth via go.mod replace); see its third_party/VENDORING.md.
-exclude = '^crates/ex-ray/third_party/v2ray-core/'
+# it. crates/ex-ray/third_party/{v2ray-core,utls} are git-subrepos of pristine
+# upstream (build truth via go.mod replace); see their third_party/VENDORING.md.
+exclude = '^crates/ex-ray/third_party/(v2ray-core|utls)/'
 
 # Local hooks ==========================================================================================================
 

@@ -18,7 +18,7 @@ pub const MARKER_FILE: &str = "update-in-progress.json";
 /// Schema version. Bump on a breaking shape change; `read` returns None on an
 /// unknown version (load-None-on-mismatch), but `clear` is remove-by-path and
 /// ignores the schema entirely.
-pub const MARKER_VERSION: u32 = 1;
+pub const MARKER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,8 +26,14 @@ pub struct MarkerInfo {
     pub version: u32,
     pub from_version: String,
     pub to_version: String,
-    pub pid: u32,
+    /// PID of the cutover DRIVER — the process whose death means the cutover is
+    /// abandoned (the detached child on Windows; the inline actor on macOS).
+    pub driver_pid: u32,
+    /// Wall-clock Unix seconds when the cutover was claimed.
     pub started_at_unix: u64,
+    /// OS creation time of `driver_pid`, Unix ms. PID-reuse guard by exact
+    /// equality; a stored `0` is a failed-probe sentinel treated as unassessed.
+    pub driver_start_unix_ms: u64,
 }
 
 /// The SERVICE log directory (where the privileged bridge writes its logs and
@@ -133,6 +139,22 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Overwrite the marker's `driver_pid` + `driver_start_unix_ms` in place,
+/// preserving the rest. The Windows cutover initiator stamps the frozen child's
+/// identity here so the marker names the driver, not the initiator. An absent
+/// marker is a no-op (`Ok`).
+pub fn stamp_driver(log_dir: &Path, driver_pid: u32, driver_start_unix_ms: u64) -> io::Result<()> {
+    let Some(mut info) = read(log_dir) else {
+        // Unreachable in the normal sequence (the initiator wrote the marker
+        // before stamping); a warn surfaces the anomaly rather than swallowing it.
+        tracing::warn!(driver_pid, "stamp_driver: no marker present to stamp");
+        return Ok(());
+    };
+    info.driver_pid = driver_pid;
+    info.driver_start_unix_ms = driver_start_unix_ms;
+    write(log_dir, &info, None)
 }
 
 #[cfg(test)]

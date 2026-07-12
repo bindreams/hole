@@ -23,7 +23,11 @@ pub(crate) enum Command {
     /// Print version information
     Version,
     /// Check for updates and install the latest version
-    Upgrade,
+    Upgrade {
+        /// Assume "yes" to the update consent prompt (for non-interactive use).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Manage the privileged bridge service
     Bridge {
         #[command(subcommand)]
@@ -373,7 +377,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
             println!("hole {}", hole::version::VERSION);
             0
         }
-        Command::Upgrade => handle_upgrade(),
+        Command::Upgrade { yes } => handle_upgrade(yes),
         Command::Bridge { action } => handle_bridge(action),
         Command::Proxy { action } => handle_proxy(action),
         Command::Path { action } => handle_path(action),
@@ -382,7 +386,7 @@ pub(crate) fn dispatch(command: Command) -> ! {
     std::process::exit(code)
 }
 
-fn handle_upgrade() -> i32 {
+fn handle_upgrade(yes: bool) -> i32 {
     cli_log!(info, "checking for updates...");
     match hole::update::check_for_update() {
         Ok(Some(info)) => {
@@ -422,19 +426,74 @@ fn handle_upgrade() -> i32 {
                 return 1;
             }
 
+            // Read lockdown fresh at send time — not the cached snapshot.
+            use std::io::{IsTerminal, Write};
+            let status = send_bridge_request_inner(hole_common::protocol::BridgeRequest::Status);
+            let lockdown_enabled = match crate::state::classify_lockdown(&status) {
+                crate::state::LockdownRead::Known { enabled, .. } => enabled,
+                crate::state::LockdownRead::WrongReply => {
+                    cli_log!(
+                        warn,
+                        "consent gate: Status returned an unexpected reply ({status:?}); assuming lockdown off"
+                    );
+                    false
+                }
+                crate::state::LockdownRead::Unreadable => {
+                    cli_log!(
+                        warn,
+                        "consent gate: Status read failed ({status:?}); assuming lockdown off"
+                    );
+                    false
+                }
+            };
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let consent = match hole::update::cli_consent_decision(lockdown_enabled, yes, interactive) {
+                hole::update::CliConsent::Proceed { consent } => {
+                    if consent {
+                        cli_log!(info, "update consent granted");
+                    }
+                    consent
+                }
+                hole::update::CliConsent::Refuse => {
+                    eprintln!("error: {}", hole::update::CONSENT_CLI_REFUSAL);
+                    return 1;
+                }
+                hole::update::CliConsent::Prompt => {
+                    print!("{}", hole::update::CONSENT_CLI_PROMPT);
+                    if let Err(e) = std::io::stdout().flush() {
+                        cli_log!(error, "failed to display consent prompt: {e}");
+                        return 1;
+                    }
+                    let mut line = String::new();
+                    match std::io::stdin().read_line(&mut line) {
+                        Err(e) => {
+                            cli_log!(warn, "consent prompt read failed: {e}");
+                            return 1;
+                        }
+                        Ok(_) => {
+                            if hole::update::cli_answer_confirms(&line) {
+                                true
+                            } else {
+                                cli_log!(info, "update cancelled by user");
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            };
+
             cli_log!(info, "installing...");
-            // The privileged bridge owns the cutover (swap + service restart);
-            // the GUI only hands it the verified payload + manifest. `hole
-            // upgrade` is an explicit user action, so consent is implied.
-            let apply = hole_common::protocol::BridgeRequest::ApplyUpdate {
-                payload_path: dest.clone(),
-                target_version: info.version.to_string(),
-                consent: true,
+            // The privileged bridge owns the cutover (swap + service restart); the
+            // GUI only hands it the verified payload + manifest.
+            let apply = hole::update::build_apply_update(
+                dest.clone(),
+                info.version.to_string(),
                 sha256sums,
                 sha256sums_minisig,
-                asset_name: info.asset_name.clone(),
-                app_dest: hole::update::app_dest_hint(),
-            };
+                info.asset_name.clone(),
+                hole::update::app_dest_hint(),
+                consent,
+            );
             match send_bridge_request_inner(apply) {
                 Ok(hole_common::protocol::BridgeResponse::Ack) => {}
                 Ok(hole_common::protocol::BridgeResponse::Error { message }) => {
@@ -443,6 +502,13 @@ fn handle_upgrade() -> i32 {
                 }
                 Ok(other) => {
                     cli_log!(error, "unexpected response: {other:?}");
+                    return 1;
+                }
+                Err(crate::bridge_client::ClientError::ConsentRequired { message }) => {
+                    cli_log!(
+                        error,
+                        "lockdown changed during the update; re-run to confirm: {message}"
+                    );
                     return 1;
                 }
                 Err(e) => {

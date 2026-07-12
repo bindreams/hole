@@ -736,8 +736,9 @@ fn update_apply_with_existing_marker_is_409() {
                 version: hole_common::update_marker::MARKER_VERSION,
                 from_version: "0.2.0".into(),
                 to_version: "0.3.0".into(),
-                pid: 1,
+                driver_pid: 1,
                 started_at_unix: 0,
+                driver_start_unix_ms: 0,
             },
             None,
         )
@@ -2053,4 +2054,20 @@ fn socket_removed_on_drop() {
         drop(server);
         assert!(!path.exists(), "socket file should be removed after drop");
     });
+}
+
+#[skuld::test]
+fn build_cutover_marker_maps_driver_identity() {
+    let m = super::build_cutover_marker("0.2.0".into(), "0.3.0".into(), 4242, 1_700_000_000, 1_700_000_000_123);
+    assert_eq!(
+        (m.driver_pid, m.driver_start_unix_ms, m.version),
+        (4242, 1_700_000_000_123, hole_common::update_marker::MARKER_VERSION)
+    );
+    assert_eq!((m.from_version.as_str(), m.to_version.as_str()), ("0.2.0", "0.3.0"));
+}
+
+#[skuld::test]
+fn own_process_start_time_is_nonzero() {
+    // The fallback-to-0 poison sentinel must not be hit for a live self-probe.
+    assert_ne!(hole_common::process::process_start_time(std::process::id()), Some(0));
 }

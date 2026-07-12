@@ -4,6 +4,12 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	core "github.com/v2fly/v2ray-core/v5"
+	"github.com/v2fly/v2ray-core/v5/app/proxyman"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
+	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 func TestUint32OptInRange(t *testing.T) {
@@ -252,5 +258,99 @@ func TestBuildTLSConfigRequireEch(t *testing.T) {
 				t.Errorf("%s: RequireEch = %v, want %v", c.desc, tc.RequireEch, c.wantRequire)
 			}
 		})
+	}
+}
+
+// withModeServer saves and restores *mode and *server, which securitySettings
+// reads to decide whether to wrap the tls.Config in the uTLS engine.
+func withModeServer(t *testing.T, modeV string, serverV bool) func() {
+	t.Helper()
+	origMode, origServer := *mode, *server
+	*mode, *server = modeV, serverV
+	return func() { *mode, *server = origMode, origServer }
+}
+
+func TestSecuritySettingsClientWebsocketWrapsUTLS(t *testing.T) {
+	restore := withModeServer(t, "websocket", false)
+	defer restore()
+	sec := securitySettings(&tls.Config{ServerName: "example.com"})
+	uc, ok := sec.(*utls.Config)
+	if !ok {
+		t.Fatalf("client websocket must wrap in uTLS, got %T", sec)
+	}
+	if uc.Imitate != "chrome_auto" {
+		t.Errorf("Imitate = %q, want chrome_auto", uc.Imitate)
+	}
+	if uc.TlsConfig == nil || uc.TlsConfig.ServerName != "example.com" {
+		t.Errorf("inner tls.Config not preserved: %+v", uc.TlsConfig)
+	}
+}
+
+func TestSecuritySettingsServerKeepsPlainTLS(t *testing.T) {
+	restore := withModeServer(t, "websocket", true)
+	defer restore()
+	if _, ok := securitySettings(&tls.Config{ServerName: "example.com"}).(*tls.Config); !ok {
+		t.Fatal("server mode must keep the bare tls.Config")
+	}
+}
+
+func TestSecuritySettingsQuicKeepsPlainTLS(t *testing.T) {
+	restore := withModeServer(t, "quic", false)
+	defer restore()
+	if _, ok := securitySettings(&tls.Config{ServerName: "example.com"}).(*tls.Config); !ok {
+		t.Fatal("quic must keep the bare tls.Config (it hard-requires *tls.Config)")
+	}
+}
+
+func senderSecurity(t *testing.T, cfg *core.Config) *anypb.Any {
+	t.Helper()
+	sender := new(proxyman.SenderConfig)
+	if err := cfg.Outbound[0].SenderSettings.UnmarshalTo(sender); err != nil {
+		t.Fatalf("unmarshal sender settings: %v", err)
+	}
+	if sender.StreamSettings == nil || len(sender.StreamSettings.SecuritySettings) == 0 {
+		t.Fatal("no stream security settings on the outbound sender")
+	}
+	return sender.StreamSettings.SecuritySettings[0]
+}
+
+// generateConfig must actually route the client stream security through
+// securitySettings: a websocket client dial gets a uTLS config, quic keeps a bare
+// tls.Config. Testing securitySettings() alone stays green if the reroute is
+// reverted, so this asserts the wired output of generateConfig itself.
+func TestGenerateConfigWiresUTLSForWebsocketClient(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origMode, origTLS := *mode, *tlsEnabled
+	*mode, *tlsEnabled = "websocket", true
+	defer func() { *mode, *tlsEnabled = origMode, origTLS }()
+
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	uc := new(utls.Config)
+	if err := senderSecurity(t, cfg).UnmarshalTo(uc); err != nil {
+		t.Fatalf("client websocket security must be a uTLS config: %v", err)
+	}
+	if uc.Imitate != "chrome_auto" {
+		t.Errorf("Imitate = %q, want chrome_auto", uc.Imitate)
+	}
+}
+
+func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origMode, origTLS := *mode, *tlsEnabled
+	*mode, *tlsEnabled = "quic", true
+	defer func() { *mode, *tlsEnabled = origMode, origTLS }()
+
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	tc := new(tls.Config)
+	if err := senderSecurity(t, cfg).UnmarshalTo(tc); err != nil {
+		t.Fatalf("quic client security must stay a bare tls.Config: %v", err)
 	}
 }

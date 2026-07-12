@@ -5,6 +5,7 @@ pub mod import;
 pub mod logging;
 pub mod paths;
 pub mod plugin;
+pub mod process;
 pub mod protocol;
 pub mod update_marker;
 pub mod verify;

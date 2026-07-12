@@ -96,7 +96,7 @@ objc2-foundation = { version = "0.3", features = ["NSData"] }
 
 [dev-dependencies]
 skuld = { workspace = true }
-icns = "0.3"
+icns = "0.4"
 png = "0.18"
 hole-test-observability = { path = "../test-observability" }
 # Test-only: the #572 cross-uid ownership proof drives `util::ownership::chown_path`
@@ -119,5 +119,5 @@ xtask-lib = { path = "../../xtask-lib", features = ["version"] }
 resvg = "0.47"
 png = "0.18"
 ico = "0.5"
-icns = "0.3"
+icns = "0.4"
 serde_json = "1"
