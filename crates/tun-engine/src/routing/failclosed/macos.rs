@@ -34,7 +34,8 @@ use super::lockdown_pf_state as lockdown_state;
 ///
 /// `set block-policy drop` silently drops blocked packets (no RST/ICMP).
 /// `block out all` is the fail-closed default; the `quick` pass rules for
-/// loopback and the server IP win without depending on pf's last-match rule.
+/// loopback and the server IP win without depending on pf's last-match rule. The
+/// `to {ip}` form carries a v6 address as written.
 pub fn build_pf_ruleset(server_ip: IpAddr) -> String {
     format!(
         "set block-policy drop\n\

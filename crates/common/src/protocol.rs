@@ -41,6 +41,13 @@ pub enum BridgeRequest {
         /// client-side-only header, so it survives the elevation
         /// re-serialization path (`encode_request` / `write_request_file`).
         attempt_id: String,
+        /// Whether this start represents an auto-connect intent, so the bridge
+        /// engages a fail-closed cover that stays blocked on failure. Sent on the
+        /// wire as the `X-Hole-Covered` header (like `attempt_id`); a struct field
+        /// so it survives the elevation re-serialization path. serde-default false
+        /// so a manual connect and older payloads keep today's fail-open behavior.
+        #[serde(default)]
+        covered: bool,
     },
     Stop,
     /// Cancel the in-flight `Start` whose `attempt_id` matches, or pre-arm a
@@ -132,6 +139,10 @@ pub enum BridgeResponse {
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
         lockdown_active: bool,
+        /// Whether a covered start failed and left the host fail-closed (blocked,
+        /// not leaked) while not running. Drives the GUI's distinct blocked state
+        /// (Retry / Disconnect).
+        blocked_until_connected: bool,
     },
     Error {
         message: String,

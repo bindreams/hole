@@ -198,6 +198,14 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     routing: R,
     dns: D,
     running: Option<RunningState<P, R, D>>,
+    /// The single transient fail-closed cover, held when a covered (auto-connect)
+    /// start failed: the host stays blocked, not leaked, while `running` is `None`.
+    /// The live guard is held here (its `Drop` still runs) — released on a user
+    /// stop/cancel or the next successful start. The transient cover is a global
+    /// singleton, so a retry reuses this guard rather than engaging a second. It
+    /// carries the server identity it permits so a same-server retry reuses the
+    /// resolved IP instead of re-resolving under the cover (which it would block).
+    blocked: Option<BlockedStart<R::Cover>>,
     last_error: Option<String>,
     /// The out-of-band death reason surfaced to the GUI status/toast, distinct
     /// from `last_error` (which keeps the rich, possibly-PII operation detail
@@ -225,6 +233,16 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
 }
 
+/// A held block-until-connected cover plus the server identity it permits. The
+/// cover permits exactly `server_ip`, so a covered retry for the same `host`
+/// reuses `server_ip` rather than re-resolving — re-resolution under the held
+/// cover would be blocked (the cover permits the server, not the DoH resolvers).
+struct BlockedStart<C> {
+    cover: C,
+    host: String,
+    server_ip: IpAddr,
+}
+
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
         Self::new_with_dns(proxy, routing, SystemDns::default())
@@ -243,6 +261,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             routing,
             dns,
             running: None,
+            blocked: None,
             last_error: None,
             death_reason: None,
             active_config: None,
@@ -413,6 +432,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
     }
 
+    /// Whether a covered start failed and left the host fail-closed (blocked, not
+    /// leaked) while not running — the GUI's distinct blocked state.
+    pub fn blocked_until_connected(&self) -> bool {
+        self.blocked.is_some()
+    }
+
     /// Whether the standing kill switch intent is on (from `bridge-lockdown.json`).
     /// Default-off when there is no state_dir or no file.
     pub fn lockdown_enabled(&self) -> bool {
@@ -446,7 +471,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[allow(clippy::disallowed_methods)]
         // Non-cancellable shim: callers explicitly opt out of cancel semantics. See clippy.toml CancellationToken::new rule.
         let token = CancellationToken::new();
-        self.start_cancellable(config, token).await
+        self.start_cancellable(config, false, token).await
     }
 
     /// Start the proxy with a caller-supplied `CancellationToken`.
@@ -478,6 +503,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     pub async fn start_cancellable(
         &mut self,
         config: &ProxyConfig,
+        covered: bool,
         cancel: CancellationToken,
     ) -> Result<(), ProxyError> {
         debug!(
@@ -493,32 +519,103 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
 
         // A (re)start supersedes any prior out-of-band death — clear the death
-        // reason regardless of this attempt's outcome (#470).
+        // reason regardless of this attempt's outcome.
         self.death_reason = None;
 
-        // `start_inner` is a free associated function — it does NOT
-        // touch `self`, so any cancel-driven unwind leaves `self`
-        // untouched. All partial state is owned by the locally-
-        // constructed RAII types inside start_inner and cleans up on
-        // drop. The cancel token is threaded *into* start_inner instead
-        // of being raced against it (#397); this prevents the
-        // "uncancellable sync phase" foot-gun where a future that
-        // doesn't yield blocks the outer select! from observing cancel.
-        debug!("awaiting start_inner");
         #[cfg(test)]
         let bootstrap_querier = self.bootstrap_querier.clone();
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
 
+        // A held cover permits only the OLD server IP, so a start for a DIFFERENT
+        // server must release it BEFORE resolving — DoH under the stale cover would
+        // be blocked (the resolvers aren't permitted) and wedge.
+        let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
+        if stale {
+            debug_assert!(self.blocked.is_some(), "stale implies a held cover");
+            self.blocked.take();
+            warn!("start for a different server while blocked: releasing the held cover before re-resolving");
+        }
+
+        // Resolve the server IP over private DoH. A same-server retry under the held
+        // cover reuses the cached IP (the cover blocks the resolvers).
+        let server_ip = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
+            Some(b) => b.server_ip,
+            None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
+                Ok(ip) => ip,
+                Err(e) => {
+                    if !matches!(e, ProxyError::Cancelled) {
+                        self.last_error = Some(e.to_string());
+                        // A covered start that can't resolve has no IP to permit, so no
+                        // cover can engage: the block-until-connected intent falls open
+                        // here — logged so the gap is visible, not silent.
+                        if covered {
+                            warn!(error = %e, "covered start could not resolve the server; host NOT blocked (no IP to permit)");
+                        }
+                    }
+                    return Err(e);
+                }
+            },
+        };
+
+        // Engage the block-until-connected cover for a covered start UNLESS the
+        // standing lockdown intent is on: that cohort installs the lockdown cover
+        // at routing.install, and engaging the transient cover too would (on macOS)
+        // clobber the singular pf ruleset. A corrupt/absent lockdown-state file
+        // resolves to off — the fail-SAFE direction (we engage, blocking not leaking).
+        let lockdown_on = self
+            .state_dir
+            .as_deref()
+            .map(lockdown_state::load_enabled)
+            .unwrap_or(false);
+        if covered && !lockdown_on {
+            // The transient cover is a global singleton — never construct a second
+            // over the same objects. An engage failure proceeds UNCOVERED (aborting
+            // would leave the user unconnected AND unprotected), surfaced via last_error.
+            if self.blocked.is_none() {
+                match self.routing.install_failclosed_cover(server_ip) {
+                    Ok(cover) => {
+                        self.blocked = Some(BlockedStart {
+                            cover,
+                            host: config.server.server.clone(),
+                            server_ip,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
+                        self.last_error = Some(e.to_string());
+                    }
+                }
+            }
+        } else if covered {
+            // Covered retry after the user enabled lockdown mid-blocked-state:
+            // release the held cover. This opens egress until the standing lockdown
+            // cover engages at routing.install — a brief, disclosed open window.
+            if self.blocked.take().is_some() {
+                warn!(
+                    "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
+                     uncovered until the standing lockdown cover engages at connect"
+                );
+            }
+        } else if self.blocked.take().is_some() {
+            // Manual (uncovered) connect or reload-while-blocked: fail-open by
+            // design. Releasing the held cover opens egress — logged so the fail-open
+            // has a visible disposition, never a silent drop.
+            warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
+        }
+        let blocking_engaged = self.blocked.is_some();
+
+        debug!("awaiting start_inner");
         let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
             &self.proxy,
             &self.routing,
             &self.dns,
             config,
+            server_ip,
+            blocking_engaged,
             self.state_dir.as_deref(),
             self.state_owner,
             cancel,
-            bootstrap_querier,
         )
         .await;
 
@@ -527,6 +624,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // after start_inner has completed successfully.
         match result {
             Ok(state) => {
+                // Tunnel is up: release the block-until-connected cover (drop →
+                // disengage; already None when lockdown subsumed it — the standing
+                // lockdown cover holds instead).
+                self.blocked = None;
                 let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
                 self.ipv6_bypass_available = state.ipv6_bypass_available;
@@ -548,15 +649,41 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
-                // Do NOT set last_error on cancel — the user asked for it.
+                // User asked to cancel: release the cover (same trust as a user
+                // disconnect). Do NOT set last_error on cancel.
+                self.blocked = None;
                 info!("proxy start cancelled");
                 Err(ProxyError::Cancelled)
             }
             Err(e) => {
+                // Covered start failed: RETAIN the held cover (`self.blocked` keeps
+                // it, so its Drop does NOT run) — the host stays blocked, not leaked,
+                // until a later successful start, a user stop/cancel, or a bridge
+                // restart. A retry reuses this single held guard and its resolved IP.
                 self.last_error = Some(e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Resolve the proxy server's hostname to an IP over PRIVATE DoH using the
+    /// configured `dns.servers` — never the OS resolver — for EVERY start,
+    /// independent of `dns.enabled`. Fail-closed unless `dns.allow_insecure_bootstrap`.
+    /// The hostname stays the SNI name; only the route + plugin handoff use the IP.
+    /// Host logged here, not in the error, so the PII-free toast omits it.
+    async fn resolve_server_ip(
+        config: &ProxyConfig,
+        bootstrap_querier: &Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+        cancel: &CancellationToken,
+    ) -> Result<IpAddr, ProxyError> {
+        if cancel.is_cancelled() {
+            return Err(ProxyError::Cancelled);
+        }
+        let res = match bootstrap_querier {
+            Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await,
+            None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
+        };
+        Ok(res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?)
     }
 
     /// Produce a [`RunningState`] without touching `self`.
@@ -618,10 +745,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         routing: &R,
         dns: &D,
         config: &ProxyConfig,
+        server_ip: IpAddr,
+        blocking_engaged: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
         cancel: CancellationToken,
-        bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
         // Pre-flight: short-circuit a pre-cancelled token before any work.
@@ -629,21 +757,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
 
-        // Resolve the proxy server's hostname to an IP over PRIVATE DoH using
-        // the configured `dns.servers` — never the OS resolver — for EVERY
-        // start (SocksOnly + Full), independent of `dns.enabled`. Fail-closed
-        // unless `dns.allow_insecure_bootstrap`. The hostname stays the SNI
-        // name; only the route + plugin handoff use the IP. Host logged here,
-        // not in the error, so the PII-free `DohBootstrap` toast omits it.
-        let server_ip = {
-            let res = match &bootstrap_querier {
-                Some(q) => {
-                    crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await
-                }
-                None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
-            };
-            res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?
-        };
+        // `server_ip` is resolved by the caller (`start_cancellable`) via private
+        // DoH BEFORE this fn, so the fail-closed cover can be owned in the outer
+        // scope — un-leakable by construction: `start_inner`'s many `?` exits
+        // cannot drop a cover they never hold. `blocking_engaged` is whether that
+        // outer cover is live for this start.
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
@@ -870,7 +988,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // original self-test reason. This bridge installs its own cover later
             // (after routing.install); at this gate the cover is a pre-existing /
             // adopted one, and the intent is its honest signal.
-            let cover_active = state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
+            // The live in-process signal (this start's engaged block-until-
+            // connected cover) OR a pre-existing/adopted standing lockdown — either
+            // means Hole's OWN cover would classify the probe's egress as blocked,
+            // so suppress it to avoid misreporting our cover as censorship.
+            let cover_active = blocking_engaged || state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
             let probe = (!cover_active).then(|| {
                 // The DoH-resolved IP, never the proxy domain: the reachability
                 // probe must not OS-resolve the hostname (that would reopen the
@@ -1058,6 +1180,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// restart and the new bridge re-adopts them. Routes/DNS/proxy/plugin tear
     /// down identically either way.
     pub async fn stop_with(&mut self, reason: StopReason) -> Result<(), ProxyError> {
+        // Fate of a block-until-connected cover a failed covered start left engaged
+        // (the blocked state is precisely `running == None`, so this must run
+        // BEFORE the `running.take()` early-return below). A user Disconnect
+        // DISENGAGES it — a user stop means "open the host". A cutover DISARMS it
+        // instead: the persistent filters survive the restart gap fail-closed (the
+        // new bridge sweeps them in recover_cover, then re-engages on its covered
+        // reconnect); dropping them here would open the host across the whole gap.
+        // Either way clear the stale error/death so a Disconnect-from-blocked lands
+        // the same clean state a normal stop does.
+        if let Some(b) = self.blocked.take() {
+            match reason {
+                StopReason::UserStop => drop(b.cover),
+                StopReason::Cutover => b.cover.disarm(),
+            }
+            self.last_error = None;
+            self.death_reason = None;
+        }
         let Some(state) = self.running.take() else {
             return Ok(());
         };

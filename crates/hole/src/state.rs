@@ -252,7 +252,7 @@ impl BridgeLink {
         // A resolved observation retracts any stale wedge failure.
         self.cell.clear_update_failed(UPDATE_FAILED);
         match observed_lockdown(result) {
-            Some((le, la)) => self.cell.commit_status(running, observed_error(result), le, la),
+            Some((le, la, blk)) => self.cell.commit_status(running, observed_error(result), le, la, blk),
             None => self.cell.commit(running),
         }
     }
@@ -397,6 +397,10 @@ pub struct ProxySnapshot {
     /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
     /// warning state — never silent green.
     pub lockdown_active: bool,
+    /// Whether a covered start (auto-connect) failed and left the host
+    /// fail-closed (blocked, not leaked) while not running — a distinct blocked
+    /// state (Retry / Disconnect), never silent Disconnected.
+    pub blocked_until_connected: bool,
 }
 
 /// Single owner of the GUI's view of "is the proxy running" (#462).
@@ -418,18 +422,22 @@ impl ProxyStateCell {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            blocked_until_connected: false,
         });
         Self { tx }
     }
 
-    /// Commit an observed running state. Bumps `seq` (and wakes watchers)
-    /// only when the value actually changes. Preserves the lockdown fields
-    /// (the non-Status paths that call this only know `running`) and clears
-    /// `error`: a non-Status running edge (Start/Stop/Cancel) is user-initiated
-    /// and carries no death reason (#470).
+    /// Commit an observed running state. Bumps `seq` (and wakes watchers) only when
+    /// something changes. Preserves the lockdown fields (the non-Status paths that
+    /// call this only know `running`); clears `error` (a running edge is
+    /// user-initiated, no death reason); and clears `blocked_until_connected`. The
+    /// callers are settled non-Status Acks (Start/Stop/Cancel) — the bridge has
+    /// dropped the transient cover — so a Go-Offline from the blocked state
+    /// (`running` already false) must still clear the flag and repaint, not
+    /// short-circuit and leave the tray showing "Blocked".
     pub fn commit(&self, running: bool) {
         self.tx.send_if_modified(|snap| {
-            if snap.running == running {
+            if snap.running == running && !snap.blocked_until_connected {
                 return false;
             }
             *snap = ProxySnapshot {
@@ -438,6 +446,7 @@ impl ProxyStateCell {
                 error: None,
                 lockdown_enabled: snap.lockdown_enabled,
                 lockdown_active: snap.lockdown_active,
+                blocked_until_connected: false,
             };
             true
         });
@@ -448,11 +457,19 @@ impl ProxyStateCell {
     /// by the `Status` arm so all commit atomically under the one client lock.
     /// `error` rides the same write — it is meaningful only alongside a running
     /// edge (a death), so it is not part of the change check.
-    pub fn commit_status(&self, running: bool, error: Option<String>, lockdown_enabled: bool, lockdown_active: bool) {
+    pub fn commit_status(
+        &self,
+        running: bool,
+        error: Option<String>,
+        lockdown_enabled: bool,
+        lockdown_active: bool,
+        blocked_until_connected: bool,
+    ) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
                 && snap.lockdown_active == lockdown_active
+                && snap.blocked_until_connected == blocked_until_connected
             {
                 return false;
             }
@@ -462,23 +479,29 @@ impl ProxyStateCell {
                 error,
                 lockdown_enabled,
                 lockdown_active,
+                blocked_until_connected,
             };
             true
         });
     }
 
     /// Commit a wedged-cutover failure: Disconnected + the path-free reason.
-    /// `lockdown` is `Some((enabled, active))` when the triggering Status carried
-    /// fresh lockdown fields (apply them) and `None` otherwise (preserve prior).
-    /// Idempotent — bumps `seq` only when running, error, or a lockdown field
+    /// `lockdown` is `Some((enabled, active, blocked))` when the triggering Status
+    /// carried fresh flags (apply them) and `None` otherwise (preserve prior).
+    /// Idempotent — bumps `seq` only when running, error, or one of those flags
     /// actually changes.
-    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool)>) {
+    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool, bool)>) {
         self.tx.send_if_modified(|snap| {
-            let (le, la) = lockdown.unwrap_or((snap.lockdown_enabled, snap.lockdown_active));
+            let (le, la, blk) = lockdown.unwrap_or((
+                snap.lockdown_enabled,
+                snap.lockdown_active,
+                snap.blocked_until_connected,
+            ));
             if !snap.running
                 && snap.error.as_deref() == Some(reason)
                 && snap.lockdown_enabled == le
                 && snap.lockdown_active == la
+                && snap.blocked_until_connected == blk
             {
                 return false;
             }
@@ -488,6 +511,7 @@ impl ProxyStateCell {
                 error: Some(reason.to_string()),
                 lockdown_enabled: le,
                 lockdown_active: la,
+                blocked_until_connected: blk,
             };
             true
         });
@@ -658,13 +682,18 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
     }
 }
 
-/// The lockdown (enabled, active) a Status exchange revealed, if any. Only a
-/// `Status` Ok carries them; every other exchange yields None (leave the
-/// snapshot's prior lockdown fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool)> {
-    match classify_lockdown(result) {
-        LockdownRead::Known { enabled, active } => Some((enabled, active)),
-        LockdownRead::Unreadable | LockdownRead::WrongReply => None,
+/// The lockdown (enabled, active) + blocked-until-connected flags a Status
+/// exchange revealed, if any. Only a `Status` Ok carries them; every other
+/// exchange yields None (leave the snapshot's prior fields untouched).
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool)> {
+    match result {
+        Ok(BridgeResponse::Status {
+            lockdown_enabled,
+            lockdown_active,
+            blocked_until_connected,
+            ..
+        }) => Some((*lockdown_enabled, *lockdown_active, *blocked_until_connected)),
+        _ => None,
     }
 }
 

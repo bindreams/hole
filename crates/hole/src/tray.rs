@@ -251,6 +251,7 @@ const ID_SETTINGS: &str = "settings";
 const ID_EXIT: &str = "exit";
 const ID_INSTALL_UPDATE: &str = "install_update";
 const ID_LOCKDOWN: &str = "lockdown";
+const ID_BLOCKED_RETRY: &str = "blocked_retry";
 
 // Window menu ---------------------------------------------------------------------------------------------------------
 const ID_WINDOW_IMPORT: &str = "window_import";
@@ -273,6 +274,46 @@ fn lockdown_menu_label(enabled: bool, active: bool) -> String {
     }
 }
 
+/// The status line + primary action a tray menu should render, from the observed
+/// state. Pure so `tray_tests` cover the blocked-state UX without Tauri. `blocked`
+/// (a covered start failed → host fail-closed while not running) applies only when
+/// not running and not mid-transition (a live transition or a running proxy takes
+/// precedence).
+struct TrayActions {
+    status: &'static str,
+    action_id: &'static str,
+    action_text: &'static str,
+    show_go_offline: bool,
+}
+
+fn tray_actions(running: bool, transition: Option<bool>, blocked: bool) -> TrayActions {
+    if blocked && !running && transition.is_none() {
+        return TrayActions {
+            status: "Blocked — connect failed",
+            action_id: ID_BLOCKED_RETRY,
+            action_text: "Retry",
+            show_go_offline: true,
+        };
+    }
+    let status = match (transition, running) {
+        (Some(true), _) => "Connecting...",
+        (Some(false), _) => "Disconnecting...",
+        (None, true) => "Connected",
+        (None, false) => "Disconnected",
+    };
+    let (action_id, action_text) = if running {
+        (ID_DISCONNECT, "Disconnect")
+    } else {
+        (ID_CONNECT, "Connect")
+    };
+    TrayActions {
+        status,
+        action_id,
+        action_text,
+        show_go_offline: false,
+    }
+}
+
 /// Build the tray menu, optionally including an "Install Update" item.
 ///
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
@@ -287,23 +328,29 @@ fn build_tray_menu(
     transition: Option<bool>,
     lockdown_enabled: bool,
     lockdown_active: bool,
+    blocked: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
-    let status_text = match (transition, running) {
-        (Some(true), _) => "Connecting...",
-        (Some(false), _) => "Disconnecting...",
-        (None, true) => "Connected",
-        (None, false) => "Disconnected",
-    };
-    // The action item carries the intent its label displays: a click
-    // dispatches on the item ID, with no state read at click time.
-    let (action_id, action_text) = if running {
-        (ID_DISCONNECT, "Disconnect")
-    } else {
-        (ID_CONNECT, "Connect")
-    };
+    // The action item carries the intent its label displays: a click dispatches
+    // on the item ID, with no state read at click time (#462).
+    let acts = tray_actions(running, transition, blocked);
 
-    let status = MenuItem::with_id(app, ID_STATUS, status_text, false, None::<&str>)?;
-    let connect = MenuItem::with_id(app, action_id, action_text, transition.is_none(), None::<&str>)?;
+    let status = MenuItem::with_id(app, ID_STATUS, acts.status, false, None::<&str>)?;
+    let connect = MenuItem::with_id(
+        app,
+        acts.action_id,
+        acts.action_text,
+        transition.is_none(),
+        None::<&str>,
+    )?;
+    // Shown only in the blocked state: releases the fail-closed cover and goes
+    // offline (unprotected) — the deliberate escape from a stay-blocked host.
+    let go_offline = MenuItem::with_id(
+        app,
+        ID_DISCONNECT,
+        "Go Offline (unblock)",
+        transition.is_none(),
+        None::<&str>,
+    )?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     // Checked tracks intent; the warning label covers the enabled-but-inactive
     // state since a checkmark alone can't signal "armed but not engaged".
@@ -318,38 +365,36 @@ fn build_tray_menu(
     let settings = MenuItem::with_id(app, ID_SETTINGS, "Dashboard...", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, ID_EXIT, "Exit", true, None::<&str>)?;
-
-    if let Some(info) = update {
-        let update_item = MenuItem::with_id(
+    let update_item = match update {
+        Some(info) => Some(MenuItem::with_id(
             app,
             ID_INSTALL_UPDATE,
             format!("Install Update (v{})", info.version),
             true,
             None::<&str>,
-        )?;
-        let sep3 = PredefinedMenuItem::separator(app)?;
-        tauri::menu::Menu::with_items(
-            app,
-            &[
-                &status,
-                &connect,
-                &sep1,
-                &autostart,
-                &lockdown,
-                &settings,
-                &sep2,
-                &update_item,
-                &sep3,
-                &exit,
-            ],
-        )
-    } else {
-        tauri::menu::Menu::with_items(
-            app,
-            &[&status, &connect, &sep1, &autostart, &lockdown, &settings, &sep2, &exit],
-        )
+        )?),
+        None => None,
+    };
+
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&status, &connect];
+    if acts.show_go_offline {
+        items.push(&go_offline);
     }
+    items.extend([
+        &sep1 as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+        &autostart,
+        &lockdown,
+        &settings,
+        &sep2,
+    ]);
+    if let Some(ref u) = update_item {
+        items.push(u);
+        items.push(&sep3);
+    }
+    items.push(&exit);
+    tauri::menu::Menu::with_items(app, &items)
 }
 
 /// Sync the autostart checkbox from the OS autostart registration. Status
@@ -392,6 +437,7 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
         None,
         snap.lockdown_enabled,
         snap.lockdown_active,
+        snap.blocked_until_connected,
     )?;
     let icon = tray_icons::tray_image(snap.running.into());
 
@@ -447,6 +493,7 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
             transition,
             snap.lockdown_enabled,
             snap.lockdown_active,
+            snap.blocked_until_connected,
         ) {
             Ok(menu) => {
                 sync_autostart_state(&handle, &menu);
@@ -558,14 +605,15 @@ pub(crate) enum Prompts {
 /// so a later reconciler tick can't override the user's explicit choice.
 pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String) -> Result<ToggleOutcome, String> {
     app.state::<AppState>().take_pending_startup_connect();
-    set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
+    // Manual connect is fail-open (covered=false): the user consents to the open window.
+    set_proxy_enabled_inner(app, enable, false, Prompts::Allowed, attempt_id).await
 }
 
-/// The sole non-interactive connect entry — startup auto-connect (#458).
-/// Connect-only by construction (no `enable` param), so silent-disconnect is
-/// unrepresentable; the shared #462 commit tail stays single-sourced.
+/// The sole non-interactive connect entry — startup auto-connect. Connect-only by
+/// construction (no `enable` param), so silent-disconnect is unrepresentable; the
+/// shared commit tail stays single-sourced.
 async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled_inner(app, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
+    set_proxy_enabled_inner(app, true, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
 
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
@@ -588,6 +636,7 @@ async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
 async fn set_proxy_enabled_inner(
     app: &AppHandle,
     enable: bool,
+    covered: bool,
     prompts: Prompts,
     attempt_id: String,
 ) -> Result<ToggleOutcome, String> {
@@ -637,6 +686,7 @@ async fn set_proxy_enabled_inner(
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
             attempt_id,
+            covered,
         };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {
@@ -751,6 +801,17 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
                             app_handle.dialog().message(msg).title("Error").blocking_show();
                         });
                     }
+                }
+            });
+        }
+        ID_BLOCKED_RETRY => {
+            info!("tray: retry clicked from the blocked state");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                // Covered retry: re-attempt under the held cover (stays blocked on failure).
+                match connect_silently(&app_handle).await {
+                    Ok(outcome) => info!(?outcome, "blocked-state retry settled"),
+                    Err(reason) => info!(%reason, "blocked-state retry did not connect"),
                 }
             });
         }
@@ -1475,11 +1536,20 @@ pub(crate) enum PendingAction {
 /// Decide the pending startup-connect action from a reconciler `Status` result.
 /// Only a reachable bridge reporting its run state is conclusive; a transport
 /// failure means "not bound yet", and a DACL/version hiccup says nothing about
-/// readiness — both retain so a later tick can apply the intent.
+/// readiness — both retain so a later tick can apply the intent. A host left
+/// fail-closed by a failed covered start (`blocked_until_connected`) is NOT idle
+/// to re-apply against: the bridge holds that blocked state independently of any
+/// GUI, so a fresh GUI instance re-arming the latch could otherwise observe a
+/// deliberately-blocked host as idle and auto-fire against it. Retain instead.
 pub(crate) fn should_apply_pending(
     result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
 ) -> PendingAction {
     match result {
+        Ok(BridgeResponse::Status {
+            running: false,
+            blocked_until_connected: true,
+            ..
+        }) => PendingAction::Retain,
         Ok(BridgeResponse::Status { running: false, .. }) => PendingAction::Apply,
         Ok(BridgeResponse::Status { running: true, .. }) => PendingAction::Drop,
         _ => PendingAction::Retain,

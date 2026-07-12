@@ -233,7 +233,7 @@ fn all_swept_guids_are_mutually_distinct() {
     // distinct: two filters sharing a key means the second add
     // silently clobbers the first (FwpmFilterAdd0 keys on filterKey). GUID
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
-    let mut all: Vec<GUID> = FILTER_GUIDS.to_vec();
+    let mut all: Vec<GUID> = swept_transient_guids(); // fixed transient GUIDs
     all.extend(swept_lockdown_guids());
     let unique: std::collections::HashSet<GUID> = all.iter().copied().collect();
     assert_eq!(
@@ -392,13 +392,15 @@ fn loopback_recv_accept_permits_are_in_both_sweep_floors() {
 fn every_emitted_filter_guid_is_in_its_sweep_set() {
     // Structural fail-closed invariant: any filter a cover installs must be
     // deletable by recovery, else a crash leaks an unswept block across restarts.
-    // Transient -> delete_all iterates FILTER_GUIDS; lockdown -> swept_lockdown_guids.
+    // Transient -> delete_all iterates swept_transient_guids (the fixed GUIDs);
+    // lockdown -> swept_lockdown_guids.
+    let transient_swept: std::collections::HashSet<GUID> = swept_transient_guids().into_iter().collect();
     for ip in [v4(), v6()] {
         let cover = build_cover_spec(ip);
         for f in &cover.filters {
             assert!(
-                FILTER_GUIDS.contains(&f.guid),
-                "transient filter {:?} ({:?}) is not in FILTER_GUIDS",
+                transient_swept.contains(&f.guid),
+                "transient filter {:?} ({:?}) is not in swept_transient_guids",
                 f.guid,
                 f.layer
             );

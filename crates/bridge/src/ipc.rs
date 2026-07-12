@@ -293,6 +293,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
         lockdown_active: pm.lockdown_active(),
+        blocked_until_connected: pm.blocked_until_connected(),
     })
 }
 
@@ -324,6 +325,12 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, StartHandlerError> {
     let attempt_id = attempt_id_from(&headers);
+    // The `X-Hole-Covered` header marks an auto-connect intent, so the bridge
+    // engages a fail-closed cover that stays blocked on failure.
+    let covered = headers
+        .get("x-hole-covered")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
@@ -357,7 +364,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 
     let result = {
         let mut pm = state.proxy.lock().await;
-        pm.start_cancellable(&config, token).await
+        pm.start_cancellable(&config, covered, token).await
     };
 
     // Clear the slot. Single-occupancy (the 409 above) guarantees it still holds

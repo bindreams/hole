@@ -408,10 +408,12 @@ pub trait Routing: Send + Sync {
     /// Engage a fail-closed cover: block all egress except loopback and
     /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
     /// survives a process crash (Windows: persistent WFP filters keyed by fixed
-    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and
-    /// is swept by [`recover_routes`] on the next start. Name-agnostic — it does
-    /// NOT permit the TUN interface (the cover only needs loopback + server IP
-    /// for the new bridge's start-time self-test); see the #468 PR2 plan.
+    /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
+    /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
+    /// interface — the block-until-connected connect gate holds it only until the
+    /// tunnel comes up. It permits the resolved `server_ip`, not the DoH resolvers:
+    /// a stay-blocked retry reuses the already-resolved IP rather than re-resolving
+    /// under the cover.
     fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError>;
 
     /// Engage the STANDING lockdown cover for this connected session: permit

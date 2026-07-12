@@ -173,6 +173,7 @@ struct MockRoutingState {
     lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
+    fail_cover: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -180,6 +181,9 @@ struct MockRoutingState {
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
+    /// the cover permits exactly the resolved server IP.
+    last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
 impl Default for MockRoutingState {
@@ -194,8 +198,10 @@ impl Default for MockRoutingState {
             lockdown_engage_calls: AtomicU32::new(0),
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
+            fail_cover: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
+            last_cover_server_ip: std::sync::Mutex::new(None),
         }
     }
 }
@@ -295,7 +301,11 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+        if self.state.fail_cover.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock cover failure".into()));
+        }
+        *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -1266,7 +1276,7 @@ fn start_cancellable_succeeds_when_not_cancelled() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), token).await.unwrap();
+        pm.start_cancellable(&test_config(), false, token).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
         pm.stop().await.unwrap();
     });
@@ -1294,7 +1304,7 @@ fn start_cancellable_cancelled_during_ss_start_rolls_back() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(
@@ -1323,7 +1333,7 @@ fn start_cancellable_cancel_before_start_returns_immediately() {
         let token = CancellationToken::new();
         token.cancel(); // already cancelled before start is even called
 
-        let err = pm.start_cancellable(&test_config(), token).await.unwrap_err();
+        let err = pm.start_cancellable(&test_config(), false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_none());
@@ -1338,7 +1348,9 @@ fn start_cancellable_late_cancel_on_finished_token_is_noop() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let token = CancellationToken::new();
-        pm.start_cancellable(&test_config(), token.clone()).await.unwrap();
+        pm.start_cancellable(&test_config(), false, token.clone())
+            .await
+            .unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
 
         // Late cancel — must not panic, must not mutate proxy state.
@@ -1373,7 +1385,7 @@ fn start_cancellable_dropped_future_runs_guards() {
         // surrounding scope drops `f`, running the drop-safety guards.
         {
             let cfg = test_config();
-            let f = pm.start_cancellable(&cfg, token);
+            let f = pm.start_cancellable(&cfg, false, token);
             tokio::pin!(f);
             tokio::select! {
                 _ = &mut f => panic!("start should not complete while gate is unfired"),
@@ -1451,7 +1463,7 @@ fn pure_vpn_start_cancellable_during_proxy_start() {
             cancel_clone.cancel();
         });
 
-        let err = pm.start_cancellable(&config, token).await.unwrap_err();
+        let err = pm.start_cancellable(&config, false, token).await.unwrap_err();
         assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
         assert_eq!(pm.state(), ProxyState::Stopped);
         // No gate release needed: the cancel drops the parked
@@ -2278,7 +2290,10 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
 
             assert!(
                 matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
@@ -2327,7 +2342,10 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, ProxyError::ForwarderSelfTestFailed { .. }),
                 "expected ForwarderSelfTestFailed, got {err:?}"
@@ -2348,7 +2366,7 @@ mod self_test {
         rt().block_on(async {
             let (mut pm, _dir) = new_manager(MockProxy::new());
             // test_config() already has dns.enabled = false.
-            pm.start_cancellable(&test_config(), CancellationToken::new())
+            pm.start_cancellable(&test_config(), false, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(pm.state(), ProxyState::Running);
@@ -2465,7 +2483,10 @@ mod self_test {
     fn lockdown_on_skips_probe_keeps_original_reason() {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
                     !reason.contains("refused"),
@@ -2486,7 +2507,10 @@ mod self_test {
     fn lockdown_off_runs_probe_rewrites_reason() {
         rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(false);
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                     let rewritten = if cfg!(target_os = "windows") {
@@ -2499,6 +2523,528 @@ mod self_test {
                         "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
                     );
                 }
+                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
+            }
+        });
+    }
+
+    // Block-until-connected cover =====================================================================================
+    //
+    // A covered start (auto-connect intent) engages the fail-closed cover BEFORE
+    // start_inner and, on failure, RETAINS it (host stays blocked). The gate
+    // fixture fails the start deterministically, so these assert engage/disengage
+    // counts + the retained-blocked state via the mock's kind-aware counters.
+
+    /// Gate fixture that also hands back the mock routing state so a test can read
+    /// the transient-cover engage/disengage counters. Server is a closed loopback
+    /// port (IP literal → resolves trivially, no DoH querier needed).
+    fn covered_gate_setup(
+        lockdown: bool,
+    ) -> (
+        ProxyManager<MockProxy, MockRouting>,
+        ProxyConfig,
+        Arc<MockRoutingState>,
+        tempfile::TempDir,
+    ) {
+        let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe_l.local_addr().unwrap();
+        drop(probe_l);
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
+        let mut cfg = test_config();
+        cfg.server.server = closed.ip().to_string();
+        cfg.server.server_port = closed.port();
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+        (pm, cfg, st, dir)
+    }
+
+    #[skuld::test]
+    fn covered_start_engages_and_retains_cover_on_failure() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "covered start engages once"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "a failed covered start must RETAIN the cover, not disengage it"
+            );
+            assert!(
+                pm.blocked_until_connected(),
+                "host stays blocked after a failed covered start"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn cutover_while_blocked_disarms_the_transient_cover_user_stop_disengages() {
+        rt().block_on(async {
+            // A covered start that failed holds the transient cover (host blocked).
+            // A cutover must DISARM it — persist the fail-closed filters across the
+            // restart gap — never disengage; a user Disconnect disengages (opens the
+            // host). Mirrors stop_with_cutover_disarms_lockdown for the standing cover.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert!(pm.blocked_until_connected());
+            pm.stop_with(StopReason::Cutover).await.unwrap();
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "cutover disarms the held cover (filters persist across the restart), never disengages"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "the manager releases the cover either way — the disarm keeps only the OS filters"
+            );
+
+            // User-stop branch, fresh manager: a Disconnect disengages (opens host).
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            pm.stop_with(StopReason::UserStop).await.unwrap();
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "a user Disconnect disengages the held cover"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn uncovered_start_never_engages_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "a manual (uncovered) start never engages"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_subsumed_when_lockdown_intent_on() {
+        rt().block_on(async {
+            // Lockdown intent on: the transient cover is subsumed (the standing
+            // lockdown cover holds the line), so we must NOT engage it.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(true);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "lockdown-on subsumes the transient cover"
+            );
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn user_stop_while_blocked_releases_cover_and_clears_error() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+            pm.stop().await.unwrap();
+            assert!(
+                !pm.blocked_until_connected(),
+                "a user Disconnect opens the blocked host"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "stop disengages the retained cover"
+            );
+            assert!(
+                pm.last_error().is_none(),
+                "Disconnect-from-blocked clears the stale error"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn same_server_retry_reuses_the_held_cover() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            // Retry to the SAME server+resolvers while blocked: reuse the guard.
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "same-server retry reuses the guard (no re-engage)"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "the reused guard is never disengaged"
+            );
+            assert!(pm.blocked_until_connected());
+        });
+    }
+
+    #[skuld::test]
+    fn different_server_retry_releases_stale_cover_and_re_engages_fresh() {
+        rt().block_on(async {
+            // End-state for a literal-IP server switch (no DoH — both are literals):
+            // a retry to a DIFFERENT server releases the stale cover (it permits only
+            // the OLD server) and engages a FRESH cover permitting the new one, never
+            // a second cover over the held singleton. The release-before-DoH ORDERING
+            // is proven separately by `different_hostname_retry_re_resolves_uncovered…`.
+            let (mut pm, mut cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            cfg.server.server = "127.0.0.2".into();
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the stale cover for the old server is released"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "a fresh cover is engaged for the new server"
+            );
+            assert_eq!(
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some("127.0.0.2".parse().unwrap()),
+                "the fresh cover permits the new server IP"
+            );
+            assert!(pm.blocked_until_connected(), "still blocked, now on the new server");
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_success_releases_cover() {
+        rt().block_on(async {
+            // A covered start that SUCCEEDS releases the cover (the tunnel is the
+            // protection now) — blocked_until_connected must be false.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
+            pm.start_cancellable(&test_config(), true, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(pm.state(), ProxyState::Running);
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1, "covered start engages");
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "success releases the cover"
+            );
+            assert!(!pm.blocked_until_connected());
+            pm.stop().await.unwrap();
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_cancel_releases_cover() {
+        rt().block_on(async {
+            // A user cancel of a covered start releases the cover (same trust as a
+            // disconnect), NOT retains it.
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+            let token = CancellationToken::new();
+            let cancel_clone = token.clone();
+            tokio::spawn(async move {
+                entered_rx.await.expect("MockProxy::start never entered");
+                cancel_clone.cancel();
+            });
+            let err = pm.start_cancellable(&test_config(), true, token).await.unwrap_err();
+            assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "covered start engages before the cancel"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "cancel releases the cover"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "a cancelled covered start does not leave the host blocked"
+            );
+            gate.notify_one();
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_engage_failure_proceeds_uncovered() {
+        rt().block_on(async {
+            // If the OS cover install FAILS on a fresh covered start, the bridge
+            // warns and proceeds UNCOVERED (aborting would leave the user
+            // unconnected AND unprotected) — no cover is retained, so the host is
+            // not (falsely) reported blocked.
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            st.fail_cover.store(true, Ordering::SeqCst);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                0,
+                "the engage failed, so none is counted"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "a failed engage retains no cover — host is not reported blocked"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_cover_permits_the_doh_resolved_ip_not_the_hostname() {
+        rt().block_on(async {
+            // The cover must permit the DoH-RESOLVED IP, not the server hostname —
+            // the onward connect target (plugin + self-test) dials the IP. A hostname
+            // server routed through the querier makes the resolved IP (203.0.113.9)
+            // provably distinct from the config's server string.
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some(resolved),
+                "the cover permits the DoH-resolved IP, not the hostname"
+            );
+        });
+    }
+
+    /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
+    /// retry reuses the resolved IP instead of re-querying under the held cover.
+    struct CountingQuerier {
+        host: String,
+        ip: IpAddr,
+        queries: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for CountingQuerier {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let q = Message::from_vec(wire).ok()?;
+            if q.queries.first()?.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let IpAddr::V4(v4) = self.ip else { return None };
+            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+            reply.to_vec().ok()
+        }
+    }
+
+    #[skuld::test]
+    fn covered_retry_reuses_the_resolved_ip_without_re_querying_doh() {
+        rt().block_on(async {
+            // A covered start resolves the server hostname via DoH (uncovered),
+            // engages the cover, and fails (host blocked). The cover permits the
+            // resolved IP, NOT the DoH resolvers, so a retry MUST reuse the cached
+            // IP — re-querying DoH under the held cover would be blocked and wedge
+            // the retry. We observe reuse via the DoH querier's call count.
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: "203.0.113.9".parse().unwrap(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let after_first = querier.queries.load(Ordering::SeqCst);
+            assert!(after_first >= 1, "the first covered start resolves via DoH");
+            assert!(pm.blocked_until_connected(), "the failed covered start holds the cover");
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                querier.queries.load(Ordering::SeqCst),
+                after_first,
+                "the covered retry reuses the resolved IP and does NOT re-query DoH under the cover"
+            );
+        });
+    }
+
+    /// A DoH stub mapping several hostnames to IPv4s (and counting queries), so a
+    /// test can drive a switch between two different-hostname servers.
+    struct MappingQuerier {
+        map: std::collections::HashMap<String, std::net::Ipv4Addr>,
+        queries: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for MappingQuerier {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let q = Message::from_vec(wire).ok()?;
+            let question = q.queries.first()?;
+            if question.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let name = question.name().to_string();
+            let ip = *self.map.get(name.trim_end_matches('.'))?;
+            let n = Name::from_ascii(&name).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
+            reply.to_vec().ok()
+        }
+    }
+
+    #[skuld::test]
+    fn different_hostname_retry_re_resolves_uncovered_and_re_engages() {
+        rt().block_on(async {
+            // A covered start blocked on server A, then a retry to a DIFFERENT hostname
+            // B, must RELEASE A's cover before resolving B (else DoH under A's cover is
+            // blocked and B never resolves), then engage a FRESH cover permitting B's
+            // resolved IP. The mock cover is a no-op guard, so this asserts the ordering
+            // via observable side-effects: re-resolution happened + cover now permits B.
+            let ip_a: IpAddr = "203.0.113.10".parse().unwrap();
+            let ip_b: IpAddr = "203.0.113.20".parse().unwrap();
+            let querier = Arc::new(MappingQuerier {
+                map: std::collections::HashMap::from([
+                    ("proxy-a.example".to_string(), std::net::Ipv4Addr::new(203, 0, 113, 10)),
+                    ("proxy-b.example".to_string(), std::net::Ipv4Addr::new(203, 0, 113, 20)),
+                ]),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec!["1.1.1.1".parse().unwrap()];
+
+            cfg.server.server = "proxy-a.example".into();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_server_ip.lock().unwrap(), Some(ip_a));
+            let queries_after_a = querier.queries.load(Ordering::SeqCst);
+
+            cfg.server.server = "proxy-b.example".into();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                querier.queries.load(Ordering::SeqCst) > queries_after_a,
+                "the different-hostname retry must RE-RESOLVE (uncovered), never wedge on the stale cover"
+            );
+            assert_eq!(
+                st.cover_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "the stale cover for server A is released before re-resolving"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "a fresh cover is engaged for server B"
+            );
+            assert_eq!(
+                *st.last_cover_server_ip.lock().unwrap(),
+                Some(ip_b),
+                "the fresh cover permits server B's resolved IP"
+            );
+            assert!(pm.blocked_until_connected(), "still blocked, now on server B");
+        });
+    }
+
+    /// The covered start engages the cover before start_inner, so the probe-
+    /// suppression predicate (cover_active) sees the live in-process signal even
+    /// with NO lockdown intent — the original self-test reason survives. Mirrors
+    /// `lockdown_on_skips_probe_keeps_original_reason`; the control is
+    /// `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe runs).
+    #[skuld::test]
+    fn covered_start_without_lockdown_suppresses_probe() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let err = pm.start_cancellable(&cfg, true, CancellationToken::new()).await.unwrap_err();
+            match err {
+                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
+                    !reason.contains("refused"),
+                    "a covered start engages a cover, so the probe is skipped and the original reason survives, got {reason:?}"
+                ),
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
         });
@@ -2537,7 +3083,10 @@ mod self_test {
             cfg.dns.protocol = hole_common::config::DnsProtocol::Https;
             cfg.dns.allow_insecure_bootstrap = false;
 
-            let err = pm.start_cancellable(&cfg, CancellationToken::new()).await.unwrap_err();
+            let err = pm
+                .start_cancellable(&cfg, false, CancellationToken::new())
+                .await
+                .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                     let rewritten = if cfg!(target_os = "windows") {

@@ -22,6 +22,8 @@ nextest-version = "0.9.130"
 #     crates/bridge/src/proxy_manager_e2e_tests.rs::e2e_none_full_tunnel_roundtrip
 #   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
+#   - `failclosed_permits_` (transient block-until-connected cover real engage):
+#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `cutover_global_net_state_` prefix:
 #     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
 #     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
@@ -34,5 +36,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/cutover_global_net_state_/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/cutover_global_net_state_/)'
 test-group = 'global-net-state'

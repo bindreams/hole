@@ -13,6 +13,37 @@ use std::path::Path;
 use std::sync::Mutex;
 
 #[skuld::test]
+fn tray_actions_blocked_offers_retry_and_go_offline() {
+    // A covered start failed → host fail-closed while not running: a distinct
+    // blocked state (never silent Disconnected), Retry (covered) + Go Offline.
+    let a = tray_actions(false, None, true);
+    assert_eq!(a.status, "Blocked — connect failed");
+    assert_eq!(a.action_id, ID_BLOCKED_RETRY);
+    assert_eq!(a.action_text, "Retry");
+    assert!(a.show_go_offline, "blocked state must offer the cover-release escape");
+}
+
+#[skuld::test]
+fn tray_actions_running_and_transition_take_precedence_over_blocked() {
+    // A live transition or a running proxy is never overridden by a stale blocked
+    // flag (blocked applies only when not running and not mid-transition).
+    let running = tray_actions(true, None, true);
+    assert_eq!(running.action_id, ID_DISCONNECT);
+    assert!(!running.show_go_offline);
+    let connecting = tray_actions(false, Some(true), true);
+    assert_eq!(connecting.status, "Connecting...");
+    assert!(!connecting.show_go_offline);
+}
+
+#[skuld::test]
+fn tray_actions_normal_states_unchanged() {
+    assert_eq!(tray_actions(false, None, false).action_id, ID_CONNECT);
+    assert_eq!(tray_actions(false, None, false).status, "Disconnected");
+    assert_eq!(tray_actions(true, None, false).action_id, ID_DISCONNECT);
+    assert_eq!(tray_actions(true, None, false).status, "Connected");
+}
+
+#[skuld::test]
 fn transition_slot_rejects_concurrent_and_clears() {
     let t = TransitionSlot::new();
     assert_eq!(t.target(), None);
@@ -187,6 +218,33 @@ fn status_resp(running: bool) -> BridgeResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
+    }
+}
+
+fn status_resp_blocked() -> BridgeResponse {
+    match status_resp(false) {
+        BridgeResponse::Status {
+            uptime_secs,
+            error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
+            lockdown_enabled,
+            lockdown_active,
+            ..
+        } => BridgeResponse::Status {
+            running: false,
+            uptime_secs,
+            error,
+            invalid_filters,
+            udp_proxy_available,
+            ipv6_bypass_available,
+            lockdown_enabled,
+            lockdown_active,
+            blocked_until_connected: true,
+        },
+        other => other,
     }
 }
 
@@ -209,6 +267,9 @@ fn should_apply_pending_rules() {
         // Reachable but the bridge errored on Status -> keep the intent.
         (Ok(err_resp("busy")), Retain),
         (Ok(BridgeResponse::Ack), Retain),
+        // Not running but fail-closed -> retain (don't re-apply against a
+        // deliberately-blocked host).
+        (Ok(status_resp_blocked()), Retain),
     ];
     for (result, expected) in &table {
         assert_eq!(should_apply_pending(result), *expected, "{result:?}");

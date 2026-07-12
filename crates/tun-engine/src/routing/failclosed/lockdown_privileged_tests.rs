@@ -1,6 +1,7 @@
-//! Privileged-lane real-engage verification for the standing lockdown cover
-//! (#527). Unlike the pure builder unit tests (`windows_tests` / `macos_tests`,
-//! the #165 isolation contract), these engage the REAL OS cover (Windows: live
+//! Privileged-lane real-engage verification for the standing lockdown cover and
+//! the transient block-until-connected cover. Unlike the pure builder unit tests
+//! (`windows_tests` / `macos_tests`, the #165 isolation contract), these engage
+//! the REAL OS cover (Windows: live
 //! FWPM; macOS: live pf) and prove at runtime that it is SELECTIVE: it permits
 //! the configured server IP and blocks all other egress, then restores on
 //! disengage. That catches the block-everything arbitration class of bug (the
@@ -25,10 +26,11 @@
 //! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
 //! `serial = TUN` only serializes within one binary.
 //!
-//! COUPLED NAMES: that group's filter matches these tests by the name prefixes
-//! `windows_lockdown_permits_server_ip_` and `macos_lockdown_permits_server_ip_`.
-//! Renaming a prefix WITHOUT updating `.config/nextest.toml` drops the test from
-//! the group → a silent cross-binary race with the bridge's live-egress
+//! COUPLED NAMES: that group's filter matches these tests by the name substrings
+//! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
+//! and `failclosed_permits_` (the transient-cover tests). Renaming one
+//! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
+//! silent cross-binary race with the bridge's live-egress
 //! `e2e_none_full_tunnel_roundtrip`. Change both together.
 
 use super::*;
@@ -201,6 +203,111 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     assert!(
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
+        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// Windows real-engage verification for the transient block-until-connected
+/// cover. Engages the REAL WFP transient cover with `server_ip = 1.1.1.1` and
+/// proves it is SELECTIVE: egress to the permitted server IP stays Ok (the permit
+/// beats block-all — catches the block-everything arbitration bug) while a
+/// non-permitted host is blocked (no leak). Drop restores egress.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_failclosed_permits_server_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    // External-event probe with a graceful failure bound: the timeout is the
+    // failure-to-human signal, not a sync sleep; assertions are Ok/Err, not timing.
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    // Baseline (PRE-cover): both hosts reachable — self-validates the probe so a
+    // network blip is never a false pass.
+    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
+    assert!(
+        bp.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage(server_ip, dir.path(), None).expect("engage real WFP transient cover");
+
+    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        n.is_err(),
+        "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
+    );
+
+    drop(cover);
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?}",
+        connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// macOS real-engage verification for the transient block-until-connected cover.
+/// Engages the REAL pf transient cover (`block out all` with `quick` permits for
+/// loopback and the server IP), proves (a) the live ruleset carries our block,
+/// (b) it is SELECTIVE, and (c) Drop restores `/etc/pf.conf`.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn macos_failclosed_permits_server_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, bn) = (connect(PERMITTED), connect(NON_PERMITTED));
+    assert!(
+        bp.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage(server_ip, dir.path(), None).expect("engage real pf transient cover");
+
+    // (a) The live ruleset carries our block-all.
+    let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        rules.contains("block") && rules.contains("all"),
+        "ruleset must carry the block:\n{rules}"
+    );
+
+    let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        n.is_err(),
+        "transient cover must block a non-permitted host (leak!): {NON_PERMITTED} connected"
+    );
+
+    // (c) Drop restores /etc/pf.conf: egress restored.
+    drop(cover);
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
 }

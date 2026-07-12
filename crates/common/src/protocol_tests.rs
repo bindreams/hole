@@ -48,10 +48,23 @@ fn bridge_request_start_json_roundtrip() {
     let req = BridgeRequest::Start {
         config: sample_config(),
         attempt_id: "attempt-1".into(),
+        covered: true,
     };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
     assert_eq!(decoded, req);
+}
+
+#[skuld::test]
+fn bridge_request_start_covered_defaults_false_for_old_clients() {
+    // An older GUI serializes Start without `covered`; it must decode to false
+    // (fail-open, today's behavior) via serde default.
+    let json = r#"{"Start":{"config":{"server":{"id":"i","name":"n","server":"1.2.3.4","server_port":8388,"method":"aes-256-gcm","password":"p","plugin":null,"plugin_opts":null,"validation":null},"local_port":4073,"filters":[],"dns":{"enabled":true,"servers":["1.1.1.1"],"protocol":"https","allow_insecure_bootstrap":false},"local_port_http":4074,"diagnostic_plugin_tap":false},"attempt_id":"a"}}"#;
+    let decoded: BridgeRequest = serde_json::from_str(json).unwrap();
+    match decoded {
+        BridgeRequest::Start { covered, .. } => assert!(!covered, "covered must default to false"),
+        other => panic!("expected Start, got {other:?}"),
+    }
 }
 
 #[skuld::test]
@@ -136,6 +149,7 @@ fn bridge_response_status_json_roundtrip() {
         ipv6_bypass_available: false,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
     let decoded: BridgeResponse = serde_json::from_slice(&json).unwrap();
@@ -216,6 +230,7 @@ fn status_response_json_roundtrip() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let decoded: StatusResponse = serde_json::from_str(&json).unwrap();
@@ -233,6 +248,7 @@ fn status_response_without_error() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
     assert!(!json.contains("error"), "None error should be skipped in serialization");
