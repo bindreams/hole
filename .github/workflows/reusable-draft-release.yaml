@@ -164,7 +164,7 @@ jobs:
           fetch-depth: 0
           path: source
 
-      - uses: astral-sh/setup-uv@v8.3.0
+      - uses: astral-sh/setup-uv@v8.3.1
 
       - name: Generate per-track release notes
         run: |
