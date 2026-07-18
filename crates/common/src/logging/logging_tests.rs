@@ -604,20 +604,28 @@ fn resolve_log_dir_prefers_explicit_override() {
     let got = super::resolve_log_dir_from(
         Some(std::path::PathBuf::from("/explicit")),
         Some(std::path::PathBuf::from("/env")),
+        super::default_log_dir,
     );
     assert_eq!(got, std::path::PathBuf::from("/explicit"));
 }
 
 #[skuld::test]
 fn resolve_log_dir_uses_env_when_no_override() {
-    let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")));
+    let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")), super::default_log_dir);
     assert_eq!(got, std::path::PathBuf::from("/env"));
 }
 
 #[skuld::test]
 fn resolve_log_dir_falls_back_to_default() {
-    let got = super::resolve_log_dir_from(None, None);
+    let got = super::resolve_log_dir_from(None, None, super::default_log_dir);
     assert_eq!(got, super::default_log_dir());
+}
+
+#[skuld::test]
+fn resolve_log_dir_from_uses_supplied_fallback() {
+    // With no override and no env, the supplied fallback wins.
+    let got = super::resolve_log_dir_from(None, None, || std::path::PathBuf::from("/service"));
+    assert_eq!(got, std::path::PathBuf::from("/service"));
 }
 
 // Per-sink composition ------------------------------------------------------------------------------------------------

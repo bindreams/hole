@@ -142,17 +142,30 @@ pub fn default_log_dir() -> PathBuf {
     crate::paths::default_user_subdir("logs")
 }
 
-/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
-/// else [`default_log_dir`]. A blank `HOLE_LOG_DIR` is ignored.
-pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
-    let env_dir = std::env::var_os("HOLE_LOG_DIR")
+/// Read `HOLE_LOG_DIR` as an override directory; a blank value is treated as
+/// unset. The one impure seam behind the log-dir resolvers, so their pure cores
+/// stay table-testable.
+pub fn hole_log_dir_env() -> Option<PathBuf> {
+    std::env::var_os("HOLE_LOG_DIR")
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    resolve_log_dir_from(override_dir, env_dir)
+        .map(PathBuf::from)
 }
 
-fn resolve_log_dir_from(override_dir: Option<PathBuf>, env_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.or(env_dir).unwrap_or_else(default_log_dir)
+/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
+/// else [`default_log_dir`].
+pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
+    resolve_log_dir_from(override_dir, hole_log_dir_env(), default_log_dir)
+}
+
+/// Pure resolution core: `override_dir`, else `env_dir`, else `fallback()`. The
+/// `fallback` distinguishes the per-user resolver ([`default_log_dir`]) from the
+/// `hole bridge log` reader, which passes the installed service's dir.
+pub fn resolve_log_dir_from(
+    override_dir: Option<PathBuf>,
+    env_dir: Option<PathBuf>,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    override_dir.or(env_dir).unwrap_or_else(fallback)
 }
 
 // Per-sink directive resolution =======================================================================================
