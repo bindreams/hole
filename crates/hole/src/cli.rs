@@ -158,8 +158,9 @@ pub(crate) enum BridgeAction {
     Status,
     /// View bridge logs
     Log {
-        /// Override the log directory
-        #[arg(long)]
+        /// Override the log directory. Global so it parses before or after the
+        /// nested `watch`/`path` subcommand.
+        #[arg(long, global = true)]
         log_dir: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: Option<LogAction>,

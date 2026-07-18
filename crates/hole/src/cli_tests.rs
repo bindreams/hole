@@ -457,6 +457,71 @@ fn bridge_install_parses_both_flags() {
     assert_eq!(repair_user_data_dir, Some(std::path::PathBuf::from("/tmp/R")));
 }
 
+// `bridge log --log-dir` position-independence ========================================================================
+//
+// --log-dir applies to `bridge log` regardless of position relative to the
+// nested watch/path subcommand.
+
+#[skuld::test]
+fn bridge_log_dir_flag_accepted_after_watch_subcommand() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "log",
+        "watch",
+        "--tail",
+        "50",
+        "--log-dir",
+        "/tmp/svc",
+    ])
+    .expect("--log-dir should be accepted after the watch subcommand");
+    let Some(Command::Bridge {
+        action: BridgeAction::Log { log_dir, action },
+    }) = cli.command
+    else {
+        panic!("expected Bridge::Log");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
+    assert!(matches!(action, Some(LogAction::Watch { tail: 50 })));
+}
+
+#[skuld::test]
+fn bridge_log_dir_flag_accepted_after_path_subcommand() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "log", "path", "--log-dir", "/tmp/svc"])
+        .expect("--log-dir should be accepted after the path subcommand");
+    let Some(Command::Bridge {
+        action: BridgeAction::Log { log_dir, action },
+    }) = cli.command
+    else {
+        panic!("expected Bridge::Log");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
+    assert!(matches!(action, Some(LogAction::Path)));
+}
+
+#[skuld::test]
+fn bridge_log_dir_flag_still_accepted_before_subcommand() {
+    let cli = Cli::try_parse_from([
+        "hole",
+        "bridge",
+        "log",
+        "--log-dir",
+        "/tmp/svc",
+        "watch",
+        "--tail",
+        "50",
+    ])
+    .expect("--log-dir before the subcommand must still parse");
+    let Some(Command::Bridge {
+        action: BridgeAction::Log { log_dir, action },
+    }) = cli.command
+    else {
+        panic!("expected Bridge::Log");
+    };
+    assert_eq!(log_dir, Some(std::path::PathBuf::from("/tmp/svc")));
+    assert!(matches!(action, Some(LogAction::Watch { tail: 50 })));
+}
+
 #[skuld::test]
 fn resolve_cli_log_dir_honors_install_log_dir_override() {
     let custom = std::path::PathBuf::from("/tmp/hole-install-XYZ");
