@@ -9,6 +9,7 @@
 //! (`version`/`ex_ray_version`) pulls `toml` + `semver` and is gated behind the
 //! `version` feature.
 
+pub mod asset;
 pub mod bindir;
 pub mod repo_root;
 
@@ -27,6 +28,10 @@ mod version_tests;
 #[cfg(all(test, feature = "version"))]
 #[path = "ex_ray_version_tests.rs"]
 mod ex_ray_version_tests;
+
+#[cfg(test)]
+#[path = "asset_tests.rs"]
+mod asset_tests;
 
 #[cfg(test)]
 #[path = "repo_root_tests.rs"]

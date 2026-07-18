@@ -9762,6 +9762,7 @@ dependencies = [
  "hole-common",
  "indexmap 2.14.0",
  "libc",
+ "payload-archive",
  "petgraph",
  "png 0.18.1",
  "resvg",
