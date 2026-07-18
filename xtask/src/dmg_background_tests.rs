@@ -111,3 +111,36 @@ fn background_inputs_carries_window_and_derived_arrow() {
     assert_eq!(get("arrow_dx").as_deref(), Some("284"));
     assert!(!source.is_empty());
 }
+
+#[skuld::test]
+fn clean_icons_are_glyphs_not_white_boxes() {
+    let font = std::fs::read(FONT).expect("read SFNS.ttf");
+    let dmg = crate::repo_root().unwrap().join("crates/hole/dmg/symbols");
+    for (file, r, g, b) in [("gear.svg", 0x8E, 0x8E, 0x93), ("hand.svg", 0x0A, 0x84, 0xFF)] {
+        let svg = std::fs::read_to_string(dmg.join(file)).unwrap();
+        // Structural: exactly the two self-color paths, no <style>/wireframe scaffolding.
+        assert_eq!(
+            svg.matches("<path").count(),
+            2,
+            "{file}: expected exactly 2 <path> elements"
+        );
+        assert!(!svg.contains("<style"), "{file}: SF-Symbols scaffolding present");
+
+        let images = vec![(format!("./{file}"), svg.into_bytes())];
+        let src = format!("#set page(width: 660pt, height: 560pt, margin: 0pt, fill: none)\n#place(top + left, box(image(\"./{file}\", height: 200pt)))");
+        let (rgba, _w, _h) = render_typst(&src, &font, &images, 1, &[]).unwrap();
+        let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let white = rgba.chunks_exact(4).filter(|p| *p == [255, 255, 255, 255]).count();
+        assert!(opaque > 0, "{file}: nothing rendered");
+        // Measured: clean ≈0.21–0.24, raw white-box ≈0.94.
+        assert!(
+            (white as f64) / (opaque as f64) < 0.5,
+            "{file}: mostly opaque white — wireframe box?"
+        );
+        assert!(
+            rgba.chunks_exact(4)
+                .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], r, g, b)),
+            "{file}: missing self-color"
+        );
+    }
+}
