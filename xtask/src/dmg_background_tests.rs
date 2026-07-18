@@ -144,3 +144,138 @@ fn clean_icons_are_glyphs_not_white_boxes() {
         );
     }
 }
+
+#[derive(serde::Deserialize)]
+struct Geo {
+    window: [u32; 2],
+    icon_size: u32,
+    app_pos: [u32; 2],
+    appfolder_pos: [u32; 2],
+}
+fn geo() -> Geo {
+    let s = std::fs::read_to_string(crate::repo_root().unwrap().join("crates/hole/dmg/layout.json")).unwrap();
+    serde_json::from_str(&s).unwrap()
+}
+fn render_real_background() -> (Vec<u8>, u32, u32) {
+    let root = crate::repo_root().unwrap();
+    let (source, _wh, inputs) = background_inputs(&root).unwrap();
+    let font = std::fs::read(FONT).unwrap();
+    let dmg = root.join("crates/hole/dmg");
+    let images = vec![
+        (
+            "./gear.svg".to_string(),
+            std::fs::read(dmg.join("symbols/gear.svg")).unwrap(),
+        ),
+        (
+            "./hand.svg".to_string(),
+            std::fs::read(dmg.join("symbols/hand.svg")).unwrap(),
+        ),
+    ];
+    render_typst(&source, &font, &images, 1, &inputs).unwrap()
+}
+
+#[skuld::test]
+fn real_background_dims_match_layout_json() {
+    let (_rgba, w, h) = render_real_background();
+    let g = geo();
+    assert_eq!(
+        (w, h),
+        (g.window[0], g.window[1]),
+        "render must match layout.json window"
+    );
+}
+
+#[skuld::test]
+fn real_background_icon_zones_fully_transparent() {
+    let (rgba, w, _h) = render_real_background();
+    let g = geo();
+    let half = g.icon_size / 2;
+    for [cx, cy] in [g.app_pos, g.appfolder_pos] {
+        for y in cy.saturating_sub(half)..(cy + half) {
+            for x in cx.saturating_sub(half)..(cx + half) {
+                assert_eq!(px(&rgba, w, x, y)[3], 0, "icon zone ({cx},{cy}) opaque at ({x},{y})");
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn real_background_edges_transparent() {
+    // The entire outer ring must be transparent: catches a stray full-bleed fill
+    // AND horizontal overflow (clipped ink would land at the page edge — the
+    // page-count guard only catches vertical overflow).
+    let (rgba, w, h) = render_real_background();
+    for x in 0..w {
+        assert_eq!(px(&rgba, w, x, 0)[3], 0, "top edge opaque at x={x}");
+        assert_eq!(px(&rgba, w, x, h - 1)[3], 0, "bottom edge opaque at x={x}");
+    }
+    for y in 0..h {
+        assert_eq!(px(&rgba, w, 0, y)[3], 0, "left edge opaque at y={y}");
+        assert_eq!(px(&rgba, w, w - 1, y)[3], 0, "right edge opaque at y={y}");
+    }
+}
+
+#[skuld::test]
+fn real_background_has_substantial_dark_ink() {
+    // typst emits NO warning for a blank/tofu render, so this ink floor is the
+    // guard: empty render = 0 dark px; the real copy = thousands.
+    let (rgba, _w, _h) = render_real_background();
+    let dark = rgba
+        .chunks_exact(4)
+        .filter(|p| p[3] > 40 && near([p[0], p[1], p[2], p[3]], 0x1d, 0x1d, 0x1f))
+        .count();
+    assert!(dark > 1000, "only {dark} dark-ink px — text may be blank/tofu");
+}
+
+#[skuld::test]
+fn real_background_recolored_quote_rule_and_icons() {
+    let (rgba, _w, _h) = render_real_background();
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x3a, 0x3a, 0x3c)),
+        "quote #3a3a3c missing"
+    );
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff)),
+        "rule #0a84ff missing"
+    );
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x8E, 0x8E, 0x93)),
+        "gear missing"
+    );
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x0A, 0x84, 0xFF)),
+        "hand missing"
+    );
+}
+
+#[skuld::test]
+fn drag_arrow_centroid_at_icon_midpoint() {
+    let (rgba, w, _h) = render_real_background();
+    let g = geo();
+    let half = g.icon_size / 2;
+    let (left, right) = (g.app_pos[0] + half, g.appfolder_pos[0] - half);
+    let midpoint = (g.app_pos[0] + g.appfolder_pos[0]) / 2;
+    let row = g.app_pos[1];
+    let (mut sum_x, mut n) = (0u64, 0u64);
+    for (i, p) in rgba.chunks_exact(4).enumerate() {
+        let (x, y) = ((i as u32) % w, (i as u32) / w);
+        if p[3] == 255
+            && near([p[0], p[1], p[2], p[3]], 0x86, 0x86, 0x8b)
+            && (left..right).contains(&x)
+            && (row.saturating_sub(30)..row + 30).contains(&y)
+        {
+            sum_x += x as u64;
+            n += 1;
+        }
+    }
+    assert!(n > 50, "arrow barely present ({n} px) between the icons");
+    let cx = (sum_x / n) as u32;
+    assert!(
+        (cx as i32 - midpoint as i32).abs() <= 20,
+        "arrow centroid x={cx} not near midpoint {midpoint}"
+    );
+}
