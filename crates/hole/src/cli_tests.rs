@@ -522,6 +522,38 @@ fn bridge_log_dir_flag_still_accepted_before_subcommand() {
     assert!(matches!(action, Some(LogAction::Watch { tail: 50 })));
 }
 
+// `hole bridge log` reader default ====================================================================================
+//
+// With no --log-dir and no HOLE_LOG_DIR, the reader resolves to the installed
+// service's log dir — where the bridge writes in production — not the per-user
+// default that never matches it.
+
+#[skuld::test]
+fn resolve_bridge_log_dir_falls_back_to_service_dir() {
+    // Pins the load-bearing wiring: the baked fallback is the service dir, not
+    // the per-user default. A revert to default_log_dir would fail this.
+    assert_eq!(
+        super::resolve_bridge_log_dir_from(None, None),
+        hole_common::update_marker::service_log_dir()
+    );
+    assert_ne!(
+        super::resolve_bridge_log_dir_from(None, None),
+        hole_common::logging::default_log_dir()
+    );
+}
+
+#[skuld::test]
+fn resolve_bridge_log_dir_prefers_explicit_override() {
+    let custom = std::path::PathBuf::from("/tmp/custom-logs");
+    assert_eq!(super::resolve_bridge_log_dir_from(Some(custom.clone()), None), custom);
+}
+
+#[skuld::test]
+fn resolve_bridge_log_dir_uses_env_when_no_override() {
+    let env = std::path::PathBuf::from("/tmp/env-logs");
+    assert_eq!(super::resolve_bridge_log_dir_from(None, Some(env.clone())), env);
+}
+
 #[skuld::test]
 fn resolve_cli_log_dir_honors_install_log_dir_override() {
     let custom = std::path::PathBuf::from("/tmp/hole-install-XYZ");

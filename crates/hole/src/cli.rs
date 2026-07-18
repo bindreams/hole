@@ -712,8 +712,24 @@ fn handle_bridge(action: BridgeAction) -> i32 {
     }
 }
 
+/// Resolve where `hole bridge log` reads: explicit `--log-dir`, else
+/// `HOLE_LOG_DIR`, else the installed service's log dir. The service is where
+/// the bridge writes in production; the per-user default never matches it.
+fn resolve_bridge_log_dir(log_dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    resolve_bridge_log_dir_from(log_dir, hole_common::logging::hole_log_dir_env())
+}
+
+/// Pure seam for [`resolve_bridge_log_dir`]: the service log dir is baked in as
+/// the fallback so tests can pin it without reading the process environment.
+fn resolve_bridge_log_dir_from(
+    log_dir: Option<std::path::PathBuf>,
+    env_dir: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    hole_common::logging::resolve_log_dir_from(log_dir, env_dir, hole_common::update_marker::service_log_dir)
+}
+
 fn handle_bridge_log(log_dir: Option<std::path::PathBuf>, action: Option<LogAction>) -> i32 {
-    let log_dir = log_dir.unwrap_or_else(hole_common::logging::default_log_dir);
+    let log_dir = resolve_bridge_log_dir(log_dir);
     let log_path = log_dir.join("bridge.log");
 
     match action {

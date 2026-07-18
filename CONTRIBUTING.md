@@ -865,6 +865,9 @@ Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 - Windows `%LOCALAPPDATA%\hole\logs\`, macOS `~/Library/Application Support/hole/logs/`
 - Installed service: Windows `C:\ProgramData\hole\logs\`, macOS `/var/log/hole/`
 
+`hole bridge log` defaults to the installed-service dir; override with `--log-dir`
+or `HOLE_LOG_DIR` to read a foreground/dev bridge's log.
+
 ### WebView2 and Chromium logs
 
 Windows WebView2 writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)
@@ -942,7 +945,7 @@ User-facing commands are in [README.md](README.md#commands). The rest:
 hole bridge run [--socket-path P] [--log-dir DIR] [--state-dir DIR]   run bridge (foreground, needs elevation)
 hole bridge run --service [--log-dir DIR] [--state-dir DIR]           run as service (invoked by SCM/launchd)
 hole bridge install | uninstall | status                             register/start | stop/remove | status (elevation)
-hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log
+hole bridge log [path | watch [--tail N]] [--log-dir DIR]            print | locate | stream the bridge log (defaults to the service log dir)
 hole bridge grant-access [--then-send B64 | --then-send-file PATH]    create hole group, add user, write SID file
 hole bridge ipc-send (--base64 B64 | --request-file PATH)            proxy a single IPC command (elevation)
 hole proxy start --config-file PATH [--local-port PORT] [--local-port-http PORT] [--no-socks5] [--http] [--tunnel-mode MODE]
