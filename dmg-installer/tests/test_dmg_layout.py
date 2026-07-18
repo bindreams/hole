@@ -64,3 +64,10 @@ def test_window_size(mounted_dmg: Path) -> None:
     # WindowBounds is a string like "{{x, y}, {w, h}}".
     nums = [int(n) for n in re.findall(r"-?\d+", bwsp["WindowBounds"])]
     assert (nums[2], nums[3]) == layout.WINDOW, f"window {nums[2]}x{nums[3]} != {layout.WINDOW}"
+
+
+def test_background_tiff_parked_offscreen(mounted_dmg: Path) -> None:
+    positions, _, _ = _read_ds_store(mounted_dmg)
+    assert positions.get(".background.tiff") == layout.TIFF_POS, (
+        f".background.tiff at {positions.get('.background.tiff')} != {layout.TIFF_POS}"
+    )
