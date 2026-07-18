@@ -187,12 +187,12 @@ fn real_background_dims_match_layout_json() {
 
 #[skuld::test]
 fn real_background_icon_zones_fully_transparent() {
-    let (rgba, w, _h) = render_real_background();
+    let (rgba, w, h) = render_real_background();
     let g = geo();
     let half = g.icon_size / 2;
     for [cx, cy] in [g.app_pos, g.appfolder_pos] {
-        for y in cy.saturating_sub(half)..(cy + half) {
-            for x in cx.saturating_sub(half)..(cx + half) {
+        for y in cy.saturating_sub(half)..(cy + half).min(h) {
+            for x in cx.saturating_sub(half)..(cx + half).min(w) {
                 assert_eq!(px(&rgba, w, x, y)[3], 0, "icon zone ({cx},{cy}) opaque at ({x},{y})");
             }
         }
@@ -229,16 +229,21 @@ fn real_background_has_substantial_dark_ink() {
 
 #[skuld::test]
 fn real_background_recolored_quote_rule_and_icons() {
-    let (rgba, _w, _h) = render_real_background();
+    let (rgba, w, _h) = render_real_background();
     assert!(
         rgba.chunks_exact(4)
             .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x3a, 0x3a, 0x3c)),
         "quote #3a3a3c missing"
     );
+    // The rule is a vertical stroke at the left margin (x≈46); the hand icon uses
+    // the same #0a84ff but sits inline far to the right (x>180). Restrict to the
+    // left column so this assertion can't alias with the hand icon.
     assert!(
-        rgba.chunks_exact(4)
-            .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff)),
-        "rule #0a84ff missing"
+        rgba.chunks_exact(4).enumerate().any(|(i, p)| {
+            let x = (i as u32) % w;
+            x < 100 && p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff)
+        }),
+        "rule #0a84ff missing near left margin"
     );
     assert!(
         rgba.chunks_exact(4)
