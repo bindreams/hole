@@ -197,10 +197,13 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Render the macOS DMG installer background (`crates/hole/dmg/background.svg`)
-    /// to `.cache/dmg/background.png` + `background@2x.png`. macOS-only; run by
-    /// the `hole-dmg` target before the dmgbuild assembly step.
-    DmgBackground,
+    /// Render the macOS DMG installer background (`crates/hole/dmg/background.typ`)
+    /// to `<out-dir>/background.png` + `background@2x.png` (default `.cache/dmg`).
+    DmgBackground {
+        /// Output directory (a dedicated dir holding only the PNG pair).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -259,7 +262,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),
-        Command::DmgBackground => run_dmg_background(),
+        Command::DmgBackground { out_dir } => run_dmg_background(out_dir),
     }
 }
 
@@ -300,13 +303,11 @@ pub fn run_galoshes() -> Result<()> {
     Ok(())
 }
 
-pub fn run_dmg_background() -> Result<()> {
+pub fn run_dmg_background(out_dir: Option<PathBuf>) -> Result<()> {
     let repo_root = repo_root()?;
-    dmg_background::build(&repo_root)?;
-    println!(
-        "xtask: DMG background rendered into {}",
-        repo_root.join(".cache/dmg").display()
-    );
+    let out_dir = out_dir.unwrap_or_else(|| repo_root.join(".cache/dmg"));
+    dmg_background::build(&repo_root, &out_dir)?;
+    println!("xtask: DMG background rendered into {}", out_dir.display());
     Ok(())
 }
 

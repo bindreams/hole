@@ -1,44 +1,136 @@
-//! `cargo xtask dmg-background` — render the macOS DMG installer background.
-//!
-//! Renders `crates/hole/dmg/background.svg` (resvg, the same renderer
-//! `crates/hole/build.rs` uses for icons) to `.cache/dmg/background.png`
-//! (660x560) and `background@2x.png` (1320x1120). `dmg-installer`'s dmgbuild
-//! step consumes them — its `lookForHiDPI` picks up the `@2x` companion for a
-//! crisp Retina background. macOS-only: needs the system font, and the
-//! `hole-dmg` target that calls it is darwin-only.
+//! Typesets `crates/hole/dmg/background.typ` (Typst library) to a transparent
+//! `background.png` + `background@2x.png` pair, so Finder composites the
+//! dark-on-light art over its own white fill. macOS-only. Geometry (window,
+//! icon size/positions) comes from `crates/hole/dmg/layout.json`, shared with
+//! the Python builder.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use typst::foundations::{Dict, IntoValue};
+use typst::text::FontInfo;
+use typst_as_lib::TypstEngine;
+use typst_layout::PagedDocument;
+use typst_render::{render, RenderOptions};
+use typst_utils::Scalar;
 
-const WIDTH: u32 = 660;
-const HEIGHT: u32 = 560;
-/// macOS system font (SF Pro), loaded by explicit path so resolution never
-/// depends on flaky system-font *name* matching.
 const SF_PRO_PATH: &str = "/System/Library/Fonts/SFNS.ttf";
+// The drag-arrow polygon authored in background.typ is 92pt × 44pt; its offset is
+// the icon midpoint minus these half-extents, so the arrow bbox centers on the gap.
+const ARROW_HALF_W: i64 = 46;
+const ARROW_HALF_H: i64 = 22;
 
-/// Render `svg` to a `width`x`height` straight-RGBA buffer using `opt` (which
-/// carries the font database).
-pub fn render_rgba(svg: &[u8], width: u32, height: u32, opt: &resvg::usvg::Options) -> Result<Vec<u8>> {
-    let tree = resvg::usvg::Tree::from_data(svg, opt).context("parsing background.svg")?;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).context("allocating pixmap")?;
-    let sx = width as f32 / tree.size().width();
-    let sy = height as f32 / tree.size().height();
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(sx, sy),
-        &mut pixmap.as_mut(),
+/// The render family. Requires exactly one face named exactly "SF NS" (the
+/// spike-verified system-font family), so a swapped/absent font — or a different
+/// SF-branded face like "SF Mono" — fails loudly rather than shipping wrong text.
+pub(crate) fn pick_family(families: &[String]) -> Result<String> {
+    match families {
+        [only] if only == "SF NS" => Ok(only.clone()),
+        [only] => Err(anyhow!("unexpected font family {only:?} — expected \"SF NS\"")),
+        _ => Err(anyhow!("expected exactly 1 font face, got {}", families.len())),
+    }
+}
+
+fn u32_at(v: &serde_json::Value, path: &[&str], idx: usize) -> Result<u32> {
+    let mut cur = v;
+    for k in path {
+        cur = &cur[k];
+    }
+    cur[idx]
+        .as_u64()
+        .with_context(|| format!("layout.json {path:?}[{idx}]"))
+        .map(|n| n as u32)
+}
+
+/// Read `background.typ` + `layout.json`; return the source, `[w,h]`, and the
+/// `sys.inputs` key/values: window size and the arrow offset DERIVED from the icon
+/// centers (not hand-tuned), so a geometry change moves the arrow automatically.
+// The tuple return is the interface both `render_all` (below) and the test file
+// destructure directly; a type alias would just rename the same shape, so the
+// clippy::type_complexity note is suppressed rather than worked around.
+#[allow(clippy::type_complexity)]
+pub(crate) fn background_inputs(repo_root: &Path) -> Result<(String, [u32; 2], Vec<(&'static str, String)>)> {
+    let dmg = repo_root.join("crates/hole/dmg");
+    let source = std::fs::read_to_string(dmg.join("background.typ")).context("reading background.typ")?;
+    let geo: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dmg.join("layout.json")).context("reading layout.json")?)?;
+    let (w, h) = (u32_at(&geo, &["window"], 0)?, u32_at(&geo, &["window"], 1)?);
+    let (app_x, fold_x) = (u32_at(&geo, &["app_pos"], 0)?, u32_at(&geo, &["appfolder_pos"], 0)?);
+    let row_y = u32_at(&geo, &["app_pos"], 1)?;
+    let arrow_dx = (app_x as i64 + fold_x as i64) / 2 - ARROW_HALF_W;
+    let arrow_dy = row_y as i64 - ARROW_HALF_H;
+    let inputs = vec![
+        ("window_w", w.to_string()),
+        ("window_h", h.to_string()),
+        ("arrow_dx", arrow_dx.to_string()),
+        ("arrow_dy", arrow_dy.to_string()),
+    ];
+    Ok((source, [w, h], inputs))
+}
+
+/// Typeset `source` with `font_bytes` and extra `inputs` (plus the derived font
+/// family) as `sys.inputs`, render at integer `scale` px-per-pt, return
+/// straight-alpha RGBA8 + dims.
+pub fn render_typst(
+    source: &str,
+    font_bytes: &[u8],
+    images: &[(String, Vec<u8>)],
+    scale: u32,
+    inputs: &[(&str, String)],
+) -> Result<(Vec<u8>, u32, u32)> {
+    let families: Vec<String> = FontInfo::iter(font_bytes).map(|f| f.family).collect();
+    let family = pick_family(&families)?;
+
+    let engine = TypstEngine::builder()
+        .main_file(source)
+        .fonts([font_bytes.to_vec()])
+        .with_static_file_resolver(images.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>())
+        .build();
+
+    let mut dict = Dict::new();
+    dict.insert("font".into(), family.into_value());
+    for (k, v) in inputs {
+        dict.insert((*k).into(), v.clone().into_value());
+    }
+    let compiled = engine.compile_with_input::<_, PagedDocument>(dict);
+
+    // typst 0.15.1 emits ZERO warnings for SFNS.ttf. Any warning is an unexpected
+    // regression: fail loudly with ALL messages for debuggability.
+    if !compiled.warnings.is_empty() {
+        let msgs = compiled
+            .warnings
+            .iter()
+            .map(|w| w.message.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(anyhow!("unexpected typst warning(s): {msgs}"));
+    }
+    let doc = compiled.output.map_err(|e| anyhow!("typst compile failed: {e:?}"))?;
+
+    // Fixed page size ⇒ page 1 is always full-size; a 2nd page is the only
+    // (vertical) overflow signal. Horizontal clip is caught by the edge-ring test.
+    if doc.pages().len() != 1 {
+        return Err(anyhow!(
+            "background.typ produced {} pages — content overflowed (would clip)",
+            doc.pages().len()
+        ));
+    }
+    let page = doc.pages().first().expect("one page");
+
+    let pixmap = render(
+        page,
+        &RenderOptions {
+            pixel_per_pt: Scalar::from(scale as f64),
+            render_bleed: false,
+        },
     );
-    let rgba = pixmap.data().to_vec();
-    // Contract: the DMG background must be fully opaque, so tiny-skia's
-    // premultiplied output equals straight RGBA (no unpremultiply needed).
-    // Enforce it loudly — a transparent SVG edit would otherwise emit
-    // silently-wrong colors.
-    assert!(
-        rgba.chunks_exact(4).all(|p| p[3] == 0xFF),
-        "DMG background must be fully opaque"
-    );
-    Ok(rgba)
+    let (w, h) = (pixmap.width(), pixmap.height());
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for px in pixmap.pixels() {
+        let c = px.demultiply(); // premultiplied → straight, else text edges halo
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Ok((rgba, w, h))
 }
 
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
@@ -46,40 +138,58 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let mut encoder = png::Encoder::new(&mut buf, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().context("writing PNG header")?;
-    writer.write_image_data(rgba).context("writing PNG data")?;
+    let mut writer = encoder.write_header().context("PNG header")?;
+    writer.write_image_data(rgba).context("PNG data")?;
     drop(writer);
     Ok(buf)
 }
 
-/// Render the background SVG to `.cache/dmg/background.png` + `background@2x.png`.
-pub fn build(repo_root: &Path) -> Result<()> {
-    let svg_path = repo_root.join("crates/hole/dmg/background.svg");
-    let svg = std::fs::read(&svg_path).with_context(|| format!("reading {}", svg_path.display()))?;
+fn read_icon(dmg_dir: &Path, rel: &str) -> Result<Vec<u8>> {
+    std::fs::read(dmg_dir.join(rel)).with_context(|| format!("reading icon {rel}"))
+}
 
-    let out_dir = repo_root.join(".cache/dmg");
-    std::fs::create_dir_all(&out_dir).context("creating .cache/dmg/")?;
-
-    let mut opt = resvg::usvg::Options::default();
-    opt.fontdb_mut()
-        .load_font_file(SF_PRO_PATH)
-        .with_context(|| format!("loading font {SF_PRO_PATH}"))?;
-    // Default font-family-less text to whatever family the loaded face
-    // registered (".SF NS", the private system-font name, today). Derived rather
-    // than hardcoded so text resolution can't silently fail if that name ever
-    // changes — a mismatch here would ship a blank-text background.
-    opt.font_family = opt
-        .fontdb
-        .faces()
-        .next()
-        .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
-        .context("SFNS.ttf registered no font family")?;
-
+/// Render+encode both scales. Both are produced before any file write, and each is
+/// validated against `layout.json`'s window.
+pub(crate) fn render_all(repo_root: &Path) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    let (source, [jw, jh], inputs) = background_inputs(repo_root)?;
+    let font_bytes = std::fs::read(SF_PRO_PATH).with_context(|| format!("reading {SF_PRO_PATH}"))?;
+    let dmg = repo_root.join("crates/hole/dmg");
+    let images = vec![
+        ("./gear.svg".to_string(), read_icon(&dmg, "symbols/gear.svg")?),
+        ("./hand.svg".to_string(), read_icon(&dmg, "symbols/hand.svg")?),
+    ];
+    let mut outputs = Vec::new();
     for (scale, name) in [(1u32, "background.png"), (2, "background@2x.png")] {
-        let (w, h) = (WIDTH * scale, HEIGHT * scale);
-        let png = encode_png(&render_rgba(&svg, w, h, &opt)?, w, h)?;
-        let path = out_dir.join(name);
-        std::fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
+        let (rgba, w, h) = render_typst(&source, &font_bytes, &images, scale, &inputs)?;
+        if (w, h) != (jw * scale, jh * scale) {
+            return Err(anyhow!(
+                "background {name}: got {w}x{h}, want {}x{}",
+                jw * scale,
+                jh * scale
+            ));
+        }
+        outputs.push((name, encode_png(&rgba, w, h)?));
     }
+    Ok(outputs)
+}
+
+/// Render into `out_dir` (a dedicated directory holding only the pair). Stages both
+/// PNGs in a sibling `.<name>.staging` dir, then swaps it onto `out_dir` with a
+/// single rename — so out_dir flips old→new atomically, never a mismatched pair. A
+/// kill mid-swap leaves out_dir absent (build_dmg_at rejects that loudly).
+pub fn build(repo_root: &Path, out_dir: &Path) -> Result<()> {
+    let outputs = render_all(repo_root)?;
+    let parent = out_dir.parent().context("out_dir has no parent")?;
+    std::fs::create_dir_all(parent).context("creating output parent")?;
+    let name = out_dir.file_name().and_then(|s| s.to_str()).unwrap_or("dmgbg");
+    let staging = parent.join(format!(".{name}.staging"));
+
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).context("creating staging dir")?;
+    for (fname, bytes) in &outputs {
+        std::fs::write(staging.join(fname), bytes).with_context(|| format!("writing staging {fname}"))?;
+    }
+    let _ = std::fs::remove_dir_all(out_dir);
+    std::fs::rename(&staging, out_dir).with_context(|| format!("swapping staging into {}", out_dir.display()))?;
     Ok(())
 }
