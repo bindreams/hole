@@ -1,5 +1,6 @@
-//! Extract the bare binaries from the verified MSI/DMG onto the destination
-//! volume. The privileged bridge (SYSTEM/root) cannot trust the non-admin GUI
+//! Extract the bare binaries from the verified update archive onto the
+//! destination volume, in-process (no external unpacker). The privileged bridge
+//! (SYSTEM/root) cannot trust the non-admin GUI
 //! that hands it the payload over the IPC socket: it re-verifies the payload
 //! offline against the embedded minisign key before any irreversible step
 //! (fail-closed). A deeper Authenticode/codesign observation belongs here as
@@ -95,9 +96,8 @@ pub struct ExtractedImages {
 ///
 /// Windows: unzip the verified `.zip` payload into a staging dir on the same
 /// volume as the install dir (the cutover re-finds each bundled binary under
-/// it). macOS: `hdiutil
-/// attach` the DMG, copy the `.app` onto the destination volume (the DMG mount
-/// is a separate volume → `EXDEV`), then detach.
+/// it). macOS: untar-gz the verified payload's `Hole.app` onto the destination
+/// volume, then stage the helper.
 pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<ExtractedImages> {
     #[cfg(target_os = "windows")]
     {
@@ -179,11 +179,12 @@ mod imp_windows {
         Ok(ExtractedImages { staging_dir })
     }
 
-    /// Find `name` anywhere under `root` (an MSI lays out files into a versioned
-    /// subtree, so the exe is not at a fixed depth). Guards against directory
-    /// symlink cycles: `is_dir()` follows symlinks, so a cycle would otherwise
-    /// recurse forever — a `visited` set of canonical paths breaks it. This is a
-    /// cycle BREAK, not a depth cap (the tree is otherwise traversed in full).
+    /// Find `name` anywhere under `root`. The payload zip is flat, so a top-level
+    /// scan would suffice; the recursive walk is defense-in-depth against a
+    /// non-flat archive layout. Guards against directory symlink cycles:
+    /// `is_dir()` follows symlinks, so a cycle would otherwise recurse forever —
+    /// a `visited` set of canonical paths breaks it. This is a cycle BREAK, not a
+    /// depth cap (the tree is otherwise traversed in full).
     fn find_file(root: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
         let mut visited = std::collections::HashSet::new();
         find_file_inner(root, name, &mut visited)
@@ -219,6 +220,9 @@ mod imp_windows {
 
 #[cfg(target_os = "macos")]
 mod imp_macos {
+    //! Unpack the verified `.tar.gz` payload in-process, select its single
+    //! `Hole.app`, and stage the helper Mach-O beside it.
+    //!
     //! Same-volume assumption: `/Applications`, `/Library`, and `/var` (the
     //! staging parent) are firmlinks into the one shared APFS Data volume on a
     //! standard install, so staging here is same-volume with both swap
@@ -226,7 +230,7 @@ mod imp_macos {
     //! assumed away: `swap_one`'s `same_volume` check fails closed (EXDEV) before
     //! any irreversible step.
 
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::ExtractedImages;
 
@@ -246,35 +250,11 @@ mod imp_macos {
         }
         std::fs::create_dir_all(&staging_dir)?;
 
-        let mount = tempfile::TempDir::with_prefix("hole-cutover-mount-")?;
-        let attach = std::process::Command::new("hdiutil")
-            .args([
-                "attach",
-                "-nobrowse",
-                "-quiet",
-                "-mountpoint",
-                &mount.path().to_string_lossy(),
-                &payload_path.to_string_lossy(),
-            ])
-            .output()?;
-        if !attach.status.success() {
-            return Err(std::io::Error::other(format!(
-                "hdiutil attach failed: {}",
-                String::from_utf8_lossy(&attach.stderr)
-            )));
-        }
+        payload_archive::unpack_targz(payload_path, &staging_dir)?;
+        let app = payload_archive::find_single_app(&staging_dir)?;
 
-        // Everything after a successful attach must go through detach.
-        let result = copy_from_mount(mount.path(), &staging_dir);
-        let _ = std::process::Command::new("hdiutil")
-            .args(["detach", &mount.path().to_string_lossy()])
-            .output();
-
-        let app = result?;
-        // Stage the helper as a sibling of the `.app`. It is copied from the
-        // bundle's in-app Mach-O, then swapped independently into HELPER_PATH —
-        // the app swap deletes the staged `.app`, so a helper path inside it
-        // would be gone (ENOENT) by the time the helper swap runs.
+        // Stage the helper as a sibling of the `.app` (the app swap deletes the
+        // staged `.app`, so a helper path inside it would vanish before its swap).
         let helper = staging_dir.join(STAGED_HELPER_NAME);
         std::fs::copy(app.join(HELPER_IN_APP), &helper)?;
         Ok(ExtractedImages {
@@ -282,31 +262,6 @@ mod imp_macos {
             app,
             helper,
         })
-    }
-
-    /// Copy the `.app` bundle off the (separate-volume) DMG mount onto the
-    /// destination volume so the later swap is same-volume.
-    fn copy_from_mount(mount: &Path, staging_dir: &Path) -> std::io::Result<PathBuf> {
-        let app_entry = std::fs::read_dir(mount)?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().extension().is_some_and(|ext| ext == "app"))
-            .ok_or_else(|| std::io::Error::other("no .app bundle found in DMG"))?;
-        let app_src = app_entry.path();
-        let app_name = app_src
-            .file_name()
-            .ok_or_else(|| std::io::Error::other("DMG .app entry has no filename"))?;
-        let app_dest = staging_dir.join(app_name);
-
-        let out = std::process::Command::new("/bin/cp")
-            .args(["-R", &app_src.to_string_lossy(), &app_dest.to_string_lossy()])
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "copy .app off DMG failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        Ok(app_dest)
     }
 }
 

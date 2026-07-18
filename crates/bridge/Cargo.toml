@@ -105,6 +105,13 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+payload-archive = { path = "../payload-archive" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The two-`.app` count-error test hand-rolls a tar.gz (pack_targz packs a single
+# bundle), so it names flate2 + tar directly. Versions match payload-archive.
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 payload-archive = { path = "../payload-archive" }

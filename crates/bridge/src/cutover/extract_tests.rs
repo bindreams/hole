@@ -124,3 +124,47 @@ fn stage_payload_private_dir_is_owner_only() {
     let mode = std::fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "the private staging dir must be owner-only");
 }
+
+#[cfg(target_os = "macos")]
+fn write_app_targz(path: &std::path::Path) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("Hole.app");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    std::fs::write(app.join("Contents/MacOS/hole"), b"MACHO").unwrap();
+    payload_archive::pack_targz(&app, path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn extract_finds_app_and_stages_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let targz = dir.path().join("payload.tar.gz");
+    write_app_targz(&targz);
+
+    let images = imp_macos::extract(&targz, dir.path()).unwrap();
+    assert!(images.app.ends_with("Hole.app"));
+    assert!(images.helper.exists());
+    assert_eq!(std::fs::read(&images.helper).unwrap(), b"MACHO");
+}
+
+// find_single_app's zero-AND-many error contract is unit-tested in
+// payload-archive (find_single_app_errs_on_zero_and_on_many); here we prove
+// imp_macos::extract SURFACES that error — a two-`.app` archive fails loud.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn extract_surfaces_the_app_count_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("root");
+    std::fs::create_dir_all(src.join("A.app")).unwrap();
+    std::fs::create_dir_all(src.join("B.app")).unwrap();
+    let targz = dir.path().join("two.tar.gz");
+    {
+        let out = std::fs::File::create(&targz).unwrap();
+        let enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
+        let mut b = tar::Builder::new(enc);
+        b.append_dir_all(".", &src).unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+    }
+    let err = imp_macos::extract(&targz, dir.path()).unwrap_err();
+    assert!(err.to_string().contains("exactly one .app"), "got: {err}");
+}
