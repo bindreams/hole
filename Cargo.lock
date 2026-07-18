@@ -3048,6 +3048,7 @@ dependencies = [
  "kill-group",
  "libc",
  "lru",
+ "payload-archive",
  "plist",
  "plugin-e2e",
  "quinn",

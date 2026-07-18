@@ -623,9 +623,10 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     };
 
     // Extract the bare binaries from the PRIVATE copy onto the destination volume.
-    // The extract shells out to a blocking `msiexec`/`hdiutil`, so run it on a
-    // blocking thread to keep it off the async worker. A failure clears the marker
-    // so the GUI does not mask Disconnected forever.
+    // The extract does blocking work (in-process unzip on Windows, a blocking
+    // `hdiutil` on macOS), so run it on a blocking thread to keep it off the async
+    // worker. A failure clears the marker so the GUI does not mask Disconnected
+    // forever.
     let state_dir = state.state_dir.clone();
     let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
     let staged = match extracted {

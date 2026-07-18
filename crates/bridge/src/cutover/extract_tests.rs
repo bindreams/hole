@@ -2,18 +2,36 @@ use super::*;
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn msiexec_admin_args_are_quiet_admin_install_to_targetdir() {
-    let args = msiexec_admin_args(
-        Path::new(r"C:\dl\hole.msi"),
-        Path::new(r"C:\Program Files\hole\.update-staging"),
-    );
-    assert_eq!(args[0], "/a", "admin (extract-only) install");
-    assert!(args.iter().any(|a| a == r"C:\dl\hole.msi"), "the MSI path");
-    assert!(args.iter().any(|a| a == "/qn"), "admin install must be silent");
-    assert!(
-        args.iter().any(|a| a.starts_with("TARGETDIR=")),
-        "must target the staging dir"
-    );
+fn extract_into_unzips_and_wipes_leftover_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path();
+    let zip = install_dir.join("payload.zip");
+    payload_archive::pack_zip(
+        &[
+            (write_tmp(&dir, "hole", b"HOLE"), "hole.exe".to_string()),
+            (write_tmp(&dir, "exray", b"EXRAY"), "ex-ray.exe".to_string()),
+        ],
+        &zip,
+    )
+    .unwrap();
+
+    // A poisoned leftover staging dir from a prior attempt must be wiped.
+    let staging = install_dir.join(".update-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("stale.txt"), b"old").unwrap();
+
+    let images = extract_into(install_dir, &zip).unwrap();
+    assert_eq!(images.staging_dir, staging);
+    assert!(!staging.join("stale.txt").exists(), "leftover staging must be wiped");
+    assert!(find_staged_exe(&images.staging_dir).is_ok());
+    assert!(find_staged(&images.staging_dir, "ex-ray.exe").is_ok());
+}
+
+#[cfg(target_os = "windows")]
+fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let p = dir.path().join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p
 }
 
 // `reverify` is locked to the production minisign key, so a present-but-unsigned

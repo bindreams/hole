@@ -91,21 +91,9 @@ pub struct ExtractedImages {
     pub helper: PathBuf,
 }
 
-/// Build the Windows `msiexec /a` admin-install args that extract the MSI's
-/// full payload (every bundled binary) to `target_dir`. Quiet (`/qn`) so no UI.
-#[cfg(target_os = "windows")]
-pub fn msiexec_admin_args(msi: &Path, target_dir: &Path) -> Vec<String> {
-    vec![
-        "/a".into(),
-        msi.to_string_lossy().into_owned(),
-        "/qn".into(),
-        format!("TARGETDIR={}", target_dir.to_string_lossy()),
-    ]
-}
-
 /// Extract the bare binaries onto the destination volume.
 ///
-/// Windows: `msiexec /a` admin-install of the MSI into a staging dir on the same
+/// Windows: unzip the verified `.zip` payload into a staging dir on the same
 /// volume as the install dir (the cutover re-finds each bundled binary under
 /// it). macOS: `hdiutil
 /// attach` the DMG, copy the `.app` onto the destination volume (the DMG mount
@@ -132,13 +120,16 @@ pub use imp_windows::{find_staged, find_staged_exe};
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use imp_windows::find_file_inner;
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use imp_windows::extract_into;
+
 #[cfg(target_os = "windows")]
 mod imp_windows {
     use std::path::{Path, PathBuf};
 
-    use super::{msiexec_admin_args, ExtractedImages};
+    use super::ExtractedImages;
 
-    /// Subdirectory where the MSI payload lands.
+    /// Subdirectory where the unzipped payload lands.
     const STAGING_NAME: &str = ".update-staging";
     /// The binary used for the post-extract fail-closed presence check.
     pub const EXE_NAME: &str = "hole.exe";
@@ -156,8 +147,8 @@ mod imp_windows {
         find_staged(staging_dir, EXE_NAME)
     }
 
-    /// Extract into a staging dir guaranteed to be on the SAME volume as the
-    /// installed binary (the swap is `std::fs::rename`, which fails cross-device).
+    /// Unzip the payload into a staging dir on the SAME volume as the installed
+    /// binary (the swap is `std::fs::rename`, which fails cross-device).
     /// `_staging_parent` (the service state dir) is ignored on Windows: it may be
     /// on a different volume than Program Files, so the install dir is the only
     /// safe same-volume parent.
@@ -166,23 +157,22 @@ mod imp_windows {
             .parent()
             .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
             .to_path_buf();
+        extract_into(&install_dir, payload_path)
+    }
+
+    /// Unpack the payload into `install_dir/.update-staging`. `install_dir` is a
+    /// parameter (not re-derived from `current_exe`) so the staging-cleanup +
+    /// fail-closed wiring is testable.
+    pub(crate) fn extract_into(install_dir: &Path, payload_path: &Path) -> std::io::Result<ExtractedImages> {
         let staging_dir = install_dir.join(STAGING_NAME);
         // A leftover staging dir from a crashed prior attempt would poison the
-        // admin-install; start clean.
+        // unpack; start clean.
         if staging_dir.exists() {
             std::fs::remove_dir_all(&staging_dir)?;
         }
         std::fs::create_dir_all(&staging_dir)?;
 
-        let args = msiexec_admin_args(payload_path, &staging_dir);
-        let out = std::process::Command::new("msiexec").args(&args).output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "msiexec /a failed (code {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
+        payload_archive::unpack_zip(payload_path, &staging_dir)?;
 
         // Fail-closed: confirm hole.exe is present before the irreversible swap.
         find_staged_exe(&staging_dir)?;

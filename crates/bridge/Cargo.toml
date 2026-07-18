@@ -107,6 +107,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+payload-archive = { path = "../payload-archive" }
 windows-service = "0.8"
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
