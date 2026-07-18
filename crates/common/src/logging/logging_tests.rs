@@ -623,9 +623,27 @@ fn resolve_log_dir_falls_back_to_default() {
 
 #[skuld::test]
 fn resolve_log_dir_from_uses_supplied_fallback() {
-    // With no override and no env, the supplied fallback wins.
     let got = super::resolve_log_dir_from(None, None, || std::path::PathBuf::from("/service"));
     assert_eq!(got, std::path::PathBuf::from("/service"));
+}
+
+#[skuld::test]
+fn nonblank_dir_keeps_nonempty() {
+    assert_eq!(
+        super::nonblank_dir(Some("/x".into())),
+        Some(std::path::PathBuf::from("/x"))
+    );
+}
+
+#[skuld::test]
+fn nonblank_dir_drops_blank() {
+    // An empty HOLE_LOG_DIR= must fall through, not resolve to a bare path.
+    assert_eq!(super::nonblank_dir(Some("".into())), None);
+}
+
+#[skuld::test]
+fn nonblank_dir_drops_absent() {
+    assert_eq!(super::nonblank_dir(None), None);
 }
 
 // Per-sink composition ------------------------------------------------------------------------------------------------

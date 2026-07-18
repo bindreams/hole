@@ -524,9 +524,7 @@ fn bridge_log_dir_flag_still_accepted_before_subcommand() {
 
 // `hole bridge log` reader default ====================================================================================
 //
-// With no --log-dir and no HOLE_LOG_DIR, the reader resolves to the installed
-// service's log dir — where the bridge writes in production — not the per-user
-// default that never matches it.
+// Falls back to the installed service's log dir, not the per-user default.
 
 #[skuld::test]
 fn resolve_bridge_log_dir_falls_back_to_service_dir() {
