@@ -246,3 +246,57 @@ fn exit_code_display_with_unicode_output() {
     assert!(rendered.contains("Привет"));
     assert!(rendered.contains("世界"));
 }
+
+// macOS AppleScript elevation quoting =================================================================================
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn applescript_quote_wraps_and_escapes() {
+    assert_eq!(applescript_quote("plain"), "\"plain\"");
+    assert_eq!(applescript_quote(r#"a"b"#), r#""a\"b""#);
+    assert_eq!(applescript_quote(r"a\b"), r#""a\\b""#);
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn build_elevation_script_uses_double_quoted_applescript_literal() {
+    let script = build_elevation_script(
+        Path::new("/Applications/Hole.app/Contents/MacOS/hole"),
+        &["bridge", "install"],
+    );
+    // A single quote after `do shell script ` is the -2741 "unknown token".
+    assert!(
+        script.starts_with("do shell script \""),
+        "outer literal must be double-quoted, got: {script}"
+    );
+    assert!(script.ends_with(" with administrator privileges"), "got: {script}");
+    assert!(script.contains("'bridge' 'install'"), "got: {script}");
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn build_elevation_script_output_compiles_and_roundtrips_via_osascript() {
+    // Feed the shipped function's own output to the real AppleScript compiler,
+    // minus the admin suffix so no password prompt appears. /bin/echo + argv
+    // with quotes, backslash, and spaces proves both compile and round-trip.
+    // The single quote in `a'b` makes shell_escape emit its own `'\''`
+    // backslash, so applescript_quote's backslash-doubling is exercised too.
+    let args = ["a\"b", "c\\d", "e f", "a'b"];
+    let full = build_elevation_script(Path::new("/bin/echo"), &args);
+    let script = full
+        .strip_suffix(" with administrator privileges")
+        .expect("script ends with the admin suffix");
+    let out = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .expect("osascript is present on macOS");
+    assert!(
+        out.status.success(),
+        "osascript rejected build_elevation_script output: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+        "a\"b c\\d e f a'b"
+    );
+}

@@ -287,17 +287,7 @@ fn cmdline_roundtrips(cmdline: &str, expected: &[&str]) -> bool {
 /// see [`prompt_bridge_install`], which layers a temp-log capture on top.
 #[cfg(target_os = "macos")]
 pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
-    // Build the shell command with proper escaping
-    let mut cmd_parts = vec![shell_escape(program.to_string_lossy().as_ref())];
-    for arg in args {
-        cmd_parts.push(shell_escape(arg));
-    }
-    let shell_cmd = cmd_parts.join(" ");
-
-    let script = format!(
-        "do shell script {} with administrator privileges",
-        shell_escape(&shell_cmd)
-    );
+    let script = build_elevation_script(program, args);
 
     let output = std::process::Command::new("osascript").args(["-e", &script]).output()?;
 
@@ -323,10 +313,37 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     })
 }
 
+/// Build the AppleScript that runs `program args…` with administrator
+/// privileges. Two escaping layers: each argv element is POSIX-shell-quoted
+/// (the command line is executed by `/bin/sh` via `do shell script`), then
+/// the whole line is wrapped as an AppleScript string literal.
+#[cfg(target_os = "macos")]
+fn build_elevation_script(program: &Path, args: &[&str]) -> String {
+    let mut cmd_parts = vec![shell_escape(program.to_string_lossy().as_ref())];
+    for arg in args {
+        cmd_parts.push(shell_escape(arg));
+    }
+    let shell_cmd = cmd_parts.join(" ");
+
+    format!(
+        "do shell script {} with administrator privileges",
+        applescript_quote(&shell_cmd)
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn shell_escape(s: &str) -> String {
     // Single-quote escaping for POSIX shell
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote a string as an AppleScript string literal. Distinct from
+/// [`shell_escape`], which produces a POSIX **single**-quoted token for
+/// `/bin/sh`. Using the latter for the AppleScript layer emits
+/// `do shell script '…'`, which the AppleScript compiler rejects with `-2741`.
+#[cfg(target_os = "macos")]
+fn applescript_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 // Install/uninstall orchestration =====================================================================================
