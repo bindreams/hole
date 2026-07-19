@@ -86,20 +86,33 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 
         yield dst_app
     finally:
-        subprocess.run(
-            ["hdiutil", "detach", "-quiet", str(mount_dir)],
-            check=False,
-        )
+        r = subprocess.run(["hdiutil", "detach", str(mount_dir)], capture_output=True, text=True)
+        if r.returncode != 0:
+            warnings.warn(f"hdiutil detach {mount_dir} failed (rc={r.returncode}): {r.stderr.strip()}")
 
 
 @pytest.fixture(scope="module")
 def mounted_dmg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
-    """Attach the built DMG read-only and yield the mounted volume root.
+    """Build a hermetic layout-only DMG (dummy app) and mount it.
 
-    Layout assertions read the volume's `.DS_Store` and `.background.tiff`, which
-    the app-only `installed_app` fixture does not expose.
+    Renders the background into a private tempdir (not the shared .cache/dmg) and
+    assembles a dummy-app DMG via build_dmg_at — the `.DS_Store`/`.background.tiff`
+    depend only on the shared `layout` constants, not the app payload, so no prior
+    `cargo xtask build hole-dmg` is needed and no concurrent cache writer can race
+    it. (Signing/payload tests keep using `installed_app`/`find_built_dmg`.)
     """
-    dmg = dmg_installer.find_built_dmg(REPO_ROOT)
+    from dmg_installer import build, layout
+
+    bg_dir = tmp_path_factory.mktemp("layout-bg")
+    subprocess.run(["cargo", "xtask", "dmg-background", "--out-dir", str(bg_dir)], cwd=REPO_ROOT, check=True)
+
+    build_dir = tmp_path_factory.mktemp("layout-build")
+    app = build_dir / layout.APP_NAME
+    app.mkdir()
+    (app / "placeholder").write_text("layout dummy\n")
+    dmg = build_dir / "layout.dmg"
+    build.build_dmg_at(REPO_ROOT, app, dmg, background_dir=bg_dir)
+
     mount_dir = tmp_path_factory.mktemp("layout-mount")
     subprocess.run(
         ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-quiet", "-mountpoint",

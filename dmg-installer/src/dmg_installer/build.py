@@ -29,26 +29,24 @@ def get_version(root: Path) -> str:
     return version
 
 
-def main() -> None:
-    root = dmg_installer._find_repo_root()
+def build_dmg_at(root: Path, app: Path, dmg_path: Path, background_dir: Path | None = None) -> None:
+    """Assemble the styled DMG for `app` at `dmg_path` using the shared layout.
 
-    app = root / "target" / "release" / "bundle" / "macos" / layout.APP_NAME
+    `background_dir` (default `<root>/.cache/dmg`) holds background.png + @2x; tests
+    pass a private dir so they never share the repo-global cache.
+    """
     if not app.is_dir():
+        raise dmg_installer.DmgTestError(f"{app.name} not found at {app} — build the app (npx tauri build) first")
+    bg_dir = background_dir or root / ".cache" / "dmg"
+    background = bg_dir / "background.png"
+    background_2x = bg_dir / "background@2x.png"  # dmgbuild's lookForHiDPI pairs it
+    missing = [str(p) for p in (background, background_2x) if not p.is_file()]
+    if missing:
         raise dmg_installer.DmgTestError(
-            f"{layout.APP_NAME} not found at {app} — run `npx tauri build` (app target) first"
+            f"background PNG(s) missing: {missing} — run `cargo xtask dmg-background` first"
         )
-
-    background = root / ".cache" / "dmg" / "background.png"  # background@2x.png picked up by lookForHiDPI
-    if not background.is_file():
-        raise dmg_installer.DmgTestError(f"background missing at {background} — run `cargo xtask dmg-background` first")
-
-    arch = "aarch64" if platform.machine() == "arm64" else "x86_64"
-    out_dir = root / "target" / "release" / "bundle" / "dmg"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dmg_path = out_dir / f"{layout.VOLUME_NAME}_{get_version(root)}_{arch}.dmg"
-    dmg_path.unlink(missing_ok=True)  # keep the single-.dmg invariant find_built_dmg relies on
-
     width, height = layout.WINDOW
+    dmg_path.unlink(missing_ok=True)  # keep the single-.dmg invariant find_built_dmg relies on
     dmgbuild.build_dmg(
         filename=str(dmg_path),
         volume_name=layout.VOLUME_NAME,
@@ -61,9 +59,23 @@ def main() -> None:
             "icon_locations": {
                 layout.APP_NAME: layout.APP_POS,
                 "Applications": layout.APPFOLDER_POS,
+                ".background.tiff": layout.TIFF_POS,
             },
             "background": str(background),
             "window_rect": ((200, 120), (width, height)),
         },
     )
+
+
+def main() -> None:
+    root = dmg_installer._find_repo_root()
+
+    app = root / "target" / "release" / "bundle" / "macos" / layout.APP_NAME
+
+    arch = "aarch64" if platform.machine() == "arm64" else "x86_64"
+    out_dir = root / "target" / "release" / "bundle" / "dmg"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dmg_path = out_dir / f"{layout.VOLUME_NAME}_{get_version(root)}_{arch}.dmg"
+
+    build_dmg_at(root, app, dmg_path)
     print(f"built {dmg_path}")

@@ -1,28 +1,374 @@
-// A text-free SVG needs no font DB, so this stays cross-platform (no SF Pro /
-// macOS dependency). The rect fills the whole 10x10 viewBox with #112233, so
-// sampling pixels proves resvg actually painted AND that the viewBox was scaled
-// to fill the requested (non-square) extent — a width/height swap or a deleted
-// `render` call fails this, unlike a bare buffer-length check.
-#[skuld::test]
-fn render_rgba_paints_and_scales() {
-    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#112233"/></svg>"##;
-    let (w, h) = (120u32, 80u32);
-    let opt = resvg::usvg::Options::default();
-    let rgba = crate::dmg_background::render_rgba(svg, w, h, &opt).unwrap();
-    assert_eq!(rgba.len(), (w * h * 4) as usize);
+use crate::dmg_background::{background_inputs, pick_family, render_all, render_typst};
 
-    let px = |x: u32, y: u32| {
-        let i = ((y * w + x) * 4) as usize;
-        (rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
-    };
-    assert_eq!(
-        px(w / 2, h / 2),
-        (0x11, 0x22, 0x33, 0xff),
-        "center must be the painted, opaque fill"
+const FONT: &str = "/System/Library/Fonts/SFNS.ttf";
+const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#0a84ff"/></svg>"##;
+// Uses sys.inputs for the font (default keeps it standalone-compilable).
+const SRC: &str = r####"
+#set page(width: 660pt, height: 560pt, margin: (top: 226pt, x: 46pt, bottom: 34pt), fill: none)
+#set text(font: sys.inputs.at("font", default: "SF NS"), size: 22pt, weight: "bold", fill: rgb("#1d1d1f"))
+Hello #box(baseline: 25%, image("./icon.svg", height: 20pt)) world.
+#block(fill: rgb(255, 0, 0, 128), width: 44pt, height: 16pt)
+"####;
+
+fn px(rgba: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * w + x) * 4) as usize;
+    [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+}
+fn near(p: [u8; 4], r: u8, g: u8, b: u8) -> bool {
+    let d = |a: u8, b: u8| (a as i16 - b as i16).abs() <= 8;
+    d(p[0], r) && d(p[1], g) && d(p[2], b)
+}
+fn png_dims(bytes: &[u8]) -> (u32, u32) {
+    // png::Decoder<R> requires R: BufRead + Seek; &[u8] impls BufRead but not
+    // Seek, so wrap in a Cursor (Seek over the same bytes, no behavior change).
+    let r = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+    (r.info().width, r.info().height)
+}
+
+/// (width, height) of background.typ's drag-arrow polygon, parsed from its vertex
+/// literals — so the arrow-offset expectations derive from the actual drawn shape,
+/// genuinely independent of background_inputs's ARROW_HALF_W/ARROW_HALF_H constants.
+fn arrow_polygon_extent() -> (i64, i64) {
+    let typ = std::fs::read_to_string(crate::repo_root().unwrap().join("crates/hole/dmg/background.typ")).unwrap();
+    let start = typ.find("polygon(").expect("polygon( in background.typ");
+    let after = &typ[start + "polygon(".len()..];
+    // Balanced-paren scan to the end of the polygon call.
+    let mut depth = 1i32;
+    let mut end = after.len();
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    // Collect every integer immediately preceding "pt"; vertices are (x, y) pairs,
+    // so even-indexed values are x and odd-indexed are y.
+    let b = body.as_bytes();
+    let mut coords: Vec<i64> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'p' && b[i + 1] == b't' {
+            let mut j = i;
+            while j > 0 && b[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < i {
+                coords.push(body[j..i].parse::<i64>().unwrap());
+            }
+        }
+        i += 1;
+    }
+    let max_x = coords.iter().step_by(2).copied().max().expect("arrow x coords");
+    let max_y = coords.iter().skip(1).step_by(2).copied().max().expect("arrow y coords");
+    (max_x, max_y)
+}
+
+#[skuld::test]
+fn pick_family_requires_exact_sf_ns() {
+    assert_eq!(pick_family(&["SF NS".into()]).unwrap(), "SF NS");
+    assert!(
+        pick_family(&["SF Mono".into()]).is_err(),
+        "wrong-but-SF family must error"
     );
+    assert!(pick_family(&["Helvetica".into()]).is_err(), "non-SF family must error");
+    assert!(
+        pick_family(&["SF NS".into(), "SF Mono".into()]).is_err(),
+        ">1 face must error"
+    );
+    assert!(pick_family(&[]).is_err(), "no face must error");
+}
+
+#[skuld::test]
+fn render_typst_dims_transparency_ink_and_alpha() {
+    let font = std::fs::read(FONT).expect("read SFNS.ttf");
+    let images = vec![("./icon.svg".to_string(), ICON.as_bytes().to_vec())];
+
+    let (rgba1, w1, h1) = render_typst(SRC, &font, &images, 1, &[]).unwrap();
+    assert_eq!((w1, h1), (660, 560));
+    assert_eq!(rgba1.len(), (w1 * h1 * 4) as usize);
+    let (_r2, w2, h2) = render_typst(SRC, &font, &images, 2, &[]).unwrap();
+    assert_eq!((w2, h2), (1320, 1120));
+
+    assert_eq!(px(&rgba1, w1, 2, 2)[3], 0, "corner transparent");
+    assert!(
+        rgba1
+            .chunks_exact(4)
+            .any(|p| p[3] >= 200 && near([p[0], p[1], p[2], p[3]], 0x1d, 0x1d, 0x1f)),
+        "no dark ink"
+    );
+    assert!(
+        rgba1
+            .chunks_exact(4)
+            .any(|p| p[0] > 230 && p[1] < 40 && p[2] < 40 && (110..=150).contains(&p[3])),
+        "red not straight-alpha"
+    );
+}
+
+#[skuld::test]
+fn render_typst_errors_when_content_overflows_one_page() {
+    let font = std::fs::read(FONT).expect("read SFNS.ttf");
+    let src = format!(
+        "#set page(width: 660pt, height: 560pt, margin: 20pt, fill: none)\n#set text(font: sys.inputs.at(\"font\", default: \"SF NS\"), size: 24pt)\n{}",
+        "Overflow line. \\\n".repeat(80)
+    );
+    let err = render_typst(&src, &font, &[], 1, &[]).unwrap_err().to_string();
+    assert!(err.contains("page"), "overflow must error mentioning pages, got: {err}");
+}
+
+#[skuld::test]
+fn render_all_produces_both_scales_before_writing() {
+    let outputs = render_all(&crate::repo_root().unwrap()).unwrap();
+    assert_eq!(outputs.len(), 2, "both scales encoded before any write");
+    for (name, bytes) in &outputs {
+        let want = if name.contains("@2x") { (1320, 1120) } else { (660, 560) };
+        assert_eq!(png_dims(bytes), want, "{name}");
+    }
+}
+
+#[skuld::test]
+fn build_swaps_atomic_pair_no_staging_leftover() {
+    let base = tempfile::tempdir().unwrap();
+    let out = base.path().join("dmgbg");
+    crate::dmg_background::build(&crate::repo_root().unwrap(), &out).unwrap();
+    for (name, want) in [
+        ("background.png", (660u32, 560u32)),
+        ("background@2x.png", (1320, 1120)),
+    ] {
+        assert_eq!(png_dims(&std::fs::read(out.join(name)).unwrap()), want, "{name}");
+    }
+    assert!(!base.path().join(".dmgbg.staging").exists(), "staging dir left behind");
+}
+
+#[skuld::test]
+fn build_recovers_from_stale_staging_and_aside() {
+    let base = tempfile::tempdir().unwrap();
+    let out = base.path().join("dmgbg");
+    // Leftovers a previously-killed build could strand:
+    std::fs::create_dir_all(base.path().join(".dmgbg.staging")).unwrap();
+    std::fs::write(base.path().join(".dmgbg.staging/garbage"), b"stale").unwrap();
+    std::fs::create_dir_all(base.path().join(".dmgbg.old")).unwrap();
+    std::fs::write(base.path().join(".dmgbg.old/garbage"), b"stale").unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("background.png"), b"old").unwrap();
+
+    crate::dmg_background::build(&crate::repo_root().unwrap(), &out).unwrap();
+
+    for (name, want) in [
+        ("background.png", (660u32, 560u32)),
+        ("background@2x.png", (1320, 1120)),
+    ] {
+        assert_eq!(png_dims(&std::fs::read(out.join(name)).unwrap()), want, "{name}");
+    }
+    assert!(
+        !base.path().join(".dmgbg.staging").exists(),
+        "stale staging not cleaned"
+    );
+    assert!(!base.path().join(".dmgbg.old").exists(), "aside not cleaned");
+}
+
+#[skuld::test]
+fn background_inputs_carries_window_and_derived_arrow() {
+    let (source, [w, h], inputs) = background_inputs(&crate::repo_root().unwrap()).unwrap();
+    assert_eq!([w, h], [660, 560]);
+    let get = |k: &str| inputs.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.clone());
+    assert_eq!(get("window_w").as_deref(), Some("660"));
+    // Arrow offset must center the polygon on the icon midpoint/row. Derive the
+    // polygon's real 92×44 extent by PARSING background.typ, so this is genuinely
+    // independent of background_inputs's ARROW_HALF_W/ARROW_HALF_H constants — a wrong
+    // constant that mismatches the drawn polygon is caught here.
+    // (drag_arrow_centroid_at_icon_midpoint is the end-to-end pixel oracle.)
+    let g = geo();
+    let (aw, ah) = arrow_polygon_extent();
+    let expected_dx = ((g.app_pos[0] + g.appfolder_pos[0]) / 2) as i64 - aw / 2;
+    let expected_dy = g.app_pos[1] as i64 - ah / 2;
+    assert_eq!(get("arrow_dx").as_deref(), Some(expected_dx.to_string().as_str()));
+    assert_eq!(get("arrow_dy").as_deref(), Some(expected_dy.to_string().as_str()));
+    assert!(!source.is_empty());
+}
+
+#[skuld::test]
+fn clean_icons_are_glyphs_not_white_boxes() {
+    let font = std::fs::read(FONT).expect("read SFNS.ttf");
+    let dmg = crate::repo_root().unwrap().join("crates/hole/dmg/symbols");
+    for (file, r, g, b) in [("gear.svg", 0x8E, 0x8E, 0x93), ("hand.svg", 0x0A, 0x84, 0xFF)] {
+        let svg = std::fs::read_to_string(dmg.join(file)).unwrap();
+        // Structural: exactly the two self-color paths, no <style>/wireframe scaffolding.
+        assert_eq!(
+            svg.matches("<path").count(),
+            2,
+            "{file}: expected exactly 2 <path> elements"
+        );
+        assert!(!svg.contains("<style"), "{file}: SF-Symbols scaffolding present");
+
+        let images = vec![(format!("./{file}"), svg.into_bytes())];
+        let src = format!("#set page(width: 660pt, height: 560pt, margin: 0pt, fill: none)\n#place(top + left, box(image(\"./{file}\", height: 200pt)))");
+        let (rgba, _w, _h) = render_typst(&src, &font, &images, 1, &[]).unwrap();
+        let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let white = rgba.chunks_exact(4).filter(|p| *p == [255, 255, 255, 255]).count();
+        assert!(opaque > 0, "{file}: nothing rendered");
+        // Measured: clean ≈0.21–0.24, raw white-box ≈0.94.
+        assert!(
+            (white as f64) / (opaque as f64) < 0.5,
+            "{file}: mostly opaque white — wireframe box?"
+        );
+        assert!(
+            rgba.chunks_exact(4)
+                .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], r, g, b)),
+            "{file}: missing self-color"
+        );
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Geo {
+    window: [u32; 2],
+    icon_size: u32,
+    app_pos: [u32; 2],
+    appfolder_pos: [u32; 2],
+}
+fn geo() -> Geo {
+    let s = std::fs::read_to_string(crate::repo_root().unwrap().join("crates/hole/dmg/layout.json")).unwrap();
+    serde_json::from_str(&s).unwrap()
+}
+fn render_real_background() -> (Vec<u8>, u32, u32) {
+    let root = crate::repo_root().unwrap();
+    let (source, _wh, inputs) = background_inputs(&root).unwrap();
+    let font = std::fs::read(FONT).unwrap();
+    let dmg = root.join("crates/hole/dmg");
+    let images = vec![
+        (
+            "./gear.svg".to_string(),
+            std::fs::read(dmg.join("symbols/gear.svg")).unwrap(),
+        ),
+        (
+            "./hand.svg".to_string(),
+            std::fs::read(dmg.join("symbols/hand.svg")).unwrap(),
+        ),
+    ];
+    render_typst(&source, &font, &images, 1, &inputs).unwrap()
+}
+
+#[skuld::test]
+fn real_background_dims_match_layout_json() {
+    let (_rgba, w, h) = render_real_background();
+    let g = geo();
     assert_eq!(
-        px(w - 1, h - 1),
-        (0x11, 0x22, 0x33, 0xff),
-        "far corner proves the viewBox scaled to fill"
+        (w, h),
+        (g.window[0], g.window[1]),
+        "render must match layout.json window"
+    );
+}
+
+#[skuld::test]
+fn real_background_icon_zones_fully_transparent() {
+    let (rgba, w, h) = render_real_background();
+    let g = geo();
+    let half = g.icon_size / 2;
+    for [cx, cy] in [g.app_pos, g.appfolder_pos] {
+        for y in cy.saturating_sub(half)..(cy + half).min(h) {
+            for x in cx.saturating_sub(half)..(cx + half).min(w) {
+                assert_eq!(px(&rgba, w, x, y)[3], 0, "icon zone ({cx},{cy}) opaque at ({x},{y})");
+            }
+        }
+    }
+}
+
+#[skuld::test]
+fn real_background_edges_transparent() {
+    // The entire outer ring must be transparent: catches a stray full-bleed fill
+    // AND horizontal overflow (clipped ink would land at the page edge — the
+    // page-count guard only catches vertical overflow).
+    let (rgba, w, h) = render_real_background();
+    for x in 0..w {
+        assert_eq!(px(&rgba, w, x, 0)[3], 0, "top edge opaque at x={x}");
+        assert_eq!(px(&rgba, w, x, h - 1)[3], 0, "bottom edge opaque at x={x}");
+    }
+    for y in 0..h {
+        assert_eq!(px(&rgba, w, 0, y)[3], 0, "left edge opaque at y={y}");
+        assert_eq!(px(&rgba, w, w - 1, y)[3], 0, "right edge opaque at y={y}");
+    }
+}
+
+#[skuld::test]
+fn real_background_has_substantial_dark_ink() {
+    // typst emits NO warning for a blank/tofu render, so this ink floor is the
+    // guard: empty render = 0 dark px; the real copy = thousands.
+    let (rgba, _w, _h) = render_real_background();
+    let dark = rgba
+        .chunks_exact(4)
+        .filter(|p| p[3] > 40 && near([p[0], p[1], p[2], p[3]], 0x1d, 0x1d, 0x1f))
+        .count();
+    assert!(dark > 1000, "only {dark} dark-ink px — text may be blank/tofu");
+}
+
+#[skuld::test]
+fn real_background_recolored_quote_rule_and_icons() {
+    let (rgba, w, _h) = render_real_background();
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x3a, 0x3a, 0x3c)),
+        "quote #3a3a3c missing"
+    );
+    // The blue rule (#0a84ff) is a tall vertical stroke (spans the ~2-line quote);
+    // the hand icon uses the same blue but is a compact ~18pt blob. Identify the
+    // rule by a column with many blue pixels — margin/spacing independent, so this
+    // survives layout tuning (unlike a hardcoded x-cutoff) and can't alias with the
+    // hand (whose tallest column is ≤ the 18pt icon height).
+    let mut blue_per_col = vec![0u32; w as usize];
+    for (i, p) in rgba.chunks_exact(4).enumerate() {
+        if p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff) {
+            blue_per_col[(i as u32 % w) as usize] += 1;
+        }
+    }
+    assert!(
+        blue_per_col.iter().any(|&c| c >= 25),
+        "blue rule stroke missing (tallest blue column only {} px)",
+        blue_per_col.iter().max().copied().unwrap_or(0)
+    );
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x8E, 0x8E, 0x93)),
+        "gear missing"
+    );
+    assert!(
+        rgba.chunks_exact(4)
+            .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x0A, 0x84, 0xFF)),
+        "hand missing"
+    );
+}
+
+#[skuld::test]
+fn drag_arrow_centroid_at_icon_midpoint() {
+    let (rgba, w, _h) = render_real_background();
+    let g = geo();
+    let half = g.icon_size / 2;
+    let (left, right) = (g.app_pos[0] + half, g.appfolder_pos[0] - half);
+    let midpoint = (g.app_pos[0] + g.appfolder_pos[0]) / 2;
+    let row = g.app_pos[1];
+    let (mut sum_x, mut n) = (0u64, 0u64);
+    for (i, p) in rgba.chunks_exact(4).enumerate() {
+        let (x, y) = ((i as u32) % w, (i as u32) / w);
+        if p[3] == 255
+            && near([p[0], p[1], p[2], p[3]], 0x86, 0x86, 0x8b)
+            && (left..right).contains(&x)
+            && (row.saturating_sub(30)..row + 30).contains(&y)
+        {
+            sum_x += x as u64;
+            n += 1;
+        }
+    }
+    assert!(n > 50, "arrow barely present ({n} px) between the icons");
+    let cx = (sum_x / n) as u32;
+    assert!(
+        (cx as i32 - midpoint as i32).abs() <= 20,
+        "arrow centroid x={cx} not near midpoint {midpoint}"
     );
 }

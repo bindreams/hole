@@ -44,10 +44,17 @@ serde_yml = "0.0.13"
 indexmap = { version = "2", features = ["serde"] }
 petgraph = "0.8"
 
-# `cargo xtask dmg-background` (macOS DMG installer background render). Same
-# renderer as crates/hole/build.rs; unconditional so the workspace lockfile is
-# identical across platforms.
-resvg = "0.47"
+# background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
+# darwin feature and the Typst tree is heavy (~300 crates); compiling it on
+# windows/linux needlessly slowed every `cargo xtask` there (the MSI build hit its
+# 20-min timeout). The lockfile stays identical across platforms (Cargo.lock is
+# target-independent). Pinned: the four typst crates are one workspace and must match.
+[target.'cfg(target_os = "macos")'.dependencies]
+typst-as-lib = "=0.16.0"
+typst = "=0.15.1"
+typst-layout = "=0.15.1"
+typst-render = "=0.15.1"
+typst-utils = "=0.15.1"
 png = "0.18"
 
 [dev-dependencies]
