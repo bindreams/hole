@@ -35,13 +35,13 @@ pub(crate) struct GitHubAsset {
 // Platform asset suffix ===============================================================================================
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-const ASSET_SUFFIX: &str = "windows-amd64.msi";
+const ASSET_SUFFIX: &str = "windows-amd64.zip";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const ASSET_SUFFIX: &str = "darwin-arm64.dmg";
+const ASSET_SUFFIX: &str = "darwin-arm64.tar.gz";
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const ASSET_SUFFIX: &str = "darwin-amd64.dmg";
+const ASSET_SUFFIX: &str = "darwin-amd64.tar.gz";
 
 #[cfg(not(any(
     all(target_os = "windows", target_arch = "x86_64"),
