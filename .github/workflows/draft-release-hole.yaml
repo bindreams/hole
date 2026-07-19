@@ -90,10 +90,49 @@ jobs:
           fi
           echo "Artifact: $ASSET"
 
+      - name: Build update archive
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          # Name from the single shared suffix source (also used by the updater),
+          # so the published name can't drift from what the updater downloads.
+          ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
+          cargo xtask update-archive --out "$ARCHIVE"
+          echo "Archive: $ARCHIVE"
+
+      - name: Verify Windows archive contents
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
+          workdir="$(mktemp -d)"
+          unzip -q "$ARCHIVE" -d "$workdir"
+          # Derive the expected set from the single source of truth.
+          cargo xtask bindir-names --os windows | jq -r '.[]' | while read -r f; do
+            test -s "$workdir/$f" || { echo "::error::missing/empty $f in $ARCHIVE"; exit 1; }
+          done
+          echo "Windows archive contents verified"
+
+      - name: Verify macOS archive app is runnable (codesign)
+        if: matrix.os == 'darwin'
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
+          workdir="$(mktemp -d)"
+          tar -xzf "$ARCHIVE" -C "$workdir"
+          app="$(find "$workdir" -maxdepth 1 -name '*.app' | head -1)"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          echo "codesign --verify passed for $app"
+
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.os }}-${{ matrix.arch }}
-          path: hole-*.${{ matrix.ext }}
+          path: |
+            hole-*.${{ matrix.ext }}
+            hole-*.zip
+            hole-*.tar.gz
 
   release:
     name: Create draft release
@@ -115,8 +154,8 @@ jobs:
           sha256sum hole-* > SHA256SUMS
 
           lines=$(wc -l < SHA256SUMS)
-          if [ "$lines" -ne 3 ]; then
-            echo "::error::Expected 3 entries in SHA256SUMS, got $lines"
+          if [ "$lines" -ne 6 ]; then
+            echo "::error::Expected 6 entries in SHA256SUMS (3 installers + 3 archives), got $lines"
             exit 1
           fi
 
