@@ -11093,7 +11093,6 @@ dependencies = [
  "skuld",
  "tar",
  "tempfile",
- "tiny-skia",
  "typst",
  "typst-as-lib",
  "typst-layout",

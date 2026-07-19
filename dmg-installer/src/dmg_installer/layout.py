@@ -5,9 +5,10 @@ Python builder read ONE source; no coordinate is restated across the boundary.
 """
 
 import json
-from pathlib import Path
 
-_GEO = json.loads((Path(__file__).resolve().parents[3] / "crates/hole/dmg/layout.json").read_text())
+import dmg_installer
+
+_GEO = json.loads((dmg_installer._find_repo_root() / "crates/hole/dmg/layout.json").read_text())
 
 APP_NAME = "Hole.app"
 VOLUME_NAME = "Hole"

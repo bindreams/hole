@@ -25,6 +25,52 @@ fn png_dims(bytes: &[u8]) -> (u32, u32) {
     (r.info().width, r.info().height)
 }
 
+/// (width, height) of background.typ's drag-arrow polygon, parsed from its vertex
+/// literals — so the arrow-offset expectations derive from the actual drawn shape,
+/// genuinely independent of background_inputs's ARROW_HALF_W/ARROW_HALF_H constants.
+fn arrow_polygon_extent() -> (i64, i64) {
+    let typ = std::fs::read_to_string(crate::repo_root().unwrap().join("crates/hole/dmg/background.typ")).unwrap();
+    let start = typ.find("polygon(").expect("polygon( in background.typ");
+    let after = &typ[start + "polygon(".len()..];
+    // Balanced-paren scan to the end of the polygon call.
+    let mut depth = 1i32;
+    let mut end = after.len();
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    // Collect every integer immediately preceding "pt"; vertices are (x, y) pairs,
+    // so even-indexed values are x and odd-indexed are y.
+    let b = body.as_bytes();
+    let mut coords: Vec<i64> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'p' && b[i + 1] == b't' {
+            let mut j = i;
+            while j > 0 && b[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < i {
+                coords.push(body[j..i].parse::<i64>().unwrap());
+            }
+        }
+        i += 1;
+    }
+    let max_x = coords.iter().step_by(2).copied().max().expect("arrow x coords");
+    let max_y = coords.iter().skip(1).step_by(2).copied().max().expect("arrow y coords");
+    (max_x, max_y)
+}
+
 #[skuld::test]
 fn pick_family_requires_exact_sf_ns() {
     assert_eq!(pick_family(&["SF NS".into()]).unwrap(), "SF NS");
@@ -134,13 +180,17 @@ fn background_inputs_carries_window_and_derived_arrow() {
     assert_eq!([w, h], [660, 560]);
     let get = |k: &str| inputs.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.clone());
     assert_eq!(get("window_w").as_deref(), Some("660"));
-    // Arrow bbox is 92pt wide (background.typ's polygon), centered on the icon
-    // midpoint — derived from layout.json here, independent of background_inputs's own
-    // ARROW_HALF_W, so a wrong constant/formula is caught. (drag_arrow_centroid_at_icon_midpoint
-    // is the end-to-end pixel oracle.)
+    // Arrow offset must center the polygon on the icon midpoint/row. Derive the
+    // polygon's real 92×44 extent by PARSING background.typ, so this is genuinely
+    // independent of background_inputs's ARROW_HALF_W/ARROW_HALF_H constants — a wrong
+    // constant that mismatches the drawn polygon is caught here.
+    // (drag_arrow_centroid_at_icon_midpoint is the end-to-end pixel oracle.)
     let g = geo();
-    let expected_dx = ((g.app_pos[0] + g.appfolder_pos[0]) / 2) as i64 - 92 / 2;
+    let (aw, ah) = arrow_polygon_extent();
+    let expected_dx = ((g.app_pos[0] + g.appfolder_pos[0]) / 2) as i64 - aw / 2;
+    let expected_dy = g.app_pos[1] as i64 - ah / 2;
     assert_eq!(get("arrow_dx").as_deref(), Some(expected_dx.to_string().as_str()));
+    assert_eq!(get("arrow_dy").as_deref(), Some(expected_dy.to_string().as_str()));
     assert!(!source.is_empty());
 }
 

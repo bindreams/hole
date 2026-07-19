@@ -192,10 +192,7 @@ pub fn build(repo_root: &Path, out_dir: &Path) -> Result<()> {
     for (fname, bytes) in &outputs {
         std::fs::write(staging.join(fname), bytes).with_context(|| format!("writing staging {fname}"))?;
     }
-    // Swap atomically: move any existing out_dir aside with a single rename (out_dir
-    // becomes momentarily ABSENT, never partial), put the new pair in place, then drop
-    // the old aside. So out_dir is only ever the complete old pair, absent, or the new
-    // pair — a kill mid-swap leaves it absent (build_dmg_at rejects that loudly).
+    // Move any existing out_dir aside first (see the doc comment above).
     let aside = parent.join(format!(".{name}.old"));
     let _ = std::fs::remove_dir_all(&aside);
     if out_dir.exists() {

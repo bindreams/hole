@@ -35,6 +35,8 @@ def build_dmg_at(root: Path, app: Path, dmg_path: Path, background_dir: Path | N
     `background_dir` (default `<root>/.cache/dmg`) holds background.png + @2x; tests
     pass a private dir so they never share the repo-global cache.
     """
+    if not app.is_dir():
+        raise dmg_installer.DmgTestError(f"{app.name} not found at {app} — build the app (npx tauri build) first")
     bg_dir = background_dir or root / ".cache" / "dmg"
     background = bg_dir / "background.png"
     background_2x = bg_dir / "background@2x.png"  # dmgbuild's lookForHiDPI pairs it
@@ -69,10 +71,6 @@ def main() -> None:
     root = dmg_installer._find_repo_root()
 
     app = root / "target" / "release" / "bundle" / "macos" / layout.APP_NAME
-    if not app.is_dir():
-        raise dmg_installer.DmgTestError(
-            f"{layout.APP_NAME} not found at {app} — run `npx tauri build` (app target) first"
-        )
 
     arch = "aarch64" if platform.machine() == "arm64" else "x86_64"
     out_dir = root / "target" / "release" / "bundle" / "dmg"
