@@ -11,15 +11,17 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::compat::TokioAsyncReadCompatExt as _;
 use tokio_util::sync::CancellationToken;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    connect_delay, connect_retrying, deframe_udp_datagram, frame_udp_datagram, next_failures, parse_udp_timeout,
-    run_client, run_server, session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, StreamTag,
-    TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    connect_delay, connect_retrying, deframe_udp_datagram, drive_connection, driver_panicked, frame_udp_datagram,
+    next_failures, parse_udp_timeout, run_client, run_server, session_reconnect_backoff, ClientBoundAddrs,
+    FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
+    REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -559,7 +561,6 @@ async fn transport_tap_silent_on_eof() {
 #[skuld::test]
 async fn transport_tap_delegates_writes() {
     use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio_util::compat::TokioAsyncReadCompatExt as _;
     let productive = Arc::new(AtomicBool::new(false));
     let (a, b) = tokio::io::duplex(64);
     let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&productive));
@@ -753,4 +754,143 @@ async fn backoff_escalates_then_resets_on_productive() {
     assert_eq!(events.recv().await.unwrap(), (0, true)); // productive → reset to floor
 
     shutdown.cancel();
+}
+
+// Remaining branch coverage -------------------------------------------------------------------------------------------
+
+/// Install a per-test tracing subscriber that captures log lines for
+/// [`wait_for_log`] rendezvous, plus the `DefaultGuard` keeping it active.
+fn capture_logs() -> (WaitableWriter, tracing::subscriber::DefaultGuard) {
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let guard = set_default_in_current_thread(subscriber);
+    (writer, guard)
+}
+
+/// Park until a log line containing `needle` is captured — a real event
+/// rendezvous, not a timed guess.
+async fn wait_for_log(writer: &WaitableWriter, needle: &str) {
+    let rx = writer.wait_for(needle);
+    tokio::task::spawn_blocking(move || rx.recv().expect("log event never arrived"))
+        .await
+        .unwrap();
+}
+
+/// Strip the 1-byte stream tag, then echo everything else back.
+async fn echo_yamux_stream(mut stream: yamux::Stream) {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut tag = [0u8; 1];
+    if stream.read_exact(&mut tag).await.is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                let _ = stream.flush().await;
+            }
+        }
+    }
+    let _ = stream.close().await;
+}
+
+#[skuld::test]
+async fn server_initiated_stream_dropped_client_keeps_serving() {
+    let (writer, _g) = capture_logs();
+    let srv_shutdown = CancellationToken::new();
+    let srv_shutdown2 = srv_shutdown.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let conn = ::yamux::Connection::new(tcp.compat(), ::yamux::Config::default(), ::yamux::Mode::Server);
+        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(16);
+        tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+        // A server-initiated stream (protocol violation on the client).
+        let (tx, rx) = oneshot::channel();
+        let _ = open_tx.send(tx).await;
+        if let Ok(Ok(mut s)) = rx.await {
+            use futures::AsyncWriteExt as _;
+            let _ = s.write_all(&[0xFF]).await;
+            let _ = s.flush().await;
+        }
+        // Echo client-initiated streams so a normal round trip works.
+        loop {
+            tokio::select! {
+                _ = srv_shutdown2.cancelled() => break,
+                s = inbound_rx.recv() => match s {
+                    Some(stream) => { tokio::spawn(echo_yamux_stream(stream)); }
+                    None => break,
+                },
+            }
+        }
+    });
+
+    let client_shutdown = CancellationToken::new();
+    let (addrs, _events) = spawn_yamux_client(server_addr, DEFAULT_UDP_TIMEOUT, client_shutdown.clone()).await;
+
+    // The bogus stream is warned-and-dropped...
+    wait_for_log(&writer, "unexpected server-initiated yamux stream").await;
+    // ...and the client keeps serving: a normal TCP round trip still echoes.
+    assert_eq!(tcp_round_trip(addrs.tcp, b"still here").await, b"still here");
+
+    client_shutdown.cancel();
+    srv_shutdown.cancel();
+}
+
+#[skuld::test]
+async fn driver_panicked_detects_panic_not_cancel() {
+    // Normal completion (the ordinary TransportDied reconnect path) → not a panic.
+    let h = tokio::spawn(async {});
+    assert!(!driver_panicked(h.await));
+
+    // Our own abort → cancelled JoinError → not a panic.
+    let h = tokio::spawn(std::future::pending::<()>());
+    h.abort();
+    assert!(!driver_panicked(h.await));
+
+    // A real panic → panic JoinError → detected (and logged as a side effect).
+    let h = tokio::spawn(async { panic!("boom") });
+    assert!(driver_panicked(h.await));
+}
+
+#[skuld::test]
+async fn shutdown_during_backoff_exits_promptly() {
+    tokio::time::pause();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, _reset) = spawn_controllable_relay(server_addr, 1).await; // one unproductive reset
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (cli_tx, cli_rx) = oneshot::channel();
+    let client = tokio::spawn(run_client(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        relay_addr,
+        DEFAULT_UDP_TIMEOUT,
+        shutdown.clone(),
+        Some(cli_tx),
+        Some(events_tx),
+    ));
+    let _ = cli_rx.await.unwrap();
+
+    // Rendezvous (not the assertion): the observer event means the client has
+    // reached the reconnect decision and is entering the backoff sleep.
+    assert_eq!(events_rx.recv().await.unwrap(), (1, false));
+
+    // The external assertion: shutdown must win the paused sleep, so the client
+    // task returns `Ok` promptly. Without the select! shutdown branch the paused
+    // sleep never elapses and this `await` hangs → framework timeout.
+    shutdown.cancel();
+    client.await.unwrap().unwrap();
 }

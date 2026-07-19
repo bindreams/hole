@@ -114,13 +114,13 @@ impl FrameAccumulator {
 
 // Driver ==============================================================================================================
 
-type OpenStreamReply = tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;
+pub(crate) type OpenStreamReply = tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;
 
 /// Central driver loop that owns the yamux `Connection`.
 ///
 /// All interaction with the connection goes through channels because `Connection`
 /// requires `&mut self` for every poll method.
-async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static>(
+pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static>(
     mut conn: yamux::Connection<T>,
     mut open_rx: mpsc::Receiver<OpenStreamReply>,
     inbound_tx: mpsc::Sender<yamux::Stream>,
@@ -599,7 +599,7 @@ pub(crate) struct ClientBoundAddrs {
 /// `inbound_tx` and so is indistinguishable from a clean transport death at the
 /// `inbound_rx` seam, so the caller uses this to escalate instead of retrying.
 #[must_use]
-fn driver_panicked(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
+pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
     match result {
         Ok(()) => false,
         Err(e) if e.is_cancelled() => false,
