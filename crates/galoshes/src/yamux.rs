@@ -406,15 +406,21 @@ pub(crate) const LOOPBACK_CONNECT_RETRY: Duration = Duration::from_millis(10);
 pub(crate) const REMOTE_BACKOFF_BASE: Duration = Duration::from_millis(100);
 pub(crate) const REMOTE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Exponential backoff for a 0-based `step`: `REMOTE_BACKOFF_BASE` doubling,
+/// capped at `REMOTE_BACKOFF_MAX`.
+fn exponential_backoff(step: u32) -> Duration {
+    REMOTE_BACKOFF_BASE
+        .saturating_mul(1u32.checked_shl(step).unwrap_or(u32::MAX))
+        .min(REMOTE_BACKOFF_MAX)
+}
+
 /// Delay before connect attempt `attempt` to `remote`: loopback peers poll on
 /// a fixed tight cadence; routable peers back off exponentially, capped.
 pub(crate) fn connect_delay(remote: SocketAddr, attempt: u32) -> Duration {
     if remote.ip().is_loopback() {
         LOOPBACK_CONNECT_RETRY
     } else {
-        REMOTE_BACKOFF_BASE
-            .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
-            .min(REMOTE_BACKOFF_MAX)
+        exponential_backoff(attempt)
     }
 }
 
@@ -434,10 +440,7 @@ pub(crate) fn next_failures(prev: u32, productive: bool) -> u32 {
 /// peer flapping right after delivering one byte — and sustained failures
 /// escalate exponentially to `REMOTE_BACKOFF_MAX`.
 pub(crate) fn session_reconnect_backoff(failures: u32) -> Duration {
-    let step = failures.max(1) - 1;
-    REMOTE_BACKOFF_BASE
-        .saturating_mul(1u32.checked_shl(step).unwrap_or(u32::MAX))
-        .min(REMOTE_BACKOFF_MAX)
+    exponential_backoff(failures.max(1) - 1)
 }
 
 /// Connect to `addr`, retrying until it succeeds or `shutdown` fires. Retries
@@ -616,10 +619,6 @@ enum SessionOutcome {
     Shutdown,
     /// The transport (yamux) connection died — reconnect.
     TransportDied,
-    /// A local listener/socket error — fatal (a broken local listener is not
-    /// fixed by reconnecting the transport, so escalate to a process restart,
-    /// matching `run_server`).
-    LocalError(anyhow::Error),
 }
 
 /// Serve one yamux connection until it ends. The local TCP+UDP listeners are
@@ -651,9 +650,17 @@ async fn run_client_session(
                 }
             }
             accept = tcp_listener.accept() => {
+                // The listener is the loopback SS_LOCAL socket accepting from the
+                // trusted local ss-service: a real accept error is rare and transient
+                // (a stray ECONNABORTED, or momentary EMFILE that clears as flows
+                // finish), not a permanently-broken listener — and reconnecting the
+                // transport would not fix a local error anyway.
                 let (tcp_stream, _peer) = match accept {
                     Ok(v) => v,
-                    Err(e) => return SessionOutcome::LocalError(anyhow::Error::new(e).context("tcp accept")),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "local tcp accept error; continuing");
+                        continue;
+                    }
                 };
                 let open_tx = open_tx.clone();
                 tokio::spawn(async move {
@@ -678,9 +685,14 @@ async fn run_client_session(
                 });
             }
             recv = udp_socket.recv_from(&mut udp_buf) => {
+                // Same rationale as the accept arm above: a local recv error is
+                // transient, not a broken socket, and the transport isn't at fault.
                 let (n, peer) = match recv {
                     Ok(v) => v,
-                    Err(e) => return SessionOutcome::LocalError(anyhow::Error::new(e).context("udp recv")),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "local udp recv error; continuing");
+                        continue;
+                    }
                 };
                 let payload = udp_buf[..n].to_vec();
 
@@ -793,11 +805,10 @@ pub(crate) async fn run_client(
         // Tear down the driver deterministically. On `TransportDied` it already
         // finished (abort is a no-op); otherwise abort ends it instead of hanging
         // until the chain drain-timeout (`drive_connection` has no shutdown hook).
-        // On `Shutdown`/`LocalError` this abruptly severs any in-flight relay
-        // stream — accepted, since those paths tear the client down anyway.
-        // `open_tx` is dropped by scope exit and is NOT load-bearing for teardown.
-        // A driver *panic* is a code bug, not a transport event — escalate to a
-        // fatal exit instead of reconnecting forever.
+        // On `Shutdown` this abruptly severs any in-flight relay stream — accepted,
+        // since that path tears the client down anyway. `open_tx` is dropped by
+        // scope exit and is NOT load-bearing for teardown.
+        // A driver panic is a code bug, not a transport event — exit rather than reconnect.
         driver.abort();
         if driver_panicked(driver.await) {
             return Err(anyhow::anyhow!("yamux driver task panicked"));
@@ -805,7 +816,6 @@ pub(crate) async fn run_client(
 
         match outcome {
             SessionOutcome::Shutdown => return Ok(()),
-            SessionOutcome::LocalError(e) => return Err(e),
             SessionOutcome::TransportDied => {
                 let was_productive = productive.load(Ordering::Relaxed);
                 failures = next_failures(failures, was_productive);
@@ -848,13 +858,22 @@ pub(crate) async fn run_server(
     }
 
     loop {
-        // Accept one underlying TCP connection.
+        // Accept one underlying TCP connection. A real accept error is rare and
+        // transient (see `run_client_session`'s local-accept rationale); log and
+        // keep serving rather than tearing down the whole plugin.
         let tcp = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             accept = listener.accept() => {
-                let (stream, peer) = accept.context("accept")?;
-                tracing::info!(peer = %peer, "accepted underlying connection");
-                stream
+                match accept {
+                    Ok((stream, peer)) => {
+                        tracing::info!(peer = %peer, "accepted underlying connection");
+                        stream
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "server accept error; continuing");
+                        continue;
+                    }
+                }
             }
         };
 

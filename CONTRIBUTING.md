@@ -239,6 +239,36 @@ installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
 
+### Yamux transport self-heal
+
+The galoshes yamux client ([`crates/galoshes/src/yamux.rs`](crates/galoshes/src/yamux.rs))
+reconnects after a transport reset instead of wedging the tunnel:
+
+- **Death detection.** The driver task owns the yamux `Connection` and drops its
+  inbound-stream sender when the connection ends; `run_client_session` seeing
+  `inbound_rx.recv() == None` is the transport-death signal — no separate
+  liveness poll is needed.
+- **Reconnect backoff.** Every reconnect waits at least `REMOTE_BACKOFF_BASE`
+  (a floor bounding a peer flapping right after one byte) and escalates
+  exponentially to `REMOTE_BACKOFF_MAX` on repeated failures.
+  "Productive" is **transport-level**, not application-level: `TransportLivenessTap`
+  sits below yamux framing and flags any inbound byte — relayed data or a bare
+  keepalive/flow-control frame alike — as liveness, which resets the backoff to
+  the floor. A session that never received a single inbound byte counts as a
+  failure and escalates.
+- **Teardown tradeoff.** On session end the driver is `abort()`-ed rather than
+  drained, so any relay stream still in flight is truncated. This trades a
+  handful of interrupted flows for a bounded, deterministic teardown instead of
+  hanging on a chain drain-timeout.
+- **Local errors don't tear down the tunnel.** A local `accept`/`recv` error on
+  the client's loopback listener, or the server's inbound listener, is logged
+  and the accept loop continues — reconnecting the transport wouldn't fix a
+  local socket error, and a broken listener is not what these errors indicate
+  (they're transient: a stray `ECONNABORTED`, momentary `EMFILE`).
+- **Scope boundary.** This detects a transport that visibly dies (FIN/RST,
+  yamux protocol error). A peer that goes silent without ever resetting the
+  connection (a black-holed link) is not detected by this mechanism — see #660.
+
 ### Fail-closed cover
 
 Two egress-block covers share the platform `Cover` guard (kind-aware `Drop`):

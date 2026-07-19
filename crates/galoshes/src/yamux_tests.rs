@@ -638,7 +638,6 @@ async fn pump_with_optional_reset(mut client: TcpStream, mut server: TcpStream, 
     }
 }
 
-/// Spawn a yamux server relaying to `upstream`; returns its listen address.
 async fn spawn_yamux_server(upstream: SocketAddr, shutdown: CancellationToken) -> SocketAddr {
     let (srv_tx, srv_rx) = oneshot::channel();
     tokio::spawn(run_server(
