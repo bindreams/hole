@@ -91,8 +91,8 @@ jobs:
         run: cargo xtask run clippy-ex-galoshes
 
       # Archive the ex-Galoshes crates plus the workspace tooling crates
-      # (kill-group, stepstool, dev-console, xtask, xtask-lib; #454) —
-      # consumed by test-garter / test-galoshes / test-tooling on all
+      # (kill-group, stepstool, dev-console, xtask, xtask-lib, payload-archive;
+      # #454) — consumed by test-garter / test-galoshes / test-tooling on all
       # platforms. Hole crates' compileability is already covered by `Clippy
       # (Hole workspace)` above; test-hole runs in its own build+test job below.
       # `--features garter/test-utils` builds garter's feature-gated
@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p ci-artifacts
-          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p stepstool -p dev-console -p xtask -p xtask-lib -p util --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
+          cargo nextest archive -p garter -p garter-bin -p galoshes -p kill-group -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
 
       # The artifact is consumed by test-garter, test-galoshes, and
       # test-tooling; test-hole does its own build.
@@ -245,7 +245,7 @@ jobs:
           cargo nextest run \
             --archive-file ci-artifacts/tests.tar.zst \
             --workspace-remap "${{ github.workspace }}" \
-            -E 'package(kill-group) + package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(util)'
+            -E 'package(kill-group) + package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(payload-archive) + package(util)'
 
   # test-hole runs a fresh build + nextest run (no archive). Hole tests have
   # too many environmental couplings (trybuild --offline registry, dist_fixture
