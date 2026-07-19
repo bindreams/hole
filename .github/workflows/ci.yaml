@@ -425,7 +425,10 @@ jobs:
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 45m (was 20m): this job intermittently hit the 20m ceiling during the
+    # post-job cache save with the actual work already green, cancelling a
+    # would-be pass. The extra headroom absorbs slow cold-sccache/cache runs.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
