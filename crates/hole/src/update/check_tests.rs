@@ -43,6 +43,13 @@ fn full_asset_set(version: &str) -> Vec<GitHubAsset> {
     ]
 }
 
+// ASSET_SUFFIX ========================================================================================================
+
+#[skuld::test]
+fn asset_suffix_matches_the_shared_release_source() {
+    assert_eq!(ASSET_SUFFIX, xtask_lib::asset::host_update_asset_suffix());
+}
+
 // candidate_tags ======================================================================================================
 
 #[skuld::test]

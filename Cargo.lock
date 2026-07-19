@@ -3459,6 +3459,7 @@ dependencies = [
  "drop_bomb",
  "dump",
  "ferrisetw",
+ "flate2",
  "garter",
  "handle-holders",
  "hex",
@@ -3476,6 +3477,7 @@ dependencies = [
  "kill-group",
  "libc",
  "lru",
+ "payload-archive",
  "plist",
  "plugin-e2e",
  "quinn",
@@ -3492,6 +3494,7 @@ dependencies = [
  "skuld",
  "smoltcp",
  "socket2",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tls-parser",
@@ -5482,6 +5485,18 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "payload-archive"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "skuld",
+ "tar",
+ "tempfile",
+ "tracing",
+ "zip",
+]
 
 [[package]]
 name = "pem"
@@ -11084,6 +11099,7 @@ dependencies = [
  "hole-common",
  "indexmap 2.14.0",
  "libc",
+ "payload-archive",
  "petgraph",
  "png 0.18.1",
  "serde",

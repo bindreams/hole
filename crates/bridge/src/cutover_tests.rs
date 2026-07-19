@@ -69,8 +69,9 @@ fn clear_marker_on_failure_clears_only_on_err() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn find_staged_exe_locates_hole_exe_in_nested_tree() {
-    // An MSI admin-install lays the exe into a versioned subtree, so the finder
-    // must recurse, not look at a fixed depth.
+    // The payload is a flat archive; the recursive walk is defense-in-depth
+    // against a non-flat layout, so the finder must recurse rather than look at a
+    // fixed depth. Nest the exe to exercise that recursion.
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("PFiles").join("hole");
     std::fs::create_dir_all(&nested).unwrap();
@@ -139,8 +140,9 @@ fn plan_windows_images_covers_full_bindir_set() {
     // of truth — NOT a hand-listed copy.
     let names = xtask_lib::bindir::bindir_dest_names(xtask_lib::bindir::Os::Windows);
 
-    // Stage a fake admin-install tree: an MSI lays the BINDIR component into a
-    // versioned subtree, so place every file under nested dirs.
+    // The payload is a flat archive; the recursive walk is defense-in-depth
+    // against a non-flat layout, so stage every file under nested dirs to
+    // exercise that recursion.
     let staging = tempfile::tempdir().unwrap();
     let nested = staging.path().join("PFiles").join("hole");
     std::fs::create_dir_all(&nested).unwrap();

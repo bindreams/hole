@@ -1,5 +1,6 @@
-//! Extract the bare binaries from the verified MSI/DMG onto the destination
-//! volume. The privileged bridge (SYSTEM/root) cannot trust the non-admin GUI
+//! Extract the bare binaries from the verified update archive onto the
+//! destination volume, in-process (no external unpacker). The privileged bridge
+//! (SYSTEM/root) cannot trust the non-admin GUI
 //! that hands it the payload over the IPC socket: it re-verifies the payload
 //! offline against the embedded minisign key before any irreversible step
 //! (fail-closed). A deeper Authenticode/codesign observation belongs here as
@@ -91,25 +92,12 @@ pub struct ExtractedImages {
     pub helper: PathBuf,
 }
 
-/// Build the Windows `msiexec /a` admin-install args that extract the MSI's
-/// full payload (every bundled binary) to `target_dir`. Quiet (`/qn`) so no UI.
-#[cfg(target_os = "windows")]
-pub fn msiexec_admin_args(msi: &Path, target_dir: &Path) -> Vec<String> {
-    vec![
-        "/a".into(),
-        msi.to_string_lossy().into_owned(),
-        "/qn".into(),
-        format!("TARGETDIR={}", target_dir.to_string_lossy()),
-    ]
-}
-
 /// Extract the bare binaries onto the destination volume.
 ///
-/// Windows: `msiexec /a` admin-install of the MSI into a staging dir on the same
+/// Windows: unzip the verified `.zip` payload into a staging dir on the same
 /// volume as the install dir (the cutover re-finds each bundled binary under
-/// it). macOS: `hdiutil
-/// attach` the DMG, copy the `.app` onto the destination volume (the DMG mount
-/// is a separate volume → `EXDEV`), then detach.
+/// it). macOS: untar-gz the verified payload's `Hole.app` onto the destination
+/// volume, then stage the helper.
 pub fn extract(payload_path: &Path, staging_parent: &Path) -> std::io::Result<ExtractedImages> {
     #[cfg(target_os = "windows")]
     {
@@ -132,13 +120,16 @@ pub use imp_windows::{find_staged, find_staged_exe};
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use imp_windows::find_file_inner;
 
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use imp_windows::extract_into;
+
 #[cfg(target_os = "windows")]
 mod imp_windows {
     use std::path::{Path, PathBuf};
 
-    use super::{msiexec_admin_args, ExtractedImages};
+    use super::ExtractedImages;
 
-    /// Subdirectory where the MSI payload lands.
+    /// Subdirectory where the unzipped payload lands.
     const STAGING_NAME: &str = ".update-staging";
     /// The binary used for the post-extract fail-closed presence check.
     pub const EXE_NAME: &str = "hole.exe";
@@ -156,8 +147,8 @@ mod imp_windows {
         find_staged(staging_dir, EXE_NAME)
     }
 
-    /// Extract into a staging dir guaranteed to be on the SAME volume as the
-    /// installed binary (the swap is `std::fs::rename`, which fails cross-device).
+    /// Unzip the payload into a staging dir on the SAME volume as the installed
+    /// binary (the swap is `std::fs::rename`, which fails cross-device).
     /// `_staging_parent` (the service state dir) is ignored on Windows: it may be
     /// on a different volume than Program Files, so the install dir is the only
     /// safe same-volume parent.
@@ -166,34 +157,34 @@ mod imp_windows {
             .parent()
             .ok_or_else(|| std::io::Error::other("current_exe has no parent dir"))?
             .to_path_buf();
+        extract_into(&install_dir, payload_path)
+    }
+
+    /// Unpack the payload into `install_dir/.update-staging`. `install_dir` is a
+    /// parameter (not re-derived from `current_exe`) so the staging-cleanup +
+    /// fail-closed wiring is testable.
+    pub(crate) fn extract_into(install_dir: &Path, payload_path: &Path) -> std::io::Result<ExtractedImages> {
         let staging_dir = install_dir.join(STAGING_NAME);
         // A leftover staging dir from a crashed prior attempt would poison the
-        // admin-install; start clean.
+        // unpack; start clean.
         if staging_dir.exists() {
             std::fs::remove_dir_all(&staging_dir)?;
         }
         std::fs::create_dir_all(&staging_dir)?;
 
-        let args = msiexec_admin_args(payload_path, &staging_dir);
-        let out = std::process::Command::new("msiexec").args(&args).output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "msiexec /a failed (code {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
+        payload_archive::unpack_zip(payload_path, &staging_dir)?;
 
         // Fail-closed: confirm hole.exe is present before the irreversible swap.
         find_staged_exe(&staging_dir)?;
         Ok(ExtractedImages { staging_dir })
     }
 
-    /// Find `name` anywhere under `root` (an MSI lays out files into a versioned
-    /// subtree, so the exe is not at a fixed depth). Guards against directory
-    /// symlink cycles: `is_dir()` follows symlinks, so a cycle would otherwise
-    /// recurse forever — a `visited` set of canonical paths breaks it. This is a
-    /// cycle BREAK, not a depth cap (the tree is otherwise traversed in full).
+    /// Find `name` anywhere under `root`. The payload zip is flat, so a top-level
+    /// scan would suffice; the recursive walk is defense-in-depth against a
+    /// non-flat archive layout. Guards against directory symlink cycles:
+    /// `is_dir()` follows symlinks, so a cycle would otherwise recurse forever —
+    /// a `visited` set of canonical paths breaks it. This is a cycle BREAK, not a
+    /// depth cap (the tree is otherwise traversed in full).
     fn find_file(root: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
         let mut visited = std::collections::HashSet::new();
         find_file_inner(root, name, &mut visited)
@@ -229,6 +220,9 @@ mod imp_windows {
 
 #[cfg(target_os = "macos")]
 mod imp_macos {
+    //! Unpack the verified `.tar.gz` payload in-process, select its single
+    //! `Hole.app`, and stage the helper Mach-O beside it.
+    //!
     //! Same-volume assumption: `/Applications`, `/Library`, and `/var` (the
     //! staging parent) are firmlinks into the one shared APFS Data volume on a
     //! standard install, so staging here is same-volume with both swap
@@ -236,7 +230,7 @@ mod imp_macos {
     //! assumed away: `swap_one`'s `same_volume` check fails closed (EXDEV) before
     //! any irreversible step.
 
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::ExtractedImages;
 
@@ -256,35 +250,11 @@ mod imp_macos {
         }
         std::fs::create_dir_all(&staging_dir)?;
 
-        let mount = tempfile::TempDir::with_prefix("hole-cutover-mount-")?;
-        let attach = std::process::Command::new("hdiutil")
-            .args([
-                "attach",
-                "-nobrowse",
-                "-quiet",
-                "-mountpoint",
-                &mount.path().to_string_lossy(),
-                &payload_path.to_string_lossy(),
-            ])
-            .output()?;
-        if !attach.status.success() {
-            return Err(std::io::Error::other(format!(
-                "hdiutil attach failed: {}",
-                String::from_utf8_lossy(&attach.stderr)
-            )));
-        }
+        payload_archive::unpack_targz(payload_path, &staging_dir)?;
+        let app = payload_archive::find_single_app(&staging_dir)?;
 
-        // Everything after a successful attach must go through detach.
-        let result = copy_from_mount(mount.path(), &staging_dir);
-        let _ = std::process::Command::new("hdiutil")
-            .args(["detach", &mount.path().to_string_lossy()])
-            .output();
-
-        let app = result?;
-        // Stage the helper as a sibling of the `.app`. It is copied from the
-        // bundle's in-app Mach-O, then swapped independently into HELPER_PATH —
-        // the app swap deletes the staged `.app`, so a helper path inside it
-        // would be gone (ENOENT) by the time the helper swap runs.
+        // Stage the helper as a sibling of the `.app` (the app swap deletes the
+        // staged `.app`, so a helper path inside it would vanish before its swap).
         let helper = staging_dir.join(STAGED_HELPER_NAME);
         std::fs::copy(app.join(HELPER_IN_APP), &helper)?;
         Ok(ExtractedImages {
@@ -292,31 +262,6 @@ mod imp_macos {
             app,
             helper,
         })
-    }
-
-    /// Copy the `.app` bundle off the (separate-volume) DMG mount onto the
-    /// destination volume so the later swap is same-volume.
-    fn copy_from_mount(mount: &Path, staging_dir: &Path) -> std::io::Result<PathBuf> {
-        let app_entry = std::fs::read_dir(mount)?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().extension().is_some_and(|ext| ext == "app"))
-            .ok_or_else(|| std::io::Error::other("no .app bundle found in DMG"))?;
-        let app_src = app_entry.path();
-        let app_name = app_src
-            .file_name()
-            .ok_or_else(|| std::io::Error::other("DMG .app entry has no filename"))?;
-        let app_dest = staging_dir.join(app_name);
-
-        let out = std::process::Command::new("/bin/cp")
-            .args(["-R", &app_src.to_string_lossy(), &app_dest.to_string_lossy()])
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "copy .app off DMG failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        Ok(app_dest)
     }
 }
 

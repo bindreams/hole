@@ -142,17 +142,33 @@ pub fn default_log_dir() -> PathBuf {
     crate::paths::default_user_subdir("logs")
 }
 
-/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
-/// else [`default_log_dir`]. A blank `HOLE_LOG_DIR` is ignored.
-pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
-    let env_dir = std::env::var_os("HOLE_LOG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    resolve_log_dir_from(override_dir, env_dir)
+/// Read `HOLE_LOG_DIR` as an override directory; a blank value is treated as
+/// unset. The one impure seam behind the log-dir resolvers.
+pub fn hole_log_dir_env() -> Option<PathBuf> {
+    nonblank_dir(std::env::var_os("HOLE_LOG_DIR"))
 }
 
-fn resolve_log_dir_from(override_dir: Option<PathBuf>, env_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.or(env_dir).unwrap_or_else(default_log_dir)
+/// Drop a blank value so an empty `HOLE_LOG_DIR=` falls through to the next
+/// resolution tier instead of resolving to a bare relative path.
+fn nonblank_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Resolve the log directory: explicit `override_dir`, else `HOLE_LOG_DIR`,
+/// else [`default_log_dir`].
+pub fn resolve_log_dir(override_dir: Option<PathBuf>) -> PathBuf {
+    resolve_log_dir_from(override_dir, hole_log_dir_env(), default_log_dir)
+}
+
+/// Pure resolution core: `override_dir`, else `env_dir`, else `fallback()`.
+/// `fallback` is a closure so callers can supply something other than
+/// [`default_log_dir`].
+pub fn resolve_log_dir_from(
+    override_dir: Option<PathBuf>,
+    env_dir: Option<PathBuf>,
+    fallback: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    override_dir.or(env_dir).unwrap_or_else(fallback)
 }
 
 // Per-sink directive resolution =======================================================================================

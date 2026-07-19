@@ -865,6 +865,9 @@ Default dir is `dirs::state_dir()/hole/logs` (`gui.log`, `bridge.log`):
 - Windows `%LOCALAPPDATA%\hole\logs\`, macOS `~/Library/Application Support/hole/logs/`
 - Installed service: Windows `C:\ProgramData\hole\logs\`, macOS `/var/log/hole/`
 
+`hole bridge log` defaults to the installed-service dir; override with `--log-dir`
+or `HOLE_LOG_DIR` to read a foreground/dev bridge's log.
+
 ### WebView2 and Chromium logs
 
 Windows WebView2 writes Chromium-format lines (`[MMDD/HHMMSS.mmm:LEVEL:file:line]`)

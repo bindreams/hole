@@ -24,6 +24,7 @@ ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG
 glob = "0.3"
 xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version"] }
 hole-common = { path = "../crates/common" } # `gen-ui-constants` reads NETWORK_BLOCKED_MESSAGE
+payload-archive = { path = "../crates/payload-archive" } # `update-archive` packs the per-platform payload via the shared pack_* the bridge unpacks with
 
 # `cargo xtask wintun` / `cargo xtask golangci-lint` (download + extract +
 # SHA256-verify runtime/lint binaries). Deps are unconditional so the workspace

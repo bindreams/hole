@@ -604,20 +604,46 @@ fn resolve_log_dir_prefers_explicit_override() {
     let got = super::resolve_log_dir_from(
         Some(std::path::PathBuf::from("/explicit")),
         Some(std::path::PathBuf::from("/env")),
+        super::default_log_dir,
     );
     assert_eq!(got, std::path::PathBuf::from("/explicit"));
 }
 
 #[skuld::test]
 fn resolve_log_dir_uses_env_when_no_override() {
-    let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")));
+    let got = super::resolve_log_dir_from(None, Some(std::path::PathBuf::from("/env")), super::default_log_dir);
     assert_eq!(got, std::path::PathBuf::from("/env"));
 }
 
 #[skuld::test]
 fn resolve_log_dir_falls_back_to_default() {
-    let got = super::resolve_log_dir_from(None, None);
+    let got = super::resolve_log_dir_from(None, None, super::default_log_dir);
     assert_eq!(got, super::default_log_dir());
+}
+
+#[skuld::test]
+fn resolve_log_dir_from_uses_supplied_fallback() {
+    let got = super::resolve_log_dir_from(None, None, || std::path::PathBuf::from("/service"));
+    assert_eq!(got, std::path::PathBuf::from("/service"));
+}
+
+#[skuld::test]
+fn nonblank_dir_keeps_nonempty() {
+    assert_eq!(
+        super::nonblank_dir(Some("/x".into())),
+        Some(std::path::PathBuf::from("/x"))
+    );
+}
+
+#[skuld::test]
+fn nonblank_dir_drops_blank() {
+    // An empty HOLE_LOG_DIR= must fall through, not resolve to a bare path.
+    assert_eq!(super::nonblank_dir(Some("".into())), None);
+}
+
+#[skuld::test]
+fn nonblank_dir_drops_absent() {
+    assert_eq!(super::nonblank_dir(None), None);
 }
 
 // Per-sink composition ------------------------------------------------------------------------------------------------

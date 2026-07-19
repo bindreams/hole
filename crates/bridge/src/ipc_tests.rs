@@ -2071,3 +2071,35 @@ fn own_process_start_time_is_nonzero() {
     // The fallback-to-0 poison sentinel must not be hit for a live self-probe.
     assert_ne!(hole_common::process::process_start_time(std::process::id()), Some(0));
 }
+
+#[skuld::test]
+fn extraction_failure_omits_the_path() {
+    // An IPC error message reaches a GUI toast verbatim, so the path-bearing
+    // detail must land in bridge.log while the client message stays PII-free.
+    use garter::test_utils::WaitableWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+
+    let writer = WaitableWriter::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _g = set_default_in_current_thread(subscriber);
+
+    let e = io::Error::other("read C:\\ProgramData\\hole\\state\\.update-staging\\hole.exe");
+    let (code, message) = super::extraction_failure(&e);
+
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !message.contains("ProgramData"),
+        "message must not carry the path: {message}"
+    );
+    assert!(
+        !message.contains('\\'),
+        "message must not carry a path separator: {message}"
+    );
+
+    // The path-bearing detail must still reach bridge.log for diagnosis.
+    let log = writer.snapshot();
+    assert!(log.contains("ProgramData"), "log must carry the redacted detail: {log}");
+}

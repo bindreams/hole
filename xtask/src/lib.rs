@@ -29,6 +29,7 @@ pub mod orchestrate;
 pub mod stage;
 pub mod target;
 pub mod test_binaries;
+pub mod update_archive;
 pub mod upstream_v2ray;
 pub mod wintun;
 
@@ -210,6 +211,23 @@ pub enum Command {
         #[arg(long)]
         out_dir: Option<PathBuf>,
     },
+    /// Build the host-platform update-payload archive at `--out`.
+    ///
+    /// Windows produces a flat `.zip` naming each entry by its BINDIR
+    /// `dest_name` (so ex-ray's `ex-ray-<triple>.exe` lands as `ex-ray.exe`);
+    /// macOS produces a `.tar.gz` of the built `Hole.app`. The bridge unpacks it
+    /// during update cutover via the shared `payload-archive` crate.
+    UpdateArchive {
+        /// Destination archive path (`.zip` on Windows, `.tar.gz` on macOS).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
+    ///
+    /// The release workflow captures it to name the published archive; the
+    /// single source (`xtask_lib::asset`) is shared with the updater so the
+    /// publish name and the download name cannot drift.
+    AssetSuffix,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -269,6 +287,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::GenUiConstants { check } => gen_ui_constants::write_or_check(&repo_root()?, check),
         Command::DmgBackground { out_dir } => run_dmg_background(out_dir),
+        Command::UpdateArchive { out } => {
+            let repo_root = repo_root()?;
+            update_archive::build_update_archive(Profile::Release, &repo_root, &out)?;
+            println!("xtask: update archive written to {}", out.display());
+            Ok(())
+        }
+        Command::AssetSuffix => {
+            println!("{}", xtask_lib::asset::host_update_asset_suffix());
+            Ok(())
+        }
     }
 }
 

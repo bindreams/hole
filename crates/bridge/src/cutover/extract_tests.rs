@@ -2,18 +2,36 @@ use super::*;
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn msiexec_admin_args_are_quiet_admin_install_to_targetdir() {
-    let args = msiexec_admin_args(
-        Path::new(r"C:\dl\hole.msi"),
-        Path::new(r"C:\Program Files\hole\.update-staging"),
-    );
-    assert_eq!(args[0], "/a", "admin (extract-only) install");
-    assert!(args.iter().any(|a| a == r"C:\dl\hole.msi"), "the MSI path");
-    assert!(args.iter().any(|a| a == "/qn"), "admin install must be silent");
-    assert!(
-        args.iter().any(|a| a.starts_with("TARGETDIR=")),
-        "must target the staging dir"
-    );
+fn extract_into_unzips_and_wipes_leftover_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path();
+    let zip = install_dir.join("payload.zip");
+    payload_archive::pack_zip(
+        &[
+            (write_tmp(&dir, "hole", b"HOLE"), "hole.exe".to_string()),
+            (write_tmp(&dir, "exray", b"EXRAY"), "ex-ray.exe".to_string()),
+        ],
+        &zip,
+    )
+    .unwrap();
+
+    // A poisoned leftover staging dir from a prior attempt must be wiped.
+    let staging = install_dir.join(".update-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("stale.txt"), b"old").unwrap();
+
+    let images = extract_into(install_dir, &zip).unwrap();
+    assert_eq!(images.staging_dir, staging);
+    assert!(!staging.join("stale.txt").exists(), "leftover staging must be wiped");
+    assert!(find_staged_exe(&images.staging_dir).is_ok());
+    assert!(find_staged(&images.staging_dir, "ex-ray.exe").is_ok());
+}
+
+#[cfg(target_os = "windows")]
+fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let p = dir.path().join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p
 }
 
 // `reverify` is locked to the production minisign key, so a present-but-unsigned
@@ -105,4 +123,48 @@ fn stage_payload_private_dir_is_owner_only() {
 
     let mode = std::fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "the private staging dir must be owner-only");
+}
+
+#[cfg(target_os = "macos")]
+fn write_app_targz(path: &std::path::Path) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("Hole.app");
+    std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    std::fs::write(app.join("Contents/MacOS/hole"), b"MACHO").unwrap();
+    payload_archive::pack_targz(&app, path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn extract_finds_app_and_stages_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let targz = dir.path().join("payload.tar.gz");
+    write_app_targz(&targz);
+
+    let images = imp_macos::extract(&targz, dir.path()).unwrap();
+    assert!(images.app.ends_with("Hole.app"));
+    assert!(images.helper.exists());
+    assert_eq!(std::fs::read(&images.helper).unwrap(), b"MACHO");
+}
+
+// find_single_app's zero-AND-many error contract is unit-tested in
+// payload-archive (find_single_app_errs_on_zero_and_on_many); here we prove
+// imp_macos::extract SURFACES that error — a two-`.app` archive fails loud.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn extract_surfaces_the_app_count_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("root");
+    std::fs::create_dir_all(src.join("A.app")).unwrap();
+    std::fs::create_dir_all(src.join("B.app")).unwrap();
+    let targz = dir.path().join("two.tar.gz");
+    {
+        let out = std::fs::File::create(&targz).unwrap();
+        let enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
+        let mut b = tar::Builder::new(enc);
+        b.append_dir_all(".", &src).unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+    }
+    let err = imp_macos::extract(&targz, dir.path()).unwrap_err();
+    assert!(err.to_string().contains("exactly one .app"), "got: {err}");
 }
