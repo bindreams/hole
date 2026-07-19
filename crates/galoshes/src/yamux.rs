@@ -650,15 +650,13 @@ async fn run_client_session(
                 }
             }
             accept = tcp_listener.accept() => {
-                // The listener is the loopback SS_LOCAL socket accepting from the
-                // trusted local ss-service: a real accept error is rare and transient
-                // (a stray ECONNABORTED, or momentary EMFILE that clears as flows
-                // finish), not a permanently-broken listener — and reconnecting the
-                // transport would not fix a local error anyway.
+                // A local accept error on the loopback listener is transient and
+                // not fixed by reconnecting the transport; log and continue.
                 let (tcp_stream, _peer) = match accept {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::debug!(error = %e, "local tcp accept error; continuing");
+                        tokio::task::yield_now().await;
                         continue;
                     }
                 };
@@ -691,6 +689,7 @@ async fn run_client_session(
                     Ok(v) => v,
                     Err(e) => {
                         tracing::debug!(error = %e, "local udp recv error; continuing");
+                        tokio::task::yield_now().await;
                         continue;
                     }
                 };
@@ -805,9 +804,6 @@ pub(crate) async fn run_client(
         // Tear down the driver deterministically. On `TransportDied` it already
         // finished (abort is a no-op); otherwise abort ends it instead of hanging
         // until the chain drain-timeout (`drive_connection` has no shutdown hook).
-        // On `Shutdown` this abruptly severs any in-flight relay stream — accepted,
-        // since that path tears the client down anyway. `open_tx` is dropped by
-        // scope exit and is NOT load-bearing for teardown.
         // A driver panic is a code bug, not a transport event — exit rather than reconnect.
         driver.abort();
         if driver_panicked(driver.await) {
@@ -871,6 +867,7 @@ pub(crate) async fn run_server(
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "server accept error; continuing");
+                        tokio::task::yield_now().await;
                         continue;
                     }
                 }
