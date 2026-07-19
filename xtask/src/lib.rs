@@ -35,7 +35,10 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
-#[cfg(test)]
+// These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
+// the DMG background is a darwin-only feature, so gate them to macOS. They fail
+// loudly on macOS if the font is missing — other platforms simply lack the feature.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "dmg_background_tests.rs"]
 mod dmg_background_tests;
 #[cfg(test)]
