@@ -235,15 +235,21 @@ fn real_background_recolored_quote_rule_and_icons() {
             .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x3a, 0x3a, 0x3c)),
         "quote #3a3a3c missing"
     );
-    // The rule is a vertical stroke at the left margin (x≈46); the hand icon uses
-    // the same #0a84ff but sits inline far to the right (x>180). Restrict to the
-    // left column so this assertion can't alias with the hand icon.
+    // The blue rule (#0a84ff) is a tall vertical stroke (spans the ~2-line quote);
+    // the hand icon uses the same blue but is a compact ~18pt blob. Identify the
+    // rule by a column with many blue pixels — margin/spacing independent, so this
+    // survives layout tuning (unlike a hardcoded x-cutoff) and can't alias with the
+    // hand (whose tallest column is ≤ the 18pt icon height).
+    let mut blue_per_col = vec![0u32; w as usize];
+    for (i, p) in rgba.chunks_exact(4).enumerate() {
+        if p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff) {
+            blue_per_col[(i as u32 % w) as usize] += 1;
+        }
+    }
     assert!(
-        rgba.chunks_exact(4).enumerate().any(|(i, p)| {
-            let x = (i as u32) % w;
-            x < 100 && p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff)
-        }),
-        "rule #0a84ff missing near left margin"
+        blue_per_col.iter().any(|&c| c >= 25),
+        "blue rule stroke missing (tallest blue column only {} px)",
+        blue_per_col.iter().max().copied().unwrap_or(0)
     );
     assert!(
         rgba.chunks_exact(4)
