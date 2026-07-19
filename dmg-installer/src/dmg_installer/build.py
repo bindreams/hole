@@ -35,9 +35,14 @@ def build_dmg_at(root: Path, app: Path, dmg_path: Path, background_dir: Path | N
     `background_dir` (default `<root>/.cache/dmg`) holds background.png + @2x; tests
     pass a private dir so they never share the repo-global cache.
     """
-    background = (background_dir or root / ".cache" / "dmg") / "background.png"  # @2x via lookForHiDPI
-    if not background.is_file():
-        raise dmg_installer.DmgTestError(f"background missing at {background} — run `cargo xtask dmg-background` first")
+    bg_dir = background_dir or root / ".cache" / "dmg"
+    background = bg_dir / "background.png"
+    background_2x = bg_dir / "background@2x.png"  # dmgbuild's lookForHiDPI pairs it
+    missing = [str(p) for p in (background, background_2x) if not p.is_file()]
+    if missing:
+        raise dmg_installer.DmgTestError(
+            f"background PNG(s) missing: {missing} — run `cargo xtask dmg-background` first"
+        )
     width, height = layout.WINDOW
     dmg_path.unlink(missing_ok=True)  # keep the single-.dmg invariant find_built_dmg relies on
     dmgbuild.build_dmg(

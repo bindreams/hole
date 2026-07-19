@@ -1,4 +1,4 @@
-"""Build a preview DMG for eyeballing the installer window (Task 7 visual check).
+"""Build a preview DMG for eyeballing the installer window.
 
 Prefers the REAL built Hole.app (accurate custom icon) if present; otherwise a
 dummy bundle, printing a caveat that the icon is not representative. Writes to

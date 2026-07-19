@@ -5,18 +5,17 @@ parents[] index, list-vs-tuple) would otherwise surface only in the
 DMG-dependent layout tests. This is the direct unit guard.
 """
 
-import json
-from pathlib import Path
-
 from dmg_installer import layout
 
 
-def test_layout_matches_json() -> None:
-    geo = json.loads((Path(layout.__file__).resolve().parents[3] / "crates/hole/dmg/layout.json").read_text())
-    assert layout.WINDOW == tuple(geo["window"])
-    assert layout.ICON_SIZE == geo["icon_size"]
-    assert layout.APP_POS == tuple(geo["app_pos"])
-    assert layout.APPFOLDER_POS == tuple(geo["appfolder_pos"])
+def test_layout_is_expected_geometry() -> None:
+    # Hand-picked canonical geometry (a deliberate tripwire, independent of
+    # layout.json's own parse): catches a wrong value in layout.json OR a mis-parse
+    # in layout.py (e.g. list instead of tuple). Update deliberately if geometry changes.
+    assert layout.WINDOW == (660, 560)
+    assert layout.ICON_SIZE == 128
+    assert layout.APP_POS == (196, 128)
+    assert layout.APPFOLDER_POS == (464, 128)
 
 
 def test_tiff_pos_is_off_window() -> None:

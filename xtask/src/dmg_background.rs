@@ -21,7 +21,7 @@ const ARROW_HALF_W: i64 = 46;
 const ARROW_HALF_H: i64 = 22;
 
 /// The render family. Requires exactly one face named exactly "SF NS" (the
-/// spike-verified system-font family), so a swapped/absent font — or a different
+/// system-font family), so a swapped/absent font — or a different
 /// SF-branded face like "SF Mono" — fails loudly rather than shipping wrong text.
 pub(crate) fn pick_family(families: &[String]) -> Result<String> {
     match families {
@@ -94,8 +94,10 @@ pub fn render_typst(
     }
     let compiled = engine.compile_with_input::<_, PagedDocument>(dict);
 
-    // typst 0.15.1 emits ZERO warnings for SFNS.ttf. Any warning is an unexpected
-    // regression: fail loudly with ALL messages for debuggability.
+    // Propagate a real compile error first (full detail) so it isn't masked by the
+    // warnings check when both occur; then treat ANY warning as a hard error (typst
+    // 0.15.1 emits zero for SFNS.ttf — verified).
+    let doc = compiled.output.map_err(|e| anyhow!("typst compile failed: {e:?}"))?;
     if !compiled.warnings.is_empty() {
         let msgs = compiled
             .warnings
@@ -105,7 +107,6 @@ pub fn render_typst(
             .join("; ");
         return Err(anyhow!("unexpected typst warning(s): {msgs}"));
     }
-    let doc = compiled.output.map_err(|e| anyhow!("typst compile failed: {e:?}"))?;
 
     // Fixed page size ⇒ page 1 is always full-size; a 2nd page is the only
     // (vertical) overflow signal. Horizontal clip is caught by the edge-ring test.
@@ -174,9 +175,11 @@ pub(crate) fn render_all(repo_root: &Path) -> Result<Vec<(&'static str, Vec<u8>)
 }
 
 /// Render into `out_dir` (a dedicated directory holding only the pair). Stages both
-/// PNGs in a sibling `.<name>.staging` dir, then swaps it onto `out_dir` with a
-/// single rename — so out_dir flips old→new atomically, never a mismatched pair. A
-/// kill mid-swap leaves out_dir absent (build_dmg_at rejects that loudly).
+/// PNGs in a sibling `.<name>.staging` dir, then swaps it onto `out_dir` by moving
+/// any existing out_dir aside with a single atomic rename, renaming staging into
+/// place, and dropping the aside — so out_dir is only ever the complete old pair,
+/// absent, or the new pair, never a mismatched partial. A kill mid-swap leaves
+/// out_dir absent (build_dmg_at rejects that loudly).
 pub fn build(repo_root: &Path, out_dir: &Path) -> Result<()> {
     let outputs = render_all(repo_root)?;
     let parent = out_dir.parent().context("out_dir has no parent")?;
@@ -189,7 +192,16 @@ pub fn build(repo_root: &Path, out_dir: &Path) -> Result<()> {
     for (fname, bytes) in &outputs {
         std::fs::write(staging.join(fname), bytes).with_context(|| format!("writing staging {fname}"))?;
     }
-    let _ = std::fs::remove_dir_all(out_dir);
+    // Swap atomically: move any existing out_dir aside with a single rename (out_dir
+    // becomes momentarily ABSENT, never partial), put the new pair in place, then drop
+    // the old aside. So out_dir is only ever the complete old pair, absent, or the new
+    // pair — a kill mid-swap leaves it absent (build_dmg_at rejects that loudly).
+    let aside = parent.join(format!(".{name}.old"));
+    let _ = std::fs::remove_dir_all(&aside);
+    if out_dir.exists() {
+        std::fs::rename(out_dir, &aside).with_context(|| format!("moving old {} aside", out_dir.display()))?;
+    }
     std::fs::rename(&staging, out_dir).with_context(|| format!("swapping staging into {}", out_dir.display()))?;
+    let _ = std::fs::remove_dir_all(&aside);
     Ok(())
 }

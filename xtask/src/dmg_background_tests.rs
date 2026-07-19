@@ -102,13 +102,45 @@ fn build_swaps_atomic_pair_no_staging_leftover() {
 }
 
 #[skuld::test]
+fn build_recovers_from_stale_staging_and_aside() {
+    let base = tempfile::tempdir().unwrap();
+    let out = base.path().join("dmgbg");
+    // Leftovers a previously-killed build could strand:
+    std::fs::create_dir_all(base.path().join(".dmgbg.staging")).unwrap();
+    std::fs::write(base.path().join(".dmgbg.staging/garbage"), b"stale").unwrap();
+    std::fs::create_dir_all(base.path().join(".dmgbg.old")).unwrap();
+    std::fs::write(base.path().join(".dmgbg.old/garbage"), b"stale").unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("background.png"), b"old").unwrap();
+
+    crate::dmg_background::build(&crate::repo_root().unwrap(), &out).unwrap();
+
+    for (name, want) in [
+        ("background.png", (660u32, 560u32)),
+        ("background@2x.png", (1320, 1120)),
+    ] {
+        assert_eq!(png_dims(&std::fs::read(out.join(name)).unwrap()), want, "{name}");
+    }
+    assert!(
+        !base.path().join(".dmgbg.staging").exists(),
+        "stale staging not cleaned"
+    );
+    assert!(!base.path().join(".dmgbg.old").exists(), "aside not cleaned");
+}
+
+#[skuld::test]
 fn background_inputs_carries_window_and_derived_arrow() {
     let (source, [w, h], inputs) = background_inputs(&crate::repo_root().unwrap()).unwrap();
     assert_eq!([w, h], [660, 560]);
     let get = |k: &str| inputs.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.clone());
     assert_eq!(get("window_w").as_deref(), Some("660"));
-    // Arrow x-offset = icon midpoint (330) − half the 92pt arrow width (46) = 284.
-    assert_eq!(get("arrow_dx").as_deref(), Some("284"));
+    // Arrow bbox is 92pt wide (background.typ's polygon), centered on the icon
+    // midpoint — derived from layout.json here, independent of background_inputs's own
+    // ARROW_HALF_W, so a wrong constant/formula is caught. (drag_arrow_centroid_at_icon_midpoint
+    // is the end-to-end pixel oracle.)
+    let g = geo();
+    let expected_dx = ((g.app_pos[0] + g.appfolder_pos[0]) / 2) as i64 - 92 / 2;
+    assert_eq!(get("arrow_dx").as_deref(), Some(expected_dx.to_string().as_str()));
     assert!(!source.is_empty());
 }
 

@@ -86,10 +86,9 @@ def installed_app(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 
         yield dst_app
     finally:
-        subprocess.run(
-            ["hdiutil", "detach", "-quiet", str(mount_dir)],
-            check=False,
-        )
+        r = subprocess.run(["hdiutil", "detach", str(mount_dir)], capture_output=True, text=True)
+        if r.returncode != 0:
+            warnings.warn(f"hdiutil detach {mount_dir} failed (rc={r.returncode}): {r.stderr.strip()}")
 
 
 @pytest.fixture(scope="module")
