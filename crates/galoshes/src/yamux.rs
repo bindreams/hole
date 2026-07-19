@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+// `Context` alone would collide with `anyhow::Context` (the `.context()` combinator, used
+// throughout this file); the tap's poll methods spell out `std::task::Context` instead.
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -277,6 +282,61 @@ fn disable_udp_connreset(sock: &std::net::UdpSocket) -> std::io::Result<()> {
 async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Result<()> {
     stream.write_all(&[tag.to_byte()]).await?;
     stream.flush().await
+}
+
+// Liveness tap ========================================================================================================
+
+/// Wraps the yamux transport and sets `productive` on the first inbound byte.
+///
+/// `run_client` gives this to `yamux::Connection::new`, so the tap is polled only
+/// by the driver task; reading `productive` after `driver.await` therefore has a
+/// happens-before edge to every write here (no cross-task race). It sits *below*
+/// yamux framing, so any inbound frame counts — relayed data or flow-control /
+/// keepalive frames alike. That is deliberate: it measures *transport*-level
+/// liveness (the far yamux peer responded), which is the correct signal for a
+/// transport reconnect, not end-to-end application relay.
+// Wired into `run_client` in a later change; only `#[cfg(test)]` calls it today,
+// so the non-test lib build sees the struct and constructor as unused.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TransportLivenessTap<T> {
+    inner: T,
+    productive: Arc<AtomicBool>,
+}
+
+impl<T> TransportLivenessTap<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(inner: T, productive: Arc<AtomicBool>) -> Self {
+        Self { inner, productive }
+    }
+}
+
+impl<T: futures::AsyncRead + Unpin> futures::AsyncRead for TransportLivenessTap<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            if *n > 0 {
+                me.productive.store(true, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+}
+
+impl<T: futures::AsyncWrite + Unpin> futures::AsyncWrite for TransportLivenessTap<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
 }
 
 /// Relay between a tokio TCP stream and a yamux stream (bidirectional),

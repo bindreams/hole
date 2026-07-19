@@ -4,6 +4,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -17,7 +19,7 @@ use garter::tracing_test::set_default_in_current_thread;
 use crate::yamux::{
     connect_delay, connect_retrying, deframe_udp_datagram, frame_udp_datagram, next_failures, parse_udp_timeout,
     run_client, run_server, session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, StreamTag,
-    DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -529,4 +531,42 @@ fn session_reconnect_backoff_schedule() {
             "@ {failures}"
         );
     }
+}
+
+// TransportLivenessTap ------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+async fn transport_tap_sets_on_inbound_bytes() {
+    use futures::AsyncReadExt as _;
+    let productive = Arc::new(AtomicBool::new(false));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(b"data".to_vec()), Arc::clone(&productive));
+    let mut buf = [0u8; 8];
+    assert_eq!(tap.read(&mut buf).await.unwrap(), 4);
+    assert!(productive.load(Ordering::Relaxed));
+}
+
+#[skuld::test]
+async fn transport_tap_silent_on_eof() {
+    use futures::AsyncReadExt as _;
+    let productive = Arc::new(AtomicBool::new(false));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(Vec::new()), Arc::clone(&productive));
+    let mut buf = [0u8; 8];
+    assert_eq!(tap.read(&mut buf).await.unwrap(), 0);
+    assert!(!productive.load(Ordering::Relaxed));
+}
+
+#[skuld::test]
+async fn transport_tap_delegates_writes() {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_util::compat::TokioAsyncReadCompatExt as _;
+    let productive = Arc::new(AtomicBool::new(false));
+    let (a, b) = tokio::io::duplex(64);
+    let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&productive));
+    tap.write_all(b"ping").await.unwrap();
+    tap.flush().await.unwrap();
+    let mut b = b.compat();
+    let mut buf = [0u8; 4];
+    b.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    assert!(!productive.load(Ordering::Relaxed), "writes never set productive");
 }
