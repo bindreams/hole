@@ -362,6 +362,34 @@ pub(crate) fn connect_delay(remote: SocketAddr, attempt: u32) -> Duration {
     }
 }
 
+/// Consecutive-failure count after a session ends. A **productive** session (the
+/// server sent bytes back) resets the count so the next reconnect is at the floor;
+/// an unproductive one increments it so repeated failures escalate. Saturating.
+// Wired into the reconnect loop in a later change; only `#[cfg(test)]` calls it
+// today, so the non-test lib build sees it as unused.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn next_failures(prev: u32, productive: bool) -> u32 {
+    if productive {
+        0
+    } else {
+        prev.saturating_add(1)
+    }
+}
+
+/// Backoff before reconnecting after `failures` consecutive failed sessions.
+/// Every reconnect waits at least `REMOTE_BACKOFF_BASE` — a floor that bounds a
+/// peer flapping right after delivering one byte — and sustained failures
+/// escalate exponentially to `REMOTE_BACKOFF_MAX`.
+// Same as `next_failures` above: only exercised by tests until the reconnect
+// loop lands.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn session_reconnect_backoff(failures: u32) -> Duration {
+    let step = failures.max(1) - 1;
+    REMOTE_BACKOFF_BASE
+        .saturating_mul(1u32.checked_shl(step).unwrap_or(u32::MAX))
+        .min(REMOTE_BACKOFF_MAX)
+}
+
 /// Connect to `addr`, retrying until it succeeds or `shutdown` fires. Retries
 /// are unbounded by design — the peer (a chain sibling or a real server) is
 /// expected to come up. While it is down, work sent to the client's local

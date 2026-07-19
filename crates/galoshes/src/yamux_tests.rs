@@ -15,9 +15,9 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    connect_delay, connect_retrying, deframe_udp_datagram, frame_udp_datagram, parse_udp_timeout, run_client,
-    run_server, ClientBoundAddrs, FrameAccumulator, StreamTag, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
-    REMOTE_BACKOFF_MAX,
+    connect_delay, connect_retrying, deframe_udp_datagram, frame_udp_datagram, next_failures, parse_udp_timeout,
+    run_client, run_server, session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, StreamTag,
+    DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -492,4 +492,41 @@ async fn connect_retrying_retries_until_the_peer_listens() {
         "must connect once the peer starts listening"
     );
     shutdown.cancel();
+}
+
+// Reconnect backoff ---------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn next_failures_resets_on_productive_and_increments_otherwise() {
+    assert_eq!(next_failures(0, true), 0);
+    assert_eq!(next_failures(5, true), 0);
+    assert_eq!(next_failures(0, false), 1);
+    assert_eq!(next_failures(3, false), 4);
+    assert_eq!(next_failures(u32::MAX, false), u32::MAX);
+}
+
+#[skuld::test]
+fn session_reconnect_backoff_schedule() {
+    // Contract properties (independent of any literal table): a floor at the base,
+    // doubling per failure, capped at the max.
+    assert_eq!(session_reconnect_backoff(0), REMOTE_BACKOFF_BASE);
+    assert_eq!(session_reconnect_backoff(1), REMOTE_BACKOFF_BASE);
+    for n in 1..14u32 {
+        assert_eq!(
+            session_reconnect_backoff(n + 1),
+            (session_reconnect_backoff(n) * 2).min(REMOTE_BACKOFF_MAX),
+            "doubling @ {n}"
+        );
+    }
+    assert_eq!(session_reconnect_backoff(u32::MAX), REMOTE_BACKOFF_MAX);
+
+    // Golden literals as a readable cross-check (mirrors the connect_delay tests).
+    let expected_ms = [100u64, 100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 30000, 30000];
+    for (failures, ms) in expected_ms.iter().enumerate() {
+        assert_eq!(
+            session_reconnect_backoff(failures as u32),
+            Duration::from_millis(*ms),
+            "@ {failures}"
+        );
+    }
 }
