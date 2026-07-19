@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use garter::test_utils::WaitableWriter;
@@ -234,6 +234,7 @@ async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (Clie
         udp_timeout,
         shutdown.clone(),
         Some(cli_tx),
+        None,
     ));
     let addrs = cli_rx.await.expect("client bound");
 
@@ -569,4 +570,187 @@ async fn transport_tap_delegates_writes() {
     b.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ping");
     assert!(!productive.load(Ordering::Relaxed), "writes never set productive");
+}
+
+// Transport-reset reconnect -------------------------------------------------------------------------------------------
+
+/// Fire a one-shot reset on a relay connection.
+struct ResetHandle {
+    tx: Option<oneshot::Sender<()>>,
+}
+impl ResetHandle {
+    fn trigger(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// A TCP relay in front of `upstream`. Its first `immediate_resets` connections
+/// are RST on accept (before any data → unproductive sessions); the next
+/// connection is armed with the returned `ResetHandle` (RST on `trigger()`);
+/// later connections pass through.
+// `set_linger` is deprecated over blocking-on-drop with a nonzero timeout; a
+// zero timeout is the opposite (an immediate abortive close, no blocking) and
+// is exactly the RST this test needs — not the case the deprecation warns about.
+#[allow(deprecated)]
+async fn spawn_controllable_relay(upstream: SocketAddr, immediate_resets: usize) -> (SocketAddr, ResetHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let addr = listener.local_addr().expect("relay addr");
+    let (reset_tx, reset_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut seen = 0usize;
+        let mut trigger = Some(reset_rx);
+        while let Ok((client_conn, _)) = listener.accept().await {
+            if seen < immediate_resets {
+                seen += 1;
+                let _ = client_conn.set_linger(Some(Duration::ZERO));
+                drop(client_conn); // RST, no upstream
+                continue;
+            }
+            let server_conn = match TcpStream::connect(upstream).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(pump_with_optional_reset(client_conn, server_conn, trigger.take()));
+        }
+    });
+    (addr, ResetHandle { tx: Some(reset_tx) })
+}
+
+/// Pump both ways; if `reset` fires first, RST both sockets.
+#[allow(deprecated)] // see `spawn_controllable_relay`
+async fn pump_with_optional_reset(mut client: TcpStream, mut server: TcpStream, reset: Option<oneshot::Receiver<()>>) {
+    match reset {
+        Some(rx) => {
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                _ = rx => {
+                    let _ = client.set_linger(Some(Duration::ZERO));
+                    let _ = server.set_linger(Some(Duration::ZERO));
+                }
+            }
+        }
+        None => {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        }
+    }
+}
+
+/// Spawn a yamux server relaying to `upstream`; returns its listen address.
+async fn spawn_yamux_server(upstream: SocketAddr, shutdown: CancellationToken) -> SocketAddr {
+    let (srv_tx, srv_rx) = oneshot::channel();
+    tokio::spawn(run_server(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        upstream,
+        shutdown,
+        Some(srv_tx),
+    ));
+    srv_rx.await.expect("server bound")
+}
+
+/// Spawn a yamux client pointed at `remote`, with a typed reconnect observer.
+/// Returns the client's local addresses and the observer receiver.
+async fn spawn_yamux_client(
+    remote: SocketAddr,
+    udp_timeout: Duration,
+    shutdown: CancellationToken,
+) -> (ClientBoundAddrs, mpsc::UnboundedReceiver<(u32, bool)>) {
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let (cli_tx, cli_rx) = oneshot::channel();
+    tokio::spawn(run_client(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        remote,
+        udp_timeout,
+        shutdown,
+        Some(cli_tx),
+        Some(events_tx),
+    ));
+    (cli_rx.await.expect("client bound"), events_rx)
+}
+
+/// One TCP request/response through the client's local listener.
+async fn tcp_round_trip(client_tcp: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut app = TcpStream::connect(client_tcp).await.expect("connect client TCP");
+    app.write_all(request).await.expect("write request");
+    app.shutdown().await.expect("half-close write");
+    let mut got = Vec::new();
+    app.read_to_end(&mut got).await.expect("read to EOF");
+    got
+}
+
+const HTTP_RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+
+#[skuld::test]
+async fn tcp_transport_reset_reconnects() {
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, mut reset) = spawn_controllable_relay(server_addr, 0).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+
+    // #1 proves the tunnel works and (via the transport tap) marks it productive.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET /1 HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+
+    reset.trigger();
+    // Rendezvous: the client observed transport death and is reconnecting. The
+    // session was productive, so it resets to the floor.
+    assert_eq!(events.recv().await.unwrap(), (0, true));
+
+    // #2 must succeed on the reconnected session.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET /2 HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn udp_transport_reset_reconnects() {
+    let echo = spawn_udp_echo("127.0.0.1".parse().unwrap()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(echo, shutdown.clone()).await;
+    let (relay_addr, mut reset) = spawn_controllable_relay(server_addr, 0).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+    let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    assert_eq!(round_trip(&app, addrs.udp, b"one").await, b"one");
+
+    reset.trigger();
+    assert_eq!(events.recv().await.unwrap(), (0, true));
+
+    assert_eq!(round_trip(&app, addrs.udp, b"two").await, b"two");
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn backoff_escalates_then_resets_on_productive() {
+    // Two immediate resets escalate failures 1→2 (unproductive), then a
+    // passthrough session round-trips (productive), then a triggered reset resets
+    // failures to 0 — proving both escalation and the productive reset.
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, mut reset) = spawn_controllable_relay(server_addr, 2).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+
+    assert_eq!(events.recv().await.unwrap(), (1, false)); // reset #1 (unproductive)
+    assert_eq!(events.recv().await.unwrap(), (2, false)); // reset #2 (unproductive)
+
+    // The 3rd connection passes through; a round trip makes it productive.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET / HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+    reset.trigger();
+    assert_eq!(events.recv().await.unwrap(), (0, true)); // productive → reset to floor
+
+    shutdown.cancel();
 }
