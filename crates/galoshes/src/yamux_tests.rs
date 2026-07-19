@@ -894,3 +894,27 @@ async fn shutdown_during_backoff_exits_promptly() {
     shutdown.cancel();
     client.await.unwrap().unwrap();
 }
+
+#[skuld::test]
+async fn server_shutdown_is_prompt_while_client_connected() {
+    // A connected client keeps the driver live; shutdown must still complete
+    // promptly (the driver is aborted, not awaited-to-natural-close).
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(b"hi".to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let (srv_tx, srv_rx) = oneshot::channel();
+    let server = tokio::spawn(run_server(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        upstream,
+        shutdown.clone(),
+        Some(srv_tx),
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    let _conn = TcpStream::connect(server_addr).await.expect("connect server");
+    wait_for_log(&writer, "accepted underlying connection").await;
+
+    shutdown.cancel();
+    server.await.expect("server task joined").expect("run_server ok");
+}

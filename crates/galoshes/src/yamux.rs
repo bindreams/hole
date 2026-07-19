@@ -889,7 +889,10 @@ pub(crate) async fn run_server(
             });
         }
 
-        let _ = driver.await;
+        driver.abort();
+        if driver_panicked(driver.await) {
+            return Err(anyhow::anyhow!("yamux driver task panicked"));
+        }
         tracing::info!("underlying connection closed, waiting for next");
     }
 }
