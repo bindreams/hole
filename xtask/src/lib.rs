@@ -15,6 +15,9 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod ci_coverage;
+// macOS-only: renders with the system font via the Typst library (a macOS-only
+// dependency — the DMG background is a darwin feature).
+#[cfg(target_os = "macos")]
 pub mod dmg_background;
 pub mod ex_ray;
 pub mod galoshes;
@@ -306,12 +309,20 @@ pub fn run_galoshes() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn run_dmg_background(out_dir: Option<PathBuf>) -> Result<()> {
     let repo_root = repo_root()?;
     let out_dir = out_dir.unwrap_or_else(|| repo_root.join(".cache/dmg"));
     dmg_background::build(&repo_root, &out_dir)?;
     println!("xtask: DMG background rendered into {}", out_dir.display());
     Ok(())
+}
+
+// The DMG background renders with the macOS system font (via Typst, a macOS-only
+// dep); the `hole-dmg` build target is darwin-only, so this only ever runs there.
+#[cfg(not(target_os = "macos"))]
+pub fn run_dmg_background(_out_dir: Option<PathBuf>) -> Result<()> {
+    anyhow::bail!("dmg-background is only supported on macOS")
 }
 
 pub fn run_golangci_lint() -> Result<()> {
