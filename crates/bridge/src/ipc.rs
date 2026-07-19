@@ -447,6 +447,17 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     }
 }
 
+/// Map an extraction failure to a PII-free client response, logging the
+/// path-bearing detail to bridge.log (an IPC message reaches a GUI toast
+/// verbatim, so it must not carry a filesystem path).
+fn extraction_failure(detail: impl std::fmt::Display) -> (StatusCode, String) {
+    error!(error = %detail, "update extraction failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "update extraction failed".to_string(),
+    )
+}
+
 async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<UpdateApplyRequest>,
@@ -623,38 +634,37 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     };
 
     // Extract the bare binaries from the PRIVATE copy onto the destination volume.
-    // The extract shells out to a blocking `msiexec`/`hdiutil`, so run it on a
-    // blocking thread to keep it off the async worker. A failure clears the marker
-    // so the GUI does not mask Disconnected forever.
+    // The extract does blocking work (in-process archive extraction — unzip on
+    // Windows, untar-gz on macOS), so run it on a blocking thread to keep it off
+    // the async worker. A failure clears the marker so the GUI does not mask
+    // Disconnected forever.
     let state_dir = state.state_dir.clone();
+    info!(target_version = %req.target_version, "extracting update payload...");
     let extracted = tokio::task::spawn_blocking(move || crate::cutover::extract::extract(&payload, &state_dir)).await;
     let staged = match extracted {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
+            let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
                 tracing::warn!(error = %e, "failed to clear cutover marker on error path");
             }
-            let _ = std::fs::remove_dir_all(&private_dir);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    message: format!("update extraction failed: {e}"),
-                }),
-            ));
+            if let Err(e) = std::fs::remove_dir_all(&private_dir) {
+                tracing::warn!(error = %e, "failed to remove private update dir on error path");
+            }
+            return Err((code, Json(ErrorResponse { message })));
         }
         Err(e) => {
+            let (code, message) = extraction_failure(&e);
             if let Err(e) = hole_common::update_marker::clear(log_dir) {
                 tracing::warn!(error = %e, "failed to clear cutover marker on error path");
             }
-            let _ = std::fs::remove_dir_all(&private_dir);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    message: format!("update extraction task panicked: {e}"),
-                }),
-            ));
+            if let Err(e) = std::fs::remove_dir_all(&private_dir) {
+                tracing::warn!(error = %e, "failed to remove private update dir on error path");
+            }
+            return Err((code, Json(ErrorResponse { message })));
         }
     };
+    info!(target_version = %req.target_version, "update payload extracted");
 
     // Kick off the actor and return 200 BEFORE any self-restart. Windows spawns
     // a detached child (returns naturally); macOS runs the actor on a detached

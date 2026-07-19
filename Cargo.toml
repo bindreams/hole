@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/dev-console", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/kill-group", "crates/plugin-e2e", "crates/stepstool", "crates/test-observability", "crates/tombstone", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/dev-console", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/kill-group", "crates/payload-archive", "crates/plugin-e2e", "crates/stepstool", "crates/test-observability", "crates/tombstone", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
 resolver = "2"
 
 [workspace.package]

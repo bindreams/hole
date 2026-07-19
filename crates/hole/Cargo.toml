@@ -107,6 +107,10 @@ tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 garter = { path = "../garter" }
 filetime = "0.2"
+# Test-only: the ASSET_SUFFIX drift-guard asserts against the shared
+# release-asset source (`asset::host_update_asset_suffix`). No features — the
+# `asset` module is feature-independent.
+xtask-lib = { path = "../../xtask-lib" }
 
 [[test]]
 name = "elevated_ownership_privileged"
