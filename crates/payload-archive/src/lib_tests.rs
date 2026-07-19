@@ -102,8 +102,13 @@ mod macos {
             let mut h = tar::Header::new_gnu();
             h.set_size(data.len() as u64);
             h.set_mode(0o644);
+            // The safe `append_data`/`set_path` refuse a `..` name; write it into
+            // the header bytes and `append` the header verbatim — exactly how a
+            // real attacker hand-crafts a traversal tar.
+            let name = b"../escape.txt";
+            h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
             h.set_cksum();
-            b.append_data(&mut h, "../escape.txt", &data[..]).unwrap();
+            b.append(&h, &data[..]).unwrap();
             b.into_inner().unwrap().finish().unwrap();
         }
         let dest = dir.path().join("staging");
