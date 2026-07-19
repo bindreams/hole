@@ -5,6 +5,8 @@ fn find_single_app_ok_on_exactly_one() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("Hole.app")).unwrap();
     std::fs::create_dir(dir.path().join("notes")).unwrap();
+    // A regular file named `*.app` must be ignored: a real bundle is a directory.
+    std::fs::write(dir.path().join("decoy.app"), b"not a bundle").unwrap();
     assert!(find_single_app(dir.path()).unwrap().ends_with("Hole.app"));
 }
 

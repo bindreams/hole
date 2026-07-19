@@ -122,7 +122,7 @@ jobs:
           ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
           workdir="$(mktemp -d)"
           tar -xzf "$ARCHIVE" -C "$workdir"
-          app="$(find "$workdir" -maxdepth 1 -name '*.app' | head -1)"
+          app="$(find "$workdir" -maxdepth 1 -name '*.app' -print -quit)"
           codesign --verify --deep --strict --verbose=2 "$app"
           echo "codesign --verify passed for $app"
 

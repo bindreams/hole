@@ -111,7 +111,7 @@ pub fn find_single_app(dir: &Path) -> std::io::Result<PathBuf> {
     let mut apps = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "app") {
+        if path.is_dir() && path.extension().is_some_and(|ext| ext == "app") {
             apps.push(path);
         }
     }

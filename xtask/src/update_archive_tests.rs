@@ -12,33 +12,15 @@ fn fake_repo() -> tempfile::TempDir {
     let root = dir.path();
     let release = root.join("target/release");
     fs::create_dir_all(&release).unwrap();
-    let hole = if cfg!(windows) { "hole.exe" } else { "hole" };
-    fs::write(release.join(hole), b"hole").unwrap();
-    let galoshes = if cfg!(windows) { "galoshes.exe" } else { "galoshes" };
-    fs::write(release.join(galoshes), b"galoshes").unwrap();
-    #[cfg(target_os = "windows")]
-    {
-        fs::write(release.join("hole.pdb"), b"pdb").unwrap();
-        let wintun = root.join(".cache/wintun");
-        fs::create_dir_all(&wintun).unwrap();
-        fs::write(wintun.join("wintun.dll"), b"wt").unwrap();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let dsym = release.join("hole.dSYM/Contents");
-        fs::create_dir_all(&dsym).unwrap();
-        fs::write(dsym.join("Info.plist"), b"<plist/>").unwrap();
-    }
+    fs::write(release.join("hole.exe"), b"hole").unwrap();
+    fs::write(release.join("galoshes.exe"), b"galoshes").unwrap();
+    fs::write(release.join("hole.pdb"), b"pdb").unwrap();
+    let wintun = root.join(".cache/wintun");
+    fs::create_dir_all(&wintun).unwrap();
+    fs::write(wintun.join("wintun.dll"), b"wt").unwrap();
     let exray = root.join(".cache/ex-ray");
     fs::create_dir_all(&exray).unwrap();
-    let exray_name = if cfg!(windows) {
-        "ex-ray-x86_64-pc-windows-msvc.exe"
-    } else if cfg!(target_arch = "aarch64") {
-        "ex-ray-aarch64-apple-darwin"
-    } else {
-        "ex-ray-x86_64-apple-darwin"
-    };
-    fs::write(exray.join(exray_name), b"exray").unwrap();
+    fs::write(exray.join("ex-ray-x86_64-pc-windows-msvc.exe"), b"exray").unwrap();
     fs::write(root.join("NOTICES.md"), b"notices").unwrap();
     dir
 }
