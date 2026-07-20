@@ -587,15 +587,20 @@ impl ResetHandle {
     }
 }
 
-/// A TCP relay in front of `upstream`. Its first `immediate_resets` connections
-/// are RST on accept (before any data → unproductive sessions); the next
+/// A TCP relay in front of `upstream`. Its first `immediate_closes` connections
+/// are closed with a graceful FIN right after accept (before any yamux frame, so
+/// the client establishes an unproductive session that then dies); the next
 /// connection is armed with the returned `ResetHandle` (RST on `trigger()`);
 /// later connections pass through.
-// `set_linger` is deprecated over blocking-on-drop with a nonzero timeout; a
-// zero timeout is the opposite (an immediate abortive close, no blocking) and
-// is exactly the RST this test needs — not the case the deprecation warns about.
-#[allow(deprecated)]
-async fn spawn_controllable_relay(upstream: SocketAddr, immediate_resets: usize) -> (SocketAddr, ResetHandle) {
+///
+/// The immediate closes are a FIN, not an RST, on purpose. An RST on accept
+/// races the client's `connect()` on loopback and, on Linux/macOS, makes the
+/// connect itself fail with `ECONNRESET` (nondeterministically); `connect_retrying`
+/// then retries silently, so no *session* death occurs and the reconnect these
+/// tests await never fires — the test hangs. A FIN never fails a completed
+/// connect, so the client always establishes, then deterministically observes
+/// transport death on every platform.
+async fn spawn_controllable_relay(upstream: SocketAddr, immediate_closes: usize) -> (SocketAddr, ResetHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
     let addr = listener.local_addr().expect("relay addr");
     let (reset_tx, reset_rx) = oneshot::channel::<()>();
@@ -603,10 +608,9 @@ async fn spawn_controllable_relay(upstream: SocketAddr, immediate_resets: usize)
         let mut seen = 0usize;
         let mut trigger = Some(reset_rx);
         while let Ok((client_conn, _)) = listener.accept().await {
-            if seen < immediate_resets {
+            if seen < immediate_closes {
                 seen += 1;
-                let _ = client_conn.set_linger(Some(Duration::ZERO));
-                drop(client_conn); // RST, no upstream
+                drop(client_conn); // graceful FIN, no upstream → unproductive session death
                 continue;
             }
             let server_conn = match TcpStream::connect(upstream).await {
@@ -620,7 +624,11 @@ async fn spawn_controllable_relay(upstream: SocketAddr, immediate_resets: usize)
 }
 
 /// Pump both ways; if `reset` fires first, RST both sockets.
-#[allow(deprecated)] // see `spawn_controllable_relay`
+// `set_linger` is deprecated in favour of blocking-on-drop with a nonzero
+// timeout; a zero timeout is the opposite — an immediate abortive close (RST),
+// no blocking — which is exactly the reset this path needs, not the case the
+// deprecation warns about.
+#[allow(deprecated)]
 async fn pump_with_optional_reset(mut client: TcpStream, mut server: TcpStream, reset: Option<oneshot::Receiver<()>>) {
     match reset {
         Some(rx) => {
@@ -732,7 +740,7 @@ async fn udp_transport_reset_reconnects() {
 
 #[skuld::test]
 async fn backoff_escalates_then_resets_on_productive() {
-    // Two immediate resets escalate failures 1→2 (unproductive), then a
+    // Two immediate closes escalate failures 1→2 (unproductive), then a
     // passthrough session round-trips (productive), then a triggered reset resets
     // failures to 0 — proving both escalation and the productive reset.
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
@@ -741,8 +749,8 @@ async fn backoff_escalates_then_resets_on_productive() {
     let (relay_addr, mut reset) = spawn_controllable_relay(server_addr, 2).await;
     let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
 
-    assert_eq!(events.recv().await.unwrap(), (1, false)); // reset #1 (unproductive)
-    assert_eq!(events.recv().await.unwrap(), (2, false)); // reset #2 (unproductive)
+    assert_eq!(events.recv().await.unwrap(), (1, false)); // close #1 (unproductive)
+    assert_eq!(events.recv().await.unwrap(), (2, false)); // close #2 (unproductive)
 
     // The 3rd connection passes through; a round trip makes it productive.
     assert_eq!(
@@ -869,7 +877,7 @@ async fn shutdown_during_backoff_exits_promptly() {
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
     let shutdown = CancellationToken::new();
     let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
-    let (relay_addr, _reset) = spawn_controllable_relay(server_addr, 1).await; // one unproductive reset
+    let (relay_addr, _reset) = spawn_controllable_relay(server_addr, 1).await; // one unproductive close
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (cli_tx, cli_rx) = oneshot::channel();
     let client = tokio::spawn(run_client(
