@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+// `Context` alone would collide with `anyhow::Context` (the `.context()` combinator, used
+// throughout this file); the tap's poll methods spell out `std::task::Context` instead.
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -109,13 +114,13 @@ impl FrameAccumulator {
 
 // Driver ==============================================================================================================
 
-type OpenStreamReply = tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;
+pub(crate) type OpenStreamReply = tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;
 
 /// Central driver loop that owns the yamux `Connection`.
 ///
 /// All interaction with the connection goes through channels because `Connection`
 /// requires `&mut self` for every poll method.
-async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static>(
+pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static>(
     mut conn: yamux::Connection<T>,
     mut open_rx: mpsc::Receiver<OpenStreamReply>,
     inbound_tx: mpsc::Sender<yamux::Stream>,
@@ -153,7 +158,7 @@ async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite + Unpin + 
                     }
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
-                    tracing::error!(error = %e, "yamux inbound stream error");
+                    tracing::debug!(error = %e, "yamux inbound stream error (connection ended)");
                     return std::task::Poll::Ready(());
                 }
                 std::task::Poll::Ready(None) => {
@@ -279,6 +284,57 @@ async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Resul
     stream.flush().await
 }
 
+// Liveness tap ========================================================================================================
+
+/// Wraps the yamux transport and sets `productive` on the first inbound byte.
+///
+/// `run_client` gives this to `yamux::Connection::new`, so the tap is polled only
+/// by the driver task; reading `productive` after `driver.await` therefore has a
+/// happens-before edge to every write here (no cross-task race). It sits *below*
+/// yamux framing, so any inbound frame counts — relayed data or flow-control /
+/// keepalive frames alike. That is deliberate: it measures *transport*-level
+/// liveness (the far yamux peer responded), which is the correct signal for a
+/// transport reconnect, not end-to-end application relay.
+pub(crate) struct TransportLivenessTap<T> {
+    inner: T,
+    productive: Arc<AtomicBool>,
+}
+
+impl<T> TransportLivenessTap<T> {
+    pub(crate) fn new(inner: T, productive: Arc<AtomicBool>) -> Self {
+        Self { inner, productive }
+    }
+}
+
+impl<T: futures::AsyncRead + Unpin> futures::AsyncRead for TransportLivenessTap<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            if *n > 0 {
+                me.productive.store(true, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+}
+
+impl<T: futures::AsyncWrite + Unpin> futures::AsyncWrite for TransportLivenessTap<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
 /// Relay between a tokio TCP stream and a yamux stream (bidirectional),
 /// with correct half-close.
 ///
@@ -350,16 +406,41 @@ pub(crate) const LOOPBACK_CONNECT_RETRY: Duration = Duration::from_millis(10);
 pub(crate) const REMOTE_BACKOFF_BASE: Duration = Duration::from_millis(100);
 pub(crate) const REMOTE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Exponential backoff for a 0-based `step`: `REMOTE_BACKOFF_BASE` doubling,
+/// capped at `REMOTE_BACKOFF_MAX`.
+fn exponential_backoff(step: u32) -> Duration {
+    REMOTE_BACKOFF_BASE
+        .saturating_mul(1u32.checked_shl(step).unwrap_or(u32::MAX))
+        .min(REMOTE_BACKOFF_MAX)
+}
+
 /// Delay before connect attempt `attempt` to `remote`: loopback peers poll on
 /// a fixed tight cadence; routable peers back off exponentially, capped.
 pub(crate) fn connect_delay(remote: SocketAddr, attempt: u32) -> Duration {
     if remote.ip().is_loopback() {
         LOOPBACK_CONNECT_RETRY
     } else {
-        REMOTE_BACKOFF_BASE
-            .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX))
-            .min(REMOTE_BACKOFF_MAX)
+        exponential_backoff(attempt)
     }
+}
+
+/// Consecutive-failure count after a session ends. A **productive** session (the
+/// server sent bytes back) resets the count so the next reconnect is at the floor;
+/// an unproductive one increments it so repeated failures escalate. Saturating.
+pub(crate) fn next_failures(prev: u32, productive: bool) -> u32 {
+    if productive {
+        0
+    } else {
+        prev.saturating_add(1)
+    }
+}
+
+/// Backoff before reconnecting after `failures` consecutive failed sessions.
+/// Every reconnect waits at least `REMOTE_BACKOFF_BASE` — a floor that bounds a
+/// peer flapping right after delivering one byte — and sustained failures
+/// escalate exponentially to `REMOTE_BACKOFF_MAX`.
+pub(crate) fn session_reconnect_backoff(failures: u32) -> Duration {
+    exponential_backoff(failures.max(1) - 1)
 }
 
 /// Connect to `addr`, retrying until it succeeds or `shutdown` fires. Retries
@@ -418,14 +499,19 @@ async fn run_udp_association(
 ) {
     let mut stream = match open_stream(&open_tx).await {
         Ok(s) => s,
+        Err(::yamux::ConnectionError::Closed) => {
+            tracing::debug!(peer = %peer, "failed to open yamux stream for UDP: connection closed");
+            let _ = cleanup_tx.send((peer, generation)).await;
+            return;
+        }
         Err(e) => {
-            tracing::error!(peer = %peer, error = %e, "failed to open yamux stream for UDP");
+            tracing::warn!(peer = %peer, error = %e, "failed to open yamux stream for UDP");
             let _ = cleanup_tx.send((peer, generation)).await;
             return;
         }
     };
     if let Err(e) = write_tag(&mut stream, StreamTag::Udp).await {
-        tracing::error!(peer = %peer, error = %e, "failed to write UDP tag");
+        tracing::warn!(peer = %peer, error = %e, "failed to write UDP tag");
         let _ = cleanup_tx.send((peer, generation)).await;
         return;
     }
@@ -510,6 +596,146 @@ pub(crate) struct ClientBoundAddrs {
     pub udp: SocketAddr,
 }
 
+/// Join an aborted driver task. Returns `true` iff it ended by a genuine panic (a
+/// code bug, distinct from our own `abort()`), logging it. A panic must be
+/// fatal, not folded into ordinary reconnect churn — a driver panic drops
+/// `inbound_tx` and so is indistinguishable from a clean transport death at the
+/// `inbound_rx` seam, so the caller uses this to escalate instead of retrying.
+#[must_use]
+pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(e) if e.is_cancelled() => false,
+        Err(e) => {
+            tracing::error!(error = %e, "yamux driver task panicked");
+            true
+        }
+    }
+}
+
+/// Why a single yamux client session ended, deciding what `run_client` does next.
+enum SessionOutcome {
+    /// Shutdown requested — stop for good.
+    Shutdown,
+    /// The transport (yamux) connection died — reconnect.
+    TransportDied,
+}
+
+/// Serve one yamux connection until it ends. The local TCP+UDP listeners are
+/// owned by `run_client` and persist across reconnects; only the yamux connection
+/// (its `open_tx` / `inbound_rx`) is per-session.
+async fn run_client_session(
+    tcp_listener: &TcpListener,
+    udp_socket: &Arc<UdpSocket>,
+    open_tx: &mpsc::Sender<OpenStreamReply>,
+    inbound_rx: &mut mpsc::Receiver<yamux::Stream>,
+    udp_timeout: Duration,
+    shutdown: &CancellationToken,
+) -> SessionOutcome {
+    let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
+    let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
+    let mut next_gen: u64 = 0;
+    let mut udp_buf = [0u8; 65536];
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return SessionOutcome::Shutdown,
+            // Transport death: the driver dropped its inbound sender. A `Some` is a
+            // protocol violation (the server never opens streams to the client);
+            // untrusted remote input — log and drop, never panic.
+            inbound = inbound_rx.recv() => {
+                match inbound {
+                    None => return SessionOutcome::TransportDied,
+                    Some(_stream) => tracing::warn!("unexpected server-initiated yamux stream on client; dropping"),
+                }
+            }
+            accept = tcp_listener.accept() => {
+                // A local accept error on the loopback listener is transient and
+                // not fixed by reconnecting the transport; log and continue.
+                let (tcp_stream, _peer) = match accept {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "local tcp accept error; continuing");
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                };
+                let open_tx = open_tx.clone();
+                tokio::spawn(async move {
+                    match open_stream(&open_tx).await {
+                        Ok(mut yamux_stream) => {
+                            if let Err(e) = write_tag(&mut yamux_stream, StreamTag::Tcp).await {
+                                tracing::warn!(error = %e, "failed to write TCP tag");
+                                return;
+                            }
+                            if let Err(e) = relay_tcp(yamux_stream, tcp_stream).await {
+                                tracing::debug!(error = %e, "tcp relay ended");
+                            }
+                        }
+                        // A closed connection is expected reconnect-window churn (the
+                        // driver is gone); any other error is a transport-alive
+                        // failure (e.g. a stream cap) worth surfacing.
+                        Err(yamux::ConnectionError::Closed) => {
+                            tracing::debug!("failed to open yamux stream for TCP: connection closed")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "failed to open yamux stream for TCP"),
+                    }
+                });
+            }
+            recv = udp_socket.recv_from(&mut udp_buf) => {
+                // Same rationale as the accept arm above: a local recv error is
+                // transient, not a broken socket, and the transport isn't at fault.
+                let (n, peer) = match recv {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "local udp recv error; continuing");
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                };
+                let payload = udp_buf[..n].to_vec();
+
+                let payload = match associations.get(&peer) {
+                    Some((_, tx)) => match tx.try_send(payload) {
+                        Ok(()) => continue,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(peer = %peer, "udp association buffer full, dropping datagram");
+                            continue;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(payload)) => {
+                            associations.remove(&peer);
+                            payload
+                        }
+                    },
+                    None => payload,
+                };
+
+                let generation = next_gen;
+                next_gen += 1;
+                let (tx, rx) = mpsc::channel::<Vec<u8>>(UDP_ASSOC_CHANNEL_CAPACITY);
+                let _ = tx.try_send(payload);
+                associations.insert(peer, (generation, tx));
+                tokio::spawn(run_udp_association(
+                    open_tx.clone(),
+                    Arc::clone(udp_socket),
+                    peer,
+                    generation,
+                    rx,
+                    cleanup_tx.clone(),
+                    udp_timeout,
+                ));
+            }
+            Some((peer, generation)) = cleanup_rx.recv() => {
+                if let Some((current, _)) = associations.get(&peer) {
+                    if *current == generation {
+                        associations.remove(&peer);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_client(
     config: yamux::Config,
     local: SocketAddr,
@@ -517,6 +743,9 @@ pub(crate) async fn run_client(
     udp_timeout: Duration,
     shutdown: CancellationToken,
     bound_addr_tx: Option<oneshot::Sender<ClientBoundAddrs>>,
+    // Test seam (mirrors `bound_addr_tx`): each reconnect decision `(failures,
+    // productive)` after a session ends. Production passes `None`.
+    reconnect_events: Option<mpsc::UnboundedSender<(u32, bool)>>,
 ) -> Result<()> {
     // Bind the local TCP + UDP listeners once for the client's lifetime. They
     // belong to `local` (the SS_LOCAL address), not to any single upstream
@@ -535,8 +764,11 @@ pub(crate) async fn run_client(
         });
     }
 
+    let mut failures: u32 = 0;
     loop {
-        // Connect to the remote yamux server.
+        // Connect to the remote yamux server (retries a down peer itself). No
+        // delay on the first attempt; a reconnect's backoff is slept at the end
+        // of the prior iteration.
         let tcp = match connect_retrying(remote, &shutdown).await {
             Some(s) => s,
             None => return Ok(()), // shutdown requested
@@ -544,115 +776,58 @@ pub(crate) async fn run_client(
 
         tracing::info!(remote = %remote, "connected to yamux server");
 
-        let compat_tcp = tcp.compat();
-        let conn = yamux::Connection::new(compat_tcp, config.clone(), yamux::Mode::Client);
+        // Tap the transport for inbound liveness. The tap is owned by the driver
+        // (inside the Connection), so reading `productive` after `driver.await`
+        // is race-free.
+        let productive = Arc::new(AtomicBool::new(false));
+        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&productive));
+        let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
 
         let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
-        let (_inbound_tx, _inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        // The client never expects server-initiated streams; this channel is the
+        // transport-death signal — the driver drops `inbound_tx` when the yamux
+        // connection ends, so `inbound_rx.recv()` yields `None`.
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(32);
 
-        let driver = tokio::spawn(drive_connection(conn, open_rx, _inbound_tx));
+        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
 
-        let result: Result<()> = async {
-            // NAT association table: local peer -> (generation, outbound sender).
-            // Owned solely by this loop (no shared mutex) and scoped to this
-            // connection — on reconnect it drops, every association task sees
-            // its `outbound_rx` close and exits, and the next iteration starts
-            // empty. `generation` closes the re-create-during-teardown race:
-            // a stale cleanup only removes an entry whose generation matches.
-            let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
-            let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
-            let mut next_gen: u64 = 0;
-            let mut udp_buf = [0u8; 65536];
-
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    // Accept local TCP connections.
-                    accept = tcp_listener.accept() => {
-                        let (tcp_stream, _peer) = accept.context("tcp accept")?;
-                        let open_tx = open_tx.clone();
-                        tokio::spawn(async move {
-                            match open_stream(&open_tx).await {
-                                Ok(mut yamux_stream) => {
-                                    if let Err(e) = write_tag(&mut yamux_stream, StreamTag::Tcp).await {
-                                        tracing::error!(error = %e, "failed to write TCP tag");
-                                        return;
-                                    }
-                                    if let Err(e) = relay_tcp(yamux_stream, tcp_stream).await {
-                                        tracing::debug!(error = %e, "tcp relay ended");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "failed to open yamux stream for TCP");
-                                }
-                            }
-                        });
-                    }
-                    // Receive local UDP datagrams; route each to its peer's association.
-                    recv = udp_socket.recv_from(&mut udp_buf) => {
-                        let (n, peer) = recv.context("udp recv")?;
-                        let payload = udp_buf[..n].to_vec();
-
-                        // Forward to an existing association if one is live.
-                        // `Closed` returns the payload so we can re-create
-                        // without cloning on the hot path; `Full` drops it
-                        // (correct lossy-UDP semantics).
-                        let payload = match associations.get(&peer) {
-                            Some((_, tx)) => match tx.try_send(payload) {
-                                Ok(()) => continue,
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    tracing::debug!(peer = %peer, "udp association buffer full, dropping datagram");
-                                    continue;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(payload)) => {
-                                    associations.remove(&peer);
-                                    payload
-                                }
-                            },
-                            None => payload,
-                        };
-
-                        // Create a new association.
-                        let generation = next_gen;
-                        next_gen += 1;
-                        let (tx, rx) = mpsc::channel::<Vec<u8>>(UDP_ASSOC_CHANNEL_CAPACITY);
-                        // First datagram always fits the fresh buffer.
-                        let _ = tx.try_send(payload);
-                        associations.insert(peer, (generation, tx));
-                        tokio::spawn(run_udp_association(
-                            open_tx.clone(),
-                            Arc::clone(&udp_socket),
-                            peer,
-                            generation,
-                            rx,
-                            cleanup_tx.clone(),
-                            udp_timeout,
-                        ));
-                    }
-                    // An association task exited; drop its entry iff still current.
-                    Some((peer, generation)) = cleanup_rx.recv() => {
-                        if let Some((current, _)) = associations.get(&peer) {
-                            if *current == generation {
-                                associations.remove(&peer);
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(())
-        }
+        let outcome = run_client_session(
+            &tcp_listener,
+            &udp_socket,
+            &open_tx,
+            &mut inbound_rx,
+            udp_timeout,
+            &shutdown,
+        )
         .await;
 
-        // Drop the open channel to let the driver finish.
-        drop(open_tx);
-        let _ = driver.await;
+        // Tear down the driver deterministically. On `TransportDied` it already
+        // finished (abort is a no-op); otherwise abort ends it instead of hanging
+        // until the chain drain-timeout (`drive_connection` has no shutdown hook).
+        // A driver panic is a code bug, not a transport event — exit rather than reconnect.
+        driver.abort();
+        if driver_panicked(driver.await) {
+            return Err(anyhow::anyhow!("yamux driver task panicked"));
+        }
 
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "client session ended, reconnecting");
-                // Loop back to reconnect.
+        match outcome {
+            SessionOutcome::Shutdown => return Ok(()),
+            SessionOutcome::TransportDied => {
+                let was_productive = productive.load(Ordering::Relaxed);
+                failures = next_failures(failures, was_productive);
+                tracing::warn!(
+                    failures,
+                    was_productive,
+                    "yamux transport connection ended, reconnecting"
+                );
+                if let Some(tx) = &reconnect_events {
+                    let _ = tx.send((failures, was_productive));
+                }
+                let delay = session_reconnect_backoff(failures);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
             }
         }
     }
@@ -679,13 +854,23 @@ pub(crate) async fn run_server(
     }
 
     loop {
-        // Accept one underlying TCP connection.
+        // Accept one underlying TCP connection. A real accept error is rare and
+        // transient (see `run_client_session`'s local-accept rationale); log and
+        // keep serving rather than tearing down the whole plugin.
         let tcp = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             accept = listener.accept() => {
-                let (stream, peer) = accept.context("accept")?;
-                tracing::info!(peer = %peer, "accepted underlying connection");
-                stream
+                match accept {
+                    Ok((stream, peer)) => {
+                        tracing::info!(peer = %peer, "accepted underlying connection");
+                        stream
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "server accept error; continuing");
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
             }
         };
 
@@ -720,7 +905,10 @@ pub(crate) async fn run_server(
             });
         }
 
-        let _ = driver.await;
+        driver.abort();
+        if driver_panicked(driver.await) {
+            return Err(anyhow::anyhow!("yamux driver task panicked"));
+        }
         tracing::info!("underlying connection closed, waiting for next");
     }
 }
@@ -839,7 +1027,7 @@ impl garter::ChainPlugin for YamuxPlugin {
         let result = if self.is_server {
             run_server(self.config, local, remote, shutdown, None).await
         } else {
-            run_client(self.config, local, remote, self.udp_timeout, shutdown, None).await
+            run_client(self.config, local, remote, self.udp_timeout, shutdown, None, None).await
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))

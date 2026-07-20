@@ -49,6 +49,13 @@ before editing; the sections linked below are the authoritative source.
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
+- **Yamux transport self-heal.** The galoshes yamux client reconnects after a
+  transport reset instead of wedging; death is detected via the driver's
+  inbound channel closing, and reconnect backoff is floored and resets on
+  transport-level liveness (any inbound yamux frame). `driver.abort()`
+  teardown deliberately truncates in-flight relays; a silent (no-RST)
+  black-hole is out of scope (→ #660). →
+  [CONTRIBUTING.md#yamux-transport-self-heal](CONTRIBUTING.md#yamux-transport-self-heal)
 - **Fail-closed covers.** The **standing lockdown** cover
   (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
   the bridge **disarms-not-drops** it across the restart and the new bridge
