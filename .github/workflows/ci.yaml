@@ -541,12 +541,16 @@ jobs:
         shell: pwsh
         run: |
           $env:HOLE_SELFTEST_CANARY = "canary-ok"
-          $out = (pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1 *>&1 | Out-String)
+          # The child streams its IL=.../PROBE_OK line straight to the log and
+          # exits 7 only when every contract check passes -- a nonzero sentinel
+          # that also proves the exit code survives the launcher. Gate on that
+          # and set the step's exit code explicitly (a lingering $LASTEXITCODE=7
+          # would otherwise fail the step under GitHub's pwsh wrapper).
+          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1
           $code = $LASTEXITCODE
-          Write-Host $out
-          if ($code -ne 7)               { throw "gsudo de-elevation contract failed (exit $code); see child output above" }
-          if ($out -notmatch 'PROBE_OK') { throw "child stdout did not stream back to the runner" }
-          Write-Host "OK: Medium integrity + env + PATH + stdout + exit code verified"
+          if ($code -ne 7) { Write-Host "::error::gsudo de-elevation contract failed (exit $code); see child output above"; exit 1 }
+          Write-Host "OK: de-elevation verified (Medium + env + PATH + stdout + exit code)"
+          exit 0
 
       # Run the dashboard E2E at Medium integrity through the shared launcher.
       # The installed-binary guard lives in e2e-medium.ps1 (inside the child),
@@ -558,7 +562,7 @@ jobs:
           HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
         run: |
           pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          exit $LASTEXITCODE
 
       - name: Kill hole.exe after E2E
         if: always()
