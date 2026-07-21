@@ -429,6 +429,9 @@ jobs:
     # post-job cache save with the actual work already green, cancelling a
     # would-be pass. The extra headroom absorbs slow cold-sccache/cache runs.
     timeout-minutes: 45
+    env:
+      # renovate: datasource=github-releases depName=gerardog/gsudo
+      GSUDO_VERSION: "2.6.1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -514,14 +517,52 @@ jobs:
           Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
           Wait-Process -Name hole -ErrorAction SilentlyContinue
 
-      # Reuse the `node_modules/` left by `frontend-build` during
-      # `cargo xtask build hole-msi`. WDIO is in devDependencies; the
-      # configured `tauri:options.application` is overridden via env var
-      # to point at the installed binary, not the workspace's release.
-      - name: E2E dashboard test
+      # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
+      # every process at High integrity (admin + UAC disabled), and WebView2
+      # Runtime 150 broke the DevTools loopback for High-integrity hosts
+      # (MicrosoftEdge/WebView2Feedback#5640) so tauri-driver can't attach.
+      # Real users run the GUI unprivileged (Medium), where 150 works.
+      - name: Install gsudo (de-elevation for the E2E)
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\gsudo.zip"
+          $dir = "$env:RUNNER_TEMP\gsudo"
+          Invoke-WebRequest -Uri "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = "$dir\x64\gsudo.exe"
+          if (-not (Test-Path $exe)) { throw "gsudo.exe not found at $exe after extract" }
+          "$dir\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Prove on the real runner that de-elevation preserves everything the E2E
+      # needs — integrity (Medium), env vars, PATH (npm), streamed stdout, and
+      # the exact exit code — via the SAME gsudo -> powershell -File launcher
+      # the E2E uses. Fails loud here rather than as an opaque session timeout.
+      - name: Verify gsudo de-elevation contract
+        shell: pwsh
+        run: |
+          $env:HOLE_SELFTEST_CANARY = "canary-ok"
+          # The child streams its IL=.../PROBE_OK line straight to the log and
+          # exits 7 only when every contract check passes -- a nonzero sentinel
+          # that also proves the exit code survives the launcher. Gate on that
+          # and set the step's exit code explicitly (a lingering $LASTEXITCODE=7
+          # would otherwise fail the step under GitHub's pwsh wrapper).
+          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1
+          $code = $LASTEXITCODE
+          if ($code -ne 7) { Write-Host "::error::gsudo de-elevation contract failed (exit $code); see child output above"; exit 1 }
+          Write-Host "OK: de-elevation verified (Medium + env + PATH + stdout + exit code)"
+          exit 0
+
+      # Run the dashboard E2E at Medium integrity through the shared launcher.
+      # The installed-binary guard lives in e2e-medium.ps1 (inside the child),
+      # so it runs where wdio actually reads HOLE_TEST_APP_PATH. `node_modules/`
+      # is reused from the `frontend-build` that produced the MSI.
+      - name: E2E dashboard test (Medium integrity)
+        shell: pwsh
         env:
           HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
-        run: npm run test:e2e
+        run: |
+          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
+          exit $LASTEXITCODE
 
       - name: Kill hole.exe after E2E
         if: always()

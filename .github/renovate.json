@@ -14,6 +14,14 @@
         "version\\s*=\\s*\"(?<currentValue>[^\"]+)\"\\n.*github\\.com/(?<depName>[^/]+/[^/]+)/"
       ],
       "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s+\\w+:\\s*[\"'](?<currentValue>[^\"']+)[\"']"
+      ],
+      "extractVersionTemplate": "^v?(?<version>.+)$"
     }
   ],
   "packageRules": [
@@ -66,6 +74,11 @@
       "description": "Major updates: one PR per package (API breaks reviewed individually). groupName: null overrides any inherited monorepo group from config:recommended's group:monorepos / group:recommended presets. Applies to customManagers (WiX) as well — by design; the customManagers block has no groupName, so this just reasserts the default.",
       "matchUpdateTypes": ["major"],
       "groupName": null,
+      "automerge": true
+    },
+    {
+      "description": "gsudo (installer-E2E de-elevation): auto-merge; the required Test installer check gates it.",
+      "matchDepNames": ["gerardog/gsudo"],
       "automerge": true
     }
   ]
