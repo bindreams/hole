@@ -292,7 +292,7 @@ def test_arp_product_icon_defined(package: ET.Element) -> None:
     Without this property, Windows's Add/Remove Programs UI falls back
     to a generic gray installer-box icon for the Hole entry (#359).
     """
-    icon_ids = {icon.get("Id") for icon in package.iter(f"{{{NS['wix']}}}Icon")}
+    icon_ids = {icon.get("Id", "") for icon in package.iter(f"{{{NS['wix']}}}Icon")}
     arp_property = None
     for prop in package.iter(f"{{{NS['wix']}}}Property"):
         if prop.get("Id") == "ARPPRODUCTICON":
