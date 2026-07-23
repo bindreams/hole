@@ -150,7 +150,12 @@ entry = "ty check"
 language = "python"
 types = ["python"]
 pass_filenames = false
-additional_dependencies = ["ty"]
+# ty 0.0.62 regressed `unresolved-import` (ignores `ty.toml`'s
+# `rules.unresolved-import = "ignore"`) and added false-positive
+# `invalid-argument-type` findings — see #667. Pinned so a new release can't
+# break every push.
+# renovate: datasource=pypi depName=ty
+additional_dependencies = ["ty==0.0.61"]
 
 # External hooks =======================================================================================================
 
