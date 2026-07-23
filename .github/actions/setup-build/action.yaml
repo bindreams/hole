@@ -25,7 +25,7 @@ runs:
     # `ui/dist/` and `tauri-codegen` panics at compile time when
     # `tauri/custom-protocol` is enabled. Pinned via `package.json`'s
     # `"engines": { "node": ">=24.0.0 <25.0.0" }`. See bindreams/hole#372.
-    - uses: actions/setup-node@v6
+    - uses: actions/setup-node@v7
       with:
         node-version-file: package.json
         cache: npm
