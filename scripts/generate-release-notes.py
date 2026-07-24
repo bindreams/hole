@@ -277,6 +277,17 @@ def parse_platforms(json_str: str) -> list[Platform]:
     return [Platform(os=p["os"], arch=p["arch"], ext=p.get("ext")) for p in raw]
 
 
+def asset_filename(track: str, version: str, platform: Platform) -> str:
+    """Release asset filename for a platform, matching each workflow's
+    rename step: `ext` present (hole's installers) uses it verbatim;
+    `ext` absent (raw binaries) appends `.exe` on windows, nothing
+    otherwise."""
+    if platform.ext is not None:
+        return f"{track}-{version}-{platform.os}-{platform.arch}.{platform.ext}"
+    suffix = ".exe" if platform.os == "windows" else ""
+    return f"{track}-{version}-{platform.os}-{platform.arch}{suffix}"
+
+
 # Rendering ============================================================================================================
 
 
@@ -446,6 +457,34 @@ def test_parse_platforms_reads_matrix_json():
         Platform(os="windows", arch="amd64", ext="msi"),
         Platform(os="darwin", arch="arm64", ext=None),
     ]
+
+
+def test_asset_filename_with_explicit_ext():
+    assert (
+        asset_filename("hole", "0.4.0", Platform(os="windows", arch="amd64",
+                                                 ext="msi")) == "hole-0.4.0-windows-amd64.msi"
+    )
+    assert (
+        asset_filename("hole", "0.4.0", Platform(os="darwin", arch="arm64", ext="dmg")) == "hole-0.4.0-darwin-arm64.dmg"
+    )
+
+
+def test_asset_filename_raw_binary_windows_gets_exe():
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="windows", arch="amd64",
+                                                     ext=None)) == "galoshes-0.1.0-windows-amd64.exe"
+    )
+
+
+def test_asset_filename_raw_binary_unix_no_ext():
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="darwin", arch="arm64",
+                                                     ext=None)) == "galoshes-0.1.0-darwin-arm64"
+    )
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64",
+                                                     ext=None)) == "galoshes-0.1.0-linux-amd64"
+    )
 
 
 def test_path_spec_basic():
