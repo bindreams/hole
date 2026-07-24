@@ -355,6 +355,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("track", choices=["hole", "galoshes", "garter", "ex-ray"])
     parser.add_argument("--new-tag", required=True, help="Tag being released (e.g. releases/hole/v0.2.0)")
+    parser.add_argument(
+        "--platforms",
+        required=True,
+        help="JSON array of {os, arch, ext?} objects describing shipped platforms (the build matrix, verbatim)",
+    )
+    parser.add_argument(
+        "--version", required=True, help="Bare release version (e.g. 0.4.0), used to build asset filenames"
+    )
     parser.add_argument("--head", default="HEAD", help="Git ref representing the new release commit (default: HEAD)")
     parser.add_argument(
         "--repo-root",
@@ -380,6 +388,9 @@ def main() -> int:
             ).stdout.strip()
         )
 
+    platforms = parse_platforms(args.platforms)
+    downloads_table = render_downloads_table(args.track, args.version, args.new_tag, platforms, args.repo_url)
+
     config = load_config(repo_root, args.track)
     previous_tag = find_previous_tag(repo_root, args.track, args.head)
 
@@ -387,7 +398,7 @@ def main() -> int:
         # First-of-track release: emit the configured stub instead of
         # walking history. Avoids the "every PR ever merged" problem.
         body = config.initial_release or f"Initial release of the `{args.track}` track."
-        sys.stdout.write(body.rstrip() + "\n")
+        sys.stdout.write(downloads_table + "\n" + body.rstrip() + "\n")
         return 0
 
     range_spec = f"{previous_tag}..{args.head}"
@@ -396,7 +407,7 @@ def main() -> int:
     filtered = [c for c in commits if any(path_spec.match_file(f) for f in c.files)]
     grouped = categorize(filtered, config.categories)
     body = render_notes(grouped, new_tag=args.new_tag, previous_tag=previous_tag, repo_url=args.repo_url)
-    sys.stdout.write(body)
+    sys.stdout.write(downloads_table + "\n" + body)
     return 0
 
 
@@ -672,7 +683,20 @@ def test_integration_filtering_against_real_history():
 
     script = repo_root / "scripts" / "generate-release-notes.py"
     result = subprocess.run(
-        ["uv", "run", str(script), "ex-ray", "--new-tag", "releases/ex-ray/v999.0.0", "--head", "HEAD"],
+        [
+            "uv",
+            "run",
+            str(script),
+            "ex-ray",
+            "--new-tag",
+            "releases/ex-ray/v999.0.0",
+            "--head",
+            "HEAD",
+            "--platforms",
+            '[{"os": "linux", "arch": "amd64"}]',
+            "--version",
+            "999.0.0",
+        ],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -680,6 +704,8 @@ def test_integration_filtering_against_real_history():
     )
     out = result.stdout
     assert out.strip(), "Empty output"
+    assert "## Downloads" in out, f"Missing Downloads table: {out[:200]}"
+    assert "ex-ray-999.0.0-linux-amd64" in out, f"Missing platform asset link: {out[:400]}"
     assert "## " in out or "_No commits in this range" in out, f"Unexpected shape: {out[:200]}"
     assert "**Full Changelog**:" in out, f"Missing Full Changelog link: {out[-200:]}"
 
@@ -801,6 +827,19 @@ def _commit(repo: Path, message: str) -> str:
     ).stdout.strip()
 
 
+def _init_release_config(repo: Path, track: str) -> None:
+    """Write minimal `.github/release-<track>.yaml` + `.github/release-categories.yaml`
+    so `main()` can run end-to-end against a throwaway test repo."""
+    github_dir = repo / ".github"
+    github_dir.mkdir(exist_ok=True)
+    (github_dir / f"release-{track}.yaml").write_text(
+        "initial_release: |\n"
+        f"  Initial release of the `{track}` track.\n"
+        'include_paths:\n  - "**"\n'
+    )
+    (github_dir / "release-categories.yaml").write_text("categories:\n  - title: Other\n    types: []\n")
+
+
 def test_find_previous_tag_no_tags(tmp_path):
     repo = _init_test_repo(tmp_path)
     _commit(repo, "c1")
@@ -873,3 +912,59 @@ def test_find_previous_tag_skips_malformed_tags(tmp_path):
     subprocess.run(["git", "tag", "releases/hole/v1.0.0"], cwd=repo, check=True)
     _commit(repo, "c2")
     assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v1.0.0"
+
+
+def test_main_initial_release_includes_downloads_table(tmp_path, capsys, monkeypatch):
+    repo = _init_test_repo(tmp_path)
+    _init_release_config(repo, "hole")
+    _commit(repo, "c1")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate-release-notes.py",
+            "hole",
+            "--new-tag",
+            "releases/hole/v0.1.0",
+            "--repo-root",
+            str(repo),
+            "--platforms",
+            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
+            "--version",
+            "0.1.0",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert out.index("## Downloads") < out.index("Initial release of the `hole` track.")
+    assert "hole-0.1.0-windows-amd64.msi" in out
+
+
+def test_main_normal_release_includes_downloads_table(tmp_path, capsys, monkeypatch):
+    repo = _init_test_repo(tmp_path)
+    _init_release_config(repo, "hole")
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/hole/v0.1.0"], cwd=repo, check=True)
+    _commit(repo, "feat: add thing (#1)")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate-release-notes.py",
+            "hole",
+            "--new-tag",
+            "releases/hole/v0.2.0",
+            "--repo-root",
+            str(repo),
+            "--platforms",
+            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
+            "--version",
+            "0.2.0",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert out.index("## Downloads") < out.index("## Other")
+    assert "hole-0.2.0-windows-amd64.msi" in out
