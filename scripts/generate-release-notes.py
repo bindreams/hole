@@ -35,6 +35,7 @@ directory-only. See `build_path_spec` for the normalization rule.
 
 import argparse
 import dataclasses
+import json
 import re
 import subprocess
 import sys
@@ -69,6 +70,13 @@ class Commit:
     pr_number: int | None
     type: str | None
     desc: str
+
+
+@dataclasses.dataclass
+class Platform:
+    os: str
+    arch: str
+    ext: str | None = None
 
 
 # Loading ==============================================================================================================
@@ -236,6 +244,69 @@ def categorize(commits: list[Commit], categories: list[Category]) -> dict[str, l
     return out
 
 
+# Downloads table ======================================================================================================
+
+PLATFORM_LABELS: dict[tuple[str, str], str] = {
+    ("windows", "amd64"): "Windows",
+    ("windows", "arm64"): "Windows (ARM64)",
+    ("darwin", "amd64"): "macOS (Intel)",
+    ("darwin", "arm64"): "macOS (Apple Silicon)",
+    ("linux", "amd64"): "Linux (x86-64)",
+    ("linux", "arm64"): "Linux (ARM64)",
+}
+
+
+def platform_label(os_: str, arch: str) -> str:
+    """Friendly display label for an (os, arch) pair.
+
+    Raises for an unrecognized pair — a new platform must add a label
+    explicitly here, never render a blank/guessed row.
+    """
+    try:
+        return PLATFORM_LABELS[(os_, arch)]
+    except KeyError:
+        raise KeyError(f"No display label for platform ({os_!r}, {arch!r}); add one to PLATFORM_LABELS.") from None
+
+
+def parse_platforms(json_str: str) -> list[Platform]:
+    """Parse `--platforms` JSON (the build matrix, verbatim) into `Platform`s.
+
+    Extra matrix keys (e.g. `runner`) are ignored.
+    """
+    raw = json.loads(json_str)
+    return [Platform(os=p["os"], arch=p["arch"], ext=p.get("ext")) for p in raw]
+
+
+def asset_filename(track: str, version: str, platform: Platform) -> str:
+    """Release asset filename for a platform, matching each workflow's
+    rename step: `ext` present (hole's installers) uses it verbatim;
+    `ext` absent (raw binaries) appends `.exe` on windows, nothing
+    otherwise."""
+    if platform.ext is not None:
+        return f"{track}-{version}-{platform.os}-{platform.arch}.{platform.ext}"
+    suffix = ".exe" if platform.os == "windows" else ""
+    return f"{track}-{version}-{platform.os}-{platform.arch}{suffix}"
+
+
+def render_downloads_table(
+    track: str,
+    version: str,
+    new_tag: str,
+    platforms: list[Platform],
+    repo_url: str,
+) -> str:
+    """Render the `## Downloads` table: one row per platform, linking
+    directly to that platform's release asset."""
+    lines = ["## Downloads", "", "| Platform | Download |", "| --- | --- |"]
+    for platform in platforms:
+        label = platform_label(platform.os, platform.arch)
+        asset = asset_filename(track, version, platform)
+        url = f"{repo_url}/releases/download/{new_tag}/{asset}"
+        lines.append(f"| {label} | [{asset}]({url}) |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 # Rendering ============================================================================================================
 
 
@@ -284,6 +355,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("track", choices=["hole", "galoshes", "garter", "ex-ray"])
     parser.add_argument("--new-tag", required=True, help="Tag being released (e.g. releases/hole/v0.2.0)")
+    parser.add_argument(
+        "--platforms",
+        required=True,
+        help="JSON array of {os, arch, ext?} objects describing shipped platforms (the build matrix, verbatim)",
+    )
+    parser.add_argument(
+        "--version", required=True, help="Bare release version (e.g. 0.4.0), used to build asset filenames"
+    )
     parser.add_argument("--head", default="HEAD", help="Git ref representing the new release commit (default: HEAD)")
     parser.add_argument(
         "--repo-root",
@@ -309,6 +388,9 @@ def main() -> int:
             ).stdout.strip()
         )
 
+    platforms = parse_platforms(args.platforms)
+    downloads_table = render_downloads_table(args.track, args.version, args.new_tag, platforms, args.repo_url)
+
     config = load_config(repo_root, args.track)
     previous_tag = find_previous_tag(repo_root, args.track, args.head)
 
@@ -316,7 +398,7 @@ def main() -> int:
         # First-of-track release: emit the configured stub instead of
         # walking history. Avoids the "every PR ever merged" problem.
         body = config.initial_release or f"Initial release of the `{args.track}` track."
-        sys.stdout.write(body.rstrip() + "\n")
+        sys.stdout.write(downloads_table + "\n" + body.rstrip() + "\n")
         return 0
 
     range_spec = f"{previous_tag}..{args.head}"
@@ -325,7 +407,7 @@ def main() -> int:
     filtered = [c for c in commits if any(path_spec.match_file(f) for f in c.files)]
     grouped = categorize(filtered, config.categories)
     body = render_notes(grouped, new_tag=args.new_tag, previous_tag=previous_tag, repo_url=args.repo_url)
-    sys.stdout.write(body)
+    sys.stdout.write(downloads_table + "\n" + body)
     return 0
 
 
@@ -379,6 +461,95 @@ def test_tag_version_re():
     m = TAG_VERSION_RE.match("releases/ex-ray/v0.1.0")
     assert m is not None
     assert m.groups() == ("0", "1", "0", None)
+
+
+def test_platform_label_known_pairs():
+    assert platform_label("windows", "amd64") == "Windows"
+    assert platform_label("windows", "arm64") == "Windows (ARM64)"
+    assert platform_label("darwin", "amd64") == "macOS (Intel)"
+    assert platform_label("darwin", "arm64") == "macOS (Apple Silicon)"
+    assert platform_label("linux", "amd64") == "Linux (x86-64)"
+    assert platform_label("linux", "arm64") == "Linux (ARM64)"
+
+
+def test_platform_label_unknown_pair_raises():
+    import pytest
+    with pytest.raises(KeyError):
+        platform_label("freebsd", "amd64")
+
+
+def test_parse_platforms_reads_matrix_json():
+    platforms = parse_platforms(
+        '[{"os": "windows", "arch": "amd64", "runner": "windows-latest", "ext": "msi"}, '
+        '{"os": "darwin", "arch": "arm64", "runner": "macos-latest"}]'
+    )
+    assert platforms == [
+        Platform(os="windows", arch="amd64", ext="msi"),
+        Platform(os="darwin", arch="arm64", ext=None),
+    ]
+
+
+def test_asset_filename_with_explicit_ext():
+    assert (
+        asset_filename("hole", "0.4.0", Platform(os="windows", arch="amd64",
+                                                 ext="msi")) == "hole-0.4.0-windows-amd64.msi"
+    )
+    assert (
+        asset_filename("hole", "0.4.0", Platform(os="darwin", arch="arm64", ext="dmg")) == "hole-0.4.0-darwin-arm64.dmg"
+    )
+
+
+def test_asset_filename_raw_binary_windows_gets_exe():
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="windows", arch="amd64",
+                                                     ext=None)) == "galoshes-0.1.0-windows-amd64.exe"
+    )
+
+
+def test_asset_filename_raw_binary_unix_no_ext():
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="darwin", arch="arm64",
+                                                     ext=None)) == "galoshes-0.1.0-darwin-arm64"
+    )
+    assert (
+        asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64",
+                                                     ext=None)) == "galoshes-0.1.0-linux-amd64"
+    )
+
+
+def test_render_downloads_table_hole_shape():
+    platforms = [
+        Platform(os="windows", arch="amd64", ext="msi"),
+        Platform(os="darwin", arch="arm64", ext="dmg"),
+        Platform(os="darwin", arch="amd64", ext="dmg"),
+    ]
+    table = render_downloads_table(
+        "hole", "0.4.0", "releases/hole/v0.4.0", platforms, "https://github.com/bindreams/hole"
+    )
+    assert table == (
+        "## Downloads\n"
+        "\n"
+        "| Platform | Download |\n"
+        "| --- | --- |\n"
+        "| Windows | [hole-0.4.0-windows-amd64.msi]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-windows-amd64.msi) |\n"
+        "| macOS (Apple Silicon) | [hole-0.4.0-darwin-arm64.dmg]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-darwin-arm64.dmg) |\n"
+        "| macOS (Intel) | [hole-0.4.0-darwin-amd64.dmg]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-darwin-amd64.dmg) |\n"
+    )
+
+
+def test_render_downloads_table_raw_binary_no_ext():
+    platforms = [Platform(os="linux", arch="arm64", ext=None)]
+    table = render_downloads_table(
+        "galoshes", "0.1.0", "releases/galoshes/v0.1.0", platforms, "https://github.com/bindreams/hole"
+    )
+    assert (
+        "| Linux (ARM64) | [galoshes-0.1.0-linux-arm64]"
+        "(https://github.com/bindreams/hole/releases/download/releases/galoshes/v0.1.0/galoshes-0.1.0-linux-arm64) |\n"
+        in table
+    )
 
 
 def test_path_spec_basic():
@@ -512,7 +683,20 @@ def test_integration_filtering_against_real_history():
 
     script = repo_root / "scripts" / "generate-release-notes.py"
     result = subprocess.run(
-        ["uv", "run", str(script), "ex-ray", "--new-tag", "releases/ex-ray/v999.0.0", "--head", "HEAD"],
+        [
+            "uv",
+            "run",
+            str(script),
+            "ex-ray",
+            "--new-tag",
+            "releases/ex-ray/v999.0.0",
+            "--head",
+            "HEAD",
+            "--platforms",
+            '[{"os": "linux", "arch": "amd64"}]',
+            "--version",
+            "999.0.0",
+        ],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -520,6 +704,8 @@ def test_integration_filtering_against_real_history():
     )
     out = result.stdout
     assert out.strip(), "Empty output"
+    assert "## Downloads" in out, f"Missing Downloads table: {out[:200]}"
+    assert "ex-ray-999.0.0-linux-amd64" in out, f"Missing platform asset link: {out[:400]}"
     assert "## " in out or "_No commits in this range" in out, f"Unexpected shape: {out[:200]}"
     assert "**Full Changelog**:" in out, f"Missing Full Changelog link: {out[-200:]}"
 
@@ -641,6 +827,19 @@ def _commit(repo: Path, message: str) -> str:
     ).stdout.strip()
 
 
+def _init_release_config(repo: Path, track: str) -> None:
+    """Write minimal `.github/release-<track>.yaml` + `.github/release-categories.yaml`
+    so `main()` can run end-to-end against a throwaway test repo."""
+    github_dir = repo / ".github"
+    github_dir.mkdir(exist_ok=True)
+    (github_dir / f"release-{track}.yaml").write_text(
+        "initial_release: |\n"
+        f"  Initial release of the `{track}` track.\n"
+        'include_paths:\n  - "**"\n'
+    )
+    (github_dir / "release-categories.yaml").write_text("categories:\n  - title: Other\n    types: []\n")
+
+
 def test_find_previous_tag_no_tags(tmp_path):
     repo = _init_test_repo(tmp_path)
     _commit(repo, "c1")
@@ -713,3 +912,59 @@ def test_find_previous_tag_skips_malformed_tags(tmp_path):
     subprocess.run(["git", "tag", "releases/hole/v1.0.0"], cwd=repo, check=True)
     _commit(repo, "c2")
     assert find_previous_tag(repo, "hole", "HEAD") == "releases/hole/v1.0.0"
+
+
+def test_main_initial_release_includes_downloads_table(tmp_path, capsys, monkeypatch):
+    repo = _init_test_repo(tmp_path)
+    _init_release_config(repo, "hole")
+    _commit(repo, "c1")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate-release-notes.py",
+            "hole",
+            "--new-tag",
+            "releases/hole/v0.1.0",
+            "--repo-root",
+            str(repo),
+            "--platforms",
+            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
+            "--version",
+            "0.1.0",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert out.index("## Downloads") < out.index("Initial release of the `hole` track.")
+    assert "hole-0.1.0-windows-amd64.msi" in out
+
+
+def test_main_normal_release_includes_downloads_table(tmp_path, capsys, monkeypatch):
+    repo = _init_test_repo(tmp_path)
+    _init_release_config(repo, "hole")
+    _commit(repo, "c1")
+    subprocess.run(["git", "tag", "releases/hole/v0.1.0"], cwd=repo, check=True)
+    _commit(repo, "feat: add thing (#1)")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate-release-notes.py",
+            "hole",
+            "--new-tag",
+            "releases/hole/v0.2.0",
+            "--repo-root",
+            str(repo),
+            "--platforms",
+            '[{"os": "windows", "arch": "amd64", "ext": "msi"}]',
+            "--version",
+            "0.2.0",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert out.index("## Downloads") < out.index("## Other")
+    assert "hole-0.2.0-windows-amd64.msi" in out

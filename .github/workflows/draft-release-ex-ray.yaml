@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,6 +43,13 @@ jobs:
       - name: Validate version.toml matches version
         run: cargo xtask version --check --exact --group ex-ray
 
+      # Single definition of the build matrix, consumed by both the
+      # `build` job's strategy and the `release` job's Downloads table.
+      - name: Define build matrix
+        id: matrix
+        run: |
+          echo 'matrix=[{"os":"windows","arch":"amd64","runner":"windows-latest"},{"os":"windows","arch":"arm64","runner":"windows-11-arm"},{"os":"darwin","arch":"amd64","runner":"macos-15-intel"},{"os":"darwin","arch":"arm64","runner":"macos-latest"},{"os":"linux","arch":"amd64","runner":"ubuntu-latest"},{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"}]' >> "$GITHUB_OUTPUT"
+
   # Native-runner matrix over the galoshes/garter 6-platform set:
   # windows amd64/arm64, darwin amd64/arm64, linux amd64/arm64.
   # Assets named ex-ray-{version}-{os}-{arch}[.exe].
@@ -52,13 +60,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest    }
-          - { os: windows, arch: arm64, runner: windows-11-arm    }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel    }
-          - { os: darwin,  arch: arm64, runner: macos-latest      }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest     }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm  }
+        include: ${{ fromJSON(needs.validate.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -146,6 +148,8 @@ jobs:
             --new-tag "$TAG" \
             --head "${{ github.sha }}" \
             --repo-root source \
+            --platforms '${{ needs.validate.outputs.matrix }}' \
+            --version "$VERSION" \
             > release-notes.md
           echo "--- release-notes.md ---"
           cat release-notes.md
