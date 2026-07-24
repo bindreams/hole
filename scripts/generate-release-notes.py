@@ -35,6 +35,7 @@ directory-only. See `build_path_spec` for the normalization rule.
 
 import argparse
 import dataclasses
+import json
 import re
 import subprocess
 import sys
@@ -69,6 +70,13 @@ class Commit:
     pr_number: int | None
     type: str | None
     desc: str
+
+
+@dataclasses.dataclass
+class Platform:
+    os: str
+    arch: str
+    ext: str | None = None
 
 
 # Loading ==============================================================================================================
@@ -236,6 +244,39 @@ def categorize(commits: list[Commit], categories: list[Category]) -> dict[str, l
     return out
 
 
+# Downloads table ======================================================================================================
+
+PLATFORM_LABELS: dict[tuple[str, str], str] = {
+    ("windows", "amd64"): "Windows",
+    ("windows", "arm64"): "Windows (ARM64)",
+    ("darwin", "amd64"): "macOS (Intel)",
+    ("darwin", "arm64"): "macOS (Apple Silicon)",
+    ("linux", "amd64"): "Linux (x86-64)",
+    ("linux", "arm64"): "Linux (ARM64)",
+}
+
+
+def platform_label(os_: str, arch: str) -> str:
+    """Friendly display label for an (os, arch) pair.
+
+    Raises for an unrecognized pair — a new platform must add a label
+    explicitly here, never render a blank/guessed row.
+    """
+    try:
+        return PLATFORM_LABELS[(os_, arch)]
+    except KeyError:
+        raise KeyError(f"No display label for platform ({os_!r}, {arch!r}); add one to PLATFORM_LABELS.") from None
+
+
+def parse_platforms(json_str: str) -> list[Platform]:
+    """Parse `--platforms` JSON (the build matrix, verbatim) into `Platform`s.
+
+    Extra matrix keys (e.g. `runner`) are ignored.
+    """
+    raw = json.loads(json_str)
+    return [Platform(os=p["os"], arch=p["arch"], ext=p.get("ext")) for p in raw]
+
+
 # Rendering ============================================================================================================
 
 
@@ -379,6 +420,32 @@ def test_tag_version_re():
     m = TAG_VERSION_RE.match("releases/ex-ray/v0.1.0")
     assert m is not None
     assert m.groups() == ("0", "1", "0", None)
+
+
+def test_platform_label_known_pairs():
+    assert platform_label("windows", "amd64") == "Windows"
+    assert platform_label("windows", "arm64") == "Windows (ARM64)"
+    assert platform_label("darwin", "amd64") == "macOS (Intel)"
+    assert platform_label("darwin", "arm64") == "macOS (Apple Silicon)"
+    assert platform_label("linux", "amd64") == "Linux (x86-64)"
+    assert platform_label("linux", "arm64") == "Linux (ARM64)"
+
+
+def test_platform_label_unknown_pair_raises():
+    import pytest
+    with pytest.raises(KeyError):
+        platform_label("freebsd", "amd64")
+
+
+def test_parse_platforms_reads_matrix_json():
+    platforms = parse_platforms(
+        '[{"os": "windows", "arch": "amd64", "runner": "windows-latest", "ext": "msi"}, '
+        '{"os": "darwin", "arch": "arm64", "runner": "macos-latest"}]'
+    )
+    assert platforms == [
+        Platform(os="windows", arch="amd64", ext="msi"),
+        Platform(os="darwin", arch="arm64", ext=None),
+    ]
 
 
 def test_path_spec_basic():
