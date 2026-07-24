@@ -288,6 +288,25 @@ def asset_filename(track: str, version: str, platform: Platform) -> str:
     return f"{track}-{version}-{platform.os}-{platform.arch}{suffix}"
 
 
+def render_downloads_table(
+    track: str,
+    version: str,
+    new_tag: str,
+    platforms: list[Platform],
+    repo_url: str,
+) -> str:
+    """Render the `## Downloads` table: one row per platform, linking
+    directly to that platform's release asset."""
+    lines = ["## Downloads", "", "| Platform | Download |", "| --- | --- |"]
+    for platform in platforms:
+        label = platform_label(platform.os, platform.arch)
+        asset = asset_filename(track, version, platform)
+        url = f"{repo_url}/releases/download/{new_tag}/{asset}"
+        lines.append(f"| {label} | [{asset}]({url}) |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 # Rendering ============================================================================================================
 
 
@@ -484,6 +503,41 @@ def test_asset_filename_raw_binary_unix_no_ext():
     assert (
         asset_filename("galoshes", "0.1.0", Platform(os="linux", arch="amd64",
                                                      ext=None)) == "galoshes-0.1.0-linux-amd64"
+    )
+
+
+def test_render_downloads_table_hole_shape():
+    platforms = [
+        Platform(os="windows", arch="amd64", ext="msi"),
+        Platform(os="darwin", arch="arm64", ext="dmg"),
+        Platform(os="darwin", arch="amd64", ext="dmg"),
+    ]
+    table = render_downloads_table(
+        "hole", "0.4.0", "releases/hole/v0.4.0", platforms, "https://github.com/bindreams/hole"
+    )
+    assert table == (
+        "## Downloads\n"
+        "\n"
+        "| Platform | Download |\n"
+        "| --- | --- |\n"
+        "| Windows | [hole-0.4.0-windows-amd64.msi]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-windows-amd64.msi) |\n"
+        "| macOS (Apple Silicon) | [hole-0.4.0-darwin-arm64.dmg]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-darwin-arm64.dmg) |\n"
+        "| macOS (Intel) | [hole-0.4.0-darwin-amd64.dmg]"
+        "(https://github.com/bindreams/hole/releases/download/releases/hole/v0.4.0/hole-0.4.0-darwin-amd64.dmg) |\n"
+    )
+
+
+def test_render_downloads_table_raw_binary_no_ext():
+    platforms = [Platform(os="linux", arch="arm64", ext=None)]
+    table = render_downloads_table(
+        "galoshes", "0.1.0", "releases/galoshes/v0.1.0", platforms, "https://github.com/bindreams/hole"
+    )
+    assert (
+        "| Linux (ARM64) | [galoshes-0.1.0-linux-arm64]"
+        "(https://github.com/bindreams/hole/releases/download/releases/galoshes/v0.1.0/galoshes-0.1.0-linux-arm64) |\n"
+        in table
     )
 
 
