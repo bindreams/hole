@@ -29,7 +29,7 @@
     "@wdio/spec-reporter": "^9.27.1",
     "jsdom": "^29.0.0",
     "ts-node": "^10",
-    "typescript": "^6.0.0",
+    "typescript": "^7.0.0",
     "vite": "^8.0.3",
     "vitest": "^4"
   }
