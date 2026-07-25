@@ -105,19 +105,12 @@ jobs:
           cargo xtask update-archive --out "$ARCHIVE"
           echo "Archive: $ARCHIVE"
 
-      - name: Verify Windows archive contents
-        if: matrix.os == 'windows'
+      - name: Verify archive contents
         shell: bash
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
-          workdir="$(mktemp -d)"
-          unzip -q "$ARCHIVE" -d "$workdir"
-          # Derive the expected set from the single source of truth.
-          cargo xtask bindir-names --os windows | jq -r '.[]' | while read -r f; do
-            test -s "$workdir/$f" || { echo "::error::missing/empty $f in $ARCHIVE"; exit 1; }
-          done
-          echo "Windows archive contents verified"
+          cargo xtask verify-update-archive --archive "$ARCHIVE"
 
       - name: Verify macOS archive app is runnable (codesign)
         if: matrix.os == 'darwin'

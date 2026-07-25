@@ -222,6 +222,14 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Assert an update archive carries every file the bridge needs to unpack a
+    /// working BINDIR. The expected set comes from `bindir_dest_names`, so the
+    /// release workflow cannot drift from what ships.
+    VerifyUpdateArchive {
+        /// Archive to check (`.zip` on Windows, `.tar.gz` on macOS).
+        #[arg(long)]
+        archive: PathBuf,
+    },
     /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
     ///
     /// The release workflow captures it to name the published archive; the
@@ -291,6 +299,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let repo_root = repo_root()?;
             update_archive::build_update_archive(Profile::Release, &repo_root, &out)?;
             println!("xtask: update archive written to {}", out.display());
+            Ok(())
+        }
+        Command::VerifyUpdateArchive { archive } => {
+            update_archive::verify_update_archive(&archive)?;
+            println!("xtask: update archive verified {}", archive.display());
             Ok(())
         }
         Command::AssetSuffix => {
