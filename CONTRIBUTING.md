@@ -854,6 +854,16 @@ through these IN ORDER before proposing any timeout bump:
 timeouts. Job-level timeouts (`build` 30m, `test-hole` 20m, `test-garter`/
 `test-galoshes` 10m) are the only global timeouts.
 
+### Known coverage gap: macOS reopen
+
+`RunEvent::Reopen` — the Spotlight/Finder/Launchpad activation that reveals the
+dashboard — has no automated coverage on any platform. `RunEvent` is
+`#[non_exhaustive]` and constructed by the wry runtime, and there is no macOS GUI
+driver lane (the WebdriverIO E2E is Windows-only; `tauri-driver` has no macOS
+backend). Verify by hand on macOS when touching `handle_run_event` or
+`tray::open_settings_window`: with Hole running and the dashboard closed,
+Spotlight "Hole" must reveal it.
+
 ### Test invariants
 
 - **Test observability** — every test-bearing crate dev-deps

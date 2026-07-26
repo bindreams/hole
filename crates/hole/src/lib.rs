@@ -4,14 +4,17 @@
 // breaks in the lib without this alias.
 extern crate self as hole;
 
+pub mod autostart_registration;
 pub mod bridge_client;
 #[macro_use]
 pub mod cli_log;
 pub mod commands;
 pub mod config_recovery;
+pub mod dashboard;
 #[cfg(target_os = "macos")]
 pub mod dock_icon;
 pub mod elevation;
+pub mod launch;
 pub mod logging;
 pub mod path_management;
 pub mod relaunch;

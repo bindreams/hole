@@ -10,12 +10,30 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "hole", about = "Shadowsocks GUI with transparent proxy", version = env!("HOLE_VERSION"))]
 pub(crate) struct Cli {
-    /// Open the dashboard window on launch instead of starting in the tray
-    #[arg(long)]
-    pub(crate) show_dashboard: bool,
+    /// Open the dashboard window on launch (the default)
+    #[arg(long, overrides_with = "no_show_dashboard")]
+    show_dashboard: bool,
+
+    /// Start in the tray without opening the dashboard
+    #[arg(long, overrides_with = "show_dashboard")]
+    no_show_dashboard: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+impl Cli {
+    /// Whether this launch should open the dashboard. Mutual `overrides_with`
+    /// makes the last flag win, so the suppressing flag alone decides.
+    pub(crate) fn show_dashboard(&self) -> bool {
+        !self.no_show_dashboard
+    }
+
+    /// Whether either flag was given, for the subcommand rejection.
+    /// `show_dashboard()` cannot serve there — it is true by default.
+    pub(crate) fn show_dashboard_flag_present(&self) -> bool {
+        self.show_dashboard || self.no_show_dashboard
+    }
 }
 
 #[derive(Subcommand)]
@@ -231,19 +249,59 @@ pub(crate) enum PathAction {
 
 // Dispatch ============================================================================================================
 
-/// Parse CLI arguments. On Windows, attaches the parent console first so that
-/// `--help`/`--version`/error output reaches the user's terminal — but only if
-/// any args were passed. With zero args (the bare GUI launch from Explorer or
-/// the autostart entry) no console is attached and the app stays silent. The
-/// MSI installer launches with `--show-dashboard`, so it will attach to
-/// `msiexec`'s console if `msiexec` was started from one — that's acceptable.
-pub(crate) fn parse_args() -> Cli {
-    #[cfg(target_os = "windows")]
-    if std::env::args().len() > 1 {
-        attach_console();
+/// Resolve whether to open the dashboard. An explicit flag is the user speaking
+/// and wins; the env var is a relaunching predecessor's handoff and only
+/// redirects the default.
+pub(crate) fn resolve_show_dashboard(flag_present: bool, flag_value: bool, env_suppressed: bool) -> bool {
+    if flag_present {
+        return flag_value;
     }
+    !env_suppressed
+}
 
-    Cli::parse()
+/// Resolve whether a duplicate launch asked for the dashboard, from the argv
+/// `tauri-plugin-single-instance` forwarded (including `argv[0]`).
+///
+/// Reuses the real parser so last-wins resolution lives in one place. A parse
+/// failure should not happen — the forwarding process parsed the same argv
+/// during its own startup — so it is logged and treated as a plain launch.
+pub(crate) fn show_dashboard_from_argv(argv: &[String]) -> bool {
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => cli.show_dashboard(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not parse a duplicate launch's arguments; revealing the dashboard");
+            true
+        }
+    }
+}
+
+/// Whether this invocation writes to a console. A GUI launch must not attach:
+/// the console sends `CTRL_CLOSE_EVENT` to every attached process when its
+/// window closes, which would kill a tray-resident Hole along with the shell.
+pub(crate) fn wants_console(command: &Option<Command>) -> bool {
+    command.is_some()
+}
+
+/// Parse CLI arguments, attaching the parent console on Windows first for
+/// console invocations so their output reaches the user's terminal.
+///
+/// `std` fetches its stdout handle lazily, so attaching before the first write
+/// is what makes the output land.
+pub(crate) fn parse_args() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => {
+            if wants_console(&cli.command) {
+                attach_console();
+            }
+            cli
+        }
+        // `--help` and `--version` arrive here too, as DisplayHelp /
+        // DisplayVersion, and print via `exit()`.
+        Err(e) => {
+            attach_console();
+            e.exit()
+        }
+    }
 }
 
 /// Return `true` if dispatching `command` should install a `gui-cli.log`
@@ -1196,6 +1254,10 @@ fn attach_console() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
+
+/// No-op: only Windows detaches a GUI process from its parent console.
+#[cfg(not(target_os = "windows"))]
+fn attach_console() {}
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]
