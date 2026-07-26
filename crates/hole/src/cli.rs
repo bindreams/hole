@@ -249,19 +249,35 @@ pub(crate) enum PathAction {
 
 // Dispatch ============================================================================================================
 
-/// Parse CLI arguments. On Windows, attaches the parent console first so that
-/// `--help`/`--version`/error output reaches the user's terminal — but only if
-/// any args were passed. With zero args (the bare GUI launch from Explorer or
-/// the autostart entry) no console is attached and the app stays silent. The
-/// MSI installer launches with `--show-dashboard`, so it will attach to
-/// `msiexec`'s console if `msiexec` was started from one — that's acceptable.
-pub(crate) fn parse_args() -> Cli {
-    #[cfg(target_os = "windows")]
-    if std::env::args().len() > 1 {
-        attach_console();
-    }
+/// Whether this invocation writes to a console. A GUI launch must not attach:
+/// the console sends `CTRL_CLOSE_EVENT` to every attached process when its
+/// window closes, which would kill a tray-resident Hole along with the shell.
+pub(crate) fn wants_console(command: &Option<Command>) -> bool {
+    command.is_some()
+}
 
-    Cli::parse()
+/// Parse CLI arguments, attaching the parent console on Windows first for
+/// console invocations so their output reaches the user's terminal.
+///
+/// `std` fetches its stdout handle lazily, so attaching before the first write
+/// is what makes the output land.
+pub(crate) fn parse_args() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => {
+            #[cfg(target_os = "windows")]
+            if wants_console(&cli.command) {
+                attach_console();
+            }
+            cli
+        }
+        // `--help` and `--version` arrive here too, as DisplayHelp /
+        // DisplayVersion, and print via `exit()`.
+        Err(e) => {
+            #[cfg(target_os = "windows")]
+            attach_console();
+            e.exit()
+        }
+    }
 }
 
 /// Return `true` if dispatching `command` should install a `gui-cli.log`

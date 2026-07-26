@@ -102,6 +102,15 @@ fn flag_presence_distinguishes_default_from_explicit() {
     }
 }
 
+#[skuld::test]
+fn only_subcommands_want_a_console() {
+    // A GUI launch must never attach: the console sends CTRL_CLOSE_EVENT to
+    // every attached process when its window closes.
+    assert!(!wants_console(&None));
+    assert!(wants_console(&Some(Command::Version)));
+    assert!(wants_console(&Some(Command::Upgrade { yes: false })));
+}
+
 // Dispatch guard exemption: must NOT install a gui-cli.log subscriber for
 // commands that either have their own subscriber (`bridge run`) or don't
 // need an audit trail (`version`, `bridge log [...]`). Installing one would
