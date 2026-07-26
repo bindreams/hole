@@ -220,14 +220,13 @@ def test_launch_ca_after_install_finalize(package: ET.Element) -> None:
                       ) == "yes", (f"Launch CA '{action}' must have Impersonate='yes' to run as the installing user")
 
 
-def test_launch_ca_passes_show_dashboard(package: ET.Element) -> None:
-    """Launch CA must pass --show-dashboard so the first-run UX is the dashboard, not tray-only."""
+def test_launch_ca_passes_no_arguments(package: ET.Element) -> None:
+    """A bare launch shows the dashboard, so the launch CA must pass no arguments."""
     assert _LAUNCH_CAS, "no launch CAs configured to test"
     cas = _ca_map(package)
     for action in _LAUNCH_CAS:
         ca = cas[action]
-        assert ca.get("ExeCommand"
-                      ) == "--show-dashboard", (f"Launch CA '{action}' must have ExeCommand='--show-dashboard'")
+        assert not ca.get("ExeCommand"), (f"Launch CA '{action}' must pass no arguments; the dashboard is the default")
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
