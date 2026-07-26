@@ -290,7 +290,6 @@ pub(crate) fn wants_console(command: &Option<Command>) -> bool {
 pub(crate) fn parse_args() -> Cli {
     match Cli::try_parse() {
         Ok(cli) => {
-            #[cfg(target_os = "windows")]
             if wants_console(&cli.command) {
                 attach_console();
             }
@@ -299,7 +298,6 @@ pub(crate) fn parse_args() -> Cli {
         // `--help` and `--version` arrive here too, as DisplayHelp /
         // DisplayVersion, and print via `exit()`.
         Err(e) => {
-            #[cfg(target_os = "windows")]
             attach_console();
             e.exit()
         }
@@ -1256,6 +1254,10 @@ fn attach_console() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
+
+/// No-op: only Windows detaches a GUI process from its parent console.
+#[cfg(not(target_os = "windows"))]
+fn attach_console() {}
 
 #[cfg(test)]
 #[path = "cli_tests.rs"]
