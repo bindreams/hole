@@ -87,6 +87,11 @@
       "description": "gsudo (installer-E2E de-elevation): auto-merge; the required Test installer check gates it.",
       "matchDepNames": ["gerardog/gsudo"],
       "automerge": true
+    },
+    {
+      "description": "Tauri ships each plugin as an npm/crate pair and `npx tauri build` refuses a major.minor mismatch (#679). The npm and cargo managers are grouped separately above, so without this a bump on one side lands alone and breaks the DMG bundle. Last rule wins, so this overrides those groups for these packages.",
+      "matchPackageNames": ["@tauri-apps/**", "tauri", "tauri-build", "tauri-plugin-**"],
+      "groupName": "Tauri"
     }
   ]
 }

@@ -28,6 +28,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
 pub mod target;
+pub mod tauri_pairs;
 pub mod test_binaries;
 pub mod update_archive;
 pub mod upstream_v2ray;
