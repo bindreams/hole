@@ -10,12 +10,30 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "hole", about = "Shadowsocks GUI with transparent proxy", version = env!("HOLE_VERSION"))]
 pub(crate) struct Cli {
-    /// Open the dashboard window on launch instead of starting in the tray
-    #[arg(long)]
-    pub(crate) show_dashboard: bool,
+    /// Open the dashboard window on launch (the default)
+    #[arg(long, overrides_with = "no_show_dashboard")]
+    show_dashboard: bool,
+
+    /// Start in the tray without opening the dashboard
+    #[arg(long, overrides_with = "show_dashboard")]
+    no_show_dashboard: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+impl Cli {
+    /// Whether this launch should open the dashboard. Mutual `overrides_with`
+    /// makes the last flag win, so the suppressing flag alone decides.
+    pub(crate) fn show_dashboard(&self) -> bool {
+        !self.no_show_dashboard
+    }
+
+    /// Whether either flag was given, for the subcommand rejection.
+    /// `show_dashboard()` cannot serve there — it is true by default.
+    pub(crate) fn show_dashboard_flag_present(&self) -> bool {
+        self.show_dashboard || self.no_show_dashboard
+    }
 }
 
 #[derive(Subcommand)]

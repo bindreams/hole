@@ -38,15 +38,19 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 fn main() {
     let cli = cli::parse_args();
+    // Read both before the match: it moves `command` out, and a partially moved
+    // `cli` cannot be borrowed by a `&self` method.
+    let show_dashboard = cli.show_dashboard();
+    let dashboard_flag_present = cli.show_dashboard_flag_present();
     match cli.command {
         Some(cmd) => {
-            if cli.show_dashboard {
-                eprintln!("error: --show-dashboard cannot be combined with a subcommand");
+            if dashboard_flag_present {
+                eprintln!("error: dashboard flags cannot be combined with a subcommand");
                 std::process::exit(2);
             }
             cli::dispatch(cmd);
         }
-        None => launch_gui(cli.show_dashboard),
+        None => launch_gui(show_dashboard),
     }
 }
 

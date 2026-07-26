@@ -53,10 +53,9 @@ impl DashboardWindow {
     }
 }
 
-/// Window label for a dashboard generation. Must match the capability glob
-/// `dashboard-*` in `capabilities/default.json`.
+/// Window label for a dashboard generation.
 fn label_for(generation: u64) -> String {
-    format!("dashboard-{generation}")
+    format!("{}{generation}", hole::launch::DASHBOARD_LABEL_PREFIX)
 }
 
 #[cfg(test)]
