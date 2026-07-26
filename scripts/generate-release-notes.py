@@ -115,7 +115,7 @@ def git(repo_root: Path, *args: str) -> str:
         ["git", *args],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=False,
     )
     if result.returncode != 0:
@@ -351,6 +351,17 @@ def render_notes(
 # Entry point ==========================================================================================================
 
 
+def emit(text: str) -> None:
+    """Write to stdout as UTF-8 regardless of the console's code page.
+
+    Category titles carry emoji, so the output is UTF-8 by contract; going
+    through the text layer dies on cp1252 (stock Windows) — invisible while
+    this only ran on ubuntu (#682).
+    """
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("track", choices=["hole", "galoshes", "garter", "ex-ray"])
@@ -383,7 +394,7 @@ def main() -> int:
             subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
                 check=True,
             ).stdout.strip()
         )
@@ -398,7 +409,7 @@ def main() -> int:
         # First-of-track release: emit the configured stub instead of
         # walking history. Avoids the "every PR ever merged" problem.
         body = config.initial_release or f"Initial release of the `{args.track}` track."
-        sys.stdout.write(downloads_table + "\n" + body.rstrip() + "\n")
+        emit(downloads_table + "\n" + body.rstrip() + "\n")
         return 0
 
     range_spec = f"{previous_tag}..{args.head}"
@@ -407,7 +418,7 @@ def main() -> int:
     filtered = [c for c in commits if any(path_spec.match_file(f) for f in c.files)]
     grouped = categorize(filtered, config.categories)
     body = render_notes(grouped, new_tag=args.new_tag, previous_tag=previous_tag, repo_url=args.repo_url)
-    sys.stdout.write(downloads_table + "\n" + body)
+    emit(downloads_table + "\n" + body)
     return 0
 
 
@@ -699,9 +710,12 @@ def test_integration_filtering_against_real_history():
         ],
         cwd=repo_root,
         capture_output=True,
-        text=True,
-        check=True,
+        encoding="utf-8",
+        check=False,
     )
+    # Surface the child's stderr: `check=True` raises with only the exit status,
+    # which left a CI failure undiagnosable (#682).
+    assert result.returncode == 0, f"generate-release-notes exited {result.returncode}:\n{result.stderr}"
     out = result.stdout
     assert out.strip(), "Empty output"
     assert "## Downloads" in out, f"Missing Downloads table: {out[:200]}"
@@ -719,7 +733,7 @@ def test_integration_filtering_against_real_history():
         ["git", "log", "--format=%H", "--no-merges", f"{prev_tag}..HEAD"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
     ).stdout.splitlines()
     for sha in all_commits:
@@ -727,7 +741,7 @@ def test_integration_filtering_against_real_history():
             ["git", "show", "--no-renames", "--name-only", "--format=", sha],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         ).stdout.splitlines()
         files = [f for f in files if f.strip()]
@@ -740,7 +754,7 @@ def test_integration_filtering_against_real_history():
             ["git", "log", "--format=%s", "-1", sha],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         ).stdout.strip()
         m = re.search(r"\(#(\d+)\)\s*$", subject)
@@ -758,7 +772,7 @@ def test_integration_filtering_against_real_history():
 def test_shared_categories_file_loaded():
     """load_config returns categories from the shared file for every track."""
     repo_root = Path(__file__).resolve().parent.parent
-    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text())
+    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text(encoding="utf-8"))
     expected_titles = [c["title"] for c in shared["categories"]]
     for track in ["hole", "galoshes", "garter", "ex-ray"]:
         config = load_config(repo_root, track)
@@ -770,7 +784,7 @@ def test_per_track_configs_dont_duplicate_categories():
     """Per-track files must not redeclare categories (single source of truth)."""
     repo_root = Path(__file__).resolve().parent.parent
     for track in ["hole", "galoshes", "garter", "ex-ray"]:
-        raw = yaml.safe_load((repo_root / ".github" / f"release-{track}.yaml").read_text())
+        raw = yaml.safe_load((repo_root / ".github" / f"release-{track}.yaml").read_text(encoding="utf-8"))
         assert "categories" not in raw, (
             f"release-{track}.yaml must not declare `categories:`; "
             f"shared schema lives in .github/release-categories.yaml"
@@ -787,11 +801,11 @@ def test_categories_cover_all_semantic_pr_types():
     type must have an explicit category.
     """
     repo_root = Path(__file__).resolve().parent.parent
-    semantic = yaml.safe_load((repo_root / ".github/workflows/semantic-pr.yaml").read_text())
+    semantic = yaml.safe_load((repo_root / ".github/workflows/semantic-pr.yaml").read_text(encoding="utf-8"))
     types_block = semantic["jobs"]["validate"]["steps"][0]["with"]["types"]
     declared_types = {t.strip() for t in types_block.splitlines() if t.strip()}
 
-    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text())
+    shared = yaml.safe_load((repo_root / ".github" / "release-categories.yaml").read_text(encoding="utf-8"))
     explicit_types = {t for cat in shared["categories"] for t in cat.get("types", [])}
     has_catchall = any(not cat.get("types") for cat in shared["categories"])
 
@@ -822,7 +836,7 @@ def _commit(repo: Path, message: str) -> str:
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
     ).stdout.strip()
 
