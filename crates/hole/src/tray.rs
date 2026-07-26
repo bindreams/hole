@@ -1244,11 +1244,25 @@ async fn handle_check_for_updates(app: AppHandle) {
     }
 }
 
+/// Proof that the launch-time dashboard decision has been applied. The status
+/// reconciler drives the self-heal probe, which reads live dashboard state, so
+/// it must not run before the launch has had its say.
+#[must_use]
+pub struct LaunchWindowsSettled(());
+
+/// Apply the launch-time dashboard decision.
+pub fn apply_launch_window(app: &AppHandle, show_dashboard: bool) -> LaunchWindowsSettled {
+    if show_dashboard {
+        open_settings_window(app);
+    }
+    LaunchWindowsSettled(())
+}
+
 /// Reveal the dashboard if one is open, otherwise build a fresh one. Called
-/// by the tray click, the tray "Dashboard…" item, `--show-dashboard`, and the
-/// single-instance callback.
+/// by the tray click, the tray "Dashboard…" item, the launch-time decision, and
+/// the single-instance callback.
 pub(crate) fn open_settings_window(app: &AppHandle) {
-    let dashboard = app.state::<crate::dashboard::DashboardWindow>();
+    let dashboard = app.state::<hole::dashboard::DashboardWindow>();
     if let Some(label) = dashboard.current_label() {
         if let Some(window) = app.get_webview_window(&label) {
             reveal(&window);
@@ -1272,7 +1286,7 @@ fn reveal(window: &tauri::WebviewWindow) {
 
 /// Build a fresh dashboard window with a unique label and wire its close
 /// handler.
-fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindow) {
+fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow) {
     let (generation, label) = dashboard.allocate();
 
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::default())
@@ -1341,7 +1355,7 @@ fn build_dashboard(app: &AppHandle, dashboard: &crate::dashboard::DashboardWindo
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
                     close_handle
-                        .state::<crate::dashboard::DashboardWindow>()
+                        .state::<hole::dashboard::DashboardWindow>()
                         .forget(generation);
                 }
             });
@@ -1484,7 +1498,7 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// Beyond presentation, each tick's Status result drives the one-shot
 /// startup-connect intent (#458): the recorded intent is applied (connect) at
 /// most once — the first time the bridge proves reachable — and never again.
-pub fn spawn_status_reconciler(app: &AppHandle) {
+pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));

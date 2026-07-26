@@ -249,6 +249,16 @@ pub(crate) enum PathAction {
 
 // Dispatch ============================================================================================================
 
+/// Resolve whether to open the dashboard. An explicit flag is the user speaking
+/// and wins; the env var is a relaunching predecessor's handoff and only
+/// redirects the default.
+pub(crate) fn resolve_show_dashboard(flag_present: bool, flag_value: bool, env_suppressed: bool) -> bool {
+    if flag_present {
+        return flag_value;
+    }
+    !env_suppressed
+}
+
 /// Resolve whether a duplicate launch asked for the dashboard, from the argv
 /// `tauri-plugin-single-instance` forwarded (including `argv[0]`).
 ///

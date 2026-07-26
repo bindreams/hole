@@ -6,9 +6,10 @@ use std::sync::Mutex;
 
 /// At most one dashboard window is open at a time. Each built window gets a
 /// unique, monotonic label (`dashboard-{n}`) so a new window never collides
-/// with a still-closing one. Tauri-managed; the `Mutex` only satisfies `Sync`
-/// (all access is on the main thread).
-pub(crate) struct DashboardWindow {
+/// with a still-closing one. Tauri-managed. The `Mutex` is load-bearing:
+/// writes come from the main thread, while the self-heal path reads
+/// `current_label` from the tokio runtime.
+pub struct DashboardWindow {
     inner: Mutex<Inner>,
 }
 
@@ -19,22 +20,28 @@ struct Inner {
     next: u64,
 }
 
+impl Default for DashboardWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DashboardWindow {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner { current: None, next: 0 }),
         }
     }
 
     /// Label of the live dashboard, or `None` if none is open.
-    pub(crate) fn current_label(&self) -> Option<String> {
+    pub fn current_label(&self) -> Option<String> {
         self.inner.lock().unwrap().current.map(label_for)
     }
 
     /// Allocate a fresh generation, mark it the current dashboard, and return
     /// `(generation, label)`. On build failure the caller calls
     /// [`forget`](Self::forget) with `generation`.
-    pub(crate) fn allocate(&self) -> (u64, String) {
+    pub fn allocate(&self) -> (u64, String) {
         let mut inner = self.inner.lock().unwrap();
         let generation = inner.next;
         inner.next += 1;
@@ -45,7 +52,7 @@ impl DashboardWindow {
     /// The window of `generation` is going away. Clears the current dashboard
     /// iff it still points at `generation`, so a stale window's close can
     /// never forget a newer dashboard.
-    pub(crate) fn forget(&self, generation: u64) {
+    pub fn forget(&self, generation: u64) {
         let mut inner = self.inner.lock().unwrap();
         if inner.current == Some(generation) {
             inner.current = None;
@@ -53,9 +60,10 @@ impl DashboardWindow {
     }
 }
 
-/// Window label for a dashboard generation.
+/// Window label for a dashboard generation. Must match the capability glob
+/// `dashboard-*` in `capabilities/default.json`.
 fn label_for(generation: u64) -> String {
-    format!("{}{generation}", hole::launch::DASHBOARD_LABEL_PREFIX)
+    format!("dashboard-{generation}")
 }
 
 #[cfg(test)]

@@ -102,6 +102,28 @@ fn flag_presence_distinguishes_default_from_explicit() {
     }
 }
 
+#[skuld::test]
+fn resolve_show_dashboard_lets_an_explicit_flag_beat_the_env_var() {
+    // A relaunch sets the env var and passes no flag; a flag on the command line
+    // is the user speaking and wins.
+    assert!(
+        !resolve_show_dashboard(false, true, true),
+        "env suppresses a default launch"
+    );
+    assert!(
+        resolve_show_dashboard(false, true, false),
+        "no env, no flag: the default shows"
+    );
+    assert!(
+        resolve_show_dashboard(true, true, true),
+        "--show-dashboard beats the env var"
+    );
+    assert!(
+        !resolve_show_dashboard(true, false, false),
+        "--no-show-dashboard needs no env var"
+    );
+}
+
 // Duplicate-launch argv resolution (the single-instance callback).
 
 #[skuld::test]

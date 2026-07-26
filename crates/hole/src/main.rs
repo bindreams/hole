@@ -10,7 +10,6 @@ mod bridge_client;
 mod cli_log;
 mod cli;
 mod commands;
-mod dashboard;
 mod elevation;
 mod log_collector;
 mod logging;
@@ -40,8 +39,12 @@ fn main() {
     let cli = cli::parse_args();
     // Read both before the match: it moves `command` out, and a partially moved
     // `cli` cannot be borrowed by a `&self` method.
-    let show_dashboard = cli.show_dashboard();
     let dashboard_flag_present = cli.show_dashboard_flag_present();
+    let show_dashboard = cli::resolve_show_dashboard(
+        dashboard_flag_present,
+        cli.show_dashboard(),
+        std::env::var_os(hole::launch::NO_DASHBOARD_ENV).is_some(),
+    );
     match cli.command {
         Some(cmd) => {
             if dashboard_flag_present {
@@ -128,7 +131,7 @@ fn launch_gui(show_dashboard: bool) {
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![hole::launch::NO_SHOW_DASHBOARD]),
         ))
         .plugin(tauri_plugin_dialog::init())
         // `.skip_logger()` is critical: `tracing-subscriber 0.3`'s default
@@ -181,7 +184,7 @@ fn launch_gui(show_dashboard: bool) {
             }
             app.manage(hole::update::UpdateState::default());
             app.manage(tray::TransitionSlot::new());
-            app.manage(dashboard::DashboardWindow::new());
+            app.manage(hole::dashboard::DashboardWindow::new());
             tray::create_tray(app)?;
             // Tray + webview follow the ProxyStateCell; the reconciler's
             // immediate first tick is the startup resync against the
@@ -192,11 +195,17 @@ fn launch_gui(show_dashboard: bool) {
             // the first time the bridge is reachable, so a cold-boot race against
             // the bridge's socket bind can't drop it.
             tray::arm_startup_auto_connect(app.handle());
-            tray::spawn_status_reconciler(app.handle());
             platform::on_setup(app)?;
-            if show_dashboard {
-                tray::open_settings_window(app.handle());
+            // Registrations written before the dashboard flag existed carry no
+            // arguments and would open a window at login. Best-effort: never
+            // block startup. The detail may embed a filesystem path, so it stays
+            // in gui.log rather than a toast.
+            match hole::autostart_registration::migrate(&app.package_info().name, hole::launch::NO_SHOW_DASHBOARD) {
+                Ok(outcome) => tracing::debug!(?outcome, "autostart argument migration"),
+                Err(e) => tracing::warn!(error = %e, "autostart argument migration failed"),
             }
+            let settled = tray::apply_launch_window(app.handle(), show_dashboard);
+            tray::spawn_status_reconciler(app.handle(), settled);
             // Best-effort sweep of `hole-install-*` temp directories left
             // behind by failed elevated installs (`run_elevated` detaches
             // its TempDir on failure so the user can attach the log to
