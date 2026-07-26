@@ -37,6 +37,14 @@ jobs:
       - name: Run linters
         run: cargo xtask run prek
 
+      # `scripts/*.py` keep their tests inline, and the filenames are
+      # hyphenated, so pytest's default `test_*.py` collection finds nothing —
+      # which is why sign-release.py's stale asset-count check reached a release
+      # unnoticed (#682). `python_files` collects every script rather than a
+      # hand-listed set, so a new script's tests run without touching CI.
+      - name: Test release scripts
+        run: uv run --with pytest --with PyYAML --with pathspec pytest -o python_files="*.py" scripts/
+
   # Per-platform build job: compiles clippy + test binaries once and publishes
   # them as a platform-scoped artifact (`build-<os>-<arch>`). Test jobs below
   # download the archive and run filtered tests without invoking the Rust
