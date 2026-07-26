@@ -115,7 +115,7 @@ def git(repo_root: Path, *args: str) -> str:
         ["git", *args],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=False,
     )
     if result.returncode != 0:
@@ -394,7 +394,7 @@ def main() -> int:
             subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
                 check=True,
             ).stdout.strip()
         )
@@ -710,7 +710,7 @@ def test_integration_filtering_against_real_history():
         ],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=False,
     )
     # Surface the child's stderr: `check=True` raises with only the exit status,
@@ -733,7 +733,7 @@ def test_integration_filtering_against_real_history():
         ["git", "log", "--format=%H", "--no-merges", f"{prev_tag}..HEAD"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
     ).stdout.splitlines()
     for sha in all_commits:
@@ -741,7 +741,7 @@ def test_integration_filtering_against_real_history():
             ["git", "show", "--no-renames", "--name-only", "--format=", sha],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         ).stdout.splitlines()
         files = [f for f in files if f.strip()]
@@ -754,7 +754,7 @@ def test_integration_filtering_against_real_history():
             ["git", "log", "--format=%s", "-1", sha],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         ).stdout.strip()
         m = re.search(r"\(#(\d+)\)\s*$", subject)
@@ -836,7 +836,7 @@ def _commit(repo: Path, message: str) -> str:
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=True,
     ).stdout.strip()
 
