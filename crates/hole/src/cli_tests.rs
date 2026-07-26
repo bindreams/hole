@@ -102,6 +102,38 @@ fn flag_presence_distinguishes_default_from_explicit() {
     }
 }
 
+// Duplicate-launch argv resolution (the single-instance callback).
+
+#[skuld::test]
+fn forwarded_argv_defaults_to_revealing() {
+    let argv = vec![r"C:\Program Files\hole\bin\hole.exe".to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn forwarded_argv_honors_suppression() {
+    // The autostart entry landing on a running instance must stay quiet.
+    let argv = vec![
+        "/Applications/Hole.app/Contents/MacOS/hole".to_string(),
+        hole::launch::NO_SHOW_DASHBOARD.to_string(),
+    ];
+    assert!(!show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn forwarded_argv_honors_explicit_show() {
+    let argv = vec!["hole".to_string(), hole::launch::SHOW_DASHBOARD.to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn unparseable_forwarded_argv_reveals() {
+    // Should be unreachable, but the fallback must be the useful response to a
+    // user double-clicking the icon, not silence.
+    let argv = vec!["hole".to_string(), "--not-a-flag".to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
 #[skuld::test]
 fn only_subcommands_want_a_console() {
     // A GUI launch must never attach: the console sends CTRL_CLOSE_EVENT to

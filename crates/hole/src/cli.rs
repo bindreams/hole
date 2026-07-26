@@ -249,6 +249,22 @@ pub(crate) enum PathAction {
 
 // Dispatch ============================================================================================================
 
+/// Resolve whether a duplicate launch asked for the dashboard, from the argv
+/// `tauri-plugin-single-instance` forwarded (including `argv[0]`).
+///
+/// Reuses the real parser so last-wins resolution lives in one place. A parse
+/// failure should not happen — the forwarding process parsed the same argv
+/// during its own startup — so it is logged and treated as a plain launch.
+pub(crate) fn show_dashboard_from_argv(argv: &[String]) -> bool {
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => cli.show_dashboard(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not parse a duplicate launch's arguments; revealing the dashboard");
+            true
+        }
+    }
+}
+
 /// Whether this invocation writes to a console. A GUI launch must not attach:
 /// the console sends `CTRL_CLOSE_EVENT` to every attached process when its
 /// window closes, which would kill a tray-resident Hole along with the shell.

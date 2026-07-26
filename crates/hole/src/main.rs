@@ -111,11 +111,14 @@ fn launch_gui(show_dashboard: bool) {
         // against the live first instance). The callback fires on a
         // plugin-owned thread; `WebviewWindowBuilder::build` and Cocoa UI
         // work require the main thread, so dispatch via
-        // `run_on_main_thread`. `argv` and `cwd` are intentionally ignored
-        // — whether the user typed `hole`, `hole --show-dashboard`, or
-        // double-clicked the desktop shortcut, the only useful response
-        // is to reveal the existing UI (same as a tray click). See #360.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // `run_on_main_thread`. `argv` decides whether to reveal: an autostart
+        // entry landing on a running instance forwards `--no-show-dashboard` and
+        // must stay quiet, while any other launch is a user asking for the UI.
+        // `cwd` is irrelevant.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !cli::show_dashboard_from_argv(&args) {
+                return;
+            }
             let handle = app.clone();
             if let Err(e) = app.run_on_main_thread(move || {
                 tray::open_settings_window(&handle);
@@ -250,43 +253,56 @@ fn launch_gui(show_dashboard: bool) {
 /// flag, the `None` arm would call `prevent_exit` and abort the explicit
 /// exit we just initiated.
 fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
-    let tauri::RunEvent::ExitRequested { code, api, .. } = event else {
-        return;
-    };
+    match event {
+        // No new process is spawned on reopen, so single-instance never fires;
+        // this is the only signal. `has_visible_windows` is ignored: reveal-or-build
+        // also covers a minimized dashboard.
+        //
+        // The `EXITING` guard matters: the `Some(_)` arm destroys every window and
+        // returns to the event loop, which processes the destroys on a later
+        // iteration. An activation delivered in that window would build a fresh
+        // webview on a process about to `process::exit` past every `Drop`.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } if !EXITING.load(Ordering::SeqCst) => tray::open_settings_window(app),
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {}
 
-    match code {
-        None => {
-            if EXITING.load(Ordering::SeqCst) {
-                // Re-entered from the destroys we triggered in the
-                // `Some(_)` arm. Let the natural shutdown proceed; do
-                // not call `prevent_exit`.
-                return;
+        tauri::RunEvent::ExitRequested { code, api, .. } => match code {
+            None => {
+                if EXITING.load(Ordering::SeqCst) {
+                    // Re-entered from the destroys we triggered in the
+                    // `Some(_)` arm. Let the natural shutdown proceed; do
+                    // not call `prevent_exit`.
+                    return;
+                }
+                api.prevent_exit();
+                #[cfg(target_os = "macos")]
+                platform::hide_dock_icon(app);
             }
-            api.prevent_exit();
-            #[cfg(target_os = "macos")]
-            platform::hide_dock_icon(app);
-        }
-        Some(_) => {
-            EXITING.store(true, Ordering::SeqCst);
-            for window in app.webview_windows().values() {
-                if let Err(e) = window.destroy() {
-                    // Use eprintln rather than tracing::warn here.
-                    // tracing-subscriber writes through an async
-                    // appender, and tao's `EventLoop::run` is about to
-                    // call `std::process::exit` which bypasses the
-                    // WorkerGuard's flush-on-drop. eprintln hits stderr
-                    // synchronously so dev-mode users (the only ones who
-                    // have a console at all, since release builds use
-                    // windows_subsystem) actually see the failure. If
-                    // destroy fails, the original ERROR_CLASS_HAS_WINDOWS
-                    // bug recurs — surfacing the warning loudly is
-                    // important so the regression is diagnosable.
-                    eprintln!(
-                        "warning: failed to destroy webview window {:?} on exit: {e}",
-                        window.label(),
-                    );
+            Some(_) => {
+                EXITING.store(true, Ordering::SeqCst);
+                for window in app.webview_windows().values() {
+                    if let Err(e) = window.destroy() {
+                        // Use eprintln rather than tracing::warn here.
+                        // tracing-subscriber writes through an async
+                        // appender, and tao's `EventLoop::run` is about to
+                        // call `std::process::exit` which bypasses the
+                        // WorkerGuard's flush-on-drop. eprintln hits stderr
+                        // synchronously so dev-mode users (the only ones who
+                        // have a console at all, since release builds use
+                        // windows_subsystem) actually see the failure. If
+                        // destroy fails, the original ERROR_CLASS_HAS_WINDOWS
+                        // bug recurs — surfacing the warning loudly is
+                        // important so the regression is diagnosable.
+                        eprintln!(
+                            "warning: failed to destroy webview window {:?} on exit: {e}",
+                            window.label(),
+                        );
+                    }
                 }
             }
-        }
+        },
+
+        _ => {}
     }
 }
