@@ -50,15 +50,17 @@ fn parse_addrs_extracts_a_and_aaaa_records() {
     msg.add_answer(Record::from_rdata(name, 60, RData::AAAA(AAAA(v6))));
     let bytes = msg.to_vec().unwrap();
 
-    let addrs = parse_addrs(&bytes);
+    let addrs = parse_addrs(&bytes).unwrap();
     assert!(addrs.contains(&IpAddr::V4(v4)));
     assert!(addrs.contains(&IpAddr::V6(v6)));
 }
 
 #[skuld::test]
-fn parse_addrs_ignores_garbage() {
-    // < 12 bytes is not a parseable DNS message.
-    assert!(parse_addrs(&[0u8; 4]).is_empty());
+fn parse_addrs_reports_an_unparseable_reply() {
+    // < 12 bytes is not a parseable DNS message. Distinct from a reply that
+    // parses and carries no records — a resolver that answered garbage is a
+    // different finding from one that answered "I have nothing".
+    assert_eq!(parse_addrs(&[0u8; 4]), None);
 }
 
 // resolve_via_doh =====================================================================================================
@@ -69,7 +71,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use hole_common::config::{DnsConfig, DnsProtocol};
 
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+
 use super::{resolve_via_doh_with, DohQuerier};
+use crate::dns::forwarder::UpstreamCause;
 
 /// In-test querier: answers ONLY for resolver IPs it was given a canned reply
 /// for; returns `None` otherwise (models "this resolver unreachable"). Records
@@ -77,20 +82,27 @@ use super::{resolve_via_doh_with, DohQuerier};
 /// resolver — not the OS resolver — was consulted.
 struct StubQuerier {
     answer_for: HashMap<IpAddr, Vec<u8>>,
+    /// Returned for any server without a canned reply.
+    fail_with: UpstreamCause,
     asked: Mutex<Vec<IpAddr>>,
 }
 
 #[async_trait]
 impl DohQuerier for StubQuerier {
-    async fn query(&self, server: IpAddr, _wire: &[u8]) -> Option<Vec<u8>> {
+    async fn query(&self, server: IpAddr, _wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
         self.asked.lock().unwrap().push(server);
-        self.answer_for.get(&server).cloned()
+        self.answer_for.get(&server).cloned().ok_or(self.fail_with)
     }
 }
 
 fn stub(answers: HashMap<IpAddr, Vec<u8>>) -> Arc<StubQuerier> {
+    stub_failing(answers, UpstreamCause::Unreachable)
+}
+
+fn stub_failing(answers: HashMap<IpAddr, Vec<u8>>, fail_with: UpstreamCause) -> Arc<StubQuerier> {
     Arc::new(StubQuerier {
         answer_for: answers,
+        fail_with,
         asked: Mutex::new(Vec::new()),
     })
 }
@@ -155,13 +167,253 @@ async fn resolve_surfaces_invalid_name_not_no_answer() {
 }
 
 #[skuld::test]
-async fn resolve_fails_closed_when_no_resolver_answers() {
+async fn resolve_reports_unreachable_when_no_resolver_answers() {
+    // Fail-closed AND specific: an unreachable resolver is not "no answer".
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
-    let q = stub(HashMap::new()); // querier returns None for every server.
-    let err = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
+    let err = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), stub(HashMap::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(err, BootstrapError::Unreachable);
+}
+
+#[skuld::test]
+async fn resolve_maps_every_upstream_cause_to_its_bootstrap_error() {
+    // Every variant the seam can carry — the match in `classify` is total, so
+    // this list is exhaustive by construction.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let cases = [
+        (UpstreamCause::CertificateRejected, BootstrapError::CertificateRejected),
+        (UpstreamCause::Unreachable, BootstrapError::Unreachable),
+        (UpstreamCause::Timeout, BootstrapError::Timeout),
+        (UpstreamCause::TlsFailed, BootstrapError::Transport),
+        (UpstreamCause::BadResponse, BootstrapError::Transport),
+        (UpstreamCause::Io, BootstrapError::Transport),
+    ];
+    for (cause, expected) in cases {
+        let q = stub_failing(HashMap::new(), cause);
+        let err = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
+            .await
+            .unwrap_err();
+        assert_eq!(err, expected, "cause {cause:?}");
+    }
+}
+
+#[skuld::test]
+async fn resolve_reports_no_answer_when_a_resolver_replies_without_records() {
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    msg.metadata.response_code = ResponseCode::ServFail;
+    msg.add_query(Query::query(Name::from_ascii("proxy.example.").unwrap(), RecordType::A));
+    let mut answers = HashMap::new();
+    answers.insert(resolver, msg.to_vec().unwrap());
+    let err = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), stub(answers))
         .await
         .unwrap_err();
     assert_eq!(err, BootstrapError::NoAnswer);
+}
+
+#[skuld::test]
+async fn resolve_reports_malformed_reply_when_a_resolver_answers_non_dns() {
+    // HTTP 200, `application/dns-message`, body that is not DNS: the resolver
+    // is answering, but not with DNS. Distinct from an empty answer.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let mut answers = HashMap::new();
+    answers.insert(resolver, b"not dns at all".to_vec());
+    let err = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), stub(answers))
+        .await
+        .unwrap_err();
+    assert_eq!(err, BootstrapError::MalformedReply);
+}
+
+#[skuld::test]
+fn bootstrap_error_ranking_is_total_and_ordered() {
+    // The fold reports the highest-ranked failure observed. Pin the whole
+    // order: an answered-but-empty resolver must NOT be masked by another
+    // resolver's failed connect, or the toast claims a network failure that
+    // did not happen. `InvalidName` is included even though it short-circuits
+    // before the loop today — if it ever reaches the fold, it must win.
+    let order = [
+        BootstrapError::Unreachable,
+        BootstrapError::Timeout,
+        BootstrapError::Transport,
+        BootstrapError::NoAnswer,
+        BootstrapError::MalformedReply,
+        BootstrapError::CertificateRejected,
+        BootstrapError::InvalidName,
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            pair[1].rank() > pair[0].rank(),
+            "{:?} must outrank {:?}",
+            pair[1],
+            pair[0]
+        );
+    }
+}
+
+#[skuld::test]
+async fn resolve_does_not_mask_an_answering_resolver_with_another_resolvers_failure() {
+    // One resolver answered (with nothing); another could not be reached.
+    // Reporting "could not reach a secure DNS resolver" would be a false
+    // network diagnosis.
+    let answered: IpAddr = "1.1.1.1".parse().unwrap();
+    let dead: IpAddr = "9.9.9.9".parse().unwrap();
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    msg.metadata.response_code = ResponseCode::NXDomain;
+    msg.add_query(Query::query(Name::from_ascii("proxy.example.").unwrap(), RecordType::A));
+    let mut answers = HashMap::new();
+    answers.insert(answered, msg.to_vec().unwrap());
+    for servers in [vec![answered, dead], vec![dead, answered]] {
+        let err = resolve_via_doh_with("proxy.example", &cfg(servers.clone(), false), stub(answers.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, BootstrapError::NoAnswer, "servers {servers:?}");
+    }
+}
+
+#[skuld::test]
+async fn resolve_reports_certificate_rejection_over_a_weaker_failure_from_another_resolver() {
+    let intercepted: IpAddr = "1.1.1.1".parse().unwrap();
+    let unreachable: IpAddr = "9.9.9.9".parse().unwrap();
+    struct PerServer(IpAddr);
+    #[async_trait]
+    impl DohQuerier for PerServer {
+        async fn query(&self, server: IpAddr, _wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            if server == self.0 {
+                Err(UpstreamCause::CertificateRejected)
+            } else {
+                Err(UpstreamCause::Unreachable)
+            }
+        }
+    }
+    for servers in [vec![intercepted, unreachable], vec![unreachable, intercepted]] {
+        let err = resolve_via_doh_with(
+            "proxy.example",
+            &cfg(servers.clone(), false),
+            Arc::new(PerServer(intercepted)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, BootstrapError::CertificateRejected, "servers {servers:?}");
+    }
+}
+
+#[skuld::test]
+async fn resolve_reports_no_answer_when_no_resolvers_are_configured() {
+    // Degenerate config: the loop never runs, so nothing is observed. Must be
+    // an error, and specifically the generic one — not a panic, and not a
+    // cause the code never actually saw.
+    let err = resolve_via_doh_with("proxy.example", &cfg(vec![], false), stub(HashMap::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(err, BootstrapError::NoAnswer);
+}
+
+#[skuld::test]
+async fn bootstrap_error_display_never_leaks_the_hostname() {
+    // The PII contract: `ProxyError::DohBootstrap` renders this verbatim into a
+    // toast, so no variant may name the host it was resolving. All seven —
+    // including the two reached through a SUCCESSFUL round trip, which are the
+    // newest surface and the easiest to enrich with reply detail later.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let host = "secret-proxy.example";
+    let mut empty = Message::new(0, MessageType::Response, OpCode::Query);
+    empty.metadata.response_code = ResponseCode::NXDomain;
+    empty.add_query(Query::query(
+        Name::from_ascii("secret-proxy.example.").unwrap(),
+        RecordType::A,
+    ));
+    let answered = |bytes: Vec<u8>| {
+        let mut m = HashMap::new();
+        m.insert(resolver, bytes);
+        stub(m)
+    };
+
+    let queriers: Vec<Arc<StubQuerier>> = vec![
+        stub_failing(HashMap::new(), UpstreamCause::CertificateRejected),
+        stub_failing(HashMap::new(), UpstreamCause::Unreachable),
+        stub_failing(HashMap::new(), UpstreamCause::Timeout),
+        stub_failing(HashMap::new(), UpstreamCause::TlsFailed),
+        answered(empty.to_vec().unwrap()),    // -> NoAnswer
+        answered(b"not dns at all".to_vec()), // -> MalformedReply
+    ];
+    for q in queriers {
+        let err = resolve_via_doh_with(host, &cfg(vec![resolver], false), q)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains(host), "{err:?} Display leaked the host: {text}");
+        assert!(!text.contains("1.1.1.1"), "{err:?} Display leaked the resolver: {text}");
+    }
+
+    // InvalidName is the seventh variant and the one built directly FROM the
+    // untrusted hostname, so it is the likeliest to acquire the offending name
+    // in a later edit. It short-circuits before any querier runs, hence the
+    // separate drive: a 64-octet label is not a valid DNS name.
+    let bad = "a".repeat(64);
+    let err = resolve_via_doh_with(&bad, &cfg(vec![resolver], false), stub(HashMap::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(err, BootstrapError::InvalidName);
+    assert!(!err.to_string().contains(&bad), "InvalidName Display leaked the host");
+}
+
+#[skuld::test]
+async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds() {
+    // allow_insecure_bootstrap turns a rejected certificate into a SUCCESSFUL
+    // start over plaintext system DNS -- the one channel an interceptor
+    // certainly controls. The log line is then the only surviving evidence.
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let q = stub_failing(HashMap::new(), UpstreamCause::CertificateRejected);
+    // "localhost" resolves on every CI host without network.
+    let ip = resolve_via_doh_with("localhost", &cfg(vec![resolver], true), q)
+        .await
+        .expect("insecure fallback resolves localhost");
+    assert!(ip.is_loopback());
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("PLAINTEXT system DNS"),
+        "the WARN must state the consequence, not just flag it; got:\n{output}"
+    );
+    assert!(
+        output.contains("CertificateRejected"),
+        "the WARN must name the finding the fallback is proceeding past; got:\n{output}"
+    );
+}
+
+#[skuld::test]
+async fn a_recovering_resolve_logs_no_failure_warning() {
+    // An AAAA-only host makes the A query answer with no IPv4 — ordinary
+    // dual-stack behavior, not a failure. A WARN here would put a false alarm
+    // in bridge.log on a start that worked.
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x35);
+    let mut answers = HashMap::new();
+    answers.insert(resolver, aaaa_reply_for("proxy.example", v6));
+    let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), stub(answers))
+        .await
+        .unwrap();
+    assert_eq!(ip, IpAddr::V6(v6));
+    assert_eq!(writer.snapshot_string(), "", "a successful resolve must log no warning");
 }
 
 #[skuld::test]
@@ -304,6 +556,75 @@ async fn spawn_loopback_doh(reply: Vec<u8>) -> (CertificateDer<'static>, u16) {
         }
     });
     (cert_der, port)
+}
+
+/// A TCP port held by a bound-but-never-listened socket — see the twin in
+/// `forwarder_tests.rs`. The returned socket must stay alive.
+fn refused_tcp_port() -> (socket2::Socket, std::net::SocketAddr) {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    sock.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let addr = sock.local_addr().unwrap().as_socket().unwrap();
+    (sock, addr)
+}
+
+#[skuld::test]
+async fn resolve_reports_certificate_rejection_through_a_real_tls_handshake() {
+    // End-to-end: a real rustls client with the PRODUCTION trust config rejects
+    // a real self-signed chain as UnknownIssuer (see test_untrusted_querier).
+    let expected = Ipv4Addr::new(203, 0, 113, 42);
+    let (_cert_der, port) = spawn_loopback_doh(a_reply_for("proxy.example", expected)).await;
+
+    let resolver: IpAddr = "127.0.0.1".parse().unwrap();
+    let err = super::resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        super::test_untrusted_querier(port),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err,
+        BootstrapError::CertificateRejected,
+        "a rejected resolver certificate must not be reported as no answer"
+    );
+}
+
+#[skuld::test]
+async fn resolve_reports_unreachable_through_a_real_refused_port() {
+    // The contrasting branch on the same real path: nothing is listening.
+    let (_held, addr) = refused_tcp_port();
+    let resolver: IpAddr = "127.0.0.1".parse().unwrap();
+    let err = super::resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        super::test_untrusted_querier(addr.port()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, BootstrapError::Unreachable);
+}
+
+#[skuld::test]
+async fn resolve_reports_no_answer_through_a_real_trusted_resolver_with_no_records() {
+    // Trusted chain, real handshake, real HTTP 200 — the reply just carries no
+    // address. This is the only branch that may still say "no answer".
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    msg.metadata.response_code = ResponseCode::ServFail;
+    msg.add_query(Query::query(Name::from_ascii("proxy.example.").unwrap(), RecordType::A));
+    let (cert_der, port) = spawn_loopback_doh(msg.to_vec().unwrap()).await;
+
+    let resolver: IpAddr = "127.0.0.1".parse().unwrap();
+    let err = super::resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        super::test_loopback_querier(cert_der, port),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, BootstrapError::NoAnswer);
 }
 
 #[skuld::test]

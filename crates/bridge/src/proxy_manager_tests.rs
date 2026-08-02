@@ -1163,11 +1163,12 @@ fn build_config_failure_sets_last_error() {
 #[skuld::test]
 fn doh_bootstrap_failure_sets_last_error() {
     use crate::dns::bootstrap::DohQuerier;
+    use crate::dns::forwarder::UpstreamCause;
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
-            None
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
         }
     }
     rt().block_on(async {
@@ -1745,6 +1746,7 @@ use hole_common::protocol::TunnelMode;
 
 /// Stub querier resolving exactly one hostname to one IPv4, used to prove
 /// `start_inner` resolves via DoH (not the OS) and hands the result downstream.
+use crate::dns::forwarder::UpstreamCause;
 struct WiringStubQuerier {
     host: String,
     ip: IpAddr,
@@ -1752,22 +1754,28 @@ struct WiringStubQuerier {
 
 #[async_trait::async_trait]
 impl DohQuerier for WiringStubQuerier {
-    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-        use hickory_proto::op::{Message, MessageType, OpCode, Query};
-        use hickory_proto::rr::rdata::A;
-        use hickory_proto::rr::{Name, RData, Record, RecordType};
-        // Only answer the A query (port-free: the stub keys on hostname).
-        let q = Message::from_vec(wire).ok()?;
-        let question = q.queries.first()?;
-        if question.query_type() != RecordType::A {
-            return None; // force the resolver onto the A path (IPv4-preferred).
-        }
-        let IpAddr::V4(v4) = self.ip else { return None };
-        let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
-        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-        reply.add_query(Query::query(n.clone(), RecordType::A));
-        reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
-        reply.to_vec().ok()
+    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+        // `None` below means "this stub serves no record of that type" —
+        // model it as a resolver that answered with nothing, not as an
+        // unreachable one.
+        let answer = (|| -> Option<Vec<u8>> {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            // Only answer the A query (port-free: the stub keys on hostname).
+            let q = Message::from_vec(wire).ok()?;
+            let question = q.queries.first()?;
+            if question.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let IpAddr::V4(v4) = self.ip else { return None };
+            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+            reply.to_vec().ok()
+        })();
+        Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
     }
 }
 
@@ -1890,11 +1898,12 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 fn full_start_fails_closed_when_doh_cannot_resolve() {
     // A stub that answers nothing → NoAnswer → DohBootstrap, hermetic (no
     // system DNS or network).
+    use crate::dns::forwarder::UpstreamCause;
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
-            None
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
         }
     }
     rt().block_on(async {
@@ -2874,6 +2883,7 @@ mod self_test {
 
     /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
     /// retry reuses the resolved IP instead of re-querying under the held cover.
+    use crate::dns::forwarder::UpstreamCause;
     struct CountingQuerier {
         host: String,
         ip: IpAddr,
@@ -2882,21 +2892,27 @@ mod self_test {
 
     #[async_trait::async_trait]
     impl DohQuerier for CountingQuerier {
-        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-            use hickory_proto::op::{Message, MessageType, OpCode, Query};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{Name, RData, Record, RecordType};
-            self.queries.fetch_add(1, Ordering::SeqCst);
-            let q = Message::from_vec(wire).ok()?;
-            if q.queries.first()?.query_type() != RecordType::A {
-                return None; // force the resolver onto the A path (IPv4-preferred).
-            }
-            let IpAddr::V4(v4) = self.ip else { return None };
-            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
-            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-            reply.add_query(Query::query(n.clone(), RecordType::A));
-            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
-            reply.to_vec().ok()
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            // `None` below means "this stub serves no record of that type" —
+            // model it as a resolver that answered with nothing, not as an
+            // unreachable one.
+            let answer = (|| -> Option<Vec<u8>> {
+                use hickory_proto::op::{Message, MessageType, OpCode, Query};
+                use hickory_proto::rr::rdata::A;
+                use hickory_proto::rr::{Name, RData, Record, RecordType};
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                let q = Message::from_vec(wire).ok()?;
+                if q.queries.first()?.query_type() != RecordType::A {
+                    return None; // force the resolver onto the A path (IPv4-preferred).
+                }
+                let IpAddr::V4(v4) = self.ip else { return None };
+                let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(Query::query(n.clone(), RecordType::A));
+                reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+                reply.to_vec().ok()
+            })();
+            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
         }
     }
 
@@ -2949,23 +2965,29 @@ mod self_test {
 
     #[async_trait::async_trait]
     impl DohQuerier for MappingQuerier {
-        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-            use hickory_proto::op::{Message, MessageType, OpCode, Query};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{Name, RData, Record, RecordType};
-            self.queries.fetch_add(1, Ordering::SeqCst);
-            let q = Message::from_vec(wire).ok()?;
-            let question = q.queries.first()?;
-            if question.query_type() != RecordType::A {
-                return None; // force the resolver onto the A path (IPv4-preferred).
-            }
-            let name = question.name().to_string();
-            let ip = *self.map.get(name.trim_end_matches('.'))?;
-            let n = Name::from_ascii(&name).ok()?;
-            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-            reply.add_query(Query::query(n.clone(), RecordType::A));
-            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
-            reply.to_vec().ok()
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            // `None` below means "this stub serves no record of that type" —
+            // model it as a resolver that answered with nothing, not as an
+            // unreachable one.
+            let answer = (|| -> Option<Vec<u8>> {
+                use hickory_proto::op::{Message, MessageType, OpCode, Query};
+                use hickory_proto::rr::rdata::A;
+                use hickory_proto::rr::{Name, RData, Record, RecordType};
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                let q = Message::from_vec(wire).ok()?;
+                let question = q.queries.first()?;
+                if question.query_type() != RecordType::A {
+                    return None; // force the resolver onto the A path (IPv4-preferred).
+                }
+                let name = question.name().to_string();
+                let ip = *self.map.get(name.trim_end_matches('.'))?;
+                let n = Name::from_ascii(&name).ok()?;
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(Query::query(n.clone(), RecordType::A));
+                reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
+                reply.to_vec().ok()
+            })();
+            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
         }
     }
 
