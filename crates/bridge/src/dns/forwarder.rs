@@ -107,10 +107,6 @@ impl UpstreamCause {
     /// ties keep the first observed. Ordered by how much each cause tells the
     /// user: a rejected certificate names a third party on the path, a failed
     /// connect says only that the path is broken.
-    ///
-    /// A contract that outlives any single caller: `rank` decides how several
-    /// upstream failures fold into one, independent of how many servers a
-    /// given caller passes.
     pub fn rank(self) -> u8 {
         match self {
             Self::CertificateRejected => 5,
@@ -298,8 +294,7 @@ const DNS_PORT_HTTPS: u16 = 443;
 
 /// Default per-upstream attempt budget, used by [`DnsForwarder::forward`].
 /// Shorter than the OS default TCP timeout so a dead server doesn't stall the
-/// whole forward loop. Callers with their own budget pass it to
-/// [`DnsForwarder::try_forward`] instead of wrapping the call in a `timeout`.
+/// whole forward loop.
 pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Maximum reply size we'll buffer (bytes). DNS messages cap around 65535

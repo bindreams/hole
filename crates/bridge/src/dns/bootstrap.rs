@@ -295,7 +295,11 @@ pub async fn resolve_via_doh_with(
          (dns.allow_insecure_bootstrap is on). A CertificateRejected finding here means the proxy \
          address was resolved over the same network path that presented an untrusted certificate."
     );
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0)).await.map_err(|_| failure)?.collect();
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .inspect_err(|e| tracing::warn!(kind = ?e.kind(), "plaintext DNS fallback also failed"))
+        .map_err(|_| failure)?
+        .collect();
     addrs
         .iter()
         .find(|a| a.is_ipv4())

@@ -490,6 +490,21 @@ fn cause_of_tls_layer_without_cert_error_is_tls_failed() {
 }
 
 #[skuld::test]
+fn cause_of_tls_layer_with_a_non_certificate_rustls_error_is_tls_failed() {
+    // The other half of the catch-all arm: a rustls error IS present, it just
+    // isn't about certificate trust. Covered separately from the no-rustls-error
+    // case so a future edit cannot change one without the suite noticing.
+    let e = UpstreamErr::new(
+        UpstreamLayer::Tls,
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::PeerIncompatible(rustls::PeerIncompatible::NoCipherSuitesInCommon),
+        ),
+    );
+    assert_eq!(e.cause(), UpstreamCause::TlsFailed);
+}
+
+#[skuld::test]
 fn cause_of_non_tls_layers_follows_the_layer_tag() {
     let refused = UpstreamErr::new(
         UpstreamLayer::Connect,
@@ -800,9 +815,6 @@ mod typed_error_logs {
     /// honored budget from an ignored one without measuring elapsed time — the
     /// virtual clock's quantisation and the real time spent connecting make any
     /// exact elapsed-span assertion a race, not a measurement.
-    /// The failure this guards: an outer `timeout` firing before
-    /// `forward_one`'s own deadline drops the future with nothing classified
-    /// or logged.
     #[skuld::test]
     async fn expired_caller_budget_still_logs_the_upstream_failure() {
         let writer = VecWriter::new();

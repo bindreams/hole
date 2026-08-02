@@ -104,16 +104,12 @@ always have bytes to write back. `try_forward` is the same walk without that
 erasure: it returns the highest-ranked `UpstreamCause` observed
 (`UpstreamCause::rank`), splitting a rejected peer certificate from every other
 TLS failure via `first_rustls_error`. It also takes the per-upstream budget as a
-parameter — a caller that wraps the call in its own shorter `timeout` instead
-drops the future before `forward_one`'s deadline fires, so nothing is classified
-and nothing reaches `bridge.log`. Pass the budget; do not wrap. The DoH bootstrap
-resolver uses `try_forward` so `BootstrapError` can tell a user that something is
+parameter (see `try_forward`'s doc for why callers must pass it rather than wrap
+the call). The DoH bootstrap resolver uses `try_forward` so `BootstrapError` can tell a user that something is
 intercepting TLS — a finding no other resolver will fix — apart from a resolver
 that simply did not answer. `BootstrapError` `Display` strings stay hostname-,
 IP- and path-free (`ProxyError::DohBootstrap` renders them verbatim into the
-start-error toast) and existential, never universal: several resolvers are tried
-and only the highest-ranked finding is reported, so no string may claim something
-about all of them.
+start-error toast) and existential, never universal — see `BootstrapError`'s doc.
 
 ### Listener selection invariants
 
