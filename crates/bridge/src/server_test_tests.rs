@@ -487,10 +487,7 @@ fn preflight_path_uses_doh_resolved_ip() {
     #[async_trait::async_trait]
     impl DohQuerier for LoopbackQuerier {
         async fn query(&self, _s: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            // `None` below means "this stub serves no record of that type" —
-            // model it as a resolver that answered with nothing, not as an
-            // unreachable one.
-            let answer = (|| -> Option<Vec<u8>> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
                 use hickory_proto::op::{Message, MessageType, OpCode, Query};
                 use hickory_proto::rr::rdata::A;
                 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -503,8 +500,7 @@ fn preflight_path_uses_doh_resolved_ip() {
                 reply.add_query(Query::query(n.clone(), RecordType::A));
                 reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
                 reply.to_vec().ok()
-            })();
-            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+            })
         }
     }
 
@@ -631,10 +627,7 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
     #[async_trait::async_trait]
     impl DohQuerier for FixtureQuerier {
         async fn query(&self, _s: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            // `None` below means "this stub serves no record of that type" —
-            // model it as a resolver that answered with nothing, not as an
-            // unreachable one.
-            let answer = (|| -> Option<Vec<u8>> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
                 use hickory_proto::op::{Message, MessageType, OpCode, Query};
                 use hickory_proto::rr::rdata::A;
                 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -647,8 +640,7 @@ fn bare_ss_tunnel_uses_doh_resolved_ip() {
                 reply.add_query(Query::query(n.clone(), RecordType::A));
                 reply.add_answer(Record::from_rdata(n, 60, RData::A(A(Ipv4Addr::LOCALHOST))));
                 reply.to_vec().ok()
-            })();
-            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+            })
         }
     }
 
@@ -752,10 +744,7 @@ struct Ipv6LoopbackQuerier;
 #[async_trait::async_trait]
 impl crate::dns::bootstrap::DohQuerier for Ipv6LoopbackQuerier {
     async fn query(&self, _s: std::net::IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-        // `None` below means "this stub serves no record of that type" —
-        // model it as a resolver that answered with nothing, not as an
-        // unreachable one.
-        let answer = (|| -> Option<Vec<u8>> {
+        crate::dns::forwarder::answered_or_servfail(wire, || {
             use hickory_proto::op::{Message, MessageType, OpCode, Query};
             use hickory_proto::rr::rdata::AAAA;
             use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -772,8 +761,7 @@ impl crate::dns::bootstrap::DohQuerier for Ipv6LoopbackQuerier {
                 RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
             ));
             reply.to_vec().ok()
-        })();
-        Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+        })
     }
 }
 

@@ -1755,10 +1755,7 @@ struct WiringStubQuerier {
 #[async_trait::async_trait]
 impl DohQuerier for WiringStubQuerier {
     async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-        // `None` below means "this stub serves no record of that type" —
-        // model it as a resolver that answered with nothing, not as an
-        // unreachable one.
-        let answer = (|| -> Option<Vec<u8>> {
+        crate::dns::forwarder::answered_or_servfail(wire, || {
             use hickory_proto::op::{Message, MessageType, OpCode, Query};
             use hickory_proto::rr::rdata::A;
             use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -1774,8 +1771,7 @@ impl DohQuerier for WiringStubQuerier {
             reply.add_query(Query::query(n.clone(), RecordType::A));
             reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
             reply.to_vec().ok()
-        })();
-        Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+        })
     }
 }
 
@@ -2893,10 +2889,7 @@ mod self_test {
     #[async_trait::async_trait]
     impl DohQuerier for CountingQuerier {
         async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            // `None` below means "this stub serves no record of that type" —
-            // model it as a resolver that answered with nothing, not as an
-            // unreachable one.
-            let answer = (|| -> Option<Vec<u8>> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
                 use hickory_proto::op::{Message, MessageType, OpCode, Query};
                 use hickory_proto::rr::rdata::A;
                 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -2911,8 +2904,7 @@ mod self_test {
                 reply.add_query(Query::query(n.clone(), RecordType::A));
                 reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
                 reply.to_vec().ok()
-            })();
-            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+            })
         }
     }
 
@@ -2966,10 +2958,7 @@ mod self_test {
     #[async_trait::async_trait]
     impl DohQuerier for MappingQuerier {
         async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-            // `None` below means "this stub serves no record of that type" —
-            // model it as a resolver that answered with nothing, not as an
-            // unreachable one.
-            let answer = (|| -> Option<Vec<u8>> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
                 use hickory_proto::op::{Message, MessageType, OpCode, Query};
                 use hickory_proto::rr::rdata::A;
                 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -2986,8 +2975,7 @@ mod self_test {
                 reply.add_query(Query::query(n.clone(), RecordType::A));
                 reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
                 reply.to_vec().ok()
-            })();
-            Ok(answer.unwrap_or_else(|| crate::dns::forwarder::synthesize_servfail(wire)))
+            })
         }
     }
 

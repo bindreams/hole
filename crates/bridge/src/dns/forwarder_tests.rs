@@ -313,7 +313,7 @@ async fn silent_tcp_peer() -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let _ = accepted_tx.send(());
-        std::future::pending::<()>().await; // Hold it open, never write.
+        std::future::pending::<()>().await;
         drop(tcp);
     });
     (addr, accepted_rx)
@@ -464,11 +464,11 @@ fn first_rustls_error_is_none_for_plain_socket_error() {
 }
 
 #[skuld::test]
-fn cause_of_tls_layer_with_cert_error_is_certificate_rejected() {
+fn cause_of_tls_layer_with_a_trust_chain_rejection_is_certificate_rejected() {
     // Both trust-rejection families, not just the UnknownIssuer one.
     for rustls_err in [
         rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
-        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature),
         rustls::Error::InvalidCertRevocationList(rustls::CertRevocationListError::BadSignature),
     ] {
         let e = UpstreamErr::new(
@@ -476,6 +476,28 @@ fn cause_of_tls_layer_with_cert_error_is_certificate_rejected() {
             io::Error::new(io::ErrorKind::InvalidData, rustls_err.clone()),
         );
         assert_eq!(e.cause(), UpstreamCause::CertificateRejected, "{rustls_err:?}");
+    }
+}
+
+#[skuld::test]
+fn cause_of_a_non_trust_certificate_complaint_is_not_certificate_rejected() {
+    // A resolver IP outside the provider table is verified against an IP SAN,
+    // so a cert carrying only DNS SANs fails with NotValidForName on every
+    // start, on a clean network — and a skewed clock yields Expired. Reporting
+    // either as interception would blame the network for the user's config or
+    // clock, and would tell them switching resolvers cannot help when it is in
+    // fact the fix.
+    for rustls_err in [
+        rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+    ] {
+        let e = UpstreamErr::new(
+            UpstreamLayer::Tls,
+            io::Error::new(io::ErrorKind::InvalidData, rustls_err.clone()),
+        );
+        assert_eq!(e.cause(), UpstreamCause::TlsFailed, "{rustls_err:?}");
     }
 }
 

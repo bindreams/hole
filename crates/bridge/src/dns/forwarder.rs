@@ -154,8 +154,9 @@ pub struct UpstreamErr {
     pub budget_ms: u64,
     /// Time from `forward_one` start to return of `connector.connect_tcp`.
     /// `Some` whenever the TCP/SOCKS5-level connection completed
-    /// (Tls/Io/Http failures); `None` when we errored at `Connect` or
-    /// `Timeout` fired before connect completed.
+    /// (Tls/Io/Http failures); `None` when we errored at `Connect`, and always
+    /// `None` on `Timeout` regardless of how far the attempt got — see
+    /// [`Self::tcp_wrote`].
     pub socks5_ms: Option<u64>,
     /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`.
     /// `Some` on `Tls`/`Io`/`Http` layers; `None` otherwise.
@@ -164,6 +165,12 @@ pub struct UpstreamErr {
     /// observed by [`crate::dns::connector::CountingStream`]. `None` when
     /// connect failed (no stream existed). Post-SOCKS5 byte counts —
     /// what a DoH server would see.
+    ///
+    /// ALSO `None` on the `Timeout` layer, whatever had already happened: the
+    /// budget fires outside the per-transport future, which owns the counters,
+    /// so a timed-out attempt that connected, handshook and wrote is
+    /// indistinguishable here from one that never connected. Do not read
+    /// `tcp_wrote = None` on `layer=timeout` as "never connected".
     pub tcp_wrote: Option<u64>,
     pub tcp_read: Option<u64>,
     /// First `io::Error::raw_os_error()` found walking
@@ -206,8 +213,8 @@ impl UpstreamErr {
     }
 
     /// Classify this failure for reporting. Only the `Tls` layer needs the
-    /// error chain — it splits on whether `first_rustls_error` found an
-    /// `InvalidCertificate` / `InvalidCertRevocationList` rustls error.
+    /// error chain — it splits on whether `first_rustls_error` found a
+    /// TRUST-CHAIN rejection (see [`is_trust_chain_rejection`]).
     pub fn cause(&self) -> UpstreamCause {
         match self.layer {
             UpstreamLayer::Connect => UpstreamCause::Unreachable,
@@ -215,9 +222,7 @@ impl UpstreamErr {
             UpstreamLayer::Http => UpstreamCause::BadResponse,
             UpstreamLayer::Io => UpstreamCause::Io,
             UpstreamLayer::Tls => match first_rustls_error(&self.source) {
-                Some(rustls::Error::InvalidCertificate(_) | rustls::Error::InvalidCertRevocationList(_)) => {
-                    UpstreamCause::CertificateRejected
-                }
+                Some(e) if is_trust_chain_rejection(e) => UpstreamCause::CertificateRejected,
                 _ => UpstreamCause::TlsFailed,
             },
         }
@@ -263,6 +268,36 @@ fn first_os_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
         current = err.source();
     }
     None
+}
+
+/// Does this rustls error mean the peer's chain did not verify against our
+/// trust roots — as opposed to any other certificate complaint?
+///
+/// Only trust-chain rejections justify telling the user something may be
+/// intercepting TLS. `InvalidCertificate` is much broader than that: it also
+/// carries `NotValidForName` (routine for a free-form resolver IP, since
+/// `https_target_for` falls back to IP-SAN verification for addresses outside
+/// the provider table) and `Expired` (a skewed system clock). Reporting those
+/// as interception would accuse the network of something the user's own
+/// configuration or clock caused, and — unlike a real interception — switching
+/// resolvers WOULD fix them.
+///
+/// `CertificateError` is `#[non_exhaustive]`, so the fallthrough deliberately
+/// answers "not a trust-chain rejection": a future variant we have not
+/// considered must not silently inherit the interception claim.
+fn is_trust_chain_rejection(e: &rustls::Error) -> bool {
+    match e {
+        rustls::Error::InvalidCertificate(c) => matches!(
+            c,
+            rustls::CertificateError::UnknownIssuer
+                | rustls::CertificateError::BadSignature
+                | rustls::CertificateError::Revoked
+                | rustls::CertificateError::UnknownRevocationStatus
+        ),
+        // A CRL we could not verify is a trust-material failure in its own right.
+        rustls::Error::InvalidCertRevocationList(_) => true,
+        _ => false,
+    }
 }
 
 /// Walk the chain for a `rustls::Error`. tokio-rustls reports a verification
@@ -876,7 +911,6 @@ impl DnsForwarder {
         extra_root: rustls_pki_types::CertificateDer<'static>,
         forced_port: u16,
     ) -> Self {
-        // One port for EVERY server — never a partial override.
         let ports = vec![forced_port; config.servers.len()];
         let mut s = Self::new_with_ports(config, connector, ipv6_bypass_available, ports);
         s.tls_config = Arc::new(build_tls_config_with_extra_root(extra_root));
@@ -945,6 +979,19 @@ fn parse_http_dns_response(resp: &[u8]) -> io::Result<Vec<u8>> {
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"\r\n\r\n";
     buf.windows(NEEDLE.len()).position(|w| w == NEEDLE)
+}
+
+/// Test-only adapter for `DohQuerier` stubs that model a resolver by building
+/// an answer or not building one. `None` means "this resolver served no record
+/// of that type" — a resolver that ANSWERED with nothing, which is `Ok` at the
+/// seam, not an `Err`. Collapses the six stubs that would otherwise each
+/// re-derive that mapping by hand.
+#[cfg(test)]
+pub(crate) fn answered_or_servfail(
+    wire: &[u8],
+    build: impl FnOnce() -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, UpstreamCause> {
+    Ok(build().unwrap_or_else(|| synthesize_servfail(wire)))
 }
 
 /// Build a SERVFAIL response from an incoming query. Preserves the

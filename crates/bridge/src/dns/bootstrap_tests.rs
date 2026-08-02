@@ -417,6 +417,39 @@ async fn a_recovering_resolve_logs_no_failure_warning() {
 }
 
 #[skuld::test]
+async fn a_malformed_reply_logs_even_when_a_later_resolver_rescues_the_resolve() {
+    // The deliberate asymmetry with the empty-answer case above: a resolver
+    // answering non-DNS is evidence of something rewriting the response, so it
+    // is recorded the moment it happens — even though this resolve succeeds.
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let garbage: IpAddr = "1.1.1.1".parse().unwrap();
+    let good: IpAddr = "9.9.9.9".parse().unwrap();
+    let expected = Ipv4Addr::new(203, 0, 113, 7);
+    let mut answers = HashMap::new();
+    answers.insert(garbage, b"not dns at all".to_vec());
+    answers.insert(good, a_reply_for("proxy.example", expected));
+
+    let ip = resolve_via_doh_with("proxy.example", &cfg(vec![garbage, good], false), stub(answers))
+        .await
+        .expect("the second resolver rescues the resolve");
+    assert_eq!(ip, IpAddr::V4(expected));
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("not parseable DNS"),
+        "a non-DNS reply must be recorded even on a rescued resolve; got:\n{output}"
+    );
+}
+
+#[skuld::test]
 async fn resolve_returns_ipv6_when_only_aaaa_answers() {
     // No A record from any resolver; an AAAA answer must be returned (the v6
     // branch is correct, not dodged). The wiring task verifies the bracket-safe
@@ -434,16 +467,26 @@ async fn resolve_returns_ipv6_when_only_aaaa_answers() {
 
 #[skuld::test]
 async fn resolve_prefers_ipv4_when_both_answer() {
-    // One resolver answers both A and AAAA; IPv4 wins (bypass-route compat).
+    // A genuinely dual-stack answer: ONE reply carrying both an A and an AAAA
+    // record. Answering only A would prove nothing — the A branch returns
+    // before the AAAA query is ever issued, so IPv6 would never be a candidate.
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
     let v4 = Ipv4Addr::new(203, 0, 113, 7);
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x7);
+    let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+    let n = Name::from_ascii("proxy.example.").unwrap();
+    msg.add_query(Query::query(n.clone(), RecordType::A));
+    msg.add_answer(Record::from_rdata(n.clone(), 60, RData::AAAA(AAAA(v6))));
+    msg.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+    // AAAA first in the answer section, so a naive "take the first address"
+    // would pick IPv6 and this test would catch it.
     let mut answers = HashMap::new();
-    answers.insert(resolver, a_reply_for("proxy.example", v4));
+    answers.insert(resolver, msg.to_vec().unwrap());
     let q = stub(answers);
     let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
         .await
         .unwrap();
-    assert_eq!(ip, IpAddr::V4(v4));
+    assert_eq!(ip, IpAddr::V4(v4), "IPv4 wins (bypass-route compat)");
 }
 
 #[skuld::test]

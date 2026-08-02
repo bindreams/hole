@@ -103,7 +103,7 @@ synthesizes SERVFAIL when every upstream fails, because the in-TUN endpoint must
 always have bytes to write back. `try_forward` is the same walk without that
 erasure: it returns the highest-ranked `UpstreamCause` observed
 (`UpstreamCause::rank`), splitting a rejected peer certificate from every other
-TLS failure via `first_rustls_error`. It also takes the per-upstream budget as a
+TLS failure by inspecting the underlying rustls error. It also takes the per-upstream budget as a
 parameter (see `try_forward`'s doc for why callers must pass it rather than wrap
 the call). The DoH bootstrap resolver uses `try_forward` so `BootstrapError` can tell a user that something is
 intercepting TLS — a finding no other resolver will fix — apart from a resolver
