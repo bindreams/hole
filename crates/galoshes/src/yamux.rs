@@ -888,7 +888,8 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// the last pong, and emitted the moment our probe wakes the driver. That holds
 /// only while a probe cannot come sooner than a ping is due, so the interval may
 /// not drop below yamux's cadence. `PING_INTERVAL` is private to that crate, so
-/// the relation is pinned here rather than imported.
+/// the relation is pinned against a literal read out of yamux 0.14.0 rather than
+/// imported — a `yamux` bump has to re-check it, because nothing here can.
 const _: () = assert!(KEEPALIVE_INTERVAL.as_secs() >= 10);
 
 /// The whole point of the feature: detection must stay well clear of the 300 s

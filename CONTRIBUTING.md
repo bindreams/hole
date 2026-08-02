@@ -272,9 +272,8 @@ reconnects after a transport reset instead of wedging the tunnel:
   writes an 8-byte nonce on a `StreamTag::Keepalive` substream, purely to give an
   idle transport a reason to speak; a transport that delivered anything is not
   probed at all, so a busy tunnel carries no keepalive traffic. The verdict is not
-  "did the echo come back" — the client drains the echo without ever inspecting
-  it, because `read` is cancel-safe and `read_exact` is not — but "did the tap
-  count *any* inbound read before `KEEPALIVE_TIMEOUT` was up". That is what makes
+  "did the echo come back" but "did the tap count *any* inbound read before
+  `KEEPALIVE_TIMEOUT` was up". That is what makes
   the wire addition safe against version skew: an un-upgraded server resets the
   unknown tag, the reset is inbound traffic and is necessarily read *before* the
   probe's read can fail, so the tunnel behaves exactly as it did before. The whole
