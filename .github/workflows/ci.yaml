@@ -615,7 +615,11 @@ jobs:
   test-dmg-signing:
     name: Test DMG signing (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # The installer-assembly budget, held equal to `test-installer` by
+    # `ci_installer_assembly_jobs_share_a_timeout_budget`. The darwin/amd64 leg
+    # is what needs it: `macos-15-intel` runs ~1.7x slower than the arm64 runner
+    # across every phase, and legitimately takes up to 29 min.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -638,8 +642,10 @@ jobs:
 
       # hdiutil DMG creation/mounting is a non-deterministic macOS
       # DiskArbitration race; capture system state on any failure (build or the
-      # pytest mount) to diagnose the next occurrence (#446). `--last 30m` spans
-      # the job's whole lifetime (timeout-minutes: 30).
+      # pytest mount) to diagnose the next occurrence (#446). Note `if: failure()`
+      # does not fire when a timeout kills the job — that surfaces as `cancelled`,
+      # so a budget overrun leaves no diagnostics here.
+      # `--last 45m` spans the job's whole lifetime (timeout-minutes: 45).
       - name: Capture DiskArbitration/hdiutil state on failure
         if: failure()
         shell: bash
@@ -650,7 +656,7 @@ jobs:
           hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
           ls -la /Volumes > "$OUT/volumes.txt"      2>&1
           mount           > "$OUT/mount.txt"        2>&1
-          log show --last 30m --predicate \
+          log show --last 45m --predicate \
             'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
             > "$OUT/diskarb-log.txt" 2>&1
           echo "captured DMG-flake diagnostics to $OUT"
