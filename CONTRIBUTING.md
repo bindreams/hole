@@ -252,7 +252,7 @@ reconnects after a transport reset instead of wedging the tunnel:
   (a floor bounding a peer flapping right after one byte) and escalates
   exponentially to `REMOTE_BACKOFF_MAX` on repeated failures.
   "Productive" is **transport-level**, not application-level: `TransportLivenessTap`
-  sits below yamux framing and flags any inbound byte — relayed data or a bare
+  sits below yamux framing and counts every inbound read — relayed data or a bare
   keepalive/flow-control frame alike — as liveness, which resets the backoff to
   the floor. A session that never received a single inbound byte counts as a
   failure and escalates.
@@ -265,9 +265,22 @@ reconnects after a transport reset instead of wedging the tunnel:
   and the accept loop continues — reconnecting the transport wouldn't fix a
   local socket error, and a broken listener is not what these errors indicate
   (they're transient: a stray `ECONNABORTED`, momentary `EMFILE`).
-- **Scope boundary.** This detects a transport that visibly dies (FIN/RST,
-  yamux protocol error). A peer that goes silent without ever resetting the
-  connection (a black-holed link) is not detected by this mechanism — see #660.
+- **Proactive keepalive.** A visible death (FIN/RST, yamux protocol error) is
+  caught by the inbound-channel signal above. A peer that goes silent without
+  resetting — a black-holed link — is caught instead by a client keepalive. Every
+  `KEEPALIVE_INTERVAL` in which `TransportLivenessTap` counted nothing, the client
+  writes an 8-byte nonce on a `StreamTag::Keepalive` substream, purely to give an
+  idle transport a reason to speak; a transport that delivered anything is not
+  probed at all, so a busy tunnel carries no keepalive traffic. The verdict is not
+  "did the echo come back" — the client drains the echo without ever inspecting
+  it, because `read` is cancel-safe and `read_exact` is not — but "did the tap
+  count *any* inbound read before `KEEPALIVE_TIMEOUT` was up". That is what makes
+  the wire addition safe against version skew: an un-upgraded server resets the
+  unknown tag, the reset is inbound traffic and is necessarily read *before* the
+  probe's read can fail, so the tunnel behaves exactly as it did before. The whole
+  cycle including the substream open sits inside the deadline, because opening
+  parks indefinitely once enough substreams await an ACK. Detection is bounded by
+  `2 × KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT` from the last inbound byte.
 
 ### Fail-closed cover
 
