@@ -178,62 +178,168 @@ fn servfail_handles_short_input() {
 async fn plain_udp_primary_succeeds() {
     let q = sample_query(0x0042);
     let (addr, _h) = start_udp_stub(None).await;
-    let fwd = DnsForwarder::new(
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainUdp, vec![addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![addr.port()],
     );
-    // Override server list to include the ephemeral port via the connector
-    // layer: the forwarder always targets port 53, but our stub listens on
-    // ephemeral — so we swap via a test-only helper.
-    let reply = fwd.forward_on_port(&q, addr.port()).await;
+    let reply = fwd.forward(&q).await;
     assert_eq!(&reply[..2], &[0x00, 0x42], "tx id echoed");
     assert_eq!(reply[2] & 0x80, 0x80, "QR set (real reply, not SERVFAIL)");
     assert_ne!(reply[3] & 0x0F, 2, "RCODE is not SERVFAIL");
 }
 
 #[skuld::test]
-async fn plain_udp_primary_fails_secondary_succeeds() {
+async fn primary_fails_secondary_succeeds() {
+    // Failover is in `try_forward`'s server loop, not in any one transport.
+    // TCP so the dead primary's port can be HELD: a released ephemeral port can
+    // be re-bound by a concurrent test, and a primary that answers makes this
+    // test silently stop testing failover.
     let q = sample_query(0x0001);
-    // Primary: bind then drop to get a closed port.
-    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead.local_addr().unwrap();
-    drop(dead);
-    let (live_addr, _h) = start_udp_stub(None).await;
+    let (_held, dead_addr) = refused_tcp_port();
+    let (live_addr, _h) = start_tcp_stub(Vec::new()).await;
 
-    let fwd = DnsForwarder::new(
-        DnsConfig {
-            enabled: true,
-            servers: vec![dead_addr.ip(), live_addr.ip()],
-            protocol: DnsProtocol::PlainUdp,
-            allow_insecure_bootstrap: false,
-        },
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), live_addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![dead_addr.port(), live_addr.port()],
     );
-    // Both stubs live on 127.0.0.1 but different ports; the test helper
-    // overrides the forwarder's port. Since we can only override one port,
-    // use two distinct addresses via the `forward_with_ports` helper.
-    let reply = fwd.forward_with_ports(&q, &[dead_addr.port(), live_addr.port()]).await;
-    // We expect success from the second server.
+    let reply = fwd.forward(&q).await;
+    assert_eq!(&reply[..2], &[0x00, 0x01], "tx id echoed by the secondary");
     assert_ne!(reply[3] & 0x0F, 2, "secondary succeeded, not SERVFAIL");
+    // Both servers are 127.0.0.1, so one throttle entry — and it exists only
+    // because an attempt FAILED. Pins the premise: the primary really did fail.
+    let map = fwd.failure_throttle.lock().unwrap();
+    let state = map.get(&dead_addr.ip()).expect("the primary must have failed");
+    assert!(state.logged >= 1, "the primary must have failed");
 }
 
 #[skuld::test]
 async fn all_servers_fail_returns_servfail() {
     let q = sample_query(0x5678);
-    // Two closed addresses.
-    let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-    let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-    let fwd = DnsForwarder::new(
+    let (_h1, s1) = refused_tcp_port();
+    let (_h2, s2) = refused_tcp_port();
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![s1.port(), s2.port()],
     );
-    // Use TCP (closed address → immediate RST or connect failure).
-    let reply = fwd.forward_with_ports(&q, &[s1.port(), s2.port()]).await;
+    let reply = fwd.forward(&q).await;
     assert_eq!(reply[3] & 0x0F, 2, "RCODE=SERVFAIL");
     assert_eq!(&reply[..2], &[0x56, 0x78]);
+}
+
+#[skuld::test]
+async fn try_forward_reports_unreachable_when_every_server_refuses() {
+    let q = sample_query(0x5678);
+    let (_h1, s1) = refused_tcp_port();
+    let (_h2, s2) = refused_tcp_port();
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![s1.port(), s2.port()],
+    );
+    assert_eq!(
+        fwd.try_forward(&q, UPSTREAM_TIMEOUT).await,
+        Err(ForwardFailure::Upstream(UpstreamCause::Unreachable))
+    );
+}
+
+#[skuld::test]
+async fn try_forward_reports_malformed_query_and_no_upstream() {
+    let (addr, _h) = start_udp_stub(None).await;
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainUdp, vec![addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![addr.port()],
+    );
+    assert_eq!(
+        fwd.try_forward(b"abc", UPSTREAM_TIMEOUT).await,
+        Err(ForwardFailure::MalformedQuery)
+    );
+
+    // Every configured server skipped (IPv6 with no IPv6 bypass) — nothing was
+    // attempted, which is not the same as an upstream failing.
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    let none = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainUdp, vec![v6]),
+        Arc::new(DirectConnector),
+        false,
+        vec![0],
+    );
+    assert_eq!(
+        none.try_forward(&sample_query(1), UPSTREAM_TIMEOUT).await,
+        Err(ForwardFailure::NoUpstream)
+    );
+}
+
+#[skuld::test]
+async fn try_forward_reports_tls_failed_when_the_peer_closes_mid_handshake() {
+    // Accept, then close gracefully (FIN, not RST — an RST races connect() on
+    // Linux/macOS loopback). tokio-rustls reports an unclean EOF with no rustls
+    // error attached: TlsFailed, not CertificateRejected.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            drop(tcp);
+        }
+    });
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::Https, vec![addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![addr.port()],
+    );
+    assert_eq!(
+        fwd.try_forward(&sample_query(0x0009), UPSTREAM_TIMEOUT).await,
+        Err(ForwardFailure::Upstream(UpstreamCause::TlsFailed))
+    );
+}
+
+/// Accept one connection, signal it, and never write. Returns the address and
+/// a receiver that fires once the connection is ESTABLISHED — a real
+/// rendezvous, so the timeout tests advance virtual time only after the
+/// connect has completed rather than racing it.
+async fn silent_tcp_peer() -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _ = accepted_tx.send(());
+        std::future::pending::<()>().await; // Hold it open, never write.
+        drop(tcp);
+    });
+    (addr, accepted_rx)
+}
+
+#[skuld::test]
+async fn try_forward_reports_timeout_when_an_established_peer_stays_silent() {
+    let (addr, accepted_rx) = silent_tcp_peer().await;
+    let fwd = Arc::new(DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![addr.port()],
+    ));
+    let call = tokio::spawn({
+        let fwd = Arc::clone(&fwd);
+        async move { fwd.try_forward(&sample_query(0x000A), UPSTREAM_TIMEOUT).await }
+    });
+
+    accepted_rx.await.expect("stub accepted the connection");
+    tokio::time::pause();
+
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+    );
 }
 
 // Forward: TCP ========================================================================================================
@@ -242,12 +348,13 @@ async fn all_servers_fail_returns_servfail() {
 async fn plain_tcp_primary_succeeds() {
     let q = sample_query(0x00AA);
     let (addr, _h) = start_tcp_stub(Vec::new()).await;
-    let fwd = DnsForwarder::new(
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![addr.port()],
     );
-    let reply = fwd.forward_on_port(&q, addr.port()).await;
+    let reply = fwd.forward(&q).await;
     assert_eq!(&reply[..2], &[0x00, 0xAA]);
     assert_eq!(reply[2] & 0x80, 0x80);
     assert_ne!(reply[3] & 0x0F, 2);
@@ -260,17 +367,13 @@ async fn ipv6_upstream_skipped_when_no_v6_bypass() {
     let q = sample_query(0x0003);
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
     let (v4_addr, _h) = start_udp_stub(None).await;
-    let fwd = DnsForwarder::new(
-        DnsConfig {
-            enabled: true,
-            servers: vec![v6, v4_addr.ip()],
-            protocol: DnsProtocol::PlainUdp,
-            allow_insecure_bootstrap: false,
-        },
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainUdp, vec![v6, v4_addr.ip()]),
         Arc::new(DirectConnector),
         false, // no v6 bypass
+        vec![0, v4_addr.port()],
     );
-    let reply = fwd.forward_with_ports(&q, &[0, v4_addr.port()]).await;
+    let reply = fwd.forward(&q).await;
     // The v6 server was skipped; v4 answered.
     assert_ne!(reply[3] & 0x0F, 2);
 }
@@ -283,13 +386,14 @@ async fn duplicate_server_in_list_creates_one_throttle_entry() {
     // single failure burst against the same server doesn't duplicate
     // state across the map.
     let (_held, dead_addr) = refused_tcp_port();
-    let fwd = DnsForwarder::new(
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), dead_addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![dead_addr.port(), dead_addr.port()],
     );
     let q = sample_query(0x0001);
-    let _ = fwd.forward_with_ports(&q, &[dead_addr.port(), dead_addr.port()]).await;
+    let _ = fwd.forward(&q).await;
     let map = fwd.failure_throttle.lock().unwrap();
     assert_eq!(map.len(), 1, "duplicate server has one throttle entry");
     let state = map.get(&dead_addr.ip()).expect("throttle entry exists");
@@ -306,15 +410,16 @@ async fn throttle_logs_first_n_then_suppresses() {
     // failures log in full, subsequent ones are counted as suppressed
     // (never silently dedup-forever).
     let (_held, dead_addr) = refused_tcp_port();
-    let fwd = DnsForwarder::new(
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![dead_addr.port()],
     );
     let q = sample_query(0x0002);
     // 5 attempts against the same server.
     for _ in 0..5 {
-        let _ = fwd.forward_with_ports(&q, &[dead_addr.port()]).await;
+        let _ = fwd.forward(&q).await;
     }
     let map = fwd.failure_throttle.lock().unwrap();
     let state = map.get(&dead_addr.ip()).expect("throttle entry exists");
@@ -429,51 +534,15 @@ fn upstream_cause_ranking_is_total_and_ordered() {
 async fn forward_on_short_query_returns_servfail() {
     let short = b"abc"; // below 12-byte DNS header
     let (addr, _h) = start_udp_stub(None).await;
-    let fwd = DnsForwarder::new(
+    let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainUdp, vec![addr.ip()]),
         Arc::new(DirectConnector),
         true,
+        vec![addr.port()],
     );
-    let reply = fwd.forward_on_port(short, addr.port()).await;
+    let reply = fwd.forward(short).await;
     assert!(reply.len() >= 12);
     assert_eq!(reply[3] & 0x0F, 2);
-}
-
-// Test-only helpers allowing ephemeral-port stubs =====================================================================
-//
-// The forwarder always targets fixed well-known ports (53/853/443). Tests
-// need ephemeral ports to run without privilege. These helpers mirror the
-// public API but let tests substitute the port.
-
-impl DnsForwarder {
-    async fn forward_on_port(&self, query: &[u8], port: u16) -> Vec<u8> {
-        self.forward_with_ports(query, &[port]).await
-    }
-
-    async fn forward_with_ports(&self, query: &[u8], ports: &[u16]) -> Vec<u8> {
-        if query.len() < 12 {
-            return synthesize_servfail(query);
-        }
-        for (i, &server) in self.config.servers.iter().enumerate() {
-            if server.is_ipv6() && !self.ipv6_bypass_available {
-                self.log_ipv6_skip_once(server);
-                continue;
-            }
-            let port = ports.get(i).copied().unwrap_or(match self.config.protocol {
-                DnsProtocol::PlainUdp | DnsProtocol::PlainTcp => 53,
-                DnsProtocol::Tls => 853,
-                DnsProtocol::Https => 443,
-            });
-            let target = SocketAddr::new(server, port);
-            // Delegate to the production `forward_one` — now `SocketAddr`-shaped,
-            // so ephemeral-port stubs work without any in-test protocol inlining.
-            match self.forward_one(target, query).await {
-                Ok(reply) => return reply,
-                Err(e) => self.log_upstream_failure(server, &e),
-            }
-        }
-        synthesize_servfail(query)
-    }
 }
 
 // URL split helpers (whitebox) ========================================================================================
@@ -638,12 +707,13 @@ mod typed_error_logs {
         let _guard = set_default_in_current_thread(subscriber);
 
         let (_held, dead) = refused_tcp_port();
-        let fwd = DnsForwarder::new(
+        let fwd = DnsForwarder::new_with_ports(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
             Arc::new(DirectConnector),
             true,
+            vec![dead.port()],
         );
-        let _ = fwd.forward_on_port(&sample_query(0x0001), dead.port()).await;
+        let _ = fwd.forward(&sample_query(0x0001)).await;
 
         let output = writer.snapshot_string();
         assert!(
@@ -672,12 +742,13 @@ mod typed_error_logs {
         let _guard = set_default_in_current_thread(subscriber);
 
         let (_held, dead) = refused_tcp_port();
-        let fwd = DnsForwarder::new(
+        let fwd = DnsForwarder::new_with_ports(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
             Arc::new(DirectConnector),
             true,
+            vec![dead.port()],
         );
-        let _ = fwd.forward_on_port(&sample_query(0x0002), dead.port()).await;
+        let _ = fwd.forward(&sample_query(0x0002)).await;
 
         let output = writer.snapshot_string();
         assert!(
@@ -708,17 +779,76 @@ mod typed_error_logs {
                 drop(stream);
             }
         });
-        let fwd = DnsForwarder::new(
+        let fwd = DnsForwarder::new_with_ports(
             build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
             Arc::new(DirectConnector),
             true,
+            vec![addr.port()],
         );
-        let _ = fwd.forward_on_port(&sample_query(0x0003), addr.port()).await;
+        let _ = fwd.forward(&sample_query(0x0003)).await;
 
         let output = writer.snapshot_string();
         assert!(
             output.contains("layer=io"),
             "expected 'layer=io' for EOF mid-exchange; got:\n{output}"
+        );
+    }
+
+    /// A caller-supplied budget must reach `forward_one` AND still produce the
+    /// `upstream failed` WARN. `budget_ms` is stamped inside `forward_one` from
+    /// the deadline it actually applied, so asserting it discriminates a
+    /// honored budget from an ignored one without measuring elapsed time — the
+    /// virtual clock's quantisation and the real time spent connecting make any
+    /// exact elapsed-span assertion a race, not a measurement.
+    /// The failure this guards: an outer `timeout` firing before
+    /// `forward_one`'s own deadline drops the future with nothing classified
+    /// or logged.
+    #[skuld::test]
+    async fn expired_caller_budget_still_logs_the_upstream_failure() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = set_default_in_current_thread(subscriber);
+
+        const CALLER_BUDGET: Duration = Duration::from_millis(1500);
+        assert!(CALLER_BUDGET < UPSTREAM_TIMEOUT, "the budget must be the tighter one");
+
+        let (addr, accepted_rx) = super::silent_tcp_peer().await;
+        let fwd = Arc::new(DnsForwarder::new_with_ports(
+            build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
+            Arc::new(DirectConnector),
+            true,
+            vec![addr.port()],
+        ));
+        let call = tokio::spawn({
+            let fwd = Arc::clone(&fwd);
+            async move { fwd.try_forward(&sample_query(0x000C), CALLER_BUDGET).await }
+        });
+        accepted_rx.await.expect("stub accepted the connection");
+        tokio::time::pause();
+        let result = call.await.unwrap();
+
+        assert_eq!(result, Err(ForwardFailure::Upstream(UpstreamCause::Timeout)));
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("upstream failed"),
+            "an expired budget must still log; got:\n{output}"
+        );
+        assert!(
+            output.contains("layer=timeout"),
+            "expected 'layer=timeout'; got:\n{output}"
+        );
+        assert!(
+            output.contains("cause=timeout"),
+            "expected 'cause=timeout'; got:\n{output}"
+        );
+        assert!(
+            output.contains("budget_ms=1500"),
+            "the log must report the budget in force, not the default; got:\n{output}"
         );
     }
 }

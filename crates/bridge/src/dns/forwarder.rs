@@ -45,10 +45,11 @@ pub enum UpstreamLayer {
     Http,
     /// Post-handshake read / write on the upstream stream.
     Io,
-    /// Outer `UPSTREAM_TIMEOUT` budget fired. Distinct from `Io` so
-    /// observers can tell "inner future completed with error at 2573ms"
-    /// from "outer timer cancelled the future at exactly 3000ms" —
-    /// different root causes, different fixes.
+    /// The per-upstream budget passed to `forward_one` fired. Distinct from
+    /// `Io` so observers can tell "inner future completed with error at
+    /// 2573ms" from "the timer cancelled the future at the deadline" —
+    /// different root causes, different fixes. `budget_ms` on the WARN
+    /// reports which budget was in force.
     Timeout,
 }
 
@@ -149,8 +150,12 @@ pub struct UpstreamErr {
     pub layer: UpstreamLayer,
     pub source: io::Error,
     /// Wall-clock from `forward_one`'s `Instant::now()` to error emission.
-    /// Bounded above by [`UPSTREAM_TIMEOUT`].
+    /// Bounded above by the `budget` passed to `forward_one`.
     pub elapsed_ms: u64,
+    /// The per-upstream budget the attempt actually ran under, stamped by
+    /// `forward_one`. Logged as `budget_ms` so the WARN can never claim a
+    /// deadline that was not in force.
+    pub budget_ms: u64,
     /// Time from `forward_one` start to return of `connector.connect_tcp`.
     /// `Some` whenever the TCP/SOCKS5-level connection completed
     /// (Tls/Io/Http failures); `None` when we errored at `Connect` or
@@ -179,6 +184,7 @@ impl UpstreamErr {
             layer,
             source,
             elapsed_ms: 0,
+            budget_ms: 0,
             socks5_ms: None,
             tls_ms: None,
             tcp_wrote: None,
@@ -290,9 +296,11 @@ const DNS_PORT_TLS: u16 = 853;
 /// DoH typically runs on 443 (RFC 8484 §3).
 const DNS_PORT_HTTPS: u16 = 443;
 
-/// Per-upstream attempt timeout. Shorter than the OS default TCP timeout
-/// so a dead server doesn't stall the whole forward loop.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default per-upstream attempt budget, used by [`DnsForwarder::forward`].
+/// Shorter than the OS default TCP timeout so a dead server doesn't stall the
+/// whole forward loop. Callers with their own budget pass it to
+/// [`DnsForwarder::try_forward`] instead of wrapping the call in a `timeout`.
+pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Maximum reply size we'll buffer (bytes). DNS messages cap around 65535
 /// but we cap even tighter — DoH servers never return more than ~8KB in
@@ -373,12 +381,12 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
-    /// Test-only upstream-port override so the cross-module
-    /// `bootstrap::test_loopback_querier` e2e can reach an ephemeral DoH
-    /// listener. Behind `#[cfg(test)]` so production `forward` stays
-    /// byte-identical.
+    /// Test-only per-server upstream-port override, indexed against
+    /// `config.servers`, so tests can target ephemeral listeners without
+    /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
+    /// `try_forward` stays byte-identical.
     #[cfg(test)]
-    forced_port: Option<u16>,
+    forced_ports: Option<Vec<u16>>,
 }
 
 impl DnsForwarder {
@@ -395,7 +403,7 @@ impl DnsForwarder {
             failure_throttle: Mutex::new(HashMap::new()),
             ipv6_skip_logged: Mutex::new(HashSet::new()),
             #[cfg(test)]
-            forced_port: None,
+            forced_ports: None,
         }
     }
 
@@ -403,41 +411,80 @@ impl DnsForwarder {
     /// Never errors — on total failure returns a synthesized SERVFAIL so
     /// the caller can always write a reply back.
     pub async fn forward(&self, query: &[u8]) -> Vec<u8> {
+        // Short-query check ahead of the delegation: this is the in-TUN
+        // datagram path, so arbitrary local traffic reaches it and must not be
+        // able to drive `try_forward`'s unthrottled malformed-query WARN.
         if query.len() < 12 {
             return synthesize_servfail(query);
         }
+        self.try_forward(query, UPSTREAM_TIMEOUT)
+            .await
+            .unwrap_or_else(|_| synthesize_servfail(query))
+    }
 
-        for &server in &self.config.servers {
+    /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
+    /// upstream answered. Per-server failures are logged by the same throttle
+    /// either way; the returned cause is the highest-ranked one observed
+    /// (see [`UpstreamCause::rank`]), ties keeping the first.
+    ///
+    /// `per_upstream` bounds ONE upstream attempt. The walk tries up to
+    /// `config.servers.len()` of them, so bound the whole call at
+    /// `servers.len() * per_upstream`. A caller that owns a total budget should
+    /// pass this rather than wrapping the call in its own `timeout`: an outer
+    /// timer that fires first drops the future before `forward_one`'s deadline,
+    /// so nothing is classified and nothing is logged.
+    pub async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
+        if query.len() < 12 {
+            // A caller bug, and the one failure with no per-upstream WARN
+            // behind it — log at the point of detection or it is invisible to
+            // whichever caller consumes the `Err`.
+            tracing::warn!(
+                len = query.len(),
+                "DNS forward called with a query shorter than the header"
+            );
+            return Err(ForwardFailure::MalformedQuery);
+        }
+
+        let mut worst: Option<UpstreamCause> = None;
+        for (idx, &server) in self.config.servers.iter().enumerate() {
             if server.is_ipv6() && !self.ipv6_bypass_available {
                 self.log_ipv6_skip_once(server);
                 continue;
             }
 
-            let port = {
-                #[cfg(test)]
-                {
-                    self.forced_port.unwrap_or_else(|| default_port(self.config.protocol))
+            let target = SocketAddr::new(server, self.port_for(idx));
+            match self.forward_one(target, query, per_upstream).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    let cause = e.cause();
+                    self.log_upstream_failure(server, &e);
+                    if worst.is_none_or(|w| cause.rank() > w.rank()) {
+                        worst = Some(cause);
+                    }
                 }
-                #[cfg(not(test))]
-                {
-                    default_port(self.config.protocol)
-                }
-            };
-            let target = SocketAddr::new(server, port);
-            match self.forward_one(target, query).await {
-                Ok(reply) => return reply,
-                Err(e) => self.log_upstream_failure(server, &e),
             }
         }
 
-        synthesize_servfail(query)
+        Err(worst.map_or(ForwardFailure::NoUpstream, ForwardFailure::Upstream))
     }
 
-    /// Single-attempt forward against `target`. Callers build `target`
-    /// from the config'd server plus the protocol's well-known port;
-    /// the test-only `forward_with_ports` builds it from an ephemeral
-    /// port so stubs don't need privilege to bind 53/853/443.
-    async fn forward_one(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    /// Upstream port for the server at `_idx`. Production always answers the
+    /// protocol's well-known port; tests may override per server index.
+    fn port_for(&self, _idx: usize) -> u16 {
+        #[cfg(test)]
+        if let Some(ports) = self.forced_ports.as_ref() {
+            // `new_with_ports` is the only writer and asserts full coverage.
+            // Falling through here would dial a real public resolver.
+            return ports[_idx];
+        }
+        default_port(self.config.protocol)
+    }
+
+    /// Single-attempt forward against `target`, bounded by `budget`. Callers
+    /// build `target` from the config'd server plus the protocol's well-known
+    /// port; the test-only `port_for` / `forced_ports` seam substitutes an
+    /// ephemeral port so stubs don't need privilege to bind 53/853/443.
+    async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> Result<Vec<u8>, UpstreamErr> {
         let started = Instant::now();
         let fut = async {
             match self.config.protocol {
@@ -447,7 +494,7 @@ impl DnsForwarder {
                 DnsProtocol::Https => self.forward_https(target, query).await,
             }
         };
-        let result = match timeout(UPSTREAM_TIMEOUT, fut).await {
+        let result = match timeout(budget, fut).await {
             Ok(res) => res,
             Err(_) => Err(UpstreamErr::new(
                 UpstreamLayer::Timeout,
@@ -456,6 +503,7 @@ impl DnsForwarder {
         };
         result.map_err(|mut e| {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
+            e.budget_ms = budget.as_millis() as u64;
             e
         })
     }
@@ -513,7 +561,7 @@ impl DnsForwarder {
                     layer = %e.layer,
                     cause = %e.cause(),
                     elapsed_ms = e.elapsed_ms,
-                    budget_ms = UPSTREAM_TIMEOUT.as_millis() as u64,
+                    budget_ms = e.budget_ms,
                     socks5_ms = ?e.socks5_ms,
                     tls_ms = ?e.tls_ms,
                     tcp_wrote = ?e.tcp_wrote,
@@ -540,8 +588,8 @@ impl DnsForwarder {
     }
 }
 
-/// Well-known port per protocol. Split out so `forward_with_ports` (test
-/// helper) can reuse the mapping.
+/// Well-known port per protocol. Split out so the test-only `port_for`
+/// override can reuse the mapping.
 fn default_port(protocol: DnsProtocol) -> u16 {
     match protocol {
         DnsProtocol::PlainUdp | DnsProtocol::PlainTcp => DNS_PORT_PLAIN,
@@ -803,6 +851,26 @@ pub(crate) fn build_tls_config_with_extra_root(extra: rustls_pki_types::Certific
 
 #[cfg(test)]
 impl DnsForwarder {
+    /// Test-only forwarder with per-server upstream-port overrides — see the
+    /// `forced_ports` field. Every server must get one: an uncovered index
+    /// falls back to the real well-known port, which would dial a public
+    /// resolver for real from a test.
+    pub(crate) fn new_with_ports(
+        config: DnsConfig,
+        connector: Arc<dyn UpstreamConnector>,
+        ipv6_bypass_available: bool,
+        ports: Vec<u16>,
+    ) -> Self {
+        assert_eq!(
+            ports.len(),
+            config.servers.len(),
+            "forced_ports must cover every configured server"
+        );
+        let mut s = Self::new(config, connector, ipv6_bypass_available);
+        s.forced_ports = Some(ports);
+        s
+    }
+
     /// Test-only forwarder trusting one extra root, with a fixed upstream port
     /// so the loopback e2e can target an ephemeral DoH listener. Compiled out
     /// of production — never weakens the real `webpki_roots` verifier.
@@ -813,9 +881,10 @@ impl DnsForwarder {
         extra_root: rustls_pki_types::CertificateDer<'static>,
         forced_port: u16,
     ) -> Self {
-        let mut s = Self::new(config, connector, ipv6_bypass_available);
+        // One port for EVERY server — never a partial override.
+        let ports = vec![forced_port; config.servers.len()];
+        let mut s = Self::new_with_ports(config, connector, ipv6_bypass_available, ports);
         s.tls_config = Arc::new(build_tls_config_with_extra_root(extra_root));
-        s.forced_port = Some(forced_port);
         s
     }
 }
