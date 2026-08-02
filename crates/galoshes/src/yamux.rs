@@ -136,10 +136,20 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
     let mut pending_opens: Vec<Option<OpenStreamReply>> = Vec::new();
 
     std::future::poll_fn(|cx| {
-        // 1. Service pending outbound stream requests.
+        // 1. Service pending outbound stream requests, discarding any whose
+        // requester is already gone: opening a substream for a departed caller
+        // means an immediate reset and a wasted stream-table slot. A requester
+        // that departs after this check is absorbed by `reply.send` failing
+        // below and the stream being dropped.
         for slot in pending_opens.iter_mut() {
-            if slot.is_none() {
-                continue;
+            match slot {
+                None => continue,
+                Some(reply) if reply.is_closed() => {
+                    tracing::debug!("discarding an open request whose requester is gone");
+                    *slot = None;
+                    continue;
+                }
+                Some(_) => {}
             }
             match conn.poll_new_outbound(cx) {
                 std::task::Poll::Ready(Ok(stream)) => {
@@ -181,6 +191,10 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
         loop {
             match open_rx.poll_recv(cx) {
                 std::task::Poll::Ready(Some(reply)) => {
+                    if reply.is_closed() {
+                        tracing::debug!("discarding an open request whose requester is gone");
+                        continue;
+                    }
                     // Try to open immediately.
                     match conn.poll_new_outbound(cx) {
                         std::task::Poll::Ready(Ok(stream)) => {
@@ -209,7 +223,9 @@ pub(crate) async fn drive_connection<T: futures::AsyncRead + futures::AsyncWrite
 }
 
 /// Request a new outbound stream from the driver.
-async fn open_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> Result<yamux::Stream, yamux::ConnectionError> {
+pub(crate) async fn open_stream(
+    open_tx: &mpsc::Sender<OpenStreamReply>,
+) -> Result<yamux::Stream, yamux::ConnectionError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     open_tx.send(tx).await.map_err(|_| yamux::ConnectionError::Closed)?;
     rx.await.map_err(|_| yamux::ConnectionError::Closed)?
@@ -638,6 +654,7 @@ async fn run_client_session(
     open_tx: &mpsc::Sender<OpenStreamReply>,
     inbound_rx: &mut mpsc::Receiver<yamux::Stream>,
     udp_timeout: Duration,
+    inbound_reads: &Arc<AtomicU64>,
     shutdown: &CancellationToken,
 ) -> SessionOutcome {
     let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
@@ -645,9 +662,17 @@ async fn run_client_session(
     let mut next_gen: u64 = 0;
     let mut udp_buf = [0u8; 65536];
 
+    // Pinned outside the loop so an in-flight probe survives every other select
+    // arm firing.
+    let keepalive = run_keepalive(open_tx.clone(), Arc::clone(inbound_reads));
+    tokio::pin!(keepalive);
+
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return SessionOutcome::Shutdown,
+            // A transport that has gone silent: black-holed with no RST or FIN,
+            // so no other arm here would ever notice.
+            () = &mut keepalive => return SessionOutcome::TransportDied,
             // Transport death: the driver dropped its inbound sender. A `Some` is a
             // protocol violation (the server never opens streams to the client);
             // untrusted remote input — log and drop, never panic.
@@ -805,6 +830,7 @@ pub(crate) async fn run_client(
             &open_tx,
             &mut inbound_rx,
             udp_timeout,
+            &inbound_reads,
             &shutdown,
         )
         .await;
@@ -838,6 +864,205 @@ pub(crate) async fn run_client(
                 }
             }
         }
+    }
+}
+
+// Keepalive ===========================================================================================================
+
+/// How long the transport may stay silent before the client gives it a reason to
+/// speak.
+///
+/// A silently black-holed transport — a middlebox dropping packets with no
+/// RST/FIN — produces no death signal of its own, so an idle tunnel otherwise
+/// waits out ex-ray's inherited 300 s `ConnectionIdle`
+/// (`third_party/v2ray-core/features/policy/policy.go`, `SessionDefault`) before
+/// anything notices. This constant keeps recovery bounded here rather than by any
+/// timer further down the stack.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The margin that keeps a healthy-but-slow server off the fatal path.
+///
+/// Detection itself needs no help: a black-holed transport delivers neither an
+/// echo nor anything else. But a server whose echo task is merely slow would be
+/// silent too, and what covers it is yamux's own RTT ping — due again 10 s after
+/// the last pong, and emitted the moment our probe wakes the driver. That holds
+/// only while a probe cannot come sooner than a ping is due, so the interval may
+/// not drop below yamux's cadence. `PING_INTERVAL` is private to that crate, so
+/// the relation is pinned here rather than imported.
+const _: () = assert!(KEEPALIVE_INTERVAL.as_secs() >= 10);
+
+/// How long the transport may stay completely silent after a probe before it is
+/// declared dead.
+///
+/// Worst-case detection is `2 × KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT` from the
+/// last inbound byte: the cadence is fixed rather than reset by traffic, so a
+/// byte landing just after a cycle boundary makes the next cycle skip its probe
+/// and the probe lands a cycle later.
+///
+/// The probe is a full round trip through the local ex-ray hop, the wire, the
+/// remote ex-ray hop and the remote yamux server, so this is sized for a bad day
+/// on a long path, not a median RTT: a false positive tears the session down and
+/// `driver.abort()` truncates whatever relays were in flight.
+pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open a keepalive substream and put `tag || nonce` on it in a single write.
+///
+/// The tag and the first nonce share one write so there is exactly one failure
+/// path between opening and having asked the peer something. The substream is
+/// returned only once that write has completed, so a caller cancelled mid-write
+/// drops a partially written substream instead of caching it.
+pub(crate) async fn open_probe(open_tx: &mpsc::Sender<OpenStreamReply>, nonce: u64) -> Option<yamux::Stream> {
+    let mut stream = match open_stream(open_tx).await {
+        Ok(s) => s,
+        // A closed connection is expected reconnect-window churn; anything else
+        // is a transport-alive failure worth surfacing, matching the TCP-accept
+        // and UDP-association arms above.
+        Err(yamux::ConnectionError::Closed) => {
+            tracing::debug!("no keepalive substream: connection closed");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open the keepalive substream");
+            return None;
+        }
+    };
+    let mut request = [0u8; 1 + KEEPALIVE_NONCE_LEN];
+    request[0] = StreamTag::Keepalive.to_byte();
+    request[1..].copy_from_slice(&nonce.to_be_bytes());
+    match write_all_flush(&mut stream, &request).await {
+        Ok(()) => Some(stream),
+        Err(e) => {
+            tracing::debug!(nonce, error = %e, "keepalive probe could not be written");
+            None
+        }
+    }
+}
+
+async fn write_all_flush(stream: &mut yamux::Stream, bytes: &[u8]) -> std::io::Result<()> {
+    stream.write_all(bytes).await?;
+    stream.flush().await
+}
+
+/// Keep giving the peer a reason to speak until it does, or until there is
+/// nothing left to ask with. Never resolves in the second case — the caller's
+/// deadline ends the cycle.
+///
+/// A substream stops being usable in two ways that need different signals: a
+/// reset makes the next write fail instantly, while a FIN leaves it in
+/// `State::RecvClosed`, which still permits writes — so the read side ending is
+/// the second signal. Either way a fresh substream is opened inside the same
+/// window. The tap is re-checked between reads on the probe substream, so a peer
+/// that answers *there* — even with a reset — is asked exactly once and its cycle
+/// costs a round trip rather than a whole deadline. Liveness arriving on some
+/// other substream does not wake this read; the caller's deadline covers that,
+/// and the verdict is the same either way.
+///
+/// The echo is drained but never inspected: its value is not part of the verdict,
+/// and a single `read` consumes nothing when cancelled, so the substream survives
+/// a deadline that fires mid-echo. `read_exact` would not.
+async fn elicit(
+    open_tx: &mpsc::Sender<OpenStreamReply>,
+    probe: &mut Option<yamux::Stream>,
+    nonce: u64,
+    inbound_reads: &AtomicU64,
+    before: u64,
+) {
+    while inbound_reads.load(Ordering::Relaxed) == before {
+        match probe.take() {
+            // Own the substream across the write: `poll_write` can return
+            // Pending mid-nonce when the send window is short, and a deadline
+            // firing there would leave a partial nonce behind and mis-frame
+            // every later probe. A cancelled write drops it instead.
+            Some(mut stream) => match write_all_flush(&mut stream, &nonce.to_be_bytes()).await {
+                Ok(()) => *probe = Some(stream),
+                Err(e) => {
+                    tracing::debug!(nonce, error = %e, "keepalive probe substream is spent");
+                    continue;
+                }
+            },
+            None => *probe = open_probe(open_tx, nonce).await,
+        }
+        let Some(stream) = probe.as_mut() else { break };
+        tracing::debug!(nonce, "keepalive probe sent");
+
+        let mut sink = [0u8; KEEPALIVE_NONCE_LEN];
+        loop {
+            if inbound_reads.load(Ordering::Relaxed) != before {
+                return; // the peer spoke; nothing more to ask
+            }
+            match stream.read(&mut sink).await {
+                Ok(n) if n > 0 => {}
+                Ok(_) => {
+                    tracing::debug!(nonce, "keepalive probe substream closed by the peer");
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(nonce, error = %e, "keepalive probe substream ended");
+                    break;
+                }
+            }
+        }
+        *probe = None;
+    }
+    if inbound_reads.load(Ordering::Relaxed) == before {
+        std::future::pending().await
+    }
+}
+
+/// Client-side liveness for one yamux session.
+///
+/// Every [`KEEPALIVE_INTERVAL`] in which the transport delivered nothing, it
+/// gives the peer a reason to speak and then asks the tap whether *anything*
+/// arrived before [`KEEPALIVE_TIMEOUT`] was up. Resolves only when the answer is
+/// no, so the caller can park on it as a plain `select!` arm.
+pub(crate) async fn run_keepalive(open_tx: mpsc::Sender<OpenStreamReply>, inbound_reads: Arc<AtomicU64>) {
+    let mut nonce: u64 = 0;
+    let mut probe: Option<yamux::Stream> = None;
+    let mut last_seen = inbound_reads.load(Ordering::Relaxed);
+
+    loop {
+        // The cadence IS the behavior (a keepalive interval), not
+        // synchronization between our own code paths.
+        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+
+        let seen = inbound_reads.load(Ordering::Relaxed);
+        if seen != last_seen {
+            last_seen = seen;
+            tracing::debug!("transport still active; skipping the keepalive probe");
+            continue;
+        }
+
+        nonce += 1;
+        // Likewise the deadline: it IS how long silence is tolerated. It covers
+        // the substream open too, which parks indefinitely once enough
+        // substreams await an ACK — exactly what a black hole produces.
+        let deadline = tokio::time::sleep(KEEPALIVE_TIMEOUT);
+        tokio::pin!(deadline);
+        // `elicit` holds the only borrow of `probe` for the whole select; do not
+        // hand it a clone or an `Option::take` round trip, or a cancelled cycle
+        // stops discarding the substream it was mid-write on.
+        tokio::select! {
+            () = elicit(&open_tx, &mut probe, nonce, &inbound_reads, last_seen) => {}
+            () = &mut deadline => {}
+        }
+
+        let seen = inbound_reads.load(Ordering::Relaxed);
+        if seen != last_seen {
+            last_seen = seen;
+            tracing::debug!(nonce, "transport answered inside the keepalive deadline");
+            continue;
+        }
+
+        // Nothing at all arrived across a whole interval and a whole deadline.
+        // If the probe could not even be sent, the reading is the same: a
+        // connection whose substream budget is exhausted while delivering
+        // nothing is, at this layer, indistinguishable from a dead one, and
+        // reconnecting is the fail-safe choice for a VPN.
+        tracing::warn!(
+            nonce,
+            "transport silent across the keepalive deadline; declaring it dead"
+        );
+        return;
     }
 }
 

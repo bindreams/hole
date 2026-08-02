@@ -19,9 +19,9 @@ use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
     connect_delay, connect_retrying, deframe_udp_datagram, drive_connection, driver_panicked, frame_udp_datagram,
-    next_failures, parse_udp_timeout, run_client, run_server, session_reconnect_backoff, ClientBoundAddrs,
-    FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
-    REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    next_failures, open_probe, parse_udp_timeout, run_client, run_keepalive, run_server, session_reconnect_backoff,
+    ClientBoundAddrs, FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT,
+    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 // Only the Windows-gated CONNRESET regression test uses this.
 #[cfg(windows)]
@@ -797,11 +797,18 @@ async fn wait_for_log(writer: &WaitableWriter, needle: &str) {
 
 /// Strip the 1-byte stream tag, then echo everything else back.
 async fn echo_yamux_stream(mut stream: yamux::Stream) {
-    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    use futures::AsyncReadExt as _;
     let mut tag = [0u8; 1];
     if stream.read_exact(&mut tag).await.is_err() {
         return;
     }
+    echo_yamux_stream_body(stream).await;
+}
+
+/// Echo every byte back until the peer goes away. Any stream tag must already
+/// have been consumed.
+async fn echo_yamux_stream_body(mut stream: yamux::Stream) {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
     let mut buf = vec![0u8; 4096];
     loop {
         match stream.read(&mut buf).await {
@@ -881,7 +888,6 @@ async fn driver_panicked_detects_panic_not_cancel() {
 
 #[skuld::test]
 async fn shutdown_during_backoff_exits_promptly() {
-    tokio::time::pause();
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
     let shutdown = CancellationToken::new();
     let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
@@ -902,6 +908,12 @@ async fn shutdown_during_backoff_exits_promptly() {
     // Rendezvous (not the assertion): the observer event means the client has
     // reached the reconnect decision and is entering the backoff sleep.
     assert_eq!(events_rx.recv().await.unwrap(), (1, false));
+
+    // Freeze only the backoff window. Pausing for the whole test would put the
+    // session's keepalive timers inside an auto-advancing clock while real
+    // socket traffic is still in flight, and a spurious verdict would change
+    // which reconnect event the rendezvous above yields.
+    tokio::time::pause();
 
     // The external assertion: shutdown must win the paused sleep, so the client
     // task returns `Ok` promptly. Without the select! shutdown branch the paused
@@ -1021,6 +1033,514 @@ async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
     shutdown.cancel();
 }
 
+/// A `MakeWriter` that fires a **tokio** oneshot the first time a registered
+/// substring is written.
+///
+/// `garter`'s `WaitableWriter` hands back a `std::sync::mpsc::Receiver`, which a
+/// test can only await through `spawn_blocking` — and on a current-thread
+/// runtime built with `test-util`, spawning a blocking task calls
+/// `Clock::inhibit_auto_advance` for that task's whole lifetime. Under
+/// `tokio::time::pause()` the clock then never advances, the awaited line is
+/// never written, the blocking task never ends, and the wait deadlocks. This
+/// receiver is awaited on the runtime instead, so the runtime still parks and
+/// the clock still advances.
+/// One registered wait: the substring, how many occurrences it needs, and the
+/// sender that fires when it has them.
+type LogWait = (String, usize, tokio::sync::oneshot::Sender<()>);
+
+#[derive(Clone, Default)]
+struct LogWaiter {
+    text: Arc<std::sync::Mutex<String>>,
+    waiters: Arc<std::sync::Mutex<Vec<LogWait>>>,
+}
+
+impl LogWaiter {
+    /// Fires the first time the accumulated log contains `needle`; fires
+    /// immediately if it already does, so a caller cannot race a past write.
+    fn wait_for(&self, needle: &str) -> tokio::sync::oneshot::Receiver<()> {
+        self.wait_for_nth(needle, 1)
+    }
+
+    /// Fires once `needle` has been written at least `nth` times. Lets a test
+    /// wait for an occurrence that provably post-dates a snapshot, which
+    /// `wait_for` cannot: a needle already present fires it immediately.
+    fn wait_for_nth(&self, needle: &str, nth: usize) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Hold both locks across the check-and-register so a write landing
+        // between them cannot be lost.
+        let text = self.text.lock().unwrap();
+        let mut waiters = self.waiters.lock().unwrap();
+        if text.matches(needle).count() >= nth {
+            let _ = tx.send(());
+        } else {
+            waiters.push((needle.to_string(), nth, tx));
+        }
+        rx
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.text.lock().unwrap().matches(needle).count()
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.count(needle) > 0
+    }
+}
+
+impl std::io::Write for LogWaiter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut text = self.text.lock().unwrap();
+        text.push_str(&String::from_utf8_lossy(buf));
+        // Scan the whole accumulated text, not just this write: tracing's
+        // formatter splits a line's header and body across calls.
+        let mut waiters = self.waiters.lock().unwrap();
+        let mut i = 0;
+        while i < waiters.len() {
+            if text.matches(waiters[i].0.as_str()).count() >= waiters[i].1 {
+                let (_, _, tx) = waiters.swap_remove(i);
+                let _ = tx.send(());
+            } else {
+                i += 1;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWaiter {
+    type Writer = LogWaiter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install a per-test subscriber whose waits are awaitable on the runtime.
+fn capture_logs_awaitable() -> (LogWaiter, tracing::subscriber::DefaultGuard) {
+    let writer = LogWaiter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let guard = set_default_in_current_thread(subscriber);
+    (writer, guard)
+}
+
+/// How a stub peer treats the client's keepalive substream. Non-keepalive
+/// substreams are always echoed, so a test can generate ordinary traffic.
+#[derive(Clone, Copy)]
+enum StubPeer {
+    /// Echoes every nonce, like the production server.
+    Echo,
+    /// What a pre-keepalive galoshes server does: the tag is unknown, the
+    /// handler errors, the substream is dropped — which yamux turns into a reset
+    /// the client will read.
+    RejectTag,
+    /// Answers, but with bytes that are not the nonce.
+    Corrupt,
+    /// Reads every nonce and never answers any of them, holding the substream
+    /// open. Models a busy-but-alive peer whose probe stalls.
+    StallProbe,
+    /// Answers one nonce, then half-closes the substream. A FIN leaves the
+    /// client's side writable (`State::RecvClosed`), so the read side ending is
+    /// the only signal that it is spent.
+    FinAfterFirstProbe,
+    /// Answers one nonce, then *resets* the substream. The reset lands between
+    /// cycles, so the client's next write is the thing that discovers it.
+    ResetAfterFirstProbe,
+    /// A raw byte sink: reads and discards, never writes a single byte. NOT a
+    /// yamux peer — a real `Connection` would answer yamux's own pings and so
+    /// could not model a black hole.
+    Blackhole,
+}
+
+/// A live yamux client whose transport is an in-process pipe to `peer`.
+///
+/// Every stub except `Blackhole` runs a real `yamux::Connection`, whose first RTT
+/// ping is due immediately — so the peer pongs during setup and the tap has
+/// already moved before the keepalive's first cycle. That cycle is therefore
+/// skipped by the idle gate and probes start at cycle 2. `PING_INTERVAL` is 10 s
+/// of *real* time, which a virtual clock does not move, so no further pong
+/// arrives during a test.
+struct PipedClient {
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    inbound_reads: Arc<AtomicU64>,
+    /// One item per keepalive nonce the peer read.
+    probes: mpsc::UnboundedReceiver<()>,
+    /// One item per inbound substream the peer accepted, of any kind.
+    substreams: mpsc::UnboundedReceiver<()>,
+    _client_driver: tokio::task::JoinHandle<()>,
+    _client_inbound: mpsc::Receiver<yamux::Stream>,
+    _peer: tokio::task::JoinHandle<()>,
+}
+
+async fn piped_client(peer: StubPeer) -> PipedClient {
+    piped_client_with_max_streams(peer, 512).await
+}
+
+async fn piped_client_with_max_streams(peer: StubPeer, max_streams: usize) -> PipedClient {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (client_io, peer_io) = tokio::io::duplex(256 * 1024);
+
+    let mut config = ::yamux::Config::default();
+    config.set_max_num_streams(max_streams);
+
+    let inbound_reads = Arc::new(AtomicU64::new(0));
+    let tapped = TransportLivenessTap::new(client_io.compat(), Arc::clone(&inbound_reads));
+    let conn = ::yamux::Connection::new(tapped, config, ::yamux::Mode::Client);
+    let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
+    let (inbound_tx, client_inbound) = mpsc::channel::<yamux::Stream>(32);
+    let client_driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+
+    let (probe_tx, probes) = mpsc::unbounded_channel();
+    let (substream_tx, substreams) = mpsc::unbounded_channel();
+    let peer_task = tokio::spawn(async move {
+        if let StubPeer::Blackhole = peer {
+            let mut sink = peer_io;
+            let mut buf = [0u8; 4096];
+            while matches!(tokio::io::AsyncReadExt::read(&mut sink, &mut buf).await, Ok(n) if n > 0) {}
+            return;
+        }
+
+        let conn = ::yamux::Connection::new(peer_io.compat(), ::yamux::Config::default(), ::yamux::Mode::Server);
+        let (_open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+
+        while let Some(mut stream) = inbound_rx.recv().await {
+            let _ = substream_tx.send(());
+            let probe_tx = probe_tx.clone();
+            tokio::spawn(async move {
+                let mut tag = [0u8; 1];
+                if stream.read_exact(&mut tag).await.is_err() {
+                    return;
+                }
+                if tag[0] != StreamTag::Keepalive.to_byte() {
+                    echo_yamux_stream_body(stream).await;
+                    return;
+                }
+                if let StubPeer::RejectTag = peer {
+                    return; // drops the substream -> reset
+                }
+                let mut nonce = [0u8; 8];
+                let mut answered = 0u32;
+                while stream.read_exact(&mut nonce).await.is_ok() {
+                    let _ = probe_tx.send(());
+                    if let StubPeer::StallProbe = peer {
+                        continue;
+                    }
+                    if let StubPeer::Corrupt = peer {
+                        nonce.iter_mut().for_each(|b| *b ^= 0xFF);
+                    }
+                    if stream.write_all(&nonce).await.is_err() || stream.flush().await.is_err() {
+                        return;
+                    }
+                    answered += 1;
+                    match peer {
+                        StubPeer::FinAfterFirstProbe if answered == 1 => {
+                            let _ = stream.close().await;
+                            return;
+                        }
+                        StubPeer::ResetAfterFirstProbe if answered == 1 => return, // drop -> reset
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    PipedClient {
+        open_tx,
+        inbound_reads,
+        probes,
+        substreams,
+        _client_driver: client_driver,
+        _client_inbound: client_inbound,
+        _peer: peer_task,
+    }
+}
+
+/// Await `count` nonces read by the peer. An in-runtime rendezvous, so a paused
+/// clock only advances between cycles and never mid-exchange.
+async fn expect_probes(client: &mut PipedClient, count: usize) {
+    for probe in 1..=count {
+        client
+            .probes
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("probe {probe} never reached the peer"));
+    }
+}
+
+/// Drive one echoed round trip on an ordinary substream. Used where the point is
+/// that a real substream still works, not to time inbound traffic against a
+/// keepalive cycle.
+async fn chatter(open_tx: &mpsc::Sender<OpenStreamReply>) {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = open_test_stream(open_tx).await;
+    stream.write_all(&[StreamTag::Tcp.to_byte()]).await.unwrap();
+    stream.write_all(b"still here").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut buf = [0u8; 10];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"still here");
+}
+
+#[skuld::test]
+async fn opening_a_probe_fails_when_the_substream_budget_is_exhausted() {
+    // The `TooManyStreams` arm: a refused open must be reported, not mistaken
+    // for a probe. Cap the connection at one substream and take it first.
+    let (writer, _g) = capture_logs_awaitable();
+    let client = piped_client_with_max_streams(StubPeer::Echo, 1).await;
+    let _hog = open_test_stream(&client.open_tx).await;
+    assert!(open_probe(&client.open_tx, 1).await.is_none());
+    assert!(
+        writer.contains("failed to open the keepalive substream"),
+        "a refused open must warn, not pass silently"
+    );
+}
+
+#[skuld::test]
+async fn opening_a_probe_fails_when_the_connection_is_gone() {
+    let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(1);
+    drop(open_rx);
+    assert!(open_probe(&open_tx, 1).await.is_none());
+}
+
+#[skuld::test]
+async fn opening_a_probe_tags_it_and_delivers_the_first_nonce() {
+    let mut client = piped_client(StubPeer::Echo).await;
+    let probe = open_probe(&client.open_tx, 7).await;
+    assert!(probe.is_some(), "a healthy connection must yield a probe substream");
+    expect_probes(&mut client, 1).await;
+}
+
+#[skuld::test]
+async fn the_driver_opens_no_substream_for_a_departed_requester() {
+    // The keepalive cancels an open whenever its deadline beats the transport.
+    // Answering a request already known to be cancelled would open a substream
+    // nobody reads, which yamux immediately resets — a wasted SYN/RST pair and a
+    // stream-table slot.
+    //
+    // `try_send` is fully synchronous, so no other task can run between the send
+    // and the drop: the driver is guaranteed to see a request that is already
+    // abandoned. (`send().await` would not do — it goes through
+    // `batch_semaphore.rs`'s `poll_proceed`, which yields on an exhausted coop
+    // budget even when the channel has room.)
+    let (writer, _g) = capture_logs_awaitable();
+    let mut client = piped_client(StubPeer::Echo).await;
+    let (tx, rx) = oneshot::channel();
+    client.open_tx.try_send(tx).expect("driver alive");
+    drop(rx);
+
+    // Assert the discard branch itself ran, not just its side effect: that line
+    // is written only there. It covers requests abandoned before the driver's
+    // poll, which is what this test constructs; one abandoned later is caught by
+    // `reply.send` failing instead.
+    writer
+        .wait_for("discarding an open request whose requester is gone")
+        .await
+        .expect("the driver must discard the cancelled request, not answer it");
+
+    // And the observable consequence: a real substream afterwards works, and its
+    // round trip gives the peer time to report every substream it accepted.
+    chatter(&client.open_tx).await;
+    assert!(client.substreams.recv().await.is_some(), "the chatter substream");
+    assert!(
+        matches!(client.substreams.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "the cancelled request must not have opened a substream of its own"
+    );
+}
+
+#[skuld::test]
+async fn keepalive_keeps_probing_a_healthy_peer() {
+    // Three delivered probes prove the loop took the non-fatal path twice and
+    // came back for more, which a fatal verdict would have prevented.
+    let mut client = piped_client(StubPeer::Echo).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+    expect_probes(&mut client, 3).await;
+    assert!(!keepalive.is_finished(), "a healthy peer must never be declared dead");
+    keepalive.abort();
+}
+
+#[skuld::test]
+async fn keepalive_survives_a_peer_that_rejects_the_tag() {
+    // An un-upgraded server. Its reset is inbound traffic read inside the same
+    // window, so the cycle ends non-fatally — which only the post-window line
+    // can report.
+    let (writer, _g) = capture_logs_awaitable();
+    let client = piped_client(StubPeer::RejectTag).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+    writer
+        .wait_for("transport answered inside the keepalive deadline")
+        .await
+        .expect("the rejected probe must close its window non-fatally");
+    assert!(
+        !keepalive.is_finished(),
+        "an un-upgraded peer must never be declared dead"
+    );
+    keepalive.abort();
+}
+
+#[skuld::test]
+async fn keepalive_replaces_a_probe_substream_the_peer_half_closed() {
+    // A FIN leaves the client's substream writable, so a write cannot detect it.
+    // The read side ending is the signal; the next cycle must open a fresh
+    // substream, which the peer sees as a second one carrying a second nonce.
+    let mut client = piped_client(StubPeer::FinAfterFirstProbe).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+    expect_probes(&mut client, 2).await;
+    assert!(
+        !keepalive.is_finished(),
+        "a half-closed probe substream is not a dead transport"
+    );
+    keepalive.abort();
+}
+
+#[skuld::test]
+async fn keepalive_replaces_a_probe_substream_the_peer_reset_between_cycles() {
+    // The write-failure path: the peer answers, then resets while the client is
+    // *not* reading it. The cached substream is discovered dead by a later
+    // cycle's write, which must retry on a fresh substream rather than lose the
+    // cycle. A second delivered nonce is proof it did.
+    let mut client = piped_client(StubPeer::ResetAfterFirstProbe).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+    expect_probes(&mut client, 2).await;
+    assert!(
+        !keepalive.is_finished(),
+        "a reset probe substream costs a re-open, not a session"
+    );
+    keepalive.abort();
+}
+
+#[skuld::test]
+async fn keepalive_survives_a_peer_that_garbles_the_echo() {
+    let mut client = piped_client(StubPeer::Corrupt).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+    expect_probes(&mut client, 3).await;
+    assert!(
+        !keepalive.is_finished(),
+        "a peer that answers with the wrong bytes is still a live transport"
+    );
+    keepalive.abort();
+}
+
+#[skuld::test]
+async fn a_stalled_probe_survives_on_other_traffic_then_dies_on_silence() {
+    // One test, both halves of the stalled-probe contract. The peer holds the
+    // substream open and answers nothing, so nothing ever makes it unusable and
+    // it is reused across cycles.
+    //
+    // Cycle A: probe #1 stalls, but the transport delivers a frame on some other
+    // substream, so the window closes non-fatally — proved by cycle B happening
+    // at all. Cycle B: probe #2 goes out on that same retained substream and
+    // nothing answers it, so silence wins.
+    //
+    // The other-traffic frame is injected straight into the tap rather than
+    // relayed for real. The tap counter IS the keepalive's input, and driving it
+    // directly is what makes the ordering exact: real traffic has to be produced
+    // between two cycle boundaries, and a paused clock auto-advances on any park
+    // inside that exchange.
+    let mut client = piped_client(StubPeer::StallProbe).await;
+    tokio::time::pause();
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+
+    expect_probes(&mut client, 1).await;
+    client.inbound_reads.fetch_add(1, Ordering::Relaxed);
+
+    // A second nonce can only exist if cycle A ended non-fatally, and it travels
+    // the retained substream because nothing has invalidated it.
+    expect_probes(&mut client, 1).await;
+    keepalive.await.expect("silence must end the loop, not hang it");
+}
+
+#[skuld::test]
+async fn keepalive_skips_the_probe_while_the_transport_is_busy() {
+    // A transport that delivered something has already answered the question a
+    // probe asks, so those cycles send nothing at all.
+    //
+    // The traffic is injected into the tap on its own cadence rather than
+    // relayed for real: the tap counter is the keepalive's input, and a
+    // stand-in that ticks three times per keepalive interval guarantees every
+    // gate check sees movement. Real traffic would have to be produced between
+    // two cycle boundaries, which a paused clock can auto-advance straight past.
+    // The interval here IS the behavior being modelled (a busy transport), not
+    // synchronization between test steps.
+    let (writer, _g) = capture_logs_awaitable();
+    let mut client = piped_client(StubPeer::Echo).await;
+    let reads = Arc::clone(&client.inbound_reads);
+    tokio::time::pause();
+    let busy = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(KEEPALIVE_INTERVAL / 3).await;
+            reads.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let keepalive = tokio::spawn(run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)));
+
+    // Three skipped cycles, or the first probe — whichever comes first. A
+    // keepalive with no idle gate probes immediately and loses this race, so the
+    // regression fails fast instead of hanging.
+    const SKIP: &str = "transport still active; skipping the keepalive probe";
+    tokio::select! {
+        r = writer.wait_for_nth(SKIP, 3) => r.expect("skips observed"),
+        _ = client.probes.recv() => panic!("a busy transport must not be probed"),
+    }
+
+    assert!(!keepalive.is_finished(), "a skipped cycle is never a fatal one");
+    keepalive.abort();
+    busy.abort();
+}
+
+#[skuld::test]
+async fn keepalive_declares_a_silent_transport_dead() {
+    // The peer swallows everything and answers nothing, with no reset and no
+    // FIN. Only timers can make progress, so the paused clock advances
+    // deterministically to the verdict; if it never came, this would hang to the
+    // framework timeout.
+    let client = piped_client(StubPeer::Blackhole).await;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)).await;
+    assert_eq!(
+        client.inbound_reads.load(Ordering::Relaxed),
+        0,
+        "nothing came back — that silence is what made the verdict fatal"
+    );
+    assert!(
+        tokio::time::Instant::now() - started >= KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT,
+        "the verdict must wait out a whole interval and a whole deadline"
+    );
+}
+
+#[skuld::test]
+async fn keepalive_declares_a_transport_dead_when_it_cannot_even_open_a_probe() {
+    // A refused open plus a whole silent window is, at this layer,
+    // observationally identical to a dead transport: substreams that delivered
+    // nothing. Reconnecting is the fail-safe reading — but only after the full
+    // window, never on the open failure alone.
+    let client = piped_client_with_max_streams(StubPeer::Blackhole, 1).await;
+    let _hog = open_test_stream(&client.open_tx).await;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    run_keepalive(client.open_tx.clone(), Arc::clone(&client.inbound_reads)).await;
+    assert_eq!(client.inbound_reads.load(Ordering::Relaxed), 0);
+    assert!(
+        tokio::time::Instant::now() - started >= KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT,
+        "a refused open must not short-circuit the window"
+    );
+}
+
 #[skuld::test]
 async fn server_shutdown_is_prompt_while_client_connected() {
     // A connected client keeps the driver live; shutdown must still complete
@@ -1043,4 +1563,96 @@ async fn server_shutdown_is_prompt_while_client_connected() {
 
     shutdown.cancel();
     server.await.expect("server task joined").expect("run_server ok");
+}
+
+/// Fire a one-shot silent black hole on a relay connection.
+struct BlackholeHandle {
+    tx: Option<oneshot::Sender<()>>,
+}
+impl BlackholeHandle {
+    fn trigger(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// A TCP relay in front of `upstream` whose first connection can be silently
+/// black-holed: on `trigger()` it stops forwarding both ways but holds both
+/// sockets open forever, so neither peer sees a FIN or an RST and neither peer's
+/// TCP stack times out (the relay's kernel keeps ACKing). That is strictly
+/// harsher than the field condition, where the client's retransmits do
+/// eventually abort.
+async fn spawn_blackholing_relay(upstream: SocketAddr) -> (SocketAddr, BlackholeHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let addr = listener.local_addr().expect("relay addr");
+    let (hole_tx, hole_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut trigger = Some(hole_rx);
+        while let Ok((client_conn, _)) = listener.accept().await {
+            let server_conn = match TcpStream::connect(upstream).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(pump_with_optional_blackhole(client_conn, server_conn, trigger.take()));
+        }
+    });
+    (addr, BlackholeHandle { tx: Some(hole_tx) })
+}
+
+async fn pump_with_optional_blackhole(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    hole: Option<oneshot::Receiver<()>>,
+) {
+    match hole {
+        Some(rx) => {
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                // `client` and `server` stay alive in this frame, so both
+                // sockets stay open: a true silent black hole.
+                _ = rx => std::future::pending::<()>().await,
+            }
+        }
+        None => {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        }
+    }
+}
+
+#[skuld::test]
+async fn a_silently_blackholed_session_is_declared_dead() {
+    let (writer, _g) = capture_logs_awaitable();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, mut hole) = spawn_blackholing_relay(server_addr).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+
+    // #1 proves the tunnel works and marks the session productive.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET /1 HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+
+    hole.trigger();
+    // From here nothing but a timer can make progress, so the clock
+    // auto-advances to the verdict (see `LogWaiter` for why the rendezvous
+    // below must stay in-runtime).
+    tokio::time::pause();
+
+    // Productive before the hole, so failures reset to the floor. `run_client`
+    // emits this before any backoff or reconnect, so nothing else has started.
+    assert_eq!(events.recv().await.unwrap(), (0, true));
+    tokio::time::resume();
+
+    // Naming the mechanism: the fatal line is written by `run_keepalive`, which
+    // returns before `run_client_session` returns and therefore before the event
+    // above — same task, so the ordering is program order, not a race.
+    assert!(
+        writer.contains("transport silent across the keepalive deadline"),
+        "the reconnect must have been caused by the keepalive, not by anything else"
+    );
+
+    shutdown.cancel();
 }
