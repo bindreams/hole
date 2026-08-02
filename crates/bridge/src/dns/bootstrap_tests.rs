@@ -247,7 +247,8 @@ fn handoff_host_v6_is_bracketed_and_parses_with_port() {
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Stand up a loopback rustls DoH server on 127.0.0.1:<ephemeral> that serves
-/// one canned `application/dns-message` reply, returning the server's cert DER
+/// one canned `application/dns-message` reply to EVERY connection (the resolver
+/// loop opens a second one for the AAAA fallback), returning the server's cert DER
 /// (for the client trust root) and the bound port. The cert carries an IP SAN
 /// for 127.0.0.1 because `https_target_for` uses IP-SNI for non-table IPs.
 /// (127.0.0.1, not another 127/8 address: macOS makes only 127.0.0.1 loopback
@@ -277,13 +278,17 @@ async fn spawn_loopback_doh(reply: Vec<u8>) -> (CertificateDer<'static>, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        if let Ok((tcp, _)) = listener.accept().await {
-            if let Ok(mut tls) = acceptor.accept(tcp).await {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let body = reply.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return; // Handshake refused by the client (untrusted chain).
+                };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Drain the POST request (best-effort) then write the HTTP reply.
+                // Drain the POST request (best-effort).
                 let mut buf = [0u8; 4096];
                 let _ = tls.read(&mut buf).await;
-                let body = reply;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -295,10 +300,27 @@ async fn spawn_loopback_doh(reply: Vec<u8>) -> (CertificateDer<'static>, u16) {
                 // `read_to_end` on the client errors on the unclean EOF, as a real
                 // DoH server (which closes cleanly) never would.
                 let _ = tls.shutdown().await;
-            }
+            });
         }
     });
     (cert_der, port)
+}
+
+#[skuld::test]
+async fn loopback_doh_stub_serves_the_aaaa_query_after_the_a_query() {
+    // Second connection for the AAAA fallback: a single-shot stub would fail
+    // that connection at connect and mis-report the cause.
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x35);
+    let (cert_der, port) = spawn_loopback_doh(aaaa_reply_for("proxy.example", v6)).await;
+    let resolver: IpAddr = "127.0.0.1".parse().unwrap();
+    let ip = super::resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        super::test_loopback_querier(cert_der, port),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ip, IpAddr::V6(v6));
 }
 
 #[skuld::test]
