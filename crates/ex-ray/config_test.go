@@ -1,12 +1,14 @@
 package main
 
 import (
+	"flag"
 	"math"
 	"strings"
 	"testing"
 
 	core "github.com/v2fly/v2ray-core/v5"
 	"github.com/v2fly/v2ray-core/v5/app/proxyman"
+	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -352,5 +354,169 @@ func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
 	tc := new(tls.Config)
 	if err := senderSecurity(t, cfg).UnmarshalTo(tc); err != nil {
 		t.Fatalf("quic client security must stay a bare tls.Config: %v", err)
+	}
+}
+
+// withKeepAliveFlag saves the tcp-keepalive global, applies a value, and returns
+// a restore func. Mirrors withFlags/withEchFlags: generateConfig and
+// registerTCPKeepAlive read this package-level pointer, so tests must leave it
+// as they found it rather than writing back an assumed default.
+func withKeepAliveFlag(t *testing.T, v int) func() {
+	t.Helper()
+	orig := *tcpKeepAlive
+	*tcpKeepAlive = v
+	return func() { *tcpKeepAlive = orig }
+}
+
+// outboundSocketConfig returns the SocketConfig generateConfig puts on the
+// client outbound, or nil when there is no outbound sender (server mode).
+func outboundSocketConfig(t *testing.T) *internet.SocketConfig {
+	t.Helper()
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	if cfg.Outbound[0].SenderSettings == nil {
+		return nil
+	}
+	sender := new(proxyman.SenderConfig)
+	if err := cfg.Outbound[0].SenderSettings.UnmarshalTo(sender); err != nil {
+		t.Fatalf("unmarshal sender settings: %v", err)
+	}
+	if sender.StreamSettings == nil {
+		return nil
+	}
+	return sender.StreamSettings.SocketSettings
+}
+
+// inboundSocketConfig returns the SocketConfig on the server-mode inbound
+// receiver. Server mode puts streamConfig there, NOT on an outbound sender, so
+// this is the surface a server-mode keepalive leak would show up on.
+func inboundSocketConfig(t *testing.T) *internet.SocketConfig {
+	t.Helper()
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	receiver := new(proxyman.ReceiverConfig)
+	if err := cfg.Inbound[0].ReceiverSettings.UnmarshalTo(receiver); err != nil {
+		t.Fatalf("unmarshal receiver settings: %v", err)
+	}
+	if receiver.StreamSettings == nil {
+		return nil
+	}
+	return receiver.StreamSettings.SocketSettings
+}
+
+func TestTCPKeepAliveDefaultIsFifteen(t *testing.T) {
+	// flag.Lookup reads the registered default, so this is immune to the other
+	// tests in this binary mutating *tcpKeepAlive.
+	if got := flag.Lookup("tcp-keepalive").DefValue; got != "15" {
+		t.Errorf("tcp-keepalive default = %q, want \"15\"", got)
+	}
+}
+
+func TestTCPKeepAliveParams(t *testing.T) {
+	for _, bad := range []int{-1, 32768} {
+		restore := withKeepAliveFlag(t, bad)
+		_, err := tcpKeepAliveParams()
+		restore()
+		if err == nil {
+			t.Errorf("tcpKeepAliveParams() with %d = nil error, want out-of-range error", bad)
+		}
+	}
+
+	restore := withKeepAliveFlag(t, 0)
+	got, err := tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with 0 returned error: %v", err)
+	}
+	if got.enabled() {
+		t.Errorf("tcpKeepAliveParams() with 0 = %+v, want disabled", got)
+	}
+
+	// The accepted side of the fencepost, so a `>=` typo in the bound check
+	// cannot pass with only the 32768 rejection covered.
+	restore = withKeepAliveFlag(t, keepAliveMaxSeconds)
+	got, err = tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with %d returned error: %v", keepAliveMaxSeconds, err)
+	}
+	if got.IdleSeconds != keepAliveMaxSeconds {
+		t.Errorf("tcpKeepAliveParams() with %d = %+v, want IdleSeconds %d", keepAliveMaxSeconds, got, keepAliveMaxSeconds)
+	}
+
+	restore = withKeepAliveFlag(t, 15)
+	got, err = tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with 15 returned error: %v", err)
+	}
+	if want := (keepAliveParams{IdleSeconds: 15, IntervalSeconds: 15, Probes: 3}); got != want {
+		t.Errorf("tcpKeepAliveParams() = %+v, want %+v", got, want)
+	}
+}
+
+func TestTCPKeepAliveReachesSocketConfig(t *testing.T) {
+	restore := withKeepAliveFlag(t, 15)
+	sock := outboundSocketConfig(t)
+	restore()
+	if sock == nil {
+		t.Fatal("outbound SocketConfig is nil; the keepalive fields must force one to exist")
+	}
+	if sock.TcpKeepAliveIdle != 15 || sock.TcpKeepAliveInterval != 15 {
+		t.Errorf("idle/interval = %d/%d, want 15/15", sock.TcpKeepAliveIdle, sock.TcpKeepAliveInterval)
+	}
+
+	// tcp-keepalive=0 must disable Go's own keepalive too, not merely skip
+	// ex-ray's; see the sentinel comment in config.go for why a negative value
+	// is what does that.
+	restore = withKeepAliveFlag(t, 0)
+	sock = outboundSocketConfig(t)
+	restore()
+	if sock == nil || sock.TcpKeepAliveIdle >= 0 {
+		t.Fatalf("SocketConfig with tcp-keepalive=0 = %+v, want a negative TcpKeepAliveIdle sentinel", sock)
+	}
+}
+
+// Server mode puts streamConfig on the INBOUND receiver, where a keepalive
+// field would strip Go's own keepalive from every accepted connection
+// (DefaultListener sets lc.KeepAlive = -1 and no dialer controller reaches a
+// listener). Asserting on the outbound would be vacuous: server mode builds no
+// outbound sender at all.
+func TestTCPKeepAliveSkippedInServerMode(t *testing.T) {
+	restoreFlags := withFlags(t, 1, 0, true)
+	restoreKA := withKeepAliveFlag(t, 15)
+	sock := inboundSocketConfig(t)
+	regErr := registerTCPKeepAlive()
+	restoreKA()
+	restoreFlags()
+
+	if sock != nil && (sock.TcpKeepAliveIdle != 0 || sock.TcpKeepAliveInterval != 0) {
+		t.Errorf("server mode inbound SocketConfig = %+v, want no keepalive fields", sock)
+	}
+	if regErr != nil {
+		t.Errorf("registerTCPKeepAlive() in server mode = %v, want nil", regErr)
+	}
+}
+
+// registerTCPKeepAlive short-circuits before validating in server mode, so
+// generateConfig is the only gate that rejects an out-of-range value there.
+func TestGenerateConfigRejectsOutOfRangeKeepAlive(t *testing.T) {
+	for _, srv := range []bool{false, true} {
+		restoreFlags := withFlags(t, 1, 0, srv)
+		restoreKA := withKeepAliveFlag(t, 32768)
+		_, err := generateConfig()
+		restoreKA()
+		restoreFlags()
+		if err == nil {
+			t.Errorf("server=%v: generateConfig() with tcp-keepalive=32768 = nil error, want out-of-range error", srv)
+			continue
+		}
+		if !strings.Contains(err.Error(), "tcp-keepalive") {
+			t.Errorf("server=%v: error %q does not mention tcp-keepalive", srv, err.Error())
+		}
 	}
 }

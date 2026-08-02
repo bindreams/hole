@@ -54,6 +54,13 @@ func parseOptsIntoFlags() {
 			logWarn("failed to parse mux, use default value")
 		}
 	}
+	if c, b := opts.Get("tcp-keepalive"); b {
+		if i, err := strconv.Atoi(c); err == nil {
+			*tcpKeepAlive = i
+		} else {
+			logWarn("failed to parse tcp-keepalive, use default value")
+		}
+	}
 	if _, b := opts.Get("tls"); b {
 		*tlsEnabled = true
 	}
@@ -197,6 +204,14 @@ func main() {
 	printCoreVersion()
 
 	parseOptsIntoFlags()
+
+	// Must precede core.New: app/proxyman/outbound reads the registered
+	// controllers when it builds each handler's dialer.
+	if err := registerTCPKeepAlive(); err != nil {
+		emitFatal(err.Error(), nil)
+		logFatal(err.Error())
+		os.Exit(23) // config-class error
+	}
 
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
 	// port-0 / OS-assigned-port contract: v2ray-core does not expose the

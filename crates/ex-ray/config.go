@@ -35,26 +35,27 @@ import (
 )
 
 var (
-	vpn        = flag.Bool("V", false, "Run in VPN mode.")
-	fastOpen   = flag.Bool("fast-open", false, "Enable TCP fast open.")
-	localAddr  = flag.String("localAddr", "127.0.0.1", "local address to listen on.")
-	localPort  = flag.String("localPort", "1984", "local port to listen on.")
-	remoteAddr = flag.String("remoteAddr", "127.0.0.1", "remote address to forward.")
-	remotePort = flag.String("remotePort", "1080", "remote port to forward.")
-	path       = flag.String("path", "/", "URL path for websocket.")
-	host       = flag.String("host", "cloudfront.com", "Hostname for server.")
-	tlsEnabled = flag.Bool("tls", false, "Enable TLS.")
-	cert       = flag.String("cert", "", "Path to TLS certificate file. Overrides certRaw. Default: ~/.acme.sh/{host}/fullchain.cer")
-	certRaw    = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
-	key        = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
-	mode       = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
-	mux        = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
-	server     = flag.Bool("server", false, "Run in server mode")
-	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
-	version    = flag.Bool("version", false, "Show current version of ex-ray")
-	fwmark     = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
-	echMode    = flag.String("ech", "auto", "ECH (Encrypted Client Hello) mode: auto (opportunistic), always (fail-closed), never.")
-	echDoh     = flag.String("ech-doh", "", "DoH URL used to fetch the ECH config (HTTPS record). Empty disables ECH.")
+	vpn          = flag.Bool("V", false, "Run in VPN mode.")
+	fastOpen     = flag.Bool("fast-open", false, "Enable TCP fast open.")
+	localAddr    = flag.String("localAddr", "127.0.0.1", "local address to listen on.")
+	localPort    = flag.String("localPort", "1984", "local port to listen on.")
+	remoteAddr   = flag.String("remoteAddr", "127.0.0.1", "remote address to forward.")
+	remotePort   = flag.String("remotePort", "1080", "remote port to forward.")
+	path         = flag.String("path", "/", "URL path for websocket.")
+	host         = flag.String("host", "cloudfront.com", "Hostname for server.")
+	tlsEnabled   = flag.Bool("tls", false, "Enable TLS.")
+	cert         = flag.String("cert", "", "Path to TLS certificate file. Overrides certRaw. Default: ~/.acme.sh/{host}/fullchain.cer")
+	certRaw      = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
+	key          = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
+	mode         = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
+	mux          = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
+	server       = flag.Bool("server", false, "Run in server mode")
+	logLevel     = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
+	version      = flag.Bool("version", false, "Show current version of ex-ray")
+	fwmark       = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
+	echMode      = flag.String("ech", "auto", "ECH (Encrypted Client Hello) mode: auto (opportunistic), always (fail-closed), never.")
+	echDoh       = flag.String("ech-doh", "", "DoH URL used to fetch the ECH config (HTTPS record). Empty disables ECH.")
+	tcpKeepAlive = flag.Int("tcp-keepalive", 15, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
 )
 
 func homeDir() string {
@@ -114,6 +115,54 @@ func uint32Opt(name string, v int) (uint32, error) {
 		return uint32(v), nil
 	}
 	return 0, newError("invalid", name, "(expected 0..4294967295), got:", v)
+}
+
+const (
+	// keepAliveProbeCount is fixed rather than configurable: the option's one
+	// number is the idle time, and the probe count is what turns it into the
+	// documented detection bound.
+	keepAliveProbeCount = 3
+	// keepAliveMaxSeconds is the range Linux accepts for TCP_KEEPIDLE and
+	// TCP_KEEPINTVL. Rejecting above it turns an operator typo into a startup
+	// config error rather than a swallowed EINVAL on the first dial.
+	keepAliveMaxSeconds = 32767
+)
+
+// tcpKeepAliveParams validates the tcp-keepalive option and expands it into the
+// socket timings. Pure, so generateConfig can call it freely. The bound guard
+// wrapping the conversion is gosec G115's recognized mitigation, as in uint32Opt.
+func tcpKeepAliveParams() (keepAliveParams, error) {
+	v := *tcpKeepAlive
+	if v < 0 || v > keepAliveMaxSeconds {
+		return keepAliveParams{}, newError("invalid tcp-keepalive (expected 0..", keepAliveMaxSeconds, "), got:", v)
+	}
+	idle := int32(v)
+	if idle == 0 {
+		return keepAliveParams{}, nil
+	}
+	return keepAliveParams{IdleSeconds: idle, IntervalSeconds: idle, Probes: keepAliveProbeCount}, nil
+}
+
+// registerTCPKeepAlive must run exactly once, before core.New: it mutates
+// process-global state, and generateConfig deliberately does not call it
+// because RegisterDialerController appends and the tests call generateConfig
+// repeatedly.
+//
+// Server mode is skipped: ex-ray's outbound there dials loopback to ss-server,
+// and a listener is unreachable from a dialer controller anyway.
+func registerTCPKeepAlive() error {
+	if *server {
+		return nil
+	}
+	params, err := tcpKeepAliveParams()
+	if err != nil {
+		return err
+	}
+	ctl := keepAliveDialerController(params)
+	if ctl == nil {
+		return nil
+	}
+	return internet.RegisterDialerController(ctl)
 }
 
 // buildTLSConfig assembles the v2ray tls.Config: SNI stays *host, ECH is armed
@@ -254,13 +303,30 @@ func generateConfig() (*core.Config, error) {
 			Settings:     serial.ToTypedMessage(transportSettings),
 		}},
 	}
-	if *fastOpen || *fwmark != 0 {
+	keepAlive, err := tcpKeepAliveParams()
+	if err != nil {
+		return nil, err
+	}
+	// Client mode only -- server-mode streamConfig lands on the inbound, which
+	// would strip Go's keepalive from every accepted connection.
+	keepAliveWanted := !*server
+	if *fastOpen || *fwmark != 0 || keepAliveWanted {
 		socketConfig := &internet.SocketConfig{}
 		if *fastOpen {
 			socketConfig.Tfo = internet.SocketConfig_Enable
 		}
 		if *fwmark != 0 {
 			socketConfig.Mark = fwmarkU32
+		}
+		if keepAliveWanted {
+			if keepAlive.enabled() {
+				socketConfig.TcpKeepAliveIdle = keepAlive.IdleSeconds
+				socketConfig.TcpKeepAliveInterval = keepAlive.IntervalSeconds
+			} else {
+				// tcp-keepalive=0: a negative idle is the sentinel that
+				// suppresses Go's own keepalive too (see README for why).
+				socketConfig.TcpKeepAliveIdle = -1
+			}
 		}
 
 		streamConfig.SocketSettings = socketConfig
