@@ -451,6 +451,28 @@ jobs:
       - name: Test ex-ray Go (ECH gate)
         run: cargo xtask run ex-ray-tests
 
+  # ex-ray's own Go tests on every OS it ships for. The `test-ex-ray` job above
+  # is linux-only because it also runs upstream v2ray-core suites; this one is
+  # scoped to `crates/ex-ray` so it can go wide cheaply. Without it the
+  # build-tagged per-OS socket code (keepalive_windows.go, keepalive_darwin.go)
+  # would never be compiled, let alone run, in CI.
+  test-ex-ray-platforms:
+    name: Test ex-ray (Go, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Test ex-ray Go
+        shell: bash
+        run: cargo xtask run ex-ray-unit-tests
+
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
