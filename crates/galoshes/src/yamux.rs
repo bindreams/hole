@@ -34,6 +34,10 @@ pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum StreamTag {
     Tcp = 0x01,
     Udp = 0x02,
+    /// Client-opened liveness probe: the client writes `KEEPALIVE_NONCE_LEN`
+    /// bytes and the server echoes them back, for as many rounds as the client
+    /// keeps the substream open.
+    Keepalive = 0x03,
 }
 
 impl StreamTag {
@@ -45,10 +49,14 @@ impl StreamTag {
         match b {
             0x01 => Some(Self::Tcp),
             0x02 => Some(Self::Udp),
+            0x03 => Some(Self::Keepalive),
             _ => None,
         }
     }
 }
+
+/// Payload size of one keepalive probe: a big-endian `u64` nonce.
+pub(crate) const KEEPALIVE_NONCE_LEN: usize = 8;
 
 /// Frame a UDP datagram with a 2-byte big-endian length prefix.
 pub fn frame_udp_datagram(payload: &[u8]) -> Vec<u8> {
@@ -914,7 +922,7 @@ pub(crate) async fn run_server(
 }
 
 /// Handle a single inbound yamux stream: read the tag byte, then relay.
-async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) -> Result<()> {
+pub(crate) async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) -> Result<()> {
     // Read the tag byte.
     let mut tag_buf = [0u8; 1];
     stream.read_exact(&mut tag_buf).await.context("read stream tag")?;
@@ -929,8 +937,24 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
         StreamTag::Udp => {
             relay_udp_server(stream, remote).await?;
         }
+        StreamTag::Keepalive => echo_keepalive(stream).await?,
     }
 
+    Ok(())
+}
+
+/// Echo keepalive nonces back to the client until it drops the substream.
+///
+/// Exactly `KEEPALIVE_NONCE_LEN` bytes are read and written per round — never an
+/// open-ended echo, so a probe substream cannot be used to make the server relay
+/// arbitrary traffic. A read that fails is the ordinary end of the substream
+/// (the client moved on, or the session is over), not a fault.
+async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
+    let mut nonce = [0u8; KEEPALIVE_NONCE_LEN];
+    while stream.read_exact(&mut nonce).await.is_ok() {
+        stream.write_all(&nonce).await.context("write keepalive echo")?;
+        stream.flush().await.context("flush keepalive echo")?;
+    }
     Ok(())
 }
 

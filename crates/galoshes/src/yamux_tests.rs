@@ -40,6 +40,12 @@ fn stream_tag_udp_roundtrip() {
 }
 
 #[skuld::test]
+fn stream_tag_keepalive_roundtrip() {
+    assert_eq!(StreamTag::Keepalive.to_byte(), 0x03);
+    assert_eq!(StreamTag::from_byte(0x03).unwrap(), StreamTag::Keepalive);
+}
+
+#[skuld::test]
 fn stream_tag_invalid() {
     assert!(StreamTag::from_byte(0x00).is_none());
     assert!(StreamTag::from_byte(0xFF).is_none());
@@ -900,6 +906,117 @@ async fn shutdown_during_backoff_exits_promptly() {
     // sleep never elapses and this `await` hangs → framework timeout.
     shutdown.cancel();
     client.await.unwrap().unwrap();
+}
+
+// Keepalive -----------------------------------------------------------------------------------------------------------
+
+/// Open one substream through `open_tx`. Panics if the connection is gone.
+async fn open_test_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> yamux::Stream {
+    let (tx, rx) = oneshot::channel();
+    open_tx.send(tx).await.expect("driver alive");
+    rx.await.expect("open reply").expect("stream opened")
+}
+
+/// Write `payload` to `stream` and read exactly `expect_len` bytes back.
+async fn write_and_read(stream: &mut yamux::Stream, payload: &[u8], expect_len: usize) -> Option<Vec<u8>> {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    stream.write_all(payload).await.ok()?;
+    stream.flush().await.ok()?;
+    let mut echo = vec![0u8; expect_len];
+    stream.read_exact(&mut echo).await.ok().map(|()| echo)
+}
+
+/// A raw yamux client over a real TCP connection, kept alive so a test can send
+/// several substreams — and several messages per substream — down the *same*
+/// session.
+struct RawYamuxClient {
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    _inbound_rx: mpsc::Receiver<yamux::Stream>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl RawYamuxClient {
+    async fn connect(server_addr: SocketAddr) -> Self {
+        let tcp = TcpStream::connect(server_addr).await.expect("connect yamux server");
+        let conn = ::yamux::Connection::new(tcp.compat(), ::yamux::Config::default(), ::yamux::Mode::Client);
+        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<yamux::Stream>(4);
+        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+        Self {
+            open_tx,
+            _inbound_rx,
+            driver,
+        }
+    }
+
+    /// Open a fresh substream and write its leading `tag` byte.
+    async fn open_tagged(&self, tag: u8) -> yamux::Stream {
+        use futures::AsyncWriteExt as _;
+        let mut stream = open_test_stream(&self.open_tx).await;
+        stream.write_all(&[tag]).await.expect("write tag");
+        stream.flush().await.expect("flush tag");
+        stream
+    }
+
+    /// Send `tag` + `payload` on a fresh substream and read `expect_len` bytes
+    /// back. `None` if the peer ended the substream first.
+    async fn exchange(&self, tag: u8, payload: &[u8], expect_len: usize) -> Option<Vec<u8>> {
+        let mut stream = self.open_tagged(tag).await;
+        write_and_read(&mut stream, payload, expect_len).await
+    }
+}
+
+impl Drop for RawYamuxClient {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+#[skuld::test]
+async fn the_server_echoes_every_nonce_on_one_keepalive_substream() {
+    // The client holds a single keepalive substream for the whole session, so
+    // the server must keep echoing on it rather than answering once and closing.
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let client = RawYamuxClient::connect(server_addr).await;
+    let mut probe = client.open_tagged(0x03).await;
+    for nonce in [1u64, 2, 3] {
+        assert_eq!(
+            write_and_read(&mut probe, &nonce.to_be_bytes(), 8).await,
+            Some(nonce.to_be_bytes().to_vec()),
+            "nonce {nonce} must come back verbatim on the same substream"
+        );
+    }
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
+    // The compatibility property in mirror image, asserted on the SAME session:
+    // the server rejects the substream and keeps serving the connection. This is
+    // exactly what an un-upgraded server does to a keepalive probe.
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let client = RawYamuxClient::connect(server_addr).await;
+    assert_eq!(
+        client.exchange(0x7F, b"whatever", 1).await,
+        None,
+        "unknown tag rejected"
+    );
+    assert_eq!(
+        client
+            .exchange(0x01, b"GET / HTTP/1.0\r\n\r\n", HTTP_RESPONSE.len())
+            .await,
+        Some(HTTP_RESPONSE.to_vec()),
+        "the session must survive a rejected substream"
+    );
+
+    shutdown.cancel();
 }
 
 #[skuld::test]
