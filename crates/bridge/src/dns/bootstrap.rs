@@ -230,14 +230,18 @@ pub async fn resolve_via_doh_with(
     for &server in &dns.servers {
         match querier.query(server, &a_query).await {
             Ok(reply) => match parse_addrs(&reply) {
-                Some(addrs) => match addrs.into_iter().find(IpAddr::is_ipv4) {
-                    Some(ip) => return Ok(ip), // IPv4 preferred for bypass-route compatibility.
-                    // Silent: an A query with no IPv4 is ordinary for an
-                    // AAAA-only host, and the AAAA query below may still
-                    // succeed. The tail logs once, only if the whole resolve
-                    // fails.
-                    None => fold_worst(&mut worst, BootstrapError::NoAnswer),
-                },
+                // An A reply with no IPv4 folds NOTHING: it is ordinary for an
+                // AAAA-only host and says nothing about whether the address
+                // exists — only the AAAA leg below can conclude that. Folding
+                // `NoAnswer` here would outrank a real
+                // Transport/Timeout/Unreachable finding from the AAAA leg or a
+                // later resolver (see `rank`), reporting a hostname problem
+                // for a network fault.
+                Some(addrs) => {
+                    if let Some(ip) = addrs.into_iter().find(IpAddr::is_ipv4) {
+                        return Ok(ip); // IPv4 preferred for bypass-route compatibility.
+                    }
+                }
                 None => fold_worst(&mut worst, note_unparseable_reply(server, RecordType::A, reply.len())),
             },
             Err(cause) => fold_worst(&mut worst, classify(cause)),

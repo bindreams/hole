@@ -710,7 +710,7 @@ fn run_test_fails_closed_when_doh_cannot_resolve() {
         let outcome = run_server_test(&entry, &cfg).await;
         assert!(
             matches!(outcome, ServerTestOutcome::DnsFailed),
-            "fail-closed DoH no-answer must be DnsFailed, got {outcome:?}"
+            "fail-closed DoH unreachable-resolver must be DnsFailed, got {outcome:?}"
         );
     });
 }

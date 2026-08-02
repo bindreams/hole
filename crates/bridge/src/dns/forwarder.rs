@@ -294,8 +294,18 @@ fn is_trust_chain_rejection(e: &rustls::Error) -> bool {
                 | rustls::CertificateError::Revoked
                 | rustls::CertificateError::UnknownRevocationStatus
         ),
-        // A CRL we could not verify is a trust-material failure in its own right.
-        rustls::Error::InvalidCertRevocationList(_) => true,
+        // Same discipline for revocation material: only a CRL whose trust
+        // fails, not one we merely could not parse or whose algorithm/version
+        // this client does not implement — those are the resolver's problem or
+        // ours, not an interceptor's. (Unreachable today: `build_tls_config`
+        // configures no CRLs, so rustls never checks revocation.)
+        rustls::Error::InvalidCertRevocationList(c) => matches!(
+            c,
+            rustls::CertRevocationListError::BadSignature
+                | rustls::CertRevocationListError::IssuerInvalidForCrl
+                | rustls::CertRevocationListError::InvalidCrlNumber
+                | rustls::CertRevocationListError::InvalidRevokedCertSerialNumber
+        ),
         _ => false,
     }
 }

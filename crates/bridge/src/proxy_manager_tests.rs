@@ -1892,7 +1892,7 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 
 #[skuld::test]
 fn full_start_fails_closed_when_doh_cannot_resolve() {
-    // A stub that answers nothing → NoAnswer → DohBootstrap, hermetic (no
+    // A stub that never answers → Unreachable → DohBootstrap, hermetic (no
     // system DNS or network).
     use crate::dns::forwarder::UpstreamCause;
     struct NeverQuerier;

@@ -469,6 +469,8 @@ fn cause_of_tls_layer_with_a_trust_chain_rejection_is_certificate_rejected() {
     for rustls_err in [
         rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
         rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownRevocationStatus),
         rustls::Error::InvalidCertRevocationList(rustls::CertRevocationListError::BadSignature),
     ] {
         let e = UpstreamErr::new(

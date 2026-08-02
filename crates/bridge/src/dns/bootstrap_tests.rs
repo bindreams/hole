@@ -272,6 +272,38 @@ async fn resolve_does_not_mask_an_answering_resolver_with_another_resolvers_fail
 }
 
 #[skuld::test]
+async fn an_a_query_without_ipv4_does_not_mask_a_transport_failure() {
+    // Ordinary dual-stack shape: the A leg parses with no IPv4 (an AAAA-only
+    // host), then the AAAA leg fails at the transport. The A leg concluded
+    // nothing about whether the address exists, so the transport finding must
+    // survive — reporting "could not resolve … via secure DNS" here would hand
+    // the user a hostname diagnosis for a network fault.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    struct AEmptyThenTimeout;
+    #[async_trait]
+    impl DohQuerier for AEmptyThenTimeout {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            let q = Message::from_vec(wire).unwrap();
+            if q.queries[0].query_type() == RecordType::A {
+                // Parses, NOERROR, zero answers.
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(q.queries[0].clone());
+                return Ok(reply.to_vec().unwrap());
+            }
+            Err(UpstreamCause::Timeout)
+        }
+    }
+    let err = resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        Arc::new(AEmptyThenTimeout),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, BootstrapError::Timeout);
+}
+
+#[skuld::test]
 async fn resolve_reports_certificate_rejection_over_a_weaker_failure_from_another_resolver() {
     let intercepted: IpAddr = "1.1.1.1".parse().unwrap();
     let unreachable: IpAddr = "9.9.9.9".parse().unwrap();
