@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 // `Context` alone would collide with `anyhow::Context` (the `.context()` combinator, used
 // throughout this file); the tap's poll methods spell out `std::task::Context` instead.
@@ -294,23 +294,23 @@ async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Resul
 
 // Liveness tap ========================================================================================================
 
-/// Wraps the yamux transport and sets `productive` on the first inbound byte.
+/// The file's single transport-liveness signal. It sits *below* yamux framing,
+/// so any inbound frame counts — relayed data, a flow-control window update, a
+/// yamux pong, or a peer's stream reset alike. That is deliberate: it measures
+/// *transport*-level liveness (the far yamux peer responded), which is the right
+/// signal both for the reconnect backoff and for the keepalive's fatal decision,
+/// neither of which is about application relay.
 ///
-/// `run_client` gives this to `yamux::Connection::new`, so the tap is polled only
-/// by the driver task; reading `productive` after `driver.await` therefore has a
-/// happens-before edge to every write here (no cross-task race). It sits *below*
-/// yamux framing, so any inbound frame counts — relayed data or flow-control /
-/// keepalive frames alike. That is deliberate: it measures *transport*-level
-/// liveness (the far yamux peer responded), which is the correct signal for a
-/// transport reconnect, not end-to-end application relay.
+/// `Relaxed` is sufficient: two samples of a monotonic counter are compared for
+/// inequality and no other memory is published through it.
 pub(crate) struct TransportLivenessTap<T> {
     inner: T,
-    productive: Arc<AtomicBool>,
+    inbound_reads: Arc<AtomicU64>,
 }
 
 impl<T> TransportLivenessTap<T> {
-    pub(crate) fn new(inner: T, productive: Arc<AtomicBool>) -> Self {
-        Self { inner, productive }
+    pub(crate) fn new(inner: T, inbound_reads: Arc<AtomicU64>) -> Self {
+        Self { inner, inbound_reads }
     }
 }
 
@@ -324,7 +324,7 @@ impl<T: futures::AsyncRead + Unpin> futures::AsyncRead for TransportLivenessTap<
         let r = Pin::new(&mut me.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(n)) = &r {
             if *n > 0 {
-                me.productive.store(true, Ordering::Relaxed);
+                me.inbound_reads.fetch_add(1, Ordering::Relaxed);
             }
         }
         r
@@ -784,11 +784,11 @@ pub(crate) async fn run_client(
 
         tracing::info!(remote = %remote, "connected to yamux server");
 
-        // Tap the transport for inbound liveness. The tap is owned by the driver
-        // (inside the Connection), so reading `productive` after `driver.await`
-        // is race-free.
-        let productive = Arc::new(AtomicBool::new(false));
-        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&productive));
+        // Tap the transport for inbound liveness. The counter is shared with the
+        // driver task and with the session's keepalive, and is only ever compared
+        // between two samples.
+        let inbound_reads = Arc::new(AtomicU64::new(0));
+        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&inbound_reads));
         let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
 
         let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
@@ -821,7 +821,7 @@ pub(crate) async fn run_client(
         match outcome {
             SessionOutcome::Shutdown => return Ok(()),
             SessionOutcome::TransportDied => {
-                let was_productive = productive.load(Ordering::Relaxed);
+                let was_productive = inbound_reads.load(Ordering::Relaxed) > 0;
                 failures = next_failures(failures, was_productive);
                 tracing::warn!(
                     failures,
