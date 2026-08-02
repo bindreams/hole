@@ -96,12 +96,27 @@ async fn start_tcp_stub(reply: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<
     (addr, h)
 }
 
-/// A closed listener, pre-computed so the connect attempt fails.
-async fn unused_tcp_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+/// A TCP port held by a bound-but-never-listened socket: every connect to it is
+/// refused, and no concurrently-running test can bind it away. The returned
+/// socket must stay alive for the reservation to hold.
+fn refused_tcp_port() -> (socket2::Socket, SocketAddr) {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    sock.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+    let addr = sock.local_addr().unwrap().as_socket().unwrap();
+    // No `listen()`: the stack RSTs incoming SYNs instead of queueing them.
+    (sock, addr)
+}
+
+#[skuld::test]
+async fn refused_tcp_port_is_refused_and_not_rebindable() {
+    let (_held, addr) = refused_tcp_port();
+    let err = tokio::net::TcpStream::connect(addr).await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(
+        TcpListener::bind(addr).await.is_err(),
+        "the held socket must keep the port un-bindable"
+    );
 }
 
 fn build_cfg(protocol: DnsProtocol, servers: Vec<IpAddr>) -> DnsConfig {
@@ -267,7 +282,7 @@ async fn duplicate_server_in_list_creates_one_throttle_entry() {
     // Two identical dead addresses share one per-IP throttle entry; a
     // single failure burst against the same server doesn't duplicate
     // state across the map.
-    let dead_addr = unused_tcp_port().await;
+    let (_held, dead_addr) = refused_tcp_port();
     let fwd = DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), dead_addr.ip()]),
         Arc::new(DirectConnector),
@@ -290,7 +305,7 @@ async fn throttle_logs_first_n_then_suppresses() {
     // Pins the per-server log throttle: the first LOG_FULL_LIMIT=3
     // failures log in full, subsequent ones are counted as suppressed
     // (never silently dedup-forever).
-    let dead_addr = unused_tcp_port().await;
+    let (_held, dead_addr) = refused_tcp_port();
     let fwd = DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip()]),
         Arc::new(DirectConnector),
@@ -622,7 +637,7 @@ mod typed_error_logs {
         );
         let _guard = set_default_in_current_thread(subscriber);
 
-        let dead = unused_tcp_port().await;
+        let (_held, dead) = refused_tcp_port();
         let fwd = DnsForwarder::new(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
             Arc::new(DirectConnector),
@@ -656,7 +671,7 @@ mod typed_error_logs {
         );
         let _guard = set_default_in_current_thread(subscriber);
 
-        let dead = unused_tcp_port().await;
+        let (_held, dead) = refused_tcp_port();
         let fwd = DnsForwarder::new(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
             Arc::new(DirectConnector),
