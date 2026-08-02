@@ -299,3 +299,20 @@ fn capture_windows_tcp_state(port: u16) {
         Err(e) => eprintln!("[wait_for_port] UDP probe: bind 127.0.0.1:0 failed: {e}"),
     }
 }
+
+/// A TCP port held by a bound-but-never-listened socket: every connect to it is
+/// refused, and no concurrently-running test can bind it away. The returned
+/// socket must stay alive for the reservation to hold.
+///
+/// Preferred over bind-then-drop wherever a test asserts an EXACT failure cause:
+/// a released ephemeral port can be re-bound by a concurrent test, turning the
+/// expected `ConnectionRefused` into a successful connect.
+pub(crate) fn refused_tcp_port() -> (socket2::Socket, std::net::SocketAddr) {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    sock.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let addr = sock.local_addr().unwrap().as_socket().unwrap();
+    // No `listen()`: the stack RSTs incoming SYNs instead of queueing them.
+    (sock, addr)
+}

@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use super::*;
 use crate::dns::connector::DirectConnector;
+use crate::test_support::port_alloc::refused_tcp_port;
 
 // Helpers =============================================================================================================
 
@@ -94,18 +95,6 @@ async fn start_tcp_stub(reply: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<
         let _ = stream.write_all(&reply).await;
     });
     (addr, h)
-}
-
-/// A TCP port held by a bound-but-never-listened socket: every connect to it is
-/// refused, and no concurrently-running test can bind it away. The returned
-/// socket must stay alive for the reservation to hold.
-fn refused_tcp_port() -> (socket2::Socket, SocketAddr) {
-    use socket2::{Domain, Socket, Type};
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    sock.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
-    let addr = sock.local_addr().unwrap().as_socket().unwrap();
-    // No `listen()`: the stack RSTs incoming SYNs instead of queueing them.
-    (sock, addr)
 }
 
 #[skuld::test]
@@ -490,6 +479,9 @@ fn cause_of_a_non_trust_certificate_complaint_is_not_certificate_rejected() {
     // clock, and would tell them switching resolvers cannot help when it is in
     // fact the fix.
     for rustls_err in [
+        // A CRL we merely could not parse is a fault in material we supply, not
+        // an interceptor's doing — it must not inherit the interception claim.
+        rustls::Error::InvalidCertRevocationList(rustls::CertRevocationListError::ParseError),
         rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
         rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
         rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet),

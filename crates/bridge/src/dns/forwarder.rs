@@ -294,18 +294,15 @@ fn is_trust_chain_rejection(e: &rustls::Error) -> bool {
                 | rustls::CertificateError::Revoked
                 | rustls::CertificateError::UnknownRevocationStatus
         ),
-        // Same discipline for revocation material: only a CRL whose trust
-        // fails, not one we merely could not parse or whose algorithm/version
-        // this client does not implement — those are the resolver's problem or
-        // ours, not an interceptor's. (Unreachable today: `build_tls_config`
-        // configures no CRLs, so rustls never checks revocation.)
-        rustls::Error::InvalidCertRevocationList(c) => matches!(
-            c,
-            rustls::CertRevocationListError::BadSignature
-                | rustls::CertRevocationListError::IssuerInvalidForCrl
-                | rustls::CertRevocationListError::InvalidCrlNumber
-                | rustls::CertRevocationListError::InvalidRevokedCertSerialNumber
-        ),
+        // Same discipline for revocation material, and only `BadSignature`
+        // qualifies: a malformed CRL number, a bad revoked-serial or a CA
+        // missing cRLSign are content/config faults in material WE supply —
+        // rustls never fetches CRLs from the network, so no interceptor can
+        // cause them. (Unreachable today: `build_tls_config` configures no
+        // CRLs, so rustls never checks revocation at all.)
+        rustls::Error::InvalidCertRevocationList(c) => {
+            matches!(c, rustls::CertRevocationListError::BadSignature)
+        }
         _ => false,
     }
 }

@@ -50,9 +50,29 @@ fn parse_addrs_extracts_a_and_aaaa_records() {
     msg.add_answer(Record::from_rdata(name, 60, RData::AAAA(AAAA(v6))));
     let bytes = msg.to_vec().unwrap();
 
-    let addrs = parse_addrs(&bytes).unwrap();
-    assert!(addrs.contains(&IpAddr::V4(v4)));
-    assert!(addrs.contains(&IpAddr::V6(v6)));
+    let parsed = parse_addrs(&bytes).unwrap();
+    assert!(parsed.addrs.contains(&IpAddr::V4(v4)));
+    assert!(parsed.addrs.contains(&IpAddr::V6(v6)));
+    assert!(!parsed.name_missing, "NOERROR is not NXDOMAIN");
+}
+
+#[skuld::test]
+fn parse_addrs_reports_nxdomain_separately_from_an_empty_answer() {
+    // NXDOMAIN is a verdict on the NAME; an empty NOERROR speaks only for the
+    // record type queried. The resolve loop folds NoAnswer on the former from
+    // either leg, but on the latter only when both legs answered.
+    let name = Name::from_ascii("proxy.example.").unwrap();
+    let mut empty = Message::new(0, MessageType::Response, OpCode::Query);
+    empty.metadata.response_code = ResponseCode::NoError;
+    empty.add_query(Query::query(name.clone(), RecordType::A));
+    let parsed = parse_addrs(&empty.to_vec().unwrap()).unwrap();
+    assert!(parsed.addrs.is_empty());
+    assert!(!parsed.name_missing);
+
+    let mut nx = Message::new(0, MessageType::Response, OpCode::Query);
+    nx.metadata.response_code = ResponseCode::NXDomain;
+    nx.add_query(Query::query(name, RecordType::A));
+    assert!(parse_addrs(&nx.to_vec().unwrap()).unwrap().name_missing);
 }
 
 #[skuld::test]
@@ -75,6 +95,7 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use super::{resolve_via_doh_with, DohQuerier};
 use crate::dns::forwarder::UpstreamCause;
+use crate::test_support::port_alloc::refused_tcp_port;
 
 /// In-test querier: answers ONLY for resolver IPs it was given a canned reply
 /// for; returns `None` otherwise (models "this resolver unreachable"). Records
@@ -301,6 +322,65 @@ async fn an_a_query_without_ipv4_does_not_mask_a_transport_failure() {
     .await
     .unwrap_err();
     assert_eq!(err, BootstrapError::Timeout);
+}
+
+#[skuld::test]
+async fn an_aaaa_query_without_ipv6_does_not_mask_a_transport_failure() {
+    // The mirror, and the commoner shape: an IPv4-only host makes the AAAA leg
+    // answer emptily. With the A leg failed at the transport, that emptiness
+    // concludes nothing about the hostname, so the transport finding survives.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    struct ATimeoutThenAaaaEmpty;
+    #[async_trait]
+    impl DohQuerier for ATimeoutThenAaaaEmpty {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            let q = Message::from_vec(wire).unwrap();
+            if q.queries[0].query_type() == RecordType::A {
+                return Err(UpstreamCause::Timeout);
+            }
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(q.queries[0].clone());
+            Ok(reply.to_vec().unwrap())
+        }
+    }
+    let err = resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        Arc::new(ATimeoutThenAaaaEmpty),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, BootstrapError::Timeout);
+}
+
+#[skuld::test]
+async fn an_nxdomain_from_one_leg_reports_no_answer() {
+    // NXDOMAIN is conclusive about the NAME, so it folds even though only one
+    // leg answered — the actionable finding (fix the hostname) must not be
+    // displaced by the other leg's transient network failure.
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    struct ANxdomainThenTimeout;
+    #[async_trait]
+    impl DohQuerier for ANxdomainThenTimeout {
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            let q = Message::from_vec(wire).unwrap();
+            if q.queries[0].query_type() == RecordType::A {
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.metadata.response_code = ResponseCode::NXDomain;
+                reply.add_query(q.queries[0].clone());
+                return Ok(reply.to_vec().unwrap());
+            }
+            Err(UpstreamCause::Timeout)
+        }
+    }
+    let err = resolve_via_doh_with(
+        "proxy.example",
+        &cfg(vec![resolver], false),
+        Arc::new(ANxdomainThenTimeout),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, BootstrapError::NoAnswer);
 }
 
 #[skuld::test]
@@ -631,17 +711,6 @@ async fn spawn_loopback_doh(reply: Vec<u8>) -> (CertificateDer<'static>, u16) {
         }
     });
     (cert_der, port)
-}
-
-/// A TCP port held by a bound-but-never-listened socket — see the twin in
-/// `forwarder_tests.rs`. The returned socket must stay alive.
-fn refused_tcp_port() -> (socket2::Socket, std::net::SocketAddr) {
-    use socket2::{Domain, Socket, Type};
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    sock.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .unwrap();
-    let addr = sock.local_addr().unwrap().as_socket().unwrap();
-    (sock, addr)
 }
 
 #[skuld::test]

@@ -59,6 +59,11 @@ impl BootstrapError {
     /// keep the first observed. A resolver that ANSWERED outranks one that
     /// failed to connect: an answer is evidence about the hostname, a failed
     /// connect is only evidence about that one resolver.
+    ///
+    /// `CertificateRejected` is the deliberate exception: nothing was answered,
+    /// yet it names a third party on the path rather than describing our own
+    /// reach, so it outranks every answered outcome. Do not "correct" it down
+    /// to match the rule above — that would delete the interception signal.
     pub(crate) fn rank(self) -> u8 {
         match self {
             Self::InvalidName => 7, // Short-circuits before the loop; never folded.
@@ -94,8 +99,9 @@ fn fold_worst(worst: &mut Option<BootstrapError>, e: BootstrapError) {
 /// happens, even if a later query rescues the resolve — deliberately unlike the
 /// answered-but-empty case, which is deferred to the failure tail: an empty
 /// answer is ordinary, a non-DNS body is evidence of something rewriting the
-/// response and is worth recording either way. The `Err` paths are already
-/// logged in full by `DnsForwarder`; this one it counts as a success.
+/// response and is worth recording either way. `DnsForwarder` already logs its
+/// `Err` paths in full; this reply arrives on its `Ok` path, so nothing else
+/// records it.
 /// Hostname-free — the resolver IP is config, the hostname is not.
 fn note_unparseable_reply(server: IpAddr, rtype: RecordType, len: usize) -> BootstrapError {
     tracing::warn!(%server, ?rtype, reply_len = len, "DoH bootstrap: resolver reply is not parseable DNS");
@@ -121,14 +127,29 @@ fn build_query(name: &str, tx_id: u16, rtype: RecordType) -> Result<Vec<u8>, Boo
     msg.to_vec().map_err(|_| BootstrapError::InvalidName)
 }
 
-/// Extract every A / AAAA address from a wire-format DNS reply. `None` when the
-/// bytes do not parse as DNS at all — a resolver answering non-DNS is a finding
-/// of its own, not the same as an answerless reply, which is `Some(vec![])`.
-pub fn parse_addrs(reply: &[u8]) -> Option<Vec<IpAddr>> {
+/// A resolver's parsed reply.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DnsReply {
+    /// Every A / AAAA address the answer section carried.
+    pub addrs: Vec<IpAddr>,
+    /// The resolver said the name does not exist AT ALL (NXDOMAIN) — a verdict
+    /// about the hostname itself. An empty NOERROR answer is not this: it
+    /// speaks only for the record type queried, so an A query returning it
+    /// tells us nothing about whether an AAAA exists.
+    pub name_missing: bool,
+}
+
+/// Parse a wire-format DNS reply. `None` when the bytes do not parse as DNS at
+/// all — a resolver answering non-DNS is a finding of its own, not the same as
+/// an answerless reply.
+pub fn parse_addrs(reply: &[u8]) -> Option<DnsReply> {
     let msg = Message::from_vec(reply).ok()?;
-    // `record.data` is the pub RData field; `RData::ip_addr()` yields
-    // Some(IpAddr) for A/AAAA, None otherwise — no variant match needed.
-    Some(msg.answers.iter().filter_map(|rec| rec.data.ip_addr()).collect())
+    Some(DnsReply {
+        // `record.data` is the pub RData field; `RData::ip_addr()` yields
+        // Some(IpAddr) for A/AAAA, None otherwise — no variant match needed.
+        addrs: msg.answers.iter().filter_map(|rec| rec.data.ip_addr()).collect(),
+        name_missing: msg.response_code == hickory_proto::op::ResponseCode::NXDomain,
+    })
 }
 
 // Resolver ============================================================================================================
@@ -228,18 +249,24 @@ pub async fn resolve_via_doh_with(
     let mut v6_fallback: Option<IpAddr> = None;
     let mut worst: Option<BootstrapError> = None;
     for &server in &dns.servers {
+        // `NoAnswer` means "this hostname has no address", which only a reply
+        // can establish. One leg answering emptily does NOT establish it: an
+        // empty A reply is ordinary for an AAAA-only host and vice versa. So
+        // fold `NoAnswer` only when the resolver said NXDOMAIN (a verdict on
+        // the name itself) or when BOTH legs answered and neither carried an
+        // address. Folding it on a single empty leg would outrank a real
+        // Transport/Timeout/Unreachable finding from the other leg (see
+        // `rank`) and report a hostname problem for a network fault.
+        let mut a_answered = false;
         match querier.query(server, &a_query).await {
             Ok(reply) => match parse_addrs(&reply) {
-                // An A reply with no IPv4 folds NOTHING: it is ordinary for an
-                // AAAA-only host and says nothing about whether the address
-                // exists — only the AAAA leg below can conclude that. Folding
-                // `NoAnswer` here would outrank a real
-                // Transport/Timeout/Unreachable finding from the AAAA leg or a
-                // later resolver (see `rank`), reporting a hostname problem
-                // for a network fault.
-                Some(addrs) => {
-                    if let Some(ip) = addrs.into_iter().find(IpAddr::is_ipv4) {
+                Some(parsed) => {
+                    if let Some(ip) = parsed.addrs.iter().copied().find(IpAddr::is_ipv4) {
                         return Ok(ip); // IPv4 preferred for bypass-route compatibility.
+                    }
+                    a_answered = true;
+                    if parsed.name_missing {
+                        fold_worst(&mut worst, BootstrapError::NoAnswer);
                     }
                 }
                 None => fold_worst(&mut worst, note_unparseable_reply(server, RecordType::A, reply.len())),
@@ -249,9 +276,9 @@ pub async fn resolve_via_doh_with(
         if v6_fallback.is_none() {
             match querier.query(server, &aaaa_query).await {
                 Ok(reply) => match parse_addrs(&reply) {
-                    Some(addrs) => {
-                        v6_fallback = addrs.into_iter().find(IpAddr::is_ipv6);
-                        if v6_fallback.is_none() {
+                    Some(parsed) => {
+                        v6_fallback = parsed.addrs.iter().copied().find(IpAddr::is_ipv6);
+                        if v6_fallback.is_none() && (a_answered || parsed.name_missing) {
                             fold_worst(&mut worst, BootstrapError::NoAnswer);
                         }
                     }
