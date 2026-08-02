@@ -70,6 +70,76 @@ impl std::fmt::Display for UpstreamLayer {
     }
 }
 
+/// Coarse, `Copy` classification of an upstream failure. `UpstreamErr` owns an
+/// `io::Error` and is neither `Clone` nor `Eq`, so this is what travels out of
+/// the forwarder into a comparable error enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamCause {
+    /// Connect never completed — refused, unreachable, or a SOCKS5 failure.
+    Unreachable,
+    /// The peer's certificate chain did not verify against our trust roots.
+    CertificateRejected,
+    /// TLS failed for a non-certificate reason: unclean EOF, fatal alert,
+    /// version or cipher mismatch.
+    TlsFailed,
+    /// The DoH response was non-200, malformed, or truncated.
+    BadResponse,
+    /// Post-handshake read/write failure on the upstream stream.
+    Io,
+    /// The per-upstream budget fired before the attempt completed.
+    Timeout,
+}
+
+impl UpstreamCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::CertificateRejected => "certificate-rejected",
+            Self::TlsFailed => "tls-failed",
+            Self::BadResponse => "bad-response",
+            Self::Io => "io",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// Report priority when several upstreams fail differently — highest wins,
+    /// ties keep the first observed. Ordered by how much each cause tells the
+    /// user: a rejected certificate names a third party on the path, a failed
+    /// connect says only that the path is broken.
+    ///
+    /// A contract that outlives any single caller: `rank` decides how several
+    /// upstream failures fold into one, independent of how many servers a
+    /// given caller passes.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::CertificateRejected => 5,
+            Self::TlsFailed => 4,
+            Self::BadResponse => 3,
+            Self::Io => 2,
+            Self::Timeout => 1,
+            Self::Unreachable => 0,
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why [`DnsForwarder::try_forward`] produced no reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardFailure {
+    /// The query is shorter than the 12-byte DNS header — a caller bug.
+    MalformedQuery,
+    /// Nothing was attempted: no servers configured, or every configured
+    /// server was skipped (IPv6 with no IPv6 bypass).
+    NoUpstream,
+    /// Every attempted upstream failed; carries the highest-ranked cause.
+    Upstream(UpstreamCause),
+}
+
 /// Tagged upstream failure: `{ layer, source, elapsed_ms }` plus optional
 /// diagnostic context captured at the point of failure. `io::Error` is
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
@@ -132,6 +202,24 @@ impl UpstreamErr {
         self.tcp_wrote = Some(c.written());
         self
     }
+
+    /// Classify this failure for reporting. Only the `Tls` layer needs the
+    /// error chain — it splits on whether `first_rustls_error` found an
+    /// `InvalidCertificate` / `InvalidCertRevocationList` rustls error.
+    pub fn cause(&self) -> UpstreamCause {
+        match self.layer {
+            UpstreamLayer::Connect => UpstreamCause::Unreachable,
+            UpstreamLayer::Timeout => UpstreamCause::Timeout,
+            UpstreamLayer::Http => UpstreamCause::BadResponse,
+            UpstreamLayer::Io => UpstreamCause::Io,
+            UpstreamLayer::Tls => match first_rustls_error(&self.source) {
+                Some(rustls::Error::InvalidCertificate(_) | rustls::Error::InvalidCertRevocationList(_)) => {
+                    UpstreamCause::CertificateRejected
+                }
+                _ => UpstreamCause::TlsFailed,
+            },
+        }
+    }
 }
 
 /// Walk `std::error::Error::source()` and join the chain with ` -> `.
@@ -165,6 +253,27 @@ fn first_os_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
             if let Some(errno) = io_err.raw_os_error() {
                 return Some(errno);
             }
+            if let Some(inner) = io_err.get_ref() {
+                current = Some(inner);
+                continue;
+            }
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// Walk the chain for a `rustls::Error`. tokio-rustls reports a verification
+/// failure as `io::Error::new(InvalidData, rustls::Error)`, so the rustls error
+/// hangs off `io::Error::get_ref()` — `io::Error::source()` skips the wrapper
+/// and would hide it. Same descent as [`first_os_errno`].
+fn first_rustls_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(r) = err.downcast_ref::<rustls::Error>() {
+            return Some(r);
+        }
+        if let Some(io_err) = err.downcast_ref::<io::Error>() {
             if let Some(inner) = io_err.get_ref() {
                 current = Some(inner);
                 continue;
@@ -402,6 +511,7 @@ impl DnsForwarder {
                     %server,
                     protocol = ?self.config.protocol,
                     layer = %e.layer,
+                    cause = %e.cause(),
                     elapsed_ms = e.elapsed_ms,
                     budget_ms = UPSTREAM_TIMEOUT.as_millis() as u64,
                     socks5_ms = ?e.socks5_ms,

@@ -327,6 +327,87 @@ fn first_os_errno_returns_none_for_pure_custom_error() {
     assert_eq!(first_os_errno(&e), None);
 }
 
+// Rustls-error extraction + cause classification ======================================================================
+
+#[skuld::test]
+fn first_rustls_error_found_through_tokio_rustls_wrapper() {
+    // tokio-rustls's exact wrap shape — see first_rustls_error's doc.
+    let inner = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+    let outer = io::Error::new(io::ErrorKind::InvalidData, inner.clone());
+    assert_eq!(first_rustls_error(&outer), Some(&inner));
+}
+
+#[skuld::test]
+fn first_rustls_error_is_none_for_plain_socket_error() {
+    let e = io::Error::from_raw_os_error(10054); // WSAECONNRESET
+    assert_eq!(first_rustls_error(&e), None);
+}
+
+#[skuld::test]
+fn cause_of_tls_layer_with_cert_error_is_certificate_rejected() {
+    // Both trust-rejection families, not just the UnknownIssuer one.
+    for rustls_err in [
+        rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        rustls::Error::InvalidCertRevocationList(rustls::CertRevocationListError::BadSignature),
+    ] {
+        let e = UpstreamErr::new(
+            UpstreamLayer::Tls,
+            io::Error::new(io::ErrorKind::InvalidData, rustls_err.clone()),
+        );
+        assert_eq!(e.cause(), UpstreamCause::CertificateRejected, "{rustls_err:?}");
+    }
+}
+
+#[skuld::test]
+fn cause_of_tls_layer_without_cert_error_is_tls_failed() {
+    // tokio-rustls's unclean-EOF shape: a Custom error carrying no rustls error.
+    let e = UpstreamErr::new(
+        UpstreamLayer::Tls,
+        io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof"),
+    );
+    assert_eq!(e.cause(), UpstreamCause::TlsFailed);
+}
+
+#[skuld::test]
+fn cause_of_non_tls_layers_follows_the_layer_tag() {
+    let refused = UpstreamErr::new(
+        UpstreamLayer::Connect,
+        io::Error::from(io::ErrorKind::ConnectionRefused),
+    );
+    assert_eq!(refused.cause(), UpstreamCause::Unreachable);
+    let timed_out = UpstreamErr::new(
+        UpstreamLayer::Timeout,
+        io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+    );
+    assert_eq!(timed_out.cause(), UpstreamCause::Timeout);
+    let http = UpstreamErr::new(UpstreamLayer::Http, io::Error::other("non-200 DoH response"));
+    assert_eq!(http.cause(), UpstreamCause::BadResponse);
+    let io_err = UpstreamErr::new(UpstreamLayer::Io, io::Error::from(io::ErrorKind::BrokenPipe));
+    assert_eq!(io_err.cause(), UpstreamCause::Io);
+}
+
+#[skuld::test]
+fn upstream_cause_ranking_is_total_and_ordered() {
+    // Pins the total order `rank` promises across every UpstreamCause variant.
+    let order = [
+        UpstreamCause::Unreachable,
+        UpstreamCause::Timeout,
+        UpstreamCause::Io,
+        UpstreamCause::BadResponse,
+        UpstreamCause::TlsFailed,
+        UpstreamCause::CertificateRejected,
+    ];
+    for pair in order.windows(2) {
+        assert!(
+            pair[1].rank() > pair[0].rank(),
+            "{:?} must outrank {:?}",
+            pair[1],
+            pair[0]
+        );
+    }
+}
+
 // Short-query safety ==================================================================================================
 
 #[skuld::test]
