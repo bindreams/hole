@@ -891,6 +891,11 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// the relation is pinned here rather than imported.
 const _: () = assert!(KEEPALIVE_INTERVAL.as_secs() >= 10);
 
+/// The whole point of the feature: detection must stay well clear of the 300 s
+/// `ConnectionIdle` ex-ray inherits, which is what used to bound idle recovery.
+/// Widening the cadence for a slow deployment must not quietly give that back.
+const _: () = assert!(2 * KEEPALIVE_INTERVAL.as_secs() + KEEPALIVE_TIMEOUT.as_secs() < 300);
+
 /// How long the transport may stay completely silent after a probe before it is
 /// declared dead.
 ///
@@ -914,15 +919,19 @@ pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) async fn open_probe(open_tx: &mpsc::Sender<OpenStreamReply>, nonce: u64) -> Option<yamux::Stream> {
     let mut stream = match open_stream(open_tx).await {
         Ok(s) => s,
-        // A closed connection is expected reconnect-window churn; anything else
-        // is a transport-alive failure worth surfacing, matching the TCP-accept
-        // and UDP-association arms above.
+        // A closed connection is expected reconnect-window churn.
         Err(yamux::ConnectionError::Closed) => {
             tracing::debug!("no keepalive substream: connection closed");
             return None;
         }
+        // Anything else — in practice `TooManyStreams` — is not survivable:
+        // `Connection::poll_new_outbound` hands any open error to `cleanup`,
+        // which drops every substream and ends the connection. So this is the
+        // last cycle either way, and the session is about to reconnect through
+        // the transport-death path. The relay paths share the hazard; opening a
+        // substream at all is what trips it, not the keepalive specifically.
         Err(e) => {
-            tracing::warn!(error = %e, "failed to open the keepalive substream");
+            tracing::warn!(error = %e, "keepalive substream open ended the yamux connection");
             return None;
         }
     };
@@ -1054,10 +1063,9 @@ pub(crate) async fn run_keepalive(open_tx: mpsc::Sender<OpenStreamReply>, inboun
         }
 
         // Nothing at all arrived across a whole interval and a whole deadline.
-        // If the probe could not even be sent, the reading is the same: a
-        // connection whose substream budget is exhausted while delivering
-        // nothing is, at this layer, indistinguishable from a dead one, and
-        // reconnecting is the fail-safe choice for a VPN.
+        // If the probe could not even be sent, the reading is the same either
+        // way: the open either failed on an already-closed connection, or ended
+        // it (see `open_probe`). Reconnecting is the fail-safe choice for a VPN.
         tracing::warn!(
             nonce,
             "transport silent across the keepalive deadline; declaring it dead"

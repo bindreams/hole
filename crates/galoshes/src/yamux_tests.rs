@@ -1033,6 +1033,10 @@ async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
     shutdown.cancel();
 }
 
+/// One registered wait: the substring, how many occurrences it needs, and the
+/// sender that fires when it has them.
+type LogWait = (String, usize, tokio::sync::oneshot::Sender<()>);
+
 /// A `MakeWriter` that fires a **tokio** oneshot the first time a registered
 /// substring is written.
 ///
@@ -1044,10 +1048,6 @@ async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
 /// never written, the blocking task never ends, and the wait deadlocks. This
 /// receiver is awaited on the runtime instead, so the runtime still parks and
 /// the clock still advances.
-/// One registered wait: the substring, how many occurrences it needs, and the
-/// sender that fires when it has them.
-type LogWait = (String, usize, tokio::sync::oneshot::Sender<()>);
-
 #[derive(Clone, Default)]
 struct LogWaiter {
     text: Arc<std::sync::Mutex<String>>,
@@ -1292,17 +1292,28 @@ async fn chatter(open_tx: &mpsc::Sender<OpenStreamReply>) {
 }
 
 #[skuld::test]
-async fn opening_a_probe_fails_when_the_substream_budget_is_exhausted() {
-    // The `TooManyStreams` arm: a refused open must be reported, not mistaken
-    // for a probe. Cap the connection at one substream and take it first.
+async fn a_refused_probe_open_ends_the_whole_yamux_connection() {
+    // Pins yamux's actual behavior, which is harsher than "the open failed":
+    // `Connection::poll_new_outbound` hands any open error to `cleanup`, which
+    // drops every substream. So exhausting the budget does not cost one probe,
+    // it costs the connection — and the keepalive must report it as such rather
+    // than treat it as a survivable, transport-alive event.
+    use futures::AsyncWriteExt as _;
+
     let (writer, _g) = capture_logs_awaitable();
     let client = piped_client_with_max_streams(StubPeer::Echo, 1).await;
-    let _hog = open_test_stream(&client.open_tx).await;
+    let mut hog = open_test_stream(&client.open_tx).await;
     assert!(open_probe(&client.open_tx, 1).await.is_none());
     assert!(
-        writer.contains("failed to open the keepalive substream"),
-        "a refused open must warn, not pass silently"
+        writer.contains("keepalive substream open ended the yamux connection"),
+        "a refused open must be reported as fatal to the connection"
     );
+
+    // The driver ends outright — an in-runtime rendezvous on it dropping the
+    // open channel, no polling.
+    client.open_tx.closed().await;
+    // And the pre-existing substream is collateral, not merely idle.
+    assert!(hog.write_all(b"x").await.is_err(), "the held substream is gone too");
 }
 
 #[skuld::test]
