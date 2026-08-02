@@ -1,10 +1,21 @@
 package main
 
 import (
+	"math"
 	"net"
 	"syscall"
 	"testing"
 )
+
+// sockoptInt32 narrows a getsockopt result to the int32 keepAliveParams carries.
+// The bound guard wrapping the conversion is gosec G115's recognized
+// mitigation, matching uint32Opt in config.go.
+func sockoptInt32(name string, v int) (int32, error) {
+	if v >= 0 && v <= math.MaxInt32 {
+		return int32(v), nil
+	}
+	return 0, newError("out-of-range ", name, " read back from the socket: ", v)
+}
 
 func testParams() keepAliveParams {
 	return keepAliveParams{IdleSeconds: 15, IntervalSeconds: 15, Probes: 3}

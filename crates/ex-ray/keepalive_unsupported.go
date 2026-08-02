@@ -7,7 +7,3 @@ package main
 func setTCPKeepAlive(_ uintptr, _ keepAliveParams) error {
 	return newError("TCP keepalive is not supported on this platform")
 }
-
-func readTCPKeepAlive(_ uintptr) (keepAliveParams, bool, error) {
-	return keepAliveParams{}, false, newError("TCP keepalive is not supported on this platform")
-}

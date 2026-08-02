@@ -359,8 +359,7 @@ func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
 
 // withKeepAliveFlag saves the tcp-keepalive global, applies a value, and returns
 // a restore func. Mirrors withFlags/withEchFlags: generateConfig and
-// registerTCPKeepAlive read this package-level pointer, so tests must leave it
-// as they found it rather than writing back an assumed default.
+// registerTCPKeepAlive read this package-level pointer.
 func withKeepAliveFlag(t *testing.T, v int) func() {
 	t.Helper()
 	orig := *tcpKeepAlive

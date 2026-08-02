@@ -1,19 +1,6 @@
 package main
 
-import (
-	"math"
-	"strings"
-)
-
-// sockoptInt32 narrows a getsockopt result to the int32 keepAliveParams carries.
-// The bound guard wrapping the conversion is gosec G115's recognized
-// mitigation, matching uint32Opt in config.go.
-func sockoptInt32(name string, v int) (int32, error) {
-	if v >= 0 && v <= math.MaxInt32 {
-		return int32(v), nil
-	}
-	return 0, newError("out-of-range ", name, " read back from the socket: ", v)
-}
+import "strings"
 
 // keepAliveParams are the TCP keepalive timings applied to ex-ray's outbound
 // connections.
@@ -42,10 +29,13 @@ func keepAliveDialerController(p keepAliveParams) func(network, address string, 
 		}
 		if err := setTCPKeepAlive(fd, p); err != nil {
 			// Unreachable on installed builds (pre-16299 Windows only, see
-			// README); v2ray-core discards this error, so a loud log naming the
-			// failed option is the only recourse.
-			logWarn("TCP keepalive could not be applied to " + address +
-				", falling back to the OS default: " + err.Error())
+			// README); v2ray-core discards this error, so a loud log is the
+			// only recourse. The wrapped error names the option that failed
+			// rather than asserting the resulting socket state: on linux and
+			// darwin the vendored applyOutboundSocketOptions has already
+			// applied idle and interval from the same SocketConfig, so a
+			// failure on the probe count alone leaves those intact.
+			logWarn("TCP keepalive not fully applied to " + address + ": " + err.Error())
 			return err
 		}
 		return nil
