@@ -6,6 +6,7 @@
 
 pub mod bootstrap;
 pub mod connector;
+pub mod ech;
 pub mod forwarder;
 pub mod providers;
 pub mod recovery;
