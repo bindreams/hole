@@ -116,7 +116,7 @@ pub fn ci_run_packages(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeSet<St
 /// Collapse shell backslash-newline line continuations into spaces, so a command
 /// written across several lines (as the archive-lane nextest invocations are)
 /// is one logical command before [`split_commands`] runs.
-fn join_line_continuations(script: &str) -> String {
+pub(crate) fn join_line_continuations(script: &str) -> String {
     script.replace("\\\r\n", " ").replace("\\\n", " ")
 }
 
@@ -154,7 +154,7 @@ fn collect_from_command(
 /// nextest `-E '…'` filter expression (folded YAML) carries newlines inside its
 /// single quotes. Tokens within a command stay whitespace-separated, so
 /// downstream `split_whitespace` matching is unaffected.
-fn split_commands(script: &str) -> Vec<String> {
+pub(crate) fn split_commands(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -212,7 +212,7 @@ fn xtask_run_target(cmd: &str) -> Option<&str> {
 }
 
 /// The command-line text of a manifest step, for token extraction.
-fn step_command(step: &Step) -> String {
+pub(crate) fn step_command(step: &Step) -> String {
     match step {
         Step::Bash { command, .. } => command.clone(),
         Step::Process { args, .. } => args.join(" "),

@@ -15,6 +15,7 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod ci_coverage;
+pub mod ci_timeouts;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
 // dependency — the DMG background is a darwin feature).
 #[cfg(target_os = "macos")]
@@ -40,6 +41,9 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
+#[cfg(test)]
+#[path = "ci_timeouts_tests.rs"]
+mod ci_timeouts_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.
