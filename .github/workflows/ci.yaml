@@ -263,16 +263,37 @@ jobs:
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # 45min: the non-TUN pass provisions stock upstream v2ray-plugin and runs
-    # the cross-impl interop tests (~78s each).
-    timeout-minutes: 45
+    # Per-leg, because the legs differ by ~2x: one number would either
+    # under-budget darwin/amd64 or push every leg's hang-detection deadline out
+    # to suit the slowest. Whole-job wall clock, 38 runs per leg on `main`:
+    #
+    #   darwin/arm64   16m31s - 32m01s, 0 killed  -> 45
+    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60
+    #   darwin/amd64   22m22s - 44m28s, 8 killed  -> 90
+    #
+    # darwin/amd64's distribution is right-CENSORED by the 45min wall replaced
+    # here, so 44m28s is a floor, not a maximum. Reconstructing the killed runs
+    # from their phase timings puts the real requirement near 56min. 90
+    # clears the censored region so the true tail becomes observable; tighten
+    # once it is. windows/amd64 has never been killed but sits at 94% of the old
+    # wall, so it is raised too; darwin/arm64 has 29% margin and stays.
+    #
+    # For darwin this is a stopgap: most of its TUN pass is a whole-workspace
+    # rebuild caused by a feature-set mismatch in that step (#720).
+    #
+    # The `ci_installer_assembly_jobs_share_a_timeout_budget` conformance test
+    # does not cover these: it selects jobs whose xtask cascade reaches a
+    # `uv run --directory <name>-installer build` handoff, and `hole-tests`
+    # (-> hole -> galoshes -> ex-ray) reaches none. Should that cascade ever
+    # gain an installer edge, this job joins that class and must match it.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: windows, arch: amd64, runner: windows-latest, timeout: 60 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 90 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 45 }
     steps:
       - uses: actions/checkout@v7
         with:

@@ -36,10 +36,41 @@ struct CiYaml {
 
 #[derive(Deserialize)]
 struct Job {
+    /// Left uninterpreted so an unexpected scalar on an unrelated job cannot
+    /// abort the whole document — see [`resolve_timeout`].
     #[serde(rename = "timeout-minutes")]
-    timeout_minutes: Option<u64>,
+    timeout_minutes: Option<serde_yml::Value>,
     #[serde(default)]
     steps: Vec<CiStep>,
+}
+
+/// A declared `timeout-minutes` as a literal minute count.
+///
+/// GitHub accepts a number or a workflow expression here; `test-hole` uses an
+/// expression to budget each matrix leg separately. An expression cannot be
+/// compared against a sibling statically, so it is an error for a job in the
+/// class — but only there, which is why the value is interpreted at use rather
+/// than at deserialization.
+///
+/// Classification is on the `${{` syntax, matching [`xtask_target`], not on
+/// which serde shape the scalar took: `"60"` is a quoted literal, not an
+/// expression.
+fn resolve_timeout(id: &str, value: &serde_yml::Value) -> Result<u64> {
+    if let Some(n) = value.as_u64() {
+        return Ok(n);
+    }
+    if let Some(s) = value.as_str() {
+        if s.contains("${{") {
+            bail!(
+                "job {id:?} declares timeout-minutes as the expression {s:?} — \
+                 it cannot be compared against its siblings' budgets statically"
+            );
+        }
+        if let Ok(n) = s.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+    bail!("job {id:?} declares timeout-minutes as {value:?}, which is not a whole number of minutes")
 }
 
 #[derive(Deserialize)]
@@ -120,9 +151,15 @@ pub fn installer_assembly_job_timeouts(ci_yaml: &str, manifest: &Manifest) -> Re
                 }
             }
         }
-        if assembles {
-            out.insert(id.clone(), job.timeout_minutes);
+        if !assembles {
+            continue;
         }
+        let minutes = job
+            .timeout_minutes
+            .as_ref()
+            .map(|v| resolve_timeout(id, v))
+            .transpose()?;
+        out.insert(id.clone(), minutes);
     }
 
     Ok(out)

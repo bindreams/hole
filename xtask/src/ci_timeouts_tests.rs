@@ -152,6 +152,87 @@ jobs:
     assert_eq!(got["a"], Some(45));
 }
 
+/// GitHub allows an expression for `timeout-minutes` (a per-leg matrix budget,
+/// as `test-hole` uses). A job outside the class must not break the parse.
+#[skuld::test]
+fn an_expression_timeout_outside_the_class_is_ignored() {
+    let ci = r#"
+jobs:
+  a:
+    timeout-minutes: 45
+    steps:
+      - run: cargo xtask build pkg
+  b:
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - run: cargo xtask run unrelated
+"#;
+    let got = installer_assembly_job_timeouts(ci, &fixture_manifest()).expect("analyze");
+    assert_eq!(got.keys().collect::<Vec<_>>(), vec!["a"]);
+}
+
+/// Inside the class an expression cannot be compared against a sibling, so it
+/// must fail loudly rather than silently drop out of the equality check.
+#[skuld::test]
+fn an_expression_timeout_inside_the_class_is_an_error() {
+    let ci = r#"
+jobs:
+  a:
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - run: cargo xtask build pkg
+"#;
+    let err = installer_assembly_job_timeouts(ci, &fixture_manifest()).unwrap_err();
+    assert!(format!("{err:#}").contains("expression"), "unexpected error: {err:#}");
+}
+
+/// A YAML-quoted number is a literal, not an expression — classification is on
+/// the `${{` syntax, not on which serde shape the scalar happened to take.
+#[skuld::test]
+fn a_quoted_numeric_timeout_is_a_literal() {
+    let ci = r#"
+jobs:
+  a:
+    timeout-minutes: "60"
+    steps:
+      - run: cargo xtask build pkg
+"#;
+    let got = installer_assembly_job_timeouts(ci, &fixture_manifest()).expect("analyze");
+    assert_eq!(got["a"], Some(60));
+}
+
+/// An odd scalar on an unrelated job must not abort the whole ci.yaml parse —
+/// the failure mode the expression handling exists to prevent.
+#[skuld::test]
+fn an_odd_timeout_scalar_outside_the_class_does_not_break_parsing() {
+    let ci = r#"
+jobs:
+  a:
+    timeout-minutes: 45
+    steps:
+      - run: cargo xtask build pkg
+  b:
+    timeout-minutes: 0.5
+    steps:
+      - run: cargo xtask run unrelated
+"#;
+    let got = installer_assembly_job_timeouts(ci, &fixture_manifest()).expect("analyze");
+    assert_eq!(got.keys().collect::<Vec<_>>(), vec!["a"]);
+}
+
+#[skuld::test]
+fn a_non_integral_timeout_inside_the_class_is_an_error() {
+    let ci = r#"
+jobs:
+  a:
+    timeout-minutes: 0.5
+    steps:
+      - run: cargo xtask build pkg
+"#;
+    let err = installer_assembly_job_timeouts(ci, &fixture_manifest()).unwrap_err();
+    assert!(format!("{err:#}").contains("whole number"), "unexpected error: {err:#}");
+}
+
 #[skuld::test]
 fn a_job_without_a_declared_timeout_is_reported_as_none() {
     let ci = r#"
