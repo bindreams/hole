@@ -264,10 +264,9 @@ reconnects after a transport reset instead of wedging the tunnel:
   (a floor bounding a peer flapping right after one byte) and escalates
   exponentially to `REMOTE_BACKOFF_MAX` on repeated failures.
   "Productive" is **transport-level**, not application-level: `TransportLivenessTap`
-  sits below yamux framing and flags any inbound byte — relayed data or a bare
-  keepalive/flow-control frame alike — as liveness, which resets the backoff to
-  the floor. A session that never received a single inbound byte counts as a
-  failure and escalates.
+  sits below yamux framing and counts every inbound read — relayed data or a bare
+  ping/flow-control frame alike — as liveness, which resets the backoff to the
+  floor. A session whose count never moved counts as a failure and escalates.
 - **Teardown tradeoff.** On session end the driver is `abort()`-ed rather than
   drained, so any relay stream still in flight is truncated. This trades a
   handful of interrupted flows for a bounded, deterministic teardown instead of
@@ -277,9 +276,28 @@ reconnects after a transport reset instead of wedging the tunnel:
   and the accept loop continues — reconnecting the transport wouldn't fix a
   local socket error, and a broken listener is not what these errors indicate
   (they're transient: a stray `ECONNABORTED`, momentary `EMFILE`).
-- **Scope boundary.** This detects a transport that visibly dies (FIN/RST,
-  yamux protocol error). A peer that goes silent without ever resetting the
-  connection (a black-holed link) is not detected by this mechanism — see #660.
+- **Proactive keepalive**
+  ([`yamux/keepalive.rs`](crates/galoshes/src/yamux/keepalive.rs)). A visible
+  death (FIN/RST, yamux protocol error) is caught by the inbound-channel signal
+  above. A peer that goes silent without resetting — a black-holed link — is
+  caught instead by a client keepalive. Every `KEEPALIVE_INTERVAL` in which
+  `TransportLivenessTap` counted nothing, the client opens a
+  `StreamTag::Keepalive` substream and writes an 8-byte nonce, purely to give an
+  idle transport a reason to speak; a transport that delivered anything is not
+  probed at all, so a busy tunnel carries no keepalive traffic. The verdict is
+  not "did the echo come back" — the client reads the substream exactly once and
+  never inspects what it got — but "did the tap count *any* inbound read before
+  `KEEPALIVE_TIMEOUT` was up". That is what makes the wire addition safe against
+  version skew: an un-upgraded server resets the unknown tag, and the reset is
+  inbound traffic that is necessarily read *before* the probe's read can end, so
+  the tunnel behaves exactly as it did before. The whole cycle including the
+  substream open sits inside the deadline, because opening parks indefinitely
+  once enough substreams await an ACK. Detection is bounded by
+  `2 × KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT` from the last inbound byte, which
+  holds only while the deadline is no longer than the interval; the interval may
+  also not drop below yamux's own 10 s ping cadence, which is what keeps a
+  healthy-but-slow server off the fatal path. `const` assertions pin both
+  relations at the constants.
 
 ### Fail-closed cover
 
