@@ -4,6 +4,16 @@
 // the regular GUI functions appear unused to clippy.
 #![cfg_attr(test, allow(dead_code))]
 
+// A release build must serve the bundled frontend over the custom protocol.
+// Without `tauri/custom-protocol` (default-on) the dashboard webview points at
+// `devUrl` and a shipped binary shows "localhost refused to connect".
+// `tauri::is_dev()` is const, so this is a build failure, not a runtime
+// surprise.
+const _: () = assert!(
+    !(cfg!(not(debug_assertions)) && tauri::is_dev()),
+    "release builds of hole must enable `tauri/custom-protocol`"
+);
+
 mod autostart;
 mod bridge_client;
 #[macro_use]
@@ -19,7 +29,6 @@ mod platform;
 mod setup;
 mod state;
 mod tray;
-mod ui_ready;
 mod ui_settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,12 +109,6 @@ fn launch_gui(show_dashboard: bool) {
     hole::selfheal::init_startup();
 
     tauri::Builder::default()
-        // `UiReady` is registered on the builder (not in `.setup`) so
-        // it is available to command handlers at first dispatch — the
-        // dashboard webview begins navigation during `.build()`, and
-        // `ui/main.ts::init()` may fire `signal_ui_ready` before the
-        // setup hook runs.
-        .manage(ui_ready::UiReady::default())
         // `tauri-plugin-single-instance` must be registered first per
         // upstream guidance: the duplicate-instance process exits during
         // this plugin's init, so any plugin registered earlier would do
@@ -162,8 +165,6 @@ fn launch_gui(show_dashboard: bool) {
             tray::cancel_proxy,
             tray::get_autostart,
             tray::set_autostart,
-            ui_ready::signal_ui_ready,
-            ui_ready::wait_ui_ready,
         ])
         .setup(move |app| {
             // Manage shared state here (instead of pre-`.setup()`) so that
