@@ -87,6 +87,10 @@ pub async fn start_real_ss_server(method: CipherKind, password: &str) -> (Socket
     (addr, handle)
 }
 
+/// Server-mode options for the plain-WS fixture. Tests that need to pin an
+/// extra directive build on this.
+pub const WS_SERVER_OPTS: &str = "server;host=cloudfront.com;path=/";
+
 /// Front a held ss-server with a SERVER-mode plugin (websocket, no TLS) and
 /// return the public address external clients connect to. The public port is
 /// allocated for `Protocols::TCP` only — WS is TCP per RFC 6455.
@@ -95,14 +99,18 @@ pub async fn start_real_ss_server_with_plugin_ws(
     password: &str,
     plugin_path: &str,
 ) -> (SocketAddr, PluginServer) {
-    spawn_ss_with_plugin(
-        method,
-        password,
-        Protocols::TCP,
-        plugin_path,
-        "server;host=cloudfront.com;path=/",
-    )
-    .await
+    start_real_ss_server_with_plugin_ws_opts(method, password, plugin_path, WS_SERVER_OPTS).await
+}
+
+/// [`start_real_ss_server_with_plugin_ws`] with the server-mode options string
+/// supplied by the caller, for tests that pin a specific plugin directive.
+pub async fn start_real_ss_server_with_plugin_ws_opts(
+    method: CipherKind,
+    password: &str,
+    plugin_path: &str,
+    opts: &str,
+) -> (SocketAddr, PluginServer) {
+    spawn_ss_with_plugin(method, password, Protocols::TCP, plugin_path, opts).await
 }
 
 /// Front a held ss-server with a SERVER-mode plugin (websocket + TLS). Same
