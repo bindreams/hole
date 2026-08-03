@@ -51,11 +51,12 @@ mod launcher_smoke {
 
 mod roundtrips {
     use plugin_e2e::locators::locate_built_galoshes;
-    #[cfg(not(target_os = "windows"))]
-    use plugin_e2e::roundtrip::NotReachableKind;
-    use plugin_e2e::roundtrip::{run_roundtrip, Roundtrip, RoundtripConfig};
+    use plugin_e2e::roundtrip::{run_roundtrip, NotReachableKind, Roundtrip, RoundtripConfig};
     use plugin_e2e::sentinel::start_fake_sentinel;
-    use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_ws, TEST_METHOD, TEST_PASSWORD};
+    use plugin_e2e::ssserver::{
+        start_real_ss_server_with_plugin_ws, start_real_ss_server_with_plugin_ws_opts, TEST_METHOD, TEST_PASSWORD,
+        WS_SERVER_OPTS,
+    };
     use plugin_e2e::util::{require_binary, rt};
 
     // WS-TLS + QUIC present a self-signed cert; v2ray-core's getCertPool drops
@@ -96,6 +97,62 @@ mod roundtrips {
             )
             .await;
             assert!(matches!(outcome, Roundtrip::Reachable { .. }), "ws: {outcome:?}");
+        });
+    }
+
+    /// Client options for the plain-WS fixture, mirroring `WS_SERVER_OPTS`.
+    const WS_CLIENT_OPTS: &str = "host=cloudfront.com;path=/";
+
+    /// `mux` also selects the server's dokodemo destination, so a default client
+    /// and a `mux=1` server no longer speak the same wire format. Proving the
+    /// tunnel BREAKS is what shows the default actually changed.
+    #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+    fn galoshes_ws_mux_default_cannot_reach_a_mux1_server() {
+        let g = require_galoshes();
+        rt().block_on(async {
+            let server_opts = format!("{WS_SERVER_OPTS};mux=1");
+            let (svr, _h) =
+                start_real_ss_server_with_plugin_ws_opts(TEST_METHOD, TEST_PASSWORD, &g, &server_opts).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let outcome = run_roundtrip(
+                &g,
+                Some(&format!("mux=1;{WS_CLIENT_OPTS}")),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Roundtrip::Reachable { .. }),
+                "mux=1 on both ends must still tunnel (control): {outcome:?}"
+            );
+
+            let (svr, _h) =
+                start_real_ss_server_with_plugin_ws_opts(TEST_METHOD, TEST_PASSWORD, &g, &server_opts).await;
+            let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            let outcome = run_roundtrip(
+                &g,
+                Some(WS_CLIENT_OPTS),
+                &svr.ip().to_string(),
+                svr.port(),
+                TEST_METHOD,
+                TEST_PASSWORD,
+                sentinel,
+                &RoundtripConfig::default(),
+            )
+            .await;
+            // Torn down via common/mux/server.go:204-208, not a hang (ReadTimeout)
+            // or a broken harness (ChainFailed) — hence PeerClosed specifically.
+            let Roundtrip::NotReachable { kind, detail } = &outcome else {
+                panic!("a mux=0 client must NOT reach a mux=1 server, and must fail by peer close: {outcome:?}");
+            };
+            assert!(
+                matches!(kind, NotReachableKind::PeerClosed),
+                "mux mismatch must tear the connection down, not hang or misreply, got {kind:?}: {detail}"
+            );
         });
     }
 
