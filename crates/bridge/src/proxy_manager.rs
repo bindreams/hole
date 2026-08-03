@@ -1420,13 +1420,11 @@ mod proxy_manager_tests;
 //   listener-selection tests) run on every Hole platform (Win+mac).
 // - **galoshes-fronted** tests front a galoshes *server* via the garter
 //   `ChainRunner` launcher (`plugin_e2e::ssserver`), which the `SsServerHandle`
-//   fixture keeps alive for the test's lifetime. The SOCKS5 UDP-associate test
-//   runs on **Win+mac** (its reply-leg flake was fixed in #543). The rest run on
-//   **macOS** only, gated off Windows pending fixes: the socks-only WS/IPv6
-//   roundtrips hit an intermittent Windows bridge-e2e stall (#542), the
-//   full-tunnel TUN test hangs (#541), and WS-TLS/QUIC are macOS-only anyway
-//   (Windows custom-cert limit). Broader galoshes transport coverage on Windows
-//   lives in the `plugin-e2e` crate.
+//   fixture keeps alive for the test's lifetime. The socks-only WS/IPv6
+//   roundtrips run on **Win+mac**; WS-TLS and QUIC are macOS-only (Windows
+//   custom-cert limit), and the full-tunnel TUN variants are Windows-only
+//   (`mod tun` is `cfg(target_os = "windows")` and needs elevation). Broader
+//   galoshes transport coverage on Windows lives in the `plugin-e2e` crate.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
