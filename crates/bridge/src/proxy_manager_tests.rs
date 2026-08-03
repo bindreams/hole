@@ -1163,11 +1163,12 @@ fn build_config_failure_sets_last_error() {
 #[skuld::test]
 fn doh_bootstrap_failure_sets_last_error() {
     use crate::dns::bootstrap::DohQuerier;
+    use crate::dns::forwarder::UpstreamCause;
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
-            None
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
         }
     }
     rt().block_on(async {
@@ -1745,6 +1746,7 @@ use hole_common::protocol::TunnelMode;
 
 /// Stub querier resolving exactly one hostname to one IPv4, used to prove
 /// `start_inner` resolves via DoH (not the OS) and hands the result downstream.
+use crate::dns::forwarder::UpstreamCause;
 struct WiringStubQuerier {
     host: String,
     ip: IpAddr,
@@ -1752,22 +1754,24 @@ struct WiringStubQuerier {
 
 #[async_trait::async_trait]
 impl DohQuerier for WiringStubQuerier {
-    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-        use hickory_proto::op::{Message, MessageType, OpCode, Query};
-        use hickory_proto::rr::rdata::A;
-        use hickory_proto::rr::{Name, RData, Record, RecordType};
-        // Only answer the A query (port-free: the stub keys on hostname).
-        let q = Message::from_vec(wire).ok()?;
-        let question = q.queries.first()?;
-        if question.query_type() != RecordType::A {
-            return None; // force the resolver onto the A path (IPv4-preferred).
-        }
-        let IpAddr::V4(v4) = self.ip else { return None };
-        let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
-        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-        reply.add_query(Query::query(n.clone(), RecordType::A));
-        reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
-        reply.to_vec().ok()
+    async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+        crate::dns::forwarder::answered_or_servfail(wire, || {
+            use hickory_proto::op::{Message, MessageType, OpCode, Query};
+            use hickory_proto::rr::rdata::A;
+            use hickory_proto::rr::{Name, RData, Record, RecordType};
+            // Only answer the A query (port-free: the stub keys on hostname).
+            let q = Message::from_vec(wire).ok()?;
+            let question = q.queries.first()?;
+            if question.query_type() != RecordType::A {
+                return None; // force the resolver onto the A path (IPv4-preferred).
+            }
+            let IpAddr::V4(v4) = self.ip else { return None };
+            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(n.clone(), RecordType::A));
+            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+            reply.to_vec().ok()
+        })
     }
 }
 
@@ -1888,13 +1892,14 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
 
 #[skuld::test]
 fn full_start_fails_closed_when_doh_cannot_resolve() {
-    // A stub that answers nothing → NoAnswer → DohBootstrap, hermetic (no
+    // A stub that never answers → Unreachable → DohBootstrap, hermetic (no
     // system DNS or network).
+    use crate::dns::forwarder::UpstreamCause;
     struct NeverQuerier;
     #[async_trait::async_trait]
     impl DohQuerier for NeverQuerier {
-        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Option<Vec<u8>> {
-            None
+        async fn query(&self, _s: IpAddr, _w: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
         }
     }
     rt().block_on(async {
@@ -1926,29 +1931,13 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::connector::{ConnectedStream, UpstreamConnector, UpstreamUdp};
     use crate::dns::forwarder::DnsForwarder;
     use crate::test_support::log_capture::VecWriter;
-    use async_trait::async_trait;
+    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
-    use std::io;
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-
-    /// A connector that immediately fails every connect. Drives the
-    /// dead-upstream path in tests — the forwarder will fail every
-    /// attempt, surfacing as `SelfTestOutcome::Failed`.
-    struct DeadConnector;
-    #[async_trait]
-    impl UpstreamConnector for DeadConnector {
-        async fn connect_tcp(&self, _target: std::net::SocketAddr) -> io::Result<ConnectedStream> {
-            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
-        }
-        async fn connect_udp(&self, _target: std::net::SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
-            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
-        }
-    }
 
     fn test_dns_cfg() -> DnsConfig {
         DnsConfig {
@@ -1956,6 +1945,122 @@ mod self_test {
             servers: vec!["127.0.0.1".parse().unwrap()],
             protocol: DnsProtocol::PlainTcp,
             allow_insecure_bootstrap: false,
+        }
+    }
+
+    /// The self-test hands its budget DOWN to the forwarder instead of
+    /// wrapping the call in a `timeout`, so a failing attempt is classified and
+    /// logged before the self-test's own budget can drop it. This asserts the
+    /// reason carries the typed cause, i.e. the gate reports WHAT failed.
+    #[skuld::test]
+    fn self_test_failure_logs_the_typed_upstream_cause() {
+        let writer = VecWriter::new();
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
+                run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            });
+
+        let reason = match outcome {
+            SelfTestOutcome::Failed { reason, .. } => reason,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(
+            reason.contains("Unreachable"),
+            "the reason must name the cause, not just 'timed out'; got: {reason}"
+        );
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("upstream failed"),
+            "the per-upstream WARN must survive the self-test's budget; got:\n{output}"
+        );
+        assert!(
+            output.contains("layer=connect"),
+            "expected 'layer=connect'; got:\n{output}"
+        );
+        assert!(
+            output.contains("cause=unreachable"),
+            "expected 'cause=unreachable'; got:\n{output}"
+        );
+        assert!(
+            output.contains("budget_ms=1500"),
+            "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
+        );
+    }
+
+    /// The overall budget is a deadline the loop respects, so a self-test whose
+    /// upstreams all hang stops ON TIME, reports the real typed failure, and
+    /// counts only the attempts that ran. Virtual time: the connector never
+    /// completes, so every `forward_one` budget expires via auto-advance and no
+    /// wall-clock is consumed.
+    #[skuld::test]
+    fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
+        let (outcome, elapsed) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::pause();
+                let servers: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()];
+                let cfg = DnsConfig {
+                    servers: servers.clone(),
+                    ..test_dns_cfg()
+                };
+                let forwarder = SArc::new(DnsForwarder::new(cfg, SArc::new(HangingConnector), false));
+                let t0 = tokio::time::Instant::now();
+                let outcome = run_forwarder_self_test(forwarder, servers, false, CancellationToken::new()).await;
+                (outcome, t0.elapsed())
+            });
+
+        // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
+        // deadline must cut it near 5s. tokio rounds every timer deadline UP to
+        // a whole millisecond and the loop arms at most one per upstream per
+        // attempt, so allow exactly that many milliseconds of overshoot.
+        const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
+        let quantization = std::time::Duration::from_millis(3 * 2);
+        assert!(
+            elapsed < UNBOUNDED,
+            "the deadline must truncate the retry sequence; took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(5) + quantization,
+            "the loop must stop at the overall deadline; took {elapsed:?}"
+        );
+        match outcome {
+            SelfTestOutcome::Failed { reason, attempts } => {
+                assert!(
+                    reason.contains("Timeout"),
+                    "every upstream hung, so the reason must say so; got: {reason}"
+                );
+                assert!(
+                    !reason.contains("no attempt completed"),
+                    "attempts run to completion under a deadline; got: {reason}"
+                );
+                assert!(
+                    (1..=3).contains(&attempts),
+                    "attempts must count what actually ran; got {attempts}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
@@ -1981,7 +2086,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
                 assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
             });
@@ -2014,7 +2119,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let outcome = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],
@@ -2075,7 +2180,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let _ = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],
@@ -2115,7 +2220,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let _ = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],
@@ -2874,6 +2979,7 @@ mod self_test {
 
     /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
     /// retry reuses the resolved IP instead of re-querying under the held cover.
+    use crate::dns::forwarder::UpstreamCause;
     struct CountingQuerier {
         host: String,
         ip: IpAddr,
@@ -2882,21 +2988,23 @@ mod self_test {
 
     #[async_trait::async_trait]
     impl DohQuerier for CountingQuerier {
-        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-            use hickory_proto::op::{Message, MessageType, OpCode, Query};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{Name, RData, Record, RecordType};
-            self.queries.fetch_add(1, Ordering::SeqCst);
-            let q = Message::from_vec(wire).ok()?;
-            if q.queries.first()?.query_type() != RecordType::A {
-                return None; // force the resolver onto the A path (IPv4-preferred).
-            }
-            let IpAddr::V4(v4) = self.ip else { return None };
-            let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
-            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-            reply.add_query(Query::query(n.clone(), RecordType::A));
-            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
-            reply.to_vec().ok()
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
+                use hickory_proto::op::{Message, MessageType, OpCode, Query};
+                use hickory_proto::rr::rdata::A;
+                use hickory_proto::rr::{Name, RData, Record, RecordType};
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                let q = Message::from_vec(wire).ok()?;
+                if q.queries.first()?.query_type() != RecordType::A {
+                    return None; // force the resolver onto the A path (IPv4-preferred).
+                }
+                let IpAddr::V4(v4) = self.ip else { return None };
+                let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(Query::query(n.clone(), RecordType::A));
+                reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+                reply.to_vec().ok()
+            })
         }
     }
 
@@ -2949,23 +3057,25 @@ mod self_test {
 
     #[async_trait::async_trait]
     impl DohQuerier for MappingQuerier {
-        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Option<Vec<u8>> {
-            use hickory_proto::op::{Message, MessageType, OpCode, Query};
-            use hickory_proto::rr::rdata::A;
-            use hickory_proto::rr::{Name, RData, Record, RecordType};
-            self.queries.fetch_add(1, Ordering::SeqCst);
-            let q = Message::from_vec(wire).ok()?;
-            let question = q.queries.first()?;
-            if question.query_type() != RecordType::A {
-                return None; // force the resolver onto the A path (IPv4-preferred).
-            }
-            let name = question.name().to_string();
-            let ip = *self.map.get(name.trim_end_matches('.'))?;
-            let n = Name::from_ascii(&name).ok()?;
-            let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
-            reply.add_query(Query::query(n.clone(), RecordType::A));
-            reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
-            reply.to_vec().ok()
+        async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            crate::dns::forwarder::answered_or_servfail(wire, || {
+                use hickory_proto::op::{Message, MessageType, OpCode, Query};
+                use hickory_proto::rr::rdata::A;
+                use hickory_proto::rr::{Name, RData, Record, RecordType};
+                self.queries.fetch_add(1, Ordering::SeqCst);
+                let q = Message::from_vec(wire).ok()?;
+                let question = q.queries.first()?;
+                if question.query_type() != RecordType::A {
+                    return None; // force the resolver onto the A path (IPv4-preferred).
+                }
+                let name = question.name().to_string();
+                let ip = *self.map.get(name.trim_end_matches('.'))?;
+                let n = Name::from_ascii(&name).ok()?;
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(Query::query(n.clone(), RecordType::A));
+                reply.add_answer(Record::from_rdata(n, 60, RData::A(A(ip))));
+                reply.to_vec().ok()
+            })
         }
     }
 

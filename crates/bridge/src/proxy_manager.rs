@@ -1503,9 +1503,15 @@ pub(crate) const TAP_ENABLED_HINT: &str =
 pub(crate) const TAP_DISABLED_HINT: &str =
     "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
 
-/// Run the forwarder self-test inline against its first configured server.
-/// Returns `SelfTestOutcome::Ok` when any well-formed non-SERVFAIL reply
-/// comes back within the 3×1500ms / 5s budget, else `Failed`. Also writes
+/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
+/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
+/// else `Failed`.
+///
+/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
+/// so that a whole attempt (one walk of N resolvers) still fits inside what is
+/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
+/// early rather than overrun. Nothing wraps the call in a `timeout`, so every
+/// upstream failure is classified and logged before the gate gives up. Also writes
 /// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
 /// log line at `info!`. On failure, additionally emits a `warn!`
 /// correlation breadcrumb pointing the reader to the plugin tap
@@ -1533,42 +1539,66 @@ async fn run_forwarder_self_test(
 
     let query = sample_self_test_query();
     let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(OUTER_BUDGET, async {
-        let mut last_err: Option<String> = None;
-        for attempt in 1..=ATTEMPTS {
-            // Cooperative cancel check between retry attempts (#397).
-            if cancel.is_cancelled() {
-                return SelfTestOutcome::Cancelled;
-            }
-            // Future-drop on `forwarder.forward(&query)` IS acceptable
-            // here — the single exception to the cooperative cancellation
-            // contract in this module (#397). The `DnsForwarder`'s only
-            // in-flight resource is a TCP/UDP socket that closes on Drop
-            // (sync, trivial); there is no async cleanup to await.
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-                r = tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)) => r,
-            };
-            match result {
-                Ok(reply) => {
-                    if is_dns_reply_ok(&reply) {
-                        return SelfTestOutcome::Ok { attempts: attempt };
-                    }
-                    last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+    // The overall bound is a DEADLINE the loop respects, not a `timeout` around
+    // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
+    // was in flight, and a dropped future produces no `UpstreamErr`, so that
+    // upstream's failure would never be classified or logged. Bounding each
+    // attempt by what remains instead means every attempt runs to completion
+    // and nothing is discarded.
+    let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
+    let mut last_err: Option<String> = None;
+    let mut completed: u32 = 0;
+    let mut outcome = None;
+
+    for attempt in 1..=ATTEMPTS {
+        // Cooperative cancel check between retry attempts (#397).
+        if cancel.is_cancelled() {
+            return SelfTestOutcome::Cancelled;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // `try_forward` walks every upstream it will attempt at `per_upstream`
+        // each, so divide what is left by that width to keep the whole attempt
+        // inside the deadline. The width comes from the forwarder, not from
+        // `servers.len()`: it skips IPv6 entries without an IPv6 bypass, and
+        // counting those would shrink every surviving upstream's budget while
+        // leaving part of the deadline unused. A zero-width walk dials nothing
+        // and returns immediately, so its budget is irrelevant.
+        let width = forwarder.attempted_upstreams();
+        let per_upstream = if width == 0 {
+            PER_ATTEMPT
+        } else {
+            PER_ATTEMPT.min(remaining / width as u32)
+        };
+        // The budget goes down into the forwarder so `forward_one`'s own
+        // deadline fires first, producing a classified `UpstreamErr` that
+        // `log_upstream_failure` can log. Cancel stays a `select!` arm:
+        // drop-on-cancel is the documented single exception in this module,
+        // since the forwarder's only in-flight resource is a socket that
+        // closes on Drop.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
+            r = forwarder.try_forward(&query, per_upstream) => r,
+        };
+        completed = attempt;
+        match result {
+            Ok(reply) => {
+                if is_dns_reply_ok(&reply) {
+                    outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
+                    break;
                 }
-                Err(_) => last_err = Some(format!("attempt {attempt} timed out after {PER_ATTEMPT:?}")),
+                last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
             }
+            Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
         }
-        SelfTestOutcome::Failed {
-            attempts: ATTEMPTS,
-            reason: last_err.unwrap_or_else(|| "unknown".into()),
-        }
-    })
-    .await
-    .unwrap_or(SelfTestOutcome::Failed {
-        attempts: ATTEMPTS,
-        reason: format!("outer timeout after {OUTER_BUDGET:?}"),
+    }
+
+    let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
+        attempts: completed,
+        reason: last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
     });
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
