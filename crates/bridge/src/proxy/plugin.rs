@@ -822,6 +822,36 @@ mod inject_tests {
         );
     }
 
+    // The full bridge-side path for a postern-issued config: derive the URL from
+    // the resolver that answered, then inject it over postern's own. Neither unit
+    // test would catch the two being wired together wrongly.
+    #[skuld::test]
+    fn a_postern_config_composes_into_holes_pinned_url() {
+        use std::net::IpAddr;
+
+        use hole_common::config::DnsConfig;
+
+        use crate::dns::ech::{ech_doh_url, PinSource};
+
+        let answering: IpAddr = "9.9.9.9".parse().expect("test IP literal");
+        let dns = DnsConfig {
+            servers: vec!["1.1.1.1".parse().expect("test IP literal"), answering],
+            ..Default::default()
+        };
+        let ech_doh = ech_doh_url(&dns, PinSource::Answered(answering)).expect("a resolver is configured");
+
+        let out = merged(
+            "v2ray-plugin",
+            Some("mode=websocket;host=cdn.example;tls;ech=always;ech-doh=https://cloudflare-dns.com/dns-query"),
+            Some(&ech_doh),
+        );
+
+        assert_eq!(
+            out.as_deref(),
+            Some("mode=websocket;host=cdn.example;tls;ech=always;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
+        );
+    }
+
     #[skuld::test]
     fn readiness_known_plugins_expect_sitrep_unknown_probes() {
         use garter::ReadinessMode;
