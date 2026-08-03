@@ -1933,7 +1933,7 @@ mod self_test {
     use super::*;
     use crate::dns::forwarder::DnsForwarder;
     use crate::test_support::log_capture::VecWriter;
-    use crate::test_support::refusing_connector::RefusingConnector;
+    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
@@ -2007,49 +2007,58 @@ mod self_test {
         );
     }
 
-    /// With the shipped two-resolver default, one attempt costs up to
-    /// 2×PER_ATTEMPT, so three attempts want 9s against the 5s OUTER_BUDGET and
-    /// the outer arm becomes reachable. It must then report the last REAL
-    /// failure and the number of attempts that actually ran — not a fabricated
-    /// `attempts: 3` with a contentless "outer timeout" string, which is the
-    /// same contentless-reason failure this change set out to remove.
+    /// The overall budget is a deadline the loop respects, so a self-test whose
+    /// upstreams all hang stops ON TIME, reports the real typed failure, and
+    /// counts only the attempts that ran. Virtual time: the connector never
+    /// completes, so every `forward_one` budget expires via auto-advance and no
+    /// wall-clock is consumed.
     #[skuld::test]
-    fn self_test_outer_budget_reports_the_last_real_failure() {
-        // Virtual time: the upstreams are refused instantly by the connector,
-        // so nothing here waits on wall-clock. Two servers that both refuse
-        // means every attempt fails fast and the loop completes all three —
-        // the outer arm is exercised by the assertion on `attempts`, which must
-        // reflect reality either way.
-        let outcome = tokio::runtime::Builder::new_current_thread()
+    fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
+        let (outcome, elapsed) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
+                tokio::time::pause();
+                let servers: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()];
                 let cfg = DnsConfig {
-                    servers: vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+                    servers: servers.clone(),
                     ..test_dns_cfg()
                 };
-                let forwarder = SArc::new(DnsForwarder::new(cfg, RefusingConnector::all(), false));
-                run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await
+                let forwarder = SArc::new(DnsForwarder::new(cfg, SArc::new(HangingConnector), false));
+                let t0 = tokio::time::Instant::now();
+                let outcome = run_forwarder_self_test(forwarder, servers, false, CancellationToken::new()).await;
+                (outcome, t0.elapsed())
             });
 
+        // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
+        // deadline must cut it near 5s. tokio rounds every timer deadline UP to
+        // a whole millisecond and the loop arms at most one per upstream per
+        // attempt, so allow exactly that many milliseconds of overshoot.
+        const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
+        let quantization = std::time::Duration::from_millis(3 * 2);
+        assert!(
+            elapsed < UNBOUNDED,
+            "the deadline must truncate the retry sequence; took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(5) + quantization,
+            "the loop must stop at the overall deadline; took {elapsed:?}"
+        );
         match outcome {
             SelfTestOutcome::Failed { reason, attempts } => {
                 assert!(
-                    reason.contains("Unreachable"),
-                    "the reason must name the real cause on every arm; got: {reason}"
+                    reason.contains("Timeout"),
+                    "every upstream hung, so the reason must say so; got: {reason}"
                 );
                 assert!(
-                    !reason.starts_with("outer timeout"),
-                    "a bare 'outer timeout' discards the finding; got: {reason}"
+                    !reason.contains("no attempt completed"),
+                    "attempts run to completion under a deadline; got: {reason}"
                 );
-                assert!(attempts > 0, "attempts must reflect what ran; got {attempts}");
+                assert!(
+                    (1..=3).contains(&attempts),
+                    "attempts must count what actually ran; got {attempts}"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }

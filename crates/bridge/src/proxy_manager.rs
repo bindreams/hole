@@ -1507,11 +1507,11 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
 /// else `Failed`.
 ///
-/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, so one
-/// attempt against N configured resolvers can take up to N×`PER_ATTEMPT`;
-/// `OUTER_BUDGET` remains the overall bound and may cut the retry sequence
-/// short. That is the intended trade: every upstream that fails inside its own
-/// budget is classified and logged first. Also writes
+/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
+/// so that a whole attempt (one walk of N resolvers) still fits inside what is
+/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
+/// early rather than overrun. Nothing wraps the call in a `timeout`, so every
+/// upstream failure is classified and logged before the gate gives up. Also writes
 /// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
 /// log line at `info!`. On failure, additionally emits a `warn!`
 /// correlation breadcrumb pointing the reader to the plugin tap
@@ -1539,71 +1539,57 @@ async fn run_forwarder_self_test(
 
     let query = sample_self_test_query();
     let started = std::time::Instant::now();
-    // Retry state lives OUTSIDE the timed future. `timeout` DROPS the future,
-    // taking anything it owns with it, and `OUTER_BUDGET` is genuinely
-    // reachable: one attempt costs up to `servers.len() * PER_ATTEMPT`, so with
-    // the two-resolver default three attempts can want 9s against a 5s bound.
-    // Held out here, the outer arm reports the last real failure and the number
-    // of attempts that actually ran instead of inventing both.
-    let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // The overall bound is a DEADLINE the loop respects, not a `timeout` around
+    // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
+    // was in flight, and a dropped future produces no `UpstreamErr`, so that
+    // upstream's failure would never be classified or logged: the exact gap this
+    // gate exists to close. Bounding each attempt by what remains instead means
+    // every attempt runs to completion and nothing is discarded.
+    let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
+    let mut last_err: Option<String> = None;
+    let mut completed: u32 = 0;
+    let mut outcome = None;
 
-    let outcome = tokio::time::timeout(OUTER_BUDGET, {
-        let last_err = std::sync::Arc::clone(&last_err);
-        let completed = std::sync::Arc::clone(&completed);
-        let forwarder = std::sync::Arc::clone(&forwarder);
-        let query = query.clone();
-        let cancel = cancel.clone();
-        async move {
-            for attempt in 1..=ATTEMPTS {
-                // Cooperative cancel check between retry attempts (#397).
-                if cancel.is_cancelled() {
-                    return SelfTestOutcome::Cancelled;
-                }
-                // The budget goes down into the forwarder so `forward_one`'s own
-                // deadline fires first, producing a classified `UpstreamErr` that
-                // `log_upstream_failure` can log — an outer `timeout` around the
-                // call would drop the future before that happens. Cancel stays a
-                // `select!` arm: drop-on-cancel is the documented single
-                // exception in this module (#397), since the forwarder's only
-                // in-flight resource is a socket that closes on Drop.
-                let result = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-                    r = forwarder.try_forward(&query, PER_ATTEMPT) => r,
-                };
-                match result {
-                    Ok(reply) => {
-                        if is_dns_reply_ok(&reply) {
-                            return SelfTestOutcome::Ok { attempts: attempt };
-                        }
-                        *last_err.lock().expect("poisoned") = Some(format!("SERVFAIL reply on attempt {attempt}"));
-                    }
-                    Err(failure) => {
-                        *last_err.lock().expect("poisoned") = Some(format!("attempt {attempt} failed: {failure:?}"));
-                    }
-                }
-                completed.store(attempt, std::sync::atomic::Ordering::SeqCst);
-            }
-            SelfTestOutcome::Failed {
-                attempts: ATTEMPTS,
-                reason: last_err
-                    .lock()
-                    .expect("poisoned")
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
-            }
+    for attempt in 1..=ATTEMPTS {
+        // Cooperative cancel check between retry attempts (#397).
+        if cancel.is_cancelled() {
+            return SelfTestOutcome::Cancelled;
         }
-    })
-    .await
-    .unwrap_or_else(|_| SelfTestOutcome::Failed {
-        attempts: completed.load(std::sync::atomic::Ordering::SeqCst),
-        reason: last_err
-            .lock()
-            .expect("poisoned")
-            .clone()
-            .map(|e| format!("{e}; gave up after {OUTER_BUDGET:?}"))
-            .unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // `try_forward` walks every configured resolver at `per_upstream` each,
+        // so divide what is left by the walk width to keep the whole attempt
+        // inside the deadline. `ATTEMPTS` is therefore a maximum, not a promise.
+        let per_upstream = PER_ATTEMPT.min(remaining / servers.len().max(1) as u32);
+        // The budget goes down into the forwarder so `forward_one`'s own
+        // deadline fires first, producing a classified `UpstreamErr` that
+        // `log_upstream_failure` can log. Cancel stays a `select!` arm:
+        // drop-on-cancel is the documented single exception in this module
+        // (#397), since the forwarder's only in-flight resource is a socket
+        // that closes on Drop.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
+            r = forwarder.try_forward(&query, per_upstream) => r,
+        };
+        completed = attempt;
+        match result {
+            Ok(reply) => {
+                if is_dns_reply_ok(&reply) {
+                    outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
+                    break;
+                }
+                last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+            }
+            Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
+        }
+    }
+
+    let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
+        attempts: completed,
+        reason: last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
     });
 
     let elapsed_ms = started.elapsed().as_millis() as u64;

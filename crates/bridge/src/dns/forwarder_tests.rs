@@ -183,6 +183,13 @@ async fn primary_fails_secondary_succeeds() {
     let q = sample_query(0x0001);
     let dead_addr = dead_addr(0);
     let (live_addr, _h) = start_tcp_stub(Vec::new()).await;
+    // The refuse list matches by exact SocketAddr and the stub's port is
+    // kernel-assigned, so pin the premise: a collision would refuse the
+    // secondary too and read as a failover regression.
+    assert_ne!(
+        live_addr, dead_addr,
+        "the refuse list must not swallow the live secondary"
+    );
 
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), live_addr.ip()]),
@@ -467,12 +474,9 @@ fn cause_of_tls_layer_with_a_trust_chain_rejection_is_certificate_rejected() {
 
 #[skuld::test]
 fn cause_of_a_non_trust_certificate_complaint_is_not_certificate_rejected() {
-    // A resolver IP outside the provider table is verified against an IP SAN,
-    // so a cert carrying only DNS SANs fails with NotValidForName on every
-    // start, on a clean network — and a skewed clock yields Expired. Reporting
-    // either as interception would blame the network for the user's config or
-    // clock, and would tell them switching resolvers cannot help when it is in
-    // fact the fix.
+    // The non-trust CertificateError variants `is_trust_chain_rejection`'s doc
+    // explains must not be reported as interception: they come from the user's
+    // own config or clock, not the network.
     for rustls_err in [
         // A CRL we merely could not parse is a fault in material we supply, not
         // an interceptor's doing — it must not inherit the interception claim.

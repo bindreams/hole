@@ -43,6 +43,22 @@ impl RefusingConnector {
     }
 }
 
+/// Never completes a connect. Pairs with `tokio::time::pause()` to drive
+/// budget-expiry paths on virtual time, without any wall-clock wait.
+#[derive(Debug)]
+pub(crate) struct HangingConnector;
+
+#[async_trait::async_trait]
+impl UpstreamConnector for HangingConnector {
+    async fn connect_tcp(&self, _target: SocketAddr) -> io::Result<ConnectedStream> {
+        std::future::pending().await
+    }
+
+    async fn connect_udp(&self, _target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
+        std::future::pending().await
+    }
+}
+
 #[async_trait::async_trait]
 impl UpstreamConnector for RefusingConnector {
     async fn connect_tcp(&self, target: SocketAddr) -> io::Result<ConnectedStream> {
