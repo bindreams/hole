@@ -231,6 +231,10 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// instead of the production `resolve_via_doh`.
     #[cfg(test)]
     bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
+    /// The `ech-doh` URL the most recent start derived. Test-only: the
+    /// derivation is otherwise observable only through the plugin it spawns.
+    #[cfg(test)]
+    last_ech_doh: Option<String>,
 }
 
 /// A held block-until-connected cover plus the server identity it permits. The
@@ -241,6 +245,10 @@ struct BlockedStart<C> {
     cover: C,
     host: String,
     server_ip: IpAddr,
+    /// Which resolver answered when this cover's IP was resolved. A covered
+    /// retry never re-resolves, so it reuses this — revalidated against the
+    /// retry's own config, so an edited resolver set is never overridden.
+    pin: crate::dns::ech::PinSource,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -271,6 +279,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             state_owner: None,
             #[cfg(test)]
             bootstrap_querier: None,
+            #[cfg(test)]
+            last_ech_doh: None,
         }
     }
 
@@ -438,6 +448,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.blocked.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_ech_doh(&self) -> Option<&str> {
+        self.last_ech_doh.as_deref()
+    }
+
     /// Whether the standing kill switch intent is on (from `bridge-lockdown.json`).
     /// Default-off when there is no state_dir or no file.
     pub fn lockdown_enabled(&self) -> bool {
@@ -539,10 +554,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Resolve the server IP over private DoH. A same-server retry under the held
         // cover reuses the cached IP (the cover blocks the resolvers).
-        let server_ip = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
-            Some(b) => b.server_ip,
+        let (server_ip, pin) = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
+            Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
-                Ok(ip) => ip,
+                Ok(b) => (b.server_ip, b.via),
                 Err(e) => {
                     if !matches!(e, ProxyError::Cancelled) {
                         self.last_error = Some(e.to_string());
@@ -557,6 +572,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
             },
         };
+
+        // Every pin outcome reaches ex-ray as one URL, so the reason is named here
+        // or it is unrecoverable from the log.
+        let ech_doh = crate::dns::ech::ech_doh_url(&config.dns, pin);
+        debug!(ech_doh = ?ech_doh, ?pin, "ech-doh source");
+        if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
+            warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
+        }
+        #[cfg(test)]
+        {
+            self.last_ech_doh = ech_doh.as_ref().map(|e| e.url.clone());
+        }
 
         // Engage the block-until-connected cover for a covered start UNLESS the
         // standing lockdown intent is on: that cohort installs the lockdown cover
@@ -579,6 +606,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
+                            pin,
                         });
                     }
                     Err(e) => {
@@ -612,6 +640,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             &self.dns,
             config,
             server_ip,
+            ech_doh,
             blocking_engaged,
             self.state_dir.as_deref(),
             self.state_owner,
@@ -675,7 +704,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         config: &ProxyConfig,
         bootstrap_querier: &Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>>,
         cancel: &CancellationToken,
-    ) -> Result<IpAddr, ProxyError> {
+    ) -> Result<crate::dns::bootstrap::Bootstrapped, ProxyError> {
         if cancel.is_cancelled() {
             return Err(ProxyError::Cancelled);
         }
@@ -683,9 +712,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await,
             None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
         };
-        Ok(res
-            .inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?
-            .server_ip)
+        Ok(res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?)
     }
 
     /// Produce a [`RunningState`] without touching `self`.
@@ -748,6 +775,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         dns: &D,
         config: &ProxyConfig,
         server_ip: IpAddr,
+        ech_doh: Option<crate::dns::ech::EchDoh>,
         blocking_engaged: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
@@ -771,13 +799,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // wait + bind_ephemeral retries.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
             let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
-            // ech-doh = the first configured resolver's DoH URL, so ex-ray's
-            // ECH path fetches the ECHConfigList over the same private DoH the
-            // bootstrap used. Empty `dns.servers` ⇒ no ech-doh ⇒ ECH off.
-            let ech_doh = config.dns.servers.first().map(|ip| crate::dns::ech::EchDoh {
-                url: hole_common::doh_url(*ip),
-                pinned: false,
-            });
             let chain = crate::proxy::plugin::start_plugin_chain(
                 plugin_name,
                 &plugin_path,
