@@ -17,10 +17,11 @@ use hole_common::config::DnsConfig;
 
 /// Which resolver the ECH lookup is pinned to — and when none is, why.
 ///
-/// An unpinned URL names an endpoint nothing has demonstrated this host can
-/// reach. The reasons stay distinct because they are not equally benign:
-/// `NoQueryNeeded` means nothing needed pinning, while `SecureBootstrapFailed`
-/// means every configured resolver already failed for the proxy hostname.
+/// Anything but `Answered` names an endpoint nothing has demonstrated this host
+/// can reach. The reasons stay distinct because they are not equally benign,
+/// and each is reported in its own words: `NoQueryNeeded` means no query was
+/// ever issued, while `SecureBootstrapFailed` means every configured resolver
+/// failed to complete a DoH exchange at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinSource {
     /// This resolver returned a well-formed reply over its DoH channel. What it
@@ -50,28 +51,31 @@ pub fn doh_url_for_ip(ip: IpAddr) -> String {
 /// Whether `url`'s authority is a name rather than an IP literal. A name is
 /// what costs the plaintext system-DNS lookup this module exists to avoid, so
 /// it is the test for whether replacing a URL removes a leak or merely swaps
-/// one endpoint for another. Anything that is not an IP literal is a name —
-/// including an unparseable authority, which a plugin would hand to its
-/// resolver verbatim.
+/// one endpoint for another. Anything not demonstrably an IP literal counts as
+/// a name — an unparseable or host-less URL included, since a plugin would hand
+/// whatever it read to its resolver.
 pub fn authority_is_a_name(url: &str) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split_once(']').map_or(v6, |(host, _)| host),
-        None => authority.split_once(':').map_or(authority, |(host, _)| host),
-    };
-    host.parse::<IpAddr>().is_err()
+    !matches!(
+        url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)),
+        Some(host) if host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok()
+    )
 }
 
-/// The `ech-doh` Hole offers, and whether it names a resolver that ANSWERED.
-/// Unpinned, it is a guess — on `SecureBootstrapFailed` a resolver that just
-/// failed — so it displaces a value the config already carries only when that
-/// value's authority is a name (see [`authority_is_a_name`]).
+/// The `ech-doh` Hole offers, and how its resolver was chosen. The reason is
+/// carried rather than reduced to "pinned": each one warrants a different line
+/// in the log, and only [`PinSource::Answered`] outranks a value the config
+/// already carries whose authority is not a name (see [`authority_is_a_name`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchDoh {
     pub url: String,
-    pub pinned: bool,
+    pub source: PinSource,
+}
+
+impl EchDoh {
+    /// Whether a resolver demonstrated it serves DoH from this host.
+    pub fn is_pinned(&self) -> bool {
+        matches!(self.source, PinSource::Answered(_))
+    }
 }
 
 /// The `ech-doh=<url>` value: the pinned resolver, or a configured one when
@@ -84,20 +88,18 @@ pub struct EchDoh {
 /// one address family on a path where nothing demonstrated the host has it, and
 /// ex-ray cannot fail over to the other.
 pub fn ech_doh_url(dns: &DnsConfig, source: PinSource) -> Option<EchDoh> {
-    let (resolver, pinned) = match source {
-        PinSource::Answered(ip) => (Some(ip), true),
-        _ => (
-            dns.servers
-                .iter()
-                .find(|ip| ip.is_ipv4())
-                .or_else(|| dns.servers.first())
-                .copied(),
-            false,
-        ),
+    let resolver = match source {
+        PinSource::Answered(ip) => Some(ip),
+        _ => dns
+            .servers
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or_else(|| dns.servers.first())
+            .copied(),
     };
     resolver.map(|ip| EchDoh {
         url: doh_url_for_ip(ip),
-        pinned,
+        source,
     })
 }
 

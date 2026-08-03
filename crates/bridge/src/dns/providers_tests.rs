@@ -57,33 +57,38 @@ fn all_keys_parse_as_ip() {
     }
 }
 
-// ech-doh must carry no host — see `crate::dns::ech` for why. Assert per
-// provider IP so a future addition can't silently reintroduce the leak.
+// The table drives DoT SNI and the DoH `Host:`/certificate check
+// (`tls_server_name_for` / `https_target_for`), so a mistyped or dropped IP
+// silently downgrades a hostname-verified channel to IP-SAN verification. Pin
+// the set explicitly — the same resolvers `ui/settings.ts` offers as presets.
 #[skuld::test]
-fn every_provider_ip_yields_a_name_free_ech_doh_authority() {
-    use hole_common::config::DnsConfig;
+fn the_table_covers_exactly_the_shipped_resolver_ips() {
+    use std::collections::BTreeSet;
 
-    use crate::dns::ech::{ech_doh_url, PinSource};
-
-    for (addr, _) in TABLE {
-        let resolver: IpAddr = addr.parse().expect("table IP literal");
-        let cfg = DnsConfig {
-            servers: vec![resolver],
-            ..Default::default()
-        };
-        let url = ech_doh_url(&cfg, PinSource::Answered(resolver))
-            .expect("a resolver is configured")
-            .url;
-        let rest = url.strip_prefix("https://").expect("https URL");
-        let authority = rest.split('/').next().expect("split yields at least one part");
-        let bare = authority
-            .strip_prefix('[')
-            .and_then(|a| a.strip_suffix(']'))
-            .unwrap_or(authority);
-        assert_eq!(
-            bare.parse::<IpAddr>().ok(),
-            Some(resolver),
-            "ech-doh authority for {resolver} must be the IP literal, got {url}"
-        );
-    }
+    let expected: BTreeSet<IpAddr> = [
+        "1.1.1.1",
+        "1.0.0.1",
+        "2606:4700:4700::1111",
+        "2606:4700:4700::1001",
+        "8.8.8.8",
+        "8.8.4.4",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844",
+        "9.9.9.9",
+        "149.112.112.112",
+        "2620:fe::fe",
+        "2620:fe::9",
+        "208.67.222.222",
+        "208.67.220.220",
+        "94.140.14.14",
+        "94.140.15.15",
+    ]
+    .iter()
+    .map(|a| a.parse().expect("expected IP literal"))
+    .collect();
+    let actual: BTreeSet<IpAddr> = TABLE
+        .iter()
+        .map(|(addr, _)| addr.parse().expect("table IP literal"))
+        .collect();
+    assert_eq!(actual, expected, "the provider IP set changed");
 }

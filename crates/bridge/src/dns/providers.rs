@@ -52,7 +52,7 @@ const ADGUARD: KnownProvider = KnownProvider {
 };
 
 // Stable order — tests match on this to catch accidental reshuffling.
-const TABLE: &[(&str, &KnownProvider)] = &[
+pub(crate) const TABLE: &[(&str, &KnownProvider)] = &[
     ("1.1.1.1", &CLOUDFLARE),
     ("1.0.0.1", &CLOUDFLARE),
     ("2606:4700:4700::1111", &CLOUDFLARE),

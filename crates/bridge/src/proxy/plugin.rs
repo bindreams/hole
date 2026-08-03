@@ -407,6 +407,21 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
     }
 }
 
+/// Why no resolver is pinned, in the words of the reason itself — "no resolver
+/// answered" is false for a literal server entry, where none was ever asked.
+fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
+    use crate::dns::ech::PinSource;
+    match ech_doh.map(|e| e.source) {
+        Some(PinSource::NoQueryNeeded) => "the server entry is a literal IP, so no resolver was consulted",
+        Some(PinSource::SecureBootstrapFailed) => "no configured resolver completed a DoH exchange",
+        Some(PinSource::ResolverDeselected) => "the cached resolver is no longer configured",
+        Some(PinSource::Answered(_)) | None => {
+            debug_assert!(false, "unpinned_reason is only reached for an unpinned EchDoh");
+            "no resolver is pinned"
+        }
+    }
+}
+
 /// Remove any existing copy of a key Hole is about to set, then append it.
 /// ex-ray's `Args.Get` is first-wins, so an appended duplicate would silently
 /// lose to a user's, and postern writes `ech-doh` before Hole ever sees the
@@ -436,7 +451,7 @@ fn inject_plugin_directives(
             // is no leak to fix, so only a resolver that ANSWERED outranks the
             // operator's own choice.
             let displaces = match (ech_doh, config_ech_doh) {
-                (Some(e), Some(s)) => e.pinned || crate::dns::ech::authority_is_a_name(&s.value),
+                (Some(e), Some(s)) => e.is_pinned() || crate::dns::ech::authority_is_a_name(&s.value),
                 _ => false,
             };
             // Strip only what we are about to set, so an override never becomes
@@ -449,19 +464,24 @@ fn inject_plugin_directives(
 
             // Which ECH source won, and how much is known about it. Every outcome
             // reaches ex-ray as one URL, so this is the only record of the choice.
-            let fail_closed = segments.iter().any(|s| s.key == "ech" && s.value == "always");
+            // `find`, not `any`: ex-ray reads the FIRST `ech`, so a later one
+            // reporting a posture it will never apply would invert the line.
+            let fail_closed = segments
+                .iter()
+                .find(|s| s.key == "ech")
+                .is_some_and(|s| s.value == "always");
             match (ech_doh, config_ech_doh) {
-                // Ours yields: theirs already names an IP, and nothing here
-                // demonstrated that our resolver answers.
                 (Some(_), Some(s)) if !displaces => tracing::warn!(
                     plugin = %plugin_name,
-                    "no resolver answered, so the config's own name-free ech-doh stands: {}", s.raw
+                    "{}, so the config's own name-free ech-doh stands: {}",
+                    unpinned_reason(ech_doh),
+                    s.raw
                 ),
-                // Ours is what the plugin will fetch from, but no resolver
-                // answered the bootstrap, so nothing has demonstrated it works.
-                (Some(e), _) if !e.pinned => tracing::warn!(
+                (Some(e), _) if !e.is_pinned() => tracing::warn!(
                     plugin = %plugin_name, fail_closed,
-                    "no resolver answered; the ECH lookup falls back to an unverified resolver: {}", e.url
+                    "{}; the ECH lookup uses a resolver that has not been exercised: {}",
+                    unpinned_reason(ech_doh),
+                    e.url
                 ),
                 (Some(_), _) => {}
                 // Stripping this would disarm ECH altogether, so it stands — but
@@ -517,7 +537,7 @@ fn readiness_for(plugin_name: &str) -> garter::ReadinessMode {
 #[cfg(test)]
 mod inject_tests {
     use super::*;
-    use crate::dns::ech::EchDoh;
+    use crate::dns::ech::{EchDoh, PinSource};
 
     /// The merged options, or panic — for inputs that are not testing rejection.
     fn merged(plugin: &str, opts: Option<&str>, ech_doh: Option<&EchDoh>) -> Option<String> {
@@ -528,16 +548,37 @@ mod inject_tests {
     fn pinned(url: &str) -> EchDoh {
         EchDoh {
             url: url.to_string(),
-            pinned: true,
+            source: PinSource::Answered("9.9.9.9".parse().expect("test IP literal")),
         }
     }
 
-    /// An `ech-doh` Hole guessed because no resolver answered.
-    fn unpinned(url: &str) -> EchDoh {
+    /// An `ech-doh` Hole guessed for the given reason, no resolver having answered.
+    fn unpinned_for(url: &str, source: PinSource) -> EchDoh {
         EchDoh {
             url: url.to_string(),
-            pinned: false,
+            source,
         }
+    }
+
+    fn unpinned(url: &str) -> EchDoh {
+        unpinned_for(url, PinSource::SecureBootstrapFailed)
+    }
+
+    /// The WARN lines `inject_plugin_directives` emits for these arguments.
+    fn warnings_for(plugin: &str, opts: Option<&str>, ech_doh: Option<&EchDoh>) -> String {
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+        let writer = crate::test_support::log_capture::VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            let _ = inject_plugin_directives(plugin, opts, ech_doh);
+        }
+        writer.snapshot_string()
     }
 
     #[skuld::test]
@@ -848,6 +889,61 @@ mod inject_tests {
             )
             .as_deref(),
             Some("loglevel=warning"),
+        );
+    }
+
+    // The reason no resolver is pinned is reported in its own words: "no resolver
+    // answered" is false for a literal server entry, where none was ever asked.
+    #[skuld::test]
+    fn each_unpinned_reason_is_reported_in_its_own_words() {
+        for (source, expected) in [
+            (PinSource::NoQueryNeeded, "the server entry is a literal IP"),
+            (
+                PinSource::SecureBootstrapFailed,
+                "no configured resolver completed a DoH exchange",
+            ),
+            (
+                PinSource::ResolverDeselected,
+                "the cached resolver is no longer configured",
+            ),
+        ] {
+            let ech_doh = unpinned_for("https://1.1.1.1/dns-query", source);
+            let out = warnings_for("ex-ray", Some("path=/x"), Some(&ech_doh));
+            assert!(
+                out.contains(expected),
+                "{source:?} must be reported as {expected:?}, got:
+{out}"
+            );
+            assert!(
+                !out.contains("no resolver answered"),
+                "{source:?} must not claim a resolver answered nothing, got:
+{out}"
+            );
+        }
+    }
+
+    // A pinned resolver is the good case and warns about nothing.
+    #[skuld::test]
+    fn a_pinned_resolver_warns_about_nothing() {
+        let out = warnings_for("ex-ray", Some("path=/x"), Some(&pinned("https://9.9.9.9/dns-query")));
+        assert_eq!(out, "", "a pinned ech-doh has nothing to report");
+    }
+
+    // ex-ray reads the FIRST `ech`, so a later `always` it will never apply must
+    // not be reported as a fail-closed posture.
+    #[skuld::test]
+    fn fail_closed_reads_the_first_ech_not_any_of_them() {
+        let out = warnings_for("ex-ray", Some("ech=never;ech=always"), None);
+        assert!(
+            out.contains("fail_closed=false"),
+            "the first `ech` is `never`; got:
+{out}"
+        );
+        let out = warnings_for("ex-ray", Some("ech=always;ech=never"), None);
+        assert!(
+            out.contains("fail_closed=true"),
+            "the first `ech` is `always`; got:
+{out}"
         );
     }
 

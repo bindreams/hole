@@ -8,7 +8,7 @@ fn ip(s: &str) -> IpAddr {
     s.parse().expect("test IP literal")
 }
 
-/// The URL of a derived `EchDoh`, dropping the pin flag.
+/// The URL of a derived `EchDoh`, dropping the reason.
 fn url_of(e: Option<EchDoh>) -> Option<String> {
     e.map(|e| e.url)
 }
@@ -115,25 +115,23 @@ fn an_answering_ipv6_resolver_is_bracketed() {
     );
 }
 
-// Only a resolver that answered is pinned; every other reason is a guess and
-// must say so, because an unpinned URL never displaces a config's own.
+// The reason travels with the URL: a caller decides displacement from
+// `is_pinned`, and reports the unpinned cases in their own words.
 #[skuld::test]
-fn only_an_answering_resolver_is_marked_pinned() {
+fn the_derived_url_carries_the_reason_it_was_chosen() {
     let cfg = dns(&["9.9.9.9"]);
-    assert!(
-        ech_doh_url(&cfg, PinSource::Answered(ip("9.9.9.9")))
-            .expect("a resolver is configured")
-            .pinned
-    );
+    let answered = PinSource::Answered(ip("9.9.9.9"));
+    let derived = ech_doh_url(&cfg, answered).expect("a resolver is configured");
+    assert_eq!(derived.source, answered);
+    assert!(derived.is_pinned());
     for source in [
         PinSource::NoQueryNeeded,
         PinSource::SecureBootstrapFailed,
         PinSource::ResolverDeselected,
     ] {
-        assert!(
-            !ech_doh_url(&cfg, source).expect("a resolver is configured").pinned,
-            "{source:?} is not a resolver that answered"
-        );
+        let derived = ech_doh_url(&cfg, source).expect("a resolver is configured");
+        assert_eq!(derived.source, source);
+        assert!(!derived.is_pinned(), "{source:?} is not a resolver that answered");
     }
 }
 
@@ -225,28 +223,12 @@ fn revalidate_leaves_the_unpinned_reasons_alone() {
     }
 }
 
-// Every shipped provider IP must produce a name-free authority — a provider
-// added to the table cannot silently reintroduce a hostname lookup.
+// Every shipped provider IP must produce a name-free authority. Driven by the
+// real table, so a provider added there — or a derivation that started
+// consulting it for a hostname URL again — is caught here.
 #[skuld::test]
 fn every_provider_ip_yields_a_name_free_authority() {
-    for addr in [
-        "1.1.1.1",
-        "1.0.0.1",
-        "2606:4700:4700::1111",
-        "2606:4700:4700::1001",
-        "8.8.8.8",
-        "8.8.4.4",
-        "2001:4860:4860::8888",
-        "2001:4860:4860::8844",
-        "9.9.9.9",
-        "149.112.112.112",
-        "2620:fe::fe",
-        "2620:fe::9",
-        "208.67.222.222",
-        "208.67.220.220",
-        "94.140.14.14",
-        "94.140.15.15",
-    ] {
+    for (addr, _) in crate::dns::providers::TABLE {
         let resolver = ip(addr);
         let url = url_of(ech_doh_url(&dns(&[addr]), PinSource::Answered(resolver))).expect("a resolver is configured");
         assert_eq!(

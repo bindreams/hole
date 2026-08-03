@@ -128,10 +128,7 @@ fn split_decodes_the_key_but_leaves_the_segment_raw() {
     assert_eq!(s[0].raw, r"k\=ey=a\;b");
 }
 
-// A backslash escapes whatever follows, matching the SIP003 reference parser.
-// `parse_plugin_options` keeps the backslash here; a consumer asking "which key
-// will the PLUGIN read this as" must get the plugin's answer, or a strip keyed
-// on the decoded name can be evaded by escaping one character of it.
+// See `OptionSegment::key` for why this decoding rule differs from `parse_plugin_options`.
 #[skuld::test]
 fn split_decodes_a_key_the_way_a_sip003_plugin_does() {
     assert_eq!(segs(r"ech\-doh=x")[0].key, "ech-doh");
