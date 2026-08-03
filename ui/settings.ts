@@ -82,7 +82,7 @@ function patchDns(partial: Partial<DnsConfig>) {
 const customRow = document.getElementById("row-dns-custom")!;
 const dnsServersInput = document.getElementById("input-dns-servers") as HTMLInputElement;
 
-/** Provider key → resolver IP preset. Mirrors crates/common/src/dns_providers.rs. */
+/** Provider key → resolver IP preset. Mirrors crates/bridge/src/dns/providers.rs. */
 const DNS_PROVIDERS: Record<string, string[]> = {
   cloudflare: ["1.1.1.1", "1.0.0.1"],
   google: ["8.8.8.8", "8.8.4.4"],

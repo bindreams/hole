@@ -57,30 +57,33 @@ fn all_keys_parse_as_ip() {
     }
 }
 
-// This DoT/SNI table and hole_common's DoH-URL table are maintained by hand as
-// two tables (this one carries the extra tls_dns_name); they must cover the same
-// provider IPs and agree on each doh_url. Drift is otherwise silent: an IP here
-// but missing from hole_common makes `doh_url` fall back to a literal-IP URL that
-// is WRONG for the hostname-based providers (OpenDNS, AdGuard).
+// ech-doh must carry no host — see `crate::dns::ech` for why. Assert per
+// provider IP so a future addition can't silently reintroduce the leak.
 #[skuld::test]
-fn provider_table_agrees_with_hole_common() {
-    use std::collections::BTreeSet;
+fn every_provider_ip_yields_a_name_free_ech_doh_authority() {
+    use hole_common::config::DnsConfig;
 
-    let here: BTreeSet<IpAddr> = TABLE
-        .iter()
-        .map(|(addr, _)| addr.parse().expect("table IP literal"))
-        .collect();
-    let common: BTreeSet<IpAddr> = hole_common::dns_providers::provider_ips().collect();
-    assert_eq!(here, common, "provider IP sets have drifted from hole_common");
+    use crate::dns::ech::{ech_doh_url, PinSource};
 
-    for (addr, provider) in TABLE {
-        let ip = addr.parse::<IpAddr>().unwrap();
+    for (addr, _) in TABLE {
+        let resolver: IpAddr = addr.parse().expect("table IP literal");
+        let cfg = DnsConfig {
+            servers: vec![resolver],
+            ..Default::default()
+        };
+        let url = ech_doh_url(&cfg, PinSource::Answered(resolver))
+            .expect("a resolver is configured")
+            .url;
+        let rest = url.strip_prefix("https://").expect("https URL");
+        let authority = rest.split('/').next().expect("split yields at least one part");
+        let bare = authority
+            .strip_prefix('[')
+            .and_then(|a| a.strip_suffix(']'))
+            .unwrap_or(authority);
         assert_eq!(
-            hole_common::doh_url(ip),
-            provider.doh_url,
-            "doh_url for {ip} disagrees: bridge={}, hole_common={}",
-            provider.doh_url,
-            hole_common::doh_url(ip),
+            bare.parse::<IpAddr>().ok(),
+            Some(resolver),
+            "ech-doh authority for {resolver} must be the IP literal, got {url}"
         );
     }
 }

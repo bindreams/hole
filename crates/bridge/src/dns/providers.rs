@@ -1,10 +1,11 @@
-//! Known-provider table: maps a resolver IP to hostname-form metadata
-//! for DoT (SNI / cert verification) and DoH (full URL).
+//! Known-provider table: maps a resolver IP to hostname-form metadata for DoT
+//! (SNI / cert verification) and DoH (full URL).
 //!
-//! IPs not in the table fall back to IP-SAN cert verification for TLS and
-//! URL shape `https://<ip>/dns-query` for DoH — which works for Cloudflare
-//! / Google / Quad9 today but requires the provider to continue shipping
-//! IP-SAN-bearing certs.
+//! The hostname form is for SNI and the `Host:` header only — the connection is
+//! always made to the configured IP. Every table IP also serves DoH addressed by
+//! IP literal with full certificate verification, which is what
+//! `crate::dns::ech` hands the plugin chain; an IP absent from this table gets
+//! that same literal form for DoT/DoH too.
 
 use std::net::IpAddr;
 
