@@ -241,6 +241,25 @@ async fn try_forward_reports_unreachable_when_every_server_refuses() {
 }
 
 #[skuld::test]
+fn attempted_upstreams_counts_only_the_servers_a_walk_will_dial() {
+    // A caller sizing a per-upstream budget from a total must divide by the
+    // width the walk ACTUALLY dials. Counting skipped IPv6 entries would shrink
+    // every surviving upstream's budget and leave part of the total unused.
+    let v4: IpAddr = "1.1.1.1".parse().unwrap();
+    let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+    let cfg = |servers: Vec<IpAddr>| build_cfg(DnsProtocol::Https, servers);
+    let width = |servers: Vec<IpAddr>, v6_ok: bool| {
+        DnsForwarder::new(cfg(servers), RefusingConnector::all(), v6_ok).attempted_upstreams()
+    };
+
+    assert_eq!(width(vec![v4, v6], false), 1, "the IPv6 entry is skipped");
+    assert_eq!(width(vec![v4, v6], true), 2, "with a bypass both are dialled");
+    assert_eq!(width(vec![v6], false), 0, "an all-IPv6 config dials nothing");
+    assert_eq!(width(vec![v4, v4], false), 2, "duplicates are separate attempts");
+}
+
+#[skuld::test]
 async fn try_forward_reports_malformed_query_and_no_upstream() {
     let (addr, _h) = start_udp_stub(None).await;
     let fwd = DnsForwarder::new_with_ports(

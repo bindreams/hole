@@ -1542,9 +1542,9 @@ async fn run_forwarder_self_test(
     // The overall bound is a DEADLINE the loop respects, not a `timeout` around
     // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
     // was in flight, and a dropped future produces no `UpstreamErr`, so that
-    // upstream's failure would never be classified or logged: the exact gap this
-    // gate exists to close. Bounding each attempt by what remains instead means
-    // every attempt runs to completion and nothing is discarded.
+    // upstream's failure would never be classified or logged. Bounding each
+    // attempt by what remains instead means every attempt runs to completion
+    // and nothing is discarded.
     let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
     let mut last_err: Option<String> = None;
     let mut completed: u32 = 0;
@@ -1559,16 +1559,25 @@ async fn run_forwarder_self_test(
         if remaining.is_zero() {
             break;
         }
-        // `try_forward` walks every configured resolver at `per_upstream` each,
-        // so divide what is left by the walk width to keep the whole attempt
-        // inside the deadline. `ATTEMPTS` is therefore a maximum, not a promise.
-        let per_upstream = PER_ATTEMPT.min(remaining / servers.len().max(1) as u32);
+        // `try_forward` walks every upstream it will attempt at `per_upstream`
+        // each, so divide what is left by that width to keep the whole attempt
+        // inside the deadline. The width comes from the forwarder, not from
+        // `servers.len()`: it skips IPv6 entries without an IPv6 bypass, and
+        // counting those would shrink every surviving upstream's budget while
+        // leaving part of the deadline unused. A zero-width walk dials nothing
+        // and returns immediately, so its budget is irrelevant.
+        let width = forwarder.attempted_upstreams();
+        let per_upstream = if width == 0 {
+            PER_ATTEMPT
+        } else {
+            PER_ATTEMPT.min(remaining / width as u32)
+        };
         // The budget goes down into the forwarder so `forward_one`'s own
         // deadline fires first, producing a classified `UpstreamErr` that
         // `log_upstream_failure` can log. Cancel stays a `select!` arm:
-        // drop-on-cancel is the documented single exception in this module
-        // (#397), since the forwarder's only in-flight resource is a socket
-        // that closes on Drop.
+        // drop-on-cancel is the documented single exception in this module,
+        // since the forwarder's only in-flight resource is a socket that
+        // closes on Drop.
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,

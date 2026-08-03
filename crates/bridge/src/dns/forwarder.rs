@@ -470,6 +470,22 @@ impl DnsForwarder {
     /// pass this rather than wrapping the call in its own `timeout`: an outer
     /// timer that fires first drops the future before `forward_one`'s deadline,
     /// so nothing is classified and nothing is logged.
+    /// How many configured upstreams a walk will ACTUALLY attempt. IPv6 entries
+    /// are skipped without an IPv6 bypass, so this can be less than
+    /// `servers.len()` — and zero, for an all-IPv6 config on an IPv4-only host,
+    /// where a walk returns `NoUpstream` without dialling anything.
+    ///
+    /// A caller that owns a total budget divides by this to size the
+    /// `per_upstream` it passes to [`Self::try_forward`]. The skip rule lives
+    /// here, next to the loop that applies it, so a caller cannot drift from it.
+    pub fn attempted_upstreams(&self) -> usize {
+        self.config
+            .servers
+            .iter()
+            .filter(|s| !s.is_ipv6() || self.ipv6_bypass_available)
+            .count()
+    }
+
     pub async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
         if query.len() < 12 {
             // A caller bug, and the one failure with no per-upstream WARN

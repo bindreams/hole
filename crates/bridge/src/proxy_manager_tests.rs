@@ -1950,8 +1950,8 @@ mod self_test {
 
     /// The self-test hands its budget DOWN to the forwarder instead of
     /// wrapping the call in a `timeout`, so a failing attempt is classified and
-    /// logged before the self-test's own budget can drop it. Because the reason
-    /// now carries the typed cause, this asserts the gate reports WHAT failed.
+    /// logged before the self-test's own budget can drop it. This asserts the
+    /// reason carries the typed cause, i.e. the gate reports WHAT failed.
     #[skuld::test]
     fn self_test_failure_logs_the_typed_upstream_cause() {
         let writer = VecWriter::new();
