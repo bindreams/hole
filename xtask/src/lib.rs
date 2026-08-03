@@ -15,6 +15,7 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod ci_coverage;
+pub mod ci_nextest_parity;
 pub mod ci_timeouts;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
 // dependency — the DMG background is a darwin feature).
@@ -41,6 +42,9 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
+#[cfg(test)]
+#[path = "ci_nextest_parity_tests.rs"]
+mod ci_nextest_parity_tests;
 #[cfg(test)]
 #[path = "ci_timeouts_tests.rs"]
 mod ci_timeouts_tests;

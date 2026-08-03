@@ -278,8 +278,10 @@ jobs:
     # once it is. windows/amd64 has never been killed but sits at 94% of the old
     # wall, so it is raised too; darwin/arm64 has 29% margin and stays.
     #
-    # For darwin this is a stopgap: most of its TUN pass is a whole-workspace
-    # rebuild caused by a feature-set mismatch in that step (#720).
+    # The macOS TUN step's own rebuild is gone (its feature set now matches), so
+    # the darwin measurements above predate that — re-measure those legs before
+    # tightening. windows/amd64 is unaffected; its TUN step already matched. The
+    # `hole` → `hole-tests` cascade still recompiles the shared crates (#723).
     #
     # The `ci_installer_assembly_jobs_share_a_timeout_budget` conformance test
     # does not cover these: it selects jobs whose xtask cascade reaches a
@@ -327,6 +329,8 @@ jobs:
       # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
       # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
       # compiled actually run (matching feature set → no rebuild). See #522.
+      # The `ci_test_hole_steps_match_the_hole_tests_target` conformance test
+      # holds every nextest step here equal to that target's `run:`.
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
@@ -341,7 +345,8 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      - name: Test (TUN, runs last for #200)
+      # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
+      - name: "Test (TUN, runs last for #200)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
         shell: bash
@@ -362,6 +367,10 @@ jobs:
       # binaries are prebuilt above; nextest only re-executes them). macOS
       # runners have passwordless sudo. Windows engages WFP from the elevated
       # token above; macOS has no such token, so root is the equivalent.
+      #
+      # `--features` must match `Build hole test binaries` and the non-TUN
+      # step above (see that comment) or cargo rebuilds instead of reusing
+      # the prebuilt binaries.
       - name: Test (TUN, macOS — root for pfctl)
         if: matrix.os == 'darwin'
         id: test-tun-macos
@@ -369,10 +378,12 @@ jobs:
         run: >
           sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
           cargo nextest run --no-default-features
+          --features tombstone/crash-dumps,tombstone/crash-child
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+              + package(handle-holders) + package(tombstone)
+              + package(hole-test-observability)'
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see

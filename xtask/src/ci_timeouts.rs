@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::ci_coverage::{join_line_continuations, split_commands, step_command};
+use crate::ci_coverage::{join_line_continuations, split_commands, step_command, unquote};
 use crate::manifest::Manifest;
 
 // Minimal `ci.yaml` shape — serde ignores every field we don't name, so this
@@ -77,21 +77,6 @@ fn resolve_timeout(id: &str, value: &serde_yml::Value) -> Result<u64> {
 struct CiStep {
     #[serde(default)]
     run: Option<String>,
-}
-
-/// Strip one matched pair of surrounding shell quotes.
-///
-/// [`split_commands`] preserves quote characters, so `cargo xtask build
-/// "hole-msi"` yields the token `"hole-msi"`. Comparing that raw against a
-/// target name silently drops the command out of every match below — the exact
-/// invisible-miss the conformance test exists to prevent.
-fn unquote(tok: &str) -> &str {
-    for q in ['"', '\''] {
-        if let Some(inner) = tok.strip_prefix(q).and_then(|t| t.strip_suffix(q)) {
-            return inner;
-        }
-    }
-    tok
 }
 
 /// Does `cmd` assemble an installer package?
