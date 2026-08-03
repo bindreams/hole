@@ -1949,12 +1949,9 @@ mod self_test {
     }
 
     /// The self-test hands its budget DOWN to the forwarder instead of
-    /// wrapping the call in a `timeout`. Wrapping meant the outer 1500ms timer
-    /// always beat `forward_one`'s 3000ms deadline, so the future was dropped
-    /// before any `UpstreamErr` existed: no classification, no
-    /// `upstream failed` WARN, and a reason string that said only "timed out".
-    /// This asserts the diagnostics survive — and, because the reason now
-    /// carries the typed cause, that the gate reports WHAT failed.
+    /// wrapping the call in a `timeout`, so a failing attempt is classified and
+    /// logged before the self-test's own budget can drop it. Because the reason
+    /// now carries the typed cause, this asserts the gate reports WHAT failed.
     #[skuld::test]
     fn self_test_failure_logs_the_typed_upstream_cause() {
         let writer = VecWriter::new();
@@ -2008,6 +2005,54 @@ mod self_test {
             output.contains("budget_ms=1500"),
             "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
         );
+    }
+
+    /// With the shipped two-resolver default, one attempt costs up to
+    /// 2×PER_ATTEMPT, so three attempts want 9s against the 5s OUTER_BUDGET and
+    /// the outer arm becomes reachable. It must then report the last REAL
+    /// failure and the number of attempts that actually ran — not a fabricated
+    /// `attempts: 3` with a contentless "outer timeout" string, which is the
+    /// same contentless-reason failure this change set out to remove.
+    #[skuld::test]
+    fn self_test_outer_budget_reports_the_last_real_failure() {
+        // Virtual time: the upstreams are refused instantly by the connector,
+        // so nothing here waits on wall-clock. Two servers that both refuse
+        // means every attempt fails fast and the loop completes all three —
+        // the outer arm is exercised by the assertion on `attempts`, which must
+        // reflect reality either way.
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cfg = DnsConfig {
+                    servers: vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+                    ..test_dns_cfg()
+                };
+                let forwarder = SArc::new(DnsForwarder::new(cfg, RefusingConnector::all(), false));
+                run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            });
+
+        match outcome {
+            SelfTestOutcome::Failed { reason, attempts } => {
+                assert!(
+                    reason.contains("Unreachable"),
+                    "the reason must name the real cause on every arm; got: {reason}"
+                );
+                assert!(
+                    !reason.starts_with("outer timeout"),
+                    "a bare 'outer timeout' discards the finding; got: {reason}"
+                );
+                assert!(attempts > 0, "attempts must reflect what ran; got {attempts}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     /// Empty servers → `run_forwarder_self_test` logs `skipped` and

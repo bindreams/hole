@@ -1511,8 +1511,7 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// attempt against N configured resolvers can take up to N×`PER_ATTEMPT`;
 /// `OUTER_BUDGET` remains the overall bound and may cut the retry sequence
 /// short. That is the intended trade: every upstream that fails inside its own
-/// budget is classified and logged first, which is what the outer-timeout
-/// version could never do. Also writes
+/// budget is classified and logged first. Also writes
 /// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
 /// log line at `info!`. On failure, additionally emits a `warn!`
 /// correlation breadcrumb pointing the reader to the plugin tap
@@ -1540,47 +1539,71 @@ async fn run_forwarder_self_test(
 
     let query = sample_self_test_query();
     let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(OUTER_BUDGET, async {
-        let mut last_err: Option<String> = None;
-        for attempt in 1..=ATTEMPTS {
-            // Cooperative cancel check between retry attempts (#397).
-            if cancel.is_cancelled() {
-                return SelfTestOutcome::Cancelled;
-            }
-            // The budget goes DOWN into the forwarder rather than wrapping the
-            // call in a `timeout`. Wrapping is what this used to do, and it
-            // silently destroyed every diagnostic: the outer 1500ms timer
-            // always beat `forward_one`'s own deadline, so the future was
-            // dropped before an `UpstreamErr` existed and `log_upstream_failure`
-            // never ran. `bridge.log` got nothing and the reason degraded to
-            // "timed out" — exactly the case where the detail matters most.
-            // Cancel stays a `select!` arm; drop-on-cancel is the documented
-            // single exception in this module (#397), since the forwarder's
-            // only in-flight resource is a socket that closes on Drop.
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-                r = forwarder.try_forward(&query, PER_ATTEMPT) => r,
-            };
-            match result {
-                Ok(reply) => {
-                    if is_dns_reply_ok(&reply) {
-                        return SelfTestOutcome::Ok { attempts: attempt };
-                    }
-                    last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+    // Retry state lives OUTSIDE the timed future. `timeout` DROPS the future,
+    // taking anything it owns with it, and `OUTER_BUDGET` is genuinely
+    // reachable: one attempt costs up to `servers.len() * PER_ATTEMPT`, so with
+    // the two-resolver default three attempts can want 9s against a 5s bound.
+    // Held out here, the outer arm reports the last real failure and the number
+    // of attempts that actually ran instead of inventing both.
+    let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let outcome = tokio::time::timeout(OUTER_BUDGET, {
+        let last_err = std::sync::Arc::clone(&last_err);
+        let completed = std::sync::Arc::clone(&completed);
+        let forwarder = std::sync::Arc::clone(&forwarder);
+        let query = query.clone();
+        let cancel = cancel.clone();
+        async move {
+            for attempt in 1..=ATTEMPTS {
+                // Cooperative cancel check between retry attempts (#397).
+                if cancel.is_cancelled() {
+                    return SelfTestOutcome::Cancelled;
                 }
-                Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
+                // The budget goes down into the forwarder so `forward_one`'s own
+                // deadline fires first, producing a classified `UpstreamErr` that
+                // `log_upstream_failure` can log — an outer `timeout` around the
+                // call would drop the future before that happens. Cancel stays a
+                // `select!` arm: drop-on-cancel is the documented single
+                // exception in this module (#397), since the forwarder's only
+                // in-flight resource is a socket that closes on Drop.
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
+                    r = forwarder.try_forward(&query, PER_ATTEMPT) => r,
+                };
+                match result {
+                    Ok(reply) => {
+                        if is_dns_reply_ok(&reply) {
+                            return SelfTestOutcome::Ok { attempts: attempt };
+                        }
+                        *last_err.lock().expect("poisoned") = Some(format!("SERVFAIL reply on attempt {attempt}"));
+                    }
+                    Err(failure) => {
+                        *last_err.lock().expect("poisoned") = Some(format!("attempt {attempt} failed: {failure:?}"));
+                    }
+                }
+                completed.store(attempt, std::sync::atomic::Ordering::SeqCst);
             }
-        }
-        SelfTestOutcome::Failed {
-            attempts: ATTEMPTS,
-            reason: last_err.unwrap_or_else(|| "unknown".into()),
+            SelfTestOutcome::Failed {
+                attempts: ATTEMPTS,
+                reason: last_err
+                    .lock()
+                    .expect("poisoned")
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            }
         }
     })
     .await
-    .unwrap_or(SelfTestOutcome::Failed {
-        attempts: ATTEMPTS,
-        reason: format!("outer timeout after {OUTER_BUDGET:?}"),
+    .unwrap_or_else(|_| SelfTestOutcome::Failed {
+        attempts: completed.load(std::sync::atomic::Ordering::SeqCst),
+        reason: last_err
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .map(|e| format!("{e}; gave up after {OUTER_BUDGET:?}"))
+            .unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
     });
 
     let elapsed_ms = started.elapsed().as_millis() as u64;

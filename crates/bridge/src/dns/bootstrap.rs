@@ -222,6 +222,41 @@ impl DohQuerier for ForwarderQuerier {
     }
 }
 
+/// What one query leg concluded. Both legs classify identically; only what they
+/// do with the conclusion differs, so the classification lives here once.
+enum LegOutcome {
+    /// A usable address of the family this leg asked for.
+    Address(IpAddr),
+    /// The resolver answered without one. `name_missing` is its NXDOMAIN
+    /// verdict — conclusive about the hostname, unlike an empty NOERROR.
+    Answered { name_missing: bool },
+    /// No usable reply: the round trip failed, or the bytes were not DNS.
+    Failed(BootstrapError),
+}
+
+/// Run one query leg against `server` and classify the result. `want` selects
+/// the address family this leg asked for.
+async fn run_leg(
+    querier: &Arc<dyn DohQuerier>,
+    server: IpAddr,
+    wire: &[u8],
+    rtype: RecordType,
+    want: fn(&IpAddr) -> bool,
+) -> LegOutcome {
+    match querier.query(server, wire).await {
+        Ok(reply) => match parse_addrs(&reply) {
+            Some(parsed) => match parsed.addrs.into_iter().find(want) {
+                Some(ip) => LegOutcome::Address(ip),
+                None => LegOutcome::Answered {
+                    name_missing: parsed.name_missing,
+                },
+            },
+            None => LegOutcome::Failed(note_unparseable_reply(server, rtype, reply.len())),
+        },
+        Err(cause) => LegOutcome::Failed(classify(cause)),
+    }
+}
+
 /// Resolve `host` to an IP over the configured DoH `dns.servers`. See the task
 /// interface for the fail-closed / `allow_insecure_bootstrap` contract.
 pub async fn resolve_via_doh(host: &str, dns: &DnsConfig) -> Result<IpAddr, BootstrapError> {
@@ -249,45 +284,30 @@ pub async fn resolve_via_doh_with(
     let mut v6_fallback: Option<IpAddr> = None;
     let mut worst: Option<BootstrapError> = None;
     for &server in &dns.servers {
-        // `NoAnswer` means "this hostname has no address", which only a reply
-        // can establish. One leg answering emptily does NOT establish it: an
-        // empty A reply is ordinary for an AAAA-only host and vice versa. So
-        // fold `NoAnswer` only when the resolver said NXDOMAIN (a verdict on
-        // the name itself) or when BOTH legs answered and neither carried an
-        // address. Folding it on a single empty leg would outrank a real
-        // Transport/Timeout/Unreachable finding from the other leg (see
-        // `rank`) and report a hostname problem for a network fault.
+        // Fold `NoAnswer` only on NXDOMAIN or once BOTH legs answered emptily —
+        // a single empty leg proves nothing (e.g. an AAAA-only host's A leg) and
+        // folding it there would outrank a real Transport/Timeout/Unreachable
+        // finding from the other leg (see `rank`).
         let mut a_answered = false;
-        match querier.query(server, &a_query).await {
-            Ok(reply) => match parse_addrs(&reply) {
-                Some(parsed) => {
-                    if let Some(ip) = parsed.addrs.iter().copied().find(IpAddr::is_ipv4) {
-                        return Ok(ip); // IPv4 preferred for bypass-route compatibility.
-                    }
-                    a_answered = true;
-                    if parsed.name_missing {
+        match run_leg(&querier, server, &a_query, RecordType::A, IpAddr::is_ipv4).await {
+            LegOutcome::Address(ip) => return Ok(ip), // IPv4 preferred for bypass-route compatibility.
+            LegOutcome::Answered { name_missing } => {
+                a_answered = true;
+                if name_missing {
+                    fold_worst(&mut worst, BootstrapError::NoAnswer);
+                }
+            }
+            LegOutcome::Failed(e) => fold_worst(&mut worst, e),
+        }
+        if v6_fallback.is_none() {
+            match run_leg(&querier, server, &aaaa_query, RecordType::AAAA, IpAddr::is_ipv6).await {
+                LegOutcome::Address(ip) => v6_fallback = Some(ip),
+                LegOutcome::Answered { name_missing } => {
+                    if a_answered || name_missing {
                         fold_worst(&mut worst, BootstrapError::NoAnswer);
                     }
                 }
-                None => fold_worst(&mut worst, note_unparseable_reply(server, RecordType::A, reply.len())),
-            },
-            Err(cause) => fold_worst(&mut worst, classify(cause)),
-        }
-        if v6_fallback.is_none() {
-            match querier.query(server, &aaaa_query).await {
-                Ok(reply) => match parse_addrs(&reply) {
-                    Some(parsed) => {
-                        v6_fallback = parsed.addrs.iter().copied().find(IpAddr::is_ipv6);
-                        if v6_fallback.is_none() && (a_answered || parsed.name_missing) {
-                            fold_worst(&mut worst, BootstrapError::NoAnswer);
-                        }
-                    }
-                    None => fold_worst(
-                        &mut worst,
-                        note_unparseable_reply(server, RecordType::AAAA, reply.len()),
-                    ),
-                },
-                Err(cause) => fold_worst(&mut worst, classify(cause)),
+                LegOutcome::Failed(e) => fold_worst(&mut worst, e),
             }
         }
     }
