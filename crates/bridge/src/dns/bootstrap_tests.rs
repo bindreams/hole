@@ -640,8 +640,7 @@ async fn resolve_returns_literal_ip_unchanged_without_querying() {
 
 // Which resolver answered =============================================================================================
 
-// The bootstrap fails over past a dead first resolver, so "which resolver
-// answered" is not "servers[0]" — a caller needing a reachable resolver reads `via`.
+// `via` is the resolver that answered, which may not be `servers[0]`.
 #[skuld::test]
 async fn via_names_the_resolver_that_answered_not_the_first() {
     let dead: IpAddr = "2606:4700:4700::1111".parse().unwrap();
@@ -659,6 +658,25 @@ async fn via_names_the_resolver_that_answered_not_the_first() {
         PinSource::Answered(answering),
         "via is the resolver that answered"
     );
+}
+
+// A resolver that answered NOERROR-empty is reachable for DoH even though it
+// resolved nothing here, so the insecure tail still has a resolver to pin —
+// serving an HTTPS record for another name is exactly what it just proved it can do.
+#[skuld::test]
+async fn an_empty_but_well_formed_reply_still_pins_the_resolver() {
+    let resolver: IpAddr = "1.1.1.1".parse().unwrap();
+    let mut empty = Message::new(0, MessageType::Response, OpCode::Query);
+    empty.metadata.response_code = ResponseCode::NoError;
+    empty.add_query(Query::query(Name::from_ascii("localhost.").unwrap(), RecordType::A));
+    let mut answers = HashMap::new();
+    answers.insert(resolver, empty.to_vec().unwrap());
+
+    let got = resolve_via_doh_with("localhost", &cfg(vec![resolver], true), stub(answers))
+        .await
+        .expect("the insecure fallback resolves localhost");
+    assert!(got.server_ip.is_loopback());
+    assert_eq!(got.via, PinSource::Answered(resolver));
 }
 
 // A literal server entry short-circuits before any query runs, so no resolver

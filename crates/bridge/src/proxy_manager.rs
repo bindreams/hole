@@ -573,13 +573,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             },
         };
 
-        // Every pin outcome reaches ex-ray as one URL, so the reason is named here
-        // or it is unrecoverable from the log.
-        let ech_doh = crate::dns::ech::ech_doh_url(&config.dns, pin);
-        debug!(ech_doh = ?ech_doh, ?pin, "ech-doh source");
-        if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
-            warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
-        }
+        // Only a plugin chain carries an ECH lookup, so a plugin-less start
+        // derives nothing and reports nothing — an "unpinned ECH lookup" line
+        // there would name an exposure that does not exist. Every pin outcome
+        // reaches ex-ray as one URL, so the reason is named here or it is
+        // unrecoverable from the log.
+        let ech_doh = if config.server.plugin.is_some() {
+            let derived = crate::dns::ech::ech_doh_url(&config.dns, pin);
+            debug!(ech_doh = ?derived, ?pin, "ech-doh source");
+            if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
+                warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
+            }
+            derived
+        } else {
+            None
+        };
         #[cfg(test)]
         {
             self.last_ech_doh = ech_doh.as_ref().map(|e| e.url.clone());

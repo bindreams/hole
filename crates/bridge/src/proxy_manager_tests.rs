@@ -3064,6 +3064,9 @@ mod self_test {
         let mut cfg = test_config();
         cfg.server.server = "proxy.example".into();
         cfg.dns.enabled = true;
+        // Only a plugin start derives an `ech-doh`. This name resolves to no
+        // binary, so phase 1 fails immediately and the cover stays held.
+        cfg.server.plugin = Some("hole-694-absent-plugin".into());
         // v6 first so the PIN and the IPv4-preferring fallback disagree — with a
         // single-entry list every assertion below would pass on a discarded pin.
         // `CountingQuerier` ignores which resolver it was asked, so the first
@@ -3096,6 +3099,69 @@ mod self_test {
                 .await
                 .unwrap_err();
             assert_eq!(pm.last_ech_doh(), Some("https://[2606:4700:4700::1111]/dns-query"));
+        });
+    }
+
+    // A plugin-less start carries no ECH lookup, so it derives no `ech-doh` —
+    // and therefore never reports one as unpinned.
+    #[skuld::test]
+    fn a_plugin_less_start_derives_no_ech_doh() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let cfg = test_config();
+            assert!(cfg.server.plugin.is_none(), "the default test config has no plugin");
+            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            assert_eq!(pm.last_ech_doh(), None);
+        });
+    }
+
+    // A literal-IP server entry needs no bootstrap query, so nothing is pinned —
+    // the URL still comes from the config, IPv4-preferring rather than positional.
+    #[skuld::test]
+    fn a_literal_server_entry_falls_back_without_a_pin() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut cfg = test_config();
+            cfg.server.server = "203.0.113.9".into();
+            cfg.server.plugin = Some("hole-694-absent-plugin".into());
+            cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
+            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
+        });
+    }
+
+    /// A querier that answers nothing, so every configured resolver fails.
+    struct DeadQuerier;
+
+    #[async_trait::async_trait]
+    impl DohQuerier for DeadQuerier {
+        async fn query(&self, _server: IpAddr, _wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            Err(UpstreamCause::Unreachable)
+        }
+    }
+
+    // Every resolver failed and the OS resolver supplied the address, so no
+    // resolver is known to serve the ECH lookup — the URL is still derived,
+    // because omitting it refuses the start under `ech=always`.
+    #[skuld::test]
+    fn an_insecure_bootstrap_fallback_derives_an_unpinned_url() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            let mut cfg = test_config();
+            // Resolvable on every CI host without network.
+            cfg.server.server = "localhost".into();
+            cfg.server.plugin = Some("hole-694-absent-plugin".into());
+            cfg.dns.allow_insecure_bootstrap = true;
+            cfg.dns.servers = vec!["2606:4700:4700::1111".parse().unwrap(), "1.0.0.1".parse().unwrap()];
+            let _ = pm.start_cancellable(&cfg, false, CancellationToken::new()).await;
+            assert_eq!(pm.last_ech_doh(), Some("https://1.0.0.1/dns-query"));
         });
     }
 

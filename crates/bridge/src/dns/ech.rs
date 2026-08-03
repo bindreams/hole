@@ -23,12 +23,14 @@ use hole_common::config::DnsConfig;
 /// means every configured resolver already failed for the proxy hostname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinSource {
-    /// This resolver answered the DoH bootstrap.
+    /// This resolver returned a well-formed reply over its DoH channel. What it
+    /// said about the proxy hostname is beside the point: serving the ECH lookup
+    /// needs only that the resolver is reachable and its certificate verified.
     Answered(IpAddr),
     /// The proxy server entry was a literal IP, so no resolver was consulted.
     NoQueryNeeded,
-    /// Every configured resolver failed and `allow_insecure_bootstrap` let the
-    /// OS resolver resolve the server instead.
+    /// No configured resolver completed a DoH exchange at all, and
+    /// `allow_insecure_bootstrap` let the OS resolver resolve the server instead.
     SecureBootstrapFailed,
     /// A covered retry's cached resolver is no longer listed in `dns.servers`.
     ResolverDeselected,
@@ -45,10 +47,27 @@ pub fn doh_url_for_ip(ip: IpAddr) -> String {
     }
 }
 
+/// Whether `url`'s authority is a name rather than an IP literal. A name is
+/// what costs the plaintext system-DNS lookup this module exists to avoid, so
+/// it is the test for whether replacing a URL removes a leak or merely swaps
+/// one endpoint for another. Anything that is not an IP literal is a name —
+/// including an unparseable authority, which a plugin would hand to its
+/// resolver verbatim.
+pub fn authority_is_a_name(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or(v6, |(host, _)| host),
+        None => authority.split_once(':').map_or(authority, |(host, _)| host),
+    };
+    host.parse::<IpAddr>().is_err()
+}
+
 /// The `ech-doh` Hole offers, and whether it names a resolver that ANSWERED.
-/// Only a pinned URL displaces one the config already carries: unpinned, Hole's
-/// URL is a guess, and on `SecureBootstrapFailed` it names a resolver that just
-/// failed — while the config's own value may be the one that works.
+/// Unpinned, it is a guess — on `SecureBootstrapFailed` a resolver that just
+/// failed — so it displaces a value the config already carries only when that
+/// value's authority is a name (see [`authority_is_a_name`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchDoh {
     pub url: String,

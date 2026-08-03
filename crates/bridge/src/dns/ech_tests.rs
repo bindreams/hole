@@ -36,6 +36,39 @@ fn authority_of_strips_scheme_path_and_brackets() {
     assert_eq!(authority_of("https://[2620:fe::fe]/dns-query"), "2620:fe::fe");
 }
 
+// The test that decides whether replacing a config's `ech-doh` removes a leak.
+#[skuld::test]
+fn a_hostname_authority_is_a_name_and_an_ip_literal_is_not() {
+    for url in [
+        "https://cloudflare-dns.com/dns-query",
+        "https://doh.opendns.com:443/dns-query",
+        "https://user@dns.google/dns-query",
+        "https://1.1.1.1.nip.io/dns-query",
+        "not a url at all",
+        "",
+    ] {
+        assert!(authority_is_a_name(url), "{url} must count as a name");
+    }
+    for url in [
+        "https://1.1.1.1/dns-query",
+        "https://9.9.9.9:443/dns-query",
+        "https://[2620:fe::fe]/dns-query",
+        "https://[2620:fe::fe]:443/dns-query",
+        "https://user@8.8.8.8/dns-query",
+        "https://1.0.0.1",
+    ] {
+        assert!(!authority_is_a_name(url), "{url} names an IP literal");
+    }
+}
+
+// Every URL this module emits must pass its own name-free test.
+#[skuld::test]
+fn a_derived_url_is_never_a_name() {
+    for addr in ["1.1.1.1", "2620:fe::fe"] {
+        assert!(!authority_is_a_name(&doh_url_for_ip(ip(addr))));
+    }
+}
+
 #[skuld::test]
 fn ipv4_authority_is_the_bare_address() {
     assert_eq!(doh_url_for_ip(ip("1.1.1.1")), "https://1.1.1.1/dns-query");

@@ -430,45 +430,53 @@ fn inject_plugin_directives(
             let segments = garter::split_plugin_options(opts)
                 .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
 
+            let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
+            // Hole's URL is name-free, so it displaces one whose authority is a
+            // name — that lookup is the defect. Against an IP-literal value there
+            // is no leak to fix, so only a resolver that ANSWERED outranks the
+            // operator's own choice.
+            let displaces = match (ech_doh, config_ech_doh) {
+                (Some(e), Some(s)) => e.pinned || crate::dns::ech::authority_is_a_name(&s.value),
+                _ => false,
+            };
             // Strip only what we are about to set, so an override never becomes
             // a deletion. Keys compare as the PLUGIN decodes them.
-            // Only a PINNED url displaces the config's own: unpinned, ours is a
-            // guess (and on a failed bootstrap, a resolver that just failed),
-            // while theirs may be the one that works. Appending ours after
-            // theirs lets first-wins keep the operator's.
-            let owned: &[&str] = if ech_doh.is_some_and(|e| e.pinned) {
+            let owned: &[&str] = if displaces {
                 &["loglevel", "ech-doh"]
             } else {
                 &["loglevel"]
             };
-            // With no URL to inject, whatever the config carries is the only ECH
-            // source there is — say which case this is, because both end in an
-            // unpinned lookup and only one of them has anything to look up.
-            let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh").map(|s| s.raw);
-            if let (Some(url), Some(e)) = (config_ech_doh, ech_doh) {
-                if !e.pinned {
-                    tracing::warn!(
-                        plugin = %plugin_name,
-                        "no resolver answered, so the config's own ech-doh stands over Hole's guess: {url}"
-                    );
-                }
-            }
-            if ech_doh.is_none() {
-                match config_ech_doh {
-                    // Stripping this would disarm ECH altogether, so it stands —
-                    // but a hostname authority is resolved over plaintext system DNS.
-                    Some(url) => tracing::warn!(
-                        plugin = %plugin_name,
-                        "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {url}"
-                    ),
-                    // ECH is armed only by `ech-doh`, so there is none. Under
-                    // `ech=always` ex-ray refuses to start over exactly this.
-                    None => tracing::warn!(
-                        plugin = %plugin_name,
-                        fail_closed = segments.iter().any(|s| s.key == "ech" && s.value == "always"),
-                        "no ech-doh from any source; ECH is off"
-                    ),
-                }
+
+            // Which ECH source won, and how much is known about it. Every outcome
+            // reaches ex-ray as one URL, so this is the only record of the choice.
+            let fail_closed = segments.iter().any(|s| s.key == "ech" && s.value == "always");
+            match (ech_doh, config_ech_doh) {
+                // Ours yields: theirs already names an IP, and nothing here
+                // demonstrated that our resolver answers.
+                (Some(_), Some(s)) if !displaces => tracing::warn!(
+                    plugin = %plugin_name,
+                    "no resolver answered, so the config's own name-free ech-doh stands: {}", s.raw
+                ),
+                // Ours is what the plugin will fetch from, but no resolver
+                // answered the bootstrap, so nothing has demonstrated it works.
+                (Some(e), _) if !e.pinned => tracing::warn!(
+                    plugin = %plugin_name, fail_closed,
+                    "no resolver answered; the ECH lookup falls back to an unverified resolver: {}", e.url
+                ),
+                (Some(_), _) => {}
+                // Stripping this would disarm ECH altogether, so it stands — but
+                // a name authority is resolved over plaintext system DNS.
+                (None, Some(s)) => tracing::warn!(
+                    plugin = %plugin_name,
+                    "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
+                ),
+                // ECH is armed only by `ech-doh`, so there is none. Under
+                // `ech=always` ex-ray refuses to start over exactly this.
+                (None, None) => tracing::warn!(
+                    plugin = %plugin_name,
+                    fail_closed,
+                    "no ech-doh from any source; ECH is off"
+                ),
             }
 
             let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
@@ -704,17 +712,38 @@ mod inject_tests {
     }
 
     // Unpinned, Hole's URL is a guess — on a failed bootstrap, a resolver that
-    // just failed — so the config's own source keeps first-wins precedence.
+    // just failed — so a config value that is ALREADY name-free keeps first-wins
+    // precedence: there is no plaintext lookup to remove by displacing it.
     #[skuld::test]
-    fn an_unpinned_url_does_not_displace_the_configs_own() {
+    fn an_unpinned_url_yields_to_a_name_free_config_value() {
+        for their_url in ["https://8.8.8.8/dns-query", "https://[2620:fe::fe]/dns-query"] {
+            let out = merged(
+                "ex-ray",
+                Some(&format!("ech-doh={their_url}")),
+                Some(&unpinned("https://1.1.1.1/dns-query")),
+            );
+            assert_eq!(
+                out.as_deref(),
+                Some(&*format!(
+                    "ech-doh={their_url};loglevel=debug;ech-doh=https://1.1.1.1/dns-query"
+                )),
+            );
+        }
+    }
+
+    // The cohort a pin-only rule would miss: a literal-IP server entry needs no
+    // bootstrap query, so nothing is pinned — yet postern's hostname URL would
+    // still win under first-wins and cost the plaintext lookup #694 is about.
+    #[skuld::test]
+    fn an_unpinned_url_still_displaces_a_name_config_value() {
         let out = merged(
             "ex-ray",
-            Some("ech-doh=https://example.net/dns-query"),
+            Some("ech=always;ech-doh=https://cloudflare-dns.com/dns-query"),
             Some(&unpinned("https://1.1.1.1/dns-query")),
         );
         assert_eq!(
             out.as_deref(),
-            Some("ech-doh=https://example.net/dns-query;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
+            Some("ech=always;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
         );
     }
 

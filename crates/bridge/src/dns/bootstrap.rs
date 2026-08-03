@@ -296,6 +296,10 @@ pub async fn resolve_via_doh_with(
     let aaaa_query = build_aaaa_query(host, 0x0002)?;
 
     let mut v6_fallback: Option<Bootstrapped> = None;
+    // A resolver that returned a well-formed reply over its verified DoH channel
+    // is reachable for DoH, whatever it said about THIS hostname — and that is
+    // all the ECH lookup needs from it. Kept so the insecure tail can still pin.
+    let mut reachable: Option<IpAddr> = None;
     let mut worst: Option<BootstrapError> = None;
     for &server in &dns.servers {
         // Fold `NoAnswer` only on NXDOMAIN or once BOTH legs answered emptily —
@@ -313,6 +317,7 @@ pub async fn resolve_via_doh_with(
             }
             LegOutcome::Answered { name_missing } => {
                 a_answered = true;
+                reachable.get_or_insert(server);
                 if name_missing {
                     fold_worst(&mut worst, BootstrapError::NoAnswer);
                 }
@@ -328,6 +333,7 @@ pub async fn resolve_via_doh_with(
                     })
                 }
                 LegOutcome::Answered { name_missing } => {
+                    reachable.get_or_insert(server);
                     if a_answered || name_missing {
                         fold_worst(&mut worst, BootstrapError::NoAnswer);
                     }
@@ -382,7 +388,7 @@ pub async fn resolve_via_doh_with(
         .or_else(|| addrs.first())
         .map(|a| Bootstrapped {
             server_ip: a.ip(),
-            via: PinSource::SecureBootstrapFailed,
+            via: reachable.map_or(PinSource::SecureBootstrapFailed, PinSource::Answered),
         })
         .ok_or(failure)
 }
