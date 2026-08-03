@@ -1931,29 +1931,13 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::connector::{ConnectedStream, UpstreamConnector, UpstreamUdp};
     use crate::dns::forwarder::DnsForwarder;
     use crate::test_support::log_capture::VecWriter;
-    use async_trait::async_trait;
+    use crate::test_support::refusing_connector::RefusingConnector;
     use hole_common::config::{DnsConfig, DnsProtocol};
-    use std::io;
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
-
-    /// A connector that immediately fails every connect. Drives the
-    /// dead-upstream path in tests — the forwarder will fail every
-    /// attempt, surfacing as `SelfTestOutcome::Failed`.
-    struct DeadConnector;
-    #[async_trait]
-    impl UpstreamConnector for DeadConnector {
-        async fn connect_tcp(&self, _target: std::net::SocketAddr) -> io::Result<ConnectedStream> {
-            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
-        }
-        async fn connect_udp(&self, _target: std::net::SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
-            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "dead connector"))
-        }
-    }
 
     fn test_dns_cfg() -> DnsConfig {
         DnsConfig {
@@ -1962,6 +1946,68 @@ mod self_test {
             protocol: DnsProtocol::PlainTcp,
             allow_insecure_bootstrap: false,
         }
+    }
+
+    /// The self-test hands its budget DOWN to the forwarder instead of
+    /// wrapping the call in a `timeout`. Wrapping meant the outer 1500ms timer
+    /// always beat `forward_one`'s 3000ms deadline, so the future was dropped
+    /// before any `UpstreamErr` existed: no classification, no
+    /// `upstream failed` WARN, and a reason string that said only "timed out".
+    /// This asserts the diagnostics survive — and, because the reason now
+    /// carries the typed cause, that the gate reports WHAT failed.
+    #[skuld::test]
+    fn self_test_failure_logs_the_typed_upstream_cause() {
+        let writer = VecWriter::new();
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
+                run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            });
+
+        let reason = match outcome {
+            SelfTestOutcome::Failed { reason, .. } => reason,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(
+            reason.contains("Unreachable"),
+            "the reason must name the cause, not just 'timed out'; got: {reason}"
+        );
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("upstream failed"),
+            "the per-upstream WARN must survive the self-test's budget; got:\n{output}"
+        );
+        assert!(
+            output.contains("layer=connect"),
+            "expected 'layer=connect'; got:\n{output}"
+        );
+        assert!(
+            output.contains("cause=unreachable"),
+            "expected 'cause=unreachable'; got:\n{output}"
+        );
+        assert!(
+            output.contains("budget_ms=1500"),
+            "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
+        );
     }
 
     /// Empty servers → `run_forwarder_self_test` logs `skipped` and
@@ -1986,7 +2032,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
                 assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
             });
@@ -2019,7 +2065,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let outcome = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],
@@ -2080,7 +2126,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let _ = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],
@@ -2120,7 +2166,7 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(DeadConnector), false));
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
                 let _ = run_forwarder_self_test(
                     forwarder,
                     vec!["127.0.0.1".parse().unwrap()],

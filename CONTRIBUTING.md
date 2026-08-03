@@ -107,9 +107,8 @@ TLS failure by inspecting the underlying rustls error. It also takes the per-ups
 parameter (see `try_forward`'s doc for why callers must pass it rather than wrap
 the call). The DoH bootstrap resolver uses `try_forward` so `BootstrapError` can tell a user that something is
 intercepting TLS — a finding no other resolver will fix — apart from a resolver
-that simply did not answer. `BootstrapError` `Display` strings stay hostname-,
-IP- and path-free (`ProxyError::DohBootstrap` renders them verbatim into the
-start-error toast) and existential, never universal — see `BootstrapError`'s doc.
+that simply did not answer; see `BootstrapError`'s doc for its PII-free,
+existential `Display` contract.
 
 ### Listener selection invariants
 

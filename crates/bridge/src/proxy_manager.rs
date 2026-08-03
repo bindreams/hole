@@ -1503,9 +1503,16 @@ pub(crate) const TAP_ENABLED_HINT: &str =
 pub(crate) const TAP_DISABLED_HINT: &str =
     "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
 
-/// Run the forwarder self-test inline against its first configured server.
-/// Returns `SelfTestOutcome::Ok` when any well-formed non-SERVFAIL reply
-/// comes back within the 3×1500ms / 5s budget, else `Failed`. Also writes
+/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
+/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
+/// else `Failed`.
+///
+/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, so one
+/// attempt against N configured resolvers can take up to N×`PER_ATTEMPT`;
+/// `OUTER_BUDGET` remains the overall bound and may cut the retry sequence
+/// short. That is the intended trade: every upstream that fails inside its own
+/// budget is classified and logged first, which is what the outer-timeout
+/// version could never do. Also writes
 /// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
 /// log line at `info!`. On failure, additionally emits a `warn!`
 /// correlation breadcrumb pointing the reader to the plugin tap
@@ -1540,15 +1547,20 @@ async fn run_forwarder_self_test(
             if cancel.is_cancelled() {
                 return SelfTestOutcome::Cancelled;
             }
-            // Future-drop on `forwarder.forward(&query)` IS acceptable
-            // here — the single exception to the cooperative cancellation
-            // contract in this module (#397). The `DnsForwarder`'s only
-            // in-flight resource is a TCP/UDP socket that closes on Drop
-            // (sync, trivial); there is no async cleanup to await.
+            // The budget goes DOWN into the forwarder rather than wrapping the
+            // call in a `timeout`. Wrapping is what this used to do, and it
+            // silently destroyed every diagnostic: the outer 1500ms timer
+            // always beat `forward_one`'s own deadline, so the future was
+            // dropped before an `UpstreamErr` existed and `log_upstream_failure`
+            // never ran. `bridge.log` got nothing and the reason degraded to
+            // "timed out" — exactly the case where the detail matters most.
+            // Cancel stays a `select!` arm; drop-on-cancel is the documented
+            // single exception in this module (#397), since the forwarder's
+            // only in-flight resource is a socket that closes on Drop.
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-                r = tokio::time::timeout(PER_ATTEMPT, forwarder.forward(&query)) => r,
+                r = forwarder.try_forward(&query, PER_ATTEMPT) => r,
             };
             match result {
                 Ok(reply) => {
@@ -1557,7 +1569,7 @@ async fn run_forwarder_self_test(
                     }
                     last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
                 }
-                Err(_) => last_err = Some(format!("attempt {attempt} timed out after {PER_ATTEMPT:?}")),
+                Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
             }
         }
         SelfTestOutcome::Failed {

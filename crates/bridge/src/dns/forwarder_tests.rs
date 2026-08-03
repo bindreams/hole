@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use super::*;
 use crate::dns::connector::DirectConnector;
+use crate::test_support::refusing_connector::RefusingConnector;
 
 // Helpers =============================================================================================================
 
@@ -94,56 +95,6 @@ async fn start_tcp_stub(reply: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<
         let _ = stream.write_all(&reply).await;
     });
     (addr, h)
-}
-
-/// A connector whose `connect_tcp` always fails with `ConnectionRefused`, and a
-/// loopback address to pair it with.
-///
-/// Deliberately NOT a real closed socket. "Connect to a port nothing is
-/// listening on" is not portable enough to assert an exact failure layer:
-/// macOS black-holes connects to a bound-but-unlistened socket (the attempt
-/// runs to the full budget and reports `layer=timeout`), and GitHub's Windows
-/// runners drop SYNs to closed ephemeral loopback ports (documented in
-/// `server_test_tests.rs`). `UpstreamConnector` is the codebase's seam for
-/// exactly this — the OS socket is not what these tests are about, the
-/// classification and logging of a connect-layer failure is.
-#[derive(Debug)]
-struct RefusingConnector {
-    /// Addresses to refuse. Empty = refuse everything; otherwise anything not
-    /// listed is dialled for real, so a test can pair a refused primary with a
-    /// live secondary.
-    refuse: Vec<SocketAddr>,
-}
-
-impl RefusingConnector {
-    fn all() -> Arc<Self> {
-        Arc::new(Self { refuse: Vec::new() })
-    }
-
-    fn only(refuse: Vec<SocketAddr>) -> Arc<Self> {
-        Arc::new(Self { refuse })
-    }
-
-    fn refuses(&self, target: SocketAddr) -> bool {
-        self.refuse.is_empty() || self.refuse.contains(&target)
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::dns::connector::UpstreamConnector for RefusingConnector {
-    async fn connect_tcp(&self, target: SocketAddr) -> io::Result<crate::dns::connector::ConnectedStream> {
-        if self.refuses(target) {
-            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
-        }
-        DirectConnector.connect_tcp(target).await
-    }
-
-    async fn connect_udp(&self, target: SocketAddr) -> io::Result<Box<dyn crate::dns::connector::UpstreamUdp>> {
-        if self.refuses(target) {
-            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
-        }
-        DirectConnector.connect_udp(target).await
-    }
 }
 
 /// Loopback address for a server the [`RefusingConnector`] will reject. The
@@ -866,6 +817,49 @@ mod typed_error_logs {
         assert!(
             output.contains("layer=io"),
             "expected 'layer=io' for EOF mid-exchange; got:\n{output}"
+        );
+    }
+
+    /// `forward`'s short-query guard exists to keep untrusted local traffic
+    /// away from `try_forward`'s malformed-query WARN, which sits OUTSIDE the
+    /// per-server throttle. `LocalDnsEndpoint` calls `forward` once per
+    /// intercepted UDP/53 datagram, so without the guard any local process
+    /// could flood `bridge.log` one line per datagram. Deleting the guard keeps
+    /// every byte-level assertion passing, so this is the only thing pinning it.
+    #[skuld::test]
+    async fn forward_does_not_log_for_a_short_query_but_try_forward_does() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = set_default_in_current_thread(subscriber);
+
+        let fwd = DnsForwarder::new_with_ports(
+            build_cfg(DnsProtocol::PlainUdp, vec![dead_addr(0).ip()]),
+            RefusingConnector::all(),
+            true,
+            vec![dead_addr(0).port()],
+        );
+
+        let reply = fwd.forward(b"abc").await;
+        assert_eq!(reply[3] & 0x0F, 2, "still SERVFAIL");
+        assert_eq!(
+            writer.snapshot_string(),
+            "",
+            "the in-TUN datagram path must not log per malformed datagram"
+        );
+
+        // The same input through `try_forward` DOES warn: a caller that
+        // consumes the typed error is our own code, and a caller bug there
+        // should be visible.
+        let _ = fwd.try_forward(b"abc", UPSTREAM_TIMEOUT).await;
+        assert!(
+            writer.snapshot_string().contains("shorter than the header"),
+            "try_forward must warn; got:\n{}",
+            writer.snapshot_string()
         );
     }
 
