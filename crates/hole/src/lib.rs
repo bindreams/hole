@@ -22,7 +22,6 @@ pub mod selfheal;
 pub mod setup;
 pub mod state;
 pub mod tray_icons;
-pub mod ui_ready;
 pub mod ui_settings;
 pub mod update;
 pub mod version;
