@@ -18,6 +18,12 @@ use tokio::time::Instant;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod keepalive;
+#[cfg(test)]
+mod keepalive_tests;
+
+use keepalive::Cadence;
+
 /// Maximum buffered outbound datagrams per UDP association before new ones are
 /// dropped. Bounded (not unbounded) so a stalled association — e.g. yamux
 /// backpressure while the app floods UDP — can't grow without limit; dropping
@@ -688,6 +694,15 @@ impl SessionTransport {
     pub(crate) fn was_productive(&self) -> bool {
         self.inbound_reads.load(Ordering::Relaxed) > 0
     }
+
+    /// The client-side liveness loop for *this* connection.
+    ///
+    /// Both halves come from `self`, so a caller cannot hand the keepalive a
+    /// counter other than the one this session's tap feeds — which would declare
+    /// a perfectly healthy tunnel dead every cycle.
+    pub(crate) fn keepalive(&self, cadence: Cadence) -> impl std::future::Future<Output = ()> {
+        keepalive::run_keepalive(self.open_tx.clone(), Arc::clone(&self.inbound_reads), cadence)
+    }
 }
 
 /// Serve one yamux connection until it ends. The local TCP+UDP listeners are
@@ -698,8 +713,14 @@ pub(crate) async fn run_client_session(
     udp_socket: &Arc<UdpSocket>,
     session: &mut SessionTransport,
     udp_timeout: Duration,
+    cadence: Cadence,
     shutdown: &CancellationToken,
 ) -> SessionOutcome {
+    // Pinned outside the loop so the cadence survives every other select arm
+    // firing, and so an in-flight probe is not restarted by unrelated traffic.
+    let keepalive = session.keepalive(cadence);
+    tokio::pin!(keepalive);
+
     let SessionTransport {
         open_tx,
         inbound_rx,
@@ -714,6 +735,9 @@ pub(crate) async fn run_client_session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return SessionOutcome::Shutdown,
+            // A transport that has gone silent: black-holed with no RST or FIN,
+            // so no other arm here would ever notice.
+            () = &mut keepalive => return SessionOutcome::TransportDied,
             // Transport death: the driver dropped its inbound sender. A `Some` is a
             // protocol violation (the server never opens streams to the client);
             // untrusted remote input — log and drop, never panic.
@@ -852,7 +876,15 @@ pub(crate) async fn run_client(
 
         let (mut session, driver) = SessionTransport::spawn(tcp, &config);
 
-        let outcome = run_client_session(&tcp_listener, &udp_socket, &mut session, udp_timeout, &shutdown).await;
+        let outcome = run_client_session(
+            &tcp_listener,
+            &udp_socket,
+            &mut session,
+            udp_timeout,
+            Cadence::default(),
+            &shutdown,
+        )
+        .await;
 
         // Tear down the driver deterministically. On `TransportDied` it already
         // finished (abort is a no-op); otherwise abort ends it instead of hanging

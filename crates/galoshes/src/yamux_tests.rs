@@ -17,12 +17,14 @@ use tokio_util::sync::CancellationToken;
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
+use crate::yamux::keepalive::Cadence;
 use crate::yamux::{
     bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection,
-    driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client, run_server,
-    run_server_with_connections, serve_driven_connection, session_reconnect_backoff, ClientBoundAddrs,
-    FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN,
-    LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client,
+    run_client_session, run_server, run_server_with_connections, serve_driven_connection, session_reconnect_backoff,
+    ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport, StreamTag,
+    TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE,
+    REMOTE_BACKOFF_MAX,
 };
 
 #[skuld::test]
@@ -773,7 +775,7 @@ async fn backoff_escalates_then_resets_on_productive() {
 
 /// Install a per-test tracing subscriber that captures log lines for
 /// [`wait_for_log`] rendezvous, plus the `DefaultGuard` keeping it active.
-fn capture_logs() -> (WaitableWriter, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture_logs() -> (WaitableWriter, tracing::subscriber::DefaultGuard) {
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
@@ -793,13 +795,19 @@ async fn wait_for_log(writer: &WaitableWriter, needle: &str) {
         .unwrap();
 }
 
-/// Strip the 1-byte stream tag, then echo everything else back.
 async fn echo_yamux_stream(mut stream: yamux::Stream) {
-    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    use futures::AsyncReadExt as _;
     let mut tag = [0u8; 1];
     if stream.read_exact(&mut tag).await.is_err() {
         return;
     }
+    echo_yamux_stream_body(stream).await;
+}
+
+/// Echo every byte back until the peer goes away. Any stream tag must already
+/// have been consumed.
+pub(crate) async fn echo_yamux_stream_body(mut stream: yamux::Stream) {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
     let mut buf = vec![0u8; 4096];
     loop {
         match stream.read(&mut buf).await {
@@ -879,7 +887,6 @@ async fn driver_panicked_detects_panic_not_cancel() {
 
 #[skuld::test]
 async fn shutdown_during_backoff_exits_promptly() {
-    tokio::time::pause();
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
     let shutdown = CancellationToken::new();
     let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
@@ -900,6 +907,13 @@ async fn shutdown_during_backoff_exits_promptly() {
     // Rendezvous (not the assertion): the observer event means the client has
     // reached the reconnect decision and is entering the backoff sleep.
     assert_eq!(events_rx.recv().await.unwrap(), (1, false));
+
+    // Pause only here, over the backoff window, where nothing but a timer can
+    // progress. Held from the top it would also span the first session, letting
+    // auto-advance resolve a whole keepalive interval and deadline while that
+    // session's frames were still in the kernel — so the reconnect awaited above
+    // could be the keepalive's rather than the relay's close.
+    tokio::time::pause();
 
     // The external assertion: shutdown must win the paused sleep, so the client
     // task returns `Ok` promptly. Without the select! shutdown branch the paused
@@ -1189,4 +1203,165 @@ async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
     );
 
     shutdown.cancel();
+}
+
+/// Fire a one-shot silent black hole on a relay connection.
+struct BlackholeHandle {
+    tx: Option<oneshot::Sender<()>>,
+}
+
+impl BlackholeHandle {
+    fn trigger(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// A TCP relay in front of `upstream` whose first connection can be silently
+/// black-holed: on `trigger()` it stops forwarding both ways but holds both
+/// sockets open forever, so neither peer sees a FIN or an RST and neither peer's
+/// TCP stack times out (the relay's kernel keeps ACKing). That is strictly
+/// harsher than the field condition, where the client's retransmits do
+/// eventually abort.
+async fn spawn_blackholing_relay(upstream: SocketAddr) -> (SocketAddr, BlackholeHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let addr = listener.local_addr().expect("relay addr");
+    let (hole_tx, hole_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut trigger = Some(hole_rx);
+        while let Ok((client_conn, _)) = listener.accept().await {
+            let server_conn = match TcpStream::connect(upstream).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(pump_with_optional_blackhole(client_conn, server_conn, trigger.take()));
+        }
+    });
+    (addr, BlackholeHandle { tx: Some(hole_tx) })
+}
+
+async fn pump_with_optional_blackhole(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    hole: Option<oneshot::Receiver<()>>,
+) {
+    match hole {
+        Some(rx) => {
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                // `client` and `server` stay alive in this frame, so both
+                // sockets stay open: a true silent black hole.
+                _ = rx => std::future::pending::<()>().await,
+            }
+        }
+        None => {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        }
+    }
+}
+
+#[skuld::test]
+async fn a_silently_blackholed_session_is_declared_dead() {
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, mut hole) = spawn_blackholing_relay(server_addr).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+
+    // #1 proves the tunnel works and marks the session productive.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET /1 HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+
+    hole.trigger();
+    // From here nothing but a timer can make progress, and nothing that could
+    // ever come back is in flight, so where the paused clock jumps cannot change
+    // the outcome. Nothing in this window uses `spawn_blocking`, which would
+    // inhibit the advance.
+    tokio::time::pause();
+
+    // Productive before the hole, so failures reset to the floor. `run_client`
+    // emits this before any backoff or reconnect, so nothing else has started.
+    assert_eq!(events.recv().await.unwrap(), (0, true));
+    tokio::time::resume();
+
+    // Naming the mechanism: the fatal line is written by `run_keepalive`, which
+    // returns before `run_client_session` returns and therefore before the event
+    // above — same task, so the ordering is program order, not a race.
+    assert!(
+        writer
+            .snapshot()
+            .contains("transport silent across the keepalive deadline"),
+        "the reconnect must have been caused by the keepalive, not by anything else"
+    );
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
+    // The complementary direction, and the one that would otherwise ship green
+    // while tearing down every idle tunnel: the probe must travel the whole
+    // client path to the real server's `echo_keepalive` and come back as
+    // liveness on this session's own tap. The short cadence IS the behavior
+    // under test (mirroring the NAT idle-eviction test's short `udp_timeout`);
+    // the rendezvous is the log event, never a duration.
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let tcp = TcpStream::connect(server_addr).await.expect("connect yamux server");
+    let (mut session, _driver) = SessionTransport::spawn(tcp, &::yamux::Config::default());
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind local TCP");
+    let udp_socket = Arc::new(bind_udp("127.0.0.1:0".parse().unwrap()).expect("bind local UDP"));
+    // Short enough that the test does not idle, long enough that a loaded runner
+    // cannot miss a loopback round trip; `Cadence::new` requires the deadline to
+    // fit inside the interval, so they are equal rather than lopsided.
+    let cadence = Cadence::new(Duration::from_millis(500), Duration::from_millis(500));
+
+    // End the session as soon as the keepalive has reported a live transport, so
+    // the assertion below is on how the session ended, not on how long it ran.
+    let ender = {
+        let writer = writer.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            wait_for_log(&writer, "transport answered inside the keepalive deadline").await;
+            shutdown.cancel();
+        })
+    };
+
+    let outcome = run_client_session(
+        &tcp_listener,
+        &udp_socket,
+        &mut session,
+        DEFAULT_UDP_TIMEOUT,
+        cadence,
+        &shutdown,
+    )
+    .await;
+
+    ender.await.expect("ender joined");
+    assert_eq!(
+        outcome,
+        SessionOutcome::Shutdown,
+        "a session whose probe is answered must end only on shutdown"
+    );
+    assert!(
+        !writer
+            .snapshot()
+            .contains("transport silent across the keepalive deadline"),
+        "a healthy transport must never be declared dead"
+    );
+    // And the liveness came from the server's *echo*, not from some other frame:
+    // a rejected or reset probe substream would end the probe's read, which logs.
+    // A coalesced data+FIN still reads as `Ok(8)`, since `poll_read` drains the
+    // buffer before consulting `can_read`.
+    assert!(
+        !writer.snapshot().contains("keepalive probe substream ended"),
+        "the probe must have been answered by `echo_keepalive`, not rejected"
+    );
 }
