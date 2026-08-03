@@ -5,6 +5,7 @@ use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 use super::{build_a_query, build_aaaa_query, parse_addrs, BootstrapError};
+use crate::dns::ech::PinSource;
 
 /// Decode our query bytes with hickory and assert the question shape.
 fn decode(bytes: &[u8]) -> Message {
@@ -162,7 +163,8 @@ async fn resolve_uses_configured_resolver_not_system() {
 
     let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .server_ip;
     assert_eq!(ip, IpAddr::V4(expected));
     assert_eq!(
         *q.asked.lock().unwrap(),
@@ -488,7 +490,8 @@ async fn insecure_fallback_logs_the_certificate_rejection_even_when_it_succeeds(
     // "localhost" resolves on every CI host without network.
     let ip = resolve_via_doh_with("localhost", &cfg(vec![resolver], true), q)
         .await
-        .expect("insecure fallback resolves localhost");
+        .expect("insecure fallback resolves localhost")
+        .server_ip;
     assert!(ip.is_loopback());
 
     let output = writer.snapshot_string();
@@ -522,7 +525,8 @@ async fn a_recovering_resolve_logs_no_failure_warning() {
     answers.insert(resolver, aaaa_reply_for("proxy.example", v6));
     let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), stub(answers))
         .await
-        .unwrap();
+        .unwrap()
+        .server_ip;
     assert_eq!(ip, IpAddr::V6(v6));
     assert_eq!(writer.snapshot_string(), "", "a successful resolve must log no warning");
 }
@@ -550,7 +554,8 @@ async fn a_malformed_reply_logs_even_when_a_later_resolver_rescues_the_resolve()
 
     let ip = resolve_via_doh_with("proxy.example", &cfg(vec![garbage, good], false), stub(answers))
         .await
-        .expect("the second resolver rescues the resolve");
+        .expect("the second resolver rescues the resolve")
+        .server_ip;
     assert_eq!(ip, IpAddr::V4(expected));
 
     let output = writer.snapshot_string();
@@ -570,10 +575,12 @@ async fn resolve_returns_ipv6_when_only_aaaa_answers() {
     let mut answers = HashMap::new();
     answers.insert(resolver, aaaa_reply_for("proxy.example", v6));
     let q = stub(answers);
-    let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
+    let got = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
         .await
         .unwrap();
-    assert_eq!(ip, IpAddr::V6(v6));
+    assert_eq!(got.server_ip, IpAddr::V6(v6));
+    // The AAAA leg answered, so the resolver that served it is the pin.
+    assert_eq!(got.via, PinSource::Answered(resolver));
 }
 
 #[skuld::test]
@@ -596,7 +603,8 @@ async fn resolve_prefers_ipv4_when_both_answer() {
     let q = stub(answers);
     let ip = resolve_via_doh_with("proxy.example", &cfg(vec![resolver], false), q)
         .await
-        .unwrap();
+        .unwrap()
+        .server_ip;
     assert_eq!(ip, IpAddr::V4(v4), "IPv4 wins (bypass-route compat)");
 }
 
@@ -606,10 +614,17 @@ async fn resolve_allow_insecure_falls_back_to_system_for_localhost() {
     // path. "localhost" is resolvable on every CI host without network.
     let resolver: IpAddr = "1.1.1.1".parse().unwrap();
     let q = stub(HashMap::new());
-    let ip = resolve_via_doh_with("localhost", &cfg(vec![resolver], true), q)
+    let got = resolve_via_doh_with("localhost", &cfg(vec![resolver], true), q)
         .await
         .unwrap();
-    assert!(ip.is_loopback(), "localhost resolved to a loopback address: {ip}");
+    assert!(
+        got.server_ip.is_loopback(),
+        "localhost resolved to a loopback address: {}",
+        got.server_ip
+    );
+    // Every configured resolver failed; the OS resolver answered instead, so
+    // nothing here is known to serve the ECH lookup.
+    assert_eq!(got.via, PinSource::SecureBootstrapFailed);
 }
 
 #[skuld::test]
@@ -617,9 +632,46 @@ async fn resolve_returns_literal_ip_unchanged_without_querying() {
     let q = stub(HashMap::new());
     let ip = resolve_via_doh_with("198.51.100.9", &cfg(vec!["1.1.1.1".parse().unwrap()], false), q.clone())
         .await
-        .unwrap();
+        .unwrap()
+        .server_ip;
     assert_eq!(ip, "198.51.100.9".parse::<IpAddr>().unwrap());
     assert!(q.asked.lock().unwrap().is_empty(), "a literal IP must not query DoH");
+}
+
+// Which resolver answered =============================================================================================
+
+// The bootstrap fails over past a dead first resolver, so "which resolver
+// answered" is not "servers[0]" — a caller needing a reachable resolver reads `via`.
+#[skuld::test]
+async fn via_names_the_resolver_that_answered_not_the_first() {
+    let dead: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    let answering: IpAddr = "1.0.0.1".parse().unwrap();
+    let expected = Ipv4Addr::new(203, 0, 113, 7);
+    let mut answers = HashMap::new();
+    answers.insert(answering, a_reply_for("proxy.example", expected));
+
+    let got = resolve_via_doh_with("proxy.example", &cfg(vec![dead, answering], false), stub(answers))
+        .await
+        .unwrap();
+    assert_eq!(got.server_ip, IpAddr::V4(expected));
+    assert_eq!(
+        got.via,
+        PinSource::Answered(answering),
+        "via is the resolver that answered"
+    );
+}
+
+// A literal server entry short-circuits before any query runs, so no resolver
+// was consulted and there is none to report.
+#[skuld::test]
+async fn literal_server_entry_reports_no_resolver() {
+    let q = stub(HashMap::new());
+    let got = resolve_via_doh_with("198.51.100.4", &cfg(vec!["1.1.1.1".parse().unwrap()], false), q.clone())
+        .await
+        .unwrap();
+    assert_eq!(got.server_ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+    assert_eq!(got.via, PinSource::NoQueryNeeded);
+    assert!(q.asked.lock().unwrap().is_empty(), "no resolver consulted");
 }
 
 // handoff_host ========================================================================================================
@@ -775,7 +827,8 @@ async fn loopback_doh_stub_serves_the_aaaa_query_after_the_a_query() {
         super::test_loopback_querier(cert_der, port),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .server_ip;
     assert_eq!(ip, IpAddr::V6(v6));
 }
 
@@ -794,6 +847,7 @@ async fn resolve_via_doh_e2e_through_real_forwarder() {
         super::test_loopback_querier(cert_der, port),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .server_ip;
     assert_eq!(ip, IpAddr::V4(expected));
 }

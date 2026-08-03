@@ -114,7 +114,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         }
     };
     let server_ip = match resolved {
-        Ok(ip) => ip,
+        Ok(b) => b.server_ip,
         Err(e) => {
             tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");
             return ServerTestOutcome::DnsFailed;

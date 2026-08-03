@@ -683,7 +683,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await,
             None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
         };
-        Ok(res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?)
+        Ok(res
+            .inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?
+            .server_ip)
     }
 
     /// Produce a [`RunningState`] without touching `self`.
