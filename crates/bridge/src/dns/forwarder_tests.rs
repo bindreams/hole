@@ -8,7 +8,6 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use super::*;
 use crate::dns::connector::DirectConnector;
-use crate::test_support::port_alloc::refused_tcp_port;
 
 // Helpers =============================================================================================================
 
@@ -97,15 +96,61 @@ async fn start_tcp_stub(reply: Vec<u8>) -> (SocketAddr, tokio::task::JoinHandle<
     (addr, h)
 }
 
-#[skuld::test]
-async fn refused_tcp_port_is_refused_and_not_rebindable() {
-    let (_held, addr) = refused_tcp_port();
-    let err = tokio::net::TcpStream::connect(addr).await.unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
-    assert!(
-        TcpListener::bind(addr).await.is_err(),
-        "the held socket must keep the port un-bindable"
-    );
+/// A connector whose `connect_tcp` always fails with `ConnectionRefused`, and a
+/// loopback address to pair it with.
+///
+/// Deliberately NOT a real closed socket. "Connect to a port nothing is
+/// listening on" is not portable enough to assert an exact failure layer:
+/// macOS black-holes connects to a bound-but-unlistened socket (the attempt
+/// runs to the full budget and reports `layer=timeout`), and GitHub's Windows
+/// runners drop SYNs to closed ephemeral loopback ports (documented in
+/// `server_test_tests.rs`). `UpstreamConnector` is the codebase's seam for
+/// exactly this — the OS socket is not what these tests are about, the
+/// classification and logging of a connect-layer failure is.
+#[derive(Debug)]
+struct RefusingConnector {
+    /// Addresses to refuse. Empty = refuse everything; otherwise anything not
+    /// listed is dialled for real, so a test can pair a refused primary with a
+    /// live secondary.
+    refuse: Vec<SocketAddr>,
+}
+
+impl RefusingConnector {
+    fn all() -> Arc<Self> {
+        Arc::new(Self { refuse: Vec::new() })
+    }
+
+    fn only(refuse: Vec<SocketAddr>) -> Arc<Self> {
+        Arc::new(Self { refuse })
+    }
+
+    fn refuses(&self, target: SocketAddr) -> bool {
+        self.refuse.is_empty() || self.refuse.contains(&target)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::dns::connector::UpstreamConnector for RefusingConnector {
+    async fn connect_tcp(&self, target: SocketAddr) -> io::Result<crate::dns::connector::ConnectedStream> {
+        if self.refuses(target) {
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
+        DirectConnector.connect_tcp(target).await
+    }
+
+    async fn connect_udp(&self, target: SocketAddr) -> io::Result<Box<dyn crate::dns::connector::UpstreamUdp>> {
+        if self.refuses(target) {
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
+        DirectConnector.connect_udp(target).await
+    }
+}
+
+/// Loopback address for a server the [`RefusingConnector`] will reject. The
+/// port is never dialled, so any value works; distinct values keep multi-server
+/// configs readable.
+fn dead_addr(n: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000 + n)
 }
 
 fn build_cfg(protocol: DnsProtocol, servers: Vec<IpAddr>) -> DnsConfig {
@@ -182,16 +227,15 @@ async fn plain_udp_primary_succeeds() {
 #[skuld::test]
 async fn primary_fails_secondary_succeeds() {
     // Failover is in `try_forward`'s server loop, not in any one transport.
-    // TCP so the dead primary's port can be HELD: a released ephemeral port can
-    // be re-bound by a concurrent test, and a primary that answers makes this
-    // test silently stop testing failover.
+    // The primary is refused by the connector rather than by the OS, so the
+    // premise cannot drift with the platform; the secondary is a real stub.
     let q = sample_query(0x0001);
-    let (_held, dead_addr) = refused_tcp_port();
+    let dead_addr = dead_addr(0);
     let (live_addr, _h) = start_tcp_stub(Vec::new()).await;
 
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), live_addr.ip()]),
-        Arc::new(DirectConnector),
+        RefusingConnector::only(vec![dead_addr]),
         true,
         vec![dead_addr.port(), live_addr.port()],
     );
@@ -208,11 +252,11 @@ async fn primary_fails_secondary_succeeds() {
 #[skuld::test]
 async fn all_servers_fail_returns_servfail() {
     let q = sample_query(0x5678);
-    let (_h1, s1) = refused_tcp_port();
-    let (_h2, s2) = refused_tcp_port();
+    let s1 = dead_addr(0);
+    let s2 = dead_addr(1);
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
-        Arc::new(DirectConnector),
+        RefusingConnector::all(),
         true,
         vec![s1.port(), s2.port()],
     );
@@ -224,11 +268,11 @@ async fn all_servers_fail_returns_servfail() {
 #[skuld::test]
 async fn try_forward_reports_unreachable_when_every_server_refuses() {
     let q = sample_query(0x5678);
-    let (_h1, s1) = refused_tcp_port();
-    let (_h2, s2) = refused_tcp_port();
+    let s1 = dead_addr(0);
+    let s2 = dead_addr(1);
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
-        Arc::new(DirectConnector),
+        RefusingConnector::all(),
         true,
         vec![s1.port(), s2.port()],
     );
@@ -374,10 +418,10 @@ async fn duplicate_server_in_list_creates_one_throttle_entry() {
     // Two identical dead addresses share one per-IP throttle entry; a
     // single failure burst against the same server doesn't duplicate
     // state across the map.
-    let (_held, dead_addr) = refused_tcp_port();
+    let dead_addr = dead_addr(0);
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip(), dead_addr.ip()]),
-        Arc::new(DirectConnector),
+        RefusingConnector::all(),
         true,
         vec![dead_addr.port(), dead_addr.port()],
     );
@@ -398,10 +442,10 @@ async fn throttle_logs_first_n_then_suppresses() {
     // Pins the per-server log throttle: the first LOG_FULL_LIMIT=3
     // failures log in full, subsequent ones are counted as suppressed
     // (never silently dedup-forever).
-    let (_held, dead_addr) = refused_tcp_port();
+    let dead_addr = dead_addr(0);
     let fwd = DnsForwarder::new_with_ports(
         build_cfg(DnsProtocol::PlainTcp, vec![dead_addr.ip()]),
-        Arc::new(DirectConnector),
+        RefusingConnector::all(),
         true,
         vec![dead_addr.port()],
     );
@@ -737,10 +781,10 @@ mod typed_error_logs {
         );
         let _guard = set_default_in_current_thread(subscriber);
 
-        let (_held, dead) = refused_tcp_port();
+        let dead = dead_addr(0);
         let fwd = DnsForwarder::new_with_ports(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
-            Arc::new(DirectConnector),
+            RefusingConnector::all(),
             true,
             vec![dead.port()],
         );
@@ -772,10 +816,10 @@ mod typed_error_logs {
         );
         let _guard = set_default_in_current_thread(subscriber);
 
-        let (_held, dead) = refused_tcp_port();
+        let dead = dead_addr(0);
         let fwd = DnsForwarder::new_with_ports(
             build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
-            Arc::new(DirectConnector),
+            RefusingConnector::all(),
             true,
             vec![dead.port()],
         );

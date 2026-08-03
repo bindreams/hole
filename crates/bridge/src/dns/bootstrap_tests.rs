@@ -95,10 +95,9 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use super::{resolve_via_doh_with, DohQuerier};
 use crate::dns::forwarder::UpstreamCause;
-use crate::test_support::port_alloc::refused_tcp_port;
 
 /// In-test querier: answers ONLY for resolver IPs it was given a canned reply
-/// for; returns `None` otherwise (models "this resolver unreachable"). Records
+/// for; returns `Err(fail_with)` otherwise (default: `Unreachable`). Records
 /// which resolver IPs it was asked, so a test can assert the CONFIGURED
 /// resolver — not the OS resolver — was consulted.
 struct StubQuerier {
@@ -736,20 +735,12 @@ async fn resolve_reports_certificate_rejection_through_a_real_tls_handshake() {
     );
 }
 
-#[skuld::test]
-async fn resolve_reports_unreachable_through_a_real_refused_port() {
-    // The contrasting branch on the same real path: nothing is listening.
-    let (_held, addr) = refused_tcp_port();
-    let resolver: IpAddr = "127.0.0.1".parse().unwrap();
-    let err = super::resolve_via_doh_with(
-        "proxy.example",
-        &cfg(vec![resolver], false),
-        super::test_untrusted_querier(addr.port()),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err, BootstrapError::Unreachable);
-}
+// The `Unreachable` branch is deliberately NOT driven through a real closed
+// socket here: "connect to a port nothing is listening on" has no portable
+// failure shape (macOS black-holes it, GitHub's Windows runners drop SYNs to
+// closed ephemeral loopback ports), so it cannot pin an exact cause. It is
+// covered deterministically by `resolve_maps_every_upstream_cause_to_its_bootstrap_error`
+// and, at the forwarder layer, by `try_forward_reports_unreachable_when_every_server_refuses`.
 
 #[skuld::test]
 async fn resolve_reports_no_answer_through_a_real_trusted_resolver_with_no_records() {
