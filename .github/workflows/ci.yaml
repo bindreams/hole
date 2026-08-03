@@ -451,6 +451,25 @@ jobs:
       - name: Test ex-ray Go (ECH gate)
         run: cargo xtask run ex-ray-tests
 
+  # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
+  # for why it is split from test-ex-ray.
+  test-ex-ray-platforms:
+    name: Test ex-ray (Go, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Test ex-ray Go
+        shell: bash
+        run: cargo xtask run ex-ray-unit-tests
+
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
