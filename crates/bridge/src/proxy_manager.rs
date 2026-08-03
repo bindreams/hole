@@ -772,7 +772,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // ech-doh = the first configured resolver's DoH URL, so ex-ray's
             // ECH path fetches the ECHConfigList over the same private DoH the
             // bootstrap used. Empty `dns.servers` ⇒ no ech-doh ⇒ ECH off.
-            let ech_doh = config.dns.servers.first().map(|ip| hole_common::doh_url(*ip));
+            let ech_doh = config.dns.servers.first().map(|ip| crate::dns::ech::EchDoh {
+                url: hole_common::doh_url(*ip),
+                pinned: false,
+            });
             let chain = crate::proxy::plugin::start_plugin_chain(
                 plugin_name,
                 &plugin_path,
@@ -783,7 +786,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 owner,
                 config.diagnostic_plugin_tap,
                 &cancel,
-                ech_doh.as_deref(),
+                ech_doh.as_ref(),
             )
             .await?;
             Some(chain)

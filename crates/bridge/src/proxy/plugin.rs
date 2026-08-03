@@ -120,10 +120,10 @@ pub async fn start_plugin_chain(
     owner: Option<(u32, u32)>,
     diagnostic_tap: bool,
     cancel: &CancellationToken,
-    ech_doh_url: Option<&str>,
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<PluginChain, ProxyError> {
     // Inject Hole-owned SIP003 directives — see `inject_plugin_directives`.
-    let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh_url);
+    let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh)?;
     // Resolve the config name to its on-disk binary name before sizing the
     // handoff port — `plugin_alloc_protocols` is keyed by binary name so
     // `v2ray-plugin` (→ `ex-ray`) and unknown plugins get a TCP-only port
@@ -407,35 +407,82 @@ fn proxy_err_to_io_err(e: ProxyError) -> std::io::Error {
     }
 }
 
-/// Inject Hole-owned SIP003 directives into a plugin's `SS_PLUGIN_OPTIONS`
-/// at launch, when the directive shape is known for that plugin.
-///
-/// Two directives, both appended last (v2ray-core honors the LAST occurrence,
-/// so they win over any user duplicate):
-///
-/// - `loglevel=debug` (always): Hole captures plugin stderr via
-///   `garter::binary` and routes it through the bridge's tracing subscriber,
-///   so always-on debug is paid in `bridge.log` volume, not user-visible
-///   noise. It captures plugin-side handshake / dial / WebSocket failures.
-/// - `ech-doh=<url>` (when `ech_doh_url` is set): the DoH server ex-ray's ECH
-///   path fetches the ECHConfigList from. The bridge never injects `ech=<mode>`
-///   — ex-ray owns the mode (default `auto`).
+/// Remove any existing copy of a key Hole is about to set, then append it.
+/// ex-ray's `Args.Get` is first-wins, so an appended duplicate would silently
+/// lose to a user's, and postern writes `ech-doh` before Hole ever sees the
+/// string. `ech` is never touched: `ech=always` sets `RequireEch`, and dropping
+/// a user's mode would silently downgrade a deliberate fail-closed posture.
 ///
 /// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
 /// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,
-/// so both spellings are covered (#414); `galoshes` ignores the keys itself but
-/// forwards the whole options string to its inner ex-ray, so they reach that
-/// hop's v2ray-core. Unknown plugins pass through unchanged.
-fn inject_plugin_directives(plugin_name: &str, opts: Option<&str>, ech_doh_url: Option<&str>) -> Option<String> {
+/// so both spellings are covered; `galoshes` ignores the keys itself but
+/// forwards the whole options string to its inner ex-ray.
+fn inject_plugin_directives(
+    plugin_name: &str,
+    opts: Option<&str>,
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
+) -> Result<Option<String>, ProxyError> {
     match plugin_name {
         "v2ray-plugin" | "ex-ray" | "galoshes" => {
-            let mut merged = append_sip003_directive(opts, "loglevel=debug");
-            if let Some(url) = ech_doh_url {
-                merged = append_sip003_directive(Some(&merged), &format!("ech-doh={url}"));
+            let opts = opts.unwrap_or_default();
+            // Refuse rather than forward — see `ProxyError::MalformedPluginOptions`.
+            // Position only in the message; a segment can carry a secret.
+            let segments = garter::split_plugin_options(opts)
+                .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
+
+            // Strip only what we are about to set, so an override never becomes
+            // a deletion. Keys compare as the PLUGIN decodes them.
+            // Only a PINNED url displaces the config's own: unpinned, ours is a
+            // guess (and on a failed bootstrap, a resolver that just failed),
+            // while theirs may be the one that works. Appending ours after
+            // theirs lets first-wins keep the operator's.
+            let owned: &[&str] = if ech_doh.is_some_and(|e| e.pinned) {
+                &["loglevel", "ech-doh"]
+            } else {
+                &["loglevel"]
+            };
+            // With no URL to inject, whatever the config carries is the only ECH
+            // source there is — say which case this is, because both end in an
+            // unpinned lookup and only one of them has anything to look up.
+            let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh").map(|s| s.raw);
+            if let (Some(url), Some(e)) = (config_ech_doh, ech_doh) {
+                if !e.pinned {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        "no resolver answered, so the config's own ech-doh stands over Hole's guess: {url}"
+                    );
+                }
             }
-            Some(merged)
+            if ech_doh.is_none() {
+                match config_ech_doh {
+                    // Stripping this would disarm ECH altogether, so it stands —
+                    // but a hostname authority is resolved over plaintext system DNS.
+                    Some(url) => tracing::warn!(
+                        plugin = %plugin_name,
+                        "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {url}"
+                    ),
+                    // ECH is armed only by `ech-doh`, so there is none. Under
+                    // `ech=always` ex-ray refuses to start over exactly this.
+                    None => tracing::warn!(
+                        plugin = %plugin_name,
+                        fail_closed = segments.iter().any(|s| s.key == "ech" && s.value == "always"),
+                        "no ech-doh from any source; ECH is off"
+                    ),
+                }
+            }
+
+            let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
+
+            Ok(Some(garter::join_plugin_options(
+                segments
+                    .iter()
+                    .filter(|s| !owned.contains(&s.key.as_str()))
+                    .map(|s| s.raw)
+                    .chain(["loglevel=debug"])
+                    .chain(directive.as_deref()),
+            )))
         }
-        _ => opts.map(String::from),
+        _ => Ok(opts.map(String::from)),
     }
 }
 
@@ -459,52 +506,58 @@ fn readiness_for(plugin_name: &str) -> garter::ReadinessMode {
     }
 }
 
-/// Append a `key=value` directive to a SIP003-style options string,
-/// inserting the `;` separator when needed. An empty / `None` input
-/// becomes just the directive.
-fn append_sip003_directive(opts: Option<&str>, directive: &str) -> String {
-    match opts {
-        None | Some("") => directive.to_string(),
-        Some(existing) => {
-            let trimmed = existing.trim_end_matches(';');
-            format!("{trimmed};{directive}")
-        }
-    }
-}
-
 #[cfg(test)]
 mod inject_tests {
     use super::*;
+    use crate::dns::ech::EchDoh;
+
+    /// The merged options, or panic — for inputs that are not testing rejection.
+    fn merged(plugin: &str, opts: Option<&str>, ech_doh: Option<&EchDoh>) -> Option<String> {
+        inject_plugin_directives(plugin, opts, ech_doh).expect("well-formed options")
+    }
+
+    /// An `ech-doh` naming a resolver that ANSWERED the bootstrap.
+    fn pinned(url: &str) -> EchDoh {
+        EchDoh {
+            url: url.to_string(),
+            pinned: true,
+        }
+    }
+
+    /// An `ech-doh` Hole guessed because no resolver answered.
+    fn unpinned(url: &str) -> EchDoh {
+        EchDoh {
+            url: url.to_string(),
+            pinned: false,
+        }
+    }
 
     #[skuld::test]
     fn v2ray_plugin_no_opts_gets_loglevel_debug() {
-        assert_eq!(
-            inject_plugin_directives("v2ray-plugin", None, None).as_deref(),
-            Some("loglevel=debug")
-        );
+        assert_eq!(merged("v2ray-plugin", None, None).as_deref(), Some("loglevel=debug"));
     }
 
     #[skuld::test]
     fn v2ray_plugin_existing_opts_get_loglevel_appended() {
         assert_eq!(
-            inject_plugin_directives("v2ray-plugin", Some("host=example.com;path=/foo"), None).as_deref(),
+            merged("v2ray-plugin", Some("host=example.com;path=/foo"), None).as_deref(),
             Some("host=example.com;path=/foo;loglevel=debug"),
         );
     }
 
     #[skuld::test]
-    fn v2ray_plugin_user_loglevel_warning_overridden_by_appended_debug() {
-        // v2ray-plugin honors the LAST occurrence; appended debug wins.
+    fn v2ray_plugin_user_loglevel_is_removed_not_shadowed() {
+        // `Args.Get` is first-wins, so an appended duplicate would lose.
         assert_eq!(
-            inject_plugin_directives("v2ray-plugin", Some("loglevel=warning;path=/foo"), None).as_deref(),
-            Some("loglevel=warning;path=/foo;loglevel=debug"),
+            merged("v2ray-plugin", Some("loglevel=warning;path=/foo"), None).as_deref(),
+            Some("path=/foo;loglevel=debug"),
         );
     }
 
     #[skuld::test]
     fn v2ray_plugin_trailing_semicolon_collapsed() {
         assert_eq!(
-            inject_plugin_directives("v2ray-plugin", Some("host=example.com;"), None).as_deref(),
+            merged("v2ray-plugin", Some("host=example.com;"), None).as_deref(),
             Some("host=example.com;loglevel=debug"),
         );
     }
@@ -512,51 +565,43 @@ mod inject_tests {
     #[skuld::test]
     fn v2ray_plugin_empty_string_treated_as_no_opts() {
         assert_eq!(
-            inject_plugin_directives("v2ray-plugin", Some(""), None).as_deref(),
+            merged("v2ray-plugin", Some(""), None).as_deref(),
             Some("loglevel=debug")
         );
     }
 
     #[skuld::test]
     fn ex_ray_no_opts_gets_loglevel_debug() {
-        assert_eq!(
-            inject_plugin_directives("ex-ray", None, None).as_deref(),
-            Some("loglevel=debug")
-        );
+        assert_eq!(merged("ex-ray", None, None).as_deref(), Some("loglevel=debug"));
     }
 
     #[skuld::test]
     fn ex_ray_existing_opts_get_loglevel_appended() {
         assert_eq!(
-            inject_plugin_directives("ex-ray", Some("host=example.com;path=/foo"), None).as_deref(),
+            merged("ex-ray", Some("host=example.com;path=/foo"), None).as_deref(),
             Some("host=example.com;path=/foo;loglevel=debug"),
         );
     }
 
     #[skuld::test]
-    fn ex_ray_user_loglevel_warning_overridden_by_appended_debug() {
-        // ex-ray uses the same v2ray-core log config: it honors the LAST
-        // occurrence; appended debug wins.
+    fn ex_ray_user_loglevel_is_removed_not_shadowed() {
         assert_eq!(
-            inject_plugin_directives("ex-ray", Some("loglevel=warning;path=/foo"), None).as_deref(),
-            Some("loglevel=warning;path=/foo;loglevel=debug"),
+            merged("ex-ray", Some("loglevel=warning;path=/foo"), None).as_deref(),
+            Some("path=/foo;loglevel=debug"),
         );
     }
 
     #[skuld::test]
     fn ex_ray_trailing_semicolon_collapsed() {
         assert_eq!(
-            inject_plugin_directives("ex-ray", Some("host=example.com;"), None).as_deref(),
+            merged("ex-ray", Some("host=example.com;"), None).as_deref(),
             Some("host=example.com;loglevel=debug"),
         );
     }
 
     #[skuld::test]
     fn ex_ray_empty_string_treated_as_no_opts() {
-        assert_eq!(
-            inject_plugin_directives("ex-ray", Some(""), None).as_deref(),
-            Some("loglevel=debug")
-        );
+        assert_eq!(merged("ex-ray", Some(""), None).as_deref(), Some("loglevel=debug"));
     }
 
     #[skuld::test]
@@ -564,61 +609,217 @@ mod inject_tests {
         // galoshes ignores `loglevel` itself but forwards the whole options
         // string to its inner ex-ray, so the directive reaches that hop.
         assert_eq!(
-            inject_plugin_directives("galoshes", Some("host=cloudfront.com;path=/"), None).as_deref(),
+            merged("galoshes", Some("host=cloudfront.com;path=/"), None).as_deref(),
             Some("host=cloudfront.com;path=/;loglevel=debug"),
         );
     }
 
     #[skuld::test]
     fn unknown_plugin_passes_through_unchanged() {
-        assert_eq!(
-            inject_plugin_directives("some-future-plugin", Some("k=v"), None).as_deref(),
-            Some("k=v")
-        );
-        assert_eq!(inject_plugin_directives("some-future-plugin", None, None), None);
+        assert_eq!(merged("some-future-plugin", Some("k=v"), None).as_deref(), Some("k=v"));
+        assert_eq!(merged("some-future-plugin", None, None), None);
     }
 
     #[skuld::test]
     fn v2ray_plugin_gets_ech_doh_after_loglevel() {
-        let merged = inject_plugin_directives(
+        let out = merged(
             "v2ray-plugin",
             Some("host=example.com"),
-            Some("https://1.1.1.1/dns-query"),
+            Some(&pinned("https://1.1.1.1/dns-query")),
         );
         assert_eq!(
-            merged.as_deref(),
+            out.as_deref(),
             Some("host=example.com;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
         );
     }
 
     #[skuld::test]
     fn galoshes_gets_ech_doh() {
-        let merged = inject_plugin_directives("galoshes", None, Some("https://dns.google/dns-query"));
+        let out = merged("galoshes", None, Some(&pinned("https://dns.google/dns-query")));
         assert_eq!(
-            merged.as_deref(),
+            out.as_deref(),
             Some("loglevel=debug;ech-doh=https://dns.google/dns-query")
         );
     }
 
     #[skuld::test]
     fn ex_ray_gets_ech_doh() {
-        let merged = inject_plugin_directives("ex-ray", Some("path=/x"), Some("https://9.9.9.9/dns-query"));
+        let out = merged("ex-ray", Some("path=/x"), Some(&pinned("https://9.9.9.9/dns-query")));
         assert_eq!(
-            merged.as_deref(),
+            out.as_deref(),
             Some("path=/x;loglevel=debug;ech-doh=https://9.9.9.9/dns-query")
         );
     }
 
     #[skuld::test]
     fn no_ech_doh_url_appends_only_loglevel() {
-        let merged = inject_plugin_directives("ex-ray", Some("path=/x"), None);
-        assert_eq!(merged.as_deref(), Some("path=/x;loglevel=debug"));
+        let out = merged("ex-ray", Some("path=/x"), None);
+        assert_eq!(out.as_deref(), Some("path=/x;loglevel=debug"));
     }
 
     #[skuld::test]
     fn unknown_plugin_passes_through_even_with_ech_doh() {
-        let merged = inject_plugin_directives("some-future-plugin", Some("k=v"), Some("https://1.1.1.1/dns-query"));
-        assert_eq!(merged.as_deref(), Some("k=v"));
+        let out = merged(
+            "some-future-plugin",
+            Some("k=v"),
+            Some(&pinned("https://1.1.1.1/dns-query")),
+        );
+        assert_eq!(out.as_deref(), Some("k=v"));
+    }
+
+    // The production shape: postern appends `;ech=<mode>;ech-doh=<url>` before
+    // Hole sees the string, so a Hole URL that merely followed it would lose.
+    #[skuld::test]
+    fn a_postern_style_ech_doh_is_replaced_by_holes() {
+        let out = merged(
+            "v2ray-plugin",
+            Some("host=example.com;tls;ech=always;ech-doh=https://cloudflare-dns.com/dns-query"),
+            Some(&pinned("https://1.1.1.1/dns-query")),
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("host=example.com;tls;ech=always;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
+        );
+    }
+
+    // Hole injects no `ech`, so it removes none: `ech=always` sets RequireEch,
+    // which aborts a dial rather than completing a cleartext-SNI handshake.
+    #[skuld::test]
+    fn a_user_ech_mode_survives_untouched() {
+        for mode in ["always", "auto", "never"] {
+            let out = merged("ex-ray", Some(&format!("ech={mode}")), None);
+            assert_eq!(out.as_deref(), Some(&*format!("ech={mode};loglevel=debug")));
+        }
+    }
+
+    // With no URL to put in its place, removing the user's source would leave
+    // ECH with none at all — an override overrides, it does not delete.
+    #[skuld::test]
+    fn a_user_ech_doh_survives_when_hole_has_no_url() {
+        let out = merged("ex-ray", Some("ech-doh=https://example.net/dns-query"), None);
+        assert_eq!(
+            out.as_deref(),
+            Some("ech-doh=https://example.net/dns-query;loglevel=debug"),
+        );
+    }
+
+    // Unpinned, Hole's URL is a guess — on a failed bootstrap, a resolver that
+    // just failed — so the config's own source keeps first-wins precedence.
+    #[skuld::test]
+    fn an_unpinned_url_does_not_displace_the_configs_own() {
+        let out = merged(
+            "ex-ray",
+            Some("ech-doh=https://example.net/dns-query"),
+            Some(&unpinned("https://1.1.1.1/dns-query")),
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("ech-doh=https://example.net/dns-query;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
+        );
+    }
+
+    // With nothing to lose to, an unpinned guess is still the only ECH source
+    // there is, so it is injected.
+    #[skuld::test]
+    fn an_unpinned_url_is_injected_when_the_config_carries_none() {
+        let out = merged("ex-ray", Some("path=/x"), Some(&unpinned("https://1.1.1.1/dns-query")));
+        assert_eq!(
+            out.as_deref(),
+            Some("path=/x;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
+        );
+    }
+
+    // Only whole keys are matched — a key that merely starts with an owned one
+    // belongs to the user.
+    #[skuld::test]
+    fn a_key_that_merely_prefixes_an_owned_one_is_kept() {
+        let out = merged("ex-ray", Some("ech-doh-backup=x;loglevelly=y"), None);
+        assert_eq!(out.as_deref(), Some("ech-doh-backup=x;loglevelly=y;loglevel=debug"));
+    }
+
+    // Values pass through byte-identically: an escaped `;` is part of the value,
+    // never a separator, and nothing re-escapes it.
+    #[skuld::test]
+    fn an_escaped_semicolon_in_a_value_is_preserved() {
+        let out = merged("ex-ray", Some(r"path=/a\;b;loglevel=warning"), None);
+        assert_eq!(out.as_deref(), Some(r"path=/a\;b;loglevel=debug"));
+    }
+
+    // A value ending in an escaped `;` still gets its own separator, so the
+    // appended directive is not swallowed into that value.
+    #[skuld::test]
+    fn a_value_ending_in_an_escaped_semicolon_still_separates() {
+        let out = merged("ex-ray", Some(r"path=/a\;"), None);
+        assert_eq!(out.as_deref(), Some(r"path=/a\;;loglevel=debug"));
+    }
+
+    // A key is stripped by the name the PLUGIN reads, not the name a narrower
+    // unescaper reports: `ech\-doh` IS `ech-doh` to ex-ray, and leaving it would
+    // let a user-supplied hostname URL win under first-wins.
+    #[skuld::test]
+    fn an_escaped_spelling_of_an_owned_key_is_still_stripped() {
+        let out = merged(
+            "ex-ray",
+            Some(r"ech\-doh=https://evil.example/dns-query;log\level=warning"),
+            Some(&pinned("https://9.9.9.9/dns-query")),
+        );
+        assert_eq!(out.as_deref(), Some("loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),);
+    }
+
+    // ex-ray discards the whole SS_* environment on a parse error and reports
+    // `ready` on its default port, so forwarding these would produce a dead
+    // tunnel that looks healthy. Refuse the start instead.
+    #[skuld::test]
+    fn malformed_options_fail_the_start() {
+        for opts in [r"path=/a\", "host=h;=v;mux=0", "a=1;;b=2"] {
+            let err = inject_plugin_directives("ex-ray", Some(opts), Some(&pinned("https://1.1.1.1/dns-query")))
+                .expect_err("malformed options must not reach the plugin");
+            assert!(
+                matches!(err, ProxyError::MalformedPluginOptions(_)),
+                "expected MalformedPluginOptions for {opts:?}, got {err:?}"
+            );
+            // The segment can carry a per-connection secret; only its position
+            // and the fault class are reportable.
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("/a") && !msg.contains("mux"),
+                "message leaks option contents: {msg}"
+            );
+        }
+    }
+
+    // A bare key must stay bare: ex-ray reads a bare key as "1" but `key=` as
+    // "", so rewriting one into the other corrupts the value.
+    #[skuld::test]
+    fn bare_and_valued_keys_keep_their_written_form() {
+        let out = merged("ex-ray", Some("tls;mux;path="), None);
+        assert_eq!(out.as_deref(), Some("tls;mux;path=;loglevel=debug"));
+    }
+
+    #[skuld::test]
+    fn galoshes_user_duplicates_are_removed_too() {
+        // galoshes ignores these keys but forwards the whole string to its inner
+        // ex-ray, so a duplicate would win at that hop.
+        let out = merged(
+            "galoshes",
+            Some("loglevel=warning;ech-doh=https://stale.example/dns-query"),
+            Some(&pinned("https://9.9.9.9/dns-query")),
+        );
+        assert_eq!(out.as_deref(), Some("loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),);
+    }
+
+    // An unknown plugin gets no injection, so it gets no strip either.
+    #[skuld::test]
+    fn unknown_plugin_keeps_its_own_loglevel() {
+        assert_eq!(
+            merged(
+                "some-future-plugin",
+                Some("loglevel=warning"),
+                Some(&pinned("https://1.1.1.1/dns-query")),
+            )
+            .as_deref(),
+            Some("loglevel=warning"),
+        );
     }
 
     #[skuld::test]
