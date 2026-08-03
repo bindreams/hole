@@ -32,14 +32,16 @@ use crate::ci_coverage::{
 use crate::ci_timeouts::xtask_target;
 use crate::manifest::Manifest;
 
-/// Environment variables a compared step may set. They select which toolchain
-/// and which tests run; none reach cargo's fingerprint, so the two files are
-/// free to state them differently.
+/// Environment variables a compared step may set — the two files are free to
+/// state these differently.
 ///
-/// `RUSTFLAGS`, `RUSTC_WRAPPER`, `CARGO_TARGET_DIR` and friends do reach it —
-/// setting one on a compile or run step breaks the artifact reuse this module
-/// exists to protect, so anything outside this set is an error rather than a
-/// silent pass.
+/// Admission criterion: does it reach cargo's fingerprint, and if so does it
+/// INVALIDATE rather than corrupt it? `PATH` passes on the second clause (a
+/// different rustc changes the fingerprint's version hash, so cargo rebuilds
+/// instead of reusing stale units), `HOME` only relocates `CARGO_HOME`, and
+/// `SKULD_LABELS` is read by skuld at test runtime. `RUSTFLAGS`, `RUSTC_WRAPPER`
+/// and `CARGO_TARGET_DIR` fail it. The test is asymmetric: rejecting a neutral
+/// variable is loud and costs one line here, admitting a relevant one is silent.
 pub const FINGERPRINT_NEUTRAL_ENV: [&str; 3] = ["HOME", "PATH", "SKULD_LABELS"];
 
 // Minimal `ci.yaml` shape — serde ignores every field we don't name, so this
