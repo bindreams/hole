@@ -18,8 +18,9 @@ use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::{
-    connect_delay, connect_retrying, deframe_udp_datagram, drive_connection, driver_panicked, frame_udp_datagram,
-    next_failures, parse_udp_timeout, run_client, run_server, session_reconnect_backoff, ClientBoundAddrs,
+    connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection, driver_panicked,
+    enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client, run_server,
+    run_server_with_connections, serve_driven_connection, session_reconnect_backoff, ClientBoundAddrs,
     FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
     REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
@@ -924,4 +925,158 @@ async fn server_shutdown_is_prompt_while_client_connected() {
 
     shutdown.cancel();
     server.await.expect("server task joined").expect("run_server ok");
+}
+
+#[skuld::test]
+async fn server_serves_a_client_while_an_idle_connection_is_open() {
+    // An idle connection must not starve a real client sharing the server (see
+    // `run_server_with_connections`'s per-connection-task comment).
+    const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nok";
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+
+    let (srv_tx, srv_rx) = oneshot::channel();
+    tokio::spawn(run_server(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        upstream,
+        shutdown.clone(),
+        Some(srv_tx),
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    // The idle connection. Held for the whole test; never writes a frame.
+    let _idle = TcpStream::connect(server_addr).await.expect("connect idle");
+    wait_for_log(&writer, "accepted underlying connection").await;
+
+    let (cli_tx, cli_rx) = oneshot::channel();
+    tokio::spawn(run_client(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        server_addr,
+        DEFAULT_UDP_TIMEOUT,
+        shutdown.clone(),
+        Some(cli_tx),
+        None,
+    ));
+    let addrs = cli_rx.await.expect("client bound");
+
+    let mut app = TcpStream::connect(addrs.tcp).await.expect("connect client TCP");
+    app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
+    let mut got = Vec::new();
+    app.read_to_end(&mut got).await.expect("read response to EOF");
+    assert_eq!(got, RESPONSE, "the relay must serve a client past an idle connection");
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn connection_task_fatal_escalates_panics_not_aborts() {
+    assert!(!connection_task_fatal(tokio::spawn(async {}).await));
+
+    // Our own teardown abort → cancelled JoinError → not a bug.
+    let h = tokio::spawn(std::future::pending::<()>());
+    h.abort();
+    assert!(!connection_task_fatal(h.await));
+
+    // A panic — the single route by which a code bug reaches the supervisor,
+    // including a driver panic, which `serve_underlying` re-raises.
+    assert!(connection_task_fatal(tokio::spawn(async { panic!("boom") }).await));
+}
+
+#[skuld::test]
+async fn served_connection_gets_os_keepalive() {
+    // Without it a peer whose path dies silently is never reaped.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let _client = TcpStream::connect(addr).await.expect("connect");
+    let (accepted, _) = listener.accept().await.expect("accept");
+
+    let sock = socket2::SockRef::from(&accepted);
+    assert!(!sock.keepalive().expect("read keepalive"), "off before");
+    enable_keepalive(&accepted);
+    assert!(sock.keepalive().expect("read keepalive"), "on after");
+}
+
+#[skuld::test]
+async fn server_exits_on_a_panic_and_winds_down_its_other_connections() {
+    // A code bug must stop the whole plugin rather than let it limp on — and the
+    // surviving connections must be wound down cooperatively, so their drivers
+    // are aborted and their sockets closed before `run_server` returns.
+    let shutdown = CancellationToken::new();
+    let (srv_tx, srv_rx) = oneshot::channel();
+    let (serving_tx, mut serving_rx) = mpsc::channel::<()>(1);
+    let sibling_wound_down = Arc::new(AtomicBool::new(false));
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&sibling_wound_down);
+    let server = tokio::spawn(run_server_with_connections(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+        shutdown.clone(),
+        Some(srv_tx),
+        move |_tcp, _peer, _config, _remote, shutdown| {
+            // First connection is the well-behaved sibling; the second panics.
+            let is_sibling = !seen.swap(true, Ordering::SeqCst);
+            let serving_tx = serving_tx.clone();
+            let flag = Arc::clone(&flag);
+            async move {
+                assert!(is_sibling, "boom");
+                let _ = serving_tx.send(()).await;
+                shutdown.cancelled().await;
+                flag.store(true, Ordering::SeqCst);
+            }
+        },
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    let _sibling = TcpStream::connect(server_addr).await.expect("connect sibling");
+    serving_rx.recv().await.expect("sibling is being served");
+    let _bad = TcpStream::connect(server_addr).await.expect("connect panicking");
+
+    let err = server
+        .await
+        .expect("server task joined")
+        .expect_err("a panicking connection task must fail the plugin");
+    assert!(err.to_string().contains("panicked"), "unexpected error: {err}");
+    assert!(
+        sibling_wound_down.load(Ordering::SeqCst),
+        "the surviving connection must be wound down, not abandoned"
+    );
+}
+
+#[skuld::test]
+async fn server_exits_when_the_yamux_driver_panics() {
+    // The driver runs on a task of its own, so its panic must be re-raised in
+    // the connection task to reach the supervisor. The injected driver drops
+    // `inbound_tx` while unwinding exactly as the real one does, so the
+    // connection observes the close only after the driver has finished.
+    let shutdown = CancellationToken::new();
+    let (srv_tx, srv_rx) = oneshot::channel();
+    let server = tokio::spawn(run_server_with_connections(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+        shutdown.clone(),
+        Some(srv_tx),
+        |_tcp, peer, _config, remote, shutdown| {
+            let (inbound_tx, inbound_rx) = mpsc::channel::<::yamux::Stream>(1);
+            let driver = tokio::spawn(async move {
+                let _inbound_tx = inbound_tx;
+                panic!("driver boom");
+            });
+            serve_driven_connection(peer, remote, shutdown, driver, inbound_rx)
+        },
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    let _conn = TcpStream::connect(server_addr).await.expect("connect server");
+
+    let err = server
+        .await
+        .expect("server task joined")
+        .expect_err("a panicking driver must fail the plugin");
+    assert!(err.to_string().contains("panicked"), "unexpected error: {err}");
 }

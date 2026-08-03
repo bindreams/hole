@@ -34,6 +34,7 @@ contracts = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"
 yamux = "0.14"
+socket2 = "0.6"
 sha2 = "0.11"
 tempfile = "3"
 tombstone = { path = "../tombstone" }
