@@ -78,6 +78,114 @@ pub fn parse_plugin_options(opts: &str) -> Vec<(String, String)> {
     result
 }
 
+/// An options string a SIP003 plugin rejects outright. Reported rather than
+/// repaired: a rewriter that quietly made such a string parseable would turn a
+/// loud startup failure into a silently different config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MalformedOptions {
+    /// Ends in an unpaired `\`, which would escape a separator appended after it.
+    #[error("plugin options end in an unpaired backslash")]
+    DanglingEscape,
+    /// A segment has no key — `;;` or a leading `=`. `index` positions it for a
+    /// diagnostic without echoing the segment, which can carry a secret.
+    #[error("plugin options segment {index} has no key")]
+    EmptyKey { index: usize },
+}
+
+/// One segment of a SIP003 options string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionSegment<'a> {
+    /// The segment exactly as written, escapes intact.
+    pub raw: &'a str,
+    /// The key as a SIP003 PLUGIN reads it: a `\` escapes whatever byte follows.
+    /// This is deliberately more permissive than [`parse_plugin_options`], which
+    /// honours only `\;`, `\\` and `\=` and otherwise keeps the backslash — so
+    /// `ech\-doh` is `ech-doh` here and `ech\-doh` there. Use this field to
+    /// decide which key a plugin will ACT on; a check that used the narrower
+    /// rule could be evaded by escaping one character of the name.
+    pub key: String,
+    /// The value, decoded by the same rule. Empty for a bare key — a caller
+    /// that must distinguish `tls` from `tls=` reads `raw`.
+    pub value: String,
+}
+
+/// Split an options string into segments on unescaped `;`, decoding each key for
+/// comparison while leaving the segment itself raw.
+///
+/// A caller that rewrites options must work in these terms rather than parsing
+/// and re-serializing: [`parse_plugin_options`] maps a bare key to `""`, while
+/// ex-ray maps it to `"1"`, so no re-serializer can round-trip both `mux` and
+/// `path=` correctly. Raw segments have nothing to round-trip.
+///
+/// This accepts exactly what a SIP003 plugin accepts: anything it would reject
+/// is an `Err` here, so a caller cannot rewrite a fatal string into a merely
+/// wrong one. The one normalization is a trailing `;`, which plugins accept and
+/// which must go — appending after it would produce the empty segment they don't.
+pub fn split_plugin_options(opts: &str) -> Result<Vec<OptionSegment<'_>>, MalformedOptions> {
+    split_on_unescaped_borrowed(opts, ';')?
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let eq = find_unescaped(raw, '=');
+            let key = unescape_any(match eq {
+                Some(eq) => &raw[..eq],
+                None => raw,
+            })?;
+            if key.is_empty() {
+                return Err(MalformedOptions::EmptyKey { index });
+            }
+            let value = match eq {
+                Some(eq) => unescape_any(&raw[eq + 1..])?,
+                None => String::new(),
+            };
+            Ok(OptionSegment { raw, key, value })
+        })
+        .collect()
+}
+
+/// Join raw segments into an options string, separating with `;`. Appending is
+/// safe because a segment that ends in an escaped `;` still gets its own
+/// separator, and [`split_plugin_options`] has already rejected the inputs that
+/// could swallow it or poison the result.
+pub fn join_plugin_options<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments.into_iter().collect::<Vec<_>>().join(";")
+}
+
+/// [`split_on_unescaped`] without the copy: yields subslices of `s`. Errors on a
+/// trailing `\` that escapes nothing.
+fn split_on_unescaped_borrowed(s: &str, delimiter: char) -> Result<Vec<&str>, MalformedOptions> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = s.char_indices();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\\' {
+            chars.next().ok_or(MalformedOptions::DanglingEscape)?;
+        } else if ch == delimiter {
+            segments.push(&s[start..i]);
+            start = i + ch.len_utf8();
+        }
+    }
+    if start < s.len() {
+        segments.push(&s[start..]);
+    }
+    Ok(segments)
+}
+
+/// Unescape by the SIP003 reference rule: `\` escapes whatever character
+/// follows — see [`OptionSegment::key`] for why this differs from [`unescape`].
+fn unescape_any(s: &str) -> Result<String, MalformedOptions> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(chars.next().ok_or(MalformedOptions::DanglingEscape)?);
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
 fn split_on_unescaped(s: &str, delimiter: char) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
