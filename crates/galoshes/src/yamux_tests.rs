@@ -887,6 +887,13 @@ async fn driver_panicked_detects_panic_not_cancel() {
 
 #[skuld::test]
 async fn shutdown_during_backoff_exits_promptly() {
+    // Paused for the whole test so no wall-clock window exists between the
+    // rendezvous below and the backoff sleep it is supposed to freeze. The
+    // keepalive timer inside the span cannot change what is observed: the first
+    // session never receives a byte, so whether it dies from the relay's close
+    // or from a keepalive verdict, the reconnect event is `(1, false)` either
+    // way.
+    tokio::time::pause();
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
     let shutdown = CancellationToken::new();
     let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
@@ -907,13 +914,6 @@ async fn shutdown_during_backoff_exits_promptly() {
     // Rendezvous (not the assertion): the observer event means the client has
     // reached the reconnect decision and is entering the backoff sleep.
     assert_eq!(events_rx.recv().await.unwrap(), (1, false));
-
-    // Pause only here, over the backoff window, where nothing but a timer can
-    // progress. Held from the top it would also span the first session, letting
-    // auto-advance resolve a whole keepalive interval and deadline while that
-    // session's frames were still in the kernel — so the reconnect awaited above
-    // could be the keepalive's rather than the relay's close.
-    tokio::time::pause();
 
     // The external assertion: shutdown must win the paused sleep, so the client
     // task returns `Ok` promptly. Without the select! shutdown branch the paused
@@ -1323,13 +1323,17 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
     // fit inside the interval, so they are equal rather than lopsided.
     let cadence = Cadence::new(Duration::from_millis(500), Duration::from_millis(500));
 
-    // End the session as soon as the keepalive has reported a live transport, so
-    // the assertion below is on how the session ended, not on how long it ran.
+    // End the session as soon as the keepalive has reached *a* verdict, so the
+    // assertions below are on which verdict it was, not on how long it ran. The
+    // needle is the substring both verdict lines share ("transport answered
+    // inside the keepalive deadline" / "transport silent across the keepalive
+    // deadline") on purpose: waiting for the good one alone would hang here
+    // instead of failing, and the diagnosis would be lost.
     let ender = {
         let writer = writer.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            wait_for_log(&writer, "transport answered inside the keepalive deadline").await;
+            wait_for_log(&writer, "the keepalive deadline").await;
             shutdown.cancel();
         })
     };

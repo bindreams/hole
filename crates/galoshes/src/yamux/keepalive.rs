@@ -4,8 +4,8 @@
 //! RST/FIN — produces no death signal of its own, so an idle tunnel otherwise
 //! waits out ex-ray's inherited 300 s `ConnectionIdle`
 //! (`third_party/v2ray-core/features/policy/policy.go`, `SessionDefault`) before
-//! anything notices. This module bounds that recovery here instead, without
-//! relying on any timer further down the stack.
+//! anything notices. This module bounds that recovery instead, without relying
+//! on any timer further down the stack.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

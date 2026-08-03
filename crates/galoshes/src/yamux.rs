@@ -886,9 +886,12 @@ pub(crate) async fn run_client(
         )
         .await;
 
-        // Tear down the driver deterministically. On `TransportDied` it already
-        // finished (abort is a no-op); otherwise abort ends it instead of hanging
-        // until the chain drain-timeout (`drive_connection` has no shutdown hook).
+        // Tear down the driver deterministically. When the driver itself observed
+        // the death it has already returned and the abort is a no-op; when the
+        // keepalive declared it, or on shutdown, the driver is still live and the
+        // abort is what ends it — truncating any in-flight relay, per the teardown
+        // tradeoff — instead of hanging until the chain drain-timeout
+        // (`drive_connection` has no shutdown hook).
         // A driver panic is a code bug, not a transport event — exit rather than reconnect.
         driver.abort();
         if driver_panicked(driver.await) {

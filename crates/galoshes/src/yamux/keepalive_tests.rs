@@ -389,8 +389,7 @@ async fn keepalive_declares_a_silent_transport_dead() {
 async fn keepalive_declares_a_transport_dead_two_intervals_after_the_last_inbound_byte() {
     // The documented worst case, driven end to end: a byte lands just before a
     // cycle boundary, that cycle skips, and the next one runs a full deadline
-    // before the verdict. `2 × INTERVAL + TIMEOUT`, which is the bound CLAUDE.md
-    // and CONTRIBUTING.md state.
+    // before the verdict: `2 × INTERVAL + TIMEOUT`.
     let client = piped_client(StubPeer::Blackhole).await;
     tokio::time::pause();
     let started = tokio::time::Instant::now();
@@ -409,4 +408,13 @@ async fn keepalive_declares_a_transport_dead_two_intervals_after_the_last_inboun
     keepalive.await;
 
     assert_elapsed(started, 2 * KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT, 3);
+}
+
+#[skuld::test]
+#[should_panic(expected = "a keepalive deadline must fit inside its interval")]
+fn a_cadence_whose_deadline_outlasts_its_interval_is_rejected() {
+    // The detection bound is only `2 × interval + timeout` while the deadline
+    // fits inside the interval, and `new` is the only way to build a pair other
+    // than the shipped one.
+    Cadence::new(Duration::from_secs(1), Duration::from_secs(2));
 }
