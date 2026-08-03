@@ -4,7 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -543,38 +543,40 @@ fn session_reconnect_backoff_schedule() {
 // TransportLivenessTap ------------------------------------------------------------------------------------------------
 
 #[skuld::test]
-async fn transport_tap_sets_on_inbound_bytes() {
+async fn transport_tap_counts_inbound_reads() {
     use futures::AsyncReadExt as _;
-    let productive = Arc::new(AtomicBool::new(false));
-    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(b"data".to_vec()), Arc::clone(&productive));
-    let mut buf = [0u8; 8];
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(b"datadata".to_vec()), Arc::clone(&reads));
+    let mut buf = [0u8; 4];
     assert_eq!(tap.read(&mut buf).await.unwrap(), 4);
-    assert!(productive.load(Ordering::Relaxed));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(tap.read(&mut buf).await.unwrap(), 4);
+    assert_eq!(reads.load(Ordering::Relaxed), 2, "each non-empty read must be counted");
 }
 
 #[skuld::test]
 async fn transport_tap_silent_on_eof() {
     use futures::AsyncReadExt as _;
-    let productive = Arc::new(AtomicBool::new(false));
-    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(Vec::new()), Arc::clone(&productive));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(Vec::new()), Arc::clone(&reads));
     let mut buf = [0u8; 8];
     assert_eq!(tap.read(&mut buf).await.unwrap(), 0);
-    assert!(!productive.load(Ordering::Relaxed));
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
 }
 
 #[skuld::test]
 async fn transport_tap_delegates_writes() {
     use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-    let productive = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
     let (a, b) = tokio::io::duplex(64);
-    let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&productive));
+    let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&reads));
     tap.write_all(b"ping").await.unwrap();
     tap.flush().await.unwrap();
     let mut b = b.compat();
     let mut buf = [0u8; 4];
     b.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ping");
-    assert!(!productive.load(Ordering::Relaxed), "writes never set productive");
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "writes are never inbound liveness");
 }
 
 // Transport-reset reconnect -------------------------------------------------------------------------------------------
