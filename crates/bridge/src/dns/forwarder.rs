@@ -223,12 +223,20 @@ impl UpstreamErr {
 /// accepted and then reset before the first write leaves `written == 0`, and
 /// reading that as "no connection was opened" would be a positive claim about
 /// the local hop that the connect itself disproves.
+///
+/// A completed SOCKS5 CONNECT counts on its own: `shadowsocks-service` answers
+/// it only once the attempt reaches the plugin's local port, so completion is
+/// evidence about that hop. A completed UDP ASSOCIATE does not count on its
+/// own — `shadowsocks-service` answers it purely locally, without touching the
+/// plugin at all, so it is evidence of nothing beyond the SOCKS5 listener
+/// itself. A datagram attempt only counts once a reply is actually read; see
+/// [`AttemptProbe::established`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpstreamActivity {
     pub read: u64,
     pub written: u64,
     /// Upstream connections established — a completed SOCKS5 CONNECT, or a
-    /// completed UDP ASSOCIATE.
+    /// UDP exchange that returned a reply.
     pub connects: u64,
 }
 
@@ -285,7 +293,8 @@ impl AttemptProbe {
         s.stream = Some(counters.clone());
     }
 
-    /// The UDP association completed.
+    /// The UDP association completed. Only a byte-counting handle — see
+    /// [`Self::established`] for why this alone is not "a connection".
     fn associated(&self, counters: DatagramCounters) {
         self.state.lock().expect("poisoned").datagram = Some(counters);
     }
@@ -298,12 +307,16 @@ impl AttemptProbe {
         self.state.lock().expect("poisoned").tls_ms = Some(tls_ms);
     }
 
-    /// Did the connector hand back a usable upstream? True the moment a SOCKS5
-    /// CONNECT or UDP ASSOCIATE completed, independent of any byte moving — see
-    /// [`UpstreamActivity`] for why zero bytes must not read as "no connection".
+    /// Did the connector hand back a usable upstream, with evidence that
+    /// reaches past the immediate local hop? True the moment a SOCKS5 CONNECT
+    /// completed, independent of any byte moving — see [`UpstreamActivity`]
+    /// for why zero bytes must not read as "no connection" there. A UDP
+    /// ASSOCIATE does NOT complete this on its own: `shadowsocks-service`
+    /// answers it locally without touching the plugin, so it is not
+    /// comparable evidence until a reply is actually read.
     fn established(&self) -> bool {
         let s = self.state.lock().expect("poisoned");
-        s.stream.is_some() || s.datagram.is_some()
+        s.stream.is_some() || s.datagram.as_ref().is_some_and(|c| c.read() > 0)
     }
 
     /// `(read, written)` for the attempt, over whichever transport ran.

@@ -2110,6 +2110,45 @@ mod self_test {
         );
     }
 
+    /// Regression: `shadowsocks-service` answers a UDP ASSOCIATE purely
+    /// locally, without touching the plugin — unlike a SOCKS5 CONNECT, which
+    /// it only answers once the attempt reaches the plugin's local port. A
+    /// completed ASSOCIATE with no reply is therefore the same physical fault
+    /// as `a_refused_local_hop_is_reported_as_no_connection` (the local hop),
+    /// not `TunnelSilent`: an ASSOCIATE carries none of a CONNECT's evidence.
+    #[skuld::test]
+    fn a_silent_udp_associate_is_reported_as_no_connection() {
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (connector, connected_rx) = SilentConnector::new();
+                let cfg = DnsConfig {
+                    protocol: DnsProtocol::PlainUdp,
+                    ..test_dns_cfg()
+                };
+                let forwarder = SArc::new(DnsForwarder::new(cfg, connector, false));
+                let run = tokio::spawn(run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                ));
+                connected_rx.await.expect("the stub connector completed a connect");
+                tokio::time::pause();
+                run.await.unwrap()
+            });
+
+        let SelfTestOutcome::Failed { reason, .. } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            matches!(reason, SelfTestReason::NoConnection),
+            "a completed UDP ASSOCIATE with no reply must not read as a reached tunnel; got {reason:?}"
+        );
+    }
+
     /// A resolver that answered SERVFAIL over UDP must not be reported as a
     /// silent tunnel.
     #[skuld::test]
@@ -2168,6 +2207,19 @@ mod self_test {
         );
         assert!(!err.to_string().contains("Upstream("), "got: {err}");
         assert!(err.to_string().contains("SERVFAIL"), "got: {err}");
+    }
+
+    /// Only the two transport-implicating reasons ask the plugin to account
+    /// for itself. `Other` also covers a transport proven healthy (a reply
+    /// arrived and was rejected) or never exercised (nothing dialled), where
+    /// quoting the plugin would misattribute a failure that is not its own.
+    #[skuld::test]
+    fn implicates_plugin_transport_covers_only_the_two_tunnel_readings() {
+        assert!(super::implicates_plugin_transport(&SelfTestReason::NoConnection));
+        assert!(super::implicates_plugin_transport(&SelfTestReason::TunnelSilent));
+        assert!(!super::implicates_plugin_transport(&SelfTestReason::Other(
+            "a resolver answered with SERVFAIL".into()
+        )));
     }
 
     /// `report_plugin_output` quotes a chain's lines, and says so when there is

@@ -1097,7 +1097,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
-                    report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
+                    if implicates_plugin_transport(&reason) {
+                        report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
+                    }
                     return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
             }
@@ -1749,6 +1751,17 @@ struct Observed {
     dialled: bool,
     /// What the forwarder did during the run.
     moved: crate::dns::forwarder::UpstreamActivity,
+}
+
+/// Does this reason implicate the plugin transport enough to ask it to
+/// account for itself? `NoConnection`/`TunnelSilent` are the two readings
+/// about the tunnel not carrying or returning data. `Other` also covers a
+/// transport proven HEALTHY (a reply arrived and was rejected — SERVFAIL, or
+/// too short) or never exercised (nothing dialled) — quoting the plugin's
+/// "own account of why its transport failed" there would blame it for a
+/// failure that is not its own.
+fn implicates_plugin_transport(reason: &SelfTestReason) -> bool {
+    matches!(reason, SelfTestReason::NoConnection | SelfTestReason::TunnelSilent)
 }
 
 /// Emit the plugin chain's kept output for a failed gate, or say there is no

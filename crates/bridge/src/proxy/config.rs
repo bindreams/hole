@@ -108,11 +108,15 @@ pub enum ProxyError {
     /// PII-free by construction.
     #[error("Nothing came back through the tunnel ({attempts} attempts in {elapsed_ms}ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver.")]
     TunnelSilent { attempts: u32, elapsed_ms: u64 },
-    /// The DNS self-test never wrote a byte upstream, so no query entered the
-    /// tunnel. That is the LOCAL hop — the shadowsocks SOCKS5 listener, or the
-    /// plugin's local port — and distinct from [`Self::TunnelSilent`], whose
-    /// first cause is the plugin's own outward connection. `Display`
-    /// interpolates only integers.
+    /// The DNS self-test never established a connection into the tunnel. That
+    /// is the LOCAL hop — the shadowsocks SOCKS5 listener refusing outright,
+    /// or (for a TCP-based DNS transport) a SOCKS5 CONNECT that never reached
+    /// the plugin's local port — and distinct from [`Self::TunnelSilent`],
+    /// whose first cause is the plugin's own outward connection. A UDP DNS
+    /// transport's ASSOCIATE completing does not disprove this variant: it is
+    /// answered by `shadowsocks-service` itself without touching the plugin,
+    /// so it carries none of a CONNECT's evidence. `Display` interpolates
+    /// only integers.
     #[error("Could not open a connection into the tunnel ({attempts} attempts in {elapsed_ms}ms). The local proxy or its plugin is not accepting connections.")]
     NoTunnelConnection { attempts: u32, elapsed_ms: u64 },
     /// The start-time reachability probe found the network is resetting/dropping
