@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -153,26 +154,22 @@ pub struct UpstreamErr {
     /// deadline that was not in force.
     pub budget_ms: u64,
     /// Time from `forward_one` start to return of `connector.connect_tcp`.
-    /// `Some` whenever the TCP/SOCKS5-level connection completed
-    /// (Tls/Io/Http failures); `None` when we errored at `Connect`, and always
-    /// `None` on `Timeout` regardless of how far the attempt got — see
-    /// [`Self::tcp_wrote`].
+    /// `Some` whenever the TCP/SOCKS5-level connection completed; `None` when
+    /// we errored at `Connect`, or for a UDP transport.
     pub socks5_ms: Option<u64>,
-    /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`.
-    /// `Some` on `Tls`/`Io`/`Http` layers; `None` otherwise.
+    /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`. On a
+    /// handshake still in flight when the budget fired, how long it had run.
     pub tls_ms: Option<u64>,
     /// Raw bytes written to / read from the underlying TCP stream,
-    /// observed by [`crate::dns::connector::CountingStream`]. `None` when
-    /// connect failed (no stream existed). Post-SOCKS5 byte counts —
-    /// what a DoH server would see.
-    ///
-    /// ALSO `None` on the `Timeout` layer, whatever had already happened: the
-    /// budget fires outside the per-transport future, which owns the counters,
-    /// so a timed-out attempt that connected, handshook and wrote is
-    /// indistinguishable here from one that never connected. Do not read
-    /// `tcp_wrote = None` on `layer=timeout` as "never connected".
+    /// observed by [`crate::dns::connector::CountingStream`]. `None` when no
+    /// stream was opened (connect failed, or a UDP transport). Post-SOCKS5
+    /// byte counts — what a DoH server would see.
     pub tcp_wrote: Option<u64>,
     pub tcp_read: Option<u64>,
+    /// Datagram bytes sent to / received from the upstream, for the UDP
+    /// transport. `None` whenever a stream was opened — read `tcp_*` there.
+    pub udp_sent: Option<u64>,
+    pub udp_received: Option<u64>,
     /// First `io::Error::raw_os_error()` found walking
     /// `std::error::Error::source()` from `source`. Distinguishes FIN
     /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
@@ -192,24 +189,10 @@ impl UpstreamErr {
             tls_ms: None,
             tcp_wrote: None,
             tcp_read: None,
+            udp_sent: None,
+            udp_received: None,
             os_errno,
         }
-    }
-
-    fn with_socks5_ms(mut self, ms: u64) -> Self {
-        self.socks5_ms = Some(ms);
-        self
-    }
-
-    fn with_tls_ms(mut self, ms: u64) -> Self {
-        self.tls_ms = Some(ms);
-        self
-    }
-
-    fn with_counters(mut self, c: &StreamCounters) -> Self {
-        self.tcp_read = Some(c.read());
-        self.tcp_wrote = Some(c.written());
-        self
     }
 
     /// Classify this failure for reporting. Only the `Tls` layer needs the
@@ -225,6 +208,110 @@ impl UpstreamErr {
                 Some(e) if is_trust_chain_rejection(e) => UpstreamCause::CertificateRejected,
                 _ => UpstreamCause::TlsFailed,
             },
+        }
+    }
+}
+
+/// Bytes a forwarder has moved upstream, cumulative over its lifetime and
+/// counted whether the attempt succeeded, failed or was cancelled by its
+/// budget. Snapshot before a sequence and [`Self::since`] after: the difference
+/// is direct evidence of whether anything came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpstreamBytes {
+    pub read: u64,
+    pub written: u64,
+}
+
+impl UpstreamBytes {
+    /// This snapshot minus an earlier one from the same forwarder.
+    pub fn since(self, earlier: Self) -> Self {
+        debug_assert!(
+            self.read >= earlier.read && self.written >= earlier.written,
+            "upstream byte counters only increase; snapshots were passed out of order"
+        );
+        Self {
+            read: self.read.saturating_sub(earlier.read),
+            written: self.written.saturating_sub(earlier.written),
+        }
+    }
+}
+
+// Attempt probe -------------------------------------------------------------------------------------------------------
+
+/// Diagnostics an attempt publishes as it makes progress, owned by
+/// [`DnsForwarder::forward_one`] rather than by the transport future it bounds.
+/// The budget cancels that future by dropping it, which would take any state it
+/// still owned with it — so `tcp_read = None` on a timed-out attempt could not
+/// be told apart from "never connected".
+///
+/// All four transports feed it. UDP has no stream to wrap, so it reports its
+/// `send`/`recv` returns directly; without that, a byte reading would be a
+/// constant zero for `PlainUdp` rather than a measurement.
+#[derive(Default)]
+struct AttemptProbe {
+    state: Mutex<AttemptState>,
+}
+
+#[derive(Default)]
+struct AttemptState {
+    socks5_ms: Option<u64>,
+    /// Set when the TLS handshake starts. If the attempt is cancelled
+    /// mid-handshake, `apply` reports how long it had been running.
+    tls_started_at: Option<Instant>,
+    tls_ms: Option<u64>,
+    counters: Option<StreamCounters>,
+    udp_read: u64,
+    udp_written: u64,
+}
+
+impl AttemptProbe {
+    /// The TCP/SOCKS5-level connection completed.
+    fn connected(&self, socks5_ms: u64, counters: &StreamCounters) {
+        let mut s = self.state.lock().expect("poisoned");
+        s.socks5_ms = Some(socks5_ms);
+        s.counters = Some(counters.clone());
+    }
+
+    fn tls_started(&self) {
+        self.state.lock().expect("poisoned").tls_started_at = Some(Instant::now());
+    }
+
+    fn tls_done(&self, tls_ms: u64) {
+        self.state.lock().expect("poisoned").tls_ms = Some(tls_ms);
+    }
+
+    fn datagram_sent(&self, n: u64) {
+        self.state.lock().expect("poisoned").udp_written += n;
+    }
+
+    fn datagram_received(&self, n: u64) {
+        self.state.lock().expect("poisoned").udp_read += n;
+    }
+
+    /// `(read, written)` for the attempt, over whichever transport ran.
+    fn bytes(&self) -> (u64, u64) {
+        let s = self.state.lock().expect("poisoned");
+        let (r, w) = s.counters.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
+        (r + s.udp_read, w + s.udp_written)
+    }
+
+    /// Decorate an error with everything the attempt had published. `tcp_*`
+    /// stay stream-only and UDP gets its own pair — widening the `tcp_*` fields
+    /// would make the log line's name a lie, and dropping the UDP counts would
+    /// leave a timed-out datagram attempt reporting all-`None`, which reads as
+    /// "never sent anything".
+    fn apply(&self, e: &mut UpstreamErr) {
+        let s = self.state.lock().expect("poisoned");
+        e.socks5_ms = s.socks5_ms;
+        e.tls_ms = s
+            .tls_ms
+            .or_else(|| s.tls_started_at.map(|t| t.elapsed().as_millis() as u64));
+        if let Some(c) = s.counters.as_ref() {
+            e.tcp_read = Some(c.read());
+            e.tcp_wrote = Some(c.written());
+        } else {
+            e.udp_sent = Some(s.udp_written);
+            e.udp_received = Some(s.udp_read);
         }
     }
 }
@@ -418,6 +505,10 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
+    /// Cumulative upstream bytes — see [`UpstreamBytes`]. Written by
+    /// `forward_one` on every attempt, read by snapshot/diff.
+    upstream_read: AtomicU64,
+    upstream_written: AtomicU64,
     /// Test-only per-server upstream-port override, indexed against
     /// `config.servers`, so tests can target ephemeral listeners without
     /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
@@ -439,8 +530,17 @@ impl DnsForwarder {
             ipv6_bypass_available,
             failure_throttle: Mutex::new(HashMap::new()),
             ipv6_skip_logged: Mutex::new(HashSet::new()),
+            upstream_read: AtomicU64::new(0),
+            upstream_written: AtomicU64::new(0),
             #[cfg(test)]
             forced_ports: None,
+        }
+    }
+
+    pub fn upstream_bytes(&self) -> UpstreamBytes {
+        UpstreamBytes {
+            read: self.upstream_read.load(Ordering::Relaxed),
+            written: self.upstream_written.load(Ordering::Relaxed),
         }
     }
 
@@ -537,14 +637,20 @@ impl DnsForwarder {
     /// build `target` from the config'd server plus the protocol's well-known
     /// port; the test-only `port_for` / `forced_ports` seam substitutes an
     /// ephemeral port so stubs don't need privilege to bind 53/853/443.
+    ///
+    /// Every error — including the budget's own — is decorated from the
+    /// [`AttemptProbe`], so the diagnostic fields mean the same thing on every
+    /// layer. The bytes the attempt moved fold into the forwarder's cumulative
+    /// totals whether it succeeded or not.
     async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> Result<Vec<u8>, UpstreamErr> {
         let started = Instant::now();
+        let probe = AttemptProbe::default();
         let fut = async {
             match self.config.protocol {
-                DnsProtocol::PlainUdp => self.forward_udp(target, query).await,
-                DnsProtocol::PlainTcp => self.forward_tcp(target, query).await,
-                DnsProtocol::Tls => self.forward_tls(target, query).await,
-                DnsProtocol::Https => self.forward_https(target, query).await,
+                DnsProtocol::PlainUdp => self.forward_udp(target, query, &probe).await,
+                DnsProtocol::PlainTcp => self.forward_tcp(target, query, &probe).await,
+                DnsProtocol::Tls => self.forward_tls(target, query, &probe).await,
+                DnsProtocol::Https => self.forward_https(target, query, &probe).await,
             }
         };
         let result = match timeout(budget, fut).await {
@@ -554,9 +660,13 @@ impl DnsForwarder {
                 io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
             )),
         };
+        let (read, written) = probe.bytes();
+        self.upstream_read.fetch_add(read, Ordering::Relaxed);
+        self.upstream_written.fetch_add(written, Ordering::Relaxed);
         result.map_err(|mut e| {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
             e.budget_ms = budget.as_millis() as u64;
+            probe.apply(&mut e);
             e
         })
     }
@@ -619,6 +729,8 @@ impl DnsForwarder {
                     tls_ms = ?e.tls_ms,
                     tcp_wrote = ?e.tcp_wrote,
                     tcp_read = ?e.tcp_read,
+                    udp_sent = ?e.udp_sent,
+                    udp_received = ?e.udp_received,
                     os_errno = ?e.os_errno,
                     caused_by = %format_error_chain(&e.source),
                     "upstream failed"
@@ -654,21 +766,28 @@ fn default_port(protocol: DnsProtocol) -> u16 {
 // Transport: plain UDP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_udp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_udp(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socket = self
             .connector
             .connect_udp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        socket
+        let sent = socket
             .send(query)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
+        probe.datagram_sent(sent as u64);
         let mut buf = vec![0u8; MAX_REPLY_SIZE];
         let n = socket
             .recv(&mut buf)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
+        probe.datagram_received(n as u64);
         buf.truncate(n);
         Ok(buf)
     }
@@ -677,63 +796,68 @@ impl DnsForwarder {
 // Transport: plain TCP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_tcp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_tcp(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
-        exchange_tcp_framed(stream, query).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_counters(&counters)
-        })
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
+        exchange_tcp_framed(stream, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoT (TLS over TCP) =======================================================================================
 
 impl DnsForwarder {
-    async fn forward_tls(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_tls(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
 
-        let server_name = tls_server_name_for(target.ip()).map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_counters(&counters)
-        })?;
+        let server_name = tls_server_name_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
         let tls_start = Instant::now();
+        probe.tls_started();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
-                .with_counters(&counters)
-        })?;
-        let tls_ms = tls_start.elapsed().as_millis() as u64;
-        exchange_tcp_framed(tls, query).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        })
+        let tls = tls_connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        probe.tls_done(tls_start.elapsed().as_millis() as u64);
+        exchange_tcp_framed(tls, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoH (HTTP/1.1 over TLS) ==================================================================================
 
 impl DnsForwarder {
-    async fn forward_https(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_https(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
 
@@ -743,18 +867,17 @@ impl DnsForwarder {
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
 
         let tls_start = Instant::now();
+        probe.tls_started();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let mut tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
-                .with_counters(&counters)
-        })?;
-        let tls_ms = tls_start.elapsed().as_millis() as u64;
+        let mut tls = tls_connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        probe.tls_done(tls_start.elapsed().as_millis() as u64);
 
         let (host, path) = path_and_host;
         let mut req = Vec::with_capacity(256 + query.len());
@@ -772,12 +895,7 @@ impl DnsForwarder {
         .unwrap();
         req.extend_from_slice(query);
 
-        let io_err = |e: io::Error| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        };
+        let io_err = |e: io::Error| UpstreamErr::new(UpstreamLayer::Io, e);
         tls.write_all(&req).await.map_err(io_err)?;
         tls.flush().await.map_err(io_err)?;
 
@@ -788,12 +906,7 @@ impl DnsForwarder {
             .await
             .map_err(io_err)?;
 
-        parse_http_dns_response(&resp).map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Http, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        })
+        parse_http_dns_response(&resp).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))
     }
 }
 

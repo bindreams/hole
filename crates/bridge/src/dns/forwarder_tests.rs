@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use super::*;
 use crate::dns::connector::DirectConnector;
-use crate::test_support::refusing_connector::RefusingConnector;
+use crate::test_support::refusing_connector::{RefusingConnector, SilentConnector};
 
 // Helpers =============================================================================================================
 
@@ -940,4 +940,185 @@ mod typed_error_logs {
             "the log must report the budget in force, not the default; got:\n{output}"
         );
     }
+
+    /// Install a WARN-capturing subscriber and return its buffer.
+    fn warn_capture() -> (VecWriter, tracing::subscriber::DefaultGuard) {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let guard = set_default_in_current_thread(subscriber);
+        (writer, guard)
+    }
+
+    /// A budget that fires mid-attempt must still report the bytes the attempt
+    /// had already moved — see [`AttemptProbe`].
+    #[skuld::test]
+    async fn a_timed_out_attempt_reports_the_bytes_it_had_already_moved() {
+        let (writer, _guard) = warn_capture();
+
+        let (connector, connected_rx) = SilentConnector::new();
+        let fwd = Arc::new(DnsForwarder::new(
+            build_cfg(DnsProtocol::PlainTcp, vec!["127.0.0.1".parse().unwrap()]),
+            connector,
+            true,
+        ));
+        let call = tokio::spawn({
+            let fwd = Arc::clone(&fwd);
+            async move { fwd.try_forward(&sample_query(0x000D), UPSTREAM_TIMEOUT).await }
+        });
+        connected_rx.await.expect("the stub connector completed a connect");
+        tokio::time::pause();
+        assert_eq!(
+            call.await.unwrap(),
+            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+        );
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("layer=timeout"),
+            "expected 'layer=timeout'; got:\n{output}"
+        );
+        // The query was framed and written before the peer went silent.
+        assert!(
+            output.contains("tcp_wrote=Some("),
+            "a timed-out attempt must report what it wrote; got:\n{output}"
+        );
+        assert!(
+            output.contains("tcp_read=Some(0)"),
+            "the peer sent nothing, and that must be a measured 0, not None; got:\n{output}"
+        );
+        assert!(
+            output.contains("socks5_ms=Some("),
+            "the connect completed, so its duration is known; got:\n{output}"
+        );
+    }
+
+    /// A handshake that was in flight when the budget fired reports how long it
+    /// had been running — the TLS/DoH half of the same guarantee.
+    #[skuld::test]
+    async fn a_cancelled_tls_handshake_reports_how_long_it_ran() {
+        let (writer, _guard) = warn_capture();
+
+        let (connector, connected_rx) = SilentConnector::new();
+        let fwd = Arc::new(DnsForwarder::new(
+            build_cfg(DnsProtocol::Tls, vec!["127.0.0.1".parse().unwrap()]),
+            connector,
+            true,
+        ));
+        let call = tokio::spawn({
+            let fwd = Arc::clone(&fwd);
+            async move { fwd.try_forward(&sample_query(0x000F), UPSTREAM_TIMEOUT).await }
+        });
+        connected_rx.await.expect("the stub connector completed a connect");
+        tokio::time::pause();
+        assert_eq!(
+            call.await.unwrap(),
+            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+        );
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("layer=timeout"),
+            "expected 'layer=timeout'; got:\n{output}"
+        );
+        assert!(
+            output.contains("tls_ms=Some("),
+            "a handshake in flight at the deadline must report its duration; got:\n{output}"
+        );
+        // rustls wrote its ClientHello into the tunnel and got nothing back.
+        assert!(output.contains("tcp_read=Some(0)"), "got:\n{output}");
+    }
+
+    /// A timed-out DATAGRAM attempt reports its own counts. UDP opens no
+    /// stream, so all-`None` here would read as "never sent anything".
+    #[skuld::test]
+    async fn a_timed_out_udp_attempt_reports_its_datagram_counts() {
+        let (writer, _guard) = warn_capture();
+
+        let (connector, connected_rx) = SilentConnector::new();
+        let fwd = Arc::new(DnsForwarder::new(
+            build_cfg(DnsProtocol::PlainUdp, vec!["127.0.0.1".parse().unwrap()]),
+            connector,
+            true,
+        ));
+        let call = tokio::spawn({
+            let fwd = Arc::clone(&fwd);
+            async move { fwd.try_forward(&sample_query(0x0010), UPSTREAM_TIMEOUT).await }
+        });
+        connected_rx.await.expect("the stub connector completed a connect");
+        tokio::time::pause();
+        assert_eq!(
+            call.await.unwrap(),
+            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+        );
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("layer=timeout"),
+            "expected 'layer=timeout'; got:\n{output}"
+        );
+        assert!(
+            output.contains("udp_sent=Some("),
+            "the datagram left before the deadline; got:\n{output}"
+        );
+        assert!(
+            output.contains("udp_received=Some(0)"),
+            "nothing came back, measured; got:\n{output}"
+        );
+    }
+}
+
+// Cumulative upstream byte totals =====================================================================================
+
+#[skuld::test]
+async fn upstream_bytes_accumulate_across_a_timed_out_walk() {
+    let (connector, connected_rx) = SilentConnector::new();
+    let fwd = Arc::new(DnsForwarder::new(
+        build_cfg(DnsProtocol::PlainTcp, vec!["127.0.0.1".parse().unwrap()]),
+        connector,
+        true,
+    ));
+    let before = fwd.upstream_bytes();
+    assert_eq!(before, UpstreamBytes::default());
+
+    let call = tokio::spawn({
+        let fwd = Arc::clone(&fwd);
+        async move { fwd.try_forward(&sample_query(0x000E), UPSTREAM_TIMEOUT).await }
+    });
+    connected_rx.await.expect("the stub connector completed a connect");
+    tokio::time::pause();
+    assert_eq!(
+        call.await.unwrap(),
+        Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+    );
+
+    let moved = fwd.upstream_bytes().since(before);
+    assert!(
+        moved.written > 0,
+        "the query was written into the tunnel; got {moved:?}"
+    );
+    assert_eq!(moved.read, 0, "the peer answered nothing; got {moved:?}");
+}
+
+/// UDP has no stream — pins that `upstream_bytes` measures it too, per
+/// [`AttemptProbe`].
+#[skuld::test]
+async fn upstream_bytes_count_udp_datagrams() {
+    let q = sample_query(0x00BB);
+    let (addr, _h) = start_udp_stub(Some(sample_reply(&q))).await;
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainUdp, vec![addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![addr.port()],
+    );
+    let before = fwd.upstream_bytes();
+    fwd.try_forward(&q, UPSTREAM_TIMEOUT).await.expect("the stub replies");
+    let moved = fwd.upstream_bytes().since(before);
+    assert_eq!(moved.written, q.len() as u64, "got {moved:?}");
+    assert!(moved.read > 0, "the stub's reply must be counted; got {moved:?}");
 }
