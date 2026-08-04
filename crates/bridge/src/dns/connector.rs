@@ -57,31 +57,15 @@ impl ConnectedStream {
 /// Wire bytes an [`UpstreamUdp`] has moved. Counted BEFORE any header parsing,
 /// so a reply that arrives and then fails to parse is still recorded as
 /// something having come back — the datagram counterpart of what
-/// [`StreamCounters`] does for the stream transports. Cheap to clone; the
-/// handle outlives the socket.
-#[derive(Debug, Clone, Default)]
-pub struct DatagramCounters {
-    read: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl DatagramCounters {
-    pub fn add_read(&self, n: u64) {
-        self.read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn add_written(&self, n: u64) {
-        self.written.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn read(&self) -> u64 {
-        self.read.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn written(&self) -> u64 {
-        self.written.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
+/// [`StreamCounters`] does for the stream transports.
+///
+/// A UDP `send`/`recv` doesn't go through a poll-based `AsyncRead`/
+/// `AsyncWrite` wrapper the way [`CountingStream`] counts a TCP stream, so
+/// this is [`garter::ByteCounters`] directly — the same read/write atomic
+/// pair `StreamCounters` is itself built on, with the manual `add_read`/
+/// `add_written` update API a datagram transport needs instead of a poll
+/// hook.
+pub type DatagramCounters = garter::ByteCounters;
 
 /// UDP send/recv abstraction. Separate from [`AsyncDuplex`] because the
 /// SOCKS5 UDP ASSOCIATE path wraps an inner socket and prepends a header,

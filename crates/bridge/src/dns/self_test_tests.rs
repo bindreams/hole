@@ -13,6 +13,40 @@ use std::sync::Arc as SArc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
+/// Regression: a nonzero `remaining` too small to divide evenly across
+/// `width` must stop the walk, not fire a same-instant, zero-budget
+/// "attempt" per upstream — see `attempt_budget`'s own doc. `Duration`
+/// divides at nanosecond precision, so the rounds-to-zero case needs
+/// `remaining` under `width` NANOSECONDS, not milliseconds.
+#[skuld::test]
+fn attempt_budget_stops_before_a_zero_length_attempt() {
+    assert_eq!(super::attempt_budget(std::time::Duration::from_nanos(1), 2), None);
+    assert_eq!(super::attempt_budget(std::time::Duration::ZERO, 1), None);
+}
+
+#[skuld::test]
+fn attempt_budget_divides_remaining_across_the_walk_width() {
+    assert_eq!(
+        super::attempt_budget(std::time::Duration::from_millis(3000), 2),
+        Some(std::time::Duration::from_millis(1500))
+    );
+    // Capped at PER_ATTEMPT even with plenty of time left.
+    assert_eq!(
+        super::attempt_budget(std::time::Duration::from_secs(10), 1),
+        Some(std::time::Duration::from_millis(1500))
+    );
+}
+
+/// `width == 0` dials nothing, so it needs no time budget at all — not even
+/// when `remaining` is already exhausted.
+#[skuld::test]
+fn attempt_budget_ignores_remaining_when_width_is_zero() {
+    assert_eq!(
+        super::attempt_budget(std::time::Duration::ZERO, 0),
+        Some(std::time::Duration::from_millis(1500))
+    );
+}
+
 fn test_dns_cfg() -> DnsConfig {
     DnsConfig {
         enabled: true,

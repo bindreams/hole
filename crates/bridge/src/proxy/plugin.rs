@@ -65,6 +65,26 @@ impl PluginChain {
         &self.log
     }
 
+    /// Build a `PluginChain` around a pre-seeded log, with no real plugin
+    /// subprocess behind it. For tests that need a genuinely `Some`
+    /// `PluginChain` to prove a CALL SITE reads whatever `log()` returns —
+    /// the spawn/readiness machinery itself is proven separately, against a
+    /// real child, by `tests/plugin_chain.rs`. `cancel` is caller-supplied
+    /// so this stays out of the disallowed-fresh-token lint (test callers
+    /// carry the sanctioned module-level allow; this constructor does not
+    /// need to).
+    #[cfg(test)]
+    pub(crate) fn for_test(log: Arc<crate::proxy::plugin_log::PluginLog>, cancel: CancellationToken) -> Self {
+        Self {
+            handle: tokio::spawn(async { Ok(()) }),
+            cancel,
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            transports: garter::Transports::TCP,
+            state_dir: None,
+            log,
+        }
+    }
+
     /// Explicitly kill all tracked plugin PIDs and clear the state file.
     /// Called from `ProxyManager::stop` before dropping the chain, so the
     /// stop path doesn't race with the OS reaping.

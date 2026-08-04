@@ -2001,6 +2001,43 @@ mod self_test {
         );
     }
 
+    /// The `None` branch above proves the call site exists; this proves the
+    /// `Some` branch actually reaches a real chain's lines. Drives the EXACT
+    /// expression `start_inner` uses — `plugin_chain.as_ref().map(|c| &**c.log())`
+    /// — against a `PluginChain::for_test` seeded with lines, rather than a
+    /// hand-constructed `Option<&PluginLog>`, so a regression in that
+    /// double-deref/reference conversion would show up here. The spawn +
+    /// readiness machinery that BUILDS a real `PluginChain` is proven
+    /// separately, against a real child, by `tests/plugin_chain.rs`.
+    #[skuld::test]
+    async fn a_configured_plugins_lines_reach_the_report_through_the_real_call_site() {
+        let log = crate::proxy::plugin_log::PluginLog::new();
+        log.push_line("transport/internet/tls: ECH required but no ECH config could be obtained");
+        let plugin_chain = Some(crate::proxy::plugin::PluginChain::for_test(
+            log,
+            CancellationToken::new(),
+        ));
+
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            // The exact expression from start_inner's SelfTestOutcome::Failed arm.
+            super::report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
+        }
+
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains("ECH required"),
+            "a configured plugin's ring must reach the report through this call site; got:\n{output}"
+        );
+    }
+
     /// **Load-bearing**: when the forwarder self-test fails, `start_cancellable`
     /// returns `Err(ForwarderSelfTestFailed)` AND `routing.install` is NEVER
     /// called. Catches any future regression that re-orders the gate

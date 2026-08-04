@@ -222,8 +222,22 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
     }
 
     let output = writer.snapshot();
+    // Assert on output ONLY `warn_recent` can produce: garter's ordinary
+    // stderr relay (`tracing::warn!(plugin = ..., "{line}")`) ALSO logs the
+    // raw line independent of the ring, so a bare substring match on the
+    // message can't tell "the ring held it" apart from "the relay logged it
+    // regardless" — `warn_recent`'s header and its `"plugin: "` line prefix
+    // can only come from a read that found something in the ring.
     assert!(
-        output.contains("fatal: injected crash on stderr"),
-        "the child's stderr line must reach bridge.log before the ring is read; got:\n{output}"
+        output.contains(hole_bridge::proxy::plugin_log::PLUGIN_OUTPUT_HEADER),
+        "warn_recent must have read a non-empty ring; got:\n{output}"
+    );
+    assert!(
+        output.contains("plugin: fatal: injected crash on stderr"),
+        "the child's stderr line must be IN THE RING by the time it is reported; got:\n{output}"
+    );
+    assert!(
+        !output.contains(hole_bridge::proxy::plugin_log::NO_PLUGIN_OUTPUT),
+        "got:\n{output}"
     );
 }

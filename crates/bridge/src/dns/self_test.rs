@@ -101,13 +101,39 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// `routing.install` / `Dns::apply`. A failure short-circuits the start;
 /// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
 /// without ever hijacking system DNS into a dead tunnel.
+/// Per-upstream budget for one attempt, before dividing across a walk's
+/// width — see [`attempt_budget`].
+const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Per-upstream budget for a walk of `width` upstreams with `remaining` time
+/// left on the outer deadline, or `None` if there is not enough left for a
+/// real attempt.
+///
+/// `width == 0` needs no check: a zero-width walk dials nothing and returns
+/// immediately regardless of how much time is left, so its budget is
+/// irrelevant. Otherwise, checking the DERIVED per-upstream budget rather
+/// than `remaining` directly is what makes `remaining == 0` (deadline
+/// already passed) return `None` rather than a same-instant, zero-budget
+/// "attempt" per upstream in the walk — one that would still count toward
+/// `attempts` and log a `budget_ms=0` timeout with no dial behind it.
+/// `Duration`'s division is nanosecond-precise, so this only ever rounds a
+/// genuinely nonzero `remaining` down to zero when it's under `width`
+/// nanoseconds — in practice indistinguishable from the deadline having
+/// already passed.
+fn attempt_budget(remaining: std::time::Duration, width: usize) -> Option<std::time::Duration> {
+    if width == 0 {
+        return Some(PER_ATTEMPT);
+    }
+    let per_upstream = PER_ATTEMPT.min(remaining / width as u32);
+    (!per_upstream.is_zero()).then_some(per_upstream)
+}
+
 pub(crate) async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,
     diagnostic_tap_enabled: bool,
     cancel: CancellationToken,
 ) -> SelfTestOutcome {
-    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
     const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     const ATTEMPTS: u32 = 3;
 
@@ -147,22 +173,15 @@ pub(crate) async fn run_forwarder_self_test(
             outcome = Some(SelfTestOutcome::Cancelled);
             break;
         }
+        // The width comes from the forwarder, not from `servers.len()`: it
+        // skips IPv6 entries without an IPv6 bypass, and counting those would
+        // shrink every surviving upstream's budget while leaving part of the
+        // deadline unused. `attempt_budget` stops the walk once there isn't
+        // enough of the deadline left for a real attempt.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        // `try_forward` walks every upstream it will attempt at `per_upstream`
-        // each, so divide what is left by that width to keep the whole attempt
-        // inside the deadline. The width comes from the forwarder, not from
-        // `servers.len()`: it skips IPv6 entries without an IPv6 bypass, and
-        // counting those would shrink every surviving upstream's budget while
-        // leaving part of the deadline unused. A zero-width walk dials nothing
-        // and returns immediately, so its budget is irrelevant.
         let width = forwarder.attempted_upstreams();
-        let per_upstream = if width == 0 {
-            PER_ATTEMPT
-        } else {
-            PER_ATTEMPT.min(remaining / width as u32)
+        let Some(per_upstream) = attempt_budget(remaining, width) else {
+            break;
         };
         // The budget goes down into the forwarder so `forward_one`'s own
         // deadline fires first, producing a classified `UpstreamErr` that
