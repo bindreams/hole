@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 /// Path to the `test_plugin` fixture bin. The runtime env var wins (nextest
 /// remaps it under `--archive-file`); the compile-time value covers plain
 /// `cargo test`. Never invoke cargo here — a concurrent build's uplift
-/// deletes+recreates `target/debug/<bin>`, racing this spawn (#496).
+/// deletes+recreates `target/debug/<bin>`, racing this spawn.
 fn test_plugin_path() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_test_plugin")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_test_plugin").to_string())
@@ -65,6 +65,44 @@ async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
     assert!(
         echoed.contains("host=example.com;path=/foo;loglevel=debug"),
         "the merged options must reach the child verbatim; got: {echoed}"
+    );
+
+    cancel.cancel();
+    drop(chain);
+}
+
+/// A plugin that loses its local-port race must report `bind_conflict`, the one
+/// class `bind_ephemeral` retries on a fresh port. The stub injects the loss
+/// through its options string (there is no environment seam), so the first
+/// attempt reports the conflict and the retry binds for real.
+#[skuld::test]
+async fn a_bind_conflict_is_retried_on_a_fresh_port() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sentinel = dir.path().join("bind-once");
+    let opts = format!("host=example.com;fail-bind-once={}", sentinel.display());
+
+    let cancel = CancellationToken::new();
+    let chain = start_plugin_chain(
+        "v2ray-plugin",
+        test_plugin_path().to_str().expect("utf-8 path"),
+        Some(&opts),
+        "127.0.0.1",
+        9,
+        None,
+        None,
+        false,
+        &cancel,
+        None,
+    )
+    .await
+    .expect("the conflict must be retried, not propagated");
+
+    assert!(sentinel.exists(), "the first attempt must have taken the sentinel");
+    // Two attempts fed one ring, so the losing attempt's output survives too.
+    let lines = chain.log().recent();
+    assert!(
+        lines.iter().filter(|l| l.contains("SS_PLUGIN_OPTIONS=")).count() >= 2,
+        "every attempt feeds the same ring; got: {lines:?}"
     );
 
     cancel.cancel();

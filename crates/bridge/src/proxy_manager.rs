@@ -1765,10 +1765,9 @@ fn report_plugin_output(log: Option<&crate::proxy::plugin_log::PluginLog>) {
 /// reaches `UpstreamLayer::Connect`, so its cause is `Timeout`, and splitting on
 /// `Unreachable` would file it under the tunnel sentence.
 ///
-/// The local-hop claim keys on `connects`, not on `written`. A tunnel that
-/// accepts the connection and then resets it before the first write moves no
-/// bytes, and calling that "the local proxy is not accepting connections" would
-/// be a positive claim the completed connect disproves.
+/// The local-hop claim keys on `connects`, not on `written` — see
+/// [`crate::dns::forwarder::UpstreamActivity`] for why a reset before the first
+/// write still counts as a connection.
 fn classify_failure(observed: Observed, last_err: String) -> SelfTestReason {
     // Anything back at all disproves silence; nothing dialled proves nothing.
     if observed.answered || observed.moved.read > 0 || !observed.dialled {

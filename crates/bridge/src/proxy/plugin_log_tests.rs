@@ -53,10 +53,10 @@ fn warn_recent_emits_the_header_and_every_line() {
     assert!(output.contains("failed to dial WebSocket"), "got:\n{output}");
 }
 
-/// A plugin that said nothing is itself a finding — distinguish it from a relay
-/// that was never wired.
+/// An empty ring reports what was CAPTURED, never that the plugin said nothing:
+/// garter relays from a detached task, so the two are not the same claim.
 #[skuld::test]
-fn warn_recent_says_so_when_the_plugin_said_nothing() {
+fn warn_recent_says_so_when_nothing_was_captured() {
     let output = emitted_for(&PluginLog::new());
     assert!(output.contains(NO_PLUGIN_OUTPUT), "got:\n{output}");
     assert!(!output.contains(PLUGIN_OUTPUT_HEADER), "got:\n{output}");

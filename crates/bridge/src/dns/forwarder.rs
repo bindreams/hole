@@ -299,10 +299,8 @@ impl AttemptProbe {
     }
 
     /// Did the connector hand back a usable upstream? True the moment a SOCKS5
-    /// CONNECT or UDP ASSOCIATE completed, independent of any byte moving. A
-    /// connection the peer accepted and then reset before the first write is
-    /// still a connection, and reading its zero bytes as "none was opened"
-    /// would be a claim the connect itself disproves.
+    /// CONNECT or UDP ASSOCIATE completed, independent of any byte moving — see
+    /// [`UpstreamActivity`] for why zero bytes must not read as "no connection".
     fn established(&self) -> bool {
         let s = self.state.lock().expect("poisoned");
         s.stream.is_some() || s.datagram.is_some()

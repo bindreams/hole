@@ -2201,13 +2201,19 @@ mod self_test {
         );
     }
 
-    /// The gate REACHES `report_plugin_output`, and reports the local hop.
-    /// Driven through the real `start_inner` failure arm with the mock backends:
-    /// `MockProxy` binds no listener, so the forwarder's SOCKS5 connect to
-    /// `127.0.0.1:local_port` never carries a byte. No plugin is configured, so
-    /// the `None` branch is what proves the call site exists — the `Some` branch
-    /// differs only in the argument, and `tests/plugin_chain.rs` proves a real
-    /// chain's ring holds the child's lines.
+    /// The gate REACHES `report_plugin_output`. Driven through the real
+    /// `start_inner` failure arm with the mock backends: `MockProxy` binds no
+    /// listener, so the forwarder's SOCKS5 connect cannot complete and the gate
+    /// fails. No plugin is configured, so the `None` branch is what proves the
+    /// call site exists — the `Some` branch differs only in the argument, and
+    /// `tests/plugin_chain.rs` proves a real chain's ring holds the child's
+    /// lines.
+    ///
+    /// Which classification comes out is deliberately NOT asserted: the SOCKS5
+    /// port is a real one, and pinning a variant would make the test depend on
+    /// nothing else being bound there. `classify_failure_covers_every_branch`
+    /// and `a_refused_local_hop_is_reported_as_no_connection` pin the variants
+    /// against stub connectors that own their outcome.
     #[skuld::test]
     fn a_failed_gate_reaches_the_plugin_output_report() {
         let writer = VecWriter::new();
@@ -2233,15 +2239,23 @@ mod self_test {
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
                 let mut cfg = test_config();
+                // An ephemeral port, not the config default 1080: that is the
+                // canonical SOCKS5 port, and a real server bound there would
+                // both change the outcome and push this test's DNS queries out
+                // through someone else's proxy.
+                cfg.local_port = util::port_alloc::free_port(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    util::port_alloc::Protocols::TCP,
+                )
+                .await
+                .expect("allocate a loopback port");
                 cfg.dns = DnsConfig {
                     enabled: true,
                     servers: vec!["127.0.0.1".parse().unwrap()],
                     protocol: DnsProtocol::PlainTcp,
                     allow_insecure_bootstrap: false,
                 };
-                let err = pm.start(&cfg).await.expect_err("the gate must fail with no listener");
-                // Refused or dropped, the reading is the same: nothing was written.
-                assert!(matches!(err, ProxyError::NoTunnelConnection { .. }), "got {err:?}");
+                pm.start(&cfg).await.expect_err("the gate must fail with no listener");
             });
         let output = writer.snapshot_string();
         assert!(

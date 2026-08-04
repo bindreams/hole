@@ -18,27 +18,45 @@ fn emit(ev: &SitrepEvent) {
     let _ = std::io::stdout().flush();
 }
 
+/// Fault-injection knob, read out of `SS_PLUGIN_OPTIONS` because
+/// `start_plugin_chain` has no environment seam: `fail-bind-once=<path>` makes
+/// the FIRST invocation sharing that sentinel path report a bind conflict.
+/// Atomic via `create_new`, so there is no TOCTOU between sibling attempts.
+fn losing_bind_race(opts: &str) -> bool {
+    let Some(path) = opts.split(';').find_map(|s| s.strip_prefix("fail-bind-once=")) else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .is_ok()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_host = std::env::var("SS_LOCAL_HOST")?;
     let local_port: u16 = std::env::var("SS_LOCAL_PORT")?.parse()?;
     let local_addr: SocketAddr = format!("{local_host}:{local_port}").parse()?;
+    let opts = std::env::var("SS_PLUGIN_OPTIONS").unwrap_or_default();
 
     emit(&SitrepEvent::Hello {
         protocol: SITREP_PROTOCOL.to_string(),
     });
 
-    println!(
-        "test-plugin: SS_PLUGIN_OPTIONS={}",
-        std::env::var("SS_PLUGIN_OPTIONS").unwrap_or_default()
-    );
+    println!("test-plugin: SS_PLUGIN_OPTIONS={opts}");
     let _ = std::io::stdout().flush();
 
     // A lost port race must be reported as `bind_conflict`, the only class
     // `bind_ephemeral` retries on a fresh port — exiting with a bare error
-    // instead would turn the residual probe-drop-to-bind TOCTOU (#304) into an
+    // instead would turn the residual probe-drop-to-bind TOCTOU into an
     // unconditional test failure. Mirrors mock-plugin's `bind_conflict` path.
-    let listener = match TcpListener::bind(local_addr).await {
+    let bind = if losing_bind_race(&opts) {
+        Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+    } else {
+        TcpListener::bind(local_addr).await
+    };
+    let listener = match bind {
         Ok(l) => l,
         Err(e) => {
             emit(&SitrepEvent::BindConflict {

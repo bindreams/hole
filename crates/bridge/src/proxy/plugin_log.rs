@@ -20,7 +20,7 @@ pub const RECENT_LINES: usize = 40;
 
 pub const PLUGIN_OUTPUT_HEADER: &str =
     "the plugin chain's most recent output follows — the plugin's own account of why its transport failed";
-pub const NO_PLUGIN_OUTPUT: &str = "the plugin chain logged nothing before this failure";
+pub const NO_PLUGIN_OUTPUT: &str = "no plugin chain output was captured for this failure";
 pub const NO_PLUGIN_CONFIGURED: &str =
     "no plugin chain is configured, so there is no plugin output to quote for this failure";
 
@@ -58,6 +58,13 @@ impl PluginLog {
 
 /// Emit the plugin's kept lines at WARN, next to the failure they explain.
 /// `bridge.log` only — see the module doc.
+///
+/// Best-effort by construction: garter relays each line from a detached reader
+/// task, so a ring read moments after a child dies may not hold its last words
+/// yet. [`NO_PLUGIN_OUTPUT`] therefore reports what was CAPTURED and never
+/// claims the plugin said nothing — a claim this call cannot support. The lines
+/// reach `bridge.log` through the ordinary relay either way; what this adds is
+/// adjacency to the failure.
 pub fn warn_recent(log: &PluginLog) {
     let lines = log.recent();
     if lines.is_empty() {

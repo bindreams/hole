@@ -82,10 +82,8 @@ impl UpstreamConnector for RefusingConnector {
 // Silent ==============================================================================================================
 
 /// Connects, accepts writes, and never delivers a byte back — the shape of a
-/// black-holed tunnel. `shadowsocks-service`'s SOCKS5 answers `Succeeded` as
-/// soon as it reaches the plugin's local port, so a dead plugin transport looks
-/// exactly like this from the forwarder: a connection that swallows the query
-/// and answers nothing.
+/// black-holed tunnel, and (per [`crate::proxy::ProxyError::TunnelSilent`])
+/// exactly what a dead plugin transport looks like from the forwarder.
 ///
 /// [`Self::new`] hands back a receiver that fires on the first connect, so a
 /// test can pause the clock only once the attempt is genuinely in flight. That
