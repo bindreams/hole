@@ -113,10 +113,12 @@ pub enum ProxyError {
     /// or (for a TCP-based DNS transport) a SOCKS5 CONNECT that never reached
     /// the plugin's local port — and distinct from [`Self::TunnelSilent`],
     /// whose first cause is the plugin's own outward connection. A UDP DNS
-    /// transport's ASSOCIATE completing does not disprove this variant: it is
-    /// answered by `shadowsocks-service` itself without touching the plugin,
-    /// so it carries none of a CONNECT's evidence. `Display` interpolates
-    /// only integers.
+    /// transport's ASSOCIATE completing DOES disprove this variant (the local
+    /// SOCKS5 listener demonstrably accepted something) without being strong
+    /// enough evidence for `TunnelSilent` either, since `shadowsocks-service`
+    /// answers ASSOCIATE without touching the plugin — that reading falls
+    /// through to the generic self-test failure instead. `Display`
+    /// interpolates only integers.
     #[error("Could not open a connection into the tunnel ({attempts} attempts in {elapsed_ms}ms). The local proxy or its plugin is not accepting connections.")]
     NoTunnelConnection { attempts: u32, elapsed_ms: u64 },
     /// The start-time reachability probe found the network is resetting/dropping

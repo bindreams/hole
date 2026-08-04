@@ -1149,3 +1149,34 @@ async fn upstream_activity_counts_udp_datagrams() {
     assert_eq!(moved.written, q.len() as u64, "got {moved:?}");
     assert!(moved.read > 0, "the stub's reply must be counted; got {moved:?}");
 }
+
+/// A completed UDP ASSOCIATE must never be counted as a `connects` — see
+/// [`crate::dns::forwarder::UpstreamActivity`] for why the two are distinct
+/// strengths of evidence.
+#[skuld::test]
+async fn upstream_activity_counts_a_udp_associate_separately_from_connects() {
+    let (connector, connected_rx) = SilentConnector::new();
+    let fwd = Arc::new(DnsForwarder::new(
+        build_cfg(DnsProtocol::PlainUdp, vec!["127.0.0.1".parse().unwrap()]),
+        connector,
+        true,
+    ));
+    let before = fwd.upstream_activity();
+    let call = tokio::spawn({
+        let fwd = Arc::clone(&fwd);
+        async move { fwd.try_forward(&sample_query(0x0022), UPSTREAM_TIMEOUT).await }
+    });
+    connected_rx.await.expect("the stub connector completed a connect");
+    tokio::time::pause();
+    let _ = call.await.unwrap();
+
+    let moved = fwd.upstream_activity().since(before);
+    assert_eq!(
+        moved.connects, 0,
+        "a UDP ASSOCIATE must not count as a CONNECT; got {moved:?}"
+    );
+    assert_eq!(
+        moved.associates, 1,
+        "the ASSOCIATE itself must be counted; got {moved:?}"
+    );
+}

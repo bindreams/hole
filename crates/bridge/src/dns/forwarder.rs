@@ -224,33 +224,43 @@ impl UpstreamErr {
 /// reading that as "no connection was opened" would be a positive claim about
 /// the local hop that the connect itself disproves.
 ///
-/// A completed SOCKS5 CONNECT counts on its own: `shadowsocks-service` answers
-/// it only once the attempt reaches the plugin's local port, so completion is
-/// evidence about that hop. A completed UDP ASSOCIATE does not count on its
-/// own — `shadowsocks-service` answers it purely locally, without touching the
-/// plugin at all, so it is evidence of nothing beyond the SOCKS5 listener
-/// itself. A datagram attempt only counts once a reply is actually read; see
-/// [`AttemptProbe::established`].
+/// `connects` and `associates` are two DIFFERENT strengths of evidence, kept
+/// apart rather than folded together:
+/// - A completed SOCKS5 CONNECT (`connects`) is evidence the attempt reached
+///   the plugin's local port — `shadowsocks-service` only answers it once it
+///   gets there.
+/// - A completed UDP ASSOCIATE (`associates`) is evidence of nothing beyond
+///   the SOCKS5 listener itself — `shadowsocks-service` answers it purely
+///   locally, without touching the plugin at all. It disproves "the local
+///   proxy refused a connection" but is NOT comparable to a CONNECT: it must
+///   never be counted toward `connects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpstreamActivity {
     pub read: u64,
     pub written: u64,
-    /// Upstream connections established — a completed SOCKS5 CONNECT, or a
-    /// UDP exchange that returned a reply.
+    /// A completed SOCKS5 CONNECT. See the struct doc for why this is not
+    /// interchangeable with `associates`.
     pub connects: u64,
+    /// A completed UDP ASSOCIATE. See the struct doc for why this is not
+    /// interchangeable with `connects`.
+    pub associates: u64,
 }
 
 impl UpstreamActivity {
     /// This snapshot minus an earlier one from the same forwarder.
     pub fn since(self, earlier: Self) -> Self {
         debug_assert!(
-            self.read >= earlier.read && self.written >= earlier.written && self.connects >= earlier.connects,
+            self.read >= earlier.read
+                && self.written >= earlier.written
+                && self.connects >= earlier.connects
+                && self.associates >= earlier.associates,
             "upstream counters only increase; snapshots were passed out of order"
         );
         Self {
             read: self.read.saturating_sub(earlier.read),
             written: self.written.saturating_sub(earlier.written),
             connects: self.connects.saturating_sub(earlier.connects),
+            associates: self.associates.saturating_sub(earlier.associates),
         }
     }
 }
@@ -293,8 +303,7 @@ impl AttemptProbe {
         s.stream = Some(counters.clone());
     }
 
-    /// The UDP association completed. Only a byte-counting handle — see
-    /// [`Self::established`] for why this alone is not "a connection".
+    /// The UDP association completed.
     fn associated(&self, counters: DatagramCounters) {
         self.state.lock().expect("poisoned").datagram = Some(counters);
     }
@@ -307,16 +316,20 @@ impl AttemptProbe {
         self.state.lock().expect("poisoned").tls_ms = Some(tls_ms);
     }
 
-    /// Did the connector hand back a usable upstream, with evidence that
-    /// reaches past the immediate local hop? True the moment a SOCKS5 CONNECT
-    /// completed, independent of any byte moving — see [`UpstreamActivity`]
-    /// for why zero bytes must not read as "no connection" there. A UDP
-    /// ASSOCIATE does NOT complete this on its own: `shadowsocks-service`
-    /// answers it locally without touching the plugin, so it is not
-    /// comparable evidence until a reply is actually read.
+    /// Did the connector complete a SOCKS5 CONNECT? True the moment it
+    /// completes, independent of any byte moving — see [`UpstreamActivity`]
+    /// for why zero bytes must not read as "no connection" there. Excludes a
+    /// UDP ASSOCIATE on purpose: see [`Self::datagram_established`].
     fn established(&self) -> bool {
-        let s = self.state.lock().expect("poisoned");
-        s.stream.is_some() || s.datagram.as_ref().is_some_and(|c| c.read() > 0)
+        self.state.lock().expect("poisoned").stream.is_some()
+    }
+
+    /// Did the connector complete a UDP ASSOCIATE? Weaker evidence than
+    /// [`Self::established`] — `shadowsocks-service` answers ASSOCIATE purely
+    /// locally, without touching the plugin — so this must never be folded
+    /// into `established`/`connects`. See [`UpstreamActivity`].
+    fn datagram_established(&self) -> bool {
+        self.state.lock().expect("poisoned").datagram.is_some()
     }
 
     /// `(read, written)` for the attempt, over whichever transport ran.
@@ -542,6 +555,7 @@ pub struct DnsForwarder {
     upstream_read: AtomicU64,
     upstream_written: AtomicU64,
     upstream_connects: AtomicU64,
+    upstream_associates: AtomicU64,
     /// Test-only per-server upstream-port override, indexed against
     /// `config.servers`, so tests can target ephemeral listeners without
     /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
@@ -566,6 +580,7 @@ impl DnsForwarder {
             upstream_read: AtomicU64::new(0),
             upstream_written: AtomicU64::new(0),
             upstream_connects: AtomicU64::new(0),
+            upstream_associates: AtomicU64::new(0),
             #[cfg(test)]
             forced_ports: None,
         }
@@ -576,6 +591,7 @@ impl DnsForwarder {
             read: self.upstream_read.load(Ordering::Relaxed),
             written: self.upstream_written.load(Ordering::Relaxed),
             connects: self.upstream_connects.load(Ordering::Relaxed),
+            associates: self.upstream_associates.load(Ordering::Relaxed),
         }
     }
 
@@ -700,6 +716,8 @@ impl DnsForwarder {
         self.upstream_written.fetch_add(written, Ordering::Relaxed);
         self.upstream_connects
             .fetch_add(u64::from(probe.established()), Ordering::Relaxed);
+        self.upstream_associates
+            .fetch_add(u64::from(probe.datagram_established()), Ordering::Relaxed);
         result.map_err(|mut e| {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
             e.budget_ms = budget.as_millis() as u64;
