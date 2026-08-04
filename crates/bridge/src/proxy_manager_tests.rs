@@ -1931,7 +1931,7 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::forwarder::{DnsForwarder, UpstreamBytes};
+    use crate::dns::forwarder::{DnsForwarder, UpstreamActivity};
     use crate::test_support::log_capture::VecWriter;
     use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector, SilentConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
@@ -1969,9 +1969,23 @@ mod self_test {
     /// reads, so each arm is pinned rather than inferred from one case.
     #[skuld::test]
     fn classify_failure_covers_every_branch() {
-        let nothing = UpstreamBytes::default();
-        let wrote_only = UpstreamBytes { read: 0, written: 44 };
-        let both = UpstreamBytes { read: 91, written: 44 };
+        let no_connection = UpstreamActivity::default();
+        let wrote_only = UpstreamActivity {
+            read: 0,
+            written: 44,
+            connects: 1,
+        };
+        // Connected, then reset before the first write.
+        let connected_only = UpstreamActivity {
+            read: 0,
+            written: 0,
+            connects: 1,
+        };
+        let both = UpstreamActivity {
+            read: 91,
+            written: 44,
+            connects: 1,
+        };
         let case = |answered, dialled, moved| {
             classify_failure(
                 Observed {
@@ -1985,16 +1999,22 @@ mod self_test {
 
         // The query reached the tunnel and nothing returned.
         assert!(matches!(case(false, true, wrote_only), SelfTestReason::TunnelSilent));
-        // Not one byte was written: the local hop, not the tunnel. Covers both a
-        // refused connect and one that hung until the budget fired — the cause
-        // codes differ, the reading does not.
-        assert!(matches!(case(false, true, nothing), SelfTestReason::NoConnection));
+        // The tunnel took the connection and died before the first write. Zero
+        // bytes, but the connect disproves a local-hop claim.
+        assert!(matches!(
+            case(false, true, connected_only),
+            SelfTestReason::TunnelSilent
+        ));
+        // No connection was ever established: the local hop, not the tunnel.
+        // Covers both a refused connect and one that hung until the budget
+        // fired — the cause codes differ, the reading does not.
+        assert!(matches!(case(false, true, no_connection), SelfTestReason::NoConnection));
         // A reply arrived and was rejected — the tunnel is not silent.
         assert!(matches!(case(true, true, both), SelfTestReason::Other(_)));
         // Bytes came back even though the walk failed.
         assert!(matches!(case(false, true, both), SelfTestReason::Other(_)));
         // Nothing was dialled: a config fault, not a reading of the tunnel.
-        assert!(matches!(case(false, false, nothing), SelfTestReason::Other(_)));
+        assert!(matches!(case(false, false, no_connection), SelfTestReason::Other(_)));
     }
 
     /// A plugin that dies mid-run: attempt 1 carries the query, attempt 2 cannot
@@ -2006,7 +2026,11 @@ mod self_test {
             Observed {
                 answered: false,
                 dialled: true,
-                moved: UpstreamBytes { read: 0, written: 44 },
+                moved: UpstreamActivity {
+                    read: 0,
+                    written: 44,
+                    connects: 1,
+                },
             },
             "no resolver answered through the tunnel (unreachable)".into(),
         );
@@ -2464,8 +2488,8 @@ mod self_test {
         );
     }
 
-    /// When self-test fails AND tap is OFF, emit a `warn!`
-    /// remediation hint pointing the reader to the config flag.
+    /// The reworded hint must not demand a fresh reproduction — it should point
+    /// at what this run already logged.
     #[skuld::test]
     fn the_tap_disabled_hint_does_not_demand_a_reproduction() {
         let hint = super::TAP_DISABLED_HINT;

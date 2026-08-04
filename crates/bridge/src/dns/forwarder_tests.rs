@@ -1075,15 +1075,15 @@ mod typed_error_logs {
 // Cumulative upstream byte totals =====================================================================================
 
 #[skuld::test]
-async fn upstream_bytes_accumulate_across_a_timed_out_walk() {
+async fn upstream_activity_accumulates_across_a_timed_out_walk() {
     let (connector, connected_rx) = SilentConnector::new();
     let fwd = Arc::new(DnsForwarder::new(
         build_cfg(DnsProtocol::PlainTcp, vec!["127.0.0.1".parse().unwrap()]),
         connector,
         true,
     ));
-    let before = fwd.upstream_bytes();
-    assert_eq!(before, UpstreamBytes::default());
+    let before = fwd.upstream_activity();
+    assert_eq!(before, UpstreamActivity::default());
 
     let call = tokio::spawn({
         let fwd = Arc::clone(&fwd);
@@ -1096,7 +1096,7 @@ async fn upstream_bytes_accumulate_across_a_timed_out_walk() {
         Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
     );
 
-    let moved = fwd.upstream_bytes().since(before);
+    let moved = fwd.upstream_activity().since(before);
     assert!(
         moved.written > 0,
         "the query was written into the tunnel; got {moved:?}"
@@ -1104,10 +1104,37 @@ async fn upstream_bytes_accumulate_across_a_timed_out_walk() {
     assert_eq!(moved.read, 0, "the peer answered nothing; got {moved:?}");
 }
 
-/// UDP has no stream — pins that `upstream_bytes` measures it too, per
+/// A connection the upstream accepts and then resets before the first write
+/// moves no bytes, but it IS a connection — the reading has to say so, or a
+/// caller reads zero bytes as "nothing was ever opened".
+#[skuld::test]
+async fn a_connection_reset_before_the_first_write_still_counts_as_established() {
+    // Accept, then close gracefully. `exchange_tcp_framed`'s write can fail
+    // before `CountingStream` counts a byte.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            drop(tcp);
+        }
+    });
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainTcp, vec![addr.ip()]),
+        Arc::new(DirectConnector),
+        true,
+        vec![addr.port()],
+    );
+    let before = fwd.upstream_activity();
+    let _ = fwd.try_forward(&sample_query(0x0011), UPSTREAM_TIMEOUT).await;
+    let moved = fwd.upstream_activity().since(before);
+    assert_eq!(moved.connects, 1, "the connect completed; got {moved:?}");
+    assert_eq!(moved.read, 0, "the peer sent nothing; got {moved:?}");
+}
+
+/// UDP has no stream — pins that `upstream_activity` measures it too, per
 /// [`AttemptProbe`].
 #[skuld::test]
-async fn upstream_bytes_count_udp_datagrams() {
+async fn upstream_activity_counts_udp_datagrams() {
     let q = sample_query(0x00BB);
     let (addr, _h) = start_udp_stub(Some(sample_reply(&q))).await;
     let fwd = DnsForwarder::new_with_ports(
@@ -1116,9 +1143,9 @@ async fn upstream_bytes_count_udp_datagrams() {
         true,
         vec![addr.port()],
     );
-    let before = fwd.upstream_bytes();
+    let before = fwd.upstream_activity();
     fwd.try_forward(&q, UPSTREAM_TIMEOUT).await.expect("the stub replies");
-    let moved = fwd.upstream_bytes().since(before);
+    let moved = fwd.upstream_activity().since(before);
     assert_eq!(moved.written, q.len() as u64, "got {moved:?}");
     assert!(moved.read > 0, "the stub's reply must be counted; got {moved:?}");
 }

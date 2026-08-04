@@ -16,12 +16,12 @@ use std::sync::{Arc, Mutex};
 
 /// Lines kept. Sized to span one full dial cycle at the `loglevel=debug` the
 /// bridge injects, without holding an unbounded slice of a chatty plugin.
-pub(crate) const RECENT_LINES: usize = 40;
+pub const RECENT_LINES: usize = 40;
 
-pub(crate) const PLUGIN_OUTPUT_HEADER: &str =
+pub const PLUGIN_OUTPUT_HEADER: &str =
     "the plugin chain's most recent output follows — the plugin's own account of why its transport failed";
-pub(crate) const NO_PLUGIN_OUTPUT: &str = "the plugin chain logged nothing before the DNS self-test failed";
-pub(crate) const NO_PLUGIN_CONFIGURED: &str =
+pub const NO_PLUGIN_OUTPUT: &str = "the plugin chain logged nothing before this failure";
+pub const NO_PLUGIN_CONFIGURED: &str =
     "no plugin chain is configured, so there is no plugin output to quote for this failure";
 
 /// A bounded ring of the plugin chain's log lines, newest last.
@@ -42,7 +42,7 @@ impl PluginLog {
         Arc::new(move |line: &str| log.push_line(line))
     }
 
-    pub(crate) fn push_line(&self, line: &str) {
+    pub fn push_line(&self, line: &str) {
         let mut lines = self.lines.lock().expect("poisoned");
         if lines.len() == RECENT_LINES {
             lines.pop_front();

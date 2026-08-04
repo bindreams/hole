@@ -34,7 +34,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _ = std::io::stdout().flush();
 
-    let listener = TcpListener::bind(local_addr).await?;
+    // A lost port race must be reported as `bind_conflict`, the only class
+    // `bind_ephemeral` retries on a fresh port — exiting with a bare error
+    // instead would turn the residual probe-drop-to-bind TOCTOU (#304) into an
+    // unconditional test failure. Mirrors mock-plugin's `bind_conflict` path.
+    let listener = match TcpListener::bind(local_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            emit(&SitrepEvent::BindConflict {
+                errno: e.raw_os_error().unwrap_or(0),
+                addr: local_addr,
+            });
+            std::process::exit(1);
+        }
+    };
     emit(&SitrepEvent::Ready {
         listen: local_addr,
         transports: Transports::TCP,

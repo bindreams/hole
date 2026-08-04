@@ -186,9 +186,6 @@ same-file = "1"
 # silently drifting.
 xtask = { path = "../../xtask" }
 
-# Privileged-lane cutover proofs (real rename/SCM/renamex_np FFI). A skuld
-# harness, like the lib tests; an integration target so Cargo builds + injects
-# the `test_idle` helper bin (`CARGO_BIN_EXE_test_idle`).
 # What `start_plugin_chain` hands a real child, and what its output does. Binds
 # only an ephemeral loopback port, so it needs no `global-net-state` group.
 [[test]]
@@ -196,6 +193,9 @@ name = "plugin_chain"
 path = "tests/plugin_chain.rs"
 harness = false
 
+# Privileged-lane cutover proofs (real rename/SCM/renamex_np FFI). A skuld
+# harness, like the lib tests; an integration target so Cargo builds + injects
+# the `test_idle` helper bin (`CARGO_BIN_EXE_test_idle`).
 [[test]]
 name = "cutover_privileged"
 path = "tests/cutover_privileged.rs"

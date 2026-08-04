@@ -5,7 +5,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
-use crate::dns::connector::{ConnectedStream, CountingStream, DirectConnector, UpstreamConnector, UpstreamUdp};
+use crate::dns::connector::{
+    ConnectedStream, CountingStream, DatagramCounters, DirectConnector, UpstreamConnector, UpstreamUdp,
+};
 
 /// Refuses `connect_tcp` / `connect_udp` with `ConnectionRefused`.
 ///
@@ -126,7 +128,9 @@ impl UpstreamConnector for SilentConnector {
 
     async fn connect_udp(&self, _target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
         self.signal_connected();
-        Ok(Box::new(SilentUdp))
+        Ok(Box::new(SilentUdp {
+            counters: DatagramCounters::default(),
+        }))
     }
 }
 
@@ -163,14 +167,20 @@ impl tokio::io::AsyncWrite for SilentStream {
 }
 
 /// Accepts every datagram; never delivers one back.
-struct SilentUdp;
+struct SilentUdp {
+    counters: DatagramCounters,
+}
 
 #[async_trait::async_trait]
 impl UpstreamUdp for SilentUdp {
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.counters.add_written(buf.len() as u64);
         Ok(buf.len())
     }
     async fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
         std::future::pending().await
+    }
+    fn counters(&self) -> DatagramCounters {
+        self.counters.clone()
     }
 }

@@ -24,7 +24,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_socks::tcp::Socks5Stream;
 
-use crate::dns::connector::{ConnectedStream, CountingStream, UpstreamConnector, UpstreamUdp};
+use crate::dns::connector::{ConnectedStream, CountingStream, DatagramCounters, UpstreamConnector, UpstreamUdp};
 
 const SOCKS5_VER: u8 = 0x05;
 const SOCKS5_NO_AUTH: u8 = 0x00;
@@ -85,6 +85,7 @@ impl UpstreamConnector for Socks5Connector {
             udp,
             relay,
             target,
+            counters: DatagramCounters::default(),
         }))
     }
 }
@@ -206,6 +207,7 @@ struct Socks5Udp {
     udp: UdpSocket,
     relay: SocketAddr,
     target: SocketAddr,
+    counters: DatagramCounters,
 }
 
 #[async_trait]
@@ -216,6 +218,7 @@ impl UpstreamUdp for Socks5Udp {
         framed.extend_from_slice(&header);
         framed.extend_from_slice(buf);
         self.udp.send_to(&framed, self.relay).await?;
+        self.counters.add_written(framed.len() as u64);
         Ok(buf.len())
     }
 
@@ -224,6 +227,10 @@ impl UpstreamUdp for Socks5Udp {
         // bytes. Plus the payload. Read into a big temp buffer, then strip.
         let mut tmp = vec![0u8; buf.len() + 64];
         let (n, _from) = self.udp.recv_from(&mut tmp).await?;
+        // Count the WIRE read before interpreting it: a frame that arrives and
+        // fails to parse is still proof something came back, and the self-test
+        // gate reads these counters to decide exactly that.
+        self.counters.add_read(n as u64);
         let (payload_off, _dst) = parse_socks5_udp_header(&tmp[..n])?;
         let payload_len = n - payload_off;
         if payload_len > buf.len() {
@@ -231,6 +238,10 @@ impl UpstreamUdp for Socks5Udp {
         }
         buf[..payload_len].copy_from_slice(&tmp[payload_off..n]);
         Ok(payload_len)
+    }
+
+    fn counters(&self) -> DatagramCounters {
+        self.counters.clone()
     }
 }
 

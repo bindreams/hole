@@ -180,10 +180,15 @@ pub async fn start_plugin_chain(
             // caller short-circuits cleanly instead of seeing
             // ProxyError::Plugin("...cancelled").
             if cancel.is_cancelled() {
-                ProxyError::Cancelled
-            } else {
-                ProxyError::Plugin(format!("plugin chain start failed: {e}"))
+                return ProxyError::Cancelled;
             }
+            // The chain never became a `PluginChain`, so nothing downstream can
+            // reach its ring. "exited before becoming ready" and "did not become
+            // ready within 30s" carry no detail of their own, and the plugin's
+            // own last lines are the only account of why — emit them here, once,
+            // after every bind retry has had its say.
+            crate::proxy::plugin_log::warn_recent(&log);
+            ProxyError::Plugin(format!("plugin chain start failed: {e}"))
         })?;
 
     Ok(PluginChain {

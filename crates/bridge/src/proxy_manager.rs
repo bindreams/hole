@@ -1582,13 +1582,13 @@ async fn run_forwarder_self_test(
 
     let query = sample_self_test_query();
     let started = std::time::Instant::now();
-    let bytes_before = forwarder.upstream_bytes();
+    let before = forwarder.upstream_activity();
     // The gate is the forwarder's first user: `build_local_dns` constructs it
     // for this start, and the `Dispatcher` that drives the in-TUN endpoint is
     // not created until the gate passes. The diff is what the run itself moved.
     debug_assert_eq!(
-        bytes_before,
-        crate::dns::forwarder::UpstreamBytes::default(),
+        before,
+        crate::dns::forwarder::UpstreamActivity::default(),
         "the self-test gate must be the forwarder's first user"
     );
     // The overall bound is a DEADLINE the loop respects, not a `timeout` around
@@ -1671,7 +1671,7 @@ async fn run_forwarder_self_test(
         }
     }
 
-    let moved = forwarder.upstream_bytes().since(bytes_before);
+    let moved = forwarder.upstream_activity().since(before);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
         attempts: completed,
@@ -1747,8 +1747,8 @@ struct Observed {
     /// At least one upstream was dialled. `false` for a config whose every
     /// server is skipped, or a run with no budget left to start an attempt.
     dialled: bool,
-    /// Bytes the forwarder moved during the run.
-    moved: crate::dns::forwarder::UpstreamBytes,
+    /// What the forwarder did during the run.
+    moved: crate::dns::forwarder::UpstreamActivity,
 }
 
 /// Emit the plugin chain's kept output for a failed gate, or say there is no
@@ -1764,12 +1764,17 @@ fn report_plugin_output(log: Option<&crate::proxy::plugin_log::PluginLog>) {
 /// positive observation, never on a cause code: a local hop that HANGS never
 /// reaches `UpstreamLayer::Connect`, so its cause is `Timeout`, and splitting on
 /// `Unreachable` would file it under the tunnel sentence.
+///
+/// The local-hop claim keys on `connects`, not on `written`. A tunnel that
+/// accepts the connection and then resets it before the first write moves no
+/// bytes, and calling that "the local proxy is not accepting connections" would
+/// be a positive claim the completed connect disproves.
 fn classify_failure(observed: Observed, last_err: String) -> SelfTestReason {
     // Anything back at all disproves silence; nothing dialled proves nothing.
     if observed.answered || observed.moved.read > 0 || !observed.dialled {
         return SelfTestReason::Other(last_err);
     }
-    if observed.moved.written > 0 {
+    if observed.moved.connects > 0 {
         SelfTestReason::TunnelSilent
     } else {
         SelfTestReason::NoConnection

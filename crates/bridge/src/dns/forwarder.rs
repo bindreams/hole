@@ -22,7 +22,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::dns::connector::{StreamCounters, UpstreamConnector};
+use crate::dns::connector::{DatagramCounters, StreamCounters, UpstreamConnector};
 use crate::dns::providers;
 
 // Typed errors ========================================================================================================
@@ -166,8 +166,10 @@ pub struct UpstreamErr {
     /// byte counts — what a DoH server would see.
     pub tcp_wrote: Option<u64>,
     pub tcp_read: Option<u64>,
-    /// Datagram bytes sent to / received from the upstream, for the UDP
-    /// transport. `None` whenever a stream was opened — read `tcp_*` there.
+    /// Wire bytes sent to / received from the upstream over the UDP transport,
+    /// counted before any SOCKS5 header parsing. `Some` exactly when a UDP
+    /// association was established; the stream transports leave these `None`
+    /// and report `tcp_*` instead.
     pub udp_sent: Option<u64>,
     pub udp_received: Option<u64>,
     /// First `io::Error::raw_os_error()` found walking
@@ -212,26 +214,35 @@ impl UpstreamErr {
     }
 }
 
-/// Bytes a forwarder has moved upstream, cumulative over its lifetime and
-/// counted whether the attempt succeeded, failed or was cancelled by its
-/// budget. Snapshot before a sequence and [`Self::since`] after: the difference
-/// is direct evidence of whether anything came back.
+/// What a forwarder has done upstream, cumulative over its lifetime and counted
+/// whether the attempt succeeded, failed or was cancelled by its budget.
+/// Snapshot before a sequence and [`Self::since`] after: the difference is
+/// direct evidence, not an inference from a cause code.
+///
+/// `connects` is separate from `written` on purpose. A connection the upstream
+/// accepted and then reset before the first write leaves `written == 0`, and
+/// reading that as "no connection was opened" would be a positive claim about
+/// the local hop that the connect itself disproves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UpstreamBytes {
+pub struct UpstreamActivity {
     pub read: u64,
     pub written: u64,
+    /// Upstream connections established — a completed SOCKS5 CONNECT, or a
+    /// completed UDP ASSOCIATE.
+    pub connects: u64,
 }
 
-impl UpstreamBytes {
+impl UpstreamActivity {
     /// This snapshot minus an earlier one from the same forwarder.
     pub fn since(self, earlier: Self) -> Self {
         debug_assert!(
-            self.read >= earlier.read && self.written >= earlier.written,
-            "upstream byte counters only increase; snapshots were passed out of order"
+            self.read >= earlier.read && self.written >= earlier.written && self.connects >= earlier.connects,
+            "upstream counters only increase; snapshots were passed out of order"
         );
         Self {
             read: self.read.saturating_sub(earlier.read),
             written: self.written.saturating_sub(earlier.written),
+            connects: self.connects.saturating_sub(earlier.connects),
         }
     }
 }
@@ -259,9 +270,11 @@ struct AttemptState {
     /// mid-handshake, `apply` reports how long it had been running.
     tls_started_at: Option<Instant>,
     tls_ms: Option<u64>,
-    counters: Option<StreamCounters>,
-    udp_read: u64,
-    udp_written: u64,
+    /// Counter handles for whichever transport ran. The presence of either IS
+    /// "a connection was established": both are published the instant the
+    /// connector hands the resource back, before a byte moves.
+    stream: Option<StreamCounters>,
+    datagram: Option<DatagramCounters>,
 }
 
 impl AttemptProbe {
@@ -269,7 +282,12 @@ impl AttemptProbe {
     fn connected(&self, socks5_ms: u64, counters: &StreamCounters) {
         let mut s = self.state.lock().expect("poisoned");
         s.socks5_ms = Some(socks5_ms);
-        s.counters = Some(counters.clone());
+        s.stream = Some(counters.clone());
+    }
+
+    /// The UDP association completed.
+    fn associated(&self, counters: DatagramCounters) {
+        self.state.lock().expect("poisoned").datagram = Some(counters);
     }
 
     fn tls_started(&self) {
@@ -280,38 +298,41 @@ impl AttemptProbe {
         self.state.lock().expect("poisoned").tls_ms = Some(tls_ms);
     }
 
-    fn datagram_sent(&self, n: u64) {
-        self.state.lock().expect("poisoned").udp_written += n;
-    }
-
-    fn datagram_received(&self, n: u64) {
-        self.state.lock().expect("poisoned").udp_read += n;
+    /// Did the connector hand back a usable upstream? True the moment a SOCKS5
+    /// CONNECT or UDP ASSOCIATE completed, independent of any byte moving. A
+    /// connection the peer accepted and then reset before the first write is
+    /// still a connection, and reading its zero bytes as "none was opened"
+    /// would be a claim the connect itself disproves.
+    fn established(&self) -> bool {
+        let s = self.state.lock().expect("poisoned");
+        s.stream.is_some() || s.datagram.is_some()
     }
 
     /// `(read, written)` for the attempt, over whichever transport ran.
     fn bytes(&self) -> (u64, u64) {
         let s = self.state.lock().expect("poisoned");
-        let (r, w) = s.counters.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
-        (r + s.udp_read, w + s.udp_written)
+        let (sr, sw) = s.stream.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
+        let (dr, dw) = s.datagram.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
+        (sr + dr, sw + dw)
     }
 
-    /// Decorate an error with everything the attempt had published. `tcp_*`
-    /// stay stream-only and UDP gets its own pair — widening the `tcp_*` fields
-    /// would make the log line's name a lie, and dropping the UDP counts would
-    /// leave a timed-out datagram attempt reporting all-`None`, which reads as
-    /// "never sent anything".
+    /// Decorate an error with everything the attempt had published. Each
+    /// transport's fields appear only when that transport actually ran — a
+    /// refused DoH connect must not report `udp_sent=Some(0)`, which reads as a
+    /// datagram transport that sent nothing.
     fn apply(&self, e: &mut UpstreamErr) {
         let s = self.state.lock().expect("poisoned");
         e.socks5_ms = s.socks5_ms;
         e.tls_ms = s
             .tls_ms
             .or_else(|| s.tls_started_at.map(|t| t.elapsed().as_millis() as u64));
-        if let Some(c) = s.counters.as_ref() {
+        if let Some(c) = s.stream.as_ref() {
             e.tcp_read = Some(c.read());
             e.tcp_wrote = Some(c.written());
-        } else {
-            e.udp_sent = Some(s.udp_written);
-            e.udp_received = Some(s.udp_read);
+        }
+        if let Some(c) = s.datagram.as_ref() {
+            e.udp_sent = Some(c.written());
+            e.udp_received = Some(c.read());
         }
     }
 }
@@ -509,6 +530,7 @@ pub struct DnsForwarder {
     /// `forward_one` on every attempt, read by snapshot/diff.
     upstream_read: AtomicU64,
     upstream_written: AtomicU64,
+    upstream_connects: AtomicU64,
     /// Test-only per-server upstream-port override, indexed against
     /// `config.servers`, so tests can target ephemeral listeners without
     /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
@@ -532,15 +554,17 @@ impl DnsForwarder {
             ipv6_skip_logged: Mutex::new(HashSet::new()),
             upstream_read: AtomicU64::new(0),
             upstream_written: AtomicU64::new(0),
+            upstream_connects: AtomicU64::new(0),
             #[cfg(test)]
             forced_ports: None,
         }
     }
 
-    pub fn upstream_bytes(&self) -> UpstreamBytes {
-        UpstreamBytes {
+    pub fn upstream_activity(&self) -> UpstreamActivity {
+        UpstreamActivity {
             read: self.upstream_read.load(Ordering::Relaxed),
             written: self.upstream_written.load(Ordering::Relaxed),
+            connects: self.upstream_connects.load(Ordering::Relaxed),
         }
     }
 
@@ -663,6 +687,8 @@ impl DnsForwarder {
         let (read, written) = probe.bytes();
         self.upstream_read.fetch_add(read, Ordering::Relaxed);
         self.upstream_written.fetch_add(written, Ordering::Relaxed);
+        self.upstream_connects
+            .fetch_add(u64::from(probe.established()), Ordering::Relaxed);
         result.map_err(|mut e| {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
             e.budget_ms = budget.as_millis() as u64;
@@ -777,17 +803,18 @@ impl DnsForwarder {
             .connect_udp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let sent = socket
+        // Published before the first send: the handle counts at the wire, so a
+        // reply that arrives and then fails to parse still registers.
+        probe.associated(socket.counters());
+        socket
             .send(query)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
-        probe.datagram_sent(sent as u64);
         let mut buf = vec![0u8; MAX_REPLY_SIZE];
         let n = socket
             .recv(&mut buf)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))?;
-        probe.datagram_received(n as u64);
         buf.truncate(n);
         Ok(buf)
     }
