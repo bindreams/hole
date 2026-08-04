@@ -44,6 +44,7 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
 
+use crate::dns::forwarder::ForwardFailure;
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{
     build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
@@ -1046,7 +1047,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 (handle, stop)
             });
 
-            let started = std::time::Instant::now();
             let outcome = run_forwarder_self_test(
                 std::sync::Arc::clone(fwd),
                 config.dns.servers.clone(),
@@ -1054,26 +1054,39 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 cancel.clone(),
             )
             .await;
-            match outcome.into_result(started.elapsed().as_millis() as u64) {
+            match outcome {
                 // Self-test passed: cancel the probe token.
-                Ok(_) => {
+                SelfTestOutcome::Ok { .. } => {
                     if let Some((_, stop)) = probe {
                         stop.cancel();
                     }
                 }
+                // The user asked for the cancel; stop the probe and propagate.
+                SelfTestOutcome::Cancelled => {
+                    if let Some((_, stop)) = probe {
+                        stop.cancel();
+                    }
+                    return Err(ProxyError::Cancelled);
+                }
                 // The forwarder failed: await the concurrent probe's verdict and
                 // reclassify the error. It ran in parallel, so the wait is at most
                 // the probe's remaining budget, not its full duration on top.
-                Err(ProxyError::ForwarderSelfTestFailed {
+                // `elapsed_ms` rides in the outcome, measured by the self-test
+                // itself, so the duration in the user's sentence can never grow
+                // to include this wait.
+                SelfTestOutcome::Failed {
                     attempts,
                     elapsed_ms,
                     reason,
-                }) => {
+                } => {
                     let verdict = match probe {
                         Some((handle, _stop)) => match handle.await {
                             Ok(v) => Some(v),
+                            // The probe's verdict outranks the self-test's own
+                            // reading, so losing it degrades the report — WARN,
+                            // or the downgrade is invisible at the default level.
                             Err(e) => {
-                                tracing::debug!(%e, "reachability probe task did not complete");
+                                warn!(%e, "reachability probe task did not complete; its verdict is unavailable");
                                 None
                             }
                         },
@@ -1084,14 +1097,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
+                    report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
                     return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
-                }
-                // Any other error (e.g. Cancelled): stop the probe, propagate as-is.
-                Err(e) => {
-                    if let Some((_, stop)) = probe {
-                        stop.cancel();
-                    }
-                    return Err(e);
                 }
             }
         }
@@ -1532,10 +1539,12 @@ async fn build_local_dns(
 pub(crate) const TAP_ENABLED_HINT: &str =
     "DNS self-test failed with plugin tap enabled; check 'plugin tap: closed' lines above for per-connection bytes_to_plugin / bytes_from_plugin / ttfb_ms / close_kind";
 
-/// Hint logged on self-test failure when the plugin tap is NOT enabled.
-/// Tells the reader how to capture richer diagnostics next time.
+/// Hint logged on self-test failure when the plugin tap is NOT enabled. Points
+/// at the diagnostics this run already produced; the tap is an offer, not a
+/// prerequisite. Emitted from `run_forwarder_self_test`, which does not know
+/// whether a plugin is configured, so it must read true either way.
 pub(crate) const TAP_DISABLED_HINT: &str =
-    "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
+    "DNS self-test failed; the 'upstream failed' lines above carry the layer, cause and byte counts for every attempt. For per-connection byte flow through a plugin chain, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
 
 /// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
 /// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
@@ -1573,6 +1582,15 @@ async fn run_forwarder_self_test(
 
     let query = sample_self_test_query();
     let started = std::time::Instant::now();
+    let bytes_before = forwarder.upstream_bytes();
+    // The gate is the forwarder's first user: `build_local_dns` constructs it
+    // for this start, and the `Dispatcher` that drives the in-TUN endpoint is
+    // not created until the gate passes. The diff is what the run itself moved.
+    debug_assert_eq!(
+        bytes_before,
+        crate::dns::forwarder::UpstreamBytes::default(),
+        "the self-test gate must be the forwarder's first user"
+    );
     // The overall bound is a DEADLINE the loop respects, not a `timeout` around
     // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
     // was in flight, and a dropped future produces no `UpstreamErr`, so that
@@ -1581,6 +1599,9 @@ async fn run_forwarder_self_test(
     // and nothing is discarded.
     let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
     let mut last_err: Option<String> = None;
+    // Both latch: the reading spans the whole run, not the last attempt.
+    let mut answered = false;
+    let mut dialled = false;
     let mut completed: u32 = 0;
     let mut outcome = None;
 
@@ -1620,33 +1641,74 @@ async fn run_forwarder_self_test(
         completed = attempt;
         match result {
             Ok(reply) => {
+                dialled = true;
                 if is_dns_reply_ok(&reply) {
                     outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
                     break;
                 }
-                last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
+                // `is_dns_reply_ok` rejects on two independent grounds; say
+                // which, so a truncated answer is not reported as a resolver
+                // that returned SERVFAIL.
+                answered = true;
+                last_err = Some(if reply.len() < 12 {
+                    format!("a resolver answered with a malformed reply ({} bytes)", reply.len())
+                } else {
+                    "a resolver answered with SERVFAIL".to_string()
+                });
             }
-            Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
+            Err(failure) => {
+                last_err = Some(match failure {
+                    ForwardFailure::NoUpstream => "no configured DNS resolver could be used".to_string(),
+                    ForwardFailure::MalformedQuery => {
+                        unreachable!("the self-test's own query is always at least a DNS header")
+                    }
+                    ForwardFailure::Upstream(cause) => {
+                        dialled = true;
+                        format!("no resolver answered through the tunnel ({cause})")
+                    }
+                });
+            }
         }
     }
 
+    let moved = forwarder.upstream_bytes().since(bytes_before);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
         attempts: completed,
-        reason: last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
+        elapsed_ms,
+        reason: classify_failure(
+            Observed {
+                answered,
+                dialled,
+                moved,
+            },
+            last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
+        ),
     });
 
-    let elapsed_ms = started.elapsed().as_millis() as u64;
     match &outcome {
         SelfTestOutcome::Ok { attempts } => {
             info!(%first_server, attempts, elapsed_ms, "forwarder self-test ok");
         }
-        SelfTestOutcome::Failed { attempts, reason } => {
-            info!(%first_server, attempts, elapsed_ms, reason, "forwarder self-test failed");
+        SelfTestOutcome::Failed { attempts, reason, .. } => {
+            let reason = match reason {
+                SelfTestReason::NoConnection => "no connection into the tunnel was opened",
+                SelfTestReason::TunnelSilent => "nothing came back through the tunnel",
+                SelfTestReason::Other(s) => s.as_str(),
+            };
+            info!(
+                %first_server,
+                attempts,
+                elapsed_ms,
+                reason,
+                bytes_to_upstream = moved.written,
+                bytes_from_upstream = moved.read,
+                "forwarder self-test failed"
+            );
             // #388 correlation breadcrumb: tells the reader either
             // where the tap data lives, or how to enable it for next
-            // reproduction. The actual error surfaces through
-            // ProxyError::ForwarderSelfTestFailed → IPC response →
-            // GUI; no error! log needed.
+            // reproduction. The actual error surfaces through the
+            // start error → IPC response → GUI; no error! log needed.
             if diagnostic_tap_enabled {
                 warn!("{TAP_ENABLED_HINT}");
             } else {
@@ -1660,6 +1722,60 @@ async fn run_forwarder_self_test(
     outcome
 }
 
+/// Why the self-test failed, in the terms its report is allowed to claim.
+#[derive(Debug)]
+enum SelfTestReason {
+    /// Not one connection into the tunnel was opened — see
+    /// [`ProxyError::NoTunnelConnection`].
+    NoConnection,
+    /// A connection carried the query and nothing came back — see
+    /// [`ProxyError::TunnelSilent`].
+    TunnelSilent,
+    /// Something answered, or nothing was dialled; carries the sentence for the
+    /// toast.
+    Other(String),
+}
+
+/// What one self-test run observed. Every field spans the WHOLE run — `moved`
+/// accumulates over attempts and upstreams, the flags latch — so the three are
+/// one granularity and none can be read against another's scope.
+#[derive(Debug, Clone, Copy)]
+struct Observed {
+    /// A reply arrived at some point and was rejected (SERVFAIL, or too short
+    /// to be a reply).
+    answered: bool,
+    /// At least one upstream was dialled. `false` for a config whose every
+    /// server is skipped, or a run with no budget left to start an attempt.
+    dialled: bool,
+    /// Bytes the forwarder moved during the run.
+    moved: crate::dns::forwarder::UpstreamBytes,
+}
+
+/// Emit the plugin chain's kept output for a failed gate, or say there is no
+/// chain to quote. `bridge.log` only — these lines can name the server host.
+fn report_plugin_output(log: Option<&crate::proxy::plugin_log::PluginLog>) {
+    match log {
+        Some(log) => crate::proxy::plugin_log::warn_recent(log),
+        None => warn!("{}", crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+    }
+}
+
+/// Turn a reading into the claim the report may make. Every claim rests on a
+/// positive observation, never on a cause code: a local hop that HANGS never
+/// reaches `UpstreamLayer::Connect`, so its cause is `Timeout`, and splitting on
+/// `Unreachable` would file it under the tunnel sentence.
+fn classify_failure(observed: Observed, last_err: String) -> SelfTestReason {
+    // Anything back at all disproves silence; nothing dialled proves nothing.
+    if observed.answered || observed.moved.read > 0 || !observed.dialled {
+        return SelfTestReason::Other(last_err);
+    }
+    if observed.moved.written > 0 {
+        SelfTestReason::TunnelSilent
+    } else {
+        SelfTestReason::NoConnection
+    }
+}
+
 #[derive(Debug)]
 enum SelfTestOutcome {
     Ok {
@@ -1667,42 +1783,30 @@ enum SelfTestOutcome {
     },
     Failed {
         attempts: u32,
-        reason: String,
+        elapsed_ms: u64,
+        reason: SelfTestReason,
     },
     /// The bridge cancel token fired before the self-test could complete
-    /// or fail definitively (#397). Maps to `ProxyError::Cancelled` via
-    /// `into_result`; not a diagnostic failure (the user asked for it).
+    /// or fail definitively (#397). Maps to `ProxyError::Cancelled`; not a
+    /// diagnostic failure (the user asked for it).
     Cancelled,
-}
-
-impl SelfTestOutcome {
-    /// Convert outcome to a Result for use as a start-time gate.
-    /// `Ok(attempts)` carries the attempt count taken to succeed (0 when
-    /// skipped because no servers configured — only reachable via the
-    /// `dns.enabled = false` branch in `build_local_dns`).
-    fn into_result(self, elapsed_ms: u64) -> Result<u32, ProxyError> {
-        match self {
-            Self::Ok { attempts } => Ok(attempts),
-            Self::Failed { attempts, reason } => Err(ProxyError::ForwarderSelfTestFailed {
-                reason,
-                attempts,
-                elapsed_ms,
-            }),
-            Self::Cancelled => Err(ProxyError::Cancelled),
-        }
-    }
 }
 
 /// Map a self-test failure to the `ProxyError` the toast sees, given the
 /// out-of-band reachability `verdict` (`None` when the probe was skipped). A
 /// `Blocked` verdict becomes the typed [`ProxyError::NetworkBlocked`];
-/// `TcpRefused`/`TcpTimeout` rewrite the reason to the probe's `user_message`;
-/// every other verdict keeps the `original` self-test reason.
+/// `TcpRefused`/`TcpTimeout` rewrite the reason to the probe's `user_message`.
+///
+/// The precedence is deliberate and total: whenever the server's own port is
+/// refused or unanswered, the probe's sentence replaces
+/// [`ProxyError::TunnelSilent`] / [`ProxyError::NoTunnelConnection`] entirely.
+/// Those two surface only when the probe reported `Reachable` / `DnsFailed` /
+/// `Inconclusive`, or was suppressed by an active fail-closed cover.
 fn self_test_error_for(
     verdict: Option<crate::reachability::ReachabilityVerdict>,
     attempts: u32,
     elapsed_ms: u64,
-    original: String,
+    reason: SelfTestReason,
 ) -> ProxyError {
     use crate::reachability::ReachabilityVerdict::*;
     match verdict {
@@ -1715,10 +1819,14 @@ fn self_test_error_for(
                 .expect("TcpRefused/TcpTimeout always carry a user_message")
                 .to_owned(),
         },
-        _ => ProxyError::ForwarderSelfTestFailed {
-            attempts,
-            elapsed_ms,
-            reason: original,
+        _ => match reason {
+            SelfTestReason::NoConnection => ProxyError::NoTunnelConnection { attempts, elapsed_ms },
+            SelfTestReason::TunnelSilent => ProxyError::TunnelSilent { attempts, elapsed_ms },
+            SelfTestReason::Other(reason) => ProxyError::ForwarderSelfTestFailed {
+                attempts,
+                elapsed_ms,
+                reason,
+            },
         },
     }
 }

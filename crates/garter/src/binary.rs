@@ -70,12 +70,19 @@ pub(crate) struct Sip003Env {
 /// recovery (e.g. persist to a state file).
 pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
 
+/// Sink for a plugin's raw log lines, mirroring [`PidSink`]. Invoked for EVERY
+/// line the child writes to stdout or stderr — including lines the sitrep
+/// reader goes on to parse as protocol events — before any interpretation.
+/// Lines are handed over unparsed and unclassified.
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// A plugin backed by an external SIP003u binary.
 pub struct BinaryPlugin {
     path: PathBuf,
     options: Option<String>,
     name: String,
     pid_sink: Option<PidSink>,
+    log_sink: Option<LogSink>,
     readiness: ReadinessMode,
     extra_env: Vec<(String, String)>,
 }
@@ -89,6 +96,7 @@ impl BinaryPlugin {
             options: options.map(String::from),
             name,
             pid_sink: None,
+            log_sink: None,
             readiness: ReadinessMode::default(),
             extra_env: Vec::new(),
         }
@@ -97,6 +105,12 @@ impl BinaryPlugin {
     /// Set a callback that fires with the child PID immediately after spawn.
     pub fn pid_sink(mut self, sink: PidSink) -> Self {
         self.pid_sink = Some(sink);
+        self
+    }
+
+    /// Also deliver every line the child writes to `sink` — see [`LogSink`].
+    pub fn log_sink(mut self, sink: LogSink) -> Self {
+        self.log_sink = Some(sink);
         self
     }
 
@@ -215,12 +229,16 @@ impl ChainPlugin for BinaryPlugin {
                 // Tier-2: the stdout reader is a pure log passthrough; a
                 // separate self-probe task owns readiness.
                 let plugin_name = self.name.clone();
+                let log_sink = self.log_sink.clone();
                 let log_task = tokio::spawn(async move {
                     let reader = BufReader::new(stdout);
                     let mut lines = reader.lines();
                     loop {
                         match lines.next_line().await {
                             Ok(Some(line)) => {
+                                if let Some(ref sink) = log_sink {
+                                    sink(&line);
+                                }
                                 tracing::info!(plugin = %plugin_name, "{line}");
                             }
                             Ok(None) => break, // EOF
@@ -248,23 +266,39 @@ impl ChainPlugin for BinaryPlugin {
 
                 log_task
             }
-            ReadinessMode::ExpectSitrep => {
-                spawn_sitrep_stdout_reader(stdout, self.name.clone(), local, shutdown.clone(), ready, false)
-            }
-            ReadinessMode::Auto => {
-                spawn_sitrep_stdout_reader(stdout, self.name.clone(), local, shutdown.clone(), ready, true)
-            }
+            ReadinessMode::ExpectSitrep => spawn_sitrep_stdout_reader(
+                stdout,
+                self.name.clone(),
+                local,
+                shutdown.clone(),
+                ready,
+                false,
+                self.log_sink.clone(),
+            ),
+            ReadinessMode::Auto => spawn_sitrep_stdout_reader(
+                stdout,
+                self.name.clone(),
+                local,
+                shutdown.clone(),
+                ready,
+                true,
+                self.log_sink.clone(),
+            ),
         };
 
         // Capture stderr
         let stderr = gc.child.stderr.take().expect("stderr was piped");
         let plugin_name = self.name.clone();
+        let log_sink = self.log_sink.clone();
         let stderr_task = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
+                        if let Some(ref sink) = log_sink {
+                            sink(&line);
+                        }
                         tracing::warn!(plugin = %plugin_name, "{line}");
                     }
                     Ok(None) => break, // EOF
@@ -370,6 +404,7 @@ fn spawn_sitrep_stdout_reader(
     shutdown: CancellationToken,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     auto: bool,
+    log_sink: Option<LogSink>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
@@ -390,68 +425,77 @@ fn spawn_sitrep_stdout_reader(
         let mut handshake_ok = false;
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => match crate::sitrep::parse_event(&line) {
-                    Ok(Some(SitrepEvent::Hello { protocol })) => {
-                        match crate::sitrep::protocol_support(&protocol) {
-                            ProtocolSupport::Supported => {
-                                handshake_ok = true;
-                                // Auto: a real sitrep plugin — stand the probe
-                                // down so its richer `ready` wins. (No-op when
-                                // !auto: no probe was started with this token.)
-                                probe_standdown.cancel();
-                                tracing::debug!(plugin = %plugin_name, %protocol, "sitrep handshake");
-                            }
-                            ProtocolSupport::FallBackToTier2 => {
-                                tracing::info!(
-                                    plugin = %plugin_name,
-                                    %protocol,
-                                    "unknown sitrep protocol major; readiness falls back to probe"
-                                );
-                                // Hand readiness to a tier-2 self-probe, sharing
-                                // the single sender. In Auto the probe is already
-                                // running (do NOT cancel its standdown — unknown
-                                // major means the probe drives); in ExpectSitrep
-                                // start it now. The reader continues only as a log
-                                // passthrough (it never sends readiness again).
-                                if !auto {
-                                    spawn_shared_probe(local, shutdown.clone(), shared.clone());
+                Ok(Some(line)) => {
+                    // Sink BEFORE parsing: the arms below consume lines that
+                    // would otherwise never reach a consumer — a post-ready
+                    // `fatal` finds the readiness one-shot already taken and
+                    // falls through with no relay at all.
+                    if let Some(ref sink) = log_sink {
+                        sink(&line);
+                    }
+                    match crate::sitrep::parse_event(&line) {
+                        Ok(Some(SitrepEvent::Hello { protocol })) => {
+                            match crate::sitrep::protocol_support(&protocol) {
+                                ProtocolSupport::Supported => {
+                                    handshake_ok = true;
+                                    // Auto: a real sitrep plugin — stand the probe
+                                    // down so its richer `ready` wins. (No-op when
+                                    // !auto: no probe was started with this token.)
+                                    probe_standdown.cancel();
+                                    tracing::debug!(plugin = %plugin_name, %protocol, "sitrep handshake");
                                 }
-                                // Drain the rest of stdout as logs so the
-                                // child's pipe never blocks; the probe task
-                                // owns readiness from here on.
-                                drain_remaining_logs(&mut lines, &plugin_name).await;
-                                break;
+                                ProtocolSupport::FallBackToTier2 => {
+                                    tracing::info!(
+                                        plugin = %plugin_name,
+                                        %protocol,
+                                        "unknown sitrep protocol major; readiness falls back to probe"
+                                    );
+                                    // Hand readiness to a tier-2 self-probe, sharing
+                                    // the single sender. In Auto the probe is already
+                                    // running (do NOT cancel its standdown — unknown
+                                    // major means the probe drives); in ExpectSitrep
+                                    // start it now. The reader continues only as a log
+                                    // passthrough (it never sends readiness again).
+                                    if !auto {
+                                        spawn_shared_probe(local, shutdown.clone(), shared.clone());
+                                    }
+                                    // Drain the rest of stdout as logs so the
+                                    // child's pipe never blocks; the probe task
+                                    // owns readiness from here on.
+                                    drain_remaining_logs(&mut lines, &plugin_name, &log_sink).await;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    Ok(Some(SitrepEvent::Ready { listen, transports })) if handshake_ok => {
-                        if let Some(tx) = shared.lock().await.take() {
-                            // Empty/all-unknown transports is illegal per
-                            // SITREP: a `ready` MUST list >=1 served
-                            // transport. Reject as Fatal.
-                            if transports.is_empty() {
-                                let _ = tx.send(Err(StartError::Fatal {
-                                    detail: "sitrep ready reported empty transports (protocol violation)".into(),
-                                    errno: None,
-                                }));
-                            } else {
-                                let _ = tx.send(Ok(PluginReady { listen, transports }));
+                        Ok(Some(SitrepEvent::Ready { listen, transports })) if handshake_ok => {
+                            if let Some(tx) = shared.lock().await.take() {
+                                // Empty/all-unknown transports is illegal per
+                                // SITREP: a `ready` MUST list >=1 served
+                                // transport. Reject as Fatal.
+                                if transports.is_empty() {
+                                    let _ = tx.send(Err(StartError::Fatal {
+                                        detail: "sitrep ready reported empty transports (protocol violation)".into(),
+                                        errno: None,
+                                    }));
+                                } else {
+                                    let _ = tx.send(Ok(PluginReady { listen, transports }));
+                                }
                             }
                         }
-                    }
-                    Ok(Some(SitrepEvent::BindConflict { errno, addr })) if handshake_ok => {
-                        if let Some(tx) = shared.lock().await.take() {
-                            let _ = tx.send(Err(StartError::BindConflict { errno, addr }));
+                        Ok(Some(SitrepEvent::BindConflict { errno, addr })) if handshake_ok => {
+                            if let Some(tx) = shared.lock().await.take() {
+                                let _ = tx.send(Err(StartError::BindConflict { errno, addr }));
+                            }
                         }
-                    }
-                    Ok(Some(SitrepEvent::Fatal { detail, errno })) if handshake_ok => {
-                        if let Some(tx) = shared.lock().await.take() {
-                            let _ = tx.send(Err(StartError::Fatal { detail, errno }));
+                        Ok(Some(SitrepEvent::Fatal { detail, errno })) if handshake_ok => {
+                            if let Some(tx) = shared.lock().await.take() {
+                                let _ = tx.send(Err(StartError::Fatal { detail, errno }));
+                            }
                         }
+                        // log line / pre-handshake / unknown event → passthrough
+                        _ => tracing::info!(plugin = %plugin_name, "{line}"),
                     }
-                    // log line / pre-handshake / unknown event → passthrough
-                    _ => tracing::info!(plugin = %plugin_name, "{line}"),
-                },
+                }
                 Ok(None) => break, // EOF
                 Err(e) => {
                     tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
@@ -476,8 +520,15 @@ fn spawn_sitrep_stdout_reader(
 /// an orphan holding the *host's* stdio); and because it runs inside a detached
 /// `tokio::spawn`, runtime drop aborts it at the await point rather than
 /// blocking on it.
-async fn drain_remaining_logs(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>, plugin_name: &str) {
+async fn drain_remaining_logs(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    plugin_name: &str,
+    log_sink: &Option<LogSink>,
+) {
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(sink) = log_sink {
+            sink(&line);
+        }
         tracing::info!(plugin = %plugin_name, "{line}");
     }
 }

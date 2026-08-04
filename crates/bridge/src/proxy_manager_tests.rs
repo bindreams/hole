@@ -1931,9 +1931,9 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::forwarder::DnsForwarder;
+    use crate::dns::forwarder::{DnsForwarder, UpstreamBytes};
     use crate::test_support::log_capture::VecWriter;
-    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector};
+    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector, SilentConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
     use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
@@ -1946,6 +1946,284 @@ mod self_test {
             protocol: DnsProtocol::PlainTcp,
             allow_insecure_bootstrap: false,
         }
+    }
+
+    /// Bind a UDP socket that answers every datagram with a SERVFAIL built from
+    /// it. A resolver that answered — the case that must never be reported as a
+    /// silent tunnel.
+    async fn servfail_udp_stub() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let reply = crate::dns::forwarder::synthesize_servfail(&buf[..n]);
+                let _ = sock.send_to(&reply, peer).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Every branch of the classifier, including the ones that must NOT claim a
+    /// silent tunnel. The condition decides which of three sentences a user
+    /// reads, so each arm is pinned rather than inferred from one case.
+    #[skuld::test]
+    fn classify_failure_covers_every_branch() {
+        let nothing = UpstreamBytes::default();
+        let wrote_only = UpstreamBytes { read: 0, written: 44 };
+        let both = UpstreamBytes { read: 91, written: 44 };
+        let case = |answered, dialled, moved| {
+            classify_failure(
+                Observed {
+                    answered,
+                    dialled,
+                    moved,
+                },
+                "reason".to_string(),
+            )
+        };
+
+        // The query reached the tunnel and nothing returned.
+        assert!(matches!(case(false, true, wrote_only), SelfTestReason::TunnelSilent));
+        // Not one byte was written: the local hop, not the tunnel. Covers both a
+        // refused connect and one that hung until the budget fired — the cause
+        // codes differ, the reading does not.
+        assert!(matches!(case(false, true, nothing), SelfTestReason::NoConnection));
+        // A reply arrived and was rejected — the tunnel is not silent.
+        assert!(matches!(case(true, true, both), SelfTestReason::Other(_)));
+        // Bytes came back even though the walk failed.
+        assert!(matches!(case(false, true, both), SelfTestReason::Other(_)));
+        // Nothing was dialled: a config fault, not a reading of the tunnel.
+        assert!(matches!(case(false, false, nothing), SelfTestReason::Other(_)));
+    }
+
+    /// A plugin that dies mid-run: attempt 1 carries the query, attempt 2 cannot
+    /// connect. The reading is cumulative, so the bytes that reached the tunnel
+    /// still decide — reporting the local hop here would contradict the counters.
+    #[skuld::test]
+    fn bytes_from_an_earlier_attempt_still_decide() {
+        let reason = classify_failure(
+            Observed {
+                answered: false,
+                dialled: true,
+                moved: UpstreamBytes { read: 0, written: 44 },
+            },
+            "no resolver answered through the tunnel (unreachable)".into(),
+        );
+        assert!(matches!(reason, SelfTestReason::TunnelSilent), "got {reason:?}");
+    }
+
+    /// The load-bearing report. A tunnel that swallows the query and answers
+    /// nothing is what a dead plugin transport looks like from here, and the
+    /// message must say that instead of blaming the DNS self-test.
+    #[skuld::test]
+    fn a_silent_tunnel_is_reported_as_a_silent_tunnel() {
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (connector, connected_rx) = SilentConnector::new();
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), connector, false));
+                let run = tokio::spawn(run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                ));
+                connected_rx.await.expect("the stub connector completed a connect");
+                tokio::time::pause();
+                run.await.unwrap()
+            });
+
+        let SelfTestOutcome::Failed { attempts, reason, .. } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(matches!(reason, SelfTestReason::TunnelSilent), "got {reason:?}");
+
+        let err = self_test_error_for(Some(ReachabilityVerdict::Reachable), attempts, 4517, reason);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Nothing came back through the tunnel ({attempts} attempts in 4517ms). \
+                 Either the proxy connection could not be established, \
+                 or the server cannot reach your DNS resolver."
+            )
+        );
+        // Only integers are interpolated, so nothing host-shaped can reach a toast.
+        assert!(!err.to_string().contains("127.0.0.1"), "got: {err}");
+    }
+
+    /// A connect that never completes: the local hop, not `TunnelSilent` — see
+    /// [`ProxyError::NoTunnelConnection`].
+    #[skuld::test]
+    fn a_refused_local_hop_is_reported_as_no_connection() {
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
+                run_forwarder_self_test(
+                    forwarder,
+                    vec!["127.0.0.1".parse().unwrap()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            });
+        let SelfTestOutcome::Failed { attempts, reason, .. } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
+        let err = self_test_error_for(None, attempts, 4517, reason);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Could not open a connection into the tunnel ({attempts} attempts in 4517ms). \
+                 The local proxy or its plugin is not accepting connections."
+            )
+        );
+    }
+
+    /// A resolver that answered SERVFAIL over UDP must not be reported as a
+    /// silent tunnel.
+    #[skuld::test]
+    fn a_udp_resolver_that_answers_servfail_is_not_a_silent_tunnel() {
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (addr, _stub) = servfail_udp_stub().await;
+                let cfg = DnsConfig {
+                    servers: vec![addr.ip()],
+                    protocol: DnsProtocol::PlainUdp,
+                    ..test_dns_cfg()
+                };
+                let forwarder = SArc::new(DnsForwarder::new_with_ports(
+                    cfg,
+                    SArc::new(crate::dns::connector::DirectConnector),
+                    true,
+                    vec![addr.port()],
+                ));
+                run_forwarder_self_test(forwarder, vec![addr.ip()], false, CancellationToken::new()).await
+            });
+        let SelfTestOutcome::Failed { reason, .. } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        match reason {
+            SelfTestReason::Other(s) => assert!(s.contains("SERVFAIL"), "got: {s}"),
+            other => panic!("a resolver answered; expected Other, got {other:?}"),
+        }
+    }
+
+    /// A probe verdict is direct out-of-band evidence about the server and
+    /// outranks every self-test reading.
+    #[skuld::test]
+    fn a_blocked_probe_outranks_every_self_test_reading() {
+        for reason in [
+            SelfTestReason::TunnelSilent,
+            SelfTestReason::NoConnection,
+            SelfTestReason::Other("anything".into()),
+        ] {
+            let err = self_test_error_for(Some(ReachabilityVerdict::Blocked), 3, 4517, reason);
+            assert!(matches!(err, ProxyError::NetworkBlocked), "got {err:?}");
+        }
+    }
+
+    /// The reason must never be a `Debug`-formatted internal enum: the toast is
+    /// the only thing most users read.
+    #[skuld::test]
+    fn the_reason_never_carries_a_debug_formatted_enum() {
+        let err = self_test_error_for(
+            None,
+            3,
+            4517,
+            SelfTestReason::Other("a resolver answered with SERVFAIL".into()),
+        );
+        assert!(!err.to_string().contains("Upstream("), "got: {err}");
+        assert!(err.to_string().contains("SERVFAIL"), "got: {err}");
+    }
+
+    /// `report_plugin_output` quotes a chain's lines, and says so when there is
+    /// no chain — the branch that makes the gate's call site observable.
+    #[skuld::test]
+    fn report_plugin_output_quotes_a_chain_or_says_there_is_none() {
+        let capture = |f: &dyn Fn()| {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            {
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+                f();
+            }
+            writer.snapshot_string()
+        };
+
+        let log = crate::proxy::plugin_log::PluginLog::new();
+        log.push_line("transport/internet/tls: ECH required but no ECH config could be obtained");
+        let with_chain = capture(&|| super::report_plugin_output(Some(&log)));
+        assert!(with_chain.contains("ECH required"), "got:\n{with_chain}");
+
+        let without = capture(&|| super::report_plugin_output(None));
+        assert!(
+            without.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "got:\n{without}"
+        );
+    }
+
+    /// The gate REACHES `report_plugin_output`, and reports the local hop.
+    /// Driven through the real `start_inner` failure arm with the mock backends:
+    /// `MockProxy` binds no listener, so the forwarder's SOCKS5 connect to
+    /// `127.0.0.1:local_port` never carries a byte. No plugin is configured, so
+    /// the `None` branch is what proves the call site exists — the `Some` branch
+    /// differs only in the argument, and `tests/plugin_chain.rs` proves a real
+    /// chain's ring holds the child's lines.
+    #[skuld::test]
+    fn a_failed_gate_reaches_the_plugin_output_report() {
+        let writer = VecWriter::new();
+        // Current-thread: `set_default_in_current_thread` is thread-local, and
+        // the gate's work runs in tasks this start spawns.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                // A standing lockdown suppresses the out-of-band reachability probe,
+                // whose TcpRefused verdict would otherwise replace the gate's own
+                // reading (see `self_test_error_for`'s precedence).
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+                let mut cfg = test_config();
+                cfg.dns = DnsConfig {
+                    enabled: true,
+                    servers: vec!["127.0.0.1".parse().unwrap()],
+                    protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
+                };
+                let err = pm.start(&cfg).await.expect_err("the gate must fail with no listener");
+                // Refused or dropped, the reading is the same: nothing was written.
+                assert!(matches!(err, ProxyError::NoTunnelConnection { .. }), "got {err:?}");
+            });
+        let output = writer.snapshot_string();
+        assert!(
+            output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the failed gate must report on the plugin chain; got:\n{output}"
+        );
     }
 
     /// The self-test hands its budget DOWN to the forwarder instead of
@@ -1983,10 +2261,8 @@ mod self_test {
             SelfTestOutcome::Failed { reason, .. } => reason,
             other => panic!("expected Failed, got {other:?}"),
         };
-        assert!(
-            reason.contains("Unreachable"),
-            "the reason must name the cause, not just 'timed out'; got: {reason}"
-        );
+        // Refused at connect: not one byte reached the tunnel.
+        assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
 
         let output = writer.snapshot_string();
         assert!(
@@ -2046,15 +2322,12 @@ mod self_test {
             "the loop must stop at the overall deadline; took {elapsed:?}"
         );
         match outcome {
-            SelfTestOutcome::Failed { reason, attempts } => {
-                assert!(
-                    reason.contains("Timeout"),
-                    "every upstream hung, so the reason must say so; got: {reason}"
-                );
-                assert!(
-                    !reason.contains("no attempt completed"),
-                    "attempts run to completion under a deadline; got: {reason}"
-                );
+            SelfTestOutcome::Failed { reason, attempts, .. } => {
+                // The connect never completes, so the cause code is `Timeout`
+                // while nothing at all left the process. This is the case that
+                // makes the positive-evidence split load-bearing: a cause-code
+                // split would file it under the tunnel sentence.
+                assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
                 assert!(
                     (1..=3).contains(&attempts),
                     "attempts must count what actually ran; got {attempts}"
@@ -2127,27 +2400,17 @@ mod self_test {
                     CancellationToken::new(),
                 )
                 .await;
-                let SelfTestOutcome::Failed { attempts, reason } = outcome else {
+                let SelfTestOutcome::Failed { attempts, reason, .. } = outcome else {
                     panic!("expected Failed");
                 };
                 assert_eq!(attempts, 3);
-                assert!(
-                    !reason.is_empty(),
-                    "Failed reason must be non-empty for diagnostic value"
-                );
-                // into_result maps to the canonical error variant.
-                let err = SelfTestOutcome::Failed {
-                    attempts: 3,
-                    reason: reason.clone(),
-                }
-                .into_result(4500)
-                .unwrap_err();
+                assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
+                let err = self_test_error_for(None, attempts, 4500, reason);
                 assert!(matches!(
                     err,
-                    ProxyError::ForwarderSelfTestFailed {
+                    ProxyError::NoTunnelConnection {
                         attempts: 3,
-                        elapsed_ms: 4500,
-                        ..
+                        elapsed_ms: 4500
                     }
                 ));
             });
@@ -2198,6 +2461,18 @@ mod self_test {
         assert!(
             !output.contains(super::TAP_DISABLED_HINT),
             "tap=true must NOT emit the disabled hint; got:\n{output}"
+        );
+    }
+
+    /// When self-test fails AND tap is OFF, emit a `warn!`
+    /// remediation hint pointing the reader to the config flag.
+    #[skuld::test]
+    fn the_tap_disabled_hint_does_not_demand_a_reproduction() {
+        let hint = super::TAP_DISABLED_HINT;
+        assert!(!hint.contains("next reproduction"), "got: {hint}");
+        assert!(
+            hint.contains("above"),
+            "the hint must point at what this run logged: {hint}"
         );
     }
 
@@ -2492,7 +2767,12 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_blocked_is_network_blocked() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Blocked), 3, 200, original_reason());
+        let e = self_test_error_for(
+            Some(ReachabilityVerdict::Blocked),
+            3,
+            200,
+            SelfTestReason::Other(original_reason()),
+        );
         assert!(
             matches!(e, ProxyError::NetworkBlocked),
             "Blocked must map to the typed NetworkBlocked, got {e:?}"
@@ -2501,7 +2781,12 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_tcp_refused_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpRefused), 3, 200, original_reason());
+        let e = self_test_error_for(
+            Some(ReachabilityVerdict::TcpRefused),
+            3,
+            200,
+            SelfTestReason::Other(original_reason()),
+        );
         match e {
             ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                 assert!(reason.contains("refused"), "got {reason:?}");
@@ -2512,7 +2797,12 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_tcp_timeout_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpTimeout), 3, 200, original_reason());
+        let e = self_test_error_for(
+            Some(ReachabilityVerdict::TcpTimeout),
+            3,
+            200,
+            SelfTestReason::Other(original_reason()),
+        );
         match e {
             ProxyError::ForwarderSelfTestFailed { reason, .. } => {
                 assert!(reason.contains("did not respond"), "got {reason:?}");
@@ -2523,7 +2813,12 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_reachable_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Reachable), 3, 200, original_reason());
+        let e = self_test_error_for(
+            Some(ReachabilityVerdict::Reachable),
+            3,
+            200,
+            SelfTestReason::Other(original_reason()),
+        );
         match e {
             ProxyError::ForwarderSelfTestFailed {
                 reason,
@@ -2540,7 +2835,12 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_inconclusive_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Inconclusive), 3, 200, original_reason());
+        let e = self_test_error_for(
+            Some(ReachabilityVerdict::Inconclusive),
+            3,
+            200,
+            SelfTestReason::Other(original_reason()),
+        );
         match e {
             ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
             other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
@@ -2549,7 +2849,7 @@ mod self_test {
 
     #[skuld::test]
     fn self_test_error_none_keeps_original() {
-        let e = self_test_error_for(None, 3, 200, original_reason());
+        let e = self_test_error_for(None, 3, 200, SelfTestReason::Other(original_reason()));
         match e {
             ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
             other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
@@ -3373,7 +3673,7 @@ mod self_test {
         .await;
         assert_eq!(verdict, ReachabilityVerdict::Blocked);
         assert!(matches!(
-            self_test_error_for(Some(verdict), 3, 200, original_reason()),
+            self_test_error_for(Some(verdict), 3, 200, SelfTestReason::Other(original_reason())),
             ProxyError::NetworkBlocked
         ));
     }
