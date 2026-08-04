@@ -89,6 +89,9 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 arc-swap = "1"
 async-trait = "0.1"
+# Whether a config's `ech-doh` authority is an IP literal gates whether Hole
+# overrides an operator's ECH source — a typed `Host` beats a hand parser.
+url = "2"
 # DNS forwarder — workspace-pinned direct deps; see workspace Cargo.toml.
 hickory-proto = { workspace = true }
 hickory-resolver = { workspace = true }

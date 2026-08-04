@@ -18,8 +18,8 @@ pub use chain::{ChainReady, ChainRunner, Mode};
 pub use counting::{CountingStream, StreamCounters};
 pub use error::{Error, Result};
 pub use plugin::ChainPlugin;
-pub use sip003::parse_plugin_options;
 pub use sip003::PluginEnv;
+pub use sip003::{join_plugin_options, parse_plugin_options, split_plugin_options, MalformedOptions, OptionSegment};
 pub use sitrep::{PluginReady, ProtocolSupport, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 pub use tap::TapPlugin;
 

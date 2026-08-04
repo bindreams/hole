@@ -51,6 +51,14 @@ pub enum ProxyError {
     WintunLoad { path: PathBuf, message: String },
     #[error("plugin error: {0}")]
     Plugin(String),
+    /// Plugin options a SIP003 parser rejects. Refused rather than forwarded:
+    /// ex-ray discards the whole SS_* environment on a parse error and reports
+    /// ready on its default port, so a forwarded string yields a dead tunnel
+    /// that looks healthy. PII-free `Display` by construction — the wrapped
+    /// `MalformedOptions` names the fault class and a segment index, never the
+    /// segment, which can carry a per-connection secret.
+    #[error("malformed plugin options: {0}")]
+    MalformedPluginOptions(String),
     /// A plugin reported a typed bind conflict (`StartError::BindConflict`
     /// via sitrep) at its local listener. This is the retryable
     /// class: `proxy_err_to_io_err` synthesizes an `AddrInUse`-kind
@@ -117,6 +125,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::WintunMissing { .. }
             | ProxyError::WintunLoad { .. }
             | ProxyError::Plugin(_)
+            | ProxyError::MalformedPluginOptions(_)
             | ProxyError::BindRace { .. }
             | ProxyError::TunnelRequiresSocks5
             | ProxyError::NoListenersEnabled

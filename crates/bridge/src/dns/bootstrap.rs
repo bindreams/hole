@@ -18,6 +18,7 @@ use hickory_proto::rr::{Name, RecordType};
 use hole_common::config::{DnsConfig, DnsProtocol};
 
 use crate::dns::connector::DirectConnector;
+use crate::dns::ech::PinSource;
 use crate::dns::forwarder::{DnsForwarder, ForwardFailure, UpstreamCause};
 
 /// Typed bootstrap-resolution failure. `Display` strings are PII-FREE by
@@ -257,9 +258,19 @@ async fn run_leg(
     }
 }
 
+/// A completed bootstrap: the proxy server's address, and which resolver — if
+/// any — answered. A caller that needs a resolver known to be reachable from
+/// this host must read `via`, not `dns.servers.first()`: this function fails
+/// over past dead entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bootstrapped {
+    pub server_ip: IpAddr,
+    pub via: PinSource,
+}
+
 /// Resolve `host` to an IP over the configured DoH `dns.servers`. See the task
 /// interface for the fail-closed / `allow_insecure_bootstrap` contract.
-pub async fn resolve_via_doh(host: &str, dns: &DnsConfig) -> Result<IpAddr, BootstrapError> {
+pub async fn resolve_via_doh(host: &str, dns: &DnsConfig) -> Result<Bootstrapped, BootstrapError> {
     resolve_via_doh_with(host, dns, Arc::new(ForwarderQuerier)).await
 }
 
@@ -268,10 +279,13 @@ pub async fn resolve_via_doh_with(
     host: &str,
     dns: &DnsConfig,
     querier: Arc<dyn DohQuerier>,
-) -> Result<IpAddr, BootstrapError> {
+) -> Result<Bootstrapped, BootstrapError> {
     // A literal IP needs no resolution — return as-is.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(ip);
+        return Ok(Bootstrapped {
+            server_ip: ip,
+            via: PinSource::NoQueryNeeded,
+        });
     }
 
     // Fixed tx ids: DoH carries the query over an authenticated TLS channel, so
@@ -281,7 +295,11 @@ pub async fn resolve_via_doh_with(
     let a_query = build_a_query(host, 0x0001)?;
     let aaaa_query = build_aaaa_query(host, 0x0002)?;
 
-    let mut v6_fallback: Option<IpAddr> = None;
+    let mut v6_fallback: Option<Bootstrapped> = None;
+    // A resolver that returned a well-formed reply over its verified DoH channel
+    // is reachable for DoH, whatever it said about THIS hostname — and that is
+    // all the ECH lookup needs from it. Kept so the insecure tail can still pin.
+    let mut reachable: Option<IpAddr> = None;
     let mut worst: Option<BootstrapError> = None;
     for &server in &dns.servers {
         // Fold `NoAnswer` only on NXDOMAIN or once BOTH legs answered emptily —
@@ -290,9 +308,16 @@ pub async fn resolve_via_doh_with(
         // finding from the other leg (see `rank`).
         let mut a_answered = false;
         match run_leg(&querier, server, &a_query, RecordType::A, IpAddr::is_ipv4).await {
-            LegOutcome::Address(ip) => return Ok(ip), // IPv4 preferred for bypass-route compatibility.
+            // IPv4 preferred for bypass-route compatibility.
+            LegOutcome::Address(ip) => {
+                return Ok(Bootstrapped {
+                    server_ip: ip,
+                    via: PinSource::Answered(server),
+                })
+            }
             LegOutcome::Answered { name_missing } => {
                 a_answered = true;
+                reachable.get_or_insert(server);
                 if name_missing {
                     fold_worst(&mut worst, BootstrapError::NoAnswer);
                 }
@@ -301,8 +326,14 @@ pub async fn resolve_via_doh_with(
         }
         if v6_fallback.is_none() {
             match run_leg(&querier, server, &aaaa_query, RecordType::AAAA, IpAddr::is_ipv6).await {
-                LegOutcome::Address(ip) => v6_fallback = Some(ip),
+                LegOutcome::Address(ip) => {
+                    v6_fallback = Some(Bootstrapped {
+                        server_ip: ip,
+                        via: PinSource::Answered(server),
+                    })
+                }
                 LegOutcome::Answered { name_missing } => {
+                    reachable.get_or_insert(server);
                     if a_answered || name_missing {
                         fold_worst(&mut worst, BootstrapError::NoAnswer);
                     }
@@ -312,8 +343,8 @@ pub async fn resolve_via_doh_with(
         }
     }
 
-    if let Some(ip) = v6_fallback {
-        return Ok(ip);
+    if let Some(bootstrapped) = v6_fallback {
+        return Ok(bootstrapped);
     }
 
     // Fail-closed: report the strongest failure observed. `NoAnswer` covers the
@@ -355,7 +386,10 @@ pub async fn resolve_via_doh_with(
         .iter()
         .find(|a| a.is_ipv4())
         .or_else(|| addrs.first())
-        .map(|a| a.ip())
+        .map(|a| Bootstrapped {
+            server_ip: a.ip(),
+            via: reachable.map_or(PinSource::SecureBootstrapFailed, PinSource::Answered),
+        })
         .ok_or(failure)
 }
 
