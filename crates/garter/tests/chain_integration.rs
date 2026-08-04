@@ -846,6 +846,118 @@ async fn force_kill_reaps_descendant_tree() {
 // `crates/test-observability/` and bindreams/hole#301.
 hole_test_observability::register!();
 
+/// A `log_sink` sees every line the child writes, including the ones the sitrep
+/// parser consumes — so a plugin that reports a failure over the protocol
+/// channel is not invisible to the consumer.
+///
+/// Determinism is stream ordering: `hello` and `ready` arrive on ONE pipe in
+/// that order, and the reader sinks each line before parsing it, so a chain
+/// that has reported ready has already sunk both. No timer, no poll, no loop.
+#[skuld::test]
+async fn log_sink_receives_every_line_including_sitrep_frames() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    // `ExpectSitrep` is REQUIRED, not incidental: `BinaryPlugin::new` defaults
+    // to `Probe`, whose stdout task is a plain passthrough that never parses —
+    // the assertions below would pass while covering none of the arms this test
+    // exists for.
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    let mut sunk = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        sunk.push(line);
+    }
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"ready""#)),
+        "the reader must sink a line it parses as a sitrep event; got {sunk:?}"
+    );
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"hello""#)),
+        "every line, not just the last; got {sunk:?}"
+    );
+
+    chain_task.abort();
+}
+
+/// The arm this design exists for: a `fatal` frame is consumed by the sitrep
+/// parser and never reaches a relay, so only a sink placed BEFORE the parse can
+/// see it.
+#[skuld::test]
+async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "fatal")
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::Fatal { .. })),
+        "expected StartError::Fatal, got {outcome:?}"
+    );
+
+    let mut sunk = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        sunk.push(line);
+    }
+    assert!(
+        sunk.iter().any(|l| l.contains("injected fatal")),
+        "a frame the parser consumed must still reach the sink; got {sunk:?}"
+    );
+
+    let _ = chain_task.await;
+}
+
 fn main() {
     skuld::run_all();
 }
