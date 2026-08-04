@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 // `Context` alone would collide with `anyhow::Context` (the `.context()` combinator, used
 // throughout this file); the tap's poll methods spell out `std::task::Context` instead.
@@ -17,6 +17,12 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) mod keepalive;
+#[cfg(test)]
+mod keepalive_tests;
+
+use keepalive::Cadence;
 
 /// Maximum buffered outbound datagrams per UDP association before new ones are
 /// dropped. Bounded (not unbounded) so a stalled association — e.g. yamux
@@ -35,6 +41,9 @@ pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum StreamTag {
     Tcp = 0x01,
     Udp = 0x02,
+    /// Client-opened liveness probe: the client writes `KEEPALIVE_NONCE_LEN`
+    /// bytes and the server echoes them back and closes.
+    Keepalive = 0x03,
 }
 
 impl StreamTag {
@@ -46,10 +55,14 @@ impl StreamTag {
         match b {
             0x01 => Some(Self::Tcp),
             0x02 => Some(Self::Udp),
+            0x03 => Some(Self::Keepalive),
             _ => None,
         }
     }
 }
+
+/// Payload size of one keepalive probe: a big-endian `u64` nonce.
+pub(crate) const KEEPALIVE_NONCE_LEN: usize = 8;
 
 /// Frame a UDP datagram with a 2-byte big-endian length prefix.
 pub fn frame_udp_datagram(payload: &[u8]) -> Vec<u8> {
@@ -287,23 +300,27 @@ async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Resul
 
 // Liveness tap ========================================================================================================
 
-/// Wraps the yamux transport and sets `productive` on the first inbound byte.
+/// Wraps the yamux transport and counts inbound reads — this crate's single
+/// transport-liveness signal.
 ///
-/// `run_client` gives this to `yamux::Connection::new`, so the tap is polled only
-/// by the driver task; reading `productive` after `driver.await` therefore has a
-/// happens-before edge to every write here (no cross-task race). It sits *below*
-/// yamux framing, so any inbound frame counts — relayed data or flow-control /
-/// keepalive frames alike. That is deliberate: it measures *transport*-level
-/// liveness (the far yamux peer responded), which is the correct signal for a
-/// transport reconnect, not end-to-end application relay.
+/// `SessionTransport::spawn` gives this to `yamux::Connection::new`, so the tap
+/// is written only by the driver task. It sits *below* yamux framing, so any
+/// inbound frame counts — relayed data, a flow-control window update, a yamux
+/// pong, or a peer's stream reset alike. That is deliberate: it measures
+/// *transport*-level liveness (the far yamux peer responded), which is the right
+/// signal both for the reconnect backoff and for the keepalive's verdict, neither
+/// of which is about application relay.
+///
+/// `Relaxed` is sufficient: two samples of a monotonic counter are compared for
+/// inequality and no other memory is published through it.
 pub(crate) struct TransportLivenessTap<T> {
     inner: T,
-    productive: Arc<AtomicBool>,
+    inbound_reads: Arc<AtomicU64>,
 }
 
 impl<T> TransportLivenessTap<T> {
-    pub(crate) fn new(inner: T, productive: Arc<AtomicBool>) -> Self {
-        Self { inner, productive }
+    pub(crate) fn new(inner: T, inbound_reads: Arc<AtomicU64>) -> Self {
+        Self { inner, inbound_reads }
     }
 }
 
@@ -317,7 +334,7 @@ impl<T: futures::AsyncRead + Unpin> futures::AsyncRead for TransportLivenessTap<
         let r = Pin::new(&mut me.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(n)) = &r {
             if *n > 0 {
-                me.productive.store(true, Ordering::Relaxed);
+                me.inbound_reads.fetch_add(1, Ordering::Relaxed);
             }
         }
         r
@@ -629,24 +646,87 @@ pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinE
 }
 
 /// Why a single yamux client session ended, deciding what `run_client` does next.
-enum SessionOutcome {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionOutcome {
     /// Shutdown requested — stop for good.
     Shutdown,
     /// The transport (yamux) connection died — reconnect.
     TransportDied,
 }
 
+/// Everything one yamux connection owns, re-created on every reconnect. The
+/// local listeners and the shutdown token outlive it, so they stay separate.
+pub(crate) struct SessionTransport {
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    /// Server-initiated substreams. The client expects none: the channel closing
+    /// is how the driver reports that the connection ended.
+    inbound_rx: mpsc::Receiver<yamux::Stream>,
+    /// Inbound reads counted below yamux framing.
+    inbound_reads: Arc<AtomicU64>,
+}
+
+impl SessionTransport {
+    /// Wrap `tcp` in a tapped yamux client connection and spawn its driver.
+    ///
+    /// The tap is owned by the driver (inside the `Connection`), so reading the
+    /// counter after the driver is joined is race-free.
+    pub(crate) fn spawn(tcp: TcpStream, config: &yamux::Config) -> (Self, tokio::task::JoinHandle<()>) {
+        let inbound_reads = Arc::new(AtomicU64::new(0));
+        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&inbound_reads));
+        let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
+
+        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+
+        (
+            Self {
+                open_tx,
+                inbound_rx,
+                inbound_reads,
+            },
+            driver,
+        )
+    }
+
+    /// Whether the far peer sent anything at all during this session — the
+    /// reconnect backoff's reset condition.
+    pub(crate) fn was_productive(&self) -> bool {
+        self.inbound_reads.load(Ordering::Relaxed) > 0
+    }
+
+    /// The client-side liveness loop for *this* connection.
+    ///
+    /// Both halves come from `self`, so a caller cannot hand the keepalive a
+    /// counter other than the one this session's tap feeds — which would declare
+    /// a perfectly healthy tunnel dead every cycle.
+    pub(crate) fn keepalive(&self, cadence: Cadence) -> impl std::future::Future<Output = ()> {
+        keepalive::run_keepalive(self.open_tx.clone(), Arc::clone(&self.inbound_reads), cadence)
+    }
+}
+
 /// Serve one yamux connection until it ends. The local TCP+UDP listeners are
-/// owned by `run_client` and persist across reconnects; only the yamux connection
-/// (its `open_tx` / `inbound_rx`) is per-session.
-async fn run_client_session(
+/// owned by `run_client` and persist across reconnects; only the `session` is
+/// per-connection.
+pub(crate) async fn run_client_session(
     tcp_listener: &TcpListener,
     udp_socket: &Arc<UdpSocket>,
-    open_tx: &mpsc::Sender<OpenStreamReply>,
-    inbound_rx: &mut mpsc::Receiver<yamux::Stream>,
+    session: &mut SessionTransport,
     udp_timeout: Duration,
+    cadence: Cadence,
     shutdown: &CancellationToken,
 ) -> SessionOutcome {
+    // Pinned outside the loop so the cadence survives every other select arm
+    // firing, and so an in-flight probe is not restarted by unrelated traffic.
+    let keepalive = session.keepalive(cadence);
+    tokio::pin!(keepalive);
+
+    let SessionTransport {
+        open_tx,
+        inbound_rx,
+        inbound_reads: _,
+    } = session;
+
     let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
     let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
     let mut next_gen: u64 = 0;
@@ -655,6 +735,9 @@ async fn run_client_session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return SessionOutcome::Shutdown,
+            // A transport that has gone silent: black-holed with no RST or FIN,
+            // so no other arm here would ever notice.
+            () = &mut keepalive => return SessionOutcome::TransportDied,
             // Transport death: the driver dropped its inbound sender. A `Some` is a
             // protocol violation (the server never opens streams to the client);
             // untrusted remote input — log and drop, never panic.
@@ -791,34 +874,24 @@ pub(crate) async fn run_client(
 
         tracing::info!(remote = %remote, "connected to yamux server");
 
-        // Tap the transport for inbound liveness. The tap is owned by the driver
-        // (inside the Connection), so reading `productive` after `driver.await`
-        // is race-free.
-        let productive = Arc::new(AtomicBool::new(false));
-        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&productive));
-        let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
-
-        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
-        // The client never expects server-initiated streams; this channel is the
-        // transport-death signal — the driver drops `inbound_tx` when the yamux
-        // connection ends, so `inbound_rx.recv()` yields `None`.
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(32);
-
-        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+        let (mut session, driver) = SessionTransport::spawn(tcp, &config);
 
         let outcome = run_client_session(
             &tcp_listener,
             &udp_socket,
-            &open_tx,
-            &mut inbound_rx,
+            &mut session,
             udp_timeout,
+            Cadence::default(),
             &shutdown,
         )
         .await;
 
-        // Tear down the driver deterministically. On `TransportDied` it already
-        // finished (abort is a no-op); otherwise abort ends it instead of hanging
-        // until the chain drain-timeout (`drive_connection` has no shutdown hook).
+        // Tear down the driver deterministically. When the driver itself observed
+        // the death it has already returned and the abort is a no-op; when the
+        // keepalive declared it, or on shutdown, the driver is still live and the
+        // abort is what ends it — truncating any in-flight relay, per the teardown
+        // tradeoff — instead of hanging until the chain drain-timeout
+        // (`drive_connection` has no shutdown hook).
         // A driver panic is a code bug, not a transport event — exit rather than reconnect.
         driver.abort();
         if driver_panicked(driver.await) {
@@ -828,7 +901,7 @@ pub(crate) async fn run_client(
         match outcome {
             SessionOutcome::Shutdown => return Ok(()),
             SessionOutcome::TransportDied => {
-                let was_productive = productive.load(Ordering::Relaxed);
+                let was_productive = session.was_productive();
                 failures = next_failures(failures, was_productive);
                 tracing::warn!(
                     failures,
@@ -1052,9 +1125,24 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
         StreamTag::Udp => {
             relay_udp_server(stream, remote).await?;
         }
+        StreamTag::Keepalive => echo_keepalive(stream).await?,
     }
 
     Ok(())
+}
+
+/// Echo one keepalive nonce back to the client, then close the substream.
+///
+/// Exactly `KEEPALIVE_NONCE_LEN` bytes are read and written — never an open-ended
+/// echo, so a probe substream cannot be used to make the server relay arbitrary
+/// traffic. The client opens a fresh substream per probe, so one round is the
+/// whole exchange.
+async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
+    let mut nonce = [0u8; KEEPALIVE_NONCE_LEN];
+    stream.read_exact(&mut nonce).await.context("read keepalive nonce")?;
+    stream.write_all(&nonce).await.context("write keepalive echo")?;
+    stream.flush().await.context("flush keepalive echo")?;
+    stream.close().await.context("close keepalive substream")
 }
 
 // Plugin ==============================================================================================================

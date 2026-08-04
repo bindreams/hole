@@ -53,8 +53,11 @@ before editing; the sections linked below are the authoritative source.
   transport reset instead of wedging; death is detected via the driver's
   inbound channel closing, and reconnect backoff is floored and resets on
   transport-level liveness (any inbound yamux frame). `driver.abort()`
-  teardown deliberately truncates in-flight relays; a silent (no-RST)
-  black-hole is out of scope (→ #660). →
+  teardown deliberately truncates in-flight relays. A silent (no-RST) black
+  hole is caught by an idle-gated client keepalive on a `Keepalive` substream:
+  a cycle is fatal only when the transport tap counted no inbound read across a
+  whole interval and deadline, so an un-upgraded peer's tag rejection reads as
+  liveness and a busy tunnel is never probed at all. →
   [CONTRIBUTING.md#yamux-transport-self-heal](CONTRIBUTING.md#yamux-transport-self-heal)
 - **Fail-closed covers.** The **standing lockdown** cover
   (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
