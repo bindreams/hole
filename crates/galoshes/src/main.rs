@@ -81,8 +81,11 @@ async fn main() -> anyhow::Result<()> {
     // at startup. ex-ray ignores unrecognized keys (it only reads keys it knows).
     let udp_timeout = galoshes::yamux::parse_udp_timeout(env.plugin_options.as_deref())?;
     let yamux_plugin = galoshes::yamux::YamuxPlugin::new(mode == Mode::Server, udp_timeout);
+    // The embedded ex-ray gets its own options; the yamux hop keeps the caller's,
+    // since `mux` means nothing to it.
+    let ex_ray_options = galoshes::exray_options::ex_ray_options(env.plugin_options.as_deref())?;
     let ex_ray_plugin =
-        BinaryPlugin::new(verified.exec_path(), env.plugin_options.as_deref()).readiness(ReadinessMode::ExpectSitrep);
+        BinaryPlugin::new(verified.exec_path(), Some(&ex_ray_options)).readiness(ReadinessMode::ExpectSitrep);
 
     // Bridge-facing readiness: galoshes' OWN ChainRunner aggregates the
     // per-plugin readiness of [yamux, ex-ray] and fires this channel with

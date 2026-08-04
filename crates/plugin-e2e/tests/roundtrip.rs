@@ -49,6 +49,71 @@ mod launcher_smoke {
     }
 }
 
+/// A malformed options string must stop galoshes at startup with a diagnosable
+/// message. ex-ray would not: it discards every option and reports `ready` on
+/// the flag-default port, so galoshes is the last place the operator can be
+/// told. The bridge relays this stderr into its own log.
+mod malformed_options {
+    use plugin_e2e::locators::locate_built_galoshes;
+    use plugin_e2e::util::{require_binary, rt};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::process::Command;
+    use util::port_alloc::{self, Protocols};
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// Class-2 subprocess failure bound, matching `spawn_ss_with_plugin`'s. If the
+    /// guard regresses galoshes binds and runs forever; this names that instead of
+    /// hanging the suite with no captured output.
+    const EXIT_BUDGET: Duration = Duration::from_secs(60);
+
+    /// A port that was free a moment ago. The refused path never binds — the guard
+    /// runs before the chain starts — so this only has to be plausible; it exists
+    /// so an occupied port cannot masquerade as the guard firing.
+    async fn free_tcp_port() -> u16 {
+        let (port, _listener) = port_alloc::bind_ephemeral(LOOPBACK, Protocols::TCP, |p| async move {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, p)).await
+        })
+        .await
+        .expect("allocate a loopback tcp port");
+        port
+    }
+
+    #[skuld::test]
+    fn a_dangling_escape_stops_galoshes_with_a_named_reason() {
+        let g = locate_built_galoshes();
+        require_binary(&g, "run `cargo xtask ex-ray && cargo xtask galoshes`");
+        rt().block_on(async {
+            let (local, remote) = (free_tcp_port().await, free_tcp_port().await);
+            let child = Command::new(&g)
+                .env("SS_LOCAL_HOST", "127.0.0.1")
+                .env("SS_LOCAL_PORT", local.to_string())
+                .env("SS_REMOTE_HOST", "127.0.0.1")
+                .env("SS_REMOTE_PORT", remote.to_string())
+                .env("SS_PLUGIN_OPTIONS", "host=cloudfront.com;path=/a\\")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("galoshes must be spawnable");
+
+            let out = tokio::time::timeout(EXIT_BUDGET, child.wait_with_output())
+                .await
+                .expect("galoshes did not exit within the budget — the malformed-options guard did not fire")
+                .expect("galoshes output");
+
+            assert!(!out.status.success(), "galoshes must refuse to start: {:?}", out.status);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("embedded ex-ray") && stderr.contains("unpaired backslash"),
+                "stderr must name the malformed options as the reason, got: {stderr}"
+            );
+        });
+    }
+}
+
 mod roundtrips {
     use plugin_e2e::locators::locate_built_galoshes;
     use plugin_e2e::roundtrip::{run_roundtrip, NotReachableKind, Roundtrip, RoundtripConfig};
@@ -58,6 +123,7 @@ mod roundtrips {
         WS_SERVER_OPTS,
     };
     use plugin_e2e::util::{require_binary, rt};
+    use std::time::Duration;
 
     // WS-TLS + QUIC present a self-signed cert; v2ray-core's getCertPool drops
     // custom certs on Windows, so those two transports are gated off Windows (see
@@ -133,6 +199,15 @@ mod roundtrips {
             let (svr, _h) =
                 start_real_ss_server_with_plugin_ws_opts(TEST_METHOD, TEST_PASSWORD, &g, &server_opts).await;
             let (sentinel, _s) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+            // The teardown here is slower than the default read budget: the server
+            // stops reading without closing, and the close only follows once the
+            // keepalive errors the poisoned pipe — see
+            // CONTRIBUTING.md#galoshes-mux-default. Outlive that bound so the
+            // assertion observes the teardown instead of racing it.
+            let config = RoundtripConfig {
+                read_timeout: Duration::from_secs(90),
+                ..RoundtripConfig::default()
+            };
             let outcome = run_roundtrip(
                 &g,
                 Some(WS_CLIENT_OPTS),
@@ -141,17 +216,18 @@ mod roundtrips {
                 TEST_METHOD,
                 TEST_PASSWORD,
                 sentinel,
-                &RoundtripConfig::default(),
+                &config,
             )
             .await;
-            // Torn down via common/mux/server.go:204-208, not a hang (ReadTimeout)
-            // or a broken harness (ChainFailed) — hence PeerClosed specifically.
+            // ReadTimeout is excluded on purpose: it is the driver's transient
+            // signal, so accepting it would let a slow-but-working tunnel stand in
+            // for the break this test exists to prove.
             let Roundtrip::NotReachable { kind, detail } = &outcome else {
-                panic!("a mux=0 client must NOT reach a mux=1 server, and must fail by peer close: {outcome:?}");
+                panic!("a mux=0 client must NOT reach a mux=1 server: {outcome:?}");
             };
             assert!(
                 matches!(kind, NotReachableKind::PeerClosed),
-                "mux mismatch must tear the connection down, not hang or misreply, got {kind:?}: {detail}"
+                "mux mismatch must tear the connection down, got {kind:?}: {detail}"
             );
         });
     }

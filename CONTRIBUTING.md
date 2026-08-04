@@ -316,6 +316,14 @@ enabled), so **a `mux=0` client cannot talk to a `mux=1` server**. Both ends
 must run a galoshes that agrees; during a version-skew window, pinning `mux=1`
 in the plugin options on both ends restores the old wire format.
 
+A skewed pair **stalls before it breaks**: the `mux=1` server's worker cannot
+unmarshal the client's first frame, so it poisons its inbound pipe and stops
+reading — but nothing is reset, because no further byte is due. The
+[yamux keepalive](#yamux-transport-self-heal) is what converts the stall into a
+teardown: its next probe hits the poisoned pipe, the server closes, and the
+client sees the transport die. Skew therefore surfaces as a connection that
+lasts one keepalive interval, not as an immediate refusal.
+
 The append goes through `garter::{split_plugin_options, join_plugin_options}`
 so the escaping cannot drift from the parser's: a naive strip-then-append turns
 `path=/a\;` into `path=/a\;mux=0`, which ex-ray reads as one pair with no `mux`
