@@ -8,6 +8,7 @@ import (
 
 	core "github.com/v2fly/v2ray-core/v5"
 	"github.com/v2fly/v2ray-core/v5/app/proxyman"
+	"github.com/v2fly/v2ray-core/v5/proxy/dokodemo"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
@@ -517,5 +518,94 @@ func TestGenerateConfigRejectsOutOfRangeKeepAlive(t *testing.T) {
 		if !strings.Contains(err.Error(), "tcp-keepalive") {
 			t.Errorf("server=%v: error %q does not mention tcp-keepalive", srv, err.Error())
 		}
+	}
+}
+
+// The declared default is what makes galoshes' appended mux=0 necessary at all.
+func TestMuxFlagDefault(t *testing.T) {
+	if *mux != 1 {
+		t.Errorf("mux flag default = %d, want 1", *mux)
+	}
+}
+
+// Inputs mirror what galoshes hands its embedded ex-ray; expectations come from
+// the grammar in args.go (first-wins, escapes), not from running galoshes.
+func TestParseOptsIntoFlagsMux(t *testing.T) {
+	cases := []struct {
+		desc string
+		opts string
+		want int
+	}{
+		{"appended alone", "mux=0", 0},
+		{"appended after directives", "host=cloudfront.com;path=/;mux=0", 0},
+		{"appended after an escaped semicolon", `path=/a\;;mux=0`, 0},
+		{"operator override wins (first-wins)", "mux=8;path=/;mux=0", 8},
+		{"no mux key keeps the flag default", "host=cloudfront.com;path=/", 1},
+		// The shapes galoshes' ex_ray_options refuses to emit. Each leaves mux at
+		// 1 -- Mux.Cool silently ON -- which is precisely why it refuses.
+		{"one trailing backslash is a dangling escape", `a=b\;mux=0`, 1},
+		{"two are a literal backslash, so the separator holds", `a=b\\;mux=0`, 0},
+		{"three are a literal backslash plus a dangling escape", `a=b\\\;mux=0`, 1},
+		{"an empty segment voids the whole string", "mode=websocket;;mux=0", 1},
+		{"an empty key voids the whole string", "host=h;=v;mux=0", 1},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			orig := *mux
+			defer func() { *mux = orig }()
+			*mux = 1
+			withEnv(t, c.opts)
+			parseOptsIntoFlags()
+			if *mux != c.want {
+				t.Errorf("%s: *mux = %d, want %d", c.desc, *mux, c.want)
+			}
+		})
+	}
+}
+
+// mux=0 must disable Mux.Cool on BOTH ends of a websocket chain: the client
+// stops attaching MultiplexSettings, and the server stops pointing dokodemo at
+// the v1.mux.cool sentinel. The server half is why a mux=0 client cannot talk
+// to a mux=1 server.
+func TestGenerateConfigMuxDisablesMultiplexing(t *testing.T) {
+	cases := []struct {
+		desc          string
+		mux           int
+		wantMultiplex bool
+		wantSrvAddr   string
+	}{
+		{"mux=1 keeps Mux.Cool", 1, true, "v1.mux.cool"},
+		{"mux=0 disables Mux.Cool", 0, false, "127.0.0.1"},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			restore := withFlags(t, c.mux, 0, false)
+			clientCfg, err := generateConfig()
+			restore()
+			if err != nil {
+				t.Fatalf("client generateConfig(): %v", err)
+			}
+			sender := new(proxyman.SenderConfig)
+			if err := clientCfg.Outbound[0].SenderSettings.UnmarshalTo(sender); err != nil {
+				t.Fatalf("unmarshal sender settings: %v", err)
+			}
+			if got := sender.MultiplexSettings != nil; got != c.wantMultiplex {
+				t.Errorf("client: MultiplexSettings present = %v, want %v", got, c.wantMultiplex)
+			}
+
+			restore = withFlags(t, c.mux, 0, true)
+			serverCfg, err := generateConfig()
+			restore()
+			if err != nil {
+				t.Fatalf("server generateConfig(): %v", err)
+			}
+			dk := new(dokodemo.Config)
+			if err := serverCfg.Inbound[0].ProxySettings.UnmarshalTo(dk); err != nil {
+				t.Fatalf("unmarshal dokodemo settings: %v", err)
+			}
+			if got := dk.Address.AsAddress().String(); got != c.wantSrvAddr {
+				t.Errorf("server: dokodemo address = %q, want %q", got, c.wantSrvAddr)
+			}
+		})
 	}
 }

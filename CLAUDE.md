@@ -59,6 +59,12 @@ before editing; the sections linked below are the authoritative source.
   whole interval and deadline, so an un-upgraded peer's tag rejection reads as
   liveness and a busy tunnel is never probed at all. →
   [CONTRIBUTING.md#yamux-transport-self-heal](CONTRIBUTING.md#yamux-transport-self-heal)
+- **galoshes mux default.** galoshes appends `mux=0` for its embedded ex-ray —
+  its yamux already collapsed every stream onto one connection, so Mux.Cool is
+  pure overhead. ex-ray is first-wins on duplicate SIP003 keys, so an operator's
+  earlier `mux=` overrides it. `mux` also picks the server's dokodemo
+  destination, so a `mux=0` client cannot reach a `mux=1` server. →
+  [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
 - **Fail-closed covers.** The **standing lockdown** cover
   (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
   the bridge **disarms-not-drops** it across the restart and the new bridge
