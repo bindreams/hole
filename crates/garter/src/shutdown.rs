@@ -31,19 +31,8 @@ async fn wait_for_signal() {
 
 /// Gracefully stop a child process.
 /// Sends a termination signal, waits up to `timeout`, then force-kills.
-///
-/// Falls back to a force-kill immediately if the signal can't even be SENT
-/// (e.g. Windows `GenerateConsoleCtrlEvent` needs a console, which an
-/// SCM-hosted service has none of) — a caller that unconditionally drains
-/// its child's log readers after this returns depends on the child actually
-/// being gone (its pipes closed) on every path, not only the ones where the
-/// graceful signal was delivered.
 pub async fn graceful_stop(child: &mut Child, timeout: Duration) -> crate::Result<()> {
-    if let Err(e) = send_term_signal(child) {
-        tracing::warn!(%e, "termination signal could not be sent, force-killing");
-        child.kill().await?;
-        return Ok(());
-    }
+    send_term_signal(child)?;
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(_status)) => Ok(()),
         Ok(Err(e)) => Err(e.into()),

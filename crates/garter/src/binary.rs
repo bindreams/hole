@@ -324,13 +324,11 @@ impl ChainPlugin for BinaryPlugin {
         tokio::select! {
             status = gc.child.wait() => {
                 let status = status?;
-                // The child exited on its own, so its pipes are closed —
-                // this join is bounded by that exit, not an arbitrary
-                // timeout: `GroupedChild`'s kill-group guarantees no
-                // orphaned grandchild can hold the host's pipe handles open
-                // (see the struct's own doc), so the reader tasks reach EOF
-                // right behind it.
-                let _ = tokio::join!(stdout_task, stderr_task);
+                // Drain remaining log lines (tasks will EOF when child's pipes close)
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    async { let _ = tokio::join!(stdout_task, stderr_task); }
+                ).await;
                 if status.success() {
                     Ok(())
                 } else {
@@ -349,16 +347,12 @@ impl ChainPlugin for BinaryPlugin {
                 tracing::info!(plugin = %self.name, "shutting down");
                 // Force path force-kills the direct child; `gc` dropping at the
                 // end of `run` (or on task abort) reaps the whole tree.
-                let stop_result = shutdown::graceful_stop(&mut gc.child, drain_timeout).await;
-                // Drain regardless of `stop_result`: `graceful_stop` always
-                // attempts a kill on every path (including when the graceful
-                // signal itself could not be sent — see its doc), so the
-                // child is gone and its pipes are closed by the time we get
-                // here either way. A caller that awaits `run()` to decide
-                // when it's safe to read this plugin's collected output
-                // depends on that being true unconditionally.
-                let _ = tokio::join!(stdout_task, stderr_task);
-                stop_result?;
+                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
+                // Drain remaining log lines (tasks will EOF when child's pipes close)
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    async { let _ = tokio::join!(stdout_task, stderr_task); }
+                ).await;
                 Ok(())
             }
         }

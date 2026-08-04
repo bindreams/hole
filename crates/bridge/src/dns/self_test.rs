@@ -89,12 +89,10 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 /// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
 /// so that a whole attempt (one walk of N resolvers) still fits inside what is
 /// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
-/// early rather than overrun. Nothing wraps the call in a `timeout`, so every
-/// upstream failure is classified and logged before the gate gives up. Also writes
-/// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
-/// log line at `info!`. On failure, additionally emits a `warn!`
-/// correlation breadcrumb pointing the reader to the plugin tap
-/// (depending on whether it was enabled this run — see
+/// early rather than overrun. Also writes the canonical `"forwarder self-test
+/// ok"` / `"forwarder self-test failed"` log line at `info!`. On failure,
+/// additionally emits a `warn!` correlation breadcrumb pointing the reader to
+/// the plugin tap (depending on whether it was enabled this run — see
 /// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
 ///
 /// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
@@ -273,10 +271,6 @@ pub(crate) async fn run_forwarder_self_test(
                 bytes_from_upstream = moved.read,
                 "forwarder self-test failed"
             );
-            // Correlation breadcrumb: tells the reader either
-            // where the tap data lives, or how to enable it for next
-            // reproduction. The actual error surfaces through the
-            // start error → IPC response → GUI; no error! log needed.
             if diagnostic_tap_enabled {
                 warn!("{TAP_ENABLED_HINT}");
             } else {

@@ -376,33 +376,24 @@ async fn spawn_plugin_runner_at(
             // fresh port. The errno is preserved for `bridge.log`.
             Ok(Ok(Err(garter::StartError::BindConflict { errno, addr }))) => {
                 cancel.cancel();
-                // Await, not abort: the runner observes the cancel
-                // cooperatively and drains its log readers (bounded by its
-                // own graceful-stop + drain timeouts) before returning, so
-                // the ring warn_recent reads below is complete. Aborting here
-                // would race that drain and could read a ring missing the
-                // child's last lines.
-                let _ = handle.await;
+                handle.abort();
                 return Err(ProxyError::BindRace { errno, addr });
             }
             // Terminal start failure (config error, upstream-dial failure,
             // bare process exit) — never retried.
             Ok(Ok(Err(garter::StartError::Fatal { detail, .. }))) => {
                 cancel.cancel();
-                // Await, not abort — see the BindConflict arm above.
-                let _ = handle.await;
+                handle.abort();
                 return Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")));
             }
             Ok(Err(_)) => {
                 cancel.cancel();
-                // Await, not abort — see the BindConflict arm above.
-                let _ = handle.await;
+                handle.abort();
                 return Err(ProxyError::Plugin("plugin exited before becoming ready".into()));
             }
             Err(_) => {
                 cancel.cancel();
-                // Await, not abort — see the BindConflict arm above.
-                let _ = handle.await;
+                handle.abort();
                 return Err(ProxyError::Plugin("plugin did not become ready within 30s".into()));
             }
         },

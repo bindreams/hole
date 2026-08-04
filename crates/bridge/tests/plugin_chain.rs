@@ -184,11 +184,12 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
     );
 }
 
-/// Regression: `warn_recent` reading the ring must not race the detached
-/// stderr reader task. A real Go plugin crashing under `GOTRACEBACK=crash`
-/// writes exactly there, not to stdout — `spawn_plugin_runner_at` awaits the
-/// runner (which drains its readers) instead of aborting it, so this line is
-/// reliably in the ring by the time the failure is reported, not a race.
+/// A crash on STDERR (not stdout — the common shape for a Go panic under
+/// `GOTRACEBACK=crash`) must reach `warn_recent`'s ring too, not just a
+/// stdout crash. The child exits on its own here, so garter's `stdout_task`/
+/// `stderr_task` are draining a pipe that's already closed by the time
+/// `spawn_plugin_runner_at` reads the ring — see `plugin_log`'s module doc
+/// for why this is best-effort rather than a hard guarantee in general.
 #[skuld::test]
 async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};
