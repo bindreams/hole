@@ -142,9 +142,10 @@ pub(crate) async fn run_forwarder_self_test(
     let mut outcome = None;
 
     for attempt in 1..=ATTEMPTS {
-        // Cooperative cancel check between retry attempts (#397).
+        // Cooperative cancel check between retry attempts.
         if cancel.is_cancelled() {
-            return SelfTestOutcome::Cancelled;
+            outcome = Some(SelfTestOutcome::Cancelled);
+            break;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -171,7 +172,10 @@ pub(crate) async fn run_forwarder_self_test(
         // closes on Drop.
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
+            _ = cancel.cancelled() => {
+                outcome = Some(SelfTestOutcome::Cancelled);
+                break;
+            }
             r = forwarder.try_forward(&query, per_upstream) => r,
         };
         completed = attempt;
@@ -193,7 +197,7 @@ pub(crate) async fn run_forwarder_self_test(
                 });
             }
             Err(failure) => {
-                last_err = Some(match failure {
+                let msg = match failure {
                     ForwardFailure::NoUpstream => "no configured DNS resolver could be used".to_string(),
                     ForwardFailure::MalformedQuery => {
                         unreachable!("the self-test's own query is always at least a DNS header")
@@ -202,7 +206,16 @@ pub(crate) async fn run_forwarder_self_test(
                         dialled = true;
                         describe_upstream_failure(cause)
                     }
-                });
+                };
+                // Once a resolver has answered (even a rejected reply), that
+                // is the more informative, positive fact. A later attempt's
+                // unrelated failure must not clobber it — `classify_failure`
+                // forwards `last_err` verbatim whenever `answered` is set, so
+                // letting it drift to "no resolver answered" here would
+                // contradict the very reply already observed.
+                if !answered {
+                    last_err = Some(msg);
+                }
             }
         }
     }
@@ -241,7 +254,7 @@ pub(crate) async fn run_forwarder_self_test(
                 bytes_from_upstream = moved.read,
                 "forwarder self-test failed"
             );
-            // #388 correlation breadcrumb: tells the reader either
+            // Correlation breadcrumb: tells the reader either
             // where the tap data lives, or how to enable it for next
             // reproduction. The actual error surfaces through the
             // start error → IPC response → GUI; no error! log needed.
@@ -303,15 +316,21 @@ pub(crate) fn describe_upstream_failure(cause: crate::dns::forwarder::UpstreamCa
     }
 }
 
-/// Does this reason implicate the plugin transport enough to ask it to
-/// account for itself? `NoConnection`/`TunnelSilent` are the two readings
-/// about the tunnel not carrying or returning data. `Other` also covers a
-/// transport proven HEALTHY (a reply arrived and was rejected — SERVFAIL, or
-/// too short) or never exercised (nothing dialled) — quoting the plugin's
-/// "own account of why its transport failed" there would blame it for a
-/// failure that is not its own.
-pub(crate) fn implicates_plugin_transport(reason: &SelfTestReason) -> bool {
-    matches!(reason, SelfTestReason::NoConnection | SelfTestReason::TunnelSilent)
+/// Does this FINAL error implicate the plugin transport enough to ask it to
+/// account for itself? Takes the `ProxyError` `self_test_error_for` actually
+/// returned, not the pre-verdict `SelfTestReason` — the probe's verdict can
+/// replace `TunnelSilent`/`NoTunnelConnection` entirely (`NetworkBlocked`, or
+/// a rewritten `ForwarderSelfTestFailed`), and quoting the plugin's "own
+/// account of why its transport failed" next to a failure the code has
+/// already attributed to the network path, not the plugin, would
+/// misattribute it. Checking the same enum `self_test_error_for` returns —
+/// rather than re-deriving its precedence here — is what keeps the two in
+/// sync.
+pub(crate) fn implicates_plugin_transport(err: &ProxyError) -> bool {
+    matches!(
+        err,
+        ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSilent { .. }
+    )
 }
 
 /// Emit the plugin chain's kept output for a failed gate, or say there is no
@@ -335,10 +354,25 @@ pub(crate) fn report_plugin_output(log: Option<&crate::proxy::plugin_log::Plugin
 /// disproves `NoConnection` (the local SOCKS5 listener did accept something)
 /// without being strong enough to support `TunnelSilent` (it says nothing
 /// about the plugin), so it falls through to `Other`.
+///
+/// `last_err` is trustworthy verbatim only in the `answered` case — the
+/// `Ok(reply)` arm sets it in the same step it latches `answered`, and the
+/// loop pins it there so a later attempt's failure can't overwrite it (see
+/// `run_forwarder_self_test`). `moved.read` has no such message attached to
+/// it: it can be positive from an attempt whose own completion never
+/// reached `is_dns_reply_ok` (a peer that replies partially then resets),
+/// so `last_err` there could still be a DIFFERENT, later "no resolver
+/// answered" message — reporting it verbatim would contradict the very
+/// byte counts logged beside it, so a neutral phrase is used instead.
 pub(crate) fn classify_failure(observed: Observed, last_err: String) -> SelfTestReason {
-    // Anything back at all disproves silence; nothing dialled proves nothing.
-    if observed.answered || observed.moved.read > 0 || !observed.dialled {
+    if !observed.dialled {
         return SelfTestReason::Other(last_err);
+    }
+    if observed.answered {
+        return SelfTestReason::Other(last_err);
+    }
+    if observed.moved.read > 0 {
+        return SelfTestReason::Other("a resolver responded, but the exchange failed".to_string());
     }
     if observed.moved.connects > 0 {
         SelfTestReason::TunnelSilent

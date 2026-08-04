@@ -106,6 +106,107 @@ fn classify_failure_covers_every_branch() {
     assert!(matches!(case(false, false, no_connection), SelfTestReason::Other(_)));
 }
 
+/// Regression: a peer that replies partially then resets (e.g. `Io`) counts
+/// `read > 0` without ever setting `answered` (its own attempt never reached
+/// `is_dns_reply_ok`). `last_err` in that case may describe a DIFFERENT,
+/// later failure ("no resolver answered") — reporting it verbatim would
+/// contradict the very byte counts logged beside it, so the message must be
+/// the neutral, always-true phrase instead of the passed-in `last_err`.
+#[skuld::test]
+fn read_without_answered_overrides_a_stale_no_resolver_answered_message() {
+    let moved = UpstreamActivity {
+        read: 47,
+        written: 12,
+        connects: 1,
+        associates: 0,
+    };
+    let reason = classify_failure(
+        Observed {
+            answered: false,
+            dialled: true,
+            moved,
+        },
+        "no resolver answered through the tunnel (io)".to_string(),
+    );
+    match reason {
+        SelfTestReason::Other(s) => assert!(
+            !s.contains("no resolver answered"),
+            "47 bytes came back; the message must not claim silence, got: {s}"
+        ),
+        other => panic!("expected Other, got {other:?}"),
+    }
+}
+
+/// A connector that answers exactly once through a real stub, then refuses —
+/// models a resolver that replies SERVFAIL and then goes dark on later
+/// self-test attempts.
+struct AnswersOnceThenRefuses {
+    inner: SArc<dyn crate::dns::connector::UpstreamConnector>,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl crate::dns::connector::UpstreamConnector for AnswersOnceThenRefuses {
+    async fn connect_tcp(
+        &self,
+        target: std::net::SocketAddr,
+    ) -> std::io::Result<crate::dns::connector::ConnectedStream> {
+        self.inner.connect_tcp(target).await
+    }
+
+    async fn connect_udp(
+        &self,
+        target: std::net::SocketAddr,
+    ) -> std::io::Result<Box<dyn crate::dns::connector::UpstreamUdp>> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.inner.connect_udp(target).await
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refuses every attempt after the first",
+            ))
+        }
+    }
+}
+
+/// Regression: attempt 1 gets a real SERVFAIL reply (latching `answered`
+/// with an informative message); attempts 2 and 3 can't even connect. The
+/// informative message must survive — a later, unrelated attempt's failure
+/// must not overwrite it with a "no resolver answered" claim that
+/// contradicts the reply already observed.
+#[skuld::test]
+fn an_earlier_servfail_answer_is_not_clobbered_by_a_later_failed_attempt() {
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (addr, _stub) = servfail_udp_stub().await;
+            let cfg = DnsConfig {
+                servers: vec![addr.ip()],
+                protocol: DnsProtocol::PlainUdp,
+                ..test_dns_cfg()
+            };
+            let connector = SArc::new(AnswersOnceThenRefuses {
+                inner: SArc::new(crate::dns::connector::DirectConnector),
+                calls: std::sync::atomic::AtomicU32::new(0),
+            });
+            let forwarder = SArc::new(DnsForwarder::new_with_ports(cfg, connector, true, vec![addr.port()]));
+            run_forwarder_self_test(forwarder, vec![addr.ip()], false, CancellationToken::new()).await
+        });
+
+    let SelfTestOutcome::Failed { reason, .. } = outcome else {
+        panic!("expected Failed, got {outcome:?}");
+    };
+    match reason {
+        SelfTestReason::Other(s) => assert!(
+            s.contains("SERVFAIL"),
+            "the earlier answer must survive later attempts' failures; got: {s}"
+        ),
+        other => panic!("expected Other, got {other:?}"),
+    }
+}
+
 /// A plugin that dies mid-run: attempt 1 carries the query, attempt 2 cannot
 /// connect. The reading is cumulative, so the bytes that reached the tunnel
 /// still decide — reporting the local hop here would contradict the counters.
@@ -326,14 +427,29 @@ fn the_reason_never_carries_a_debug_formatted_enum() {
     assert!(err.to_string().contains("timeout"), "got: {err}");
 }
 
-/// Pins `implicates_plugin_transport`'s two-reason contract (see its doc).
+/// Pins `implicates_plugin_transport`'s two-variant contract (see its doc).
+/// Takes the FINAL `ProxyError`, not the pre-verdict `SelfTestReason` — a
+/// `Blocked`/`TcpRefused`/`TcpTimeout` verdict replaces `TunnelSilent`/
+/// `NoTunnelConnection` before this ever runs, so those two must not
+/// implicate the plugin either.
 #[skuld::test]
 fn implicates_plugin_transport_covers_only_the_two_tunnel_readings() {
-    assert!(super::implicates_plugin_transport(&SelfTestReason::NoConnection));
-    assert!(super::implicates_plugin_transport(&SelfTestReason::TunnelSilent));
-    assert!(!super::implicates_plugin_transport(&SelfTestReason::Other(
-        "a resolver answered with SERVFAIL".into()
-    )));
+    assert!(super::implicates_plugin_transport(&ProxyError::NoTunnelConnection {
+        attempts: 3,
+        elapsed_ms: 200
+    }));
+    assert!(super::implicates_plugin_transport(&ProxyError::TunnelSilent {
+        attempts: 3,
+        elapsed_ms: 200
+    }));
+    assert!(!super::implicates_plugin_transport(
+        &ProxyError::ForwarderSelfTestFailed {
+            attempts: 3,
+            elapsed_ms: 200,
+            reason: "a resolver answered with SERVFAIL".into(),
+        }
+    ));
+    assert!(!super::implicates_plugin_transport(&ProxyError::NetworkBlocked));
 }
 
 /// `report_plugin_output` quotes a chain's lines, and says so when there is
@@ -905,4 +1021,38 @@ async fn reset_endpoint_maps_to_network_blocked() {
         self_test_error_for(Some(verdict), 3, 200, SelfTestReason::Other(original_reason())),
         ProxyError::NetworkBlocked
     ));
+}
+
+/// Regression: a gate cancelled before its first attempt must still hit the
+/// single reporting match (both cancel return-sites set `outcome` and
+/// `break` rather than returning directly) — otherwise a cancelled gate is
+/// indistinguishable in `bridge.log` from one that never ran at all.
+#[skuld::test]
+fn a_cancelled_gate_logs_and_reports_cancelled() {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(HangingConnector), false));
+            run_forwarder_self_test(forwarder, vec!["127.0.0.1".parse().unwrap()], false, cancel).await
+        });
+
+    assert!(matches!(outcome, SelfTestOutcome::Cancelled), "got {outcome:?}");
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("forwarder self-test cancelled"),
+        "a cancelled gate must log, not silently return; got:\n{output}"
+    );
 }

@@ -47,6 +47,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("test-plugin: SS_PLUGIN_OPTIONS={opts}");
     let _ = std::io::stdout().flush();
 
+    // Fault-injection knob: `fail-stderr-then-exit=<msg>` writes `<msg>` to
+    // stderr and exits before ever binding — models a plugin that crashes
+    // (e.g. a Go panic under `GOTRACEBACK=crash`) writing its last words to
+    // stderr rather than stdout, before the chain ever becomes ready.
+    if let Some(msg) = opts.split(';').find_map(|s| s.strip_prefix("fail-stderr-then-exit=")) {
+        eprintln!("{msg}");
+        let _ = std::io::stderr().flush();
+        std::process::exit(1);
+    }
+
     // A lost port race must be reported as `bind_conflict`, the only class
     // `bind_ephemeral` retries on a fresh port — exiting with a bare error
     // instead would turn the residual probe-drop-to-bind TOCTOU into an

@@ -183,3 +183,47 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
         "a failed chain start must report the plugin ring; got:\n{output}"
     );
 }
+
+/// Regression: `warn_recent` reading the ring must not race the detached
+/// stderr reader task. A real Go plugin crashing under `GOTRACEBACK=crash`
+/// writes exactly there, not to stdout — `spawn_plugin_runner_at` awaits the
+/// runner (which drains its readers) instead of aborting it, so this line is
+/// reliably in the ring by the time the failure is reported, not a race.
+#[skuld::test]
+async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = CaptureWriter::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+
+    let cancel = CancellationToken::new();
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let err = start_plugin_chain(
+            "v2ray-plugin",
+            test_plugin_path().to_str().expect("utf-8 path"),
+            Some("host=example.com;fail-stderr-then-exit=fatal: injected crash on stderr"),
+            "127.0.0.1",
+            9,
+            None,
+            None,
+            false,
+            &cancel,
+            None,
+        )
+        .await
+        .expect_err("the stub exits before becoming ready");
+        assert!(format!("{err}").contains("plugin"), "got: {err}");
+    }
+
+    let output = writer.snapshot();
+    assert!(
+        output.contains("fatal: injected crash on stderr"),
+        "the child's stderr line must reach bridge.log before the ring is read; got:\n{output}"
+    );
+}

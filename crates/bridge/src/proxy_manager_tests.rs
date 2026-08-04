@@ -2163,6 +2163,43 @@ mod self_test {
         });
     }
 
+    /// Regression: the same closed-port setup as `lockdown_off_runs_probe_rewrites_reason`
+    /// (probe runs, its verdict overrides the gate's own `NoConnection`
+    /// reading) must NOT quote the plugin's output — no plugin is
+    /// configured here either, so a firing report would say
+    /// `NO_PLUGIN_CONFIGURED` beside a failure the code has already
+    /// attributed to the probe's verdict, not the (nonexistent) plugin.
+    /// Current-thread runtime: `set_default_in_current_thread` is
+    /// thread-local, and the gate's work runs in tasks this start spawns.
+    #[skuld::test]
+    fn a_probe_override_suppresses_the_plugin_output_report() {
+        let writer = VecWriter::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let (mut pm, cfg, _dir) = gate_failure_setup(false);
+                pm.start_cancellable(&cfg, false, CancellationToken::new())
+                    .await
+                    .expect_err("both the probe and the gate must fail");
+            });
+        let output = writer.snapshot_string();
+        assert!(
+            !output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the probe's verdict overrides the gate's own reading, so the plugin-output \
+             report must not fire; got:\n{output}"
+        );
+    }
+
     /// Control: with lockdown OFF the probe DOES run, so the same closed-port
     /// server rewrites the reason to the probe's verdict — proving the
     /// lockdown-on skip above is load-bearing, not vacuous. The closed port is
