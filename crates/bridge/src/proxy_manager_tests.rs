@@ -2920,8 +2920,10 @@ mod self_test {
 
     /// cover-skip: with the lockdown intent ON, the gate must NOT run the probe
     /// (a standing kill-switch cover would block it and we'd mis-report Hole's own
-    /// lockdown as censorship). The probe would rewrite the reason to "refused";
-    /// with the probe skipped the ORIGINAL self-test reason survives.
+    /// lockdown as censorship). The probe would rewrite this into
+    /// `ForwarderSelfTestFailed` with a "refused"/"did not respond" reason; with
+    /// the probe skipped, the self-test's own reading decides instead — not one
+    /// byte was ever written, so it is the typed `NoTunnelConnection`.
     #[skuld::test]
     fn lockdown_on_skips_probe_keeps_original_reason() {
         rt().block_on(async {
@@ -2930,13 +2932,10 @@ mod self_test {
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "lockdown-on must skip the probe and keep the original reason, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
+            );
         });
     }
 
@@ -3615,21 +3614,23 @@ mod self_test {
 
     /// The covered start engages the cover before start_inner, so the probe-
     /// suppression predicate (cover_active) sees the live in-process signal even
-    /// with NO lockdown intent — the original self-test reason survives. Mirrors
-    /// `lockdown_on_skips_probe_keeps_original_reason`; the control is
-    /// `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe runs).
+    /// with NO lockdown intent — the self-test's own reading survives instead of
+    /// the probe's rewrite. Mirrors `lockdown_on_skips_probe_keeps_original_reason`;
+    /// the control is `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe
+    /// runs).
     #[skuld::test]
     fn covered_start_without_lockdown_suppresses_probe() {
         rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            let err = pm.start_cancellable(&cfg, true, CancellationToken::new()).await.unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "a covered start engages a cover, so the probe is skipped and the original reason survives, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "a covered start engages a cover, so the probe is skipped and the self-test's own \
+                 reading (not one byte written) surfaces, got {err:?}"
+            );
         });
     }
 
