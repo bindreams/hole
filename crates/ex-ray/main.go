@@ -36,7 +36,7 @@ var VERSION = "ex-ray"
 // default" for tcp-keepalive/fwmark, whose defaults are 15/0 (see
 // TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this needs
 // args.go's Args type to distinguish a bare key from an explicit "=1", a
-// grammar change tracked as part of #744). A non-empty, non-numeric value
+// grammar change not attempted here). A non-empty, non-numeric value
 // is fatal and never echoes the rejected value: the escaping grammar lets
 // a backslash absorb a later segment into a value, so an unparseable
 // mux=abc\;certRaw=SECRET could otherwise leak certRaw's value through the
@@ -55,18 +55,31 @@ func parseIntOption(opts Args, key string, dest *int) error {
 }
 
 // parseBoolOption reads a SIP003 presence option value from opts and
-// applies it to dest, mirroring parseIntOption's structural rule: an empty
-// value means "not specified" and leaves dest alone; a non-empty value
-// that isn't recognized is fatal. A bare key (no `=` at all) resolves to
-// the parser's own literal "1" (args.go), which is the only value this
-// recognizes as "enable" -- these options have no other documented value
-// vocabulary, and inventing one (accepting "true"/"yes"/"on" as a
-// heuristic) is exactly the kind of threshold that has no principled
-// stopping point. Never echoes the rejected value for the same reason
-// parseIntOption doesn't.
+// applies it to dest. Unlike parseIntOption/parseEnumOption, an explicitly
+// empty value ("key=") is NOT a no-op here -- only an absent key is. A bare
+// key (no `=` at all) or an explicit "key=1" (args.go maps a bare key to
+// the literal "1") is the only spelling that enables the flag; any other
+// present value, empty included, is unrecognized and fatal. Inventing a
+// wider vocabulary ("true"/"yes"/"on" as a heuristic) is exactly the kind
+// of threshold that has no principled stopping point.
+//
+// The empty-value carve-out matters here specifically because these are
+// presence-only options: garter's Mode::from_plugin_options mirrors
+// ex-ray's OLD behavior for `server` -- presence of the key, regardless of
+// value, means server mode (crates/garter/src/chain_tests.rs). Treating
+// `server=` as a no-op would leave *server false while garter still
+// swapped the chain's SS_LOCAL/SS_REMOTE env vars for server mode,
+// producing exactly the kind of silently-broken-but-reports-ready config
+// this whole change exists to prevent -- and fixing that properly needs a
+// garter-side change, out of scope here. Rejecting `key=` outright avoids
+// the disagreement without touching garter: ex-ray simply refuses to
+// start.
+//
+// Never echoes the rejected value for the same reason parseIntOption
+// doesn't.
 func parseBoolOption(opts Args, key string, dest *bool) error {
 	c, ok := opts.Get(key)
-	if !ok || c == "" {
+	if !ok {
 		return nil
 	}
 	if c != "1" {
@@ -206,7 +219,7 @@ func parseOptsIntoFlags() error {
 		return err
 	}
 
-	if err := parseEnumOption(opts, "ech", []string{"auto", "always", "never"}, echMode); err != nil {
+	if err := parseEnumOption(opts, "ech", allowedEchModes, echMode); err != nil {
 		return err
 	}
 	if c, b := opts.Get("ech-doh"); b {
@@ -325,6 +338,13 @@ func main() {
 	// asked v2ray-core for (never empty); refine to the classifier's exact failed
 	// endpoint only when it carries one, so the SITREP addr is never "" (an empty
 	// addr fails the host's SocketAddr parse and drops the whole bind_conflict).
+	// bind_conflict's addr is meant to name the contended endpoint -- legitimate
+	// diagnostic content, not an echo of a rejected value. The generic fatal
+	// branch is different: v2ray-core's own Start error is unredacted internal
+	// text that can embed *localAddr/*localPort verbatim (e.g. "domain address
+	// is not allowed for listening: <value>"), so it must not reach the sitrep
+	// the way every other fatal site in this file was fixed not to; the raw
+	// error still reaches stderr via logFatal below.
 	if err := server.Start(); err != nil {
 		if errno, addr, ok := classifyBindError(err); ok {
 			if addr == "" {
@@ -332,7 +352,7 @@ func main() {
 			}
 			emitBindConflict(errno, addr)
 		} else {
-			emitFatal("start: "+err.Error(), nil)
+			emitFatal("failed to start the v2ray-core inbound listener", nil)
 		}
 		logFatal("failed to start server:", err.Error())
 		os.Exit(1)

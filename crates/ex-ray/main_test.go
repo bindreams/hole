@@ -255,18 +255,22 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_tcp_keepalive_non_numeric", "tcp-keepalive=off", false},
 		{"invalid_fwmark_non_numeric", "fwmark=off", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
-		// Task 2 Step 7's four generateConfig/buildTLSConfig no-echo fixes,
-		// driven through the REAL pipeline (parsePluginOptions ->
-		// parseOptsIntoFlags -> buildV2Ray -> generateConfig/buildTLSConfig
-		// -> emitFatal), not just via directly-stuffed flag globals the way
-		// Task 2's own unit tests do it -- proves the backslash-absorption
-		// exploit those unit tests assume is real actually reaches these
-		// sites end to end.
+		// The generateConfig/buildTLSConfig no-echo fixes for localPort/
+		// remotePort/mode, driven through the REAL pipeline
+		// (parsePluginOptions -> parseOptsIntoFlags -> buildV2Ray ->
+		// generateConfig/buildTLSConfig -> emitFatal), not just via
+		// directly-stuffed flag globals the way the sibling unit tests do
+		// it -- proves the backslash-absorption exploit those unit tests
+		// assume is real actually reaches these sites end to end.
 		{"invalid_localPort_never_echo_secret", `localPort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_remotePort_never_echo_secret", `remotePort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_mode_never_echo_secret", `mode=abc\;certRaw=SUPERSECRETVALUE`, true},
+		// ech is validated by parseEnumOption inside parseOptsIntoFlags
+		// itself, so this case never reaches buildTLSConfig's own ech-mode
+		// branch at all -- it end-to-end-proves parseEnumOption's no-echo
+		// behavior (already unit-tested directly), not buildTLSConfig's.
 		{"invalid_ech_mode_never_echo_secret", `tls;host=example.com;ech=abc\;certRaw=SUPERSECRETVALUE`, true},
-		// Task 2's boolean and loglevel fixes, likewise through the real
+		// The boolean and loglevel fixes, likewise through the real
 		// pipeline: tls=false must be fatal, not a silent TLS-enable, and
 		// must never echo an absorbed secret; same for an unrecognized
 		// loglevel.
@@ -302,6 +306,38 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 				t.Errorf("exit code = %d, want 23 (ex-ray's config-class-error convention)", exitCode)
 			}
 		})
+	}
+}
+
+// A distinct failure class from the table above: this input reaches
+// generateConfig/parseOptsIntoFlags successfully (localAddr has no
+// validator of its own), so v2ray-core's own server.Start() is what
+// rejects it -- exercising the "failed to start the v2ray-core inbound
+// listener" branch in main(), not classifyBindError's bind_conflict path
+// (this exit code is 1, ex-ray's crash-class convention for that branch,
+// not the config-class 23 the table above pins). v2ray-core's internal
+// Start error text embeds the raw listen address, so the same
+// backslash-absorption secret must not reach the sitrep here either.
+func TestStartFailureSitrepNeverEchoesLocalAddr(t *testing.T) {
+	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+		"SS_REMOTE_HOST":    "chain.example.net",
+		"SS_REMOTE_PORT":    "9443",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": `localAddr=nosuchhost.invalid\;certRaw=SUPERSECRETVALUE;host=example.com;path=/`,
+	})
+	if hello["event"] != "hello" {
+		t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+	}
+	if terminal["event"] != "fatal" {
+		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+	}
+	detail, _ := terminal["detail"].(string)
+	if strings.Contains(detail, "SUPERSECRETVALUE") {
+		t.Errorf("fatal detail leaks the absorbed segment: %q", detail)
+	}
+	if exitCode == 0 {
+		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
 	}
 }
 

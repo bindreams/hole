@@ -272,7 +272,7 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 	}
 }
 
-// Pins the newly-live path this task's parseEnv restructuring introduces:
+// Pins the newly-live path:
 // SS_PLUGIN_OPTIONS now applies even with NO SS_* env at all (the
 // fully-standalone case), where it was previously always inert (parseEnv's
 // old completeness gate ran before SS_PLUGIN_OPTIONS was ever read, so a
@@ -785,9 +785,8 @@ func TestParseOptsIntoFlagsIntOptionsEmptyValueIsANoOp(t *testing.T) {
 // Documents a known, tested mismatch, not a silent one: a bare key
 // resolves to the parser's literal "1", which equals muxDefault but not
 // tcpKeepAliveDefault/fwmarkDefault. Fixing this needs args.go's Args type
-// to distinguish a bare key from an explicit "=1", a grammar change
-// tracked as part of #744 (the same bare-key seam on the garter side)
-// rather than attempted here.
+// to distinguish a bare key from an explicit "=1", a grammar change not
+// attempted here.
 func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -804,7 +803,7 @@ func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
 }
 
 // A bad int-option value is fatal even when the SS_* chain-handoff env is
-// incomplete (parseEnv, Task 1 Step 4): SS_PLUGIN_OPTIONS is applied
+// incomplete (parseEnv): SS_PLUGIN_OPTIONS is applied
 // regardless of SS_* completeness, so mux=off (or the tcp-keepalive/fwmark
 // equivalent) can't survive by riding an incomplete env. Loops over all
 // three options like every sibling int-option test in this file, so this
@@ -936,18 +935,26 @@ func TestParseOptsIntoFlagsBoolOptionsBareKeyOrExplicitOneEnables(t *testing.T) 
 	}
 }
 
-// An explicit empty value is a no-op, like an absent key -- leaves the
-// flag at whatever it already held (mirrors TestParseOptsIntoFlagsIntOptionsEmptyValueIsANoOp).
-func TestParseOptsIntoFlagsBoolOptionsEmptyValueIsANoOp(t *testing.T) {
+// Unlike the int/enum options, an explicit empty value is NOT a no-op for a
+// presence-only boolean -- it is rejected like any other unrecognized
+// value (parseBoolOption's doc comment explains why: garter mirrors
+// ex-ray's old "presence regardless of value" semantics for `server`, and
+// a silent no-op here would let ex-ray and garter disagree about mode
+// without either side erroring).
+func TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	for _, o := range boolOptions() {
 		t.Run(o.key, func(t *testing.T) {
 			withEnv(t, o.key+"=")
-			o.set(true)
-			if err := parseOptsIntoFlags(); err != nil {
-				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			o.set(false)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
 			}
-			if !o.get() {
-				t.Errorf("%s= -> false, want it untouched at true", o.key)
+			if !strings.Contains(err.Error(), o.key) {
+				t.Errorf("error %q does not mention %q", err.Error(), o.key)
+			}
+			if o.get() {
+				t.Errorf("%s=: value = true after a rejected value, want it untouched at false", o.key)
 			}
 		})
 	}
@@ -955,19 +962,22 @@ func TestParseOptsIntoFlagsBoolOptionsEmptyValueIsANoOp(t *testing.T) {
 
 // The exact bug being fixed: today, ANY value -- including one that reads
 // as "off" to a human -- silently enables the flag. tls=false must not
-// enable TLS; server=no must not flip into server mode (the #734/#738
-// direction-disagreement class, from the value side). No value-echo check
+// enable TLS; server=no must not flip into server mode. No value-echo check
 // here: "no" is a substring of "not" (as in "value is not recognized"),
 // which would make that check fail on the correct, non-leaking message --
 // the same trap the int-option tests document. The dedicated no-echo test
 // below covers that property with a value the message text can't
-// accidentally contain.
+// accidentally contain. Seeded false (not true, the value parseBoolOption
+// ever writes): true would never distinguish "correctly rejected" from "the
+// rejection silently enabled the flag anyway" -- mirrors the int-option
+// tests' use of a sentinel the implementation could never legitimately
+// produce.
 func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
 	for _, o := range boolOptions() {
 		for _, bad := range []string{"false", "0", "no", "true", "yes"} {
 			t.Run(o.key+"="+bad, func(t *testing.T) {
 				withEnv(t, o.key+"="+bad)
-				o.set(true)
+				o.set(false)
 				err := parseOptsIntoFlags()
 				if err == nil {
 					t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
@@ -975,8 +985,8 @@ func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
 				if !strings.Contains(err.Error(), o.key) {
 					t.Errorf("error %q does not mention %q", err.Error(), o.key)
 				}
-				if !o.get() {
-					t.Errorf("%s=%s: value = false after a rejected value, want it untouched at true", o.key, bad)
+				if o.get() {
+					t.Errorf("%s=%s: value = true after a rejected value, want it untouched at false", o.key, bad)
 				}
 			})
 		}
@@ -984,8 +994,8 @@ func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
 }
 
 // The rejected value must never appear in the error text, checked with a
-// distinctive value via the same backslash-absorption exploit used
-// throughout this plan, mirroring TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret.
+// distinctive value via the same backslash-absorption exploit, mirroring
+// TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret.
 func TestParseOptsIntoFlagsBoolOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T) {
 	for _, o := range boolOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -1101,9 +1111,8 @@ func TestGenerateConfigRejectsUnrecognizedLogLevel(t *testing.T) {
 // The rejected value must never appear in the error text. A literal check
 // for "warn" would only catch a %q-formatted echo (e.g. `invalid loglevel:
 // "warn"`) and pass on a plain-concatenation echo (`invalid loglevel: warn`,
-// exactly how every other config.go site being fixed in this same step was
-// written) -- checked instead with a distinctive value via the same
-// backslash-absorption exploit used throughout this plan.
+// exactly how every other config.go site was written) -- checked instead
+// with a distinctive value via the same backslash-absorption exploit.
 func TestGenerateConfigLogLevelErrorNeverEchoesValue(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()

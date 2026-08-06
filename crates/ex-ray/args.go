@@ -57,10 +57,11 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 // returned opts, regardless of whether the SS_* chain-handoff vars below
 // are present. The SS_*-derived addresses themselves are added on top only
 // when all four vars are present; a partial set (some but not all four --
-// never a legitimate invocation shape) leaves the corresponding
-// localAddr/localPort/remoteAddr/remotePort at whatever
-// SS_PLUGIN_OPTIONS/flag defaults already supplied, which is visible via
-// logWarn below rather than silent.
+// never a legitimate invocation shape) skips the entire SS_*-derived
+// handoff -- all four of localAddr/localPort/remoteAddr/remotePort fall
+// back to whatever SS_PLUGIN_OPTIONS/flag defaults already supplied, not
+// just the missing var's own contribution -- which is visible via logWarn
+// below rather than silent.
 func parseEnv() (opts Args, err error) {
 	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
 	if err != nil {
@@ -77,11 +78,11 @@ func parseEnv() (opts Args, err error) {
 	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
 	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
 	if len(ssRemoteHost) == 0 || len(ssRemotePort) == 0 || len(ssLocalHost) == 0 || len(ssLocalPort) == 0 {
-		// A partial (not fully-absent) set is never a legitimate invocation
-		// shape -- log it rather than pass through in silence, even though
-		// it isn't escalated to fatal.
+		// A partial set skips the handoff entirely -- log it rather than
+		// pass through in silence, even though it isn't escalated to
+		// fatal.
 		if ssRemoteHost != "" || ssRemotePort != "" || ssLocalHost != "" || ssLocalPort != "" {
-			logWarn("SS_* chain-handoff env is incomplete (some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set); the address handoff from the missing var(s) was not applied")
+			logWarn("SS_* chain-handoff env is incomplete (some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set); the entire SS_*-derived address handoff was skipped, not just the missing var(s)")
 		}
 		return opts, nil
 	}

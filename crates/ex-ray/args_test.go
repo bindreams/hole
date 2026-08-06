@@ -181,18 +181,13 @@ func TestDualFaultReportsFirstReachedNotWholeStringPrepass(t *testing.T) {
 // password, a cert). Mirrors crates/bridge/src/proxy/plugin.rs's own test
 // of the same property one layer up.
 //
-// Only the dangling-escape shape can leak at all: the empty-key error's
-// pre-fix format (`empty key in %q`, args.go) computes `s[begin:i]` where
-// `i` has not yet been advanced past `begin`, so that `%q` is always the
-// empty string regardless of input -- TestEmptyKeyErrorNamesSegmentIndex
-// already pins that error's exact wording, which is a stronger, more
-// direct check for that shape than a leak probe that can never fire. The
-// secret must be placed IN the segment whose value triggers the dangling
-// escape (the LAST segment, ending in the unpaired backslash) -- putting it
-// in an earlier, successfully-parsed segment (like "certRaw=SECRET;path=/a\")
-// means the error's pre-fix `%q` (formatted from the substring being
-// scanned when the escape is found) never includes it, so a test built
-// that way would stay green whether or not the fix actually landed.
+// Only the dangling-escape shape can leak at all: the empty-key error
+// names only the segment index (TestEmptyKeyErrorNamesSegmentIndex pins
+// its exact wording), so there is no substring to probe there. The secret
+// must be placed IN the segment whose value triggers the dangling escape
+// (the LAST segment, ending in the unpaired backslash) -- an earlier,
+// successfully-parsed segment would never reach the scan that produces
+// this error.
 func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	cases := []struct {
 		desc string
@@ -213,7 +208,7 @@ func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	}
 }
 
-// The logWarn added in parseEnv (Task 1 Step 4) must fire exactly when
+// The logWarn added in parseEnv must fire exactly when
 // there is something to warn about: a genuinely partial SS_* set (some but
 // not all four vars). It must stay silent both when SS_* is fully absent
 // (the legitimate standalone case) and when it's fully complete.

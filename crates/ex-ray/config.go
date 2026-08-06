@@ -4,8 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"os"
 	"os/user"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -44,6 +44,14 @@ const (
 	fwmarkDefault       = 0
 )
 
+// allowedEchModes is the single source of truth for the `ech` option's
+// vocabulary, referenced both by parseOptsIntoFlags' parse-time validation
+// (main.go, reachable from SS_PLUGIN_OPTIONS) and by buildTLSConfig's own
+// switch below (reachable from a raw `-ech=` CLI flag, which bypasses
+// parseOptsIntoFlags entirely) -- keeping one list means a future mode
+// addition can't update one check and silently miss the other.
+var allowedEchModes = []string{"auto", "always", "never"}
+
 var (
 	vpn          = flag.Bool("V", false, "Run in VPN mode.")
 	fastOpen     = flag.Bool("fast-open", false, "Enable TCP fast open.")
@@ -68,13 +76,19 @@ var (
 	tcpKeepAlive = flag.Int("tcp-keepalive", tcpKeepAliveDefault, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
 )
 
-func homeDir() string {
+// homeDir resolves the operator's home directory, used only to build the
+// default ~/.acme.sh cert/key paths when the server-mode operator gave
+// neither. Returns an error rather than exiting directly, so a failure here
+// reaches main() through the same buildTLSConfig -> generateConfig ->
+// buildV2Ray -> failFatal path as every other config-class error in this
+// file -- a `fatal` sitrep with exit 23, not a bare stderr line and exit 1
+// that breaks the sitrep's hello-then-exactly-one-terminal-event contract.
+func homeDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
-		logFatal(err)
-		os.Exit(1)
+		return "", newError("failed to determine home directory").Base(err)
 	}
-	return usr.HomeDir
+	return usr.HomeDir, nil
 }
 
 func readCertificate() ([]byte, error) {
@@ -198,7 +212,11 @@ func buildTLSConfig() (*tls.Config, error) {
 	if *server {
 		certificate := tls.Certificate{}
 		if *cert == "" && *certRaw == "" {
-			*cert = fmt.Sprintf("%s/.acme.sh/%s/fullchain.cer", homeDir(), *host)
+			home, err := homeDir()
+			if err != nil {
+				return nil, err
+			}
+			*cert = fmt.Sprintf("%s/.acme.sh/%s/fullchain.cer", home, *host)
 			logWarn("No TLS cert specified, trying", *cert)
 		}
 		var err error
@@ -207,7 +225,11 @@ func buildTLSConfig() (*tls.Config, error) {
 			return nil, newError("failed to read cert").Base(err)
 		}
 		if *key == "" {
-			*key = fmt.Sprintf("%[1]s/.acme.sh/%[2]s/%[2]s.key", homeDir(), *host)
+			home, err := homeDir()
+			if err != nil {
+				return nil, err
+			}
+			*key = fmt.Sprintf("%[1]s/.acme.sh/%[2]s/%[2]s.key", home, *host)
 			logWarn("No TLS key specified, trying", *key)
 		}
 		certificate.Key, err = filesystem.ReadFile(*key)
@@ -225,6 +247,9 @@ func buildTLSConfig() (*tls.Config, error) {
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	}
 
+	if !slices.Contains(allowedEchModes, *echMode) {
+		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
+	}
 	switch *echMode {
 	case "never":
 		// no-op; never touch ECH regardless of ech-doh.
@@ -237,8 +262,6 @@ func buildTLSConfig() (*tls.Config, error) {
 		} else if *echMode == "always" {
 			return nil, newError("ech=always requires ech-doh to be set; refusing to start without a DoH source for fail-closed ECH")
 		}
-	default:
-		return nil, newError("invalid ech mode (expected auto, always, or never)")
 	}
 
 	return tlsConfig, nil
