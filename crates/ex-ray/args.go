@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 )
@@ -42,7 +43,7 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 		if b == '\\' {
 			i++
 			if i >= len(s) {
-				return 0, "", fmt.Errorf("nothing following final escape in %q", s)
+				return 0, "", errors.New("plugin options end in an unpaired backslash")
 			}
 			b = s[i]
 		}
@@ -51,41 +52,44 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 	return i, string(unesc), nil
 }
 
-// Parse SS_PLUGIN options from environment variables
+// Parse SS_PLUGIN options from environment variables. SS_PLUGIN_OPTIONS is
+// always validated via parsePluginOptions and always applied to the
+// returned opts, regardless of whether the SS_* chain-handoff vars below
+// are present. The SS_*-derived addresses themselves are added on top only
+// when all four vars are present; a partial set (some but not all four --
+// never a legitimate invocation shape) leaves the corresponding
+// localAddr/localPort/remoteAddr/remotePort at whatever
+// SS_PLUGIN_OPTIONS/flag defaults already supplied, which is visible via
+// logWarn below rather than silent.
 func parseEnv() (opts Args, err error) {
+	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
+	if err != nil {
+		return nil, err
+	}
+
 	opts = make(Args)
+	for k, v := range otherOpts {
+		opts[k] = v
+	}
+
 	ssRemoteHost := os.Getenv("SS_REMOTE_HOST")
 	ssRemotePort := os.Getenv("SS_REMOTE_PORT")
 	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
 	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
-	if len(ssRemoteHost) == 0 {
-		return
-	}
-	if len(ssRemotePort) == 0 {
-		return
-	}
-	if len(ssLocalHost) == 0 {
-		return
-	}
-	if len(ssLocalPort) == 0 {
-		return
+	if len(ssRemoteHost) == 0 || len(ssRemotePort) == 0 || len(ssLocalHost) == 0 || len(ssLocalPort) == 0 {
+		// A partial (not fully-absent) set is never a legitimate invocation
+		// shape -- log it rather than pass through in silence, even though
+		// it isn't escalated to fatal.
+		if ssRemoteHost != "" || ssRemotePort != "" || ssLocalHost != "" || ssLocalPort != "" {
+			logWarn("SS_* chain-handoff env is incomplete (some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set); the address handoff from the missing var(s) was not applied")
+		}
+		return opts, nil
 	}
 
 	opts.Add("remoteAddr", ssRemoteHost)
 	opts.Add("remotePort", ssRemotePort)
 	opts.Add("localAddr", ssLocalHost)
 	opts.Add("localPort", ssLocalPort)
-
-	ssPluginOptions := os.Getenv("SS_PLUGIN_OPTIONS")
-	if len(ssPluginOptions) > 0 {
-		otherOpts, err := parsePluginOptions(ssPluginOptions)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range otherOpts {
-			opts[k] = v
-		}
-	}
 	return opts, nil
 }
 
@@ -97,41 +101,36 @@ func parsePluginOptions(s string) (opts Args, err error) {
 		return
 	}
 	i := 0
-	for {
+	for segmentIndex := 0; ; segmentIndex++ {
 		var key, value string
-		var offset, begin int
+		var offset int
 
 		if i >= len(s) {
 			break
 		}
-		begin = i
-		// Read the key.
 		offset, key, err = indexUnescaped(s[i:], []byte{'=', ';'})
 		if err != nil {
 			return
 		}
 		if len(key) == 0 {
-			err = fmt.Errorf("empty key in %q", s[begin:i])
+			// No segment content in the message: a value can carry a secret.
+			// Mirrors crates/garter/src/sip003.rs's MalformedOptions::EmptyKey.
+			err = fmt.Errorf("plugin options segment %d has no key", segmentIndex)
 			return
 		}
 		i += offset
-		// End of string or no equals sign?
 		if i >= len(s) || s[i] != '=' {
 			opts.Add(key, "1")
-			// Skip the semicolon.
 			i++
 			continue
 		}
-		// Skip the equals sign.
 		i++
-		// Read the value.
 		offset, value, err = indexUnescaped(s[i:], []byte{';'})
 		if err != nil {
 			return
 		}
 		i += offset
 		opts.Add(key, value)
-		// Skip the semicolon.
 		i++
 	}
 	return opts, nil

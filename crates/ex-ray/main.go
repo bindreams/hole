@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 
 	core "github.com/v2fly/v2ray-core/v5"
@@ -18,10 +19,101 @@ import (
 
 var VERSION = "ex-ray"
 
+// parseIntOption reads a SIP003 option value from opts and applies it to
+// dest, sharing one implementation across mux/tcp-keepalive/fwmark so the
+// three can never silently drift apart.
+//
+// The rule: an empty value means "not specified" and leaves dest alone; a
+// non-empty value that fails to parse is fatal. Concretely, both an absent
+// key and an explicitly empty value ("key=") are a no-op, leaving dest at
+// whatever it already held: dest holds whatever flag.Parse left there --
+// main() calls flag.Parse() before parseOptsIntoFlags runs -- the
+// registered default when no CLI flag was passed, or the CLI-supplied
+// value when one was, deliberately preserved either way, not overwritten.
+// A BARE key (no `=` at all) is different: args.go's parser maps it to the
+// literal string "1" for every option uniformly, so it goes through the
+// same Atoi path as an explicit `=1` and sets dest to 1 -- not "the
+// default" for tcp-keepalive/fwmark, whose defaults are 15/0 (see
+// TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this needs
+// args.go's Args type to distinguish a bare key from an explicit "=1", a
+// grammar change tracked as part of #744). A non-empty, non-numeric value
+// is fatal and never echoes the rejected value: the escaping grammar lets
+// a backslash absorb a later segment into a value, so an unparseable
+// mux=abc\;certRaw=SECRET could otherwise leak certRaw's value through the
+// mux error.
+func parseIntOption(opts Args, key string, dest *int) error {
+	c, ok := opts.Get(key)
+	if !ok || c == "" {
+		return nil
+	}
+	i, err := strconv.Atoi(c)
+	if err != nil {
+		return newError(fmt.Sprintf("invalid %s: value is not an integer", key))
+	}
+	*dest = i
+	return nil
+}
+
+// parseBoolOption reads a SIP003 presence option value from opts and
+// applies it to dest, mirroring parseIntOption's structural rule: an empty
+// value means "not specified" and leaves dest alone; a non-empty value
+// that isn't recognized is fatal. A bare key (no `=` at all) resolves to
+// the parser's own literal "1" (args.go), which is the only value this
+// recognizes as "enable" -- these options have no other documented value
+// vocabulary, and inventing one (accepting "true"/"yes"/"on" as a
+// heuristic) is exactly the kind of threshold that has no principled
+// stopping point. Never echoes the rejected value for the same reason
+// parseIntOption doesn't.
+func parseBoolOption(opts Args, key string, dest *bool) error {
+	c, ok := opts.Get(key)
+	if !ok || c == "" {
+		return nil
+	}
+	if c != "1" {
+		return newError(fmt.Sprintf("invalid %s: value is not recognized", key))
+	}
+	*dest = true
+	return nil
+}
+
+// parseEnumOption reads a SIP003 option value from opts and applies it to
+// dest if it matches one of allowed, mirroring parseIntOption/
+// parseBoolOption's structural rule: an absent key or an explicitly empty
+// value is a no-op; a non-empty value outside allowed is fatal. The
+// allowed list is safe to name in the error (it's a small static
+// vocabulary, not operator input) but the rejected value itself never is,
+// for the same reason as every other option in this file.
+func parseEnumOption(opts Args, key string, allowed []string, dest *string) error {
+	c, ok := opts.Get(key)
+	if !ok || c == "" {
+		return nil
+	}
+	for _, a := range allowed {
+		if c == a {
+			*dest = c
+			return nil
+		}
+	}
+	return newError(fmt.Sprintf("invalid %s: expected one of %s", key, strings.Join(allowed, ", ")))
+}
+
+// failFatal reports err as a `fatal` sitrep and exits with ex-ray's
+// config-class-error code (23) -- distinct from other exit codes so a
+// supervisor like systemd does not treat a bad config as a crash worth
+// restarting.
+func failFatal(err error) {
+	emitFatal(err.Error(), nil)
+	logFatal(err.Error())
+	os.Exit(23) // config-class error
+}
+
 // parseOptsIntoFlags reads SS_PLUGIN env vars and cross-assigns them into the
 // package-level flag pointers. This is the env-remap seam: it is split out of
 // buildV2Ray so main() can compute the listen address between the remap and
 // core.New (the config needs the remap to have happened first).
+//
+// A non-nil return is fatal: the caller must emit a `fatal` sitrep and exit
+// non-zero rather than proceed with partially-remapped flags.
 //
 // localAddr/localPort always name the inbound listener bound by this process,
 // in BOTH modes:
@@ -34,35 +126,23 @@ var VERSION = "ex-ray"
 // The cross-assignment below mirrors that: under `*server`, a `localAddr`
 // option lands in *remoteAddr and a `remoteAddr` option lands in *localAddr
 // (likewise for ports).
-func parseOptsIntoFlags() {
+func parseOptsIntoFlags() error {
 	opts, err := parseEnv()
 	if err != nil {
-		// parseEnv only errors on a malformed SS_PLUGIN_OPTIONS string; with
-		// no SS_* env set it returns empty opts and nil. Either way, leave the
-		// flag defaults in place (matches the prior behavior, which guarded the
-		// whole remap block on `err == nil`).
-		return
+		return newError("invalid SS_PLUGIN_OPTIONS").Base(err)
 	}
 
 	if c, b := opts.Get("mode"); b {
 		*mode = c
 	}
-	if c, b := opts.Get("mux"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*mux = i
-		} else {
-			logWarn("failed to parse mux, use default value")
-		}
+	if err := parseIntOption(opts, "mux", mux); err != nil {
+		return err
 	}
-	if c, b := opts.Get("tcp-keepalive"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*tcpKeepAlive = i
-		} else {
-			logWarn("failed to parse tcp-keepalive, use default value")
-		}
+	if err := parseIntOption(opts, "tcp-keepalive", tcpKeepAlive); err != nil {
+		return err
 	}
-	if _, b := opts.Get("tls"); b {
-		*tlsEnabled = true
+	if err := parseBoolOption(opts, "tls", tlsEnabled); err != nil {
+		return err
 	}
 	if c, b := opts.Get("host"); b {
 		*host = c
@@ -82,8 +162,8 @@ func parseOptsIntoFlags() {
 	if c, b := opts.Get("loglevel"); b {
 		*logLevel = c
 	}
-	if _, b := opts.Get("server"); b {
-		*server = true
+	if err := parseBoolOption(opts, "server", server); err != nil {
+		return err
 	}
 	if c, b := opts.Get("localAddr"); b {
 		if *server {
@@ -114,24 +194,20 @@ func parseOptsIntoFlags() {
 		}
 	}
 
-	if _, b := opts.Get("fastOpen"); b {
-		*fastOpen = true
+	if err := parseBoolOption(opts, "fastOpen", fastOpen); err != nil {
+		return err
 	}
 
-	if _, b := opts.Get("__android_vpn"); b {
-		*vpn = true
+	if err := parseBoolOption(opts, "__android_vpn", vpn); err != nil {
+		return err
 	}
 
-	if c, b := opts.Get("fwmark"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*fwmark = i
-		} else {
-			logWarn("failed to parse fwmark, use default value")
-		}
+	if err := parseIntOption(opts, "fwmark", fwmark); err != nil {
+		return err
 	}
 
-	if c, b := opts.Get("ech"); b {
-		*echMode = c
+	if err := parseEnumOption(opts, "ech", []string{"auto", "always", "never"}, echMode); err != nil {
+		return err
 	}
 	if c, b := opts.Get("ech-doh"); b {
 		*echDoh = c
@@ -140,6 +216,8 @@ func parseOptsIntoFlags() {
 	if *vpn {
 		registerControlFunc()
 	}
+
+	return nil
 }
 
 // buildV2Ray generates the v2ray-core config and constructs the instance. The
@@ -203,14 +281,14 @@ func main() {
 	logInit()
 	printCoreVersion()
 
-	parseOptsIntoFlags()
+	if err := parseOptsIntoFlags(); err != nil {
+		failFatal(err)
+	}
 
 	// Must precede core.New: app/proxyman/outbound reads the registered
 	// controllers when it builds each handler's dialer.
 	if err := registerTCPKeepAlive(); err != nil {
-		emitFatal(err.Error(), nil)
-		logFatal(err.Error())
-		os.Exit(23) // config-class error
+		failFatal(err)
 	}
 
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
@@ -236,10 +314,7 @@ func main() {
 
 	server, err := buildV2Ray()
 	if err != nil {
-		emitFatal(err.Error(), nil)
-		logFatal(err.Error())
-		// Configuration error. Exit with a special value to prevent systemd from restarting.
-		os.Exit(23)
+		failFatal(err)
 	}
 
 	osSignals := make(chan os.Signal, 1)

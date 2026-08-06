@@ -127,19 +127,45 @@ func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	return func() { *echMode, *echDoh = origMode, origDoh }
 }
 
-// withEnv sets SS_PLUGIN_OPTIONS plus the four SS_* vars parseEnv gates on, for
-// the duration of the test (t.Setenv restores originals on cleanup). It also
-// snapshots and restores the address/port globals that a subsequent
-// parseOptsIntoFlags writes from SS_REMOTE_*/SS_LOCAL_*, so the restore boundary
-// matches the full mutation surface (withEchFlags only covers ech/ech-doh).
+// flagSnapshot captures every package-level flag parseOptsIntoFlags can
+// write, so a test can restore the exact pre-call state regardless of which
+// keys its SS_PLUGIN_OPTIONS happens to touch. `version` is the only
+// declared flag (config.go) parseOptsIntoFlags never writes, so it is
+// excluded.
+type flagSnapshot struct {
+	mode, host, path, cert, certRaw, key, logLevel, echMode, echDoh string
+	localAddrV, localPortV, remoteAddrV, remotePortV                string
+	mux, fwmark, tcpKeepAliveV                                      int
+	tlsEnabledV, serverV, fastOpenV, vpnV                           bool
+}
+
+func snapshotFlags() flagSnapshot {
+	return flagSnapshot{
+		mode: *mode, host: *host, path: *path, cert: *cert, certRaw: *certRaw, key: *key,
+		logLevel: *logLevel, echMode: *echMode, echDoh: *echDoh,
+		localAddrV: *localAddr, localPortV: *localPort, remoteAddrV: *remoteAddr, remotePortV: *remotePort,
+		mux: *mux, fwmark: *fwmark, tcpKeepAliveV: *tcpKeepAlive,
+		tlsEnabledV: *tlsEnabled, serverV: *server, fastOpenV: *fastOpen, vpnV: *vpn,
+	}
+}
+
+func (s flagSnapshot) restore() {
+	*mode, *host, *path, *cert, *certRaw, *key = s.mode, s.host, s.path, s.cert, s.certRaw, s.key
+	*logLevel, *echMode, *echDoh = s.logLevel, s.echMode, s.echDoh
+	*localAddr, *localPort, *remoteAddr, *remotePort = s.localAddrV, s.localPortV, s.remoteAddrV, s.remotePortV
+	*mux, *fwmark, *tcpKeepAlive = s.mux, s.fwmark, s.tcpKeepAliveV
+	*tlsEnabled, *server, *fastOpen, *vpn = s.tlsEnabledV, s.serverV, s.fastOpenV, s.vpnV
+}
+
+// withEnv snapshots every flag, THEN sets env; t.Cleanup restores the
+// snapshot. t.Cleanup callbacks run after the calling test function's own
+// defers, so a caller that also mutates a flag manually must do so AFTER
+// this call and rely on this snapshot's restore rather than a separate
+// defer -- two independent restore mechanisms race, and this one runs last.
 func withEnv(t *testing.T, pluginOptions string) {
 	t.Helper()
-	origLocalAddr, origLocalPort := *localAddr, *localPort
-	origRemoteAddr, origRemotePort := *remoteAddr, *remotePort
-	t.Cleanup(func() {
-		*localAddr, *localPort = origLocalAddr, origLocalPort
-		*remoteAddr, *remotePort = origRemoteAddr, origRemotePort
-	})
+	snap := snapshotFlags()
+	t.Cleanup(snap.restore)
 	for k, v := range map[string]string{
 		"SS_REMOTE_HOST":    "example.com",
 		"SS_REMOTE_PORT":    "443",
@@ -148,6 +174,124 @@ func withEnv(t *testing.T, pluginOptions string) {
 		"SS_PLUGIN_OPTIONS": pluginOptions,
 	} {
 		t.Setenv(k, v)
+	}
+}
+
+// withDistinctEnv sets the four SS_* vars to values that differ from every
+// flag default (127.0.0.1/1984 local, 127.0.0.1/1080 remote), so a test
+// cannot pass by silently falling back to defaults instead of actually
+// wiring the SS_*-derived values.
+func withDistinctEnv(t *testing.T, pluginOptions string) {
+	t.Helper()
+	snap := snapshotFlags()
+	t.Cleanup(snap.restore)
+	for k, v := range map[string]string{
+		"SS_REMOTE_HOST":    "chain.example.net",
+		"SS_REMOTE_PORT":    "9443",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": pluginOptions,
+	} {
+		t.Setenv(k, v)
+	}
+}
+
+// Every malformed string must make parseOptsIntoFlags fail, leaving all
+// four address flags untouched. Substrings are parsePluginOptions' own
+// error text (pinned separately in args_test.go).
+func TestParseOptsIntoFlagsRejectsMalformedOptions(t *testing.T) {
+	cases := []struct {
+		name          string
+		opts          string
+		wantErrSubstr string
+	}{
+		{"dangling escape", `host=example.com;path=/a\`, "unpaired backslash"},
+		{"empty key", `host=example.com;=v`, "has no key"},
+		{"empty segment", `host=example.com;;path=/`, "has no key"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			before := snapshotFlags() // captured pre-call, compared below -- proves "untouched", not just "equals a hardcoded literal"
+			withDistinctEnv(t, c.opts)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", c.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), c.wantErrSubstr) {
+				t.Errorf("parseOptsIntoFlags() error = %q, want it to contain %q", err.Error(), c.wantErrSubstr)
+			}
+			if *localAddr != before.localAddrV || *localPort != before.localPortV {
+				t.Errorf("localAddr/localPort = %q/%q after a rejected options string, want the untouched pre-call values %q/%q", *localAddr, *localPort, before.localAddrV, before.localPortV)
+			}
+			if *remoteAddr != before.remoteAddrV || *remotePort != before.remotePortV {
+				t.Errorf("remoteAddr/remotePort = %q/%q after a rejected options string, want the untouched pre-call values %q/%q", *remoteAddr, *remotePort, before.remoteAddrV, before.remotePortV)
+			}
+		})
+	}
+}
+
+// A malformed SS_PLUGIN_OPTIONS must be fatal even when the SS_* chain-
+// handoff vars are incomplete -- parseEnv validates the options string
+// independently of that completeness check. t.Setenv("SS_REMOTE_PORT", "")
+// makes the absence explicit rather than relying on the ambient
+// environment happening not to export it.
+func TestParseOptsIntoFlagsRejectsMalformedOptionsWithPartialSSEnv(t *testing.T) {
+	snap := snapshotFlags()
+	t.Cleanup(snap.restore)
+	t.Setenv("SS_REMOTE_HOST", "chain.example.net")
+	t.Setenv("SS_REMOTE_PORT", "")
+	t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
+	t.Setenv("SS_LOCAL_PORT", "45999")
+	t.Setenv("SS_PLUGIN_OPTIONS", `host=example.com;path=/a\`)
+
+	err := parseOptsIntoFlags()
+	if err == nil {
+		t.Fatal("parseOptsIntoFlags() = nil error, want an error (malformed options, even with SS_REMOTE_PORT unset)")
+	}
+	if !strings.Contains(err.Error(), "unpaired backslash") {
+		t.Errorf("error = %q, want it to mention the unpaired backslash", err.Error())
+	}
+	if *localAddr != snap.localAddrV || *localPort != snap.localPortV {
+		t.Errorf("localAddr/localPort = %q/%q after a rejected options string, want the untouched pre-call values %q/%q", *localAddr, *localPort, snap.localAddrV, snap.localPortV)
+	}
+}
+
+// The control row: a valid options string must still wire all four
+// SS_*-derived addresses through (withDistinctEnv's values differ from
+// every flag default, so a default-fallback wouldn't pass).
+func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
+	withDistinctEnv(t, "host=example.com;path=/")
+	if err := parseOptsIntoFlags(); err != nil {
+		t.Fatalf("parseOptsIntoFlags() with a valid options string = %v, want nil", err)
+	}
+	if *localAddr != "10.1.2.3" || *localPort != "45999" {
+		t.Errorf("localAddr/localPort = %q/%q, want the SS_LOCAL_*-derived 10.1.2.3/45999", *localAddr, *localPort)
+	}
+	if *remoteAddr != "chain.example.net" || *remotePort != "9443" {
+		t.Errorf("remoteAddr/remotePort = %q/%q, want the SS_REMOTE_*-derived chain.example.net/9443", *remoteAddr, *remotePort)
+	}
+}
+
+// Pins the newly-live path this task's parseEnv restructuring introduces:
+// SS_PLUGIN_OPTIONS now applies even with NO SS_* env at all (the
+// fully-standalone case), where it was previously always inert (parseEnv's
+// old completeness gate ran before SS_PLUGIN_OPTIONS was ever read, so a
+// standalone invocation never reached it, regardless of whether SS_* was
+// fully absent or partially set). A CLI flag set first must still survive
+// SS_PLUGIN_OPTIONS being empty for that key.
+func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
+	snap := snapshotFlags()
+	t.Cleanup(snap.restore)
+	for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
+		t.Setenv(v, "")
+	}
+	t.Setenv("SS_PLUGIN_OPTIONS", "host=standalone.example.com")
+
+	if err := parseOptsIntoFlags(); err != nil {
+		t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+	}
+	if *host != "standalone.example.com" {
+		t.Errorf("*host = %q, want the SS_PLUGIN_OPTIONS-derived value (no SS_* env was set at all)", *host)
 	}
 }
 
@@ -174,10 +318,16 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			restore := withEchFlags(t, "auto", "")
-			defer restore()
+			// withEnv's snapshot must run before withEchFlags mutates
+			// echMode/echDoh, so its t.Cleanup restore (which runs after
+			// this func's own defers) captures the true pre-subtest state.
+			// withEchFlags's own returned restore func is deliberately left
+			// undeferred for the same reason.
 			withEnv(t, c.opts)
-			parseOptsIntoFlags()
+			withEchFlags(t, "auto", "")
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v", err)
+			}
 			if *echMode != c.wantMode {
 				t.Errorf("%s: *echMode = %q, want %q", c.desc, *echMode, c.wantMode)
 			}
@@ -528,10 +678,20 @@ func TestMuxFlagDefault(t *testing.T) {
 	}
 }
 
-// Inputs mirror what galoshes hands its embedded ex-ray; expectations come from
-// the grammar in args.go (first-wins, escapes), not from running galoshes.
+// intOptionSeedSentinel never equals any want value in this file's tables
+// (0, 1, 8, muxDefault, tcpKeepAliveDefault, fwmarkDefault are all small
+// non-negative ints), so every subtest can tell "correctly computed" apart
+// from "never touched, still the seed".
+const intOptionSeedSentinel = -999
+
+// mux-specific coverage beyond the shared intOptions table below:
+// first-wins override and the escape/absorption edge cases from args.go's
+// grammar. galoshes' ex_ray_options relies on exactly these shapes to
+// decide what it must refuse to emit.
 func TestParseOptsIntoFlagsMux(t *testing.T) {
-	cases := []struct {
+	// The mux key is present in the parsed options; its value (or absence
+	// of a usable one) determines *mux.
+	presentCases := []struct {
 		desc string
 		opts string
 		want int
@@ -540,26 +700,422 @@ func TestParseOptsIntoFlagsMux(t *testing.T) {
 		{"appended after directives", "host=cloudfront.com;path=/;mux=0", 0},
 		{"appended after an escaped semicolon", `path=/a\;;mux=0`, 0},
 		{"operator override wins (first-wins)", "mux=8;path=/;mux=0", 8},
-		{"no mux key keeps the flag default", "host=cloudfront.com;path=/", 1},
-		// The shapes galoshes' ex_ray_options refuses to emit. Each leaves mux at
-		// 1 -- Mux.Cool silently ON -- which is precisely why it refuses.
-		{"one trailing backslash is a dangling escape", `a=b\;mux=0`, 1},
-		{"two are a literal backslash, so the separator holds", `a=b\\;mux=0`, 0},
-		{"three are a literal backslash plus a dangling escape", `a=b\\\;mux=0`, 1},
-		{"an empty segment voids the whole string", "mode=websocket;;mux=0", 1},
-		{"an empty key voids the whole string", "host=h;=v;mux=0", 1},
+		{"bare key resolves to the literal value 1 (== muxDefault here)", "mux", muxDefault},
+		{"two backslashes are a literal backslash, separator holds", `a=b\\;mux=0`, 0},
 	}
-	for _, c := range cases {
+	for _, c := range presentCases {
 		t.Run(c.desc, func(t *testing.T) {
-			orig := *mux
-			defer func() { *mux = orig }()
-			*mux = 1
 			withEnv(t, c.opts)
-			parseOptsIntoFlags()
+			*mux = intOptionSeedSentinel
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("%s: parseOptsIntoFlags() = %v, want nil", c.desc, err)
+			}
 			if *mux != c.want {
 				t.Errorf("%s: *mux = %d, want %d", c.desc, *mux, c.want)
 			}
 		})
+	}
+
+	// The mux key never reaches parseIntOption for these inputs -- *mux
+	// must be left completely untouched (stays the seed), not reset to any
+	// default.
+	absentCases := []struct {
+		desc string
+		opts string
+	}{
+		{"no mux key at all", "host=cloudfront.com;path=/"},
+		// A single backslash before ';' escapes the semicolon, so "mux=0" is
+		// absorbed into the preceding value instead of becoming its own
+		// directive -- no mux key is ever produced.
+		{"one backslash before ';' absorbs the rest into the value, no mux key", `a=b\;mux=0`},
+		// Three backslashes: one literal backslash + one more escaping the
+		// ';' the same way -- absorbs the rest identically.
+		{"three backslashes: one literal backslash + escaped ';', absorbs the rest", `a=b\\\;mux=0`},
+	}
+	for _, c := range absentCases {
+		t.Run(c.desc, func(t *testing.T) {
+			withEnv(t, c.opts)
+			*mux = intOptionSeedSentinel
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("%s: parseOptsIntoFlags() = %v, want nil", c.desc, err)
+			}
+			if *mux != intOptionSeedSentinel {
+				t.Errorf("%s: *mux = %d, want it untouched at the seed %d", c.desc, *mux, intOptionSeedSentinel)
+			}
+		})
+	}
+}
+
+// intOption bundles what the shared tests below need for each
+// Atoi-parsed option in parseOptsIntoFlags.
+type intOption struct {
+	key string
+	get func() int
+	set func(int)
+}
+
+func intOptions() []intOption {
+	return []intOption{
+		{"mux", func() int { return *mux }, func(v int) { *mux = v }},
+		{"tcp-keepalive", func() int { return *tcpKeepAlive }, func(v int) { *tcpKeepAlive = v }},
+		{"fwmark", func() int { return *fwmark }, func(v int) { *fwmark = v }},
+	}
+}
+
+// An explicit empty value ("key=") is a no-op, like an absent key -- leaves
+// the flag at whatever it already held. The seed stands in for a CLI flag
+// that was set before parseOptsIntoFlags ran (flag.Parse happens first in
+// main()): this proves an empty value doesn't clobber it, not just that it
+// doesn't clobber a registered default.
+func TestParseOptsIntoFlagsIntOptionsEmptyValueIsANoOp(t *testing.T) {
+	for _, o := range intOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, o.key+"=")
+			o.set(intOptionSeedSentinel)
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			}
+			if got := o.get(); got != intOptionSeedSentinel {
+				t.Errorf("%s= -> %d, want it untouched at the seed %d", o.key, got, intOptionSeedSentinel)
+			}
+		})
+	}
+}
+
+// Documents a known, tested mismatch, not a silent one: a bare key
+// resolves to the parser's literal "1", which equals muxDefault but not
+// tcpKeepAliveDefault/fwmarkDefault. Fixing this needs args.go's Args type
+// to distinguish a bare key from an explicit "=1", a grammar change
+// tracked as part of #744 (the same bare-key seam on the garter side)
+// rather than attempted here.
+func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
+	for _, o := range intOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, o.key)
+			o.set(intOptionSeedSentinel)
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			}
+			if got := o.get(); got != 1 {
+				t.Errorf("bare %s -> %d, want the literal value 1", o.key, got)
+			}
+		})
+	}
+}
+
+// A bad int-option value is fatal even when the SS_* chain-handoff env is
+// incomplete (parseEnv, Task 1 Step 4): SS_PLUGIN_OPTIONS is applied
+// regardless of SS_* completeness, so mux=off (or the tcp-keepalive/fwmark
+// equivalent) can't survive by riding an incomplete env. Loops over all
+// three options like every sibling int-option test in this file, so this
+// isn't covered for mux alone while tcp-keepalive/fwmark go untested in
+// this specific (invalid value + partial env) combination.
+func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValueWithPartialSSEnv(t *testing.T) {
+	for _, o := range intOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			snap := snapshotFlags()
+			t.Cleanup(snap.restore)
+			t.Setenv("SS_REMOTE_HOST", "chain.example.net")
+			t.Setenv("SS_REMOTE_PORT", "")
+			t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
+			t.Setenv("SS_LOCAL_PORT", "45999")
+			t.Setenv("SS_PLUGIN_OPTIONS", o.key+"=off")
+			o.set(intOptionSeedSentinel)
+
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q (even with SS_REMOTE_PORT unset)", o.key)
+			}
+			if !strings.Contains(err.Error(), o.key) {
+				t.Errorf("error %q does not mention %q", err.Error(), o.key)
+			}
+		})
+	}
+}
+
+// A non-empty, non-numeric value must be rejected, not silently kept as the
+// default -- mux=off must not leave Mux.Cool ON; the identical shape
+// applies to tcp-keepalive and fwmark. The error must name the option.
+func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValue(t *testing.T) {
+	for _, o := range intOptions() {
+		for _, bad := range []string{"off", "false", "no"} {
+			t.Run(o.key+"="+bad, func(t *testing.T) {
+				withEnv(t, o.key+"="+bad)
+				o.set(intOptionSeedSentinel)
+				err := parseOptsIntoFlags()
+				if err == nil {
+					t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
+				}
+				if !strings.Contains(err.Error(), o.key) {
+					t.Errorf("error %q does not mention %q", err.Error(), o.key)
+				}
+				if got := o.get(); got != intOptionSeedSentinel {
+					t.Errorf("%s=%s: value = %d after a rejected value, want the untouched pre-call value %d", o.key, bad, got, intOptionSeedSentinel)
+				}
+			})
+		}
+	}
+}
+
+// The rejected value must never appear in the error text. Checked with a
+// distinctive, secret-shaped value via the same backslash-absorption
+// exploit as TestMalformedOptionsErrorsNeverEchoSegmentContent, rather than
+// substring-checking against short English words like "off"/"no" -- "no" is
+// a substring of "not" (as in "value is not an integer"), which would make
+// that check fail on the correct, non-leaking message.
+func TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T) {
+	for _, o := range intOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, o.key+`=abc\;certRaw=SUPERSECRETVALUE`)
+			o.set(intOptionSeedSentinel)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
+			}
+			if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+				t.Errorf("error %q leaks an absorbed segment", err.Error())
+			}
+		})
+	}
+}
+
+// A malformed SS_PLUGIN_OPTIONS string is fatal before any of these
+// per-option blocks run, and must leave every one of them untouched.
+func TestParseOptsIntoFlagsIntOptionsUntouchedByMalformedOptions(t *testing.T) {
+	const malformed = "host=h;=v;mux=0;tcp-keepalive=0;fwmark=1"
+	for _, o := range intOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, malformed)
+			o.set(intOptionSeedSentinel)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatal("parseOptsIntoFlags() = nil error, want an error (malformed SS_PLUGIN_OPTIONS)")
+			}
+			if got := o.get(); got != intOptionSeedSentinel {
+				t.Errorf("%s: value = %d after a rejected string, want the untouched pre-call value %d", o.key, got, intOptionSeedSentinel)
+			}
+		})
+	}
+}
+
+// boolOption bundles what the shared tests below need for each
+// presence-only option in parseOptsIntoFlags.
+type boolOption struct {
+	key string
+	get func() bool
+	set func(bool)
+}
+
+func boolOptions() []boolOption {
+	return []boolOption{
+		{"tls", func() bool { return *tlsEnabled }, func(v bool) { *tlsEnabled = v }},
+		{"server", func() bool { return *server }, func(v bool) { *server = v }},
+		{"fastOpen", func() bool { return *fastOpen }, func(v bool) { *fastOpen = v }},
+		{"__android_vpn", func() bool { return *vpn }, func(v bool) { *vpn = v }},
+	}
+}
+
+// Bare key or explicit "key=1" enables the flag -- the only two spellings
+// args.go's grammar can produce for "the operator wrote this key with no
+// value" and "the operator wrote this key with the parser's own bare-key
+// literal", respectively.
+func TestParseOptsIntoFlagsBoolOptionsBareKeyOrExplicitOneEnables(t *testing.T) {
+	for _, o := range boolOptions() {
+		for _, opts := range []string{o.key, o.key + "=1"} {
+			t.Run(opts, func(t *testing.T) {
+				withEnv(t, opts)
+				o.set(false)
+				if err := parseOptsIntoFlags(); err != nil {
+					t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+				}
+				if !o.get() {
+					t.Errorf("%s -> false, want true", opts)
+				}
+			})
+		}
+	}
+}
+
+// An explicit empty value is a no-op, like an absent key -- leaves the
+// flag at whatever it already held (mirrors TestParseOptsIntoFlagsIntOptionsEmptyValueIsANoOp).
+func TestParseOptsIntoFlagsBoolOptionsEmptyValueIsANoOp(t *testing.T) {
+	for _, o := range boolOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, o.key+"=")
+			o.set(true)
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			}
+			if !o.get() {
+				t.Errorf("%s= -> false, want it untouched at true", o.key)
+			}
+		})
+	}
+}
+
+// The exact bug being fixed: today, ANY value -- including one that reads
+// as "off" to a human -- silently enables the flag. tls=false must not
+// enable TLS; server=no must not flip into server mode (the #734/#738
+// direction-disagreement class, from the value side). No value-echo check
+// here: "no" is a substring of "not" (as in "value is not recognized"),
+// which would make that check fail on the correct, non-leaking message --
+// the same trap the int-option tests document. The dedicated no-echo test
+// below covers that property with a value the message text can't
+// accidentally contain.
+func TestParseOptsIntoFlagsBoolOptionsRejectUnrecognizedValue(t *testing.T) {
+	for _, o := range boolOptions() {
+		for _, bad := range []string{"false", "0", "no", "true", "yes"} {
+			t.Run(o.key+"="+bad, func(t *testing.T) {
+				withEnv(t, o.key+"="+bad)
+				o.set(true)
+				err := parseOptsIntoFlags()
+				if err == nil {
+					t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
+				}
+				if !strings.Contains(err.Error(), o.key) {
+					t.Errorf("error %q does not mention %q", err.Error(), o.key)
+				}
+				if !o.get() {
+					t.Errorf("%s=%s: value = false after a rejected value, want it untouched at true", o.key, bad)
+				}
+			})
+		}
+	}
+}
+
+// The rejected value must never appear in the error text, checked with a
+// distinctive value via the same backslash-absorption exploit used
+// throughout this plan, mirroring TestParseOptsIntoFlagsIntOptionsErrorNeverEchoesAbsorbedSecret.
+func TestParseOptsIntoFlagsBoolOptionsErrorNeverEchoesAbsorbedSecret(t *testing.T) {
+	for _, o := range boolOptions() {
+		t.Run(o.key, func(t *testing.T) {
+			withEnv(t, o.key+`=abc\;certRaw=SUPERSECRETVALUE`)
+			o.set(true)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
+			}
+			if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+				t.Errorf("error %q leaks an absorbed segment", err.Error())
+			}
+		})
+	}
+}
+
+// The same never-echo property args.go's parse errors and parseIntOption
+// already have, extended to generateConfig/buildTLSConfig's own fatal
+// paths -- these are reachable from SS_PLUGIN_OPTIONS too (localPort,
+// remotePort, mode, ech all come straight from parsed options), and the
+// same backslash-absorption trick applies to any of them.
+func TestGenerateConfigErrorsNeverEchoOptionValues(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalPort, origRemotePort, origMode := *localPort, *remotePort, *mode
+	defer func() { *localPort, *remotePort, *mode = origLocalPort, origRemotePort, origMode }()
+
+	*localPort, *remotePort, *mode = `1\;certRaw=SUPERSECRETVALUE`, "1080", "websocket"
+	if _, err := generateConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("localPort error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	*localPort, *remotePort, *mode = "1984", `1\;certRaw=SUPERSECRETVALUE`, "websocket"
+	if _, err := generateConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("remotePort error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	*localPort, *remotePort, *mode = "1984", "1080", `abc\;certRaw=SUPERSECRETVALUE`
+	if _, err := generateConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("mode error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// The same property for buildTLSConfig's invalid-ech-mode site, which
+// needs tlsEnabled=true to reach (TestBuildTLSConfigEch's own precondition).
+func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
+	restore := withEchFlags(t, `abc\;certRaw=SUPERSECRETVALUE`, "")
+	defer restore()
+	origHost, origTLS := *host, *tlsEnabled
+	*host, *tlsEnabled = "example.com", true
+	defer func() { *host, *tlsEnabled = origHost, origTLS }()
+
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("buildTLSConfig() error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// The bug parseEnumOption exists to close: an unrecognized ech value must
+// be fatal even WITHOUT tls set, where buildTLSConfig's own check is never
+// reached at all.
+func TestParseOptsIntoFlagsRejectsUnrecognizedEchWithoutTLS(t *testing.T) {
+	withEnv(t, "ech=alwyas") //nolint:misspell // deliberate typo: a plausible operator mistake, not a real word
+	origEchMode := *echMode
+	defer func() { *echMode = origEchMode }()
+	*echMode = "auto"
+
+	err := parseOptsIntoFlags()
+	if err == nil {
+		t.Fatal("parseOptsIntoFlags() = nil error, want an error mentioning ech")
+	}
+	if !strings.Contains(err.Error(), "ech") {
+		t.Errorf("error %q does not mention ech", err.Error())
+	}
+	if *echMode != "auto" {
+		t.Errorf("*echMode = %q after a rejected value, want it untouched at %q", *echMode, "auto")
+	}
+}
+
+// Every documented loglevel value (the flag's own help text: "debug, info,
+// warning (default), error, none") must still build without error,
+// including the empty string (no option given) and the explicit "warning"
+// spelling -- both resolve to the same Warning default.
+func TestGenerateConfigAcceptsAllDocumentedLogLevels(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	orig := *logLevel
+	defer func() { *logLevel = orig }()
+	for _, lvl := range []string{"", "debug", "info", "warning", "error", "none"} {
+		*logLevel = lvl
+		if _, err := generateConfig(); err != nil {
+			t.Errorf("generateConfig() with loglevel=%q: %v, want nil", lvl, err)
+		}
+	}
+}
+
+// The exact bug being fixed: a typo'd loglevel must not silently resolve
+// to Warning and look identical to a correctly-set one.
+func TestGenerateConfigRejectsUnrecognizedLogLevel(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	orig := *logLevel
+	defer func() { *logLevel = orig }()
+	*logLevel = "warn" // a plausible typo for "warning"
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() = nil error, want an error mentioning loglevel")
+	}
+	if !strings.Contains(err.Error(), "loglevel") {
+		t.Errorf("error %q does not mention loglevel", err.Error())
+	}
+}
+
+// The rejected value must never appear in the error text. A literal check
+// for "warn" would only catch a %q-formatted echo (e.g. `invalid loglevel:
+// "warn"`) and pass on a plain-concatenation echo (`invalid loglevel: warn`,
+// exactly how every other config.go site being fixed in this same step was
+// written) -- checked instead with a distinctive value via the same
+// backslash-absorption exploit used throughout this plan.
+func TestGenerateConfigLogLevelErrorNeverEchoesValue(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	orig := *logLevel
+	defer func() { *logLevel = orig }()
+	*logLevel = `abc\;certRaw=SUPERSECRETVALUE`
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() = nil error, want an error mentioning loglevel")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("error %q leaks an absorbed segment", err.Error())
 	}
 }
 

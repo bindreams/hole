@@ -34,6 +34,16 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet/websocket"
 )
 
+// muxDefault, tcpKeepAliveDefault, and fwmarkDefault are these three flags'
+// registered defaults, named so the values aren't repeated as magic
+// numbers at the flag registration and (for mux) in doc comments elsewhere
+// that reference "the default".
+const (
+	muxDefault          = 1
+	tcpKeepAliveDefault = 15
+	fwmarkDefault       = 0
+)
+
 var (
 	vpn          = flag.Bool("V", false, "Run in VPN mode.")
 	fastOpen     = flag.Bool("fast-open", false, "Enable TCP fast open.")
@@ -48,14 +58,14 @@ var (
 	certRaw      = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
 	key          = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
 	mode         = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
-	mux          = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
+	mux          = flag.Int("mux", muxDefault, "Concurrent multiplexed connections (websocket client mode only).")
 	server       = flag.Bool("server", false, "Run in server mode")
 	logLevel     = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
 	version      = flag.Bool("version", false, "Show current version of ex-ray")
-	fwmark       = flag.Int("fwmark", 0, "Set SO_MARK option for outbound sockets.")
+	fwmark       = flag.Int("fwmark", fwmarkDefault, "Set SO_MARK option for outbound sockets.")
 	echMode      = flag.String("ech", "auto", "ECH (Encrypted Client Hello) mode: auto (opportunistic), always (fail-closed), never.")
 	echDoh       = flag.String("ech-doh", "", "DoH URL used to fetch the ECH config (HTTPS record). Empty disables ECH.")
-	tcpKeepAlive = flag.Int("tcp-keepalive", 15, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
+	tcpKeepAlive = flag.Int("tcp-keepalive", tcpKeepAliveDefault, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
 )
 
 func homeDir() string {
@@ -80,13 +90,20 @@ func readCertificate() ([]byte, error) {
 	panic("thou shalt not reach hear")
 }
 
-func logConfig(logLevel string) *vlog.Config {
+// logConfig builds the v2ray-core log config for the operator-chosen
+// level. An unrecognized value is fatal rather than silently resolving to
+// the Warning default -- the empty string ("" -- no loglevel option given)
+// and the explicit "warning" spelling are the two ways to ask for that
+// default; anything else that doesn't match a known level is an error, not
+// a guess.
+func logConfig(logLevel string) (*vlog.Config, error) {
 	config := &vlog.Config{
 		Error:  &vlog.LogSpecification{Type: vlog.LogType_Console, Level: clog.Severity_Warning},
 		Access: &vlog.LogSpecification{Type: vlog.LogType_Console},
 	}
-	level := strings.ToLower(logLevel)
-	switch level {
+	switch strings.ToLower(logLevel) {
+	case "", "warning":
+		// Already the default set above.
 	case "debug":
 		config.Error.Level = clog.Severity_Debug
 	case "info":
@@ -96,8 +113,10 @@ func logConfig(logLevel string) *vlog.Config {
 	case "none":
 		config.Error.Type = vlog.LogType_None
 		config.Access.Type = vlog.LogType_None
+	default:
+		return nil, newError("invalid loglevel: value is not recognized")
 	}
-	return config
+	return config, nil
 }
 
 func parseLocalAddr(localAddr string) []string {
@@ -114,7 +133,7 @@ func uint32Opt(name string, v int) (uint32, error) {
 	if v >= 0 && v <= math.MaxUint32 {
 		return uint32(v), nil
 	}
-	return 0, newError("invalid", name, "(expected 0..4294967295), got:", v)
+	return 0, newError("invalid", name, "(expected 0..4294967295)")
 }
 
 const (
@@ -134,7 +153,7 @@ const (
 func tcpKeepAliveParams() (keepAliveParams, error) {
 	v := *tcpKeepAlive
 	if v < 0 || v > keepAliveMaxSeconds {
-		return keepAliveParams{}, newError("invalid tcp-keepalive (expected 0..", keepAliveMaxSeconds, "), got:", v)
+		return keepAliveParams{}, newError("invalid tcp-keepalive (expected 0..", keepAliveMaxSeconds, ")")
 	}
 	idle := int32(v)
 	if idle == 0 {
@@ -219,7 +238,7 @@ func buildTLSConfig() (*tls.Config, error) {
 			return nil, newError("ech=always requires ech-doh to be set; refusing to start without a DoH source for fail-closed ECH")
 		}
 	default:
-		return nil, newError("invalid ech mode:", *echMode, "(expected auto, always, or never)")
+		return nil, newError("invalid ech mode (expected auto, always, or never)")
 	}
 
 	return tlsConfig, nil
@@ -247,11 +266,11 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 func generateConfig() (*core.Config, error) {
 	lport, err := net.PortFromString(*localPort)
 	if err != nil {
-		return nil, newError("invalid localPort:", *localPort).Base(err)
+		return nil, newError("invalid localPort: not a valid port")
 	}
 	rport, err := strconv.ParseUint(*remotePort, 10, 32)
 	if err != nil {
-		return nil, newError("invalid remotePort:", *remotePort).Base(err)
+		return nil, newError("invalid remotePort: not a valid port")
 	}
 	// Validate operator-supplied numeric options up-front, before the
 	// server/client split, so out-of-range mux/fwmark are rejected identically
@@ -293,7 +312,7 @@ func generateConfig() (*core.Config, error) {
 		}
 		*tlsEnabled = true
 	default:
-		return nil, newError("unsupported mode:", *mode)
+		return nil, newError("unsupported mode (expected websocket or quic)")
 	}
 
 	streamConfig := internet.StreamConfig{
@@ -341,11 +360,15 @@ func generateConfig() (*core.Config, error) {
 		streamConfig.SecuritySettings = []*anypb.Any{serial.ToTypedMessage(sec)}
 	}
 
+	logCfg, err := logConfig(*logLevel)
+	if err != nil {
+		return nil, err
+	}
 	apps := []*anypb.Any{
 		serial.ToTypedMessage(&dispatcher.Config{}),
 		serial.ToTypedMessage(&proxyman.InboundConfig{}),
 		serial.ToTypedMessage(&proxyman.OutboundConfig{}),
-		serial.ToTypedMessage(logConfig(*logLevel)),
+		serial.ToTypedMessage(logCfg),
 	}
 
 	if *server {
