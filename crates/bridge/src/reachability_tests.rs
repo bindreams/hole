@@ -46,12 +46,15 @@ async fn accept_then_answer() -> SocketAddr {
 // `nextest run … reachability_tests` substring filter only matches with it.
 #[skuld::test(name = "reachability_tests::classify_no_plugin_is_raw")]
 fn classify_no_plugin_is_raw() {
-    assert!(matches!(classify_transport(None, None, "ex.com"), ProbeTransport::Raw));
+    assert!(matches!(
+        classify_transport(None, None, "ex.com").unwrap(),
+        ProbeTransport::Raw
+    ));
 }
 #[skuld::test(name = "reachability_tests::classify_tls_ws_sni_is_connect_host_not_opt")]
 fn classify_tls_ws_sni_is_connect_host_not_opt() {
     // A failure-only diagnostic must not emit the proxy domain in cleartext.
-    match classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv") {
+    match classify_transport(Some("galoshes"), Some("tls;path=/t/x;host=h.ex.com"), "srv").unwrap() {
         ProbeTransport::TlsWs { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
             assert_ne!(sni, "h.ex.com", "SNI must not leak the host= opt (domain)");
@@ -61,7 +64,7 @@ fn classify_tls_ws_sni_is_connect_host_not_opt() {
 }
 #[skuld::test(name = "reachability_tests::classify_plain_ws_defaults_path_and_host")]
 fn classify_plain_ws_defaults_path_and_host() {
-    match classify_transport(Some("galoshes"), Some("path=/t/x"), "srv.ex.com") {
+    match classify_transport(Some("galoshes"), Some("path=/t/x"), "srv.ex.com").unwrap() {
         ProbeTransport::PlainWs { host, path } => {
             assert_eq!(host, "srv.ex.com");
             assert_eq!(path, "/t/x");
@@ -69,16 +72,74 @@ fn classify_plain_ws_defaults_path_and_host() {
         _ => panic!(),
     }
 }
+// Mirrors classify_transport's bare-path handling (see its doc comment).
+#[skuld::test(name = "reachability_tests::classify_path_key_matches_ex_ray_for_absent_bare_and_valued")]
+fn classify_path_key_matches_ex_ray_for_absent_bare_and_valued() {
+    let cases = [
+        ("host=h", "/"),          // absent: flag default "/", already normalized
+        ("path;host=h", "/1"),    // bare: flag "1", normalized to "/1"
+        ("path=;host=h", "/"),    // explicit empty: flag "", normalized to "/"
+        ("path=x;host=h", "/x"),  // explicit, no leading slash: normalized to "/x"
+        ("path=/x;host=h", "/x"), // explicit, already slash-prefixed: unchanged
+    ];
+    for (opts, expected) in cases {
+        match classify_transport(Some("galoshes"), Some(opts), "srv.ex.com").unwrap() {
+            ProbeTransport::PlainWs { path, .. } => {
+                assert_eq!(path, expected, "opts={opts:?}");
+            }
+            _ => panic!("expected PlainWs for opts={opts:?}"),
+        }
+    }
+}
 #[skuld::test(name = "reachability_tests::classify_quic_forces_quic")]
 fn classify_quic_forces_quic() {
     // Same no-domain-leak rule as the TLS-WS probe.
-    match classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv") {
+    match classify_transport(Some("galoshes"), Some("mode=quic;host=h"), "srv").unwrap() {
         ProbeTransport::Quic { sni } => {
             assert_eq!(sni, "srv", "SNI must be the connect host");
             assert_ne!(sni, "h", "SNI must not leak the host= opt");
         }
         _ => panic!("expected Quic"),
     }
+}
+#[skuld::test(name = "reachability_tests::classify_rejects_malformed_options")]
+fn classify_rejects_malformed_options() {
+    assert!(classify_transport(Some("galoshes"), Some(r"path=/a\"), "srv").is_err());
+}
+#[skuld::test(name = "reachability_tests::classify_recognizes_an_escaped_tls_key")]
+fn classify_recognizes_an_escaped_tls_key() {
+    // A backslash escapes whatever byte follows, so `\tls` IS `tls` — to
+    // ex-ray, and here.
+    match classify_transport(Some("galoshes"), Some(r"\tls;host=h"), "srv").unwrap() {
+        ProbeTransport::TlsWs { .. } => {}
+        _ => panic!("expected TlsWs for an escaped tls key"),
+    }
+}
+#[skuld::test(name = "reachability_tests::classify_first_wins_on_duplicate_mode_key")]
+fn classify_first_wins_on_duplicate_mode_key() {
+    // ex-ray's Args.Get is first-wins; the FIRST `mode=` must be the one
+    // consulted.
+    match classify_transport(Some("galoshes"), Some("mode=quic;mode=websocket"), "srv").unwrap() {
+        ProbeTransport::Quic { .. } => {}
+        _ => panic!("expected Quic (first mode= wins)"),
+    }
+}
+#[skuld::test(name = "reachability_tests::malformed_options_probe_is_inconclusive")]
+async fn malformed_options_probe_is_inconclusive() {
+    // Unlike `server_endpoint_is_udp`'s assume-UDP fallback, guessing wrong
+    // here produces a false confident verdict either way — Inconclusive.
+    let a = accept_then_answer().await;
+    assert_eq!(
+        probe_server_reachability(
+            &a.ip().to_string(),
+            a.port(),
+            Some("galoshes"),
+            Some(r"path=/a\"),
+            &CancellationToken::new()
+        )
+        .await,
+        ReachabilityVerdict::Inconclusive
+    );
 }
 // A `.` flanked by alphanumerics on both sides — the shape of a domain label or
 // IP octet boundary (`ex.com`, `1.2.3.4`). A sentence-final `.` (followed by a

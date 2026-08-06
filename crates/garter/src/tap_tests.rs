@@ -129,6 +129,29 @@ async fn handle_stub_conn(mut stream: TcpStream, behavior: Behavior) {
     }
 }
 
+/// Never binds anything and returns immediately without ever sending on its
+/// `ready` channel — the shape `TapPlugin::run`'s inner-exit race (see its
+/// doc comment) exists to detect.
+struct ExitsBeforeReadyPlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ExitsBeforeReadyPlugin {
+    fn name(&self) -> &str {
+        "exits-before-ready"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+    ) -> crate::Result<()> {
+        drop(ready);
+        Ok(())
+    }
+}
+
 fn unused_remote() -> SocketAddr {
     // The stubs ignore `remote`; any valid address works.
     "127.0.0.1:1".parse().unwrap()
@@ -390,6 +413,30 @@ async fn cross_check_inbound_and_upstream_counters_match() {
     assert!(
         captured.contains("bytes_inbound_written=7"),
         "inbound_written=7:\n{captured}"
+    );
+}
+
+// This PR introduced `StartError::ExitedBeforeReady` specifically so a caller
+// can `match` on the variant instead of comparing `detail` text (see its doc
+// comment, which names TapPlugin's inner-exit race by name) — this pins that
+// TapPlugin actually emits it, not the `Fatal` variant it used before.
+#[skuld::test]
+async fn tap_reports_exited_before_ready_when_inner_exits_without_binding() {
+    let local = pick_local().await;
+    let remote = unused_remote();
+    let shutdown = CancellationToken::new();
+    let inner = Box::new(ExitsBeforeReadyPlugin) as Box<dyn ChainPlugin>;
+    let tap = Box::new(TapPlugin::wrap(inner));
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let _ = tap.run(local, remote, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("tap must report something on its own ready channel");
+    assert!(
+        matches!(outcome, Err(crate::sitrep::StartError::ExitedBeforeReady)),
+        "expected ExitedBeforeReady, got {outcome:?}"
     );
 }
 

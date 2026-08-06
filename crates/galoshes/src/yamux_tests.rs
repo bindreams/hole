@@ -183,10 +183,10 @@ fn udp_timeout_parsed_value() {
 }
 
 #[skuld::test]
-fn udp_timeout_last_occurrence_wins() {
+fn udp_timeout_first_occurrence_wins() {
     assert_eq!(
         parse_udp_timeout(Some("udp_timeout=5;udp_timeout=20")).unwrap(),
-        Duration::from_secs(20)
+        Duration::from_secs(5)
     );
 }
 
@@ -197,6 +197,27 @@ fn udp_timeout_invalid_is_error() {
     // 0 would evict every association immediately — rejected.
     assert!(parse_udp_timeout(Some("udp_timeout=0")).is_err());
     assert!(parse_udp_timeout(Some("udp_timeout=-1")).is_err());
+}
+
+// First-wins selects the value, but every occurrence is still validated —
+// a self-contradictory duplicate must still refuse the start, not silently
+// keep the first (valid) value and ignore an invalid later one.
+#[skuld::test]
+fn udp_timeout_validates_every_occurrence_not_just_the_first() {
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=0")).is_err());
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=abc")).is_err());
+}
+
+#[skuld::test]
+fn udp_timeout_errors_on_malformed_options() {
+    // A dangling trailing backslash is fatal to ex-ray's own parser; failing
+    // loud here beats silently falling back to the default. The reason must
+    // survive in the error's own message, not just the fact that it failed.
+    let err = parse_udp_timeout(Some(r"udp_timeout=10;path=/a\")).unwrap_err();
+    assert!(
+        err.to_string().contains("unpaired backslash"),
+        "expected the specific reason in the message, got: {err}"
+    );
 }
 
 // End-to-end UDP relay (#415) -----------------------------------------------------------------------------------------

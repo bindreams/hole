@@ -18,7 +18,7 @@ impl PluginEnv {
             local_port: read_env_parsed("SS_LOCAL_PORT")?,
             remote_host: read_env("SS_REMOTE_HOST")?,
             remote_port: read_env_parsed("SS_REMOTE_PORT")?,
-            plugin_options: std::env::var("SS_PLUGIN_OPTIONS").ok(),
+            plugin_options: read_env_optional("SS_PLUGIN_OPTIONS")?,
         })
     }
 
@@ -52,30 +52,40 @@ where
     })
 }
 
+/// Like [`read_env`], but absence is `Ok(None)` rather than an error — for
+/// a var that's genuinely optional. Non-Unicode is still a loud error: an
+/// unreadable value must not collapse into the same `None` as "not set".
+fn read_env_optional(var: &str) -> crate::Result<Option<String>> {
+    match std::env::var(var) {
+        Ok(val) => Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Env {
+            var: var.into(),
+            reason: "contains invalid Unicode".into(),
+        }),
+    }
+}
+
 /// Parse SIP003 plugin options string into key-value pairs.
 /// Format: `key1=value1;key2=value2`
-/// Bare keys (no `=`) have value `""`.
-/// Escaping: `\;` → `;`, `\\` → `\`, `\=` → `=`.
+/// Bare keys (no `=`) have value `""` — see [`split_plugin_options`] for how
+/// this differs from ex-ray's own `"1"`.
 ///
-/// Two-pass approach:
-/// 1. Split on unescaped `;` (preserving escape sequences)
-/// 2. For each segment, split on first unescaped `=`, then unescape both parts
-pub fn parse_plugin_options(opts: &str) -> Vec<(String, String)> {
-    if opts.is_empty() {
-        return Vec::new();
-    }
-    let segments = split_on_unescaped(opts, ';');
-    let mut result = Vec::new();
-    for segment in segments {
-        if let Some(eq_pos) = find_unescaped(&segment, '=') {
-            let key = unescape(&segment[..eq_pos]);
-            let value = unescape(&segment[eq_pos + 1..]);
-            result.push((key, value));
-        } else {
-            result.push((unescape(&segment), String::new()));
-        }
-    }
-    result
+/// Decodes with the same escaping rule and segmentation
+/// [`split_plugin_options`] uses: a `\` escapes whatever byte follows, and
+/// one malformed segment — a dangling trailing `\` or an empty key —
+/// rejects the whole string rather than returning the pairs parsed so far
+/// (though not always with the same [`MalformedOptions`] variant ex-ray's
+/// single-pass scan would report for a string with more than one defect).
+/// The two primitives differ only in shape: this one decodes straight to
+/// owned pairs, while [`split_plugin_options`] keeps each segment's
+/// original bytes for a caller that must rewrite the string byte-exactly
+/// (see [`OptionSegment`]).
+pub fn parse_plugin_options(opts: &str) -> Result<Vec<(String, String)>, MalformedOptions> {
+    Ok(split_plugin_options(opts)?
+        .into_iter()
+        .map(|seg| (seg.key, seg.value))
+        .collect())
 }
 
 /// An options string a SIP003 plugin rejects outright. Reported rather than
@@ -97,12 +107,9 @@ pub enum MalformedOptions {
 pub struct OptionSegment<'a> {
     /// The segment exactly as written, escapes intact.
     pub raw: &'a str,
-    /// The key as a SIP003 PLUGIN reads it: a `\` escapes whatever byte follows.
-    /// This is deliberately more permissive than [`parse_plugin_options`], which
-    /// honours only `\;`, `\\` and `\=` and otherwise keeps the backslash — so
-    /// `ech\-doh` is `ech-doh` here and `ech\-doh` there. Use this field to
-    /// decide which key a plugin will ACT on; a check that used the narrower
-    /// rule could be evaded by escaping one character of the name.
+    /// The key as a SIP003 PLUGIN reads it: a `\` escapes whatever byte
+    /// follows — the same rule [`parse_plugin_options`] uses. Use this
+    /// field to decide which key a plugin will ACT on.
     pub key: String,
     /// The value, decoded by the same rule. Empty for a bare key — a caller
     /// that must distinguish `tls` from `tls=` reads `raw`.
@@ -151,8 +158,8 @@ pub fn join_plugin_options<'a>(segments: impl IntoIterator<Item = &'a str>) -> S
     segments.into_iter().collect::<Vec<_>>().join(";")
 }
 
-/// [`split_on_unescaped`] without the copy: yields subslices of `s`. Errors on a
-/// trailing `\` that escapes nothing.
+/// Segment `s` on unescaped occurrences of `delimiter`, yielding subslices
+/// rather than copies. Errors on a trailing `\` that escapes nothing.
 fn split_on_unescaped_borrowed(s: &str, delimiter: char) -> Result<Vec<&str>, MalformedOptions> {
     let mut segments = Vec::new();
     let mut start = 0;
@@ -171,14 +178,22 @@ fn split_on_unescaped_borrowed(s: &str, delimiter: char) -> Result<Vec<&str>, Ma
     Ok(segments)
 }
 
-/// Unescape by the SIP003 reference rule: `\` escapes whatever character
-/// follows — see [`OptionSegment::key`] for why this differs from [`unescape`].
-fn unescape_any(s: &str) -> Result<String, MalformedOptions> {
+/// Walk `s`, splitting on `\`-escapes: every non-`\` character is copied
+/// into the output verbatim, and `on_escaped` decides what to push for the
+/// byte immediately following each `\`. [`unescape_any`] and a caller that
+/// must instead tell a legitimate SIP003 escape from a mangled one apart
+/// (e.g. `garter-bin`'s `config=` diagnostic) both build on this one walk
+/// rather than each re-implementing it — they differ only in what
+/// `on_escaped` does with the escaped byte.
+///
+/// `Err` only on a dangling trailing `\` that escapes nothing.
+pub fn walk_escaped(s: &str, mut on_escaped: impl FnMut(char, &mut String)) -> Result<String, MalformedOptions> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
         if ch == '\\' {
-            out.push(chars.next().ok_or(MalformedOptions::DanglingEscape)?);
+            let escaped = chars.next().ok_or(MalformedOptions::DanglingEscape)?;
+            on_escaped(escaped, &mut out);
         } else {
             out.push(ch);
         }
@@ -186,27 +201,19 @@ fn unescape_any(s: &str) -> Result<String, MalformedOptions> {
     Ok(out)
 }
 
-fn split_on_unescaped(s: &str, delimiter: char) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            current.push(ch);
-            if let Some(&next) = chars.peek() {
-                current.push(next);
-                chars.next();
-            }
-        } else if ch == delimiter {
-            segments.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-    segments
+/// Unescape by the SIP003 reference rule: `\` escapes whatever character
+/// follows.
+fn unescape_any(s: &str) -> Result<String, MalformedOptions> {
+    walk_escaped(s, |c, out| out.push(c))
+}
+
+/// Whether `c` is one of the three bytes SIP003 gives a `\` special
+/// meaning before: `;` (segment separator), `\` (escape character), `=`
+/// (key/value separator). A `\` before any OTHER byte still decodes (drops
+/// the `\`, keeps the byte — see [`OptionSegment::key`]), but these three
+/// are the only ones a `\` is ever actually NEEDED for.
+pub fn is_sip003_metacharacter(c: char) -> bool {
+    matches!(c, ';' | '\\' | '=')
 }
 
 fn find_unescaped(s: &str, target: char) -> Option<usize> {
@@ -219,27 +226,4 @@ fn find_unescaped(s: &str, target: char) -> Option<usize> {
         }
     }
     None
-}
-
-fn unescape(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(&next) = chars.peek() {
-                match next {
-                    ';' | '\\' | '=' => {
-                        result.push(next);
-                        chars.next();
-                    }
-                    _ => result.push(ch),
-                }
-            } else {
-                result.push(ch);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
 }

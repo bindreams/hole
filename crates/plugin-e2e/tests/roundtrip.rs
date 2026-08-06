@@ -107,7 +107,7 @@ mod malformed_options {
             assert!(!out.status.success(), "galoshes must refuse to start: {:?}", out.status);
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                stderr.contains("embedded ex-ray") && stderr.contains("unpaired backslash"),
+                stderr.contains("malformed SS_PLUGIN_OPTIONS") && stderr.contains("unpaired backslash"),
                 "stderr must name the malformed options as the reason, got: {stderr}"
             );
         });

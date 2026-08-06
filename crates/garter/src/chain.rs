@@ -51,20 +51,32 @@ pub enum Mode {
 impl Mode {
     /// Derive the SIP003 chain mode from the `SS_PLUGIN_OPTIONS` string.
     /// Returns [`Mode::Server`] if a `server` key is present in the
-    /// options (with or without a value), [`Mode::Client`] otherwise.
-    /// Uses the spec-correct key parser ([`crate::parse_plugin_options`]),
-    /// so options like `servername=cdn.example.com` correctly resolve to
-    /// client mode.
-    pub fn from_plugin_options(opts: Option<&str>) -> Self {
-        let Some(opts) = opts else { return Mode::Client };
-        if crate::sip003::parse_plugin_options(opts)
-            .iter()
-            .any(|(k, _)| k == "server")
-        {
-            Mode::Server
-        } else {
-            Mode::Client
-        }
+    /// options (with or without a value), [`Mode::Client`] otherwise. Uses
+    /// [`crate::parse_plugin_options`] to decide, so options like
+    /// `servername=cdn.example.com` correctly resolve to client mode, and
+    /// an escaped spelling like `\server` still resolves to server mode —
+    /// matching how ex-ray reads the same string.
+    ///
+    /// `Err` on a malformed options string (e.g. a dangling trailing
+    /// backslash or an empty key). Neither `Mode::Client` nor `Mode::Server`
+    /// would be real parity with ex-ray here, and there is no safe default to
+    /// guess, so the failure is surfaced rather than papered over with one.
+    ///
+    /// Returns `crate::Error` (not the narrower `MalformedOptions`) so every
+    /// caller gets the canonical "malformed SS_PLUGIN_OPTIONS: {reason}"
+    /// wording through a plain `?`, with nothing to hand-write at the call site.
+    pub fn from_plugin_options(opts: Option<&str>) -> crate::Result<Self> {
+        let Some(opts) = opts else { return Ok(Mode::Client) };
+        Ok(
+            if crate::sip003::parse_plugin_options(opts)?
+                .iter()
+                .any(|(k, _)| k == "server")
+            {
+                Mode::Server
+            } else {
+                Mode::Client
+            },
+        )
     }
 }
 
@@ -342,6 +354,28 @@ impl ChainRunner {
 
 // Helpers =============================================================================================================
 
+/// Scan `rxs` for an already-delivered start-failure signal, preferring a
+/// SPECIFIC `Err(StartError)` over a generic `Closed` sender (dropped
+/// unsent) regardless of which order they're found in — a `Closed` earlier
+/// in iteration order must never mask a real `BindConflict`/`Fatal`
+/// delivered by a later one. Returns `None` only when every scanned
+/// receiver is genuinely `Empty` (or holds an `Ok(PluginReady)`, which is
+/// not a failure and is ignored here) — the caller then has nothing to
+/// recover.
+fn scan_for_delivered_error<'a>(
+    rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
+) -> Option<StartError> {
+    let mut any_closed = false;
+    for r in rxs {
+        match r.try_recv() {
+            Ok(Err(e)) => return Some(e),
+            Err(oneshot::error::TryRecvError::Closed) => any_closed = true,
+            Ok(Ok(_)) | Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
+    any_closed.then_some(StartError::ExitedBeforeReady)
+}
+
 /// Aggregate the N per-plugin readiness results into a single chain-level
 /// outcome on `ready_tx`.
 ///
@@ -350,7 +384,7 @@ impl ChainRunner {
 /// position-0 plugin's reported `listen` is the chain's public address in
 /// Client mode; in Server mode it is position N-1. The chain's transports
 /// are the intersection across all hops.
-async fn run_readiness_aggregator(
+pub(crate) async fn run_readiness_aggregator(
     ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
     n: usize,
     mode: Mode,
@@ -366,15 +400,38 @@ async fn run_readiness_aggregator(
         Mode::Client => 0,
         Mode::Server => n - 1,
     };
-    for (i, rrx) in ready_rxs {
-        let outcome = tokio::select! {
+    let mut remaining: std::collections::VecDeque<_> = ready_rxs.into_iter().collect();
+    while let Some((i, mut rrx)) = remaining.pop_front() {
+        // `biased` checks the shutdown arm first regardless of whether
+        // `rrx` ALSO already has a value waiting — a plugin can call
+        // `ready.send(...)` and exit (dropping its task, which is what
+        // fires `shutdown` via `record_exit`) within the same poll, with
+        // no `.await` between the two. Naively discarding on shutdown here
+        // would silently downgrade a real `BindConflict`/`Fatal` to a
+        // generic `ExitedBeforeReady`, so the shutdown arm yields `None`
+        // instead of returning outright, and the scan below checks for an
+        // already-delivered value — on ANY not-yet-processed receiver, not
+        // just this one, since shutdown can win the bias while an EARLIER
+        // poll of a LATER plugin already delivered — before treating this
+        // as shutdown preempting a chain that never got to report anything.
+        let selected = tokio::select! {
             biased;
-            () = shutdown.cancelled() => {
-                // Shutdown before all plugins readied → drop ready_tx; the
-                // receiver gets RecvError.
-                return;
+            () = shutdown.cancelled() => None,
+            r = &mut rrx => Some(r),
+        };
+        let outcome = match selected {
+            Some(r) => r,
+            None => {
+                // See `scan_for_delivered_error`'s doc comment.
+                let rest = std::iter::once(&mut rrx).chain(remaining.iter_mut().map(|(_, r)| r));
+                match scan_for_delivered_error(rest) {
+                    Some(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                    None => return, // nothing to recover anywhere → drop ready_tx; the receiver gets RecvError.
+                }
             }
-            r = rrx => r,
         };
         match outcome {
             Ok(Ok(pr)) => {
@@ -386,19 +443,21 @@ async fn run_readiness_aggregator(
                 return;
             }
             Err(_recv) => {
-                // Plugin dropped its sender unsent → it exited before
-                // readying. Synthesize a process-exit Fatal. This is the
-                // START-GATE channel; the SAME exit is independently
-                // observed by the Phase-1 record_exit loop, which sets
-                // first_error + cancels — that is the LIFECYCLE channel that
-                // becomes run()'s return. The two are intentionally separate
+                // This receiver's sender was dropped unsent → it exited
+                // before readying. Before synthesizing the generic
+                // `ExitedBeforeReady` cause, check whether a LATER plugin
+                // already delivered a specific one — same preference as the
+                // shutdown scan above, and for the same reason. This is the
+                // START-GATE channel; the SAME exit is independently observed by the
+                // Phase-1 record_exit loop, which sets first_error +
+                // cancels — that is the LIFECYCLE channel that becomes
+                // run()'s return. The two are intentionally separate
                 // observers of one event (typed cause to on_ready AND
                 // lifecycle error to teardown). Do NOT try to reconcile them
                 // into one value.
-                let _ = ready_tx.send(Err(StartError::Fatal {
-                    detail: "plugin exited before becoming ready".into(),
-                    errno: None,
-                }));
+                let rest = remaining.iter_mut().map(|(_, r)| r);
+                let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
+                let _ = ready_tx.send(Err(recovered));
                 return;
             }
         }

@@ -275,7 +275,12 @@ async fn spawn_ss_with_plugin(
                 let _ = chain.await;
                 panic!("server plugin failed to start: {detail} (errno={errno:?})");
             }
-            Ok(Err(_recv)) => {
+            // Two distinct signals with the same diagnosis here: the
+            // aggregator synthesized `ExitedBeforeReady`, or the chain-level
+            // ready oneshot itself dropped unsent — this fixture doesn't
+            // need bridge's `recover_exit_detail` treatment, just to fail
+            // loudly either way.
+            Ok(Ok(Err(StartError::ExitedBeforeReady))) | Ok(Err(_)) => {
                 cancel.cancel();
                 let outcome = chain.await;
                 panic!("server plugin exited before readiness: {outcome:?}");

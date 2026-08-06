@@ -138,10 +138,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 }
 
 /// A chain that never becomes ready is where the plugin's own words matter
-/// most: `spawn_plugin_runner_at`'s "exited before becoming ready" and
-/// readiness-timeout arms carry no detail of their own, and the failed attempt's
-/// ring can never be reached from outside — `PluginChain` was never built. So
-/// `start_plugin_chain` must report the ring itself before returning the error.
+/// most: the failed attempt's ring can never be reached from outside —
+/// `PluginChain` was never built. So `start_plugin_chain` must report the
+/// ring itself before returning the error, even where `spawn_plugin_runner_at`
+/// does recover a specific reason (readiness-timeout has none to recover).
 #[skuld::test]
 async fn a_failed_chain_start_reports_the_plugin_ring() {
     use tracing_subscriber::layer::{Layer, SubscriberExt};

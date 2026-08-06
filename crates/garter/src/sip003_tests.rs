@@ -46,7 +46,7 @@ fn parse_env_no_plugin_options(#[fixture] env: &skuld::EnvGuard) {
 
 #[skuld::test]
 fn parse_plugin_options_basic() {
-    let opts = parse_plugin_options("tls;host=example.com;mode=websocket");
+    let opts = parse_plugin_options("tls;host=example.com;mode=websocket").unwrap();
     assert_eq!(
         opts,
         vec![
@@ -59,7 +59,7 @@ fn parse_plugin_options_basic() {
 
 #[skuld::test]
 fn parse_plugin_options_escaped() {
-    let opts = parse_plugin_options(r"path=/a\;b;key=val\\ue");
+    let opts = parse_plugin_options(r"path=/a\;b;key=val\\ue").unwrap();
     assert_eq!(
         opts,
         vec![
@@ -71,8 +71,63 @@ fn parse_plugin_options_escaped() {
 
 #[skuld::test]
 fn parse_plugin_options_empty() {
-    let opts = parse_plugin_options("");
+    let opts = parse_plugin_options("").unwrap();
     assert!(opts.is_empty());
+}
+
+#[skuld::test]
+fn parse_plugin_options_drops_backslash_before_any_byte() {
+    // A backslash escapes whatever byte follows, matching ex-ray's
+    // `indexUnescaped` — not just the SIP003 metacharacters `;`, `\`, `=`.
+    assert_eq!(
+        parse_plugin_options(r"ech\-doh=x").unwrap(),
+        vec![("ech-doh".to_string(), "x".to_string())]
+    );
+    assert_eq!(
+        parse_plugin_options(r"\server").unwrap(),
+        vec![("server".to_string(), "".to_string())]
+    );
+}
+
+#[skuld::test]
+fn parse_plugin_options_rejects_a_dangling_trailing_escape() {
+    assert_eq!(parse_plugin_options(r"path=/a\"), Err(MalformedOptions::DanglingEscape));
+    assert_eq!(parse_plugin_options(r"a=1;b=2\"), Err(MalformedOptions::DanglingEscape));
+}
+
+#[skuld::test]
+fn parse_plugin_options_rejects_an_empty_key() {
+    assert_eq!(
+        parse_plugin_options("a=1;;b=2"),
+        Err(MalformedOptions::EmptyKey { index: 1 })
+    );
+    assert_eq!(
+        parse_plugin_options("a=1;;"),
+        Err(MalformedOptions::EmptyKey { index: 1 })
+    );
+    assert_eq!(parse_plugin_options("=v"), Err(MalformedOptions::EmptyKey { index: 0 }));
+    assert_eq!(
+        parse_plugin_options("host=h;=v;mux=0"),
+        Err(MalformedOptions::EmptyKey { index: 1 })
+    );
+    // A trailing separator alone is not an empty key.
+    assert_eq!(
+        parse_plugin_options("a=1;").unwrap(),
+        vec![("a".to_string(), "1".to_string())]
+    );
+}
+
+// ex-ray's parsePluginOptions is a true single left-to-right scan and
+// returns on the FIRST error in byte order, so a string with BOTH an empty
+// key (position 0) and a later dangling escape reports the empty key —
+// the scan never reaches the backslash. `split_plugin_options` scans in two
+// phases (delimiters/dangling-escape across the whole string, then
+// per-segment key-emptiness), so it reports DanglingEscape here instead.
+// Both sides still reject the string; only the diagnosed REASON differs,
+// and no caller branches on which variant it is.
+#[skuld::test]
+fn parse_plugin_options_error_precedence_differs_from_ex_ray_on_multiple_defects() {
+    assert_eq!(parse_plugin_options(r";a=1\"), Err(MalformedOptions::DanglingEscape));
 }
 
 #[skuld::test]
@@ -91,13 +146,13 @@ fn plugin_env_local_addr(#[fixture] env: &skuld::EnvGuard) {
 
 #[skuld::test]
 fn parse_plugin_options_escaped_equals_in_key() {
-    let opts = parse_plugin_options(r"k\=ey=value");
+    let opts = parse_plugin_options(r"k\=ey=value").unwrap();
     assert_eq!(opts, vec![("k=ey".to_string(), "value".to_string()),]);
 }
 
 #[skuld::test]
 fn parse_plugin_options_equals_in_value() {
-    let opts = parse_plugin_options("key=a=b");
+    let opts = parse_plugin_options("key=a=b").unwrap();
     assert_eq!(opts, vec![("key".to_string(), "a=b".to_string()),]);
 }
 
@@ -128,13 +183,13 @@ fn split_decodes_the_key_but_leaves_the_segment_raw() {
     assert_eq!(s[0].raw, r"k\=ey=a\;b");
 }
 
-// See `OptionSegment::key` for why this decoding rule differs from `parse_plugin_options`.
+// `parse_plugin_options` decodes a key by the same reference rule as
+// `OptionSegment::key`: a backslash escapes whatever byte follows.
 #[skuld::test]
 fn split_decodes_a_key_the_way_a_sip003_plugin_does() {
     assert_eq!(segs(r"ech\-doh=x")[0].key, "ech-doh");
     assert_eq!(segs(r"log\level=warning")[0].key, "loglevel");
-    // The narrower `parse_plugin_options` alphabet deliberately differs.
-    assert_eq!(parse_plugin_options(r"ech\-doh=x")[0].0, r"ech\-doh");
+    assert_eq!(parse_plugin_options(r"ech\-doh=x").unwrap()[0].0, "ech-doh");
 }
 
 // An escaped `;` is part of a value, not a separator.
@@ -225,7 +280,49 @@ fn appending_after_a_join_survives_a_trailing_escaped_semicolon() {
     let appended = join_plugin_options(segs(r"path=/a\;").iter().map(|x| x.raw).chain(["mux=0"]));
     assert_eq!(appended, r"path=/a\;;mux=0");
     assert_eq!(
-        parse_plugin_options(&appended),
+        parse_plugin_options(&appended).unwrap(),
         vec![("path".into(), "/a;".to_string()), ("mux".into(), "0".to_string())],
+    );
+}
+
+#[skuld::test]
+#[cfg(windows)]
+fn parse_env_rejects_non_unicode_plugin_options(#[fixture] env: &skuld::EnvGuard) {
+    env.set("SS_LOCAL_HOST", "127.0.0.1");
+    env.set("SS_LOCAL_PORT", "1080");
+    env.set("SS_REMOTE_HOST", "example.com");
+    env.set("SS_REMOTE_PORT", "443");
+    use std::os::windows::ffi::OsStringExt;
+    let invalid = std::ffi::OsString::from_wide(&[0xD800]); // unpaired UTF-16 surrogate
+                                                            // `env.remove` first so the guard's restore stack captures the prior
+                                                            // value (or absence) before the raw, non-&str set below bypasses it.
+    env.remove("SS_PLUGIN_OPTIONS");
+    // SAFETY: serialized by the `env` fixture's `serial` scheduling.
+    unsafe { std::env::set_var("SS_PLUGIN_OPTIONS", &invalid) };
+    let result = PluginEnv::from_env();
+    assert!(
+        result.is_err(),
+        "a non-Unicode SS_PLUGIN_OPTIONS must be a loud error, not treated as absent"
+    );
+}
+
+#[skuld::test]
+#[cfg(unix)]
+fn parse_env_rejects_non_unicode_plugin_options(#[fixture] env: &skuld::EnvGuard) {
+    env.set("SS_LOCAL_HOST", "127.0.0.1");
+    env.set("SS_LOCAL_PORT", "1080");
+    env.set("SS_REMOTE_HOST", "example.com");
+    env.set("SS_REMOTE_PORT", "443");
+    use std::os::unix::ffi::OsStrExt;
+    let invalid = std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]); // not valid UTF-8
+                                                              // `env.remove` first so the guard's restore stack captures the prior
+                                                              // value (or absence) before the raw, non-&str set below bypasses it.
+    env.remove("SS_PLUGIN_OPTIONS");
+    // SAFETY: serialized by the `env` fixture's `serial` scheduling.
+    unsafe { std::env::set_var("SS_PLUGIN_OPTIONS", invalid) };
+    let result = PluginEnv::from_env();
+    assert!(
+        result.is_err(),
+        "a non-Unicode SS_PLUGIN_OPTIONS must be a loud error, not treated as absent"
     );
 }

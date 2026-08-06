@@ -203,10 +203,12 @@ pub async fn start_plugin_chain(
                 return ProxyError::Cancelled;
             }
             // The chain never became a `PluginChain`, so nothing downstream can
-            // reach its ring. "exited before becoming ready" and "did not become
-            // ready within 30s" carry no detail of their own, and the plugin's
-            // own last lines are the only account of why — emit them here, once,
-            // after every bind retry has had its say.
+            // reach its ring. `spawn_plugin_runner_at` recovers a specific
+            // reason where one exists (`ExitedBeforeReady`, the chain-level
+            // RecvError), but "did not become ready within 30s" never has one
+            // to recover — the plugin's own last lines are the only account
+            // of why THAT case failed. Emit the ring here, once, after every
+            // bind retry has had its say, regardless of which case this is.
             crate::proxy::plugin_log::warn_recent(&log);
             ProxyError::Plugin(format!("plugin chain start failed: {e}"))
         })?;
@@ -380,16 +382,29 @@ async fn spawn_plugin_runner_at(
                 return Err(ProxyError::BindRace { errno, addr });
             }
             // Terminal start failure (config error, upstream-dial failure,
-            // bare process exit) — never retried.
+            // bare process exit) — never retried. Already as specific as it
+            // gets (plugin-reported via sitrep, including one forwarded
+            // verbatim by a nested garter) — `handle` has nothing more to
+            // add, so it is aborted unread.
             Ok(Ok(Err(garter::StartError::Fatal { detail, .. }))) => {
                 cancel.cancel();
                 handle.abort();
                 return Err(ProxyError::Plugin(format!("plugin failed to start: {detail}")));
             }
+            // See `StartError::ExitedBeforeReady`'s doc comment for why this is
+            // distinct from `Fatal` (e.g. `BinaryPlugin::sip003_env` erroring on
+            // malformed options before the child even spawns).
+            Ok(Ok(Err(garter::StartError::ExitedBeforeReady))) => {
+                cancel.cancel();
+                return Err(ProxyError::Plugin(recover_exit_detail(handle).await));
+            }
             Ok(Err(_)) => {
                 cancel.cancel();
-                handle.abort();
-                return Err(ProxyError::Plugin("plugin exited before becoming ready".into()));
+                // The chain-level ready oneshot ITSELF dropped unsent —
+                // distinct from the arm above: the aggregator never got to
+                // send at all (e.g. shutdown fired before it examined any
+                // plugin).
+                return Err(ProxyError::Plugin(recover_exit_detail(handle).await));
             }
             Err(_) => {
                 cancel.cancel();
@@ -400,6 +415,35 @@ async fn spawn_plugin_runner_at(
     };
 
     Ok((handle, cancel, chain_ready.listen, chain_ready.transports))
+}
+
+/// Join `handle` for the plugin's own terminal error when the ready-gate
+/// signal carried no diagnosis of its own — a real join (not a fixed
+/// timeout). Usually resolves promptly: the common case is the plugin
+/// itself already exited (e.g. `sip003_env` erroring before it even
+/// spawned). NOT guaranteed instant, though: `shutdown` can fire
+/// independently of the plugin (e.g. a SIGINT/SIGTERM to the bridge
+/// process mid-startup, via `garter`'s own signal handler) — the plugin is
+/// then still alive and only now begins its graceful-stop sequence, so
+/// this join is bounded by `ChainRunner`'s `drain_timeout` (5s default),
+/// not instant. Falls back to [`garter::EXITED_BEFORE_READY_DETAIL`] if
+/// `handle` has nothing better.
+async fn recover_exit_detail(handle: tokio::task::JoinHandle<garter::Result<()>>) -> String {
+    match handle.await {
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(())) => garter::EXITED_BEFORE_READY_DETAIL.into(),
+        Err(join_err) => {
+            // The plugin-driving task panicked or was cancelled while we
+            // were recovering its exit detail — a bug signal, not routine
+            // diagnostic noise, so it's logged at the same level
+            // `chain.rs`'s own `record_exit` uses for an individual
+            // plugin-task panic, not silently absorbed at `debug!` into
+            // the same generic fallback text used for a genuinely clean
+            // exit.
+            tracing::error!(error = %join_err, "plugin-driving task ended abnormally while recovering exit detail");
+            garter::EXITED_BEFORE_READY_DETAIL.into()
+        }
+    }
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into an
@@ -471,7 +515,10 @@ fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
 /// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
 /// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,
 /// so both spellings are covered; `galoshes` ignores the keys itself but
-/// forwards the whole options string to its inner ex-ray.
+/// forwards the whole options string to its inner ex-ray. Every OTHER plugin
+/// name still gets its options string validated (though nothing is
+/// injected) — a malformed string must not reach `BinaryPlugin` unvalidated
+/// just because the plugin isn't one of these three.
 fn inject_plugin_directives(
     plugin_name: &str,
     opts: Option<&str>,
@@ -550,7 +597,12 @@ fn inject_plugin_directives(
                     .chain(directive.as_deref()),
             )))
         }
-        _ => Ok(opts.map(String::from)),
+        _ => match opts {
+            Some(o) => garter::split_plugin_options(o)
+                .map(|_| Some(o.to_string()))
+                .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}"))),
+            None => Ok(None),
+        },
     }
 }
 
@@ -707,6 +759,11 @@ mod inject_tests {
     fn unknown_plugin_passes_through_unchanged() {
         assert_eq!(merged("some-future-plugin", Some("k=v"), None).as_deref(), Some("k=v"));
         assert_eq!(merged("some-future-plugin", None, None), None);
+    }
+
+    #[skuld::test]
+    fn unknown_plugin_with_malformed_options_is_rejected() {
+        assert!(inject_plugin_directives("obfs-local", Some(r"server;path=/a\"), None).is_err());
     }
 
     #[skuld::test]

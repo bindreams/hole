@@ -142,10 +142,7 @@ impl ChainPlugin for TapPlugin {
                 // tap listener was ever opened. Report the inner's failure
                 // through our own readiness channel so the chain aggregator
                 // sees a typed cause.
-                let _ = ready.send(Err(StartError::Fatal {
-                    detail: format!("tap[{plugin_name}]: inner exited before becoming ready"),
-                    errno: None,
-                }));
+                let _ = ready.send(Err(StartError::ExitedBeforeReady));
                 return match join {
                     Ok(result) => result,
                     Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),

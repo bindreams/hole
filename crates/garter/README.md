@@ -23,7 +23,8 @@ byte-level diagnostics.
 - **`CountingStream` / `StreamCounters`** — wire-level instrumentation
   for any `tokio::io::AsyncRead + AsyncWrite` stream.
 - **`parse_plugin_options`** — parses the SIP003 `;`-separated options
-  string into a typed `HashMap`.
+  string into an ordered list of key/value pairs, or an error for a string a
+  SIP003 plugin would reject outright.
 - **`Mode`** — selects chain direction (`Client` / `Server`); see below.
 
 ### Modes
@@ -71,7 +72,7 @@ async fn main() -> garter::Result<()> {
     // Detect SIP003 chain mode from SS_PLUGIN_OPTIONS (`server` keyword
     // = Server; default = Client). Same parse used by v2ray-plugin and
     // other SIP003 plugins.
-    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
+    let mode = Mode::from_plugin_options(env.plugin_options.as_deref())?;
 
     let chain = ChainRunner::new()
         .mode(mode)

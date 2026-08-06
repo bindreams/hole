@@ -14,6 +14,9 @@ pub enum Error {
 
     #[error("environment variable '{var}' missing or invalid: {reason}")]
     Env { var: String, reason: String },
+
+    #[error("malformed SS_PLUGIN_OPTIONS: {0}")]
+    MalformedOptions(#[from] crate::sip003::MalformedOptions),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

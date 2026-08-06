@@ -46,7 +46,13 @@ pub const GALOSHES_TRANSPORTS: Transports = Transports::TCP.union(Transports::UD
 /// `chain_ready.transports`. See [`GALOSHES_TRANSPORTS`] for why.
 ///
 /// On `Err(StartError)` the typed start failure maps 1:1 to the
-/// corresponding sitrep event.
+/// corresponding sitrep event — `ExitedBeforeReady` included: `SitrepEvent`
+/// has no counterpart for it, so it downgrades to a plain `Fatal` with
+/// [`garter::EXITED_BEFORE_READY_DETAIL`] text, discarding whatever specific
+/// cause `main`'s own `result` may hold. This is a real, tracked
+/// diagnostic-fidelity gap, not a costless design choice: symmetric recovery
+/// (matching `recover_exit_detail` on the bridge side) isn't a small patch
+/// here.
 pub fn chain_result_to_event(result: Result<ChainReady, StartError>) -> SitrepEvent {
     match result {
         Ok(chain_ready) => SitrepEvent::Ready {
@@ -57,6 +63,10 @@ pub fn chain_result_to_event(result: Result<ChainReady, StartError>) -> SitrepEv
         },
         Err(StartError::BindConflict { errno, addr }) => SitrepEvent::BindConflict { errno, addr },
         Err(StartError::Fatal { detail, errno }) => SitrepEvent::Fatal { detail, errno },
+        Err(StartError::ExitedBeforeReady) => SitrepEvent::Fatal {
+            detail: garter::EXITED_BEFORE_READY_DETAIL.into(),
+            errno: None,
+        },
     }
 }
 

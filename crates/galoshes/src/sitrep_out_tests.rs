@@ -108,3 +108,16 @@ fn fatal_maps_through_without_errno() {
         }
     );
 }
+
+#[skuld::test]
+fn exited_before_ready_maps_to_fatal_with_generic_detail() {
+    // See `chain_result_to_event`'s doc comment for why.
+    let ev = chain_result_to_event(Err(StartError::ExitedBeforeReady));
+    assert_eq!(
+        ev,
+        SitrepEvent::Fatal {
+            detail: garter::EXITED_BEFORE_READY_DETAIL.into(),
+            errno: None,
+        }
+    );
+}
