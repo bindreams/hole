@@ -82,23 +82,6 @@ pub(crate) const TAP_ENABLED_HINT: &str =
 pub(crate) const TAP_DISABLED_HINT: &str =
     "DNS self-test failed; the 'upstream failed' lines above carry the layer, cause and byte counts for every attempt. For per-connection byte flow through a plugin chain, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
 
-/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
-/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
-/// else `Failed`.
-///
-/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
-/// so that a whole attempt (one walk of N resolvers) still fits inside what is
-/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
-/// early rather than overrun. Also writes the canonical `"forwarder self-test
-/// ok"` / `"forwarder self-test failed"` log line at `info!`. On failure,
-/// additionally emits a `warn!` correlation breadcrumb pointing the reader to
-/// the plugin tap (depending on whether it was enabled this run — see
-/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
-///
-/// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
-/// `routing.install` / `Dns::apply`. A failure short-circuits the start;
-/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
-/// without ever hijacking system DNS into a dead tunnel.
 /// Per-upstream budget for one attempt, before dividing across a walk's
 /// width — see [`attempt_budget`].
 const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -126,6 +109,23 @@ fn attempt_budget(remaining: std::time::Duration, width: usize) -> Option<std::t
     (!per_upstream.is_zero()).then_some(per_upstream)
 }
 
+/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
+/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
+/// else `Failed`.
+///
+/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
+/// so that a whole attempt (one walk of N resolvers) still fits inside what is
+/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
+/// early rather than overrun. Also writes the canonical `"forwarder self-test
+/// ok"` / `"forwarder self-test failed"` log line at `info!`. On failure,
+/// additionally emits a `warn!` correlation breadcrumb pointing the reader to
+/// the plugin tap (depending on whether it was enabled this run — see
+/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
+///
+/// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
+/// `routing.install` / `Dns::apply`. A failure short-circuits the start;
+/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
+/// without ever hijacking system DNS into a dead tunnel.
 pub(crate) async fn run_forwarder_self_test(
     forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     servers: Vec<std::net::IpAddr>,
@@ -260,7 +260,7 @@ pub(crate) async fn run_forwarder_self_test(
             let reason = match reason {
                 SelfTestReason::NoConnection => "no connection into the tunnel was opened",
                 SelfTestReason::TunnelSilent => "nothing came back through the tunnel",
-                SelfTestReason::Other(s) => s.as_str(),
+                SelfTestReason::InconclusiveTransport(s) | SelfTestReason::Other(s) => s.as_str(),
             };
             info!(
                 %first_server,
@@ -293,8 +293,17 @@ pub(crate) enum SelfTestReason {
     /// A connection carried the query and nothing came back — see
     /// [`ProxyError::TunnelSilent`].
     TunnelSilent,
-    /// Something answered, or nothing was dialled; carries the sentence for the
-    /// toast.
+    /// A UDP ASSOCIATE completed — the local SOCKS5 listener did accept
+    /// something — but nothing came back. Weaker evidence than
+    /// `TunnelSilent` (an ASSOCIATE never reaches the plugin, so it proves
+    /// nothing about it) and so makes neither positive claim on the toast —
+    /// the string carries the same `ForwarderSelfTestFailed` sentence
+    /// `Other` does — but unlike `Other`, nothing here has EXONERATED the
+    /// plugin transport either, so the report still quotes it.
+    InconclusiveTransport(String),
+    /// Something answered, or nothing was dialled; carries the sentence for
+    /// the toast. The transport is proven healthy or was never exercised —
+    /// quoting the plugin here would misattribute someone else's failure.
     Other(String),
 }
 
@@ -329,21 +338,36 @@ pub(crate) fn describe_upstream_failure(cause: crate::dns::forwarder::UpstreamCa
     }
 }
 
-/// Does this FINAL error implicate the plugin transport enough to ask it to
-/// account for itself? Takes the `ProxyError` `self_test_error_for` actually
-/// returned, not the pre-verdict `SelfTestReason` — the probe's verdict can
-/// replace `TunnelSilent`/`NoTunnelConnection` entirely (`NetworkBlocked`, or
-/// a rewritten `ForwarderSelfTestFailed`), and quoting the plugin's "own
-/// account of why its transport failed" next to a failure the code has
-/// already attributed to the network path, not the plugin, would
-/// misattribute it. Checking the same enum `self_test_error_for` returns —
-/// rather than re-deriving its precedence here — is what keeps the two in
-/// sync.
-pub(crate) fn implicates_plugin_transport(err: &ProxyError) -> bool {
-    matches!(
-        err,
-        ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSilent { .. }
-    )
+/// Should the plugin's ring be quoted next to this failure? Two conditions
+/// both apply, checked independently rather than off one collapsed value:
+///
+/// - The self-test's OWN reading implicates the transport —
+///   `NoConnection`/`TunnelSilent`, or `InconclusiveTransport` (a UDP
+///   ASSOCIATE that reached the local listener but proved nothing about the
+///   plugin either way). `Other` means the transport is proven healthy (a
+///   reply arrived and was rejected) or was never exercised (nothing
+///   dialled) — quoting the plugin there would blame it for a failure that
+///   is not its own.
+/// - The out-of-band probe hasn't already reattributed the failure to the
+///   network path. `self_test_error_for` lets a `Blocked`/`TcpRefused`/
+///   `TcpTimeout` verdict replace the self-test's own reading entirely
+///   (`NetworkBlocked`, or a rewritten `ForwarderSelfTestFailed`); quoting
+///   the plugin beside a failure the code has attributed elsewhere would
+///   misattribute it. Checked directly against `verdict` rather than
+///   against `self_test_error_for`'s output, because `InconclusiveTransport`
+///   and `Other` both collapse to the same `ForwarderSelfTestFailed` shape
+///   there — the FINAL `ProxyError` alone can no longer tell them apart.
+pub(crate) fn implicates_plugin_transport(
+    reason: &SelfTestReason,
+    verdict: Option<crate::reachability::ReachabilityVerdict>,
+) -> bool {
+    use crate::reachability::ReachabilityVerdict::*;
+    let reason_implicates = matches!(
+        reason,
+        SelfTestReason::NoConnection | SelfTestReason::TunnelSilent | SelfTestReason::InconclusiveTransport(_)
+    );
+    let verdict_overrides = matches!(verdict, Some(Blocked | TcpRefused | TcpTimeout));
+    reason_implicates && !verdict_overrides
 }
 
 /// Emit the plugin chain's kept output for a failed gate, or say there is no
@@ -390,7 +414,7 @@ pub(crate) fn classify_failure(observed: Observed, last_err: String) -> SelfTest
     if observed.moved.connects > 0 {
         SelfTestReason::TunnelSilent
     } else if observed.moved.associates > 0 {
-        SelfTestReason::Other(last_err)
+        SelfTestReason::InconclusiveTransport(last_err)
     } else {
         SelfTestReason::NoConnection
     }
@@ -442,11 +466,13 @@ pub(crate) fn self_test_error_for(
         _ => match reason {
             SelfTestReason::NoConnection => ProxyError::NoTunnelConnection { attempts, elapsed_ms },
             SelfTestReason::TunnelSilent => ProxyError::TunnelSilent { attempts, elapsed_ms },
-            SelfTestReason::Other(reason) => ProxyError::ForwarderSelfTestFailed {
-                attempts,
-                elapsed_ms,
-                reason,
-            },
+            SelfTestReason::InconclusiveTransport(reason) | SelfTestReason::Other(reason) => {
+                ProxyError::ForwarderSelfTestFailed {
+                    attempts,
+                    elapsed_ms,
+                    reason,
+                }
+            }
         },
     }
 }

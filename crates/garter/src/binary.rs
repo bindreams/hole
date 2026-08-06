@@ -219,6 +219,39 @@ impl ChainPlugin for BinaryPlugin {
             sink(pid);
         }
 
+        // Capture stderr FIRST: the sitrep stdout reader's readiness-FAILURE
+        // path (child exited before ever readying) joins `stderr_done` —
+        // bounded, not indefinite — before reporting that failure, so a
+        // plugin whose crash lands on stderr (the common shape for a Go
+        // panic under `GOTRACEBACK=crash`) isn't reported as if it said
+        // nothing. `Notify` (not the `JoinHandle` itself) so this task's
+        // handle stays free for the unconditional drain below too.
+        let stderr = gc.child.stderr.take().expect("stderr was piped");
+        let plugin_name = self.name.clone();
+        let log_sink = self.log_sink.clone();
+        let stderr_done = Arc::new(tokio::sync::Notify::new());
+        let stderr_done_signal = Arc::clone(&stderr_done);
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if let Some(ref sink) = log_sink {
+                            sink(&line);
+                        }
+                        tracing::warn!(plugin = %plugin_name, "{line}");
+                    }
+                    Ok(None) => break, // EOF
+                    Err(e) => {
+                        tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
+                        break;
+                    }
+                }
+            }
+            stderr_done_signal.notify_one();
+        });
+
         // Stdout consumer: in Probe mode it forwards lines to tracing and
         // readiness comes from a separate self-probe task; in ExpectSitrep
         // mode it parses sitrep events and IS the readiness source. Build
@@ -274,6 +307,7 @@ impl ChainPlugin for BinaryPlugin {
                 ready,
                 false,
                 self.log_sink.clone(),
+                stderr_done,
             ),
             ReadinessMode::Auto => spawn_sitrep_stdout_reader(
                 stdout,
@@ -283,32 +317,9 @@ impl ChainPlugin for BinaryPlugin {
                 ready,
                 true,
                 self.log_sink.clone(),
+                stderr_done,
             ),
         };
-
-        // Capture stderr
-        let stderr = gc.child.stderr.take().expect("stderr was piped");
-        let plugin_name = self.name.clone();
-        let log_sink = self.log_sink.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(ref sink) = log_sink {
-                            sink(&line);
-                        }
-                        tracing::warn!(plugin = %plugin_name, "{line}");
-                    }
-                    Ok(None) => break, // EOF
-                    Err(e) => {
-                        tracing::debug!(plugin = %plugin_name, "log reader error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
 
         // Wait for child exit or shutdown signal.
         //
@@ -396,7 +407,10 @@ fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: S
 /// a non-sitrep plugin (including one silent on stdout) is still readied by the
 /// probe. Non-event lines pass through to tracing as logs. On stdout EOF without
 /// ever sending, the sender drops unsent → the chain aggregator synthesizes a
-/// process-exit failure (the intended backstop).
+/// process-exit failure (the intended backstop) — bounded on `stderr_done` first
+/// (see its call site), so a crash whose last words land on stderr is not
+/// reported as if the plugin said nothing.
+#[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning.
 fn spawn_sitrep_stdout_reader(
     stdout: tokio::process::ChildStdout,
     plugin_name: String,
@@ -405,6 +419,7 @@ fn spawn_sitrep_stdout_reader(
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     auto: bool,
     log_sink: Option<LogSink>,
+    stderr_done: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
@@ -503,9 +518,16 @@ fn spawn_sitrep_stdout_reader(
                 }
             }
         }
-        // If the child closed stdout without ever sending readiness,
-        // dropping the shared sender here signals process-exit to the
-        // aggregator (the intended backstop).
+        // If the child closed stdout without ever sending readiness, give the
+        // stderr reader a bounded chance to catch up before dropping the
+        // shared sender below signals process-exit to the aggregator — a
+        // crash lands on stderr more often than stdout (e.g. a Go panic
+        // under `GOTRACEBACK=crash`), and the two pipes are read by
+        // independent tasks with no ordering between them otherwise. Bounded
+        // on the child's own exit (stdout just EOF'd, so stderr is expected
+        // to follow shortly), not an arbitrary wait: this mirrors the
+        // existing drain timeout in `run`'s own shutdown paths.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), stderr_done.notified()).await;
     })
 }
 

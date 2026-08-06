@@ -610,17 +610,6 @@ impl DnsForwarder {
             .unwrap_or_else(|_| synthesize_servfail(query))
     }
 
-    /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
-    /// upstream answered. Per-server failures are logged by the same throttle
-    /// either way; the returned cause is the highest-ranked one observed
-    /// (see [`UpstreamCause::rank`]), ties keeping the first.
-    ///
-    /// `per_upstream` bounds ONE upstream attempt. The walk tries up to
-    /// `config.servers.len()` of them, so bound the whole call at
-    /// `servers.len() * per_upstream`. A caller that owns a total budget should
-    /// pass this rather than wrapping the call in its own `timeout`: an outer
-    /// timer that fires first drops the future before `forward_one`'s deadline,
-    /// so nothing is classified and nothing is logged.
     /// How many configured upstreams a walk will ACTUALLY attempt. IPv6 entries
     /// are skipped without an IPv6 bypass, so this can be less than
     /// `servers.len()` — and zero, for an all-IPv6 config on an IPv4-only host,
@@ -637,6 +626,17 @@ impl DnsForwarder {
             .count()
     }
 
+    /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
+    /// upstream answered. Per-server failures are logged by the same throttle
+    /// either way; the returned cause is the highest-ranked one observed
+    /// (see [`UpstreamCause::rank`]), ties keeping the first.
+    ///
+    /// `per_upstream` bounds ONE upstream attempt. The walk tries up to
+    /// `config.servers.len()` of them, so bound the whole call at
+    /// `servers.len() * per_upstream`. A caller that owns a total budget should
+    /// pass this rather than wrapping the call in its own `timeout`: an outer
+    /// timer that fires first drops the future before `forward_one`'s deadline,
+    /// so nothing is classified and nothing is logged.
     pub async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
         if query.len() < 12 {
             // A caller bug, and the one failure with no per-upstream WARN

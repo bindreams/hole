@@ -1100,16 +1100,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
-                    // Compute the FINAL error before deciding whether to quote
-                    // the plugin: `self_test_error_for`'s own verdict
-                    // precedence can replace `reason` entirely, and gating on
-                    // the pre-verdict `reason` instead would let the quote
-                    // fire beside a failure already attributed elsewhere.
-                    let err = self_test_error_for(verdict, attempts, elapsed_ms, reason);
-                    if implicates_plugin_transport(&err) {
+                    // Checked against the pre-verdict `reason` AND `verdict`
+                    // directly (not against the FINAL `ProxyError`): once
+                    // `InconclusiveTransport` and `Other` both collapse into
+                    // `ForwarderSelfTestFailed`, that value alone can no
+                    // longer tell them apart — see `implicates_plugin_transport`'s doc.
+                    if implicates_plugin_transport(&reason, verdict) {
                         report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
                     }
-                    return Err(err);
+                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
             }
         }

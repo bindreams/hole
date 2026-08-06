@@ -54,12 +54,9 @@ impl ConnectedStream {
     }
 }
 
-/// Wire bytes an [`UpstreamUdp`] has moved. Counted BEFORE any header parsing,
-/// so a reply that arrives and then fails to parse is still recorded as
-/// something having come back — the datagram counterpart of what
-/// [`StreamCounters`] does for the stream transports. See
-/// [`garter::ByteCounters`] for why this is that type directly rather than a
-/// second reimplementation of it.
+/// Wire bytes an [`UpstreamUdp`] has moved, counted BEFORE any header
+/// parsing — a reply that arrives and then fails to parse is still
+/// recorded as something having come back. See [`garter::ByteCounters`].
 pub type DatagramCounters = garter::ByteCounters;
 
 /// UDP send/recv abstraction. Separate from [`AsyncDuplex`] because the

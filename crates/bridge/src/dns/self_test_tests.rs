@@ -130,8 +130,11 @@ fn classify_failure_covers_every_branch() {
     // A UDP ASSOCIATE completed but nothing came back: disproves
     // NoConnection (the local listener DID accept something) without
     // being TunnelSilent-grade evidence about the plugin, so neither
-    // positive claim is made.
-    assert!(matches!(case(false, true, associated_only), SelfTestReason::Other(_)));
+    // positive claim is made — but the plugin is not exonerated either.
+    assert!(matches!(
+        case(false, true, associated_only),
+        SelfTestReason::InconclusiveTransport(_)
+    ));
     // A reply arrived and was rejected — the tunnel is not silent.
     assert!(matches!(case(true, true, both), SelfTestReason::Other(_)));
     // Bytes came back even though the walk failed.
@@ -341,9 +344,10 @@ fn a_refused_local_hop_is_reported_as_no_connection() {
 /// completed ASSOCIATE with no reply DISPROVES `NoConnection` (the local
 /// listener demonstrably accepted something) but is not strong enough
 /// evidence for `TunnelSilent` either (it says nothing about the plugin),
-/// so it must read as neither — it falls to the generic `Other` reason.
+/// so it must read as neither positive claim — `InconclusiveTransport`,
+/// not `NoConnection`/`TunnelSilent`/`Other`.
 #[skuld::test]
-fn a_silent_udp_associate_is_reported_as_other_not_a_local_hop_claim() {
+fn a_silent_udp_associate_is_reported_as_inconclusive_not_a_local_hop_claim() {
     let outcome = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -370,7 +374,7 @@ fn a_silent_udp_associate_is_reported_as_other_not_a_local_hop_claim() {
         panic!("expected Failed, got {outcome:?}");
     };
     assert!(
-        matches!(reason, SelfTestReason::Other(_)),
+        matches!(reason, SelfTestReason::InconclusiveTransport(_)),
         "a completed UDP ASSOCIATE with no reply disproves NoConnection but is not \
          TunnelSilent-grade evidence either; got {reason:?}"
     );
@@ -461,29 +465,52 @@ fn the_reason_never_carries_a_debug_formatted_enum() {
     assert!(err.to_string().contains("timeout"), "got: {err}");
 }
 
-/// Pins `implicates_plugin_transport`'s two-variant contract (see its doc).
-/// Takes the FINAL `ProxyError`, not the pre-verdict `SelfTestReason` — a
-/// `Blocked`/`TcpRefused`/`TcpTimeout` verdict replaces `TunnelSilent`/
-/// `NoTunnelConnection` before this ever runs, so those two must not
-/// implicate the plugin either.
+/// Pins `implicates_plugin_transport`'s two independent conditions: the
+/// pre-verdict reason must implicate the transport (three variants: the two
+/// tunnel readings plus the UDP-associate inconclusive case), AND no
+/// `Blocked`/`TcpRefused`/`TcpTimeout` verdict may have already reattributed
+/// the failure to the network path.
 #[skuld::test]
-fn implicates_plugin_transport_covers_only_the_two_tunnel_readings() {
-    assert!(super::implicates_plugin_transport(&ProxyError::NoTunnelConnection {
-        attempts: 3,
-        elapsed_ms: 200
-    }));
-    assert!(super::implicates_plugin_transport(&ProxyError::TunnelSilent {
-        attempts: 3,
-        elapsed_ms: 200
-    }));
-    assert!(!super::implicates_plugin_transport(
-        &ProxyError::ForwarderSelfTestFailed {
-            attempts: 3,
-            elapsed_ms: 200,
-            reason: "a resolver answered with SERVFAIL".into(),
-        }
+fn implicates_plugin_transport_covers_every_combination() {
+    let implicates = super::implicates_plugin_transport;
+
+    // Reason implicates, no overriding verdict: quote the plugin.
+    assert!(implicates(&SelfTestReason::NoConnection, None));
+    assert!(implicates(&SelfTestReason::TunnelSilent, None));
+    assert!(implicates(
+        &SelfTestReason::InconclusiveTransport("no resolver answered through the tunnel (unreachable)".into()),
+        None
     ));
-    assert!(!super::implicates_plugin_transport(&ProxyError::NetworkBlocked));
+    assert!(implicates(
+        &SelfTestReason::TunnelSilent,
+        Some(ReachabilityVerdict::Reachable)
+    ));
+
+    // Other never implicates, even with no overriding verdict: the
+    // transport is proven healthy or was never exercised.
+    assert!(!implicates(
+        &SelfTestReason::Other("a resolver answered with SERVFAIL".into()),
+        None
+    ));
+
+    // A Blocked/TcpRefused/TcpTimeout verdict overrides every reason,
+    // including the ones that would otherwise implicate the transport.
+    for reason in [
+        SelfTestReason::NoConnection,
+        SelfTestReason::TunnelSilent,
+        SelfTestReason::InconclusiveTransport("reason".into()),
+    ] {
+        for verdict in [
+            ReachabilityVerdict::Blocked,
+            ReachabilityVerdict::TcpRefused,
+            ReachabilityVerdict::TcpTimeout,
+        ] {
+            assert!(
+                !implicates(&reason, Some(verdict)),
+                "verdict {verdict:?} must override reason {reason:?}"
+            );
+        }
+    }
 }
 
 /// `report_plugin_output` quotes a chain's lines, and says so when there is

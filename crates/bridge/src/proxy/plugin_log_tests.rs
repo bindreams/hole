@@ -53,8 +53,8 @@ fn warn_recent_emits_the_header_and_every_line() {
     assert!(output.contains("failed to dial WebSocket"), "got:\n{output}");
 }
 
-/// An empty ring reports what was CAPTURED, never that the plugin said nothing:
-/// garter relays from a detached task, so the two are not the same claim.
+/// Regression guard for `warn_recent`'s CAPTURED-vs-said-nothing distinction
+/// (see its own doc).
 #[skuld::test]
 fn warn_recent_says_so_when_nothing_was_captured() {
     let output = emitted_for(&PluginLog::new());
