@@ -155,7 +155,7 @@ pass_filenames = false
 # `invalid-argument-type` findings — see #667. Pinned so a new release can't
 # break every push.
 # renovate: datasource=pypi depName=ty
-additional_dependencies = ["ty==0.0.61"]
+additional_dependencies = ["ty==0.0.65"]
 
 # External hooks =======================================================================================================
 
