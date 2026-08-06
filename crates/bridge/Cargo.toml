@@ -30,6 +30,14 @@ path = "src/bin/test_service.rs"
 test = false
 doctest = false
 
+# SIP003 plugin stub reached by the `plugin_chain` integration test via
+# `CARGO_BIN_EXE_test_plugin`. Same pattern as `test_idle`.
+[[bin]]
+name = "test_plugin"
+path = "src/bin/test_plugin.rs"
+test = false
+doctest = false
+
 [dependencies]
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
@@ -177,6 +185,13 @@ same-file = "1"
 # moves, compilation breaks immediately with a clear error rather than
 # silently drifting.
 xtask = { path = "../../xtask" }
+
+# What `start_plugin_chain` hands a real child, and what its output does. Binds
+# only an ephemeral loopback port, so it needs no `global-net-state` group.
+[[test]]
+name = "plugin_chain"
+path = "tests/plugin_chain.rs"
+harness = false
 
 # Privileged-lane cutover proofs (real rename/SCM/renamex_np FFI). A skuld
 # harness, like the lib tests; an integration target so Cargo builds + injects

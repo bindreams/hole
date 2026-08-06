@@ -44,6 +44,10 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
 
+use crate::dns::self_test::{
+    build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
+    SelfTestOutcome,
+};
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{
     build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
@@ -1046,7 +1050,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 (handle, stop)
             });
 
-            let started = std::time::Instant::now();
             let outcome = run_forwarder_self_test(
                 std::sync::Arc::clone(fwd),
                 config.dns.servers.clone(),
@@ -1054,26 +1057,39 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 cancel.clone(),
             )
             .await;
-            match outcome.into_result(started.elapsed().as_millis() as u64) {
+            match outcome {
                 // Self-test passed: cancel the probe token.
-                Ok(_) => {
+                SelfTestOutcome::Ok { .. } => {
                     if let Some((_, stop)) = probe {
                         stop.cancel();
                     }
                 }
+                // The user asked for the cancel; stop the probe and propagate.
+                SelfTestOutcome::Cancelled => {
+                    if let Some((_, stop)) = probe {
+                        stop.cancel();
+                    }
+                    return Err(ProxyError::Cancelled);
+                }
                 // The forwarder failed: await the concurrent probe's verdict and
                 // reclassify the error. It ran in parallel, so the wait is at most
                 // the probe's remaining budget, not its full duration on top.
-                Err(ProxyError::ForwarderSelfTestFailed {
+                // `elapsed_ms` rides in the outcome, measured by the self-test
+                // itself, so the duration in the user's sentence can never grow
+                // to include this wait.
+                SelfTestOutcome::Failed {
                     attempts,
                     elapsed_ms,
                     reason,
-                }) => {
+                } => {
                     let verdict = match probe {
                         Some((handle, _stop)) => match handle.await {
                             Ok(v) => Some(v),
+                            // The probe's verdict outranks the self-test's own
+                            // reading, so losing it degrades the report — WARN,
+                            // or the downgrade is invisible at the default level.
                             Err(e) => {
-                                tracing::debug!(%e, "reachability probe task did not complete");
+                                warn!(%e, "reachability probe task did not complete; its verdict is unavailable");
                                 None
                             }
                         },
@@ -1084,14 +1100,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
-                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
-                }
-                // Any other error (e.g. Cancelled): stop the probe, propagate as-is.
-                Err(e) => {
-                    if let Some((_, stop)) = probe {
-                        stop.cancel();
+                    // Checked against the pre-verdict `reason` AND `verdict`
+                    // directly (not against the FINAL `ProxyError`): once
+                    // `InconclusiveTransport` and `Other` both collapse into
+                    // `ForwarderSelfTestFailed`, that value alone can no
+                    // longer tell them apart — see `implicates_plugin_transport`'s doc.
+                    if implicates_plugin_transport(&reason, verdict) {
+                        report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
                     }
-                    return Err(e);
+                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
             }
         }
@@ -1466,287 +1483,3 @@ mod proxy_manager_e2e_tests;
 #[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]
 mod proxy_manager_listener_e2e_tests;
-
-// DNS wiring helpers ==================================================================================================
-
-/// Build the in-TUN DNS endpoint + forwarder, if the config enables it. The
-/// forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
-/// targeting the just-started SS SOCKS5 listener, so user filter rules
-/// cannot strand our own queries.
-///
-/// Returns the `forwarder` Arc alongside the endpoint so the blocking
-/// self-test gate in `start_inner` can call `forwarder.forward(...)` without
-/// re-plumbing.
-///
-/// Rejects the `dns.enabled && servers.is_empty()` config combination with
-/// `ForwarderSelfTestFailed { reason: "no DNS servers configured" }` because
-/// that combination would otherwise produce a degenerate runtime (TUN routes
-/// go live but the forwarder has nothing to forward to).
-async fn build_local_dns(
-    dns_cfg: &hole_common::config::DnsConfig,
-    local_ss_port: u16,
-    ipv6_bypass_available: bool,
-    _cancel: CancellationToken,
-) -> Result<
-    (
-        Option<crate::endpoint::LocalDnsEndpoint>,
-        Option<std::sync::Arc<crate::dns::forwarder::DnsForwarder>>,
-    ),
-    ProxyError,
-> {
-    if !dns_cfg.enabled {
-        return Ok((None, None));
-    }
-    if dns_cfg.servers.is_empty() {
-        // Hard error: the only sensible recovery is to disable the forwarder.
-        // A live TUN with no upstream would strand every in-tunnel UDP/53
-        // flow at the LocalDnsEndpoint with nothing to forward to.
-        return Err(ProxyError::ForwarderSelfTestFailed {
-            reason: "no DNS servers configured".into(),
-            attempts: 0,
-            elapsed_ms: 0,
-        });
-    }
-
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-
-    let socks_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_ss_port);
-    let connector = Arc::new(crate::dns::socks5_connector::Socks5Connector::new(socks_addr))
-        as Arc<dyn crate::dns::connector::UpstreamConnector>;
-    let forwarder = Arc::new(crate::dns::forwarder::DnsForwarder::new(
-        dns_cfg.clone(),
-        connector,
-        ipv6_bypass_available,
-    ));
-
-    // The in-TUN endpoint is the sole OS DNS path: OS DNS routes into hole-tun
-    // and is intercepted here, not via a loopback :53 server.
-    let endpoint = crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder));
-
-    Ok((Some(endpoint), Some(forwarder)))
-}
-
-/// Hint logged on self-test failure when the plugin tap IS enabled.
-/// Tells the reader where the per-connection diagnostic lines are.
-pub(crate) const TAP_ENABLED_HINT: &str =
-    "DNS self-test failed with plugin tap enabled; check 'plugin tap: closed' lines above for per-connection bytes_to_plugin / bytes_from_plugin / ttfb_ms / close_kind";
-
-/// Hint logged on self-test failure when the plugin tap is NOT enabled.
-/// Tells the reader how to capture richer diagnostics next time.
-pub(crate) const TAP_DISABLED_HINT: &str =
-    "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
-
-/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
-/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
-/// else `Failed`.
-///
-/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
-/// so that a whole attempt (one walk of N resolvers) still fits inside what is
-/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
-/// early rather than overrun. Nothing wraps the call in a `timeout`, so every
-/// upstream failure is classified and logged before the gate gives up. Also writes
-/// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
-/// log line at `info!`. On failure, additionally emits a `warn!`
-/// correlation breadcrumb pointing the reader to the plugin tap
-/// (depending on whether it was enabled this run — see
-/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
-///
-/// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
-/// `routing.install` / `Dns::apply`. A failure short-circuits the start;
-/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
-/// without ever hijacking system DNS into a dead tunnel.
-async fn run_forwarder_self_test(
-    forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
-    servers: Vec<std::net::IpAddr>,
-    diagnostic_tap_enabled: bool,
-    cancel: CancellationToken,
-) -> SelfTestOutcome {
-    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
-    const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const ATTEMPTS: u32 = 3;
-
-    let Some(&first_server) = servers.first() else {
-        info!("forwarder self-test skipped: no servers configured");
-        return SelfTestOutcome::Ok { attempts: 0 };
-    };
-
-    let query = sample_self_test_query();
-    let started = std::time::Instant::now();
-    // The overall bound is a DEADLINE the loop respects, not a `timeout` around
-    // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
-    // was in flight, and a dropped future produces no `UpstreamErr`, so that
-    // upstream's failure would never be classified or logged. Bounding each
-    // attempt by what remains instead means every attempt runs to completion
-    // and nothing is discarded.
-    let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
-    let mut last_err: Option<String> = None;
-    let mut completed: u32 = 0;
-    let mut outcome = None;
-
-    for attempt in 1..=ATTEMPTS {
-        // Cooperative cancel check between retry attempts (#397).
-        if cancel.is_cancelled() {
-            return SelfTestOutcome::Cancelled;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        // `try_forward` walks every upstream it will attempt at `per_upstream`
-        // each, so divide what is left by that width to keep the whole attempt
-        // inside the deadline. The width comes from the forwarder, not from
-        // `servers.len()`: it skips IPv6 entries without an IPv6 bypass, and
-        // counting those would shrink every surviving upstream's budget while
-        // leaving part of the deadline unused. A zero-width walk dials nothing
-        // and returns immediately, so its budget is irrelevant.
-        let width = forwarder.attempted_upstreams();
-        let per_upstream = if width == 0 {
-            PER_ATTEMPT
-        } else {
-            PER_ATTEMPT.min(remaining / width as u32)
-        };
-        // The budget goes down into the forwarder so `forward_one`'s own
-        // deadline fires first, producing a classified `UpstreamErr` that
-        // `log_upstream_failure` can log. Cancel stays a `select!` arm:
-        // drop-on-cancel is the documented single exception in this module,
-        // since the forwarder's only in-flight resource is a socket that
-        // closes on Drop.
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-            r = forwarder.try_forward(&query, per_upstream) => r,
-        };
-        completed = attempt;
-        match result {
-            Ok(reply) => {
-                if is_dns_reply_ok(&reply) {
-                    outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
-                    break;
-                }
-                last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
-            }
-            Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
-        }
-    }
-
-    let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
-        attempts: completed,
-        reason: last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
-    });
-
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match &outcome {
-        SelfTestOutcome::Ok { attempts } => {
-            info!(%first_server, attempts, elapsed_ms, "forwarder self-test ok");
-        }
-        SelfTestOutcome::Failed { attempts, reason } => {
-            info!(%first_server, attempts, elapsed_ms, reason, "forwarder self-test failed");
-            // #388 correlation breadcrumb: tells the reader either
-            // where the tap data lives, or how to enable it for next
-            // reproduction. The actual error surfaces through
-            // ProxyError::ForwarderSelfTestFailed → IPC response →
-            // GUI; no error! log needed.
-            if diagnostic_tap_enabled {
-                warn!("{TAP_ENABLED_HINT}");
-            } else {
-                warn!("{TAP_DISABLED_HINT}");
-            }
-        }
-        SelfTestOutcome::Cancelled => {
-            info!(%first_server, elapsed_ms, "forwarder self-test cancelled");
-        }
-    }
-    outcome
-}
-
-#[derive(Debug)]
-enum SelfTestOutcome {
-    Ok {
-        attempts: u32,
-    },
-    Failed {
-        attempts: u32,
-        reason: String,
-    },
-    /// The bridge cancel token fired before the self-test could complete
-    /// or fail definitively (#397). Maps to `ProxyError::Cancelled` via
-    /// `into_result`; not a diagnostic failure (the user asked for it).
-    Cancelled,
-}
-
-impl SelfTestOutcome {
-    /// Convert outcome to a Result for use as a start-time gate.
-    /// `Ok(attempts)` carries the attempt count taken to succeed (0 when
-    /// skipped because no servers configured — only reachable via the
-    /// `dns.enabled = false` branch in `build_local_dns`).
-    fn into_result(self, elapsed_ms: u64) -> Result<u32, ProxyError> {
-        match self {
-            Self::Ok { attempts } => Ok(attempts),
-            Self::Failed { attempts, reason } => Err(ProxyError::ForwarderSelfTestFailed {
-                reason,
-                attempts,
-                elapsed_ms,
-            }),
-            Self::Cancelled => Err(ProxyError::Cancelled),
-        }
-    }
-}
-
-/// Map a self-test failure to the `ProxyError` the toast sees, given the
-/// out-of-band reachability `verdict` (`None` when the probe was skipped). A
-/// `Blocked` verdict becomes the typed [`ProxyError::NetworkBlocked`];
-/// `TcpRefused`/`TcpTimeout` rewrite the reason to the probe's `user_message`;
-/// every other verdict keeps the `original` self-test reason.
-fn self_test_error_for(
-    verdict: Option<crate::reachability::ReachabilityVerdict>,
-    attempts: u32,
-    elapsed_ms: u64,
-    original: String,
-) -> ProxyError {
-    use crate::reachability::ReachabilityVerdict::*;
-    match verdict {
-        Some(Blocked) => ProxyError::NetworkBlocked,
-        Some(v @ (TcpRefused | TcpTimeout)) => ProxyError::ForwarderSelfTestFailed {
-            attempts,
-            elapsed_ms,
-            reason: v
-                .user_message()
-                .expect("TcpRefused/TcpTimeout always carry a user_message")
-                .to_owned(),
-        },
-        _ => ProxyError::ForwarderSelfTestFailed {
-            attempts,
-            elapsed_ms,
-            reason: original,
-        },
-    }
-}
-
-/// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.
-/// The reply header is 12 bytes; RCODE lives in the low nibble of byte 3
-/// (RFC 1035 §4.1.1). RCODE 2 = SERVFAIL (upstream failed explicitly);
-/// all other RCODEs (NoError, NXDOMAIN, REFUSED) mean the path works.
-fn is_dns_reply_ok(reply: &[u8]) -> bool {
-    reply.len() >= 12 && (reply[3] & 0x0F) != 2
-}
-
-/// Build a minimal wire-format DNS query: `example.com A`. Used by
-/// [`run_forwarder_self_test`] — hardcoded hostname is acceptable
-/// because the forwarder self-test is an internal probe, never a user-
-/// visible config. NXDOMAIN on this name still proves the path works.
-fn sample_self_test_query() -> Vec<u8> {
-    let mut q = Vec::with_capacity(32);
-    q.extend_from_slice(&0x0001_u16.to_be_bytes()); // id
-    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
-    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    q.push(7);
-    q.extend_from_slice(b"example");
-    q.push(3);
-    q.extend_from_slice(b"com");
-    q.push(0);
-    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
-    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
-    q
-}

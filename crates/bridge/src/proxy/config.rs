@@ -98,6 +98,29 @@ pub enum ProxyError {
         attempts: u32,
         elapsed_ms: u64,
     },
+    /// The start-time DNS self-test opened a connection into the tunnel and not
+    /// one byte came back. Two causes produce this and the bridge cannot tell
+    /// them apart: `shadowsocks-service`'s SOCKS5 answers `Succeeded` as soon as
+    /// it reaches the plugin's local port, so a plugin whose transport is dead
+    /// is indistinguishable here from a live tunnel whose exit cannot reach the
+    /// configured resolvers. The message names both rather than picking one and
+    /// being confidently wrong. `Display` interpolates only integers, so it is
+    /// PII-free by construction.
+    #[error("Nothing came back through the tunnel ({attempts} attempts in {elapsed_ms}ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver.")]
+    TunnelSilent { attempts: u32, elapsed_ms: u64 },
+    /// The DNS self-test never established a connection into the tunnel. That
+    /// is the LOCAL hop — the shadowsocks SOCKS5 listener refusing outright,
+    /// or (for a TCP-based DNS transport) a SOCKS5 CONNECT that never reached
+    /// the plugin's local port — and distinct from [`Self::TunnelSilent`],
+    /// whose first cause is the plugin's own outward connection. A UDP DNS
+    /// transport's ASSOCIATE completing DOES disprove this variant (the local
+    /// SOCKS5 listener demonstrably accepted something) without being strong
+    /// enough evidence for `TunnelSilent` either, since `shadowsocks-service`
+    /// answers ASSOCIATE without touching the plugin — that reading falls
+    /// through to the generic self-test failure instead. `Display`
+    /// interpolates only integers.
+    #[error("Could not open a connection into the tunnel ({attempts} attempts in {elapsed_ms}ms). The local proxy or its plugin is not accepting connections.")]
+    NoTunnelConnection { attempts: u32, elapsed_ms: u64 },
     /// The start-time reachability probe found the network is resetting/dropping
     /// the server handshake (DPI / censorship), distinct from a credential/config
     /// failure. `Display` is the host-free censorship sentence
@@ -131,7 +154,9 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::NoListenersEnabled
             | ProxyError::DuplicateListenerPort { .. }
             | ProxyError::InvalidListenerPort { .. }
-            | ProxyError::ForwarderSelfTestFailed { .. } => StartError::Failed { message: e.to_string() },
+            | ProxyError::ForwarderSelfTestFailed { .. }
+            | ProxyError::TunnelSilent { .. }
+            | ProxyError::NoTunnelConnection { .. } => StartError::Failed { message: e.to_string() },
         }
     }
 }

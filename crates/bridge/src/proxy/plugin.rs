@@ -36,6 +36,7 @@ pub struct PluginChain {
     /// `proxy_manager.rs` reads this as the authoritative runtime signal.
     transports: garter::Transports,
     state_dir: Option<PathBuf>,
+    log: Arc<crate::proxy::plugin_log::PluginLog>,
 }
 
 impl std::fmt::Debug for PluginChain {
@@ -57,6 +58,31 @@ impl PluginChain {
     /// flows can be carried through the tunnel or must be dropped.
     pub fn transports(&self) -> garter::Transports {
         self.transports
+    }
+
+    /// The chain's kept log lines — see [`crate::proxy::plugin_log`].
+    pub fn log(&self) -> &Arc<crate::proxy::plugin_log::PluginLog> {
+        &self.log
+    }
+
+    /// Build a `PluginChain` around a pre-seeded log, with no real plugin
+    /// subprocess behind it. For tests that need a genuinely `Some`
+    /// `PluginChain` to prove a CALL SITE reads whatever `log()` returns —
+    /// the spawn/readiness machinery itself is proven separately, against a
+    /// real child, by `tests/plugin_chain.rs`. `cancel` is caller-supplied
+    /// so this stays out of the disallowed-fresh-token lint (test callers
+    /// carry the sanctioned module-level allow; this constructor does not
+    /// need to).
+    #[cfg(test)]
+    pub(crate) fn for_test(log: Arc<crate::proxy::plugin_log::PluginLog>, cancel: CancellationToken) -> Self {
+        Self {
+            handle: tokio::spawn(async { Ok(()) }),
+            cancel,
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            transports: garter::Transports::TCP,
+            state_dir: None,
+            log,
+        }
     }
 
     /// Explicitly kill all tracked plugin PIDs and clear the state file.
@@ -132,6 +158,9 @@ pub async fn start_plugin_chain(
         .map(|d| d.binary_name)
         .unwrap_or(plugin_name);
     let protocols = hole_common::plugin::plugin_alloc_protocols(binary);
+    // Built before `bind_ephemeral` so every bind-retry attempt feeds the same
+    // ring — a losing attempt's output explains the retry.
+    let log = crate::proxy::plugin_log::PluginLog::new();
 
     let (_port, (handle, cancel, ready_addr, transports)) =
         port_alloc::bind_ephemeral(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols, |port| {
@@ -139,6 +168,7 @@ pub async fn start_plugin_chain(
             // an `async move`; clone per attempt instead. `&str`/`&Path`
             // arguments are Copy and pass through unchanged.
             let merged_opts = merged_opts.clone();
+            let log = Arc::clone(&log);
             // Each attempt gets its own child token derived from the
             // bridge cancel: cancelling the bridge cancels every attempt;
             // a failed attempt that drops its child does not signal the
@@ -157,6 +187,7 @@ pub async fn start_plugin_chain(
                     owner,
                     diagnostic_tap,
                     attempt_cancel,
+                    &log,
                 )
                 .await
                 .map_err(proxy_err_to_io_err)
@@ -169,10 +200,15 @@ pub async fn start_plugin_chain(
             // caller short-circuits cleanly instead of seeing
             // ProxyError::Plugin("...cancelled").
             if cancel.is_cancelled() {
-                ProxyError::Cancelled
-            } else {
-                ProxyError::Plugin(format!("plugin chain start failed: {e}"))
+                return ProxyError::Cancelled;
             }
+            // The chain never became a `PluginChain`, so nothing downstream can
+            // reach its ring. "exited before becoming ready" and "did not become
+            // ready within 30s" carry no detail of their own, and the plugin's
+            // own last lines are the only account of why — emit them here, once,
+            // after every bind retry has had its say.
+            crate::proxy::plugin_log::warn_recent(&log);
+            ProxyError::Plugin(format!("plugin chain start failed: {e}"))
         })?;
 
     Ok(PluginChain {
@@ -181,6 +217,7 @@ pub async fn start_plugin_chain(
         local_addr: ready_addr,
         transports,
         state_dir: state_dir.map(Path::to_path_buf),
+        log,
     })
 }
 
@@ -228,7 +265,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// A plugin `StartError::BindConflict` (the only retryable start class)
 /// maps to [`ProxyError::BindRace`] so the outer `bind_ephemeral` retries
 /// on a fresh port; a `StartError::Fatal` maps to [`ProxyError::Plugin`].
-#[allow(clippy::too_many_arguments)] // 10 args — bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 11 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
     plugin_path: &str,
@@ -240,6 +277,7 @@ async fn spawn_plugin_runner_at(
     owner: Option<(u32, u32)>,
     diagnostic_tap: bool,
     cancel: CancellationToken,
+    log: &Arc<crate::proxy::plugin_log::PluginLog>,
 ) -> Result<
     (
         tokio::task::JoinHandle<garter::Result<()>>,
@@ -250,6 +288,8 @@ async fn spawn_plugin_runner_at(
     ProxyError,
 > {
     let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts).readiness(readiness_for(plugin_name));
+    // Before the tap wrap: `TapPlugin` delegates `run`, so the sink still fires.
+    plugin = plugin.log_sink(log.sink());
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();

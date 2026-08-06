@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
-use crate::reachability::ReachabilityVerdict;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
@@ -1931,32 +1930,31 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::forwarder::DnsForwarder;
+    use crate::dns::forwarder::UpstreamCause;
     use crate::test_support::log_capture::VecWriter;
-    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
-    use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    fn test_dns_cfg() -> DnsConfig {
-        DnsConfig {
-            enabled: true,
-            servers: vec!["127.0.0.1".parse().unwrap()],
-            protocol: DnsProtocol::PlainTcp,
-            allow_insecure_bootstrap: false,
-        }
-    }
-
-    /// The self-test hands its budget DOWN to the forwarder instead of
-    /// wrapping the call in a `timeout`, so a failing attempt is classified and
-    /// logged before the self-test's own budget can drop it. This asserts the
-    /// reason carries the typed cause, i.e. the gate reports WHAT failed.
+    /// The gate REACHES `report_plugin_output`. Driven through the real
+    /// `start_inner` failure arm with the mock backends: `MockProxy` binds no
+    /// listener, so the forwarder's SOCKS5 connect cannot complete and the gate
+    /// fails. No plugin is configured, so the `None` branch is what proves the
+    /// call site exists — the `Some` branch differs only in the argument, and
+    /// `tests/plugin_chain.rs` proves a real chain's ring holds the child's
+    /// lines.
+    ///
+    /// Which classification comes out is deliberately NOT asserted: the SOCKS5
+    /// port is a real one, and pinning a variant would make the test depend on
+    /// nothing else being bound there. `classify_failure_covers_every_branch`
+    /// and `a_refused_local_hop_is_reported_as_no_connection` pin the variants
+    /// against stub connectors that own their outcome.
     #[skuld::test]
-    fn self_test_failure_logs_the_typed_upstream_cause() {
+    fn a_failed_gate_reaches_the_plugin_output_report() {
         let writer = VecWriter::new();
-
-        let outcome = tokio::runtime::Builder::new_current_thread()
+        // Current-thread: `set_default_in_current_thread` is thread-local, and
+        // the gate's work runs in tasks this start spawns.
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -1969,404 +1967,75 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await
+                // A standing lockdown suppresses the out-of-band reachability probe,
+                // whose TcpRefused verdict would otherwise replace the gate's own
+                // reading (see `self_test_error_for`'s precedence).
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+                let mut cfg = test_config();
+                // A real listener HELD open for the whole test, not a
+                // free_port()-allocated number: `free_port` only proves the
+                // port was free at the moment it probed, and nothing stops
+                // another process claiming and answering on it before the
+                // gate dials — a TOCTOU that would flip this run to
+                // `Other` (a reply arrived) and fail the assertion below as
+                // a flake. The listener never `accept()`s, so the SOCKS5
+                // handshake `Socks5Connector::connect_tcp` waits on never
+                // completes; the gate still fails (this test's whole point),
+                // just via a hung handshake instead of an instant refusal.
+                let held_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                cfg.local_port = held_port.local_addr().unwrap().port();
+                cfg.dns = DnsConfig {
+                    enabled: true,
+                    servers: vec!["127.0.0.1".parse().unwrap()],
+                    protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
+                };
+                pm.start(&cfg).await.expect_err("the gate must fail with no listener");
             });
-
-        let reason = match outcome {
-            SelfTestOutcome::Failed { reason, .. } => reason,
-            other => panic!("expected Failed, got {other:?}"),
-        };
-        assert!(
-            reason.contains("Unreachable"),
-            "the reason must name the cause, not just 'timed out'; got: {reason}"
-        );
-
         let output = writer.snapshot_string();
         assert!(
-            output.contains("upstream failed"),
-            "the per-upstream WARN must survive the self-test's budget; got:\n{output}"
-        );
-        assert!(
-            output.contains("layer=connect"),
-            "expected 'layer=connect'; got:\n{output}"
-        );
-        assert!(
-            output.contains("cause=unreachable"),
-            "expected 'cause=unreachable'; got:\n{output}"
-        );
-        assert!(
-            output.contains("budget_ms=1500"),
-            "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
+            output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the failed gate must report on the plugin chain; got:\n{output}"
         );
     }
 
-    /// The overall budget is a deadline the loop respects, so a self-test whose
-    /// upstreams all hang stops ON TIME, reports the real typed failure, and
-    /// counts only the attempts that ran. Virtual time: the connector never
-    /// completes, so every `forward_one` budget expires via auto-advance and no
-    /// wall-clock is consumed.
+    /// The `None` branch above proves the call site exists; this proves the
+    /// `Some` branch actually reaches a real chain's lines. Drives the EXACT
+    /// expression `start_inner` uses — `plugin_chain.as_ref().map(|c| &**c.log())`
+    /// — against a `PluginChain::for_test` seeded with lines, rather than a
+    /// hand-constructed `Option<&PluginLog>`, so a regression in that
+    /// double-deref/reference conversion would show up here. The spawn +
+    /// readiness machinery that BUILDS a real `PluginChain` is proven
+    /// separately, against a real child, by `tests/plugin_chain.rs`.
     #[skuld::test]
-    fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
-        let (outcome, elapsed) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::pause();
-                let servers: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()];
-                let cfg = DnsConfig {
-                    servers: servers.clone(),
-                    ..test_dns_cfg()
-                };
-                let forwarder = SArc::new(DnsForwarder::new(cfg, SArc::new(HangingConnector), false));
-                let t0 = tokio::time::Instant::now();
-                let outcome = run_forwarder_self_test(forwarder, servers, false, CancellationToken::new()).await;
-                (outcome, t0.elapsed())
-            });
+    async fn a_configured_plugins_lines_reach_the_report_through_the_real_call_site() {
+        let log = crate::proxy::plugin_log::PluginLog::new();
+        log.push_line("transport/internet/tls: ECH required but no ECH config could be obtained");
+        let plugin_chain = Some(crate::proxy::plugin::PluginChain::for_test(
+            log,
+            CancellationToken::new(),
+        ));
 
-        // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
-        // deadline must cut it near 5s. tokio rounds every timer deadline UP to
-        // a whole millisecond and the loop arms at most one per upstream per
-        // attempt, so allow exactly that many milliseconds of overshoot.
-        const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
-        let quantization = std::time::Duration::from_millis(3 * 2);
-        assert!(
-            elapsed < UNBOUNDED,
-            "the deadline must truncate the retry sequence; took {elapsed:?}"
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         );
-        assert!(
-            elapsed <= std::time::Duration::from_secs(5) + quantization,
-            "the loop must stop at the overall deadline; took {elapsed:?}"
-        );
-        match outcome {
-            SelfTestOutcome::Failed { reason, attempts } => {
-                assert!(
-                    reason.contains("Timeout"),
-                    "every upstream hung, so the reason must say so; got: {reason}"
-                );
-                assert!(
-                    !reason.contains("no attempt completed"),
-                    "attempts run to completion under a deadline; got: {reason}"
-                );
-                assert!(
-                    (1..=3).contains(&attempts),
-                    "attempts must count what actually ran; got {attempts}"
-                );
-            }
-            other => panic!("expected Failed, got {other:?}"),
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            // The exact expression from start_inner's SelfTestOutcome::Failed arm.
+            super::report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
         }
-    }
-
-    /// Empty servers → `run_forwarder_self_test` logs `skipped` and
-    /// returns `Ok(0)`. Empty-servers in production is rejected at
-    /// `build_local_dns` *before* `run_forwarder_self_test` is even
-    /// called (test below: `build_local_dns_returns_err_for_empty_servers`);
-    /// this test pins the helper's contract in isolation.
-    #[skuld::test]
-    fn self_test_empty_servers_returns_ok_zero() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
-                assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
-            });
 
         let output = writer.snapshot_string();
         assert!(
-            output.contains("forwarder self-test skipped: no servers configured"),
-            "expected skipped log; got:\n{output}"
+            output.contains("ECH required"),
+            "a configured plugin's ring must reach the report through this call site; got:\n{output}"
         );
-    }
-
-    /// Dead upstream → `run_forwarder_self_test` returns
-    /// `SelfTestOutcome::Failed { attempts: 3, .. }` and logs `forwarder
-    /// self-test failed` at INFO. `into_result` then maps that to
-    /// `ProxyError::ForwarderSelfTestFailed`.
-    #[skuld::test]
-    fn self_test_dead_upstream_returns_failed() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let outcome = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await;
-                let SelfTestOutcome::Failed { attempts, reason } = outcome else {
-                    panic!("expected Failed");
-                };
-                assert_eq!(attempts, 3);
-                assert!(
-                    !reason.is_empty(),
-                    "Failed reason must be non-empty for diagnostic value"
-                );
-                // into_result maps to the canonical error variant.
-                let err = SelfTestOutcome::Failed {
-                    attempts: 3,
-                    reason: reason.clone(),
-                }
-                .into_result(4500)
-                .unwrap_err();
-                assert!(matches!(
-                    err,
-                    ProxyError::ForwarderSelfTestFailed {
-                        attempts: 3,
-                        elapsed_ms: 4500,
-                        ..
-                    }
-                ));
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains("forwarder self-test failed"),
-            "expected 'forwarder self-test failed' in log; got:\n{output}"
-        );
-        assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
-    }
-
-    /// When self-test fails AND `diagnostic_plugin_tap=true`,
-    /// emit a `warn!` breadcrumb pointing the reader to the tap output
-    /// above. Const-anchored so a text change breaks only the const.
-    #[skuld::test]
-    fn self_test_failure_with_tap_enabled_emits_correlation_hint() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let _ = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    true,
-                    CancellationToken::new(),
-                )
-                .await;
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains(super::TAP_ENABLED_HINT),
-            "expected TAP_ENABLED_HINT in log; got:\n{output}"
-        );
-        assert!(
-            !output.contains(super::TAP_DISABLED_HINT),
-            "tap=true must NOT emit the disabled hint; got:\n{output}"
-        );
-    }
-
-    /// When self-test fails AND tap is OFF, emit a `warn!`
-    /// remediation hint pointing the reader to the config flag.
-    #[skuld::test]
-    fn self_test_failure_without_tap_emits_remediation_hint() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let _ = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await;
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains(super::TAP_DISABLED_HINT),
-            "expected TAP_DISABLED_HINT in log; got:\n{output}"
-        );
-        assert!(
-            !output.contains(super::TAP_ENABLED_HINT),
-            "tap=false must NOT emit the enabled hint; got:\n{output}"
-        );
-    }
-
-    /// `build_local_dns` rejects the degenerate `enabled=true, servers=[]`
-    /// config: a live TUN would strand every in-tunnel UDP/53 flow at the
-    /// LocalDnsEndpoint with no upstream to forward to.
-    #[skuld::test]
-    fn build_local_dns_returns_err_for_empty_servers() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: true,
-                    servers: vec![], // degenerate
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
-                    Err(ProxyError::ForwarderSelfTestFailed {
-                        attempts: 0,
-                        elapsed_ms: 0,
-                        ..
-                    }) => {}
-                    Err(other) => panic!("unexpected error variant: {other:?}"),
-                    Ok(_) => panic!("expected ForwarderSelfTestFailed for empty servers"),
-                }
-            });
-    }
-
-    /// `is_dns_reply_ok` reply-decode contract — direct unit
-    /// tests of the RCODE check. Without these, a regression in the
-    /// mask (`0x0F` → `0xF0`) or the length check would only surface
-    /// once the gate runs against real upstream DNS in production.
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_noerror_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x00; // RCODE = 0 (NoError)
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_nxdomain_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x03; // RCODE = 3 (NXDOMAIN). Path probe semantic.
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_refused_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x05; // RCODE = 5 (REFUSED). Resolver declined, path works.
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_rejects_servfail() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x02; // RCODE = 2 (SERVFAIL). Upstream explicitly failed.
-        assert!(!super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_ignores_high_nibble_of_byte_3() {
-        // RFC 1035: low nibble = RCODE; high nibble = Z (reserved) + RA
-        // (recursion available). High-nibble bits set MUST NOT mask the
-        // RCODE check.
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0xF2; // high nibble set + RCODE=2
-        assert!(!super::is_dns_reply_ok(&reply));
-        reply[3] = 0xF0; // high nibble set + RCODE=0
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_rejects_truncated_reply() {
-        // Fewer than 12 bytes is not a well-formed DNS header.
-        assert!(!super::is_dns_reply_ok(&[]));
-        assert!(!super::is_dns_reply_ok(&[0u8; 11]));
-    }
-
-    /// `dns.enabled = false` → `build_local_dns` returns
-    /// `(None, None)` → gate is skipped entirely in `start_inner`.
-    #[skuld::test]
-    fn build_local_dns_returns_none_when_disabled() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: false,
-                    servers: vec![],
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
-                let (ep, fwd) = match res {
-                    Ok(t) => t,
-                    Err(e) => panic!("expected Ok((None, None)) for disabled DNS, got {e:?}"),
-                };
-                assert!(ep.is_none());
-                assert!(fwd.is_none());
-            });
-    }
-
-    /// The in-TUN LocalDnsEndpoint is the sole OS DNS path, so it must be
-    /// constructed whenever DNS is enabled with servers. `build_local_dns`
-    /// returns a 2-tuple `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
-    #[skuld::test]
-    fn build_local_dns_builds_endpoint_when_enabled() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: true,
-                    servers: vec!["1.1.1.1".parse().unwrap()],
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
-                    .await
-                    .expect("build_local_dns ok when enabled");
-                assert!(ep.is_some(), "endpoint must exist (sole DNS path)");
-                assert!(fwd.is_some(), "forwarder must exist for the self-test gate");
-            });
     }
 
     /// **Load-bearing**: when the forwarder self-test fails, `start_cancellable`
@@ -2486,76 +2155,6 @@ mod self_test {
     // `NetworkBlocked`; `TcpRefused`/`TcpTimeout` rewrite the reason; everything
     // else keeps the original self-test reason. No real TUN / bridge start needed.
 
-    fn original_reason() -> String {
-        "attempt 3 timed out".to_string()
-    }
-
-    #[skuld::test]
-    fn self_test_error_blocked_is_network_blocked() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Blocked), 3, 200, original_reason());
-        assert!(
-            matches!(e, ProxyError::NetworkBlocked),
-            "Blocked must map to the typed NetworkBlocked, got {e:?}"
-        );
-    }
-
-    #[skuld::test]
-    fn self_test_error_tcp_refused_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpRefused), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
-                assert!(reason.contains("refused"), "got {reason:?}");
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_tcp_timeout_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpTimeout), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
-                assert!(reason.contains("did not respond"), "got {reason:?}");
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_reachable_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Reachable), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed {
-                reason,
-                attempts,
-                elapsed_ms,
-            } => {
-                assert_eq!(reason, original_reason());
-                assert_eq!(attempts, 3);
-                assert_eq!(elapsed_ms, 200);
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_inconclusive_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Inconclusive), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_none_keeps_original() {
-        let e = self_test_error_for(None, 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
     /// A server config whose `server` points at a closed loopback port, so the
     /// out-of-band probe (no plugin → Raw transport) terminates fast with a
     /// closed-port verdict (`TcpRefused`, or `TcpTimeout` on a Windows runner
@@ -2582,8 +2181,10 @@ mod self_test {
 
     /// cover-skip: with the lockdown intent ON, the gate must NOT run the probe
     /// (a standing kill-switch cover would block it and we'd mis-report Hole's own
-    /// lockdown as censorship). The probe would rewrite the reason to "refused";
-    /// with the probe skipped the ORIGINAL self-test reason survives.
+    /// lockdown as censorship). The probe would rewrite this into
+    /// `ForwarderSelfTestFailed` with a "refused"/"did not respond" reason; with
+    /// the probe skipped, the self-test's own reading decides instead — not one
+    /// byte was ever written, so it is the typed `NoTunnelConnection`.
     #[skuld::test]
     fn lockdown_on_skips_probe_keeps_original_reason() {
         rt().block_on(async {
@@ -2592,14 +2193,48 @@ mod self_test {
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "lockdown-on must skip the probe and keep the original reason, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
+            );
         });
+    }
+
+    /// Regression: the same closed-port setup as `lockdown_off_runs_probe_rewrites_reason`
+    /// (probe runs, its verdict overrides the gate's own `NoConnection`
+    /// reading) must NOT quote the plugin's output — no plugin is
+    /// configured here either, so a firing report would say
+    /// `NO_PLUGIN_CONFIGURED` beside a failure the code has already
+    /// attributed to the probe's verdict, not the (nonexistent) plugin.
+    /// Current-thread runtime: `set_default_in_current_thread` is
+    /// thread-local, and the gate's work runs in tasks this start spawns.
+    #[skuld::test]
+    fn a_probe_override_suppresses_the_plugin_output_report() {
+        let writer = VecWriter::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let (mut pm, cfg, _dir) = gate_failure_setup(false);
+                pm.start_cancellable(&cfg, false, CancellationToken::new())
+                    .await
+                    .expect_err("both the probe and the gate must fail");
+            });
+        let output = writer.snapshot_string();
+        assert!(
+            !output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the probe's verdict overrides the gate's own reading, so the plugin-output \
+             report must not fire; got:\n{output}"
+        );
     }
 
     /// Control: with lockdown OFF the probe DOES run, so the same closed-port
@@ -2979,7 +2614,6 @@ mod self_test {
 
     /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
     /// retry reuses the resolved IP instead of re-querying under the held cover.
-    use crate::dns::forwarder::UpstreamCause;
     struct CountingQuerier {
         host: String,
         ip: IpAddr,
@@ -3277,21 +2911,23 @@ mod self_test {
 
     /// The covered start engages the cover before start_inner, so the probe-
     /// suppression predicate (cover_active) sees the live in-process signal even
-    /// with NO lockdown intent — the original self-test reason survives. Mirrors
-    /// `lockdown_on_skips_probe_keeps_original_reason`; the control is
-    /// `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe runs).
+    /// with NO lockdown intent — the self-test's own reading survives instead of
+    /// the probe's rewrite. Mirrors `lockdown_on_skips_probe_keeps_original_reason`;
+    /// the control is `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe
+    /// runs).
     #[skuld::test]
     fn covered_start_without_lockdown_suppresses_probe() {
         rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            let err = pm.start_cancellable(&cfg, true, CancellationToken::new()).await.unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "a covered start engages a cover, so the probe is skipped and the original reason survives, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "a covered start engages a cover, so the probe is skipped and the self-test's own \
+                 reading (not one byte written) surfaces, got {err:?}"
+            );
         });
     }
 
@@ -3349,32 +2985,5 @@ mod self_test {
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
         });
-    }
-
-    /// End-to-end-ish: a TLS-transport endpoint that accepts TCP then resets the
-    /// handshake → the live probe verdict is `Blocked` → `self_test_error_for`
-    /// yields the typed `NetworkBlocked`.
-    #[skuld::test(name = "proxy_manager_tests::reset_endpoint_maps_to_network_blocked")]
-    async fn reset_endpoint_maps_to_network_blocked() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((s, _)) = l.accept().await {
-                drop(s);
-            }
-        });
-        let verdict = crate::reachability::probe_server_reachability(
-            &a.ip().to_string(),
-            a.port(),
-            Some("galoshes"),
-            Some("tls;host=h"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(verdict, ReachabilityVerdict::Blocked);
-        assert!(matches!(
-            self_test_error_for(Some(verdict), 3, 200, original_reason()),
-            ProxyError::NetworkBlocked
-        ));
     }
 }
