@@ -35,6 +35,24 @@ const UDP_ASSOC_CHANNEL_CAPACITY: usize = 64;
 /// in `SS_PLUGIN_OPTIONS`. Matches shadowsocks-rust's `udp_timeout` default.
 pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// `Instant::now() + udp_timeout`, saturating instead of panicking on
+/// overflow. `run_udp_association`'s idle-eviction reset re-reads the clock
+/// on every datagram for the process's whole lifetime, so a `udp_timeout`
+/// that fit `Instant::now()` at parse time (`parse_udp_timeout`'s own
+/// `checked_add` probe) is not guaranteed to still fit once the process has
+/// been up for a while — the margin shrinks as uptime grows. Mirrors the
+/// ask-forgiveness shape `tokio::time::sleep` itself uses (`checked_add`
+/// falling back to `Instant::far_future`), re-derived here because
+/// `far_future` is `pub(crate)` upstream.
+pub(crate) fn saturating_deadline(udp_timeout: Duration) -> Instant {
+    Instant::now().checked_add(udp_timeout).unwrap_or_else(|| {
+        // Roughly 30 years out — matches tokio::time::Instant::far_future's
+        // own margin, chosen there because 1000 years overflows on macOS and
+        // 100 years overflows on FreeBSD.
+        Instant::now() + Duration::from_secs(86_400 * 365 * 30)
+    })
+}
+
 // Protocol framing ====================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +572,7 @@ async fn run_udp_association(
             // local app -> server
             maybe = outbound_rx.recv() => {
                 let Some(payload) = maybe else { break "channel closed" };
-                idle.as_mut().reset(Instant::now() + udp_timeout);
+                idle.as_mut().reset(saturating_deadline(udp_timeout));
                 let framed = frame_udp_datagram(&payload);
                 if stream.write_all(&framed).await.is_err() {
                     break "stream write error";
@@ -570,7 +588,7 @@ async fn run_udp_association(
                     Ok(n) => n,
                     Err(_) => break "stream read error",
                 };
-                idle.as_mut().reset(Instant::now() + udp_timeout);
+                idle.as_mut().reset(saturating_deadline(udp_timeout));
                 acc.push(&read_buf[..n]);
                 while let Some(payload) = acc.next_frame() {
                     if let Err(e) = udp_socket.send_to(&payload, peer).await {
@@ -1150,28 +1168,53 @@ async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
 /// Parse the optional client-side `udp_timeout` (whole seconds) from an
 /// `SS_PLUGIN_OPTIONS` string.
 ///
-/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The last occurrence
-/// wins (consistent with ex-ray's duplicate-key semantics). A value that
-/// is not a positive integer is a hard error — `0` would evict every
-/// association immediately, breaking all UDP. ex-ray ignores this key,
-/// so it can share the same options string.
+/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The FIRST
+/// occurrence wins on a duplicate key — matching every other reader of this
+/// same options string (ex-ray's own `Args.Get`, and the bridge's
+/// `classify_transport`/garter-bin's `config_path_from_plugin_options`),
+/// even though `udp_timeout` is galoshes' own extension ex-ray never reads:
+/// there is no cross-tool parity requirement for this key, but there IS an
+/// intra-string one — an operator reading one options string should not
+/// see different keys resolve duplicates in opposite directions.
+///
+/// EVERY occurrence is validated, not just the winning first one — a value
+/// that is not a positive integer is a hard error on ANY occurrence (`0`
+/// would evict every association immediately, breaking all UDP), so a
+/// self-contradictory duplicate still refuses the start rather than
+/// silently keeping the first value and discarding the rest unchecked.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
         return Ok(DEFAULT_UDP_TIMEOUT);
     };
-    let mut timeout = DEFAULT_UDP_TIMEOUT;
-    for (key, value) in garter::parse_plugin_options(opts) {
-        if key == "udp_timeout" {
-            let secs: u64 = value
-                .parse()
-                .with_context(|| format!("invalid udp_timeout (expected a positive integer of seconds): {value:?}"))?;
-            if secs == 0 {
-                anyhow::bail!("udp_timeout must be greater than 0 seconds");
-            }
-            timeout = Duration::from_secs(secs);
+    let mut selected: Option<Duration> = None;
+    for (key, value) in garter::parse_plugin_options(opts).map_err(garter::Error::from)? {
+        if key != "udp_timeout" {
+            continue;
         }
+        // Never echo the rejected value: SIP003 escaping lets a `\` absorb a
+        // later segment into a value, so an unparseable
+        // `udp_timeout=abc\;token=SECRET` could otherwise leak `token`'s
+        // value through this message (same reason `Mode::from_plugin_options`
+        // and every `parse*Option` in ex-ray's own options.go withhold theirs).
+        let secs: u64 = value
+            .parse()
+            .context("invalid udp_timeout: value is not a positive integer of seconds")?;
+        if secs == 0 {
+            anyhow::bail!("udp_timeout must be greater than 0 seconds");
+        }
+        let timeout = Duration::from_secs(secs);
+        // A diagnostic, not the safety net: `run_udp_association`'s own idle
+        // resets use `saturating_deadline`, which can't panic no matter what
+        // `timeout` is. This check exists so a `udp_timeout` too large to
+        // fit `Instant` even right now — which would defeat NAT idle-eviction
+        // as thoroughly as `0` defeats it in the other direction — is
+        // reported at startup instead of silently accepted.
+        if std::time::Instant::now().checked_add(timeout).is_none() {
+            anyhow::bail!("udp_timeout is too large to represent as a deadline");
+        }
+        selected.get_or_insert(timeout);
     }
-    Ok(timeout)
+    Ok(selected.unwrap_or(DEFAULT_UDP_TIMEOUT))
 }
 
 pub struct YamuxPlugin {

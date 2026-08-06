@@ -632,22 +632,28 @@ async fn chain_runner_default_matches_explicit_client_mode() {
 #[skuld::test]
 async fn mode_from_plugin_options_detects_bare_server_keyword() {
     use crate::chain::Mode;
-    assert_eq!(Mode::from_plugin_options(Some("server")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("server;path=/")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("path=/;server;host=h")), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server")).unwrap(), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server;path=/")).unwrap(), Mode::Server);
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/;server;host=h")).unwrap(),
+        Mode::Server
+    );
 }
 
 #[skuld::test]
 async fn mode_from_plugin_options_false_when_server_only_appears_as_substring() {
     use crate::chain::Mode;
     assert_eq!(
-        Mode::from_plugin_options(Some("servername=cdn.example.com")),
+        Mode::from_plugin_options(Some("servername=cdn.example.com")).unwrap(),
         Mode::Client
     );
-    assert_eq!(Mode::from_plugin_options(Some("path=/serverlist")), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("path=/server")), Mode::Client);
     assert_eq!(
-        Mode::from_plugin_options(Some("path=/serverlist;servername=foo")),
+        Mode::from_plugin_options(Some("path=/serverlist")).unwrap(),
+        Mode::Client
+    );
+    assert_eq!(Mode::from_plugin_options(Some("path=/server")).unwrap(), Mode::Client);
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/serverlist;servername=foo")).unwrap(),
         Mode::Client
     );
 }
@@ -655,8 +661,8 @@ async fn mode_from_plugin_options_false_when_server_only_appears_as_substring() 
 #[skuld::test]
 async fn mode_from_plugin_options_false_when_options_missing() {
     use crate::chain::Mode;
-    assert_eq!(Mode::from_plugin_options(None), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(None).unwrap(), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("")).unwrap(), Mode::Client);
 }
 
 #[skuld::test]
@@ -665,7 +671,7 @@ async fn mode_from_plugin_options_handles_mixed_options() {
     // Realistic server-side `plugin_opts`:
     // `server;fast-open;path=/t/<token>;host=<fqdn>`.
     let opts = "server;fast-open;path=/t/abc123;host=hole-stgn.binarydreams.me";
-    assert_eq!(Mode::from_plugin_options(Some(opts)), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some(opts)).unwrap(), Mode::Server);
 }
 
 #[skuld::test]
@@ -674,8 +680,8 @@ async fn mode_from_plugin_options_false_for_capitalized_keyword() {
     // SIP003 keys are lowercase per v2ray-plugin convention; pin the
     // case-sensitive behavior so a future "be lenient about case" patch
     // is a conscious decision rather than drift.
-    assert_eq!(Mode::from_plugin_options(Some("Server")), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("SERVER;path=/")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("Server")).unwrap(), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("SERVER;path=/")).unwrap(), Mode::Client);
 }
 
 #[skuld::test]
@@ -685,17 +691,40 @@ async fn mode_from_plugin_options_true_when_key_has_value() {
     // own parser uses `opts.Get("server")` which matches `server=value`
     // (value ignored). Mirror that semantics: presence of the key triggers
     // server mode regardless of value.
-    assert_eq!(Mode::from_plugin_options(Some("server=1;path=/")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("server=true")), Mode::Server);
+    assert_eq!(
+        Mode::from_plugin_options(Some("server=1;path=/")).unwrap(),
+        Mode::Server
+    );
+    assert_eq!(Mode::from_plugin_options(Some("server=true")).unwrap(), Mode::Server);
 }
 
 #[skuld::test]
-async fn mode_from_plugin_options_false_for_escaped_server() {
+async fn mode_from_plugin_options_true_for_escaped_server() {
     use crate::chain::Mode;
-    // `\s` is not a SIP003-recognized escape (only \;, \\, \= per
-    // parse_plugin_options). So `\server` parses as the literal
-    // string `\server` -- which is NOT the bare key `server`.
-    assert_eq!(Mode::from_plugin_options(Some(r"\server")), Mode::Client);
+    // A backslash escapes whatever byte follows, so `\server` IS the bare
+    // key `server` — to ex-ray, and here.
+    assert_eq!(Mode::from_plugin_options(Some(r"\server")).unwrap(), Mode::Server);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_errors_on_malformed_options() {
+    use crate::chain::Mode;
+    // See Mode::from_plugin_options's doc comment for why neither Client
+    // nor Server is a safe default here.
+    assert!(Mode::from_plugin_options(Some(r"server;path=/a\")).is_err());
+    assert!(Mode::from_plugin_options(Some("server;;path=/a")).is_err());
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_unaffected_by_a_duplicate_non_deciding_key() {
+    use crate::chain::Mode;
+    // `server` is decided by presence (`.any(...)`), not by ex-ray's
+    // first-wins `Get` — a duplicate, unrelated key elsewhere in the string
+    // must not perturb that.
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/a;path=/b;server")).unwrap(),
+        Mode::Server
+    );
 }
 
 // Drain-timeout semantics tests =======================================================================================

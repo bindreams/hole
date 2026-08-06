@@ -466,10 +466,10 @@ fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
 /// `ech-doh` for. `v2ray-plugin` resolves to the first-party `ex-ray` binary,
 /// but a config may also name `ex-ray` directly, so both spellings are
 /// covered; `galoshes` ignores the keys itself but forwards the whole options
-/// string to its inner ex-ray. Every OTHER plugin name is passed through
-/// `inject_plugin_directives` completely unmodified — no `ech-doh` is ever
-/// injected, so nothing that plugin does can be influenced by Hole's ECH
-/// derivation at all.
+/// string to its inner ex-ray. Every OTHER plugin name gets no `ech-doh`
+/// injected — nothing that plugin does can be influenced by Hole's ECH
+/// derivation at all — but its options string is still validated; see
+/// `inject_plugin_directives`'s doc comment.
 fn takes_ech_directives(plugin_name: &str) -> bool {
     matches!(plugin_name, "v2ray-plugin" | "ex-ray" | "galoshes")
 }
@@ -1149,9 +1149,11 @@ fn classify_ech_doh(
 /// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
 /// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,
 /// so both spellings are covered; `galoshes` ignores the keys itself but
-/// forwards the whole options string to its inner ex-ray. Every other plugin
-/// name is passed through unmodified — the ONE gate (`takes_ech_directives`)
-/// both this function and its callers rely on, checked exactly once, here.
+/// forwards the whole options string to its inner ex-ray. Every OTHER plugin
+/// name still has its options string validated, though nothing is injected —
+/// a malformed string must not reach `BinaryPlugin` unvalidated just because
+/// the plugin isn't one of these three. The ONE gate (`takes_ech_directives`)
+/// both this function and its callers rely on is checked exactly once, here.
 /// Emits the ECH-posture `tracing::warn!` lines — called exactly once per
 /// actual plugin spawn (`start_plugin_chain`); the permit-derivation query
 /// [`effective_ech_doh`] deliberately does NOT call this, to avoid
@@ -1162,7 +1164,13 @@ fn inject_plugin_directives(
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<Option<String>, ProxyError> {
     if !takes_ech_directives(plugin_name) {
-        return Ok(opts.map(String::from));
+        // Still validated: see the doc comment above.
+        return match opts {
+            Some(o) => garter::split_plugin_options(o)
+                .map(|_| Some(o.to_string()))
+                .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}"))),
+            None => Ok(None),
+        };
     }
     {
         let opts = opts.unwrap_or_default();
@@ -1434,6 +1442,11 @@ mod inject_tests {
     }
 
     #[skuld::test]
+    fn unknown_plugin_with_malformed_options_is_rejected() {
+        assert!(inject_plugin_directives("obfs-local", Some(r"server;path=/a\"), None).is_err());
+    }
+
+    #[skuld::test]
     fn v2ray_plugin_gets_ech_doh_after_loglevel() {
         let out = merged(
             "v2ray-plugin",
@@ -1625,9 +1638,9 @@ mod inject_tests {
         );
     }
 
-    // ex-ray discards the whole SS_* environment on a parse error and reports
-    // `ready` on its default port, so forwarding these would produce a dead
-    // tunnel that looks healthy. Refuse the start instead.
+    // ex-ray fails fatally on a malformed `SS_PLUGIN_OPTIONS` string rather
+    // than silently discarding it — but only after spawning. Refusing here
+    // fails earlier and attributably instead.
     #[skuld::test]
     fn malformed_options_fail_the_start() {
         for opts in [r"path=/a\", "host=h;=v;mux=0", "a=1;;b=2"] {
