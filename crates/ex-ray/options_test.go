@@ -156,8 +156,13 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
 	snap := snapshotFlags()
 	t.Cleanup(snap.restore)
+	// unsetEnv (args_test.go), not t.Setenv(v, ""): parseEnv distinguishes
+	// a genuinely-unset var from one exported empty (see
+	// TestParseEnvRejectsOnlyGenuinePartialSSEnv), and this test means to
+	// cover true standalone absence, not "all four present but empty"
+	// (which is itself fatal).
 	for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
-		t.Setenv(v, "")
+		unsetEnv(t, v)
 	}
 	t.Setenv("SS_PLUGIN_OPTIONS", "host=standalone.example.com")
 
@@ -185,6 +190,52 @@ func TestParseOptsIntoFlagsEchRejectsExplicitEmptyValue(t *testing.T) {
 	}
 	if *echMode != "auto" {
 		t.Errorf("*echMode = %q after a rejected value, want it untouched at %q", *echMode, "auto")
+	}
+}
+
+// ech=always is a fail-closed promise ("refusing to start without a DoH
+// source for fail-closed ECH" is buildTLSConfig's own reasoning for the
+// missing-ech-doh case); without tls set at all, buildTLSConfig never
+// runs, so this must be validated in generateConfig itself or the promise
+// silently applies nothing -- the operator asked for concealed SNI and
+// gets a fully plaintext transport instead, with no diagnostic.
+func TestGenerateConfigRejectsEchAlwaysWithoutTLS(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	restoreEch := withEchFlags(t, "always", "https://1.1.1.1/dns-query")
+	defer restoreEch()
+	origTLS := *tlsEnabled
+	*tlsEnabled = false
+	defer func() { *tlsEnabled = origTLS }()
+
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() = nil error, want an error mentioning ech and tls")
+	}
+	if !strings.Contains(err.Error(), "ech") || !strings.Contains(err.Error(), "tls") {
+		t.Errorf("error %q does not mention both ech and tls", err.Error())
+	}
+}
+
+// ech=auto/never make no fail-closed promise, so they must NOT require
+// tls -- opportunistic ECH with no TLS at all is simply a no-op, not a
+// broken guarantee. Guards against a future edit widening the
+// always-requires-tls check to every non-"never" value, which would
+// reject the flag's own registered default (echMode=auto, tlsEnabled=false).
+func TestGenerateConfigAcceptsEchAutoAndNeverWithoutTLS(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	for _, mode := range []string{"auto", "never"} {
+		restoreEch := withEchFlags(t, mode, "")
+		origTLS := *tlsEnabled
+		*tlsEnabled = false
+
+		_, err := generateConfig()
+		restoreEch()
+		*tlsEnabled = origTLS
+		if err != nil {
+			t.Errorf("ech=%s, tls disabled: generateConfig() = %v, want nil", mode, err)
+		}
 	}
 }
 

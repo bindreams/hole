@@ -1,0 +1,103 @@
+package main
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// parseIntOption reads a SIP003 option value from opts and applies it to
+// dest, sharing one implementation across mux/tcp-keepalive/fwmark so the
+// three can never silently drift apart.
+//
+// The rule: an absent key is a no-op, leaving dest at whatever it already
+// held (dest holds whatever flag.Parse left there -- main() calls
+// flag.Parse() before parseOptsIntoFlags runs -- the registered default
+// when no CLI flag was passed, or the CLI-supplied value when one was).
+// Any PRESENT value, empty included, must parse as an integer or the
+// option is fatal: an explicitly empty value ("mux=") is not a documented
+// "leave it alone" spelling, and treating it as one is actively dangerous
+// for mux specifically -- galoshes' ex_ray_options appends `mux=0` and
+// ex-ray is first-wins, so an operator's earlier bare `mux=` would win
+// over galoshes' append and silently leave Mux.Cool at whatever default
+// it already held (often ON), defeating the exact mechanism `mux=0` exists
+// to guarantee. A BARE key (no `=` at all) is different: args.go's parser
+// maps it to the literal string "1" for every option uniformly, so it
+// goes through the same Atoi path as an explicit `=1` and sets dest to 1
+// -- not "the default" for tcp-keepalive/fwmark, whose defaults are 15/0
+// (see TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this
+// needs args.go's Args type to distinguish a bare key from an explicit
+// "=1", a grammar change not attempted here). A non-empty, non-numeric
+// value is fatal and never echoes the rejected value: the escaping
+// grammar lets a backslash absorb a later segment into a value, so an
+// unparseable mux=abc\;certRaw=SECRET could otherwise leak certRaw's
+// value through the mux error.
+func parseIntOption(opts Args, key string, dest *int) error {
+	c, ok := opts.Get(key)
+	if !ok {
+		return nil
+	}
+	i, err := strconv.Atoi(c)
+	if err != nil {
+		return newError(fmt.Sprintf("invalid %s: value is not an integer", key))
+	}
+	*dest = i
+	return nil
+}
+
+// parseBoolOption reads a SIP003 presence option value from opts and
+// applies it to dest. Unlike parseIntOption/parseEnumOption, an explicitly
+// empty value ("key=") is NOT a no-op here -- only an absent key is. A bare
+// key (no `=` at all) or an explicit "key=1" (args.go maps a bare key to
+// the literal "1") is the only spelling that enables the flag; any other
+// present value, empty included, is unrecognized and fatal. Inventing a
+// wider vocabulary ("true"/"yes"/"on" as a heuristic) is exactly the kind
+// of threshold that has no principled stopping point.
+//
+// The empty-value carve-out matters here specifically because these are
+// presence-only options: garter's Mode::from_plugin_options treats
+// presence of the `server` key, regardless of value, as server mode
+// (crates/garter/src/chain_tests.rs). Treating `server=` as a no-op would
+// leave *server false while garter still swapped the chain's SS_LOCAL/
+// SS_REMOTE env vars for server mode, producing a silently-broken-but-
+// reports-ready config: garter believes it is in server mode while ex-ray
+// does not -- and fixing that properly needs a garter-side change, out of
+// scope here. Rejecting `key=` outright avoids the disagreement without
+// touching garter: ex-ray simply refuses to start.
+//
+// Never echoes the rejected value for the same reason parseIntOption
+// doesn't.
+func parseBoolOption(opts Args, key string, dest *bool) error {
+	c, ok := opts.Get(key)
+	if !ok {
+		return nil
+	}
+	if c != "1" {
+		return newError(fmt.Sprintf("invalid %s: value is not recognized", key))
+	}
+	*dest = true
+	return nil
+}
+
+// parseEnumOption reads a SIP003 option value from opts and applies it to
+// dest if it matches one of allowed, mirroring parseIntOption/
+// parseBoolOption's actual structural rule (their doc comments, not their
+// old shared wording): an absent key is a no-op; any PRESENT value, empty
+// included, must be in allowed or the option is fatal. An empty value has
+// no more claim to "not specified" here than an empty mux or tls value
+// does. The allowed list is safe to name in the error (it's a small
+// static vocabulary, not operator input) but the rejected value itself
+// never is, for the same reason as every other option in this file.
+func parseEnumOption(opts Args, key string, allowed []string, dest *string) error {
+	c, ok := opts.Get(key)
+	if !ok {
+		return nil
+	}
+	for _, a := range allowed {
+		if c == a {
+			*dest = c
+			return nil
+		}
+	}
+	return newError(fmt.Sprintf("invalid %s: expected one of %s", key, strings.Join(allowed, ", ")))
+}

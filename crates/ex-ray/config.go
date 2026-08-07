@@ -151,6 +151,17 @@ func parseLocalAddr(localAddr string) []string {
 	return strings.Split(localAddr, "|")
 }
 
+// validPort parses and range-checks a SIP003 port string, the single
+// source of truth both main()'s early port-0 guard and generateConfig's
+// own localPort/remotePort validation route through -- two independently
+// written parsers is exactly the kind of drift that can silently
+// reintroduce a port-0/mis-report bug: strconv.Atoi alone accepts syntax
+// (e.g. a leading "+") that net.PortFromString (built on
+// strconv.ParseUint) rejects.
+func validPort(s string) (net.Port, error) {
+	return net.PortFromString(s)
+}
+
 // uint32Opt converts an operator-supplied integer option to uint32, rejecting
 // out-of-range values loudly instead of letting them silently wrap. The bound
 // guard wrapping the conversion is gosec G115's recognized mitigation, so the
@@ -311,15 +322,11 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 }
 
 func generateConfig() (*core.Config, error) {
-	lport, err := net.PortFromString(*localPort)
+	lport, err := validPort(*localPort)
 	if err != nil {
 		return nil, newError("invalid localPort: not a valid port")
 	}
-	// net.PortFromString range-checks to 0..65535 (net.Port is a uint16);
-	// strconv.ParseUint alone would accept anything up to 4294967295, which
-	// the freedom outbound below silently truncates to a uint16 -- a
-	// remotePort of 65536 would forward to port 0, not fail loudly.
-	rport, err := net.PortFromString(*remotePort)
+	rport, err := validPort(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
 	}
@@ -329,6 +336,24 @@ func generateConfig() (*core.Config, error) {
 	// up front instead, the same way an empty/invalid local port is.
 	if *remoteAddr == "" {
 		return nil, newError("invalid remoteAddr: must not be empty")
+	}
+	// ech is validated unconditionally here, not only inside buildTLSConfig
+	// (which runs only when *tlsEnabled below): a valid-vocabulary
+	// ech=always without tls set would otherwise silently apply nothing --
+	// the operator asked for fail-closed SNI concealment and gets a fully
+	// plaintext transport instead, with no diagnostic. "auto"/"never" make
+	// no such promise -- opportunistic ECH with no TLS at all is simply a
+	// no-op, not a broken guarantee, so only "always" is checked here.
+	// This also covers a raw -ech= CLI flag, which bypasses
+	// parseOptsIntoFlags' own parseEnumOption check entirely when
+	// SS_PLUGIN_OPTIONS carries no "ech" key at all. buildTLSConfig's own
+	// switch keeps its matching vocabulary guard as a contract assert for
+	// direct callers that skip generateConfig (e.g. its own unit tests).
+	if !slices.Contains(allowedEchModes, *echMode) {
+		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
+	}
+	if *echMode == "always" && !*tlsEnabled {
+		return nil, newError("ech=always requires tls to be enabled")
 	}
 	// Validate operator-supplied numeric options up-front, before the
 	// server/client split, so out-of-range mux/fwmark are rejected identically

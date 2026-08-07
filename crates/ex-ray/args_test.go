@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -205,6 +206,19 @@ func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	}
 }
 
+// unsetEnv genuinely removes an env var (restored via t.Cleanup), unlike
+// t.Setenv(key, "") which exports it as present-but-empty -- a
+// meaningfully different state parseEnv distinguishes (see
+// TestParseEnvRejectsOnlyGenuinePartialSSEnv's "present but empty" case).
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	orig, wasSet := os.LookupEnv(key)
+	if wasSet {
+		t.Cleanup(func() { _ = os.Setenv(key, orig) })
+	}
+	_ = os.Unsetenv(key)
+}
+
 // A partial SS_* set (some but not all four of SS_REMOTE_HOST/
 // SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT) is fatal -- it is never a
 // legitimate invocation shape, and letting it fall back to
@@ -217,7 +231,7 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 
 	t.Run("one var missing errors", func(t *testing.T) {
 		t.Setenv("SS_REMOTE_HOST", "chain.example.net")
-		t.Setenv("SS_REMOTE_PORT", "")
+		unsetEnv(t, "SS_REMOTE_PORT")
 		t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
 		t.Setenv("SS_LOCAL_PORT", "45999")
 		t.Setenv("SS_PLUGIN_OPTIONS", "")
@@ -231,10 +245,30 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 	})
 
 	t.Run("three vars missing errors", func(t *testing.T) {
-		t.Setenv("SS_REMOTE_HOST", "")
-		t.Setenv("SS_REMOTE_PORT", "")
-		t.Setenv("SS_LOCAL_HOST", "")
+		unsetEnv(t, "SS_REMOTE_HOST")
+		unsetEnv(t, "SS_REMOTE_PORT")
+		unsetEnv(t, "SS_LOCAL_HOST")
 		t.Setenv("SS_LOCAL_PORT", "45999")
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
+		_, err := parseEnv()
+		if err == nil {
+			t.Fatal("parseEnv() = nil error, want the incomplete-env error")
+		}
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	// The one var that IS present is exported empty, not unset -- presence
+	// (os.LookupEnv's ok), not value-emptiness, is what parseEnv keys the
+	// partial-set determination on. Using os.Getenv (which can't tell an
+	// unset var from one exported empty) would read this as fully
+	// standalone and silently pass, exactly the gap this case pins.
+	t.Run("one var present but empty, rest genuinely unset, errors", func(t *testing.T) {
+		unsetEnv(t, "SS_REMOTE_HOST")
+		t.Setenv("SS_REMOTE_PORT", "")
+		unsetEnv(t, "SS_LOCAL_HOST")
+		unsetEnv(t, "SS_LOCAL_PORT")
 		t.Setenv("SS_PLUGIN_OPTIONS", "")
 		_, err := parseEnv()
 		if err == nil {
@@ -247,7 +281,7 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 
 	t.Run("fully absent SS_* (standalone) is not an error", func(t *testing.T) {
 		for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
-			t.Setenv(v, "")
+			unsetEnv(t, v)
 		}
 		t.Setenv("SS_PLUGIN_OPTIONS", "")
 		if _, err := parseEnv(); err != nil {
@@ -267,6 +301,15 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 		}
 		if v, _ := opts.Get("remoteAddr"); v != "chain.example.net" {
 			t.Errorf("remoteAddr = %q, want the SS_REMOTE_HOST-derived value", v)
+		}
+		if v, _ := opts.Get("remotePort"); v != "9443" {
+			t.Errorf("remotePort = %q, want the SS_REMOTE_PORT-derived value", v)
+		}
+		if v, _ := opts.Get("localAddr"); v != "10.1.2.3" {
+			t.Errorf("localAddr = %q, want the SS_LOCAL_HOST-derived value", v)
+		}
+		if v, _ := opts.Get("localPort"); v != "45999" {
+			t.Errorf("localPort = %q, want the SS_LOCAL_PORT-derived value", v)
 		}
 	})
 }

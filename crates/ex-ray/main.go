@@ -4,117 +4,19 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 
 	core "github.com/v2fly/v2ray-core/v5"
 )
 
 var VERSION = "ex-ray"
-
-// parseIntOption reads a SIP003 option value from opts and applies it to
-// dest, sharing one implementation across mux/tcp-keepalive/fwmark so the
-// three can never silently drift apart.
-//
-// The rule: an absent key is a no-op, leaving dest at whatever it already
-// held (dest holds whatever flag.Parse left there -- main() calls
-// flag.Parse() before parseOptsIntoFlags runs -- the registered default
-// when no CLI flag was passed, or the CLI-supplied value when one was).
-// Any PRESENT value, empty included, must parse as an integer or the
-// option is fatal: an explicitly empty value ("mux=") is not a documented
-// "leave it alone" spelling, and treating it as one is actively dangerous
-// for mux specifically -- galoshes' ex_ray_options appends `mux=0` and
-// ex-ray is first-wins, so an operator's earlier bare `mux=` would win
-// over galoshes' append and silently leave Mux.Cool at whatever default
-// it already held (often ON), defeating the exact mechanism `mux=0` exists
-// to guarantee. A BARE key (no `=` at all) is different: args.go's parser
-// maps it to the literal string "1" for every option uniformly, so it
-// goes through the same Atoi path as an explicit `=1` and sets dest to 1
-// -- not "the default" for tcp-keepalive/fwmark, whose defaults are 15/0
-// (see TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this
-// needs args.go's Args type to distinguish a bare key from an explicit
-// "=1", a grammar change not attempted here). A non-empty, non-numeric
-// value is fatal and never echoes the rejected value: the escaping
-// grammar lets a backslash absorb a later segment into a value, so an
-// unparseable mux=abc\;certRaw=SECRET could otherwise leak certRaw's
-// value through the mux error.
-func parseIntOption(opts Args, key string, dest *int) error {
-	c, ok := opts.Get(key)
-	if !ok {
-		return nil
-	}
-	i, err := strconv.Atoi(c)
-	if err != nil {
-		return newError(fmt.Sprintf("invalid %s: value is not an integer", key))
-	}
-	*dest = i
-	return nil
-}
-
-// parseBoolOption reads a SIP003 presence option value from opts and
-// applies it to dest. Unlike parseIntOption/parseEnumOption, an explicitly
-// empty value ("key=") is NOT a no-op here -- only an absent key is. A bare
-// key (no `=` at all) or an explicit "key=1" (args.go maps a bare key to
-// the literal "1") is the only spelling that enables the flag; any other
-// present value, empty included, is unrecognized and fatal. Inventing a
-// wider vocabulary ("true"/"yes"/"on" as a heuristic) is exactly the kind
-// of threshold that has no principled stopping point.
-//
-// The empty-value carve-out matters here specifically because these are
-// presence-only options: garter's Mode::from_plugin_options mirrors
-// ex-ray's OLD behavior for `server` -- presence of the key, regardless of
-// value, means server mode (crates/garter/src/chain_tests.rs). Treating
-// `server=` as a no-op would leave *server false while garter still
-// swapped the chain's SS_LOCAL/SS_REMOTE env vars for server mode,
-// producing exactly the kind of silently-broken-but-reports-ready config
-// this whole change exists to prevent -- and fixing that properly needs a
-// garter-side change, out of scope here. Rejecting `key=` outright avoids
-// the disagreement without touching garter: ex-ray simply refuses to
-// start.
-//
-// Never echoes the rejected value for the same reason parseIntOption
-// doesn't.
-func parseBoolOption(opts Args, key string, dest *bool) error {
-	c, ok := opts.Get(key)
-	if !ok {
-		return nil
-	}
-	if c != "1" {
-		return newError(fmt.Sprintf("invalid %s: value is not recognized", key))
-	}
-	*dest = true
-	return nil
-}
-
-// parseEnumOption reads a SIP003 option value from opts and applies it to
-// dest if it matches one of allowed, mirroring parseIntOption/
-// parseBoolOption's actual structural rule (their doc comments, not their
-// old shared wording): an absent key is a no-op; any PRESENT value, empty
-// included, must be in allowed or the option is fatal. An empty value has
-// no more claim to "not specified" here than an empty mux or tls value
-// does. The allowed list is safe to name in the error (it's a small
-// static vocabulary, not operator input) but the rejected value itself
-// never is, for the same reason as every other option in this file.
-func parseEnumOption(opts Args, key string, allowed []string, dest *string) error {
-	c, ok := opts.Get(key)
-	if !ok {
-		return nil
-	}
-	for _, a := range allowed {
-		if c == a {
-			*dest = c
-			return nil
-		}
-	}
-	return newError(fmt.Sprintf("invalid %s: expected one of %s", key, strings.Join(allowed, ", ")))
-}
 
 // failFatal reports err as a `fatal` sitrep and exits with ex-ray's
 // config-class-error code (23) -- distinct from other exit codes so a
@@ -322,40 +224,47 @@ func main() {
 	// (SITREP.md: listen MUST be the bound address).
 	// Hole always hands ex-ray a concrete pre-allocated port; a port-0
 	// input is a misconfiguration we fail loudly on rather than mis-report.
-	// Parsed numerically, not string-compared against "0": a non-canonical
-	// spelling ("00", "000") is also port 0 to net.PortFromString
-	// (config.go, generateConfig), which would bind an OS-assigned
-	// ephemeral port while localListenAddr below -- built from this same
-	// raw string -- still reported the original spelling, a bound port
-	// that disagrees with what ready.listen claimed. A parse failure or an
-	// out-of-range value is a different fault (not a port-0 request at
-	// all) and gets its own message so the detail doesn't misdirect the
-	// operator at a port-0/OS-assignment problem they don't have.
-	localPortNum, portErr := strconv.Atoi(*localPort)
+	// validPort (config.go) is the same parser generateConfig's own
+	// localPort/remotePort validation uses -- a non-canonical spelling
+	// ("00", "000") is also port 0 to it, which would otherwise bind an
+	// OS-assigned ephemeral port while localListenAddr below -- built from
+	// this same raw string -- still reported the original spelling, a
+	// bound port that disagrees with what ready.listen claimed. A parse
+	// failure or an out-of-range value is a different fault (not a port-0
+	// request at all) and gets its own message so the detail doesn't
+	// misdirect the operator at a port-0/OS-assignment problem they don't
+	// have.
+	localPortNum, portErr := validPort(*localPort)
 	switch {
-	case portErr != nil || localPortNum < 0 || localPortNum > 65535:
-		emitFatal("invalid localPort: not a valid port", nil)
-		os.Exit(23) // config-class error
+	case portErr != nil:
+		failFatal(errors.New("invalid localPort: not a valid port"))
 	case localPortNum == 0:
-		emitFatal("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)", nil)
-		os.Exit(23) // config-class error
+		failFatal(errors.New("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)"))
 	}
 
-	// localAddr must be an IP literal (or, in server mode, a `|`-separated
-	// list of them -- parseLocalAddr, config.go): "localhost" is the one
-	// hostname spelling v2ray-core's own listener silently rewrites to
-	// 127.0.0.1 (ListenTCP), so localListenAddr below -- built from this
-	// same raw *localAddr -- would report "localhost:<port>", which fails
-	// garter's SocketAddr parse and is silently dropped as an unrecognized
-	// log line instead of being observed as ready. Every other non-IP
-	// hostname already fails loudly via generateConfig's own "domain
-	// address is not allowed for listening" error; this is the one silent
-	// gap.
-	for _, a := range parseLocalAddr(*localAddr) {
-		if net.ParseIP(a) == nil {
-			emitFatal("invalid localAddr: must be an IP literal", nil)
-			os.Exit(23) // config-class error
-		}
+	// localAddr must be exactly one IP literal. Two distinct failure modes
+	// this closes:
+	//   - Multiple addresses: parseLocalAddr (config.go) splits localAddr
+	//     on `|` for a genuine multi-address server-mode listen, but the
+	//     sitrep's `ready` event carries exactly one `listen` address
+	//     (SITREP.md) -- there is no honest way to report a `|`-joined
+	//     value there, and reporting it verbatim produces a string that
+	//     fails garter's SocketAddr parse and is silently dropped as an
+	//     unrecognized log line instead of being observed as ready.
+	//   - A non-IP hostname: "localhost" is the one spelling v2ray-core's
+	//     own listener silently rewrites to 127.0.0.1 (ListenTCP), so
+	//     localListenAddr below -- built from this same raw *localAddr --
+	//     would report "localhost:<port>", the identical unparseable-
+	//     SocketAddr failure as the multi-address case. Every other
+	//     non-IP hostname already fails loudly via generateConfig's own
+	//     "domain address is not allowed for listening" error; these two
+	//     are the only silent gaps.
+	localAddrs := parseLocalAddr(*localAddr)
+	switch {
+	case len(localAddrs) != 1:
+		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
+	case net.ParseIP(localAddrs[0]) == nil:
+		failFatal(errors.New("invalid localAddr: must be an IP literal"))
 	}
 
 	// localAddr/localPort name the inbound listener in both modes (see

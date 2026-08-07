@@ -271,9 +271,6 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_localPort_never_echo_secret", `localPort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_remotePort_never_echo_secret", `remotePort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_mode_never_echo_secret", `mode=abc\;certRaw=SUPERSECRETVALUE`, true},
-		// cert points at a nonexistent path carrying an absorbed secret;
-		// the underlying os.PathError text would otherwise embed it.
-		{"invalid_cert_path_never_echo_secret", `tls;server;host=example.com;cert=/nope\;certRaw=SUPERSECRETVALUE`, true},
 		// ech is validated by parseEnumOption inside parseOptsIntoFlags
 		// itself, so this case never reaches buildTLSConfig's own ech-mode
 		// branch at all -- it end-to-end-proves parseEnumOption's no-echo
@@ -317,21 +314,56 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	}
 }
 
-// A distinct failure class from the table above: this input reaches
-// generateConfig/parseOptsIntoFlags successfully (localAddr has no
-// validator of its own), so v2ray-core's own server.Start() is what
-// rejects it -- exercising the "failed to start the v2ray-core inbound
-// listener" branch in main(), not classifyBindError's bind_conflict path
-// (this exit code is 1, ex-ray's crash-class convention for that branch,
-// not the config-class 23 the table above pins). v2ray-core's internal
-// Start error text embeds the raw listen address, so the same
-// backslash-absorption secret must not reach the sitrep here either.
+// cert points at a nonexistent path carrying an absorbed secret; the
+// underlying os.PathError text would otherwise embed it. This needs its
+// own env (not the shared table's SS_REMOTE_HOST=chain.example.net):
+// server mode cross-assigns the remoteAddr option (== SS_REMOTE_HOST)
+// into *localAddr, and a non-IP-literal *localAddr is now itself fatal
+// (main()'s IP-literal guard) before ever reaching buildTLSConfig -- an
+// IP-literal SS_REMOTE_HOST is required for the flow to actually reach
+// the cert read this case means to exercise.
+func TestInvalidCertPathSitrepNeverEchoesSecret(t *testing.T) {
+	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+		"SS_REMOTE_HOST":    "10.9.8.7",
+		"SS_REMOTE_PORT":    "9443",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": `tls;server;host=example.com;cert=/nope\;certRaw=SUPERSECRETVALUE`,
+	})
+	if hello["event"] != "hello" {
+		t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+	}
+	if terminal["event"] != "fatal" {
+		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+	}
+	detail, _ := terminal["detail"].(string)
+	if !strings.Contains(detail, "failed to read cert") {
+		t.Errorf("fatal detail = %q, want it to mention the cert read failure (not some other fault)", detail)
+	}
+	if strings.Contains(detail, "SUPERSECRETVALUE") {
+		t.Errorf("fatal detail leaks the absorbed segment: %q", detail)
+	}
+	if exitCode != 23 {
+		t.Errorf("exit code = %d, want 23 (ex-ray's config-class-error convention)", exitCode)
+	}
+}
+
 // localAddr must be an IP literal -- "nosuchhost.invalid" (and any other
 // non-IP spelling) is fatal before the process ever attempts to bind, via
 // a static message that structurally cannot echo the absorbed secret
 // (main()'s net.ParseIP guard never interpolates the rejected value at
 // all, unlike the sites elsewhere in this file that do and must be
 // checked for it explicitly).
+//
+// This guard, plus the port/remoteAddr validation added earlier in main()
+// and generateConfig, means every SS_PLUGIN_OPTIONS-reachable address/port
+// value is now rejected before v2ray-core's server.Start() is ever called
+// -- there is no known operator-supplied input left that reaches Start()'s
+// own generic (non-bind-conflict) fatal branch (main.go's static
+// "failed to start the v2ray-core inbound listener" message), so that
+// specific site has no live process-boundary reproduction here. It is
+// still provably safe by construction: the message is a fixed string
+// literal with no interpolated value at all (main.go).
 func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",
@@ -353,8 +385,39 @@ func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	if strings.Contains(detail, "SUPERSECRETVALUE") {
 		t.Errorf("fatal detail leaks the absorbed segment: %q", detail)
 	}
-	if exitCode == 0 {
-		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
+	if exitCode != 23 {
+		t.Errorf("exit code = %d, want 23 (ex-ray's config-class-error convention)", exitCode)
+	}
+}
+
+// A `|`-separated multi-address localAddr (parseLocalAddr's own grammar,
+// meant for server-mode multi-listen) is fatal: the sitrep's `ready` event
+// carries exactly one `listen` address (SITREP.md), so ex-ray cannot
+// honestly report a `|`-joined value there. Server mode is used because
+// generateConfig only ever calls parseLocalAddr in server mode; a client
+// invocation only ever treats *localAddr as one address. In server mode
+// parseOptsIntoFlags cross-assigns a `remoteAddr` option (not `localAddr`)
+// into *localAddr -- see parseOptsIntoFlags' own doc comment.
+func TestMultiAddressLocalAddrSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
+	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+		"SS_REMOTE_HOST":    "10.9.8.7",
+		"SS_REMOTE_PORT":    "9443",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": "server;remoteAddr=127.0.0.1|127.0.0.2;host=example.com;path=/",
+	})
+	if hello["event"] != "hello" {
+		t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+	}
+	if terminal["event"] != "fatal" {
+		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+	}
+	detail, _ := terminal["detail"].(string)
+	if !strings.Contains(detail, "localAddr") {
+		t.Errorf("fatal detail = %q, want it to mention localAddr", detail)
+	}
+	if exitCode != 23 {
+		t.Errorf("exit code = %d, want 23 (ex-ray's config-class-error convention)", exitCode)
 	}
 }
 

@@ -74,12 +74,20 @@ func parseEnv() (opts Args, err error) {
 		opts[k] = v
 	}
 
-	ssRemoteHost := os.Getenv("SS_REMOTE_HOST")
-	ssRemotePort := os.Getenv("SS_REMOTE_PORT")
-	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
-	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
-	if len(ssRemoteHost) == 0 || len(ssRemotePort) == 0 || len(ssLocalHost) == 0 || len(ssLocalPort) == 0 {
-		if ssRemoteHost != "" || ssRemotePort != "" || ssLocalHost != "" || ssLocalPort != "" {
+	// LookupEnv, not Getenv: presence (the var was exported at all, even
+	// as "") is what distinguishes "a caller attempted the chain-handoff
+	// protocol and got it wrong" (partial, fatal) from "no caller ever
+	// mentioned SS_* at all" (the standalone case, not an error).
+	// os.Getenv can't tell those apart -- it returns "" for both an unset
+	// var and one explicitly exported empty, so `SS_REMOTE_PORT=` with
+	// the other three genuinely unset used to read as fully standalone.
+	ssRemoteHost, remoteHostSet := os.LookupEnv("SS_REMOTE_HOST")
+	ssRemotePort, remotePortSet := os.LookupEnv("SS_REMOTE_PORT")
+	ssLocalHost, localHostSet := os.LookupEnv("SS_LOCAL_HOST")
+	ssLocalPort, localPortSet := os.LookupEnv("SS_LOCAL_PORT")
+	allUsable := ssRemoteHost != "" && ssRemotePort != "" && ssLocalHost != "" && ssLocalPort != ""
+	if !allUsable {
+		if remoteHostSet || remotePortSet || localHostSet || localPortSet {
 			// Env var names only -- never operator/secret content, safe to
 			// name directly.
 			return nil, errors.New("SS_* chain-handoff env is incomplete: some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set")
