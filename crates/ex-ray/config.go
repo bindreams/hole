@@ -397,15 +397,23 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 }
 
 func generateConfig() (*core.Config, error) {
-	// The port-syntax half of this check (not the ==0 case, which
-	// generateConfig alone rejects) is unreachable from main(): main()
-	// already validates *localPort with this same validPort before ever
-	// calling buildV2Ray/generateConfig. Kept here as generateConfig's own
-	// guard because it IS independently reachable -- this func's own unit
-	// tests call it directly, bypassing main() entirely.
+	// Both the syntax check and the ==0 case below are unreachable from
+	// main(): main() already validates *localPort with this same validPort,
+	// rejecting a parse failure and port-0 separately, before ever calling
+	// buildV2Ray/generateConfig. Kept here as generateConfig's own guard
+	// because it IS independently reachable -- this func's own unit tests
+	// call it directly, bypassing main() entirely.
 	lport, err := validPort(*localPort)
 	if err != nil {
 		return nil, newError("invalid localPort: not a valid port")
+	}
+	// A localPort=0 parses as in-range (validPort allows 0..65535) but
+	// would bind an OS-assigned ephemeral port that v2ray-core exposes
+	// through no public API -- the same silent mis-report class
+	// remotePort's own ==0 guard below closes, and the one main()'s
+	// pre-bind check exists to prevent on the real call path.
+	if lport == 0 {
+		return nil, newError("invalid localPort: must not be 0")
 	}
 	// localAddr must be a single IP literal, via the same canonicalLocalAddr
 	// main()'s pre-bind guard uses. Unreachable from the real

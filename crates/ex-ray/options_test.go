@@ -152,12 +152,13 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 
 // An unrecognized SS_PLUGIN_OPTIONS key must NOT be fatal -- ex-ray's
 // SS_PLUGIN_OPTIONS string is shared with other first-party tools in the
-// same process chain, each appending its own keys before forwarding: this
-// is galoshes' actual udp_timeout key (crates/galoshes/src/yamux.rs),
-// which ex-ray is documented to ignore so galoshes can share the same
-// options string with its embedded ex-ray instead of composing a second,
-// ex-ray-only string. Reintroducing an allowlist/rejectUnrecognizedKeys
-// check here would break that real contract.
+// same process chain: this is galoshes' actual udp_timeout key
+// (crates/galoshes/src/yamux.rs reads it, but crates/galoshes/src/
+// exray_options.rs forwards the rest of the string verbatim, appending
+// only its own `mux=0`), which ex-ray is documented to ignore so galoshes
+// can share the same options string with its embedded ex-ray instead of
+// composing a second, ex-ray-only string. Reintroducing an allowlist/
+// rejectUnrecognizedKeys check here would break that real contract.
 func TestParseOptsIntoFlagsToleratesUnrecognizedKey(t *testing.T) {
 	withEnv(t, "udp_timeout=300;host=example.com;path=/")
 	if err := parseOptsIntoFlags(); err != nil {
@@ -713,6 +714,27 @@ func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "remotePort") {
 		t.Errorf("error %q does not mention remotePort", err.Error())
+	}
+}
+
+// generateConfig is independently reachable from this file's own unit tests,
+// bypassing main()'s own localPort==0 guard entirely -- without its own
+// guard, a direct caller could build a Config with PortRange{0,0}, which
+// binds an OS-assigned ephemeral port v2ray-core exposes through no public
+// API, mirroring remotePort's own ==0 guard above.
+func TestGenerateConfigRejectsZeroLocalPort(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalPort, origRemotePort := *localPort, *remotePort
+	defer func() { *localPort, *remotePort = origLocalPort, origRemotePort }()
+	*localPort, *remotePort = "0", "1080"
+
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() with localPort=0 = nil error, want an error mentioning localPort")
+	}
+	if !strings.Contains(err.Error(), "localPort") {
+		t.Errorf("error %q does not mention localPort", err.Error())
 	}
 }
 

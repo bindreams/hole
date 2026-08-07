@@ -284,14 +284,9 @@ func main() {
 	if len(parseLocalAddr(*localAddr)) != 1 {
 		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
 	}
-	// canonicalLocalAddr (config.go), not net.ParseIP directly: net.ParseIP
-	// accepts spellings v2ray-core's own address type folds before binding
-	// -- an IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") parses fine and
-	// would pass a bare net.ParseIP check, but v2ray-core binds it as plain
-	// IPv4 ("127.0.0.1"). Reporting the raw, unfolded string as
-	// ready.listen would disagree with the address actually bound; using
-	// the canonical form for both the guard and localListenAddr below
-	// means they can't drift apart.
+	// canonicalLocalAddr (config.go) folds IP spellings before binding; using
+	// it for both this guard and localListenAddr below keeps them from
+	// drifting apart -- see its doc comment for why.
 	canonicalAddr, ok := canonicalLocalAddr(*localAddr)
 	if !ok {
 		failFatal(errors.New("invalid localAddr: must be an IP literal"))

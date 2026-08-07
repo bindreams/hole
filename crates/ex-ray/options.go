@@ -167,15 +167,17 @@ func parseStringOption(opts Args, key string, dest *string, emptyOK bool) error 
 // An unrecognized key (a typo, or a stale/removed option name) is
 // deliberately NOT rejected here, unlike every other malformed shape in
 // this file: ex-ray's SS_PLUGIN_OPTIONS string is shared with other
-// first-party tools in the same process chain -- galoshes appends its own
-// `udp_timeout` (crates/galoshes/src/yamux.rs) to the same options string
-// before forwarding it to its embedded ex-ray, and the bridge preserves
-// arbitrary unrecognized keys when composing plugin options (crates/
-// bridge/src/proxy/plugin.rs) -- and both rely on ex-ray's documented
-// tolerance for keys it doesn't own. Rejecting unknown keys here would
-// break that established, working contract for every caller that shares
-// the string this way; closing the "typo silently ignored" gap instead
-// needs coordination with those callers (an ex-ray-side allowlist that
-// also names every externally-owned key, or a change on their side to
-// strip their own keys before forwarding) rather than a unilateral
-// ex-ray-only change.
+// first-party tools in the same process chain -- galoshes reads its own
+// `udp_timeout` out of the operator-supplied options string (crates/
+// galoshes/src/yamux.rs's parse_udp_timeout) but forwards the string to
+// its embedded ex-ray verbatim otherwise, appending only `mux=0` (crates/
+// galoshes/src/exray_options.rs), so `udp_timeout` itself still reaches
+// ex-ray unstripped; the bridge likewise preserves arbitrary unrecognized
+// keys when composing plugin options (crates/bridge/src/proxy/plugin.rs)
+// -- and both rely on ex-ray's documented tolerance for keys it doesn't
+// own. Rejecting unknown keys here would break that established, working
+// contract for every caller that shares the string this way; closing the
+// "typo silently ignored" gap instead needs coordination with those
+// callers (an ex-ray-side allowlist that also names every externally-owned
+// key, or a change on their side to strip their own keys before
+// forwarding) rather than a unilateral ex-ray-only change.

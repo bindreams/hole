@@ -263,9 +263,14 @@ func TestBuildTLSConfigEch(t *testing.T) {
 func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
-	origCertRaw, origHost, origTLS := *certRaw, *host, *tlsEnabled
-	defer func() { *certRaw, *host, *tlsEnabled = origCertRaw, origHost, origTLS }()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
 	*tlsEnabled = true
+	// readCertificate checks *cert first and only falls through to
+	// *certRaw when *cert is empty -- must be cleared explicitly so this
+	// test exercises the certRaw path it claims to, regardless of what an
+	// earlier test in the same binary left *cert holding.
+	*cert = ""
 
 	certPath, _ := writeSelfSignedCertKey(t, "example.com")
 	pem, err := os.ReadFile(certPath) //nolint:gosec // G304: certPath is this test's own t.TempDir() file, not external input.
