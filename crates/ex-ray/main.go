@@ -101,12 +101,11 @@ func parseOptsIntoFlags() error {
 		return err
 	}
 	// localAddr/localPort/remoteAddr/remotePort are cross-assigned raw,
-	// with no parse*Option validator (#703, held for Anna's decision on
-	// whether these four should be operator-settable via
-	// SS_PLUGIN_OPTIONS at all -- adding validation here would be a step
-	// toward answering that unilaterally). The same bare-key-resolves-to-
-	// "1" gap parseIntOption/parseStringOption document for their own
-	// options applies here too, undocumented until now: a fat-fingered
+	// with no parse*Option validator -- whether these four should be
+	// operator-settable via SS_PLUGIN_OPTIONS at all is an open question;
+	// adding validation here would answer it unilaterally. The same
+	// bare-key-resolves-to-"1" gap parseIntOption/parseStringOption
+	// document for their own options applies here too: a fat-fingered
 	// bare `remoteAddr` silently sets the upstream destination to the
 	// domain "1", and a bare `localPort`/`remotePort` silently sets port
 	// 1 -- both valid-looking values that sail past every guard added in

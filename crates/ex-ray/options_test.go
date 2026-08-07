@@ -150,6 +150,26 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 	}
 }
 
+// An unrecognized SS_PLUGIN_OPTIONS key must NOT be fatal -- ex-ray's
+// SS_PLUGIN_OPTIONS string is shared with other first-party tools in the
+// same process chain, each appending its own keys before forwarding: this
+// is galoshes' actual udp_timeout key (crates/galoshes/src/yamux.rs),
+// which ex-ray is documented to ignore so galoshes can share the same
+// options string with its embedded ex-ray instead of composing a second,
+// ex-ray-only string. A regression here (e.g. reintroducing an
+// allowlist/rejectUnrecognizedKeys check) previously broke this real
+// contract and had to be reverted -- this test exists specifically to
+// catch that regression again.
+func TestParseOptsIntoFlagsToleratesUnrecognizedKey(t *testing.T) {
+	withEnv(t, "udp_timeout=300;host=example.com;path=/")
+	if err := parseOptsIntoFlags(); err != nil {
+		t.Fatalf("parseOptsIntoFlags() with an unrecognized (but legitimately shared) key = %v, want nil", err)
+	}
+	if *host != "example.com" {
+		t.Errorf("*host = %q, want %q -- the unrecognized key must not prevent host from being applied", *host, "example.com")
+	}
+}
+
 // SS_PLUGIN_OPTIONS applies even with no SS_* env at all (the
 // fully-standalone case). A CLI flag set first must still survive
 // SS_PLUGIN_OPTIONS being empty for that key.
@@ -755,6 +775,27 @@ func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
 		if !strings.Contains(err.Error(), "tls") {
 			t.Errorf("%s: error %q does not mention tls", c.desc, err.Error())
 		}
+	}
+}
+
+// key is read only inside buildTLSConfig's server-mode branch -- a `key`
+// value with tls SET but in CLIENT mode passes the tls-unset guard above
+// yet is still never applied, silently dropped exactly like the
+// tls-unset case.
+func TestGenerateConfigRejectsClientModeKey(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origKey, origTLS := *key, *tlsEnabled
+	defer func() { *key, *tlsEnabled = origKey, origTLS }()
+	*tlsEnabled = true
+	*key = "/some/key.pem"
+
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() = nil error, want an error mentioning key and server")
+	}
+	if !strings.Contains(err.Error(), "key") || !strings.Contains(err.Error(), "server") {
+		t.Errorf("error %q does not mention both key and server", err.Error())
 	}
 }
 

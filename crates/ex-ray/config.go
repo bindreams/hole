@@ -524,6 +524,14 @@ func generateConfig() (*core.Config, error) {
 	if !*tlsEnabled && (*cert != "" || *certRaw != "" || *key != "") {
 		return nil, newError("cert/certRaw/key require tls to be enabled")
 	}
+	// key is read only inside buildTLSConfig's `if *server` branch (never
+	// in client mode, per its own flag help text: "(server) Path to TLS
+	// key file") -- the check above alone still lets a `key` value with
+	// tls set in CLIENT mode through unnoticed, silently dropped exactly
+	// like the tls-unset case above.
+	if !*server && *key != "" {
+		return nil, newError("key requires server mode")
+	}
 
 	streamConfig := internet.StreamConfig{
 		ProtocolName: *mode,

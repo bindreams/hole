@@ -132,15 +132,17 @@ func parseURLOption(opts Args, key string, dest *string) error {
 }
 
 // parseStringOption reads a SIP003 option value from opts and applies it
-// to dest. An absent key is always a no-op. Whether an explicitly empty
-// value ("key=") is ALSO a no-op depends on emptyOK: pass true for
-// options where the empty string is itself a meaningful, documented
-// value -- cert/certRaw/key, where empty means "use the ~/.acme.sh
-// default" (config.go's own fallback logic depends on this, the same way
-// ech-doh's "empty disables ECH" does) -- and false for options with no
-// legitimate "explicitly nothing" spelling (host, path), where an empty
+// to dest. An absent key is always a no-op, leaving dest untouched.
+// Whether an explicitly empty value ("key=") is instead APPLIED (clearing
+// dest to "") or fatal depends on emptyOK: pass true for options where
+// the empty string is itself a meaningful, documented value -- cert/
+// certRaw/key, where empty means "use the ~/.acme.sh default" (config.go's
+// own fallback logic depends on this, the same way ech-doh's "empty
+// disables ECH" does), so an explicit "cert=" deliberately clears a
+// CLI-supplied -cert=/path -- and false for options with no legitimate
+// "explicitly nothing" spelling (host, path, loglevel), where an empty
 // value is exactly as unrecognized as an empty mux/tls value and must be
-// fatal.
+// fatal instead of silently clearing whatever was there.
 //
 // A BARE key (no `=` at all) is a separate, narrower gap this does NOT
 // close: args.go's parser maps a bare key to the literal string "1" for
