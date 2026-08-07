@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -540,6 +541,68 @@ func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
 	*cert, *key, *host = "", "", `nosuchhost.invalid\;certRaw=SUPERSECRETVALUE`
 	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
 		t.Errorf("host-derived cert path error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// A readable cert/key pair that isn't a valid X509 key pair is otherwise
+// never caught before ready: v2ray-core's own BuildCertificates logs
+// "ignoring invalid X509 key pair" at Warning and silently drops it,
+// leaving zero certificates configured (TLS handshakes then fail with no
+// diagnostic ever reaching the sitrep) rather than failing to start.
+func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	garbageKeyPath := filepath.Join(dir, "garbage-key.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+	writePEMFile(t, garbageKeyPath, "PRIVATE KEY", []byte("not a real key"))
+
+	realCertPath, realKeyPath := writeSelfSignedCertKey(t, "example.com")
+
+	*cert, *key, *host = garbageCertPath, realKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("garbage cert, valid key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("garbage cert, valid key: error %q does not mention X509", err.Error())
+	}
+
+	*cert, *key, *host = realCertPath, garbageKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("valid cert, garbage key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("valid cert, garbage key: error %q does not mention X509", err.Error())
+	}
+}
+
+// The client-side pinned-CA equivalent: an unparseable PEM cert is
+// otherwise never caught before ready either -- v2ray-core's GetTLSConfig
+// only logs AppendCertsFromPEM's failure and leaves RootCAs nil, silently
+// falling back to the system root pool instead of the operator's pinned
+// CA.
+func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+	*cert = ""
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+
+	*cert, *host = garbageCertPath, "example.com"
+	_, err := buildTLSConfig()
+	if err == nil {
+		t.Fatal("buildTLSConfig() = nil error, want an error mentioning PEM")
+	}
+	if !strings.Contains(err.Error(), "PEM") {
+		t.Errorf("error %q does not mention PEM", err.Error())
 	}
 }
 

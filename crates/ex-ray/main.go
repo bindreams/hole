@@ -135,8 +135,8 @@ func parseOptsIntoFlags() error {
 	if err := parseEnumOption(opts, "ech", allowedEchModes, echMode); err != nil {
 		return err
 	}
-	if c, b := opts.Get("ech-doh"); b {
-		*echDoh = c
+	if err := parseURLOption(opts, "ech-doh", echDoh); err != nil {
+		return err
 	}
 
 	if *vpn {
@@ -253,24 +253,32 @@ func main() {
 	//     unrecognized log line instead of being observed as ready.
 	//   - A non-IP hostname: "localhost" is the one spelling v2ray-core's
 	//     own listener silently rewrites to 127.0.0.1 (ListenTCP), so
-	//     localListenAddr below -- built from this same raw *localAddr --
-	//     would report "localhost:<port>", the identical unparseable-
-	//     SocketAddr failure as the multi-address case. Every other
-	//     non-IP hostname already fails loudly via generateConfig's own
-	//     "domain address is not allowed for listening" error; these two
-	//     are the only silent gaps.
-	localAddrs := parseLocalAddr(*localAddr)
-	switch {
-	case len(localAddrs) != 1:
+	//     reporting the raw *localAddr verbatim would produce
+	//     "localhost:<port>", the identical unparseable-SocketAddr
+	//     failure as the multi-address case. Every other non-IP hostname
+	//     already fails loudly via generateConfig's own "domain address
+	//     is not allowed for listening" error; these two are the only
+	//     silent gaps.
+	if len(parseLocalAddr(*localAddr)) != 1 {
 		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
-	case net.ParseIP(localAddrs[0]) == nil:
+	}
+	// canonicalLocalAddr (config.go), not net.ParseIP directly: net.ParseIP
+	// accepts spellings v2ray-core's own address type folds before binding
+	// -- an IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") parses fine and
+	// would pass a bare net.ParseIP check, but v2ray-core binds it as plain
+	// IPv4 ("127.0.0.1"). Reporting the raw, unfolded string as
+	// ready.listen would disagree with the address actually bound; using
+	// the canonical form for both the guard and localListenAddr below
+	// means they can't drift apart.
+	canonicalAddr, ok := canonicalLocalAddr(*localAddr)
+	if !ok {
 		failFatal(errors.New("invalid localAddr: must be an IP literal"))
 	}
 
 	// localAddr/localPort name the inbound listener in both modes (see
 	// parseOptsIntoFlags for the client/server SS_*_* mapping). This is the
 	// address v2ray-core binds and that emitReady reports.
-	localListenAddr := net.JoinHostPort(*localAddr, *localPort)
+	localListenAddr := net.JoinHostPort(canonicalAddr, *localPort)
 
 	// network is the transport the inbound listener binds; emitReady reports it
 	// as the sitrep transports.

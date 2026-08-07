@@ -258,6 +258,7 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_remote_port_zero", "remotePort=0", false},
 		{"invalid_remote_addr_empty", "remoteAddr=", false},
 		{"invalid_remote_addr_any_ip", "remoteAddr=0.0.0.0", false},
+		{"invalid_cert_raw_not_pem", "tls;host=example.com;certRaw=not-a-real-certificate", false},
 		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
 		// string compare against the literal "0" alone would have missed
 		// it, binding an OS-assigned ephemeral port while ready.listen
@@ -540,6 +541,44 @@ func TestReadySitrepReachesParentOnValidOptions(t *testing.T) {
 		wantListen := "127.0.0.1:" + port
 		if terminal["listen"] != wantListen {
 			t.Errorf("listen = %v, want %q", terminal["listen"], wantListen)
+		}
+		return
+	}
+}
+
+// An IPv4-mapped IPv6 literal ("::ffff:127.0.0.1") is a valid IP per
+// net.ParseIP -- main()'s guard accepts it -- but v2ray-core's own
+// address type folds it into plain IPv4 before binding
+// (third_party/v2ray-core/common/net/address.go's IPAddress). ready.listen
+// must report the address v2ray-core actually bound (the folded IPv4
+// form), not the raw, unfolded literal, or a host reading the sitrep
+// cannot tell where ex-ray is really listening.
+func TestReadySitrepReportsCanonicalFormOfV4MappedV6LocalAddr(t *testing.T) {
+	for {
+		port := freeTCPPort(t)
+		hello, terminal, _ := runExRaySubprocess(t, map[string]string{
+			"SS_REMOTE_HOST":    "example.com",
+			"SS_REMOTE_PORT":    "443",
+			"SS_LOCAL_HOST":     "::ffff:127.0.0.1",
+			"SS_LOCAL_PORT":     port,
+			"SS_PLUGIN_OPTIONS": "host=example.com;path=/",
+		})
+		if terminal["event"] == "bind_conflict" {
+			errno, _ := terminal["errno"].(float64)
+			if isAddrInUse(int(errno)) {
+				continue
+			}
+			t.Fatalf("bind_conflict with errno %v, want the address-in-use code to retry, anything else is a real failure; terminal: %v", terminal["errno"], terminal)
+		}
+		if hello["event"] != "hello" {
+			t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+		}
+		if terminal["event"] != "ready" {
+			t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "ready")
+		}
+		wantListen := "127.0.0.1:" + port
+		if terminal["listen"] != wantListen {
+			t.Errorf("listen = %v, want the folded IPv4 form %q, not the raw IPv4-mapped-IPv6 literal", terminal["listen"], wantListen)
 		}
 		return
 	}

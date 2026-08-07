@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -46,8 +47,8 @@ func parseIntOption(opts Args, key string, dest *int) error {
 }
 
 // parseBoolOption reads a SIP003 presence option value from opts and
-// applies it to dest. Unlike parseIntOption/parseEnumOption, an explicitly
-// empty value ("key=") is NOT a no-op here -- only an absent key is. A bare
+// applies it to dest. An explicitly empty value ("key=") is not a no-op
+// here either -- only an absent key is. A bare
 // key (no `=` at all) or an explicit "key=1" (args.go maps a bare key to
 // the literal "1") is the only spelling that enables the flag; any other
 // present value, empty included, is unrecognized and fatal. Inventing a
@@ -100,4 +101,32 @@ func parseEnumOption(opts Args, key string, allowed []string, dest *string) erro
 		}
 	}
 	return newError(fmt.Sprintf("invalid %s: expected one of %s", key, strings.Join(allowed, ", ")))
+}
+
+// parseURLOption reads a SIP003 option value from opts and applies it to
+// dest if it is a well-formed https:// URL. Unlike the other parse*Option
+// helpers, an explicitly empty value is a legitimate, documented spelling
+// here, not rejected: ech-doh's own flag description says "Empty disables
+// ECH", so an empty value is applied (clearing dest) rather than treated
+// as unrecognized. A malformed non-empty value is fatal: left unvalidated,
+// a typo'd ech-doh silently disables ECH entirely (ech=auto) or leaves
+// RequireEch armed with no way to ever satisfy it (ech=always), in both
+// cases with ex-ray still reporting ready and no diagnostic reaching the
+// sitrep. Never echoes the rejected value for the same reason the other
+// parse*Option helpers don't.
+func parseURLOption(opts Args, key string, dest *string) error {
+	c, ok := opts.Get(key)
+	if !ok {
+		return nil
+	}
+	if c == "" {
+		*dest = ""
+		return nil
+	}
+	u, err := url.Parse(c)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return newError(fmt.Sprintf("invalid %s: value is not an https URL", key))
+	}
+	*dest = c
+	return nil
 }

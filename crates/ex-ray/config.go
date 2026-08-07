@@ -1,6 +1,8 @@
 package main
 
 import (
+	gotls "crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"math"
@@ -151,6 +153,31 @@ func parseLocalAddr(localAddr string) []string {
 	return strings.Split(localAddr, "|")
 }
 
+// canonicalLocalAddr validates s as a single IP literal and returns
+// v2ray-core's own canonical string form for it -- the single source of
+// truth both main()'s pre-bind guard and generateConfig's own
+// self-validation route through, and the exact address v2ray-core will
+// actually bind. This matters because net.ParseAddress folds some inputs
+// that don't look identical to what it returns: an IPv4-mapped IPv6
+// literal ("::ffff:127.0.0.1") is valid per net.ParseIP (main.go would
+// otherwise accept it) but v2ray-core's own IPAddress folds it into plain
+// IPv4 ("127.0.0.1") before binding -- reporting the raw, unfolded string
+// as the sitrep's `ready.listen` would disagree with what was actually
+// bound. ok is false when s is not a single IP literal (a `|`-joined
+// multi-address list, or a hostname net.ParseAddress resolves to the
+// domain family).
+func canonicalLocalAddr(s string) (canonical string, ok bool) {
+	addrs := parseLocalAddr(s)
+	if len(addrs) != 1 {
+		return "", false
+	}
+	addr := net.ParseAddress(addrs[0])
+	if !addr.Family().IsIP() {
+		return "", false
+	}
+	return addr.IP().String(), true
+}
+
 // validPort parses and range-checks a SIP003 port string, the single
 // source of truth both main()'s early port-0 guard and generateConfig's
 // own localPort/remotePort validation route through -- two independently
@@ -172,7 +199,11 @@ func uint32Opt(name string, v int) (uint32, error) {
 	if v >= 0 && v <= math.MaxUint32 {
 		return uint32(v), nil
 	}
-	return 0, newError("invalid", name, "(expected 0..4294967295)")
+	// v2ray-core's newError concatenates its arguments with no separator
+	// (serial.Concat), so this must be one pre-formatted string, not
+	// comma-separated fragments -- "invalid", name, "(..." would run
+	// together as "invalidmux(...".
+	return 0, newError(fmt.Sprintf("invalid %s (expected 0..4294967295)", name))
 }
 
 const (
@@ -263,6 +294,16 @@ func buildTLSConfig() (*tls.Config, error) {
 			logWarn("failed to read key file:", err)
 			return nil, &redactedError{msg: "failed to read key file", cause: err}
 		}
+		// A readable but unparseable cert/key pair is otherwise never
+		// caught before ready: v2ray-core's own BuildCertificates logs
+		// "ignoring invalid X509 key pair" at Warning and silently drops
+		// it, leaving zero certificates configured rather than failing to
+		// start. gotls.X509KeyPair is the same parse the TLS stack itself
+		// performs, so anything it accepts, v2ray-core would too.
+		if _, err := gotls.X509KeyPair(certificate.Certificate, certificate.Key); err != nil {
+			logWarn("cert and key are not a valid X509 key pair:", err)
+			return nil, &redactedError{msg: "cert and key are not a valid X509 key pair", cause: err}
+		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	} else if *cert != "" || *certRaw != "" {
 		certificate := tls.Certificate{Usage: tls.Certificate_AUTHORITY_VERIFY}
@@ -271,6 +312,15 @@ func buildTLSConfig() (*tls.Config, error) {
 		if err != nil {
 			logWarn("failed to read cert:", err)
 			return nil, &redactedError{msg: "failed to read cert", cause: err}
+		}
+		// Client-side pinned CA: an unparseable PEM is otherwise never
+		// caught before ready either -- v2ray-core's GetTLSConfig only
+		// logs AppendCertsFromPEM's failure and leaves RootCAs nil, which
+		// silently falls back to the system root pool instead of the
+		// operator's pinned CA.
+		if !x509.NewCertPool().AppendCertsFromPEM(certificate.Certificate) {
+			logWarn("cert is not a valid PEM certificate")
+			return nil, newError("cert is not a valid PEM certificate")
 		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	}
@@ -339,6 +389,18 @@ func generateConfig() (*core.Config, error) {
 	if err != nil {
 		return nil, newError("invalid localPort: not a valid port")
 	}
+	// localAddr must be a single IP literal, via the same canonicalLocalAddr
+	// main()'s pre-bind guard uses. Unreachable from the real
+	// main()-driven call path, since main() already rejects a
+	// multi-address or non-IP *localAddr before ever calling
+	// generateConfig, but kept here too because this func is
+	// independently reachable, bypassing main() entirely, from this
+	// file's own unit tests -- without it, those callers could build a
+	// Config whose Listen address is net.ParseAddress of an unparsed
+	// "a|b" string instead of failing loudly.
+	if _, ok := canonicalLocalAddr(*localAddr); !ok {
+		return nil, newError("invalid localAddr: must be a single IP literal")
+	}
 	rport, err := validPort(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
@@ -359,15 +421,18 @@ func generateConfig() (*core.Config, error) {
 	// Domain(), not the raw string, so a value ParseAddress trims to
 	// empty can't slip past a raw-string comparison.
 	//
-	// The unspecified IP address (0.0.0.0 or ::) is the same failure
-	// shape one level down, for both address families: freedom's own
-	// isValidAddress rejects an unspecified address for the destination
-	// override, so the override is silently discarded and traffic is
-	// redirected to dokodemo's net.LocalHostIP fallback instead of the
-	// intended upstream -- worse than the empty case, since it's a wrong
-	// destination that succeeds rather than one that just fails every
-	// dial. domainAddress.IP() panics, so this is checked only when the
-	// family is actually IP.
+	// The unspecified IP address (0.0.0.0 or ::) is a failure one level
+	// down, though the two families fail differently: freedom's own
+	// isValidAddress (third_party/v2ray-core/proxy/freedom/freedom.go)
+	// only compares against net.AnyIP (0.0.0.0), so a 0.0.0.0 override is
+	// silently discarded and traffic redirects to dokodemo's
+	// net.LocalHostIP fallback -- a wrong destination that succeeds
+	// rather than failing every dial. :: has no such fallback: isValidAddress
+	// doesn't recognize it as unspecified, so the override IS applied
+	// verbatim and every dial goes to "[::]:port" and fails outright.
+	// Both are rejected here regardless of which failure mode applies.
+	// domainAddress.IP() panics, so this is checked only when the family
+	// is actually IP.
 	remoteAddress := net.ParseAddress(*remoteAddr)
 	family := remoteAddress.Family()
 	if (family.IsDomain() && remoteAddress.Domain() == "") || (family.IsIP() && remoteAddress.IP().IsUnspecified()) {

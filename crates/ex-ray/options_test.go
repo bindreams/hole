@@ -176,8 +176,7 @@ func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
 
 // An explicit empty value ("ech=") is rejected like any other value
 // outside allowedEchModes -- not a no-op, matching parseIntOption/
-// parseBoolOption's actual (post-fix) rule that only an absent key is a
-// no-op.
+// parseBoolOption's rule that only an absent key is a no-op.
 func TestParseOptsIntoFlagsEchRejectsExplicitEmptyValue(t *testing.T) {
 	withEnv(t, "ech=")
 	withEchFlags(t, "auto", "")
@@ -190,6 +189,60 @@ func TestParseOptsIntoFlagsEchRejectsExplicitEmptyValue(t *testing.T) {
 	}
 	if *echMode != "auto" {
 		t.Errorf("*echMode = %q after a rejected value, want it untouched at %q", *echMode, "auto")
+	}
+}
+
+// ech-doh is the DoH URL ECH's own config fetch uses; a malformed value is
+// otherwise never caught before ready -- v2ray-core's own ApplyECH only
+// logs a dohQuery failure, so ech=auto silently never arms ECH (cleartext
+// SNI) and ech=always silently arms RequireEch with no way to ever satisfy
+// it, in both cases with ex-ray already having reported ready.
+func TestParseOptsIntoFlagsEchDohRejectsNonHTTPSValue(t *testing.T) {
+	for _, bad := range []string{"not a url", "http://1.1.1.1/dns-query", "ftp://1.1.1.1/dns-query", "https://"} {
+		t.Run(bad, func(t *testing.T) {
+			withEnv(t, "ech-doh="+bad)
+			withEchFlags(t, "auto", "")
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning ech-doh")
+			}
+			if !strings.Contains(err.Error(), "ech-doh") {
+				t.Errorf("error %q does not mention ech-doh", err.Error())
+			}
+			if *echDoh != "" {
+				t.Errorf("*echDoh = %q after a rejected value, want it untouched at %q", *echDoh, "")
+			}
+		})
+	}
+}
+
+// An explicit empty ech-doh value is a documented, legitimate spelling
+// (the flag's own description: "Empty disables ECH"), not rejected --
+// unlike every other option's empty-value handling in this file.
+func TestParseOptsIntoFlagsEchDohAcceptsExplicitEmptyValue(t *testing.T) {
+	withEnv(t, "ech-doh=")
+	restoreEch := withEchFlags(t, "auto", "https://1.1.1.1/dns-query")
+	defer restoreEch()
+	if err := parseOptsIntoFlags(); err != nil {
+		t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+	}
+	if *echDoh != "" {
+		t.Errorf("*echDoh = %q, want empty (explicit ech-doh= clears it)", *echDoh)
+	}
+}
+
+// The rejected value must never appear in the error text, checked with a
+// distinctive value via the same backslash-absorption exploit used
+// throughout this file.
+func TestParseOptsIntoFlagsEchDohErrorNeverEchoesAbsorbedSecret(t *testing.T) {
+	withEnv(t, `ech-doh=abc\;certRaw=SUPERSECRETVALUE`)
+	withEchFlags(t, "auto", "")
+	err := parseOptsIntoFlags()
+	if err == nil {
+		t.Fatal("parseOptsIntoFlags() = nil error, want an error mentioning ech-doh")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("error %q leaks an absorbed segment", err.Error())
 	}
 }
 
@@ -525,12 +578,12 @@ func TestParseOptsIntoFlagsBoolOptionsBareKeyOrExplicitOneEnables(t *testing.T) 
 	}
 }
 
-// Unlike the int/enum options, an explicit empty value is NOT a no-op for a
-// presence-only boolean -- it is rejected like any other unrecognized
-// value (parseBoolOption's doc comment explains why: garter mirrors
-// ex-ray's old "presence regardless of value" semantics for `server`, and
-// a silent no-op here would let ex-ray and garter disagree about mode
-// without either side erroring).
+// An explicit empty value is rejected for a presence-only boolean too,
+// not just for the int/enum options -- it is rejected like any other
+// unrecognized value (parseBoolOption's doc comment explains why: garter
+// mirrors ex-ray's old "presence regardless of value" semantics for
+// `server`, and a silent no-op here would let ex-ray and garter disagree
+// about mode without either side erroring).
 func TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	for _, o := range boolOptions() {
 		t.Run(o.key, func(t *testing.T) {
@@ -649,6 +702,29 @@ func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
 // forward every dial to a broken destination and never fail) or when it
 // is the unspecified address 0.0.0.0/:: (net.AnyIP): freedom's own
 // isValidAddress rejects that address for the destination override,
+// generateConfig validates localAddr itself (not just main()): a
+// multi-address `|`-list or a non-IP-literal hostname must fail loudly
+// even when generateConfig is called directly, bypassing main()'s own
+// guard entirely -- exactly how this file's own tests call it.
+func TestGenerateConfigRejectsMultiAddressOrNonIPLocalAddr(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalAddr := *localAddr
+	defer func() { *localAddr = origLocalAddr }()
+
+	for _, bad := range []string{"127.0.0.1|127.0.0.2", "localhost", "cloudfront.com"} {
+		*localAddr = bad
+		_, err := generateConfig()
+		if err == nil {
+			t.Errorf("localAddr=%q: generateConfig() = nil error, want an error mentioning localAddr", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "localAddr") {
+			t.Errorf("localAddr=%q: error %q does not mention localAddr", bad, err.Error())
+		}
+	}
+}
+
 // silently discarding it and falling back to dokodemo's net.LocalHostIP
 // -- traffic goes somewhere real and wrong, worse than the empty case.
 func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
