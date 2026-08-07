@@ -82,11 +82,11 @@ func parseBoolOption(opts Args, key string, dest *bool) error {
 
 // parseEnumOption reads a SIP003 option value from opts and applies it to
 // dest if it matches one of allowed, mirroring parseIntOption/
-// parseBoolOption's actual structural rule (their doc comments, not their
-// old shared wording): an absent key is a no-op; any PRESENT value, empty
-// included, must be in allowed or the option is fatal. An empty value has
-// no more claim to "not specified" here than an empty mux or tls value
-// does. The allowed list is safe to name in the error (it's a small
+// parseBoolOption's structural rule: an absent key is a no-op; any
+// PRESENT value, empty included, must be in allowed or the option is
+// fatal. An empty value has no more claim to "not specified" here than an
+// empty mux or tls value does. The allowed list is safe to name in the
+// error (it's a small
 // static vocabulary, not operator input) but the rejected value itself
 // never is, for the same reason as every other option in this file.
 func parseEnumOption(opts Args, key string, allowed []string, dest *string) error {
@@ -128,5 +128,71 @@ func parseURLOption(opts Args, key string, dest *string) error {
 		return newError(fmt.Sprintf("invalid %s: value is not an https URL", key))
 	}
 	*dest = c
+	return nil
+}
+
+// parseStringOption reads a SIP003 option value from opts and applies it
+// to dest. An absent key is always a no-op. Whether an explicitly empty
+// value ("key=") is ALSO a no-op depends on emptyOK: pass true for
+// options where the empty string is itself a meaningful, documented
+// value -- cert/certRaw/key, where empty means "use the ~/.acme.sh
+// default" (config.go's own fallback logic depends on this, the same way
+// ech-doh's "empty disables ECH" does) -- and false for options with no
+// legitimate "explicitly nothing" spelling (host, path), where an empty
+// value is exactly as unrecognized as an empty mux/tls value and must be
+// fatal.
+//
+// A BARE key (no `=` at all) is a separate, narrower gap this does NOT
+// close: args.go's parser maps a bare key to the literal string "1" for
+// every option uniformly (same as parseIntOption's doc comment
+// documents for mux/tcp-keepalive/fwmark), so a fat-fingered bare `host`
+// silently sets *host to "1" rather than failing loud. Fixing that needs
+// the same args.go Args grammar change already tracked (not attempted
+// here) to distinguish a bare key from an explicit "=1" -- this function
+// only closes the explicitly-empty-value gap.
+func parseStringOption(opts Args, key string, dest *string, emptyOK bool) error {
+	c, ok := opts.Get(key)
+	if !ok {
+		return nil
+	}
+	if c == "" && !emptyOK {
+		return newError(fmt.Sprintf("invalid %s: value must not be empty", key))
+	}
+	*dest = c
+	return nil
+}
+
+// recognizedOptionKeys is every SIP003 option key parseOptsIntoFlags
+// reads. Used to reject an unrecognized key (a typo, or a stale/removed
+// option name) instead of silently absorbing it into opts and never
+// applying it -- the same silent-drop bug this whole file otherwise fails
+// loud on, just for the key spelling instead of a bad value.
+var recognizedOptionKeys = []string{
+	"mode", "mux", "tcp-keepalive", "tls", "host", "path", "cert",
+	"certRaw", "key", "loglevel", "server", "localAddr", "localPort",
+	"remoteAddr", "remotePort", "fastOpen", "__android_vpn", "fwmark",
+	"ech", "ech-doh",
+}
+
+// rejectUnrecognizedKeys returns an error if opts contains any key
+// outside recognizedOptionKeys. Key names -- unlike values -- are usually
+// safe to name directly, but args.go's grammar lets a backslash-escaped
+// key ALSO absorb a later segment (the same trick that makes a value echo
+// dangerous elsewhere in this file), so this never echoes the offending
+// key either: only the count is reported.
+func rejectUnrecognizedKeys(opts Args) error {
+	recognized := make(map[string]bool, len(recognizedOptionKeys))
+	for _, k := range recognizedOptionKeys {
+		recognized[k] = true
+	}
+	var unrecognizedCount int
+	for k := range opts {
+		if !recognized[k] {
+			unrecognizedCount++
+		}
+	}
+	if unrecognizedCount > 0 {
+		return newError(fmt.Sprintf("SS_PLUGIN_OPTIONS contains %d unrecognized option key(s)", unrecognizedCount))
+	}
 	return nil
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"math"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -215,6 +217,37 @@ func TestBuildTLSConfigEch(t *testing.T) {
 				t.Errorf("%s: ServerName = %q, want SNI preserved", c.desc, tc.ServerName)
 			}
 		})
+	}
+}
+
+// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on
+// Windows -- otherwise config_windows.go's getCertPool never applies the
+// pin at all and verification silently falls back to the system root
+// pool. Portable across CI platforms: asserts true on Windows, false
+// elsewhere (config_other.go already applies a supplied cert without the
+// flag, so setting it there is a separate, not-made-here decision).
+func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCertRaw, origHost, origTLS := *certRaw, *host, *tlsEnabled
+	defer func() { *certRaw, *host, *tlsEnabled = origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	pem, err := os.ReadFile(certPath) //nolint:gosec // G304: certPath is this test's own t.TempDir() file, not external input.
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", certPath, err)
+	}
+	*certRaw = strings.TrimSuffix(strings.TrimPrefix(string(pem), "-----BEGIN CERTIFICATE-----\n"), "-----END CERTIFICATE-----\n")
+	*host = "example.com"
+
+	tc, err := buildTLSConfig()
+	if err != nil {
+		t.Fatalf("buildTLSConfig(): %v", err)
+	}
+	want := runtime.GOOS == "windows"
+	if tc.DisableSystemRoot != want {
+		t.Errorf("DisableSystemRoot = %v, want %v (GOOS=%s)", tc.DisableSystemRoot, want, runtime.GOOS)
 	}
 }
 

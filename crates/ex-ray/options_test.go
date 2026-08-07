@@ -334,7 +334,7 @@ func TestParseOptsIntoFlagsMux(t *testing.T) {
 		{"appended after an escaped semicolon", `path=/a\;;mux=0`, 0},
 		{"operator override wins (first-wins)", "mux=8;path=/;mux=0", 8},
 		{"bare key resolves to the literal value 1 (== muxDefault here)", "mux", muxDefault},
-		{"two backslashes are a literal backslash, separator holds", `a=b\\;mux=0`, 0},
+		{"two backslashes are a literal backslash, separator holds", `path=b\\;mux=0`, 0},
 	}
 	for _, c := range presentCases {
 		t.Run(c.desc, func(t *testing.T) {
@@ -360,10 +360,10 @@ func TestParseOptsIntoFlagsMux(t *testing.T) {
 		// A single backslash before ';' escapes the semicolon, so "mux=0" is
 		// absorbed into the preceding value instead of becoming its own
 		// directive -- no mux key is ever produced.
-		{"one backslash before ';' absorbs the rest into the value, no mux key", `a=b\;mux=0`},
+		{"one backslash before ';' absorbs the rest into the value, no mux key", `path=b\;mux=0`},
 		// Three backslashes: one literal backslash + one more escaping the
 		// ';' the same way -- absorbs the rest identically.
-		{"three backslashes: one literal backslash + escaped ';', absorbs the rest", `a=b\\\;mux=0`},
+		{"three backslashes: one literal backslash + escaped ';', absorbs the rest", `path=b\\\;mux=0`},
 	}
 	for _, c := range absentCases {
 		t.Run(c.desc, func(t *testing.T) {
@@ -722,6 +722,90 @@ func TestGenerateConfigRejectsMultiAddressOrNonIPLocalAddr(t *testing.T) {
 		if !strings.Contains(err.Error(), "localAddr") {
 			t.Errorf("localAddr=%q: error %q does not mention localAddr", bad, err.Error())
 		}
+	}
+}
+
+// A non-empty cert/certRaw/key without tls set is otherwise never read,
+// validated, or applied at all: buildTLSConfig only runs `if
+// *tlsEnabled`. ex-ray would silently build a plaintext transport and
+// report ready while the operator believes they configured a pinned CA
+// or server certificate.
+func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origCert, origCertRaw, origKey, origTLS := *cert, *certRaw, *key, *tlsEnabled
+	defer func() { *cert, *certRaw, *key, *tlsEnabled = origCert, origCertRaw, origKey, origTLS }()
+	*tlsEnabled = false
+
+	cases := []struct {
+		desc               string
+		cert, certRaw, key string
+	}{
+		{"cert set", "/some/cert.pem", "", ""},
+		{"certRaw set", "", "some-cert-content", ""},
+		{"key set", "", "", "/some/key.pem"},
+	}
+	for _, c := range cases {
+		*cert, *certRaw, *key = c.cert, c.certRaw, c.key
+		_, err := generateConfig()
+		if err == nil {
+			t.Errorf("%s: generateConfig() = nil error, want an error mentioning tls", c.desc)
+			continue
+		}
+		if !strings.Contains(err.Error(), "tls") {
+			t.Errorf("%s: error %q does not mention tls", c.desc, err.Error())
+		}
+	}
+}
+
+// host/path have no legitimate "explicitly nothing" spelling (unlike
+// cert/certRaw/key, where empty means "use the default"), so an explicit
+// empty value is rejected the same way mux=/tls= are.
+func TestParseOptsIntoFlagsHostAndPathRejectExplicitEmptyValue(t *testing.T) {
+	for _, key := range []string{"host", "path"} {
+		t.Run(key, func(t *testing.T) {
+			withEnv(t, key+"=")
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q does not mention %q", err.Error(), key)
+			}
+		})
+	}
+}
+
+// cert/certRaw/key accept an explicit empty value as a documented no-op
+// (config.go falls back to the ~/.acme.sh default when both cert and
+// certRaw are empty in server mode) -- unlike host/path above.
+func TestParseOptsIntoFlagsCertKeyAcceptExplicitEmptyValue(t *testing.T) {
+	for _, key := range []string{"cert", "certRaw", "key"} {
+		t.Run(key, func(t *testing.T) {
+			withEnv(t, key+"=")
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			}
+		})
+	}
+}
+
+// A key outside recognizedOptionKeys -- a typo, or a stale/removed option
+// name -- must be fatal, not silently absorbed into opts and never
+// applied: the operator's intended setting (here, a typo'd "ech") stays
+// at its untouched default with no diagnostic anywhere.
+func TestParseOptsIntoFlagsRejectsUnrecognizedKey(t *testing.T) {
+	withEnv(t, "eech=always;host=example.com")
+	origEchMode := *echMode
+	defer func() { *echMode = origEchMode }()
+	*echMode = "auto"
+
+	err := parseOptsIntoFlags()
+	if err == nil {
+		t.Fatal("parseOptsIntoFlags() = nil error, want an error about an unrecognized key")
+	}
+	if *echMode != "auto" {
+		t.Errorf("*echMode = %q, want it untouched at %q -- the typo'd key must not silently apply", *echMode, "auto")
 	}
 }
 

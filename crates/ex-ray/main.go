@@ -58,6 +58,10 @@ func parseOptsIntoFlags() error {
 		return err
 	}
 
+	if err := rejectUnrecognizedKeys(opts); err != nil {
+		return err
+	}
+
 	if c, b := opts.Get("mode"); b {
 		*mode = c
 	}
@@ -70,20 +74,23 @@ func parseOptsIntoFlags() error {
 	if err := parseBoolOption(opts, "tls", tlsEnabled); err != nil {
 		return err
 	}
-	if c, b := opts.Get("host"); b {
-		*host = c
+	if err := parseStringOption(opts, "host", host, false); err != nil {
+		return err
 	}
-	if c, b := opts.Get("path"); b {
-		*path = c
+	if err := parseStringOption(opts, "path", path, false); err != nil {
+		return err
 	}
-	if c, b := opts.Get("cert"); b {
-		*cert = c
+	// cert/certRaw/key: empty is a documented, meaningful "use the
+	// default" spelling (config.go falls back to ~/.acme.sh when both
+	// are empty in server mode) -- not fatal, unlike host/path above.
+	if err := parseStringOption(opts, "cert", cert, true); err != nil {
+		return err
 	}
-	if c, b := opts.Get("certRaw"); b {
-		*certRaw = c
+	if err := parseStringOption(opts, "certRaw", certRaw, true); err != nil {
+		return err
 	}
-	if c, b := opts.Get("key"); b {
-		*key = c
+	if err := parseStringOption(opts, "key", key, true); err != nil {
+		return err
 	}
 	if c, b := opts.Get("loglevel"); b {
 		*logLevel = c

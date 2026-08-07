@@ -259,6 +259,9 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_remote_addr_empty", "remoteAddr=", false},
 		{"invalid_remote_addr_any_ip", "remoteAddr=0.0.0.0", false},
 		{"invalid_cert_raw_not_pem", "tls;host=example.com;certRaw=not-a-real-certificate", false},
+		{"invalid_host_empty", "host=;path=/", false},
+		{"invalid_cert_material_without_tls", "certRaw=some-cert-content;host=example.com;path=/", false},
+		{"invalid_unrecognized_key", "eech=always;host=example.com;path=/", false},
 		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
 		// string compare against the literal "0" alone would have missed
 		// it, binding an OS-assigned ephemeral port while ready.listen
@@ -322,7 +325,7 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 // underlying os.PathError text would otherwise embed it. This needs its
 // own env (not the shared table's SS_REMOTE_HOST=chain.example.net):
 // server mode cross-assigns the remoteAddr option (== SS_REMOTE_HOST)
-// into *localAddr, and a non-IP-literal *localAddr is now itself fatal
+// into *localAddr, and a non-IP-literal *localAddr is itself fatal
 // (main()'s IP-literal guard) before ever reaching buildTLSConfig -- an
 // IP-literal SS_REMOTE_HOST is required for the flow to actually reach
 // the cert read this case means to exercise.
@@ -355,19 +358,14 @@ func TestInvalidCertPathSitrepNeverEchoesSecret(t *testing.T) {
 // localAddr must be an IP literal -- "nosuchhost.invalid" (and any other
 // non-IP spelling) is fatal before the process ever attempts to bind, via
 // a static message that structurally cannot echo the absorbed secret
-// (main()'s net.ParseIP guard never interpolates the rejected value at
-// all, unlike the sites elsewhere in this file that do and must be
-// checked for it explicitly).
+// (main()'s canonicalLocalAddr guard never interpolates the rejected
+// value at all, unlike the sites elsewhere in this file that do and must
+// be checked for it explicitly).
 //
-// This guard, plus the port/remoteAddr validation added earlier in main()
-// and generateConfig, means every SS_PLUGIN_OPTIONS-reachable address/port
-// value is now rejected before v2ray-core's server.Start() is ever called
-// -- there is no known operator-supplied input left that reaches Start()'s
-// own generic (non-bind-conflict) fatal branch (main.go's static
-// "failed to start the v2ray-core inbound listener" message), so that
-// specific site has no live process-boundary reproduction here. It is
-// still provably safe by construction: the message is a fixed string
-// literal with no interpolated value at all (main.go).
+// No test drives Start()'s generic (non-bind-conflict) fatal branch
+// directly -- main()'s port/localAddr/remoteAddr guards already reject
+// every value that could reach it. It's still provably safe: the message
+// is a fixed string literal with no interpolated value at all (main.go).
 func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",

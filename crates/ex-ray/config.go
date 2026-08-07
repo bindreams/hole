@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os/user"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -323,6 +324,23 @@ func buildTLSConfig() (*tls.Config, error) {
 			return nil, newError("cert is not a valid PEM certificate")
 		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
+		// Windows only: without this, the pinned CA above is silently
+		// never applied at all there. config_windows.go's getCertPool
+		// returns (nil, nil) unconditionally unless DisableSystemRoot is
+		// set, leaving RootCAs nil and verification falling back to the
+		// machine's system root pool -- any CA trusted by the OS
+		// (including one an attacker or an MDM profile installed) would
+		// then satisfy verification instead of only the operator's pin.
+		// Scoped to Windows deliberately: on every other platform,
+		// config_other.go already APPENDS the supplied cert to a copy of
+		// the system pool without this flag, which is the existing,
+		// working, non-buggy behavior -- setting DisableSystemRoot there
+		// too would additionally stop trusting the system pool, a
+		// separate security-posture change (stricter pinning vs. "pin
+		// plus system roots") this fix doesn't make unilaterally.
+		if runtime.GOOS == "windows" {
+			tlsConfig.DisableSystemRoot = true
+		}
 	}
 
 	// Unreachable from main(): generateConfig already runs this identical
@@ -495,6 +513,16 @@ func generateConfig() (*core.Config, error) {
 	}
 	if *echMode == "always" && !*tlsEnabled {
 		return nil, newError("ech=always requires tls to be enabled")
+	}
+	// A non-empty cert/certRaw/key without tls set is never read, never
+	// validated, and never applied -- buildTLSConfig only runs `if
+	// *tlsEnabled` below, so ex-ray silently builds a plaintext transport
+	// and reports ready while the operator believes they configured a
+	// pinned CA (client) or a server certificate. Same class of gap as
+	// ech=always above, just for the cert material instead of the ECH
+	// promise.
+	if !*tlsEnabled && (*cert != "" || *certRaw != "" || *key != "") {
+		return nil, newError("cert/certRaw/key require tls to be enabled")
 	}
 
 	streamConfig := internet.StreamConfig{
