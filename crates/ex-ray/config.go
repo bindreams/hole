@@ -275,6 +275,13 @@ func buildTLSConfig() (*tls.Config, error) {
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	}
 
+	// Unreachable from main(): generateConfig already runs this identical
+	// check before ever calling buildTLSConfig, so on the real
+	// (main()-driven) call path *echMode is always already valid here.
+	// Kept as buildTLSConfig's own guard because it IS independently
+	// reachable -- this func is called directly (bypassing generateConfig
+	// entirely) by its own tests, e.g. TestBuildTLSConfigEch's "invalid
+	// mode" case.
 	if !slices.Contains(allowedEchModes, *echMode) {
 		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
 	}
@@ -322,6 +329,12 @@ func securitySettings(tlsConfig *tls.Config) proto.Message {
 }
 
 func generateConfig() (*core.Config, error) {
+	// The port-syntax half of this check (not the ==0 case, which
+	// generateConfig alone rejects) is unreachable from main(): main()
+	// already validates *localPort with this same validPort before ever
+	// calling buildV2Ray/generateConfig. Kept here as generateConfig's own
+	// guard because it IS independently reachable -- this func's own unit
+	// tests call it directly, bypassing main() entirely.
 	lport, err := validPort(*localPort)
 	if err != nil {
 		return nil, newError("invalid localPort: not a valid port")
@@ -339,17 +352,25 @@ func generateConfig() (*core.Config, error) {
 	if rport == 0 {
 		return nil, newError("invalid remotePort: must not be 0")
 	}
-	// An empty remoteAddr parses as a zero-length domain address that
-	// core.New/Start both accept without complaint -- ex-ray binds and
-	// reports ready, then every dial to the upstream fails. net.AnyIP
-	// (0.0.0.0) is the same failure shape one level down: freedom's own
-	// isValidAddress rejects it too, so the destination-address override
-	// is silently discarded and traffic is redirected to dokodemo's
-	// net.LocalHostIP fallback instead of the intended upstream -- worse
-	// than the empty case, since it's a wrong destination that succeeds
-	// rather than one that just fails every dial.
+	// An empty (or whitespace-only -- ParseAddress trims) remoteAddr
+	// parses as a zero-length domain address that core.New/Start both
+	// accept without complaint -- ex-ray binds and reports ready, then
+	// every dial to the upstream fails. Checked on the PARSED address's
+	// Domain(), not the raw string, so a value ParseAddress trims to
+	// empty can't slip past a raw-string comparison.
+	//
+	// The unspecified IP address (0.0.0.0 or ::) is the same failure
+	// shape one level down, for both address families: freedom's own
+	// isValidAddress rejects an unspecified address for the destination
+	// override, so the override is silently discarded and traffic is
+	// redirected to dokodemo's net.LocalHostIP fallback instead of the
+	// intended upstream -- worse than the empty case, since it's a wrong
+	// destination that succeeds rather than one that just fails every
+	// dial. domainAddress.IP() panics, so this is checked only when the
+	// family is actually IP.
 	remoteAddress := net.ParseAddress(*remoteAddr)
-	if *remoteAddr == "" || remoteAddress == net.AnyIP {
+	family := remoteAddress.Family()
+	if (family.IsDomain() && remoteAddress.Domain() == "") || (family.IsIP() && remoteAddress.IP().IsUnspecified()) {
 		return nil, newError("invalid remoteAddr: must not be empty or the unspecified address")
 	}
 	// Validate operator-supplied numeric options up-front, before the

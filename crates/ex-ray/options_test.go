@@ -658,7 +658,12 @@ func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
 	defer func() { *localPort, *remotePort, *remoteAddr = origLocalPort, origRemotePort, origRemoteAddr }()
 	*localPort, *remotePort = "1984", "443"
 
-	for _, bad := range []string{"", "0.0.0.0"} {
+	// "::"/"[::]" cover the IPv6 unspecified address (net.AnyIPv6) --
+	// distinct from "0.0.0.0" (net.AnyIP), a different constant/type in
+	// v2ray-core's net package. " " covers a whitespace-only value:
+	// net.ParseAddress trims surrounding whitespace, so a raw non-empty
+	// string can still parse to an empty domain.
+	for _, bad := range []string{"", " ", "0.0.0.0", "::", "[::]"} {
 		*remoteAddr = bad
 		_, err := generateConfig()
 		if err == nil {

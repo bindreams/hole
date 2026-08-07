@@ -53,17 +53,9 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 	return i, string(unesc), nil
 }
 
-// Parse SS_PLUGIN options from environment variables. SS_PLUGIN_OPTIONS is
-// always validated via parsePluginOptions, independently of whether the
-// SS_* chain-handoff vars below are present. The SS_*-derived addresses
-// are added to opts only when all four vars are present; a partial set
-// (some but not all four -- never a legitimate invocation shape, per the
-// SIP003 contract every real caller follows) is fatal, matching every
-// other illegitimate-input-state this file rejects, rather than silently
-// falling back to whatever SS_PLUGIN_OPTIONS/flag defaults happen to
-// supply for all four of localAddr/localPort/remoteAddr/remotePort at
-// once. A fully-absent set is the legitimate standalone-invocation case
-// and is not an error.
+// parseEnv validates SS_PLUGIN_OPTIONS and, if present, the SS_*
+// chain-handoff vars -- a partial SS_* set is fatal (see below); the
+// standalone/fully-complete cases are not.
 func parseEnv() (opts Args, err error) {
 	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
 	if err != nil {
@@ -75,12 +67,9 @@ func parseEnv() (opts Args, err error) {
 		opts[k] = v
 	}
 
-	// LookupEnv, not Getenv: presence (the var was exported at all, even
-	// as "") is what distinguishes "a caller attempted the chain-handoff
-	// protocol and got it wrong" (partial, fatal) from "no caller ever
-	// mentioned SS_* at all" (the standalone case, not an error).
-	// os.Getenv can't tell those apart -- it returns "" for both an unset
-	// var and one explicitly exported empty.
+	// LookupEnv, not Getenv: Getenv can't tell an unset var from one
+	// exported empty, and that distinction drives the partial-vs-absent
+	// check below.
 	ssRemoteHost, remoteHostSet := os.LookupEnv("SS_REMOTE_HOST")
 	ssRemotePort, remotePortSet := os.LookupEnv("SS_REMOTE_PORT")
 	ssLocalHost, localHostSet := os.LookupEnv("SS_LOCAL_HOST")
