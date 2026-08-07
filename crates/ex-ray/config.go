@@ -81,8 +81,7 @@ var (
 // SS_PLUGIN_OPTIONS) that must never reach the sitrep. v2ray-core's own
 // Error.Base() couples Unwrap() to an Error() that unconditionally appends
 // the wrapped error's text, so it cannot express "chainable but redacted"
-// -- this type can. The raw cause is still available to a caller that logs
-// it to stderr directly, e.g. via logWarn, before returning this.
+// -- this type can.
 type redactedError struct {
 	msg   string
 	cause error
@@ -323,6 +322,13 @@ func generateConfig() (*core.Config, error) {
 	rport, err := net.PortFromString(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
+	}
+	// An empty remoteAddr parses as a zero-length domain address that
+	// core.New/Start both accept without complaint -- ex-ray binds and
+	// reports ready, then every dial to the upstream fails. Reject it
+	// up front instead, the same way an empty/invalid local port is.
+	if *remoteAddr == "" {
+		return nil, newError("invalid remoteAddr: must not be empty")
 	}
 	// Validate operator-supplied numeric options up-front, before the
 	// server/client split, so out-of-range mux/fwmark are rejected identically

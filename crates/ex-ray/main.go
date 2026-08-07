@@ -95,14 +95,16 @@ func parseBoolOption(opts Args, key string, dest *bool) error {
 
 // parseEnumOption reads a SIP003 option value from opts and applies it to
 // dest if it matches one of allowed, mirroring parseIntOption/
-// parseBoolOption's structural rule: an absent key or an explicitly empty
-// value is a no-op; a non-empty value outside allowed is fatal. The
-// allowed list is safe to name in the error (it's a small static
-// vocabulary, not operator input) but the rejected value itself never is,
-// for the same reason as every other option in this file.
+// parseBoolOption's actual structural rule (their doc comments, not their
+// old shared wording): an absent key is a no-op; any PRESENT value, empty
+// included, must be in allowed or the option is fatal. An empty value has
+// no more claim to "not specified" here than an empty mux or tls value
+// does. The allowed list is safe to name in the error (it's a small
+// static vocabulary, not operator input) but the rejected value itself
+// never is, for the same reason as every other option in this file.
 func parseEnumOption(opts Args, key string, allowed []string, dest *string) error {
 	c, ok := opts.Get(key)
-	if !ok || c == "" {
+	if !ok {
 		return nil
 	}
 	for _, a := range allowed {
@@ -325,11 +327,35 @@ func main() {
 	// (config.go, generateConfig), which would bind an OS-assigned
 	// ephemeral port while localListenAddr below -- built from this same
 	// raw string -- still reported the original spelling, a bound port
-	// that disagrees with what ready.listen claimed.
+	// that disagrees with what ready.listen claimed. A parse failure or an
+	// out-of-range value is a different fault (not a port-0 request at
+	// all) and gets its own message so the detail doesn't misdirect the
+	// operator at a port-0/OS-assignment problem they don't have.
 	localPortNum, portErr := strconv.Atoi(*localPort)
-	if portErr != nil || localPortNum <= 0 || localPortNum > 65535 {
+	switch {
+	case portErr != nil || localPortNum < 0 || localPortNum > 65535:
+		emitFatal("invalid localPort: not a valid port", nil)
+		os.Exit(23) // config-class error
+	case localPortNum == 0:
 		emitFatal("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)", nil)
 		os.Exit(23) // config-class error
+	}
+
+	// localAddr must be an IP literal (or, in server mode, a `|`-separated
+	// list of them -- parseLocalAddr, config.go): "localhost" is the one
+	// hostname spelling v2ray-core's own listener silently rewrites to
+	// 127.0.0.1 (ListenTCP), so localListenAddr below -- built from this
+	// same raw *localAddr -- would report "localhost:<port>", which fails
+	// garter's SocketAddr parse and is silently dropped as an unrecognized
+	// log line instead of being observed as ready. Every other non-IP
+	// hostname already fails loudly via generateConfig's own "domain
+	// address is not allowed for listening" error; this is the one silent
+	// gap.
+	for _, a := range parseLocalAddr(*localAddr) {
+		if net.ParseIP(a) == nil {
+			emitFatal("invalid localAddr: must be an IP literal", nil)
+			os.Exit(23) // config-class error
+		}
 	}
 
 	// localAddr/localPort name the inbound listener in both modes (see

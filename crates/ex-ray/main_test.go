@@ -261,7 +261,7 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		// still reported the literal "00" spelling.
 		{"invalid_local_port_non_canonical_zero", "localPort=00", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
-		// The generateConfig/buildTLSConfig no-echo fixes for localPort/
+		// The generateConfig/buildTLSConfig no-echo behavior for localPort/
 		// remotePort/mode, driven through the REAL pipeline
 		// (parsePluginOptions -> parseOptsIntoFlags -> buildV2Ray ->
 		// generateConfig/buildTLSConfig -> emitFatal), not just via
@@ -279,10 +279,9 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		// branch at all -- it end-to-end-proves parseEnumOption's no-echo
 		// behavior (already unit-tested directly), not buildTLSConfig's.
 		{"invalid_ech_mode_never_echo_secret", `tls;host=example.com;ech=abc\;certRaw=SUPERSECRETVALUE`, true},
-		// The boolean and loglevel fixes, likewise through the real
-		// pipeline: tls=false must be fatal, not a silent TLS-enable, and
-		// must never echo an absorbed secret; same for an unrecognized
-		// loglevel.
+		// tls and loglevel go through the same real pipeline: tls=false
+		// must be fatal, not a silent TLS-enable, and must never echo an
+		// absorbed secret; same for an unrecognized loglevel.
 		{"invalid_tls_bool_never_echo_secret", `tls=abc\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_loglevel_never_echo_secret", `loglevel=abc\;certRaw=SUPERSECRETVALUE`, true},
 	}
@@ -327,7 +326,13 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 // not the config-class 23 the table above pins). v2ray-core's internal
 // Start error text embeds the raw listen address, so the same
 // backslash-absorption secret must not reach the sitrep here either.
-func TestStartFailureSitrepNeverEchoesLocalAddr(t *testing.T) {
+// localAddr must be an IP literal -- "nosuchhost.invalid" (and any other
+// non-IP spelling) is fatal before the process ever attempts to bind, via
+// a static message that structurally cannot echo the absorbed secret
+// (main()'s net.ParseIP guard never interpolates the rejected value at
+// all, unlike the sites elsewhere in this file that do and must be
+// checked for it explicitly).
+func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "chain.example.net",
 		"SS_REMOTE_PORT":    "9443",
@@ -342,6 +347,9 @@ func TestStartFailureSitrepNeverEchoesLocalAddr(t *testing.T) {
 		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
 	}
 	detail, _ := terminal["detail"].(string)
+	if !strings.Contains(detail, "localAddr") {
+		t.Errorf("fatal detail = %q, want it to mention localAddr", detail)
+	}
 	if strings.Contains(detail, "SUPERSECRETVALUE") {
 		t.Errorf("fatal detail leaks the absorbed segment: %q", detail)
 	}
@@ -371,6 +379,37 @@ func TestPartialSSEnvSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	detail, _ := terminal["detail"].(string)
 	if !strings.Contains(detail, "SS_*") {
 		t.Errorf("fatal detail = %q, want it to mention the incomplete SS_* env", detail)
+	}
+	if exitCode == 0 {
+		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
+	}
+}
+
+// A malformed port must be fatal when it comes from the SS_*-env chain-
+// handoff itself (SS_REMOTE_PORT), not only when it's an SS_PLUGIN_OPTIONS
+// override -- generateConfig's net.PortFromString is the only gate on
+// *remotePort regardless of which of those two sources set it, so a
+// regression that special-cased validation to the options-override path
+// would pass every case in TestFatalSitrepReachesParentAndProcessExitsNonZero
+// (which never varies SS_REMOTE_PORT/SS_LOCAL_PORT themselves) while
+// leaving this, the original chain-handoff path, unvalidated again.
+func TestInvalidSSEnvPortSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
+	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+		"SS_REMOTE_HOST":    "chain.example.net",
+		"SS_REMOTE_PORT":    "70000",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": "host=example.com;path=/",
+	})
+	if hello["event"] != "hello" {
+		t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+	}
+	if terminal["event"] != "fatal" {
+		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+	}
+	detail, _ := terminal["detail"].(string)
+	if !strings.Contains(detail, "remotePort") {
+		t.Errorf("fatal detail = %q, want it to mention remotePort", detail)
 	}
 	if exitCode == 0 {
 		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
