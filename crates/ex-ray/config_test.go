@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"math"
 	"os"
@@ -17,6 +18,39 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
 	"google.golang.org/protobuf/types/known/anypb"
 )
+
+// sentinelTestError is a distinct, named error type (unlike errors.New's
+// unexported concrete type) so errors.As below can prove it retrieves
+// this SPECIFIC underlying cause, not just any error in the chain --
+// errors.As against a bare `error`-typed target would trivially match
+// err itself without ever exercising Unwrap().
+type sentinelTestError struct{ msg string }
+
+func (e *sentinelTestError) Error() string { return e.msg }
+
+// redactedError exists specifically to let errors.Is/errors.As see through
+// to cause (needed by TestBuildV2RayMissingCertIsNotBindConflict's
+// fs.ErrNotExist check) while keeping Error() limited to msg. Both halves
+// of that contract are pinned directly here, not just exercised
+// incidentally through the sites that use it.
+func TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText(t *testing.T) {
+	cause := &sentinelTestError{msg: "cause text: SUPERSECRETVALUE"}
+	err := &redactedError{msg: "redacted", cause: cause}
+
+	if got := err.Error(); got != "redacted" {
+		t.Errorf("Error() = %q, want %q", got, "redacted")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("Error() leaks the cause's text: %q", err.Error())
+	}
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is(err, cause) = false, want true -- Unwrap must expose the cause")
+	}
+	var target *sentinelTestError
+	if !errors.As(err, &target) || target != cause {
+		t.Errorf("errors.As(err, &target): target = %v, want %v", target, cause)
+	}
+}
 
 func TestUint32OptInRange(t *testing.T) {
 	cases := []struct {

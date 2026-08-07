@@ -58,10 +58,6 @@ func parseOptsIntoFlags() error {
 		return err
 	}
 
-	if err := rejectUnrecognizedKeys(opts); err != nil {
-		return err
-	}
-
 	if c, b := opts.Get("mode"); b {
 		*mode = c
 	}
@@ -92,12 +88,32 @@ func parseOptsIntoFlags() error {
 	if err := parseStringOption(opts, "key", key, true); err != nil {
 		return err
 	}
-	if c, b := opts.Get("loglevel"); b {
-		*logLevel = c
+	// loglevel's documented default spelling is "warning" (or an absent
+	// key); an explicit "loglevel=" has no legitimate meaning of its own
+	// -- treated as unrecognized like host/path, not as a meaningful
+	// "use the default" spelling like cert/certRaw/key/ech-doh, so a
+	// silent revert-to-default (e.g. discarding a CLI-set -loglevel=debug)
+	// is fatal instead of invisible.
+	if err := parseStringOption(opts, "loglevel", logLevel, false); err != nil {
+		return err
 	}
 	if err := parseBoolOption(opts, "server", server); err != nil {
 		return err
 	}
+	// localAddr/localPort/remoteAddr/remotePort are cross-assigned raw,
+	// with no parse*Option validator (#703, held for Anna's decision on
+	// whether these four should be operator-settable via
+	// SS_PLUGIN_OPTIONS at all -- adding validation here would be a step
+	// toward answering that unilaterally). The same bare-key-resolves-to-
+	// "1" gap parseIntOption/parseStringOption document for their own
+	// options applies here too, undocumented until now: a fat-fingered
+	// bare `remoteAddr` silently sets the upstream destination to the
+	// domain "1", and a bare `localPort`/`remotePort` silently sets port
+	// 1 -- both valid-looking values that sail past every guard added in
+	// this file (port-0 checks, empty/AnyIP remoteAddr checks) because
+	// "1" is neither zero nor empty. Fixing this needs the same args.go
+	// Args grammar change already tracked (not attempted here) to
+	// distinguish a bare key from an explicit "=1".
 	if c, b := opts.Get("localAddr"); b {
 		if *server {
 			*remoteAddr = c

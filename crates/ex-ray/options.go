@@ -162,37 +162,18 @@ func parseStringOption(opts Args, key string, dest *string, emptyOK bool) error 
 	return nil
 }
 
-// recognizedOptionKeys is every SIP003 option key parseOptsIntoFlags
-// reads. Used to reject an unrecognized key (a typo, or a stale/removed
-// option name) instead of silently absorbing it into opts and never
-// applying it -- the same silent-drop bug this whole file otherwise fails
-// loud on, just for the key spelling instead of a bad value.
-var recognizedOptionKeys = []string{
-	"mode", "mux", "tcp-keepalive", "tls", "host", "path", "cert",
-	"certRaw", "key", "loglevel", "server", "localAddr", "localPort",
-	"remoteAddr", "remotePort", "fastOpen", "__android_vpn", "fwmark",
-	"ech", "ech-doh",
-}
-
-// rejectUnrecognizedKeys returns an error if opts contains any key
-// outside recognizedOptionKeys. Key names -- unlike values -- are usually
-// safe to name directly, but args.go's grammar lets a backslash-escaped
-// key ALSO absorb a later segment (the same trick that makes a value echo
-// dangerous elsewhere in this file), so this never echoes the offending
-// key either: only the count is reported.
-func rejectUnrecognizedKeys(opts Args) error {
-	recognized := make(map[string]bool, len(recognizedOptionKeys))
-	for _, k := range recognizedOptionKeys {
-		recognized[k] = true
-	}
-	var unrecognizedCount int
-	for k := range opts {
-		if !recognized[k] {
-			unrecognizedCount++
-		}
-	}
-	if unrecognizedCount > 0 {
-		return newError(fmt.Sprintf("SS_PLUGIN_OPTIONS contains %d unrecognized option key(s)", unrecognizedCount))
-	}
-	return nil
-}
+// An unrecognized key (a typo, or a stale/removed option name) is
+// deliberately NOT rejected here, unlike every other malformed shape in
+// this file: ex-ray's SS_PLUGIN_OPTIONS string is shared with other
+// first-party tools in the same process chain -- galoshes appends its own
+// `udp_timeout` (crates/galoshes/src/yamux.rs) to the same options string
+// before forwarding it to its embedded ex-ray, and the bridge preserves
+// arbitrary unrecognized keys when composing plugin options (crates/
+// bridge/src/proxy/plugin.rs) -- and both rely on ex-ray's documented
+// tolerance for keys it doesn't own. Rejecting unknown keys here would
+// break that established, working contract for every caller that shares
+// the string this way; closing the "typo silently ignored" gap instead
+// needs coordination with those callers (an ex-ray-side allowlist that
+// also names every externally-owned key, or a change on their side to
+// strip their own keys before forwarding) rather than a unilateral
+// ex-ray-only change.

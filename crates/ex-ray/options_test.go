@@ -760,9 +760,12 @@ func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
 
 // host/path have no legitimate "explicitly nothing" spelling (unlike
 // cert/certRaw/key, where empty means "use the default"), so an explicit
-// empty value is rejected the same way mux=/tls= are.
-func TestParseOptsIntoFlagsHostAndPathRejectExplicitEmptyValue(t *testing.T) {
-	for _, key := range []string{"host", "path"} {
+// empty value is rejected the same way mux=/tls= are. loglevel joins them
+// here too: its documented default spelling is "warning" (or an absent
+// key), not the empty string, so a silent revert-to-default (discarding a
+// CLI-set -loglevel=debug, say) is fatal instead of invisible.
+func TestParseOptsIntoFlagsStringOptionsRejectExplicitEmptyValue(t *testing.T) {
+	for _, key := range []string{"host", "path", "loglevel"} {
 		t.Run(key, func(t *testing.T) {
 			withEnv(t, key+"=")
 			err := parseOptsIntoFlags()
@@ -780,37 +783,39 @@ func TestParseOptsIntoFlagsHostAndPathRejectExplicitEmptyValue(t *testing.T) {
 // (config.go falls back to the ~/.acme.sh default when both cert and
 // certRaw are empty in server mode) -- unlike host/path above.
 func TestParseOptsIntoFlagsCertKeyAcceptExplicitEmptyValue(t *testing.T) {
-	for _, key := range []string{"cert", "certRaw", "key"} {
-		t.Run(key, func(t *testing.T) {
-			withEnv(t, key+"=")
+	fields := []struct {
+		key string
+		get func() string
+		set func(string)
+	}{
+		{"cert", func() string { return *cert }, func(v string) { *cert = v }},
+		{"certRaw", func() string { return *certRaw }, func(v string) { *certRaw = v }},
+		{"key", func() string { return *key }, func(v string) { *key = v }},
+	}
+	for _, f := range fields {
+		t.Run(f.key, func(t *testing.T) {
+			withEnv(t, f.key+"=")
+			// Pre-seeded with a non-empty sentinel: proves the empty
+			// value is actually APPLIED (parseStringOption's emptyOK
+			// path explicitly clears dest, unlike parseIntOption/
+			// parseBoolOption's "absent key" no-op), not merely that
+			// the flag's own zero-value default happened to already be
+			// empty.
+			f.set("non-empty-sentinel")
 			if err := parseOptsIntoFlags(); err != nil {
 				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			}
+			if got := f.get(); got != "" {
+				t.Errorf("%s= -> %q, want empty (explicit key= clears it)", f.key, got)
 			}
 		})
 	}
 }
 
-// A key outside recognizedOptionKeys -- a typo, or a stale/removed option
-// name -- must be fatal, not silently absorbed into opts and never
-// applied: the operator's intended setting (here, a typo'd "ech") stays
-// at its untouched default with no diagnostic anywhere.
-func TestParseOptsIntoFlagsRejectsUnrecognizedKey(t *testing.T) {
-	withEnv(t, "eech=always;host=example.com")
-	origEchMode := *echMode
-	defer func() { *echMode = origEchMode }()
-	*echMode = "auto"
-
-	err := parseOptsIntoFlags()
-	if err == nil {
-		t.Fatal("parseOptsIntoFlags() = nil error, want an error about an unrecognized key")
-	}
-	if *echMode != "auto" {
-		t.Errorf("*echMode = %q, want it untouched at %q -- the typo'd key must not silently apply", *echMode, "auto")
-	}
-}
-
-// silently discarding it and falling back to dokodemo's net.LocalHostIP
-// -- traffic goes somewhere real and wrong, worse than the empty case.
+// 0.0.0.0 as remoteAddr is silently discarded by freedom's isValidAddress,
+// falling back to dokodemo's net.LocalHostIP -- traffic goes somewhere
+// real and wrong, worse than the empty-remoteAddr case (which fails every
+// dial).
 func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()

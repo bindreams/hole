@@ -261,7 +261,6 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_cert_raw_not_pem", "tls;host=example.com;certRaw=not-a-real-certificate", false},
 		{"invalid_host_empty", "host=;path=/", false},
 		{"invalid_cert_material_without_tls", "certRaw=some-cert-content;host=example.com;path=/", false},
-		{"invalid_unrecognized_key", "eech=always;host=example.com;path=/", false},
 		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
 		// string compare against the literal "0" alone would have missed
 		// it, binding an OS-assigned ephemeral port while ready.listen
