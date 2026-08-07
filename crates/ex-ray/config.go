@@ -524,14 +524,16 @@ func generateConfig() (*core.Config, error) {
 	if !*tlsEnabled && (*cert != "" || *certRaw != "" || *key != "") {
 		return nil, newError("cert/certRaw/key require tls to be enabled")
 	}
-	// key is read only inside buildTLSConfig's `if *server` branch (never
-	// in client mode, per its own flag help text: "(server) Path to TLS
-	// key file") -- the check above alone still lets a `key` value with
-	// tls set in CLIENT mode through unnoticed, silently dropped exactly
-	// like the tls-unset case above.
-	if !*server && *key != "" {
-		return nil, newError("key requires server mode")
-	}
+	// A client-mode `key` value (key is read only inside buildTLSConfig's
+	// `if *server` branch) is deliberately NOT rejected here, unlike the
+	// tls-unset case above: real client-side plugin_opts strings in this
+	// monorepo already carry a harmless, unused `key=<path>` alongside
+	// `cert=<path>` (crates/bridge/src/test_support/skuld_fixtures.rs
+	// builds its ws_tls/quic client fixtures this way, reusing the same
+	// cert+key pair the server-mode builder uses), so rejecting it would
+	// break real, working configs rather than close a silent-misconfig
+	// gap -- a client `key` is genuinely inert, not a broken promise like
+	// an unapplied `cert`/`certRaw` pin.
 
 	streamConfig := internet.StreamConfig{
 		ProtocolName: *mode,

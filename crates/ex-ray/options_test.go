@@ -156,10 +156,8 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 // is galoshes' actual udp_timeout key (crates/galoshes/src/yamux.rs),
 // which ex-ray is documented to ignore so galoshes can share the same
 // options string with its embedded ex-ray instead of composing a second,
-// ex-ray-only string. A regression here (e.g. reintroducing an
-// allowlist/rejectUnrecognizedKeys check) previously broke this real
-// contract and had to be reverted -- this test exists specifically to
-// catch that regression again.
+// ex-ray-only string. Reintroducing an allowlist/rejectUnrecognizedKeys
+// check here would break that real contract.
 func TestParseOptsIntoFlagsToleratesUnrecognizedKey(t *testing.T) {
 	withEnv(t, "udp_timeout=300;host=example.com;path=/")
 	if err := parseOptsIntoFlags(); err != nil {
@@ -778,24 +776,24 @@ func TestGenerateConfigRejectsCertMaterialWithoutTLS(t *testing.T) {
 	}
 }
 
-// key is read only inside buildTLSConfig's server-mode branch -- a `key`
-// value with tls SET but in CLIENT mode passes the tls-unset guard above
-// yet is still never applied, silently dropped exactly like the
-// tls-unset case.
-func TestGenerateConfigRejectsClientModeKey(t *testing.T) {
+// A client-mode `key` value is deliberately tolerated, not rejected: real
+// client-side plugin_opts strings in this monorepo carry a harmless,
+// unused `key=<path>` alongside `cert=<path>` (crates/bridge/src/
+// test_support/skuld_fixtures.rs's ws_tls/quic client fixtures), so this
+// must keep building successfully -- a regression here would break those
+// real e2e fixtures the same way TestParseOptsIntoFlagsToleratesUnrecognizedKey
+// guards against re-rejecting a shared SS_PLUGIN_OPTIONS key.
+func TestGenerateConfigToleratesClientModeKey(t *testing.T) {
 	restore := withFlags(t, 1, 0, false) // client mode
 	defer restore()
-	origKey, origTLS := *key, *tlsEnabled
-	defer func() { *key, *tlsEnabled = origKey, origTLS }()
+	origCert, origKey, origTLS := *cert, *key, *tlsEnabled
+	defer func() { *cert, *key, *tlsEnabled = origCert, origKey, origTLS }()
 	*tlsEnabled = true
+	*cert, _ = writeSelfSignedCertKey(t, "example.com")
 	*key = "/some/key.pem"
 
-	_, err := generateConfig()
-	if err == nil {
-		t.Fatal("generateConfig() = nil error, want an error mentioning key and server")
-	}
-	if !strings.Contains(err.Error(), "key") || !strings.Contains(err.Error(), "server") {
-		t.Errorf("error %q does not mention both key and server", err.Error())
+	if _, err := generateConfig(); err != nil {
+		t.Errorf("generateConfig() with a client-mode key = %v, want nil", err)
 	}
 }
 
