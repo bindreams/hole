@@ -1,8 +1,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"math"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,6 +18,39 @@ import (
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
 	"google.golang.org/protobuf/types/known/anypb"
 )
+
+// sentinelTestError is a distinct, named error type (unlike errors.New's
+// unexported concrete type) so errors.As below can prove it retrieves
+// this SPECIFIC underlying cause, not just any error in the chain --
+// errors.As against a bare `error`-typed target would trivially match
+// err itself without ever exercising Unwrap().
+type sentinelTestError struct{ msg string }
+
+func (e *sentinelTestError) Error() string { return e.msg }
+
+// redactedError exists specifically to let errors.Is/errors.As see through
+// to cause (needed by TestBuildV2RayMissingCertIsNotBindConflict's
+// fs.ErrNotExist check) while keeping Error() limited to msg. Both halves
+// of that contract are pinned directly here, not just exercised
+// incidentally through the sites that use it.
+func TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText(t *testing.T) {
+	cause := &sentinelTestError{msg: "cause text: SUPERSECRETVALUE"}
+	err := &redactedError{msg: "redacted", cause: cause}
+
+	if got := err.Error(); got != "redacted" {
+		t.Errorf("Error() = %q, want %q", got, "redacted")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("Error() leaks the cause's text: %q", err.Error())
+	}
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is(err, cause) = false, want true -- Unwrap must expose the cause")
+	}
+	var target *sentinelTestError
+	if !errors.As(err, &target) || target != cause {
+		t.Errorf("errors.As(err, &target): target = %v, want %v", target, cause)
+	}
+}
 
 func TestUint32OptInRange(t *testing.T) {
 	cases := []struct {
@@ -127,30 +164,6 @@ func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	return func() { *echMode, *echDoh = origMode, origDoh }
 }
 
-// withEnv sets SS_PLUGIN_OPTIONS plus the four SS_* vars parseEnv gates on, for
-// the duration of the test (t.Setenv restores originals on cleanup). It also
-// snapshots and restores the address/port globals that a subsequent
-// parseOptsIntoFlags writes from SS_REMOTE_*/SS_LOCAL_*, so the restore boundary
-// matches the full mutation surface (withEchFlags only covers ech/ech-doh).
-func withEnv(t *testing.T, pluginOptions string) {
-	t.Helper()
-	origLocalAddr, origLocalPort := *localAddr, *localPort
-	origRemoteAddr, origRemotePort := *remoteAddr, *remotePort
-	t.Cleanup(func() {
-		*localAddr, *localPort = origLocalAddr, origLocalPort
-		*remoteAddr, *remotePort = origRemoteAddr, origRemotePort
-	})
-	for k, v := range map[string]string{
-		"SS_REMOTE_HOST":    "example.com",
-		"SS_REMOTE_PORT":    "443",
-		"SS_LOCAL_HOST":     "127.0.0.1",
-		"SS_LOCAL_PORT":     "1984",
-		"SS_PLUGIN_OPTIONS": pluginOptions,
-	} {
-		t.Setenv(k, v)
-	}
-}
-
 func TestEchFlagDefaults(t *testing.T) {
 	if *echMode != "auto" {
 		t.Errorf("ech flag default = %q, want %q", *echMode, "auto")
@@ -174,10 +187,16 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			restore := withEchFlags(t, "auto", "")
-			defer restore()
+			// withEnv's snapshot must run before withEchFlags mutates
+			// echMode/echDoh, so its t.Cleanup restore (which runs after
+			// this func's own defers) captures the true pre-subtest state.
+			// withEchFlags's own returned restore func is deliberately left
+			// undeferred for the same reason.
 			withEnv(t, c.opts)
-			parseOptsIntoFlags()
+			withEchFlags(t, "auto", "")
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v", err)
+			}
 			if *echMode != c.wantMode {
 				t.Errorf("%s: *echMode = %q, want %q", c.desc, *echMode, c.wantMode)
 			}
@@ -232,6 +251,42 @@ func TestBuildTLSConfigEch(t *testing.T) {
 				t.Errorf("%s: ServerName = %q, want SNI preserved", c.desc, tc.ServerName)
 			}
 		})
+	}
+}
+
+// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on
+// Windows -- otherwise config_windows.go's getCertPool never applies the
+// pin at all and verification silently falls back to the system root
+// pool. Portable across CI platforms: asserts true on Windows, false
+// elsewhere (config_other.go already applies a supplied cert without the
+// flag, so setting it there is a separate, not-made-here decision).
+func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+	// readCertificate checks *cert first and only falls through to
+	// *certRaw when *cert is empty -- must be cleared explicitly so this
+	// test exercises the certRaw path it claims to, regardless of what an
+	// earlier test in the same binary left *cert holding.
+	*cert = ""
+
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	pem, err := os.ReadFile(certPath) //nolint:gosec // G304: certPath is this test's own t.TempDir() file, not external input.
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", certPath, err)
+	}
+	*certRaw = strings.TrimSuffix(strings.TrimPrefix(string(pem), "-----BEGIN CERTIFICATE-----\n"), "-----END CERTIFICATE-----\n")
+	*host = "example.com"
+
+	tc, err := buildTLSConfig()
+	if err != nil {
+		t.Fatalf("buildTLSConfig(): %v", err)
+	}
+	want := runtime.GOOS == "windows"
+	if tc.DisableSystemRoot != want {
+		t.Errorf("DisableSystemRoot = %v, want %v (GOOS=%s)", tc.DisableSystemRoot, want, runtime.GOOS)
 	}
 }
 
@@ -528,38 +583,112 @@ func TestMuxFlagDefault(t *testing.T) {
 	}
 }
 
-// Inputs mirror what galoshes hands its embedded ex-ray; expectations come from
-// the grammar in args.go (first-wins, escapes), not from running galoshes.
-func TestParseOptsIntoFlagsMux(t *testing.T) {
-	cases := []struct {
-		desc string
-		opts string
-		want int
-	}{
-		{"appended alone", "mux=0", 0},
-		{"appended after directives", "host=cloudfront.com;path=/;mux=0", 0},
-		{"appended after an escaped semicolon", `path=/a\;;mux=0`, 0},
-		{"operator override wins (first-wins)", "mux=8;path=/;mux=0", 8},
-		{"no mux key keeps the flag default", "host=cloudfront.com;path=/", 1},
-		// The shapes galoshes' ex_ray_options refuses to emit. Each leaves mux at
-		// 1 -- Mux.Cool silently ON -- which is precisely why it refuses.
-		{"one trailing backslash is a dangling escape", `a=b\;mux=0`, 1},
-		{"two are a literal backslash, so the separator holds", `a=b\\;mux=0`, 0},
-		{"three are a literal backslash plus a dangling escape", `a=b\\\;mux=0`, 1},
-		{"an empty segment voids the whole string", "mode=websocket;;mux=0", 1},
-		{"an empty key voids the whole string", "host=h;=v;mux=0", 1},
+// The same property for buildTLSConfig's cert/key read-failure sites --
+// cert, key, and host (via the ~/.acme.sh/{host}/... default path
+// construction) are all reachable from SS_PLUGIN_OPTIONS, and a missing
+// file's os.PathError text would otherwise embed the raw path verbatim.
+func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	// cert points at a nonexistent path carrying an absorbed secret.
+	*cert, *key, *host = `/nope\;certRaw=SUPERSECRETVALUE`, "", "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("cert error = %v, want a non-nil error not containing the secret", err)
 	}
-	for _, c := range cases {
-		t.Run(c.desc, func(t *testing.T) {
-			orig := *mux
-			defer func() { *mux = orig }()
-			*mux = 1
-			withEnv(t, c.opts)
-			parseOptsIntoFlags()
-			if *mux != c.want {
-				t.Errorf("%s: *mux = %d, want %d", c.desc, *mux, c.want)
-			}
-		})
+
+	// key points at a nonexistent path carrying an absorbed secret; cert
+	// must be a real, readable file so the flow reaches the key read.
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	*cert, *key, *host = certPath, `/nope\;certRaw=SUPERSECRETVALUE`, "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("key error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	// host feeds the default ~/.acme.sh/{host}/... cert path when neither
+	// cert nor certRaw is given.
+	*cert, *key, *host = "", "", `nosuchhost.invalid\;certRaw=SUPERSECRETVALUE`
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("host-derived cert path error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// A readable cert/key pair that isn't a valid X509 key pair is otherwise
+// never caught before ready: v2ray-core's own BuildCertificates logs
+// "ignoring invalid X509 key pair" at Warning and silently drops it,
+// leaving zero certificates configured (TLS handshakes then fail with no
+// diagnostic ever reaching the sitrep) rather than failing to start.
+func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	garbageKeyPath := filepath.Join(dir, "garbage-key.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+	writePEMFile(t, garbageKeyPath, "PRIVATE KEY", []byte("not a real key"))
+
+	realCertPath, realKeyPath := writeSelfSignedCertKey(t, "example.com")
+
+	*cert, *key, *host = garbageCertPath, realKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("garbage cert, valid key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("garbage cert, valid key: error %q does not mention X509", err.Error())
+	}
+
+	*cert, *key, *host = realCertPath, garbageKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("valid cert, garbage key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("valid cert, garbage key: error %q does not mention X509", err.Error())
+	}
+}
+
+// The client-side pinned-CA equivalent: an unparseable PEM cert is
+// otherwise never caught before ready either -- v2ray-core's GetTLSConfig
+// only logs AppendCertsFromPEM's failure and leaves RootCAs nil, silently
+// falling back to the system root pool instead of the operator's pinned
+// CA.
+func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+	*cert = ""
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+
+	*cert, *host = garbageCertPath, "example.com"
+	_, err := buildTLSConfig()
+	if err == nil {
+		t.Fatal("buildTLSConfig() = nil error, want an error mentioning PEM")
+	}
+	if !strings.Contains(err.Error(), "PEM") {
+		t.Errorf("error %q does not mention PEM", err.Error())
+	}
+}
+
+// The same property for buildTLSConfig's invalid-ech-mode site, which
+// needs tlsEnabled=true to reach (TestBuildTLSConfigEch's own precondition).
+func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
+	restore := withEchFlags(t, `abc\;certRaw=SUPERSECRETVALUE`, "")
+	defer restore()
+	origHost, origTLS := *host, *tlsEnabled
+	*host, *tlsEnabled = "example.com", true
+	defer func() { *host, *tlsEnabled = origHost, origTLS }()
+
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("buildTLSConfig() error = %v, want a non-nil error not containing the secret", err)
 	}
 }
 
