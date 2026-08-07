@@ -255,6 +255,11 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_tcp_keepalive_non_numeric", "tcp-keepalive=off", false},
 		{"invalid_fwmark_non_numeric", "fwmark=off", false},
 		{"invalid_remote_port_out_of_range", "remotePort=70000", false},
+		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
+		// string compare against the literal "0" alone would have missed
+		// it, binding an OS-assigned ephemeral port while ready.listen
+		// still reported the literal "00" spelling.
+		{"invalid_local_port_non_canonical_zero", "localPort=00", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
 		// The generateConfig/buildTLSConfig no-echo fixes for localPort/
 		// remotePort/mode, driven through the REAL pipeline

@@ -23,27 +23,31 @@ var VERSION = "ex-ray"
 // dest, sharing one implementation across mux/tcp-keepalive/fwmark so the
 // three can never silently drift apart.
 //
-// The rule: an empty value means "not specified" and leaves dest alone; a
-// non-empty value that fails to parse is fatal. Concretely, both an absent
-// key and an explicitly empty value ("key=") are a no-op, leaving dest at
-// whatever it already held: dest holds whatever flag.Parse left there --
-// main() calls flag.Parse() before parseOptsIntoFlags runs -- the
-// registered default when no CLI flag was passed, or the CLI-supplied
-// value when one was, deliberately preserved either way, not overwritten.
-// A BARE key (no `=` at all) is different: args.go's parser maps it to the
-// literal string "1" for every option uniformly, so it goes through the
-// same Atoi path as an explicit `=1` and sets dest to 1 -- not "the
-// default" for tcp-keepalive/fwmark, whose defaults are 15/0 (see
-// TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this needs
-// args.go's Args type to distinguish a bare key from an explicit "=1", a
-// grammar change not attempted here). A non-empty, non-numeric value
-// is fatal and never echoes the rejected value: the escaping grammar lets
-// a backslash absorb a later segment into a value, so an unparseable
-// mux=abc\;certRaw=SECRET could otherwise leak certRaw's value through the
-// mux error.
+// The rule: an absent key is a no-op, leaving dest at whatever it already
+// held (dest holds whatever flag.Parse left there -- main() calls
+// flag.Parse() before parseOptsIntoFlags runs -- the registered default
+// when no CLI flag was passed, or the CLI-supplied value when one was).
+// Any PRESENT value, empty included, must parse as an integer or the
+// option is fatal: an explicitly empty value ("mux=") is not a documented
+// "leave it alone" spelling, and treating it as one is actively dangerous
+// for mux specifically -- galoshes' ex_ray_options appends `mux=0` and
+// ex-ray is first-wins, so an operator's earlier bare `mux=` would win
+// over galoshes' append and silently leave Mux.Cool at whatever default
+// it already held (often ON), defeating the exact mechanism `mux=0` exists
+// to guarantee. A BARE key (no `=` at all) is different: args.go's parser
+// maps it to the literal string "1" for every option uniformly, so it
+// goes through the same Atoi path as an explicit `=1` and sets dest to 1
+// -- not "the default" for tcp-keepalive/fwmark, whose defaults are 15/0
+// (see TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne; fixing this
+// needs args.go's Args type to distinguish a bare key from an explicit
+// "=1", a grammar change not attempted here). A non-empty, non-numeric
+// value is fatal and never echoes the rejected value: the escaping
+// grammar lets a backslash absorb a later segment into a value, so an
+// unparseable mux=abc\;certRaw=SECRET could otherwise leak certRaw's
+// value through the mux error.
 func parseIntOption(opts Args, key string, dest *int) error {
 	c, ok := opts.Get(key)
-	if !ok || c == "" {
+	if !ok {
 		return nil
 	}
 	i, err := strconv.Atoi(c)
@@ -142,7 +146,12 @@ func failFatal(err error) {
 func parseOptsIntoFlags() error {
 	opts, err := parseEnv()
 	if err != nil {
-		return newError("invalid SS_PLUGIN_OPTIONS").Base(err)
+		// Unwrapped, not "invalid SS_PLUGIN_OPTIONS"-prefixed: parseEnv
+		// returns two distinct fault classes (a malformed
+		// SS_PLUGIN_OPTIONS string, or an incomplete SS_* chain-handoff
+		// env, which SS_PLUGIN_OPTIONS may have nothing to do with), and
+		// each already names itself accurately.
+		return err
 	}
 
 	if c, b := opts.Get("mode"); b {
@@ -306,12 +315,19 @@ func main() {
 
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
 	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
-	// inbound listener's bound port via any public API. Echoing ":0" as
-	// `ready.listen` would be a silent spec violation (SITREP.md: listen MUST be
-	// the bound address).
-	// Hole always hands ex-ray a concrete pre-allocated port; a port-0 input
-	// is a misconfiguration we fail loudly on rather than mis-report.
-	if *localPort == "0" || *localPort == "" {
+	// inbound listener's bound port via any public API. Echoing a port-0
+	// spelling as `ready.listen` would be a silent spec violation
+	// (SITREP.md: listen MUST be the bound address).
+	// Hole always hands ex-ray a concrete pre-allocated port; a port-0
+	// input is a misconfiguration we fail loudly on rather than mis-report.
+	// Parsed numerically, not string-compared against "0": a non-canonical
+	// spelling ("00", "000") is also port 0 to net.PortFromString
+	// (config.go, generateConfig), which would bind an OS-assigned
+	// ephemeral port while localListenAddr below -- built from this same
+	// raw string -- still reported the original spelling, a bound port
+	// that disagrees with what ready.listen claimed.
+	localPortNum, portErr := strconv.Atoi(*localPort)
+	if portErr != nil || localPortNum <= 0 || localPortNum > 65535 {
 		emitFatal("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)", nil)
 		os.Exit(23) // config-class error
 	}
@@ -342,9 +358,8 @@ func main() {
 	// diagnostic content, not an echo of a rejected value. The generic fatal
 	// branch is different: v2ray-core's own Start error is unredacted internal
 	// text that can embed *localAddr/*localPort verbatim (e.g. "domain address
-	// is not allowed for listening: <value>"), so it must not reach the sitrep
-	// the way every other fatal site in this file was fixed not to; the raw
-	// error still reaches stderr via logFatal below.
+	// is not allowed for listening: <value>"), so it must not reach the sitrep;
+	// the raw error still reaches stderr via logFatal below.
 	if err := server.Start(); err != nil {
 		if errno, addr, ok := classifyBindError(err); ok {
 			if addr == "" {

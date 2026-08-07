@@ -272,12 +272,8 @@ func TestParseOptsIntoFlagsAcceptsControlOptions(t *testing.T) {
 	}
 }
 
-// Pins the newly-live path:
-// SS_PLUGIN_OPTIONS now applies even with NO SS_* env at all (the
-// fully-standalone case), where it was previously always inert (parseEnv's
-// old completeness gate ran before SS_PLUGIN_OPTIONS was ever read, so a
-// standalone invocation never reached it, regardless of whether SS_* was
-// fully absent or partially set). A CLI flag set first must still survive
+// SS_PLUGIN_OPTIONS applies even with no SS_* env at all (the
+// fully-standalone case). A CLI flag set first must still survive
 // SS_PLUGIN_OPTIONS being empty for that key.
 func TestParseOptsIntoFlagsAppliesOptionsWithNoSSEnvAtAll(t *testing.T) {
 	snap := snapshotFlags()
@@ -762,21 +758,29 @@ func intOptions() []intOption {
 	}
 }
 
-// An explicit empty value ("key=") is a no-op, like an absent key -- leaves
-// the flag at whatever it already held. The seed stands in for a CLI flag
-// that was set before parseOptsIntoFlags ran (flag.Parse happens first in
-// main()): this proves an empty value doesn't clobber it, not just that it
-// doesn't clobber a registered default.
-func TestParseOptsIntoFlagsIntOptionsEmptyValueIsANoOp(t *testing.T) {
+// Unlike an absent key, an explicit empty value ("key=") is rejected, not
+// a no-op -- mirrors TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue's
+// reasoning: for mux specifically, galoshes' ex_ray_options appends
+// `mux=0` and ex-ray is first-wins, so a no-op on an operator's earlier
+// `mux=` would let it win over the append while leaving Mux.Cool at
+// whatever default it already held (often ON), defeating the append's
+// whole purpose. Seeded with the sentinel (a value parseIntOption could
+// never legitimately produce) so the assertion can tell "correctly
+// rejected" apart from "silently applied anyway".
+func TestParseOptsIntoFlagsIntOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
 			withEnv(t, o.key+"=")
 			o.set(intOptionSeedSentinel)
-			if err := parseOptsIntoFlags(); err != nil {
-				t.Fatalf("parseOptsIntoFlags(): %v, want nil", err)
+			err := parseOptsIntoFlags()
+			if err == nil {
+				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q", o.key)
+			}
+			if !strings.Contains(err.Error(), o.key) {
+				t.Errorf("error %q does not mention %q", err.Error(), o.key)
 			}
 			if got := o.get(); got != intOptionSeedSentinel {
-				t.Errorf("%s= -> %d, want it untouched at the seed %d", o.key, got, intOptionSeedSentinel)
+				t.Errorf("%s=: value = %d after a rejected value, want the untouched pre-call value %d", o.key, got, intOptionSeedSentinel)
 			}
 		})
 	}
@@ -962,11 +966,11 @@ func TestParseOptsIntoFlagsBoolOptionsRejectsExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-// The exact bug being fixed: today, ANY value -- including one that reads
-// as "off" to a human -- silently enables the flag. tls=false must not
-// enable TLS; server=no must not flip into server mode. No value-echo check
-// here: "no" is a substring of "not" (as in "value is not recognized"),
-// which would make that check fail on the correct, non-leaking message --
+// tls=false must not enable TLS; server=no must not flip into server
+// mode -- any unrecognized value is rejected, not silently treated as
+// enable. No value-echo check here: "no" is a substring of "not" (as in
+// "value is not recognized"), which would make that check fail on the
+// correct, non-leaking message --
 // the same trap the int-option tests document. The dedicated no-echo test
 // below covers that property with a value the message text can't
 // accidentally contain. Seeded false (not true, the value parseBoolOption
@@ -1150,8 +1154,8 @@ func TestGenerateConfigAcceptsAllDocumentedLogLevels(t *testing.T) {
 	}
 }
 
-// The exact bug being fixed: a typo'd loglevel must not silently resolve
-// to Warning and look identical to a correctly-set one.
+// A typo'd loglevel must not silently resolve to Warning and look
+// identical to a correctly-set one.
 func TestGenerateConfigRejectsUnrecognizedLogLevel(t *testing.T) {
 	restore := withFlags(t, 1, 0, false)
 	defer restore()

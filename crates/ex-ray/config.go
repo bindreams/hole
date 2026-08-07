@@ -75,13 +75,6 @@ var (
 	tcpKeepAlive = flag.Int("tcp-keepalive", tcpKeepAliveDefault, "Seconds an idle outbound connection waits before TCP keepalive probes start. Three probes at the same spacing follow, so a black-holed idle connection is dropped after about four times this value. 0 disables keepalive entirely, including Go's own default.")
 )
 
-// homeDir resolves the operator's home directory, used only to build the
-// default ~/.acme.sh cert/key paths when the server-mode operator gave
-// neither. Returns an error rather than exiting directly, so a failure here
-// reaches main() through the same buildTLSConfig -> generateConfig ->
-// buildV2Ray -> failFatal path as every other config-class error in this
-// file -- a `fatal` sitrep with exit 23, not a bare stderr line and exit 1
-// that breaks the sitrep's hello-then-exactly-one-terminal-event contract.
 // redactedError wraps cause for errors.Is/errors.As chaining while keeping
 // Error() text limited to msg -- used where cause's own Error() text may
 // embed operator-supplied content (e.g. a cert/key path built from
@@ -98,6 +91,13 @@ type redactedError struct {
 func (e *redactedError) Error() string { return e.msg }
 func (e *redactedError) Unwrap() error { return e.cause }
 
+// homeDir resolves the operator's home directory, used only to build the
+// default ~/.acme.sh cert/key paths when the server-mode operator gave
+// neither. Returns an error rather than exiting directly, so a failure here
+// reaches main() through the same buildTLSConfig -> generateConfig ->
+// buildV2Ray -> failFatal path as every other config-class error in this
+// file -- a `fatal` sitrep with exit 23, not a bare stderr line and exit 1
+// that breaks the sitrep's hello-then-exactly-one-terminal-event contract.
 func homeDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {

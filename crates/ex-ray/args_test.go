@@ -205,10 +205,6 @@ func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 	}
 }
 
-// The logWarn added in parseEnv must fire exactly when
-// there is something to warn about: a genuinely partial SS_* set (some but
-// not all four vars). It must stay silent both when SS_* is fully absent
-// (the legitimate standalone case) and when it's fully complete.
 // A partial SS_* set (some but not all four of SS_REMOTE_HOST/
 // SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT) is fatal -- it is never a
 // legitimate invocation shape, and letting it fall back to
