@@ -255,6 +255,9 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_tcp_keepalive_non_numeric", "tcp-keepalive=off", false},
 		{"invalid_fwmark_non_numeric", "fwmark=off", false},
 		{"invalid_remote_port_out_of_range", "remotePort=70000", false},
+		{"invalid_remote_port_zero", "remotePort=0", false},
+		{"invalid_remote_addr_empty", "remoteAddr=", false},
+		{"invalid_remote_addr_any_ip", "remoteAddr=0.0.0.0", false},
 		// strconv.Atoi("00") parses to the integer 0, same as "0" -- a raw
 		// string compare against the literal "0" alone would have missed
 		// it, binding an OS-assigned ephemeral port while ready.listen
@@ -391,13 +394,16 @@ func TestInvalidLocalAddrSitrepNeverEchoesValue(t *testing.T) {
 }
 
 // A `|`-separated multi-address localAddr (parseLocalAddr's own grammar,
-// meant for server-mode multi-listen) is fatal: the sitrep's `ready` event
-// carries exactly one `listen` address (SITREP.md), so ex-ray cannot
-// honestly report a `|`-joined value there. Server mode is used because
-// generateConfig only ever calls parseLocalAddr in server mode; a client
-// invocation only ever treats *localAddr as one address. In server mode
-// parseOptsIntoFlags cross-assigns a `remoteAddr` option (not `localAddr`)
-// into *localAddr -- see parseOptsIntoFlags' own doc comment.
+// inherited from upstream v2ray-plugin's server-mode multi-listen) is
+// fatal: the sitrep's `ready` event carries exactly one `listen` address
+// (SITREP.md), so ex-ray cannot honestly report a `|`-joined value there
+// -- main()'s guard rejects it before generateConfig ever runs, so
+// generateConfig itself only ever builds a single server-mode inbound.
+// Server mode is used here because parseLocalAddr's `|` grammar is a
+// server-only concept; a client invocation only ever treats *localAddr as
+// one address. In server mode parseOptsIntoFlags cross-assigns a
+// `remoteAddr` option (not `localAddr`) into *localAddr -- see
+// parseOptsIntoFlags' own doc comment.
 func TestMultiAddressLocalAddrSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
 		"SS_REMOTE_HOST":    "10.9.8.7",

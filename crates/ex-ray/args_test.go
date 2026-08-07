@@ -277,6 +277,39 @@ func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
 		if !strings.Contains(err.Error(), wantErrSubstr) {
 			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
 		}
+		// SS_REMOTE_HOST/SS_LOCAL_HOST/SS_LOCAL_PORT are genuinely unset;
+		// SS_REMOTE_PORT is exported but blank -- the message must say so
+		// accurately (not blanket "some but not all are set", which would
+		// be true here but imprecise about which var is in which state).
+		if !strings.Contains(err.Error(), "unset: SS_REMOTE_HOST, SS_LOCAL_HOST, SS_LOCAL_PORT") {
+			t.Errorf("error = %q, want it to list the three unset vars", err.Error())
+		}
+		if !strings.Contains(err.Error(), "set but empty: SS_REMOTE_PORT") {
+			t.Errorf("error = %q, want it to list SS_REMOTE_PORT as set but empty", err.Error())
+		}
+	})
+
+	// All four ARE set (LookupEnv ok=true for each) -- "some but not all
+	// … are set" would be a false statement here, since all of them are.
+	// The message must instead say all four are present but blank.
+	t.Run("all four present but empty errors, with an accurate message", func(t *testing.T) {
+		for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
+			t.Setenv(v, "")
+		}
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
+		_, err := parseEnv()
+		if err == nil {
+			t.Fatal("parseEnv() = nil error, want the incomplete-env error")
+		}
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+		if strings.Contains(err.Error(), "unset:") {
+			t.Errorf("error = %q, want no \"unset:\" clause -- all four vars ARE set", err.Error())
+		}
+		if !strings.Contains(err.Error(), "set but empty: SS_REMOTE_HOST, SS_REMOTE_PORT, SS_LOCAL_HOST, SS_LOCAL_PORT") {
+			t.Errorf("error = %q, want it to list all four as set but empty", err.Error())
+		}
 	})
 
 	t.Run("fully absent SS_* (standalone) is not an error", func(t *testing.T) {

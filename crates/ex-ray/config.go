@@ -330,30 +330,27 @@ func generateConfig() (*core.Config, error) {
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
 	}
+	// remotePort==0 parses as in-range (validPort allows 0..65535) but the
+	// vendored freedom outbound only applies its destination-port override
+	// `if server.Port != 0` -- a remotePort=0 silently drops the override
+	// entirely, falling back to dokodemo's unset (zero) port, and nothing
+	// downstream rejects a zero Destination.Port. Reject it explicitly,
+	// the same way localPort's port-0 is rejected in main().
+	if rport == 0 {
+		return nil, newError("invalid remotePort: must not be 0")
+	}
 	// An empty remoteAddr parses as a zero-length domain address that
 	// core.New/Start both accept without complaint -- ex-ray binds and
-	// reports ready, then every dial to the upstream fails. Reject it
-	// up front instead, the same way an empty/invalid local port is.
-	if *remoteAddr == "" {
-		return nil, newError("invalid remoteAddr: must not be empty")
-	}
-	// ech is validated unconditionally here, not only inside buildTLSConfig
-	// (which runs only when *tlsEnabled below): a valid-vocabulary
-	// ech=always without tls set would otherwise silently apply nothing --
-	// the operator asked for fail-closed SNI concealment and gets a fully
-	// plaintext transport instead, with no diagnostic. "auto"/"never" make
-	// no such promise -- opportunistic ECH with no TLS at all is simply a
-	// no-op, not a broken guarantee, so only "always" is checked here.
-	// This also covers a raw -ech= CLI flag, which bypasses
-	// parseOptsIntoFlags' own parseEnumOption check entirely when
-	// SS_PLUGIN_OPTIONS carries no "ech" key at all. buildTLSConfig's own
-	// switch keeps its matching vocabulary guard as a contract assert for
-	// direct callers that skip generateConfig (e.g. its own unit tests).
-	if !slices.Contains(allowedEchModes, *echMode) {
-		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
-	}
-	if *echMode == "always" && !*tlsEnabled {
-		return nil, newError("ech=always requires tls to be enabled")
+	// reports ready, then every dial to the upstream fails. net.AnyIP
+	// (0.0.0.0) is the same failure shape one level down: freedom's own
+	// isValidAddress rejects it too, so the destination-address override
+	// is silently discarded and traffic is redirected to dokodemo's
+	// net.LocalHostIP fallback instead of the intended upstream -- worse
+	// than the empty case, since it's a wrong destination that succeeds
+	// rather than one that just fails every dial.
+	remoteAddress := net.ParseAddress(*remoteAddr)
+	if *remoteAddr == "" || remoteAddress == net.AnyIP {
+		return nil, newError("invalid remoteAddr: must not be empty or the unspecified address")
 	}
 	// Validate operator-supplied numeric options up-front, before the
 	// server/client split, so out-of-range mux/fwmark are rejected identically
@@ -370,7 +367,7 @@ func generateConfig() (*core.Config, error) {
 	outboundProxy := serial.ToTypedMessage(&freedom.Config{
 		DestinationOverride: &freedom.DestinationOverride{
 			Server: &protocol.ServerEndpoint{
-				Address: net.NewIPOrDomain(net.ParseAddress(*remoteAddr)),
+				Address: net.NewIPOrDomain(remoteAddress),
 				Port:    uint32(rport),
 			},
 		},
@@ -396,6 +393,22 @@ func generateConfig() (*core.Config, error) {
 		*tlsEnabled = true
 	default:
 		return nil, newError("unsupported mode (expected websocket or quic)")
+	}
+
+	// ech is validated here (not earlier): quic sets *tlsEnabled = true as
+	// a side effect of the mode switch just above, and this check must
+	// see that. Not only inside buildTLSConfig (which runs only when
+	// *tlsEnabled below) either: a valid-vocabulary ech=always without
+	// tls set would otherwise silently apply nothing -- the operator
+	// asked for fail-closed SNI concealment and gets a fully plaintext
+	// transport instead, with no diagnostic. "auto"/"never" make no such
+	// promise -- opportunistic ECH with no TLS at all is simply a no-op,
+	// not a broken guarantee, so only "always" is checked here.
+	if !slices.Contains(allowedEchModes, *echMode) {
+		return nil, newError(fmt.Sprintf("invalid ech mode (expected one of %s)", strings.Join(allowedEchModes, ", ")))
+	}
+	if *echMode == "always" && !*tlsEnabled {
+		return nil, newError("ech=always requires tls to be enabled")
 	}
 
 	streamConfig := internet.StreamConfig{
@@ -461,25 +474,23 @@ func generateConfig() (*core.Config, error) {
 			// dokodemo is not aware of mux connections by itself.
 			proxyAddress = net.ParseAddress("v1.mux.cool")
 		}
-		localAddrs := parseLocalAddr(*localAddr)
-		inbounds := make([]*core.InboundHandlerConfig, len(localAddrs))
-
-		for i := 0; i < len(localAddrs); i++ {
-			inbounds[i] = &core.InboundHandlerConfig{
+		// Exactly one inbound: main()'s localAddr guard already rejects
+		// any *localAddr that parseLocalAddr would split into more than
+		// one address (the sitrep's `ready` event can only report one
+		// `listen`, so a multi-address bind could never be honestly
+		// reported as ready in the first place -- see main.go).
+		return &core.Config{
+			Inbound: []*core.InboundHandlerConfig{{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
 					PortRange:      net.SinglePortRange(lport),
-					Listen:         net.NewIPOrDomain(net.ParseAddress(localAddrs[i])),
+					Listen:         net.NewIPOrDomain(net.ParseAddress(*localAddr)),
 					StreamSettings: &streamConfig,
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
 					Address:  net.NewIPOrDomain(proxyAddress),
 					Networks: []net.Network{net.Network_TCP},
 				}),
-			}
-		}
-
-		return &core.Config{
-			Inbound: inbounds,
+			}},
 			Outbound: []*core.OutboundHandlerConfig{{
 				ProxySettings: outboundProxy,
 			}},

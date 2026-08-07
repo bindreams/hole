@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Args maps a string key to a list of values. It is similar to url.Values.
@@ -79,20 +80,51 @@ func parseEnv() (opts Args, err error) {
 	// protocol and got it wrong" (partial, fatal) from "no caller ever
 	// mentioned SS_* at all" (the standalone case, not an error).
 	// os.Getenv can't tell those apart -- it returns "" for both an unset
-	// var and one explicitly exported empty, so `SS_REMOTE_PORT=` with
-	// the other three genuinely unset used to read as fully standalone.
+	// var and one explicitly exported empty.
 	ssRemoteHost, remoteHostSet := os.LookupEnv("SS_REMOTE_HOST")
 	ssRemotePort, remotePortSet := os.LookupEnv("SS_REMOTE_PORT")
 	ssLocalHost, localHostSet := os.LookupEnv("SS_LOCAL_HOST")
 	ssLocalPort, localPortSet := os.LookupEnv("SS_LOCAL_PORT")
-	allUsable := ssRemoteHost != "" && ssRemotePort != "" && ssLocalHost != "" && ssLocalPort != ""
-	if !allUsable {
-		if remoteHostSet || remotePortSet || localHostSet || localPortSet {
-			// Env var names only -- never operator/secret content, safe to
-			// name directly.
-			return nil, errors.New("SS_* chain-handoff env is incomplete: some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set")
+
+	// unset and empty are reported separately: a var that is exported but
+	// blank is a materially different operator mistake (e.g. an empty-
+	// string default in a wrapping script) than one never mentioned at
+	// all, and conflating them into a single "some but not all are set"
+	// message is actively misleading when every var IS set, just to "".
+	vars := [...]struct {
+		name string
+		val  string
+		set  bool
+	}{
+		{"SS_REMOTE_HOST", ssRemoteHost, remoteHostSet},
+		{"SS_REMOTE_PORT", ssRemotePort, remotePortSet},
+		{"SS_LOCAL_HOST", ssLocalHost, localHostSet},
+		{"SS_LOCAL_PORT", ssLocalPort, localPortSet},
+	}
+	var unset, empty []string
+	for _, v := range vars {
+		switch {
+		case !v.set:
+			unset = append(unset, v.name)
+		case v.val == "":
+			empty = append(empty, v.name)
 		}
+	}
+	if len(unset) == len(vars) {
+		// Fully absent: the legitimate standalone-invocation case.
 		return opts, nil
+	}
+	if len(unset) > 0 || len(empty) > 0 {
+		var detail []string
+		if len(unset) > 0 {
+			detail = append(detail, fmt.Sprintf("unset: %s", strings.Join(unset, ", ")))
+		}
+		if len(empty) > 0 {
+			detail = append(detail, fmt.Sprintf("set but empty: %s", strings.Join(empty, ", ")))
+		}
+		// Env var names only -- never operator/secret content, safe to
+		// name directly.
+		return nil, fmt.Errorf("SS_* chain-handoff env is incomplete (%s)", strings.Join(detail, "; "))
 	}
 
 	opts.Add("remoteAddr", ssRemoteHost)

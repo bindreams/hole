@@ -217,6 +217,25 @@ func TestGenerateConfigRejectsEchAlwaysWithoutTLS(t *testing.T) {
 	}
 }
 
+// mode=quic sets *tlsEnabled = true itself (config.go's mode switch), a
+// side effect the ech=always/tls gate must observe -- the gate runs after
+// the mode switch specifically so a quic config with ech=always and no
+// separately-set tls flag is accepted, not rejected as "tls not enabled"
+// when quic enforces TLS unconditionally.
+func TestGenerateConfigAcceptsEchAlwaysWithQuicMode(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	restoreEch := withEchFlags(t, "always", "https://1.1.1.1/dns-query")
+	defer restoreEch()
+	origMode, origTLS := *mode, *tlsEnabled
+	*mode, *tlsEnabled = "quic", false
+	defer func() { *mode, *tlsEnabled = origMode, origTLS }()
+
+	if _, err := generateConfig(); err != nil {
+		t.Errorf("generateConfig() with mode=quic, ech=always, tls not separately set = %v, want nil", err)
+	}
+}
+
 // ech=auto/never make no fail-closed promise, so they must NOT require
 // tls -- opportunistic ECH with no TLS at all is simply a no-op, not a
 // broken guarantee. Guards against a future edit widening the
@@ -602,6 +621,52 @@ func TestGenerateConfigRejectsOutOfRangeRemotePort(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "remotePort") {
 			t.Errorf("remotePort=%s: error %q does not mention remotePort", bad, err.Error())
+		}
+	}
+}
+
+// remotePort=0 is in validPort's accepted range (0..65535) but the
+// vendored freedom outbound only applies its destination-port override
+// `if server.Port != 0` -- silently dropping it and forwarding to a
+// zero port instead of failing loudly.
+func TestGenerateConfigRejectsZeroRemotePort(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalPort, origRemotePort := *localPort, *remotePort
+	defer func() { *localPort, *remotePort = origLocalPort, origRemotePort }()
+	*localPort, *remotePort = "1984", "0"
+
+	_, err := generateConfig()
+	if err == nil {
+		t.Fatal("generateConfig() with remotePort=0 = nil error, want an error mentioning remotePort")
+	}
+	if !strings.Contains(err.Error(), "remotePort") {
+		t.Errorf("error %q does not mention remotePort", err.Error())
+	}
+}
+
+// remoteAddr must be rejected when empty (freedom/dokodemo silently
+// forward every dial to a broken destination and never fail) or when it
+// is the unspecified address 0.0.0.0/:: (net.AnyIP): freedom's own
+// isValidAddress rejects that address for the destination override,
+// silently discarding it and falling back to dokodemo's net.LocalHostIP
+// -- traffic goes somewhere real and wrong, worse than the empty case.
+func TestGenerateConfigRejectsEmptyOrAnyIPRemoteAddr(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalPort, origRemotePort, origRemoteAddr := *localPort, *remotePort, *remoteAddr
+	defer func() { *localPort, *remotePort, *remoteAddr = origLocalPort, origRemotePort, origRemoteAddr }()
+	*localPort, *remotePort = "1984", "443"
+
+	for _, bad := range []string{"", "0.0.0.0"} {
+		*remoteAddr = bad
+		_, err := generateConfig()
+		if err == nil {
+			t.Errorf("remoteAddr=%q: generateConfig() = nil error, want an error mentioning remoteAddr", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "remoteAddr") {
+			t.Errorf("remoteAddr=%q: error %q does not mention remoteAddr", bad, err.Error())
 		}
 	}
 }
