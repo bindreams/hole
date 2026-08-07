@@ -6,7 +6,6 @@ import (
 	"math"
 	"os/user"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/golang/protobuf/proto" //nolint:staticcheck // SA1019: v2ray-core's serial.ToTypedMessage takes a v1 github.com/golang/protobuf/proto.Message; migrating would add a dependency for no benefit.
@@ -83,6 +82,22 @@ var (
 // buildV2Ray -> failFatal path as every other config-class error in this
 // file -- a `fatal` sitrep with exit 23, not a bare stderr line and exit 1
 // that breaks the sitrep's hello-then-exactly-one-terminal-event contract.
+// redactedError wraps cause for errors.Is/errors.As chaining while keeping
+// Error() text limited to msg -- used where cause's own Error() text may
+// embed operator-supplied content (e.g. a cert/key path built from
+// SS_PLUGIN_OPTIONS) that must never reach the sitrep. v2ray-core's own
+// Error.Base() couples Unwrap() to an Error() that unconditionally appends
+// the wrapped error's text, so it cannot express "chainable but redacted"
+// -- this type can. The raw cause is still available to a caller that logs
+// it to stderr directly, e.g. via logWarn, before returning this.
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.cause }
+
 func homeDir() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
@@ -222,7 +237,8 @@ func buildTLSConfig() (*tls.Config, error) {
 		var err error
 		certificate.Certificate, err = readCertificate()
 		if err != nil {
-			return nil, newError("failed to read cert").Base(err)
+			logWarn("failed to read cert:", err)
+			return nil, &redactedError{msg: "failed to read cert", cause: err}
 		}
 		if *key == "" {
 			home, err := homeDir()
@@ -234,7 +250,8 @@ func buildTLSConfig() (*tls.Config, error) {
 		}
 		certificate.Key, err = filesystem.ReadFile(*key)
 		if err != nil {
-			return nil, newError("failed to read key file").Base(err)
+			logWarn("failed to read key file:", err)
+			return nil, &redactedError{msg: "failed to read key file", cause: err}
 		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	} else if *cert != "" || *certRaw != "" {
@@ -242,7 +259,8 @@ func buildTLSConfig() (*tls.Config, error) {
 		var err error
 		certificate.Certificate, err = readCertificate()
 		if err != nil {
-			return nil, newError("failed to read cert").Base(err)
+			logWarn("failed to read cert:", err)
+			return nil, &redactedError{msg: "failed to read cert", cause: err}
 		}
 		tlsConfig.Certificate = []*tls.Certificate{&certificate}
 	}
@@ -262,6 +280,13 @@ func buildTLSConfig() (*tls.Config, error) {
 		} else if *echMode == "always" {
 			return nil, newError("ech=always requires ech-doh to be set; refusing to start without a DoH source for fail-closed ECH")
 		}
+	default:
+		// Unreachable given the slices.Contains guard above: every value in
+		// allowedEchModes must have a case here, or a future entry added to
+		// the list without a matching case would silently apply no ECH
+		// config at all instead of failing loudly -- exactly the class of
+		// bug this file otherwise fails loud on.
+		panic(fmt.Sprintf("unreachable: echMode %q passed the allowedEchModes guard but has no switch case", *echMode))
 	}
 
 	return tlsConfig, nil
@@ -291,7 +316,11 @@ func generateConfig() (*core.Config, error) {
 	if err != nil {
 		return nil, newError("invalid localPort: not a valid port")
 	}
-	rport, err := strconv.ParseUint(*remotePort, 10, 32)
+	// net.PortFromString range-checks to 0..65535 (net.Port is a uint16);
+	// strconv.ParseUint alone would accept anything up to 4294967295, which
+	// the freedom outbound below silently truncates to a uint16 -- a
+	// remotePort of 65536 would forward to port 0, not fail loudly.
+	rport, err := net.PortFromString(*remotePort)
 	if err != nil {
 		return nil, newError("invalid remotePort: not a valid port")
 	}

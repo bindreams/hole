@@ -53,15 +53,16 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 }
 
 // Parse SS_PLUGIN options from environment variables. SS_PLUGIN_OPTIONS is
-// always validated via parsePluginOptions and always applied to the
-// returned opts, regardless of whether the SS_* chain-handoff vars below
-// are present. The SS_*-derived addresses themselves are added on top only
-// when all four vars are present; a partial set (some but not all four --
-// never a legitimate invocation shape) skips the entire SS_*-derived
-// handoff -- all four of localAddr/localPort/remoteAddr/remotePort fall
-// back to whatever SS_PLUGIN_OPTIONS/flag defaults already supplied, not
-// just the missing var's own contribution -- which is visible via logWarn
-// below rather than silent.
+// always validated via parsePluginOptions, independently of whether the
+// SS_* chain-handoff vars below are present. The SS_*-derived addresses
+// are added to opts only when all four vars are present; a partial set
+// (some but not all four -- never a legitimate invocation shape, per the
+// SIP003 contract every real caller follows) is fatal, matching every
+// other illegitimate-input-state this file rejects, rather than silently
+// falling back to whatever SS_PLUGIN_OPTIONS/flag defaults happen to
+// supply for all four of localAddr/localPort/remoteAddr/remotePort at
+// once. A fully-absent set is the legitimate standalone-invocation case
+// and is not an error.
 func parseEnv() (opts Args, err error) {
 	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
 	if err != nil {
@@ -78,11 +79,10 @@ func parseEnv() (opts Args, err error) {
 	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
 	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
 	if len(ssRemoteHost) == 0 || len(ssRemotePort) == 0 || len(ssLocalHost) == 0 || len(ssLocalPort) == 0 {
-		// A partial set skips the handoff entirely -- log it rather than
-		// pass through in silence, even though it isn't escalated to
-		// fatal.
 		if ssRemoteHost != "" || ssRemotePort != "" || ssLocalHost != "" || ssLocalPort != "" {
-			logWarn("SS_* chain-handoff env is incomplete (some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set); the entire SS_*-derived address handoff was skipped, not just the missing var(s)")
+			// Env var names only -- never operator/secret content, safe to
+			// name directly.
+			return nil, errors.New("SS_* chain-handoff env is incomplete: some but not all of SS_REMOTE_HOST/SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT are set")
 		}
 		return opts, nil
 	}

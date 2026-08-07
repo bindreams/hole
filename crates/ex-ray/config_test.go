@@ -802,14 +802,13 @@ func TestParseOptsIntoFlagsBareKeyResolvesToLiteralOne(t *testing.T) {
 	}
 }
 
-// A bad int-option value is fatal even when the SS_* chain-handoff env is
-// incomplete (parseEnv): SS_PLUGIN_OPTIONS is applied
-// regardless of SS_* completeness, so mux=off (or the tcp-keepalive/fwmark
-// equivalent) can't survive by riding an incomplete env. Loops over all
-// three options like every sibling int-option test in this file, so this
-// isn't covered for mux alone while tcp-keepalive/fwmark go untested in
-// this specific (invalid value + partial env) combination.
-func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValueWithPartialSSEnv(t *testing.T) {
+// A partial SS_* env is fatal independent of what SS_PLUGIN_OPTIONS
+// contains: parseEnv's SS_*-completeness check runs before parseIntOption
+// ever sees the option, so even a syntactically-valid but semantically-bad
+// value (mux=off) never reaches its own validation -- the error names the
+// incomplete env, not the option. Loops over all three int options like
+// every sibling test in this file.
+func TestParseOptsIntoFlagsIntOptionsNeverReachedWithPartialSSEnv(t *testing.T) {
 	for _, o := range intOptions() {
 		t.Run(o.key, func(t *testing.T) {
 			snap := snapshotFlags()
@@ -823,10 +822,13 @@ func TestParseOptsIntoFlagsIntOptionsRejectNonNumericValueWithPartialSSEnv(t *te
 
 			err := parseOptsIntoFlags()
 			if err == nil {
-				t.Fatalf("parseOptsIntoFlags() = nil error, want an error mentioning %q (even with SS_REMOTE_PORT unset)", o.key)
+				t.Fatal("parseOptsIntoFlags() = nil error, want the SS_* incomplete-env error")
 			}
-			if !strings.Contains(err.Error(), o.key) {
-				t.Errorf("error %q does not mention %q", err.Error(), o.key)
+			if !strings.Contains(err.Error(), "SS_* chain-handoff env is incomplete") {
+				t.Errorf("error = %q, want it to mention the incomplete SS_* env (parseEnv must fail before %q's own validation ever runs)", err.Error(), o.key)
+			}
+			if got := o.get(); got != intOptionSeedSentinel {
+				t.Errorf("%s: value = %d after a rejected env, want the untouched pre-call value %d", o.key, got, intOptionSeedSentinel)
 			}
 		})
 	}
@@ -1012,6 +1014,30 @@ func TestParseOptsIntoFlagsBoolOptionsErrorNeverEchoesAbsorbedSecret(t *testing.
 	}
 }
 
+// remotePort must reject the same out-of-range shape localPort already
+// does (net.PortFromString range-checks to 0..65535); the freedom
+// outbound's own uint32->uint16 cast otherwise truncates a too-large value
+// to a silently different port instead of failing loudly.
+func TestGenerateConfigRejectsOutOfRangeRemotePort(t *testing.T) {
+	restore := withFlags(t, 1, 0, false)
+	defer restore()
+	origLocalPort, origRemotePort := *localPort, *remotePort
+	defer func() { *localPort, *remotePort = origLocalPort, origRemotePort }()
+	*localPort = "1984"
+
+	for _, bad := range []string{"65536", "70000", "4294967295"} {
+		*remotePort = bad
+		_, err := generateConfig()
+		if err == nil {
+			t.Errorf("remotePort=%s: generateConfig() = nil error, want an error mentioning remotePort", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "remotePort") {
+			t.Errorf("remotePort=%s: error %q does not mention remotePort", bad, err.Error())
+		}
+	}
+}
+
 // The same never-echo property args.go's parse errors and parseIntOption
 // already have, extended to generateConfig/buildTLSConfig's own fatal
 // paths -- these are reachable from SS_PLUGIN_OPTIONS too (localPort,
@@ -1036,6 +1062,39 @@ func TestGenerateConfigErrorsNeverEchoOptionValues(t *testing.T) {
 	*localPort, *remotePort, *mode = "1984", "1080", `abc\;certRaw=SUPERSECRETVALUE`
 	if _, err := generateConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
 		t.Errorf("mode error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// The same property for buildTLSConfig's cert/key read-failure sites --
+// cert, key, and host (via the ~/.acme.sh/{host}/... default path
+// construction) are all reachable from SS_PLUGIN_OPTIONS, and a missing
+// file's os.PathError text would otherwise embed the raw path verbatim.
+func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	// cert points at a nonexistent path carrying an absorbed secret.
+	*cert, *key, *host = `/nope\;certRaw=SUPERSECRETVALUE`, "", "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("cert error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	// key points at a nonexistent path carrying an absorbed secret; cert
+	// must be a real, readable file so the flow reaches the key read.
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	*cert, *key, *host = certPath, `/nope\;certRaw=SUPERSECRETVALUE`, "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("key error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	// host feeds the default ~/.acme.sh/{host}/... cert path when neither
+	// cert nor certRaw is given.
+	*cert, *key, *host = "", "", `nosuchhost.invalid\;certRaw=SUPERSECRETVALUE`
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("host-derived cert path error = %v, want a non-nil error not containing the secret", err)
 	}
 }
 

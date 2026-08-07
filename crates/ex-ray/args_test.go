@@ -1,10 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 	"testing"
 )
@@ -212,68 +209,68 @@ func TestMalformedOptionsErrorsNeverEchoSegmentContent(t *testing.T) {
 // there is something to warn about: a genuinely partial SS_* set (some but
 // not all four vars). It must stay silent both when SS_* is fully absent
 // (the legitimate standalone case) and when it's fully complete.
-func TestParseEnvWarnsOnlyOnGenuinePartialSSEnv(t *testing.T) {
-	captureLog := func(t *testing.T, setEnv func(t *testing.T)) string {
-		t.Helper()
-		var buf bytes.Buffer
-		log.SetOutput(&buf)
-		defer log.SetOutput(os.Stderr)
-		setEnv(t)
+// A partial SS_* set (some but not all four of SS_REMOTE_HOST/
+// SS_REMOTE_PORT/SS_LOCAL_HOST/SS_LOCAL_PORT) is fatal -- it is never a
+// legitimate invocation shape, and letting it fall back to
+// SS_PLUGIN_OPTIONS/flag defaults for all four addresses at once is
+// exactly the "silently broken but reports ready" class this file
+// otherwise fails loud on. A fully-absent set (the standalone case) and a
+// fully-complete set are both legitimate and must not error.
+func TestParseEnvRejectsOnlyGenuinePartialSSEnv(t *testing.T) {
+	const wantErrSubstr = "SS_* chain-handoff env is incomplete"
+
+	t.Run("one var missing errors", func(t *testing.T) {
+		t.Setenv("SS_REMOTE_HOST", "chain.example.net")
+		t.Setenv("SS_REMOTE_PORT", "")
+		t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
+		t.Setenv("SS_LOCAL_PORT", "45999")
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
+		_, err := parseEnv()
+		if err == nil {
+			t.Fatal("parseEnv() = nil error, want the incomplete-env error")
+		}
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	t.Run("three vars missing errors", func(t *testing.T) {
+		t.Setenv("SS_REMOTE_HOST", "")
+		t.Setenv("SS_REMOTE_PORT", "")
+		t.Setenv("SS_LOCAL_HOST", "")
+		t.Setenv("SS_LOCAL_PORT", "45999")
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
+		_, err := parseEnv()
+		if err == nil {
+			t.Fatal("parseEnv() = nil error, want the incomplete-env error")
+		}
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	t.Run("fully absent SS_* (standalone) is not an error", func(t *testing.T) {
+		for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
+			t.Setenv(v, "")
+		}
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
 		if _, err := parseEnv(); err != nil {
-			t.Fatalf("parseEnv(): %v, want nil", err)
-		}
-		return buf.String()
-	}
-	const warning = "SS_* chain-handoff env is incomplete"
-
-	t.Run("one var missing warns", func(t *testing.T) {
-		out := captureLog(t, func(t *testing.T) {
-			t.Setenv("SS_REMOTE_HOST", "chain.example.net")
-			t.Setenv("SS_REMOTE_PORT", "")
-			t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
-			t.Setenv("SS_LOCAL_PORT", "45999")
-			t.Setenv("SS_PLUGIN_OPTIONS", "")
-		})
-		if !strings.Contains(out, warning) {
-			t.Errorf("log output = %q, want the incomplete-env warning", out)
+			t.Errorf("parseEnv(): %v, want nil for a fully-standalone invocation", err)
 		}
 	})
 
-	t.Run("three vars missing warns", func(t *testing.T) {
-		out := captureLog(t, func(t *testing.T) {
-			t.Setenv("SS_REMOTE_HOST", "")
-			t.Setenv("SS_REMOTE_PORT", "")
-			t.Setenv("SS_LOCAL_HOST", "")
-			t.Setenv("SS_LOCAL_PORT", "45999")
-			t.Setenv("SS_PLUGIN_OPTIONS", "")
-		})
-		if !strings.Contains(out, warning) {
-			t.Errorf("log output = %q, want the incomplete-env warning", out)
+	t.Run("fully complete SS_* is not an error", func(t *testing.T) {
+		t.Setenv("SS_REMOTE_HOST", "chain.example.net")
+		t.Setenv("SS_REMOTE_PORT", "9443")
+		t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
+		t.Setenv("SS_LOCAL_PORT", "45999")
+		t.Setenv("SS_PLUGIN_OPTIONS", "")
+		opts, err := parseEnv()
+		if err != nil {
+			t.Fatalf("parseEnv(): %v, want nil when SS_* is complete", err)
 		}
-	})
-
-	t.Run("fully absent SS_* (standalone) stays silent", func(t *testing.T) {
-		out := captureLog(t, func(t *testing.T) {
-			for _, v := range []string{"SS_REMOTE_HOST", "SS_REMOTE_PORT", "SS_LOCAL_HOST", "SS_LOCAL_PORT"} {
-				t.Setenv(v, "")
-			}
-			t.Setenv("SS_PLUGIN_OPTIONS", "")
-		})
-		if strings.Contains(out, warning) {
-			t.Errorf("log output = %q, want no warning for a fully-standalone invocation", out)
-		}
-	})
-
-	t.Run("fully complete SS_* stays silent", func(t *testing.T) {
-		out := captureLog(t, func(t *testing.T) {
-			t.Setenv("SS_REMOTE_HOST", "chain.example.net")
-			t.Setenv("SS_REMOTE_PORT", "9443")
-			t.Setenv("SS_LOCAL_HOST", "10.1.2.3")
-			t.Setenv("SS_LOCAL_PORT", "45999")
-			t.Setenv("SS_PLUGIN_OPTIONS", "")
-		})
-		if strings.Contains(out, warning) {
-			t.Errorf("log output = %q, want no warning when SS_* is complete", out)
+		if v, _ := opts.Get("remoteAddr"); v != "chain.example.net" {
+			t.Errorf("remoteAddr = %q, want the SS_REMOTE_HOST-derived value", v)
 		}
 	})
 }

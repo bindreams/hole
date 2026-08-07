@@ -254,6 +254,7 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_mux_non_numeric", "mux=off", false},
 		{"invalid_tcp_keepalive_non_numeric", "tcp-keepalive=off", false},
 		{"invalid_fwmark_non_numeric", "fwmark=off", false},
+		{"invalid_remote_port_out_of_range", "remotePort=70000", false},
 		{"malformed_options_never_echo_secret", `certRaw=SUPERSECRETVALUE;;path=/`, true},
 		// The generateConfig/buildTLSConfig no-echo fixes for localPort/
 		// remotePort/mode, driven through the REAL pipeline
@@ -265,6 +266,9 @@ func TestFatalSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
 		{"invalid_localPort_never_echo_secret", `localPort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_remotePort_never_echo_secret", `remotePort=1\;certRaw=SUPERSECRETVALUE`, true},
 		{"invalid_mode_never_echo_secret", `mode=abc\;certRaw=SUPERSECRETVALUE`, true},
+		// cert points at a nonexistent path carrying an absorbed secret;
+		// the underlying os.PathError text would otherwise embed it.
+		{"invalid_cert_path_never_echo_secret", `tls;server;host=example.com;cert=/nope\;certRaw=SUPERSECRETVALUE`, true},
 		// ech is validated by parseEnumOption inside parseOptsIntoFlags
 		// itself, so this case never reaches buildTLSConfig's own ech-mode
 		// branch at all -- it end-to-end-proves parseEnumOption's no-echo
@@ -335,6 +339,33 @@ func TestStartFailureSitrepNeverEchoesLocalAddr(t *testing.T) {
 	detail, _ := terminal["detail"].(string)
 	if strings.Contains(detail, "SUPERSECRETVALUE") {
 		t.Errorf("fatal detail leaks the absorbed segment: %q", detail)
+	}
+	if exitCode == 0 {
+		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
+	}
+}
+
+// A partial SS_* chain-handoff env (here, SS_REMOTE_PORT missing) must be
+// fatal through the real process boundary, not a stderr warning next to a
+// `ready` sitrep -- the whole reason main() proceeds only past a nil
+// parseOptsIntoFlags error.
+func TestPartialSSEnvSitrepReachesParentAndProcessExitsNonZero(t *testing.T) {
+	hello, terminal, exitCode := runExRaySubprocess(t, map[string]string{
+		"SS_REMOTE_HOST":    "chain.example.net",
+		"SS_REMOTE_PORT":    "",
+		"SS_LOCAL_HOST":     "10.1.2.3",
+		"SS_LOCAL_PORT":     "45999",
+		"SS_PLUGIN_OPTIONS": "host=example.com;path=/",
+	})
+	if hello["event"] != "hello" {
+		t.Errorf("first sitrep line event = %v, want %q", hello["event"], "hello")
+	}
+	if terminal["event"] != "fatal" {
+		t.Fatalf("terminal sitrep event = %v, want %q", terminal["event"], "fatal")
+	}
+	detail, _ := terminal["detail"].(string)
+	if !strings.Contains(detail, "SS_*") {
+		t.Errorf("fatal detail = %q, want it to mention the incomplete SS_* env", detail)
 	}
 	if exitCode == 0 {
 		t.Error("process exited 0; want a non-zero exit so the parent can gate on it")
