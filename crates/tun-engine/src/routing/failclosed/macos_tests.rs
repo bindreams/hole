@@ -7,10 +7,16 @@ fn v4() -> IpAddr {
 fn v6() -> IpAddr {
     "2001:db8::1".parse().unwrap()
 }
+fn resolver() -> IpAddr {
+    "198.51.100.5".parse().unwrap()
+}
+fn resolver_v6() -> IpAddr {
+    "2001:db8::abcd".parse().unwrap()
+}
 
 #[skuld::test]
 fn ruleset_blocks_all_outbound() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), None);
     assert!(
         r.contains("block") && r.contains("out") && r.contains("all"),
         "ruleset must block all outbound:\n{r}"
@@ -19,13 +25,13 @@ fn ruleset_blocks_all_outbound() {
 
 #[skuld::test]
 fn ruleset_passes_loopback() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), None);
     assert!(r.contains("lo0"), "ruleset must pass loopback:\n{r}");
 }
 
 #[skuld::test]
 fn ruleset_passes_server_ip() {
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), None);
     assert!(r.contains("203.0.113.7"), "ruleset must pass server IP:\n{r}");
 }
 
@@ -33,7 +39,7 @@ fn ruleset_passes_server_ip() {
 fn ruleset_pass_rules_are_quick() {
     // `quick` makes the pass rules win over the earlier block-all without
     // relying on pf's last-match semantics.
-    let r = build_pf_ruleset(v4());
+    let r = build_pf_ruleset(v4(), None);
     for line in r.lines().filter(|l| l.trim_start().starts_with("pass")) {
         assert!(line.contains("quick"), "pass rule must be quick: {line}");
     }
@@ -41,8 +47,65 @@ fn ruleset_pass_rules_are_quick() {
 
 #[skuld::test]
 fn ruleset_handles_ipv6_server() {
-    let r = build_pf_ruleset(v6());
+    let r = build_pf_ruleset(v6(), None);
     assert!(r.contains("2001:db8::1"), "ipv6 server must appear:\n{r}");
+}
+
+// resolver permit =====================================================================================================
+
+#[skuld::test]
+fn ruleset_passes_resolver_ip_when_given() {
+    let r = build_pf_ruleset(v4(), Some(resolver()));
+    assert!(r.contains("198.51.100.5"), "ruleset must pass the resolver IP:\n{r}");
+}
+
+#[skuld::test]
+fn ruleset_omits_resolver_when_none() {
+    // Negative direction: no resolver means the only "pass ... to <addr>" line
+    // targets the server — proves the widening is opt-in.
+    let r = build_pf_ruleset(v4(), None);
+    let pass_to_lines: Vec<&str> = r
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pass out quick") && l.contains(" to "))
+        .collect();
+    assert_eq!(pass_to_lines.len(), 1, "server only, no resolver pass rule:\n{r}");
+}
+
+#[skuld::test]
+fn ruleset_resolver_pass_rule_is_quick() {
+    let r = build_pf_ruleset(v4(), Some(resolver()));
+    for line in r.lines().filter(|l| l.contains("198.51.100.5")) {
+        assert!(line.contains("quick"), "resolver pass rule must be quick: {line}");
+    }
+}
+
+#[skuld::test]
+fn ruleset_handles_ipv6_resolver() {
+    let r = build_pf_ruleset(v4(), Some(resolver_v6()));
+    assert!(r.contains("2001:db8::abcd"), "ipv6 resolver must appear:\n{r}");
+}
+
+#[skuld::test]
+fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
+    // NOT the server permit's unrestricted shape — see build_pf_ruleset's doc.
+    let r = build_pf_ruleset(v4(), Some(resolver()));
+    let resolver_line = r
+        .lines()
+        .find(|l| l.contains("198.51.100.5"))
+        .expect("resolver pass rule must exist");
+    let port_clause = format!("port {RESOLVER_PERMIT_PORT}");
+    assert!(
+        resolver_line.contains("proto tcp") && resolver_line.contains(&port_clause),
+        "resolver pass rule must be scoped to proto tcp {port_clause}, unlike the server permit: {resolver_line}"
+    );
+    let server_line = r
+        .lines()
+        .find(|l| l.contains(&v4().to_string()))
+        .expect("server pass rule must exist");
+    assert!(
+        !server_line.contains("port"),
+        "server permit stays unrestricted (unchanged by this plan): {server_line}"
+    );
 }
 
 #[skuld::test]

@@ -201,7 +201,11 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(&self, _server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(
+        &self,
+        _server_ip: IpAddr,
+        _resolver_ip: Option<IpAddr>,
+    ) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
     }
 

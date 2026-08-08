@@ -69,8 +69,10 @@ before editing; the sections linked below are the authoritative source.
   (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
   the bridge **disarms-not-drops** it across the restart and the new bridge
   re-adopts it (`decide_cover_recovery == Adopt`). The **transient**
-  `install_failclosed_cover` (permit loopback + server only) is a bounded-window
-  RAII guard with **no production caller today** (test seam + recovery target).
+  `install_failclosed_cover` (permit loopback + server, plus the resolver
+  Hole's own `ech-doh` URL names, when a plugin is configured — scoped to
+  TCP/443) is a bounded-window RAII guard engaged by every covered
+  (auto-connect) start.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
   by `recover_routes` on next start. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)

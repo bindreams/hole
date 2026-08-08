@@ -1,9 +1,10 @@
 //! macOS fail-closed cover via pf (`pfctl`). Two layers share the `Cover` guard:
 //!
 //! - **Transient cover** (`engage`/`disengage`): enables pf (refcounted,
-//!   `pfctl -E`), flushes all state (`-Fa`), and loads a self-contained ruleset
-//!   blocking every outbound packet except loopback and the SS server IP.
-//!   Disengage restores the canonical `/etc/pf.conf` and drops the refcount.
+//!   `pfctl -E`), flushes all state (`-Fa`), and loads a self-contained
+//!   ruleset (see `build_pf_ruleset`) blocking everything but loopback, the
+//!   server, and the pinned resolver. Disengage restores the canonical
+//!   `/etc/pf.conf` and drops the refcount.
 //! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
 //!   rules forward and blocks all egress except the TUN and server IP. Disengage
@@ -29,20 +30,31 @@ use crate::error::RoutingError;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
+use super::RESOLVER_PERMIT_PORT;
 
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
 /// `set block-policy drop` silently drops blocked packets (no RST/ICMP).
 /// `block out all` is the fail-closed default; the `quick` pass rules for
-/// loopback and the server IP win without depending on pf's last-match rule. The
-/// `to {ip}` form carries a v6 address as written.
-pub fn build_pf_ruleset(server_ip: IpAddr) -> String {
+/// loopback, the server IP, and (when given) the resolver the caller's own
+/// `ech-doh` URL names win without depending on pf's last-match rule. The
+/// `to {ip}` form carries a v6 address as written. `resolver_ip` is `None`
+/// whenever nothing should be permitted — see
+/// `Routing::install_failclosed_cover`'s doc for the exact conditions. The
+/// resolver pass is scoped to `proto tcp port` [`RESOLVER_PERMIT_PORT`] (see
+/// that const's doc for why this is the only port this fetch can need) — NOT
+/// the server permit's unrestricted shape.
+pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> String {
+    let resolver_pass = resolver_ip
+        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
+        .unwrap_or_default();
     format!(
         "set block-policy drop\n\
          block out all\n\
          pass out quick on lo0 all\n\
          pass in quick on lo0 all\n\
-         pass out quick from any to {server_ip}\n"
+         pass out quick from any to {server_ip}\n\
+         {resolver_pass}"
     )
 }
 
@@ -181,7 +193,12 @@ pub struct Cover {
     kind: CoverKind,
 }
 
-pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
     // 1. Read current enabled-state (read-only).
     let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
     let was_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
@@ -203,7 +220,7 @@ pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) ->
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
     // 4. Flush all + load our self-contained blocking ruleset from stdin.
-    let ruleset = build_pf_ruleset(server_ip);
+    let ruleset = build_pf_ruleset(server_ip, resolver_ip);
     let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
         // A *failed engage* is the sole place this module fails OPEN on its own
