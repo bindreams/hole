@@ -529,6 +529,40 @@ async fn aggregator_recv_error_prefers_a_later_specific_error_over_an_earlier_cl
     );
 }
 
+// A THIRD way an early generic placeholder can reach the aggregator: index
+// 0 actively SENDS `ExitedBeforeReady` (e.g. a `TapPlugin` reporting its
+// inner's exit race) rather than dropping its sender unsent, while index 1
+// already holds a delivered `BindConflict`. The `Ok(Err(start_err))` arm
+// must scan for a better answer just like the shutdown and `Err(_recv)`
+// arms do, or the first plugin to report "no reason known" permanently
+// masks a later plugin's real error.
+#[skuld::test]
+async fn aggregator_delivered_exited_before_ready_prefers_a_later_specific_error() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx0.send(Err(StartError::ExitedBeforeReady)).unwrap();
+
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx1.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new(); // never cancelled
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 1 already delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 1's delivered BindConflict to survive despite plugin 0 sending a generic \
+         ExitedBeforeReady first, got {outcome:?}"
+    );
+}
+
 /// The aggregator reports the end-to-end transports as the intersection
 /// across every hop: a transport is carried only if EVERY plugin serves
 /// it. Here a TCP|UDP hop and a TCP-only hop must intersect to TCP. The

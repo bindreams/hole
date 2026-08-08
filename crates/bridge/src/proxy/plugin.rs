@@ -256,10 +256,17 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 /// Single-attempt plugin-runner spawn. Constructs `BinaryPlugin`
 /// (with optional `pid_sink`), wraps in `TapPlugin` when
 /// `HOLE_BRIDGE_PLUGIN_TAP=1`, builds the `ChainRunner`, spawns it,
-/// and awaits readiness with a 30-second timeout. On failure runs
-/// `cancel.cancel(); handle.abort()` so a retried attempt by
-/// `bind_ephemeral` doesn't leak the previous attempt's task. On
-/// success returns `(handle, cancel, ready_addr, transports)` — the
+/// and awaits readiness with a 30-second timeout. Every failure arm runs
+/// `cancel.cancel()` first, then either `handle.abort()` (BindConflict,
+/// Fatal, and the readiness timeout, where the plugin's own report is
+/// already as specific as it gets or nothing more can be recovered) or
+/// `recover_exit_detail(handle).await` (ExitedBeforeReady and the
+/// chain-level RecvError, where joining the handle can recover a more
+/// specific reason than the generic placeholder) — see that fn's doc for
+/// why the latter is a real, `drain_timeout`-bounded join rather than an
+/// abort. Either way a retried attempt by `bind_ephemeral` never leaks the
+/// previous attempt's task. On success returns `(handle, cancel,
+/// ready_addr, transports)` — the
 /// caller wraps these in a [`PluginChain`]. The `transports` is the
 /// sitrep-reported end-to-end transport set (#414), threaded into the
 /// bridge's UDP-drop policy.

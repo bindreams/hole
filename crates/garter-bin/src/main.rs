@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     // returned `Ok`, so this is provably unreachable on every real input.
     // `debug_assert!` makes a violation panic loudly in debug/test builds —
     // a genuine contract break, not routine input handling — while staying
-    // truly zero-cost in release (compiled out entirely, per CLAUDE.md);
+    // truly zero-cost in release (compiled out entirely);
     // the `?` alongside it is release's own fallback, so a violation there
     // degrades to a normal, well-formed error instead of an uncontrolled
     // panic in a binary that ships.

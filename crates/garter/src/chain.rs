@@ -208,8 +208,15 @@ impl ChainRunner {
     /// the `ready` channel passed to [`ChainPlugin::run`]; the aggregator
     /// collects the N per-plugin results into one chain-level outcome.
     ///
-    /// If shutdown fires before every plugin has readied, `tx` is dropped
-    /// and the receiver gets `RecvError`.
+    /// If shutdown fires before every plugin has readied, `tx` carries
+    /// whichever outcome is most specific rather than being unconditionally
+    /// dropped: the most specific already-delivered `StartError` if any
+    /// plugin had one buffered, else `Err(StartError::ExitedBeforeReady)`
+    /// if any plugin's readiness sender had already closed unsent, and
+    /// only drops `tx` (leaving the receiver to see `RecvError`) when every
+    /// remaining plugin is genuinely still pending. See
+    /// [`run_readiness_aggregator`]'s doc comment for why shutdown alone is
+    /// never enough to justify dropping `tx` outright.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
@@ -380,10 +387,16 @@ fn scan_for_delivered_error<'a>(
 /// outcome on `ready_tx`.
 ///
 /// Awaits each plugin's `ready` receiver in turn, racing the shared
-/// `shutdown` token so a cancel during startup doesn't hang. The
-/// position-0 plugin's reported `listen` is the chain's public address in
-/// Client mode; in Server mode it is position N-1. The chain's transports
-/// are the intersection across all hops.
+/// `shutdown` token so a cancel during startup doesn't hang. `shutdown` is
+/// checked with `biased`, so on any poll where both it and the receiver
+/// being awaited are simultaneously ready, `shutdown` wins and the receiver
+/// is never polled that round — before returning on shutdown, this fn
+/// therefore always falls back to [`scan_for_delivered_error`] to recover
+/// whatever the biased check would otherwise have discarded, rather than
+/// dropping `ready_tx` unconditionally. The position-0 plugin's reported
+/// `listen` is the chain's public address in Client mode; in Server mode it
+/// is position N-1. The chain's transports are the intersection across all
+/// hops.
 pub(crate) async fn run_readiness_aggregator(
     ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
     n: usize,
@@ -437,6 +450,19 @@ pub(crate) async fn run_readiness_aggregator(
             Ok(Ok(pr)) => {
                 plugin_listens[i] = Some(pr.listen);
                 transports &= pr.transports;
+            }
+            // A delivered `ExitedBeforeReady` is itself a "no reason known"
+            // placeholder (see its doc comment) — before forwarding it,
+            // check whether a LATER plugin already delivered something more
+            // specific, same preference and same reason as the shutdown
+            // scan above and the `Err(_recv)` scan below. Otherwise this
+            // arm would let the FIRST plugin to report "I have no reason"
+            // permanently mask a later plugin's real `BindConflict`/`Fatal`.
+            Ok(Err(StartError::ExitedBeforeReady)) => {
+                let rest = remaining.iter_mut().map(|(_, r)| r);
+                let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
+                let _ = ready_tx.send(Err(recovered));
+                return;
             }
             Ok(Err(start_err)) => {
                 let _ = ready_tx.send(Err(start_err));
