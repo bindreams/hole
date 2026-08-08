@@ -207,6 +207,40 @@ impl ChainPlugin for BindConflictPlugin {
     }
 }
 
+/// Mimics `BinaryPlugin::run`'s real shape (not `BindConflictPlugin`'s
+/// simplified one): hands `ready` to a DETACHED spawned task — never
+/// joined by `run` itself before it returns — that sends a specific
+/// `StartError` only after a couple of scheduler yields. `run` returns
+/// `Ok(())` immediately, well before that send happens. This is the exact
+/// race `TapPlugin::run`'s `join` arm uses `drain_for_delivered_error`
+/// (await, not `try_recv`) to close.
+struct DetachedSenderPlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for DetachedSenderPlugin {
+    fn name(&self) -> &str {
+        "detached-sender"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+    ) -> crate::Result<()> {
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            let _ = ready.send(Err(crate::sitrep::StartError::BindConflict {
+                errno: 10048,
+                addr: local,
+            }));
+        });
+        Ok(())
+    }
+}
+
 fn unused_remote() -> SocketAddr {
     // The stubs ignore `remote`; any valid address works.
     "127.0.0.1:1".parse().unwrap()
@@ -562,6 +596,36 @@ async fn tap_forwards_a_specific_bind_conflict_the_inner_delivered_before_exitin
     assert!(
         matches!(outcome, Err(crate::sitrep::StartError::BindConflict { .. })),
         "expected the inner's BindConflict to survive the tap, got {outcome:?}"
+    );
+}
+
+// `BinaryPlugin::run` hands its readiness sender to a spawned reader task
+// it only best-effort-joins (a short grace window) before returning — so
+// `inner_handle` completing does NOT mean the sender has resolved yet. A
+// plain `try_recv` snapshot at that point would see `Empty` and lose a
+// `BindConflict` sent moments later. This pins that the tap's `join` arm
+// recovers it anyway (via `drain_for_delivered_error`, not
+// `scan_for_delivered_error`).
+#[skuld::test]
+async fn tap_forwards_a_bind_conflict_delivered_by_a_detached_task_after_inner_run_returns() {
+    let local = pick_local().await;
+    let remote = unused_remote();
+    let shutdown = CancellationToken::new();
+    let inner = Box::new(DetachedSenderPlugin) as Box<dyn ChainPlugin>;
+    let tap = Box::new(TapPlugin::wrap(inner));
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let _ = tap.run(local, remote, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("tap must report something on its own ready channel");
+    assert!(
+        matches!(
+            outcome,
+            Err(crate::sitrep::StartError::BindConflict { errno: 10048, .. })
+        ),
+        "expected the detached task's BindConflict, delivered after inner.run() returned, to survive, got {outcome:?}"
     );
 }
 

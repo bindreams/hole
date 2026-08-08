@@ -48,11 +48,13 @@ pub const GALOSHES_TRANSPORTS: Transports = Transports::TCP.union(Transports::UD
 /// On `Err(StartError)` the typed start failure maps 1:1 to the
 /// corresponding sitrep event — `ExitedBeforeReady` included: `SitrepEvent`
 /// has no counterpart for it, so it downgrades to a plain `Fatal` with
-/// [`garter::EXITED_BEFORE_READY_DETAIL`] text. `main` recovers a more
-/// specific reason itself before calling this (via
-/// [`garter::recover_exit_detail_from_joined`]) and passes that in as an
-/// ordinary `Fatal` instead, so a bare `ExitedBeforeReady` only ever
-/// reaches here when nothing more specific was recoverable either.
+/// [`garter::EXITED_BEFORE_READY_DETAIL`] text. Defense-in-depth for this
+/// function's own public contract (any caller can pass a bare
+/// `ExitedBeforeReady` directly), not something `main`'s actual control
+/// flow reaches: `main` always intercepts `Ok(Err(StartError::ExitedBeforeReady))`
+/// itself first, recovers a more specific reason (via
+/// [`garter::recover_exit_detail_from_joined`]), and passes an ordinary
+/// `Fatal` here instead — so this arm never actually fires in production.
 pub fn chain_result_to_event(result: Result<ChainReady, StartError>) -> SitrepEvent {
     match result {
         Ok(chain_ready) => SitrepEvent::Ready {

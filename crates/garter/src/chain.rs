@@ -406,7 +406,7 @@ pub(crate) fn scan_for_delivered_error<'a>(
 /// Await `rxs` — each to ITS OWN resolution — for the same preference
 /// [`scan_for_delivered_error`] applies (a SPECIFIC `Err(StartError)` over a
 /// generic `Closed`/delivered-`ExitedBeforeReady` signal, regardless of
-/// order). Used only by [`send_recovered_or_generic`], from the TWO
+/// order). Used by [`send_recovered_or_generic`], from the TWO
 /// `run_readiness_aggregator` arms where a plugin has already definitively
 /// failed — see [`scan_for_delivered_error`]'s doc comment for why awaiting
 /// is safe (bounded by `ChainRunner`'s own `drain_timeout`) in exactly those
@@ -414,7 +414,17 @@ pub(crate) fn scan_for_delivered_error<'a>(
 /// `scan_for_delivered_error`'s try_recv snapshot leaves open: a
 /// `BindConflict`/`Fatal` delivered a moment AFTER a snapshot would run is
 /// still recovered here, not silently downgraded.
-async fn drain_for_delivered_error<'a>(
+///
+/// `pub(crate)`: also used by [`crate::tap::TapPlugin`]'s `join` arm, for
+/// the identical reason — `BinaryPlugin::run` (the only inner the bridge
+/// ever taps) hands its readiness sender to a spawned reader task that is
+/// only best-effort-joined (a 100ms grace window) before `run` returns, so
+/// `inner_handle` completing does NOT guarantee `inner_ready_rx` has
+/// resolved yet. Awaiting here is bounded the same way: the child process
+/// has already exited by this point, so its stdout pipe closes and the
+/// reader task's own `lines.next_line()` loop terminates on EOF shortly
+/// after, dropping the sender if it never sent.
+pub(crate) async fn drain_for_delivered_error<'a>(
     rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
 ) -> Option<StartError> {
     let mut saw_generic = false;

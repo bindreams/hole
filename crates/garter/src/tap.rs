@@ -144,30 +144,28 @@ impl ChainPlugin for TapPlugin {
             r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => r,
             join = &mut inner_handle => {
                 // Inner exited before binding — propagate its result. No
-                // tap listener was ever opened. Preference order, most to
-                // least specific:
-                //  1. A `StartError` the inner already delivered on its own
-                //     readiness channel (e.g. `BindConflict`) — mirroring
-                //     `chain::scan_for_delivered_error`, which the
-                //     aggregator applies for the same reason.
-                //  2. `join`'s own `Err` — `self.inner.run(...)`'s actual
-                //     returned error (e.g. a malformed-options
-                //     `crate::Error`), sitting right here in `join` and
-                //     otherwise destroyed: bridge's `spawn_plugin_runner_at`
-                //     treats a `Fatal` (unlike `ExitedBeforeReady`) as
-                //     already-as-specific-as-it-gets and does NOT join the
-                //     handle for more detail, so if this arm didn't consult
-                //     `join` here, that Err would be lost for good, not
-                //     just deferred to a later recovery.
-                //  3. A generic, name-bearing `Fatal` (not the bare
-                //     `ExitedBeforeReady` placeholder) — reached only on a
-                //     clean, silent inner exit (`join == Ok(Ok(()))`), where
-                //     naming the tap and plugin is strictly more useful
-                //     than a placeholder no later recovery can improve on.
+                // tap listener was ever opened. Preference: (1) a specific
+                // `StartError` the inner already delivered on its own
+                // readiness channel, via `scan_for_delivered_error`'s match
+                // below; (2) `join`'s own `Err` — `self.inner.run(...)`'s
+                // actual returned error, otherwise destroyed here: bridge's
+                // `spawn_plugin_runner_at` treats a `Fatal` (unlike
+                // `ExitedBeforeReady`) as already-as-specific-as-it-gets and
+                // does NOT join the handle again, so skipping `join` here
+                // would lose that error for good, not just defer recovering
+                // it; (3) a generic, name-bearing `Fatal` otherwise —
                 // `scan_for_delivered_error` returns `Some(ExitedBeforeReady)`
-                // itself (not `None`) for "closed, nothing specific" — so
-                // step 3's fallback must match on THAT too, not just `None`.
-                let err = match crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
+                // itself (not `None`) for "closed, nothing specific", so
+                // this fallback must match on THAT too, not just `None`.
+                //
+                // Drains (awaits) `inner_ready_rx` to resolution rather than
+                // sampling it: `inner_handle` completing does NOT mean the
+                // reader task that owns the inner's `ready` sender has
+                // finished too (`BinaryPlugin::run` only best-effort-joins
+                // it under a short grace window before returning) — see
+                // `drain_for_delivered_error`'s doc comment for why awaiting
+                // here is still bounded, not a hang risk.
+                let err = match crate::chain::drain_for_delivered_error(std::iter::once(&mut inner_ready_rx)).await {
                     Some(e) if !matches!(e, StartError::ExitedBeforeReady) => e,
                     _ => StartError::Fatal {
                         detail: match &join {
@@ -187,10 +185,28 @@ impl ChainPlugin for TapPlugin {
         match ready_outcome {
             Ok(Some(_)) => {}
             Ok(None) => {
-                // Shutdown fired before inner was ready. Drop `ready` unsent
-                // (RecvError, matching the "shutdown before ready"
-                // semantics). Wait for inner to unwind and propagate.
-                return drain_inner(plugin_name.as_str(), inner_handle).await;
+                // Shutdown fired before inner was ready — but the inner may
+                // already have delivered (or, mid-unwind, be about to
+                // deliver) a specific `StartError` on its own readiness
+                // channel before `drain_inner` below observes it exit; the
+                // neighboring `join` arm above scans for exactly this same
+                // race. `drain_inner` awaits `inner_handle` to completion
+                // first (bounded by shutdown, same as everywhere else in
+                // this file), so BY THE TIME it returns, the inner's own
+                // sender has necessarily resolved (sent or dropped) — a
+                // plain `scan_for_delivered_error` snapshot taken then is
+                // exact, not approximate. Only a genuinely non-specific
+                // outcome (nothing, or a bare `ExitedBeforeReady`) falls
+                // through to dropping `ready` unsent (RecvError, matching
+                // the "shutdown before ready" semantics for the ordinary
+                // case).
+                let result = drain_inner(plugin_name.as_str(), inner_handle).await;
+                if let Some(e) = crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
+                    if !matches!(e, StartError::ExitedBeforeReady) {
+                        let _ = ready.send(Err(e));
+                    }
+                }
+                return result;
             }
             Err(_) => {
                 inner_handle.abort();
