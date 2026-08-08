@@ -144,10 +144,10 @@ pub async fn run_roundtrip(
     let listen = match timeout(cfg.ready_timeout, ready_rx).await {
         Ok(Ok(Ok(chain_ready))) => chain_ready.listen,
         // A generic `ExitedBeforeReady` joins `handle` for a specific reason
-        // instead of discarding it — e.g. a malformed `client_opts` string
-        // now fails `BinaryPlugin::run` (via `Mode::from_plugin_options`)
-        // before it ever touches `ready`, so the readiness signal alone
-        // carries no diagnosis — delegates to `garter::recover_exit_detail_from_joined`,
+        // — e.g. a malformed `client_opts` string fails `BinaryPlugin::run`
+        // (via `Mode::from_plugin_options`) before it ever touches `ready`,
+        // so the readiness signal alone carries no diagnosis — delegates to
+        // `garter::recover_exit_detail_from_joined`,
         // the same recovery bridge's and galoshes' own `recover_exit_detail`
         // callers use for the identical gap. Any OTHER `StartError`
         // (`BindConflict`, `Fatal`) is already as specific as it gets and

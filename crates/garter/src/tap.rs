@@ -200,13 +200,17 @@ impl ChainPlugin for TapPlugin {
                 // deliver) a specific `StartError` on its own readiness
                 // channel before `drain_inner` below observes it exit; the
                 // neighboring `join` arm above scans for exactly this same
-                // race. `drain_inner` awaits `inner_handle` to completion
-                // first (bounded by shutdown, same as everywhere else in
-                // this file), so BY THE TIME it returns, the inner's own
-                // sender has necessarily resolved (sent or dropped) — a
-                // plain `scan_for_delivered_error` snapshot taken then is
-                // exact, not approximate. Only a genuinely non-specific
-                // outcome (nothing, or a bare `ExitedBeforeReady`) falls
+                // race, and its doc comment applies here too: `drain_inner`
+                // awaits `inner_handle` — `self.inner.run(...)`'s own
+                // future — to completion, NOT the detached/best-effort-
+                // joined task that actually owns `inner_ready_tx` for a
+                // `BinaryPlugin` inner (see `scan_for_delivered_error`'s
+                // doc comment). So this `scan_for_delivered_error` snapshot
+                // is, like the join arm's, a narrowed race, not a closed
+                // one — it recovers what's already landed by the time
+                // `drain_inner` returns, not necessarily everything that
+                // will ever land. Only a genuinely non-specific outcome
+                // (nothing yet, or a bare `ExitedBeforeReady`) falls
                 // through to dropping `ready` unsent (RecvError, matching
                 // the "shutdown before ready" semantics for the ordinary
                 // case).
@@ -221,12 +225,24 @@ impl ChainPlugin for TapPlugin {
             Err(_) => {
                 inner_handle.abort();
                 let _ = inner_handle.await;
-                let _ = ready.send(Err(StartError::Fatal {
-                    detail: format!(
-                        "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
-                    ),
-                    errno: None,
-                }));
+                // Same recovery as the two arms above: the inner may have
+                // already delivered a specific `StartError` (e.g.
+                // `BindConflict`) on its own readiness channel before this
+                // timeout fired — a point-in-time, non-blocking snapshot
+                // (`abort()` only stops `inner_handle`'s own task, not a
+                // detached reader/self-probe task that might still own the
+                // sender, so this can't be turned into an await without the
+                // same deadlock risk documented on the arms above).
+                let err = match crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
+                    Some(e) if !matches!(e, StartError::ExitedBeforeReady) => e,
+                    _ => StartError::Fatal {
+                        detail: format!(
+                            "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
+                        ),
+                        errno: None,
+                    },
+                };
+                let _ = ready.send(Err(err));
                 return Err(crate::Error::Chain(format!(
                     "tap[{plugin_name}]: inner plugin did not bind {inner_local} within {INNER_READY_TIMEOUT:?}"
                 )));

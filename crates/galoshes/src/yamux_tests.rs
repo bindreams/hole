@@ -199,9 +199,8 @@ fn udp_timeout_invalid_is_error() {
     assert!(parse_udp_timeout(Some("udp_timeout=-1")).is_err());
 }
 
-// First-wins selects the value, but every occurrence is still validated —
-// a self-contradictory duplicate must still refuse the start, not silently
-// keep the first (valid) value and ignore an invalid later one.
+// A self-contradictory duplicate (valid first, invalid later) must still
+// refuse the start.
 #[skuld::test]
 fn udp_timeout_validates_every_occurrence_not_just_the_first() {
     assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=0")).is_err());

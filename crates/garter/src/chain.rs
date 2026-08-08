@@ -376,11 +376,18 @@ impl ChainRunner {
 /// terminate PROMPTLY even when a remaining receiver is legitimately,
 /// indefinitely `Empty` (a plugin still starting up, not yet failed): the
 /// shutdown-preempted arm of [`run_readiness_aggregator`] (shutdown does not
-/// itself mean any plugin failed) and [`crate::tap::TapPlugin`]'s inner-exit
-/// race (the single receiver scanned there is already resolved by the time
-/// it's reached, so this is exact, not approximate). See
-/// `aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly` in
-/// `chain_tests.rs`, which pins the prompt-termination requirement.
+/// itself mean any plugin failed), and both of [`crate::tap::TapPlugin`]'s
+/// inner-exit arms. In the aggregator this is exact for `run_client`/
+/// `run_server`-style plugins whose own task owns the sender directly, but
+/// for [`crate::tap::TapPlugin`]'s wrapped `BinaryPlugin` inners it is only
+/// NARROWED, not exact: the sender there is owned by a detached/best-effort-
+/// joined reader or self-probe task neither `TapPlugin` nor `BinaryPlugin`'s
+/// own future guarantees has resolved by the time it's reached — see
+/// `TapPlugin::run`'s own doc comments on both arms for the full reasoning
+/// and a prior, reverted attempt to close this with an await instead (it
+/// deadlocked). See `aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly`
+/// in `chain_tests.rs`, which pins the prompt-termination requirement this
+/// snapshot exists to satisfy.
 ///
 /// For the OTHER two arms of `run_readiness_aggregator` — `Err(_recv)` and a
 /// delivered `ExitedBeforeReady` — a plugin has already DEFINITIVELY failed,
@@ -472,18 +479,13 @@ pub(crate) async fn run_readiness_aggregator(
     };
     let mut remaining: std::collections::VecDeque<_> = ready_rxs.into_iter().collect();
     while let Some((i, mut rrx)) = remaining.pop_front() {
-        // `biased` checks the shutdown arm first regardless of whether
-        // `rrx` ALSO already has a value waiting — a plugin can call
-        // `ready.send(...)` and exit (dropping its task, which is what
-        // fires `shutdown` via `record_exit`) within the same poll, with
-        // no `.await` between the two. Naively discarding on shutdown here
-        // would silently downgrade a real `BindConflict`/`Fatal` to a
-        // generic `ExitedBeforeReady`, so the shutdown arm yields `None`
-        // instead of returning outright, and the scan below checks for an
-        // already-delivered value — on ANY not-yet-processed receiver, not
-        // just this one, since shutdown can win the bias while an EARLIER
-        // poll of a LATER plugin already delivered — before treating this
-        // as shutdown preempting a chain that never got to report anything.
+        // A plugin can `ready.send(...)` and exit (firing `shutdown` via
+        // `record_exit`) within the same poll, with no `.await` between the
+        // two, so the scan below checks for an already-delivered value —
+        // on ANY not-yet-processed receiver, not just this one, since
+        // shutdown can win the bias while an EARLIER poll of a LATER
+        // plugin already delivered — before treating this as shutdown
+        // preempting a chain that never got to report anything.
         let selected = tokio::select! {
             biased;
             () = shutdown.cancelled() => None,

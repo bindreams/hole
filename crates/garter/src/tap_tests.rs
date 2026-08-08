@@ -152,10 +152,49 @@ impl ChainPlugin for ExitsBeforeReadyPlugin {
     }
 }
 
+/// Mimics `BinaryPlugin::run`'s `ReadinessMode::Probe` shape exactly: hands
+/// `ready` to a DETACHED spawned task (never joined by `run` itself) that
+/// only resolves it once `shutdown` fires (or the target ever becomes
+/// reachable, which it never will here) — `run` itself returns `Ok(())`
+/// immediately, well before that. Nothing OTHER than the tap's own eventual
+/// exit would ever cancel `shutdown` in this shape, matching production:
+/// `record_exit` only fires once `TapPlugin::run`'s own task completes.
+/// Regression coverage for a real, reproduced deadlock (see
+/// `tap_join_arm_does_not_deadlock_on_a_probe_mode_inner_with_no_external_shutdown`):
+/// an earlier attempt to `.await` this receiver (instead of `try_recv`) in
+/// the `join` arm hung indefinitely, since resolving it required `shutdown`
+/// to fire, which required this very task to return first.
+struct ProbeModeLikePlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ProbeModeLikePlugin {
+    fn name(&self) -> &str {
+        "probe-mode-like"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+    ) -> crate::Result<()> {
+        tokio::spawn(async move {
+            if let Some(addr) = crate::chain::poll_ready(local, shutdown).await {
+                let _ = ready.send(Ok(crate::sitrep::PluginReady {
+                    listen: addr,
+                    transports: crate::sitrep::Transports::TCP,
+                }));
+            }
+        });
+        Ok(())
+    }
+}
+
 /// Drops its readiness channel unsent (like `ExitsBeforeReadyPlugin`) but
 /// returns a specific `Err` from `run()` itself — the shape a malformed
 /// SS_PLUGIN_OPTIONS string produces (`BinaryPlugin::run` fails via
-/// `Mode::from_plugin_options`? before ever touching `ready`). Pins that
+/// `Mode::from_plugin_options` before ever touching `ready`). Pins that
 /// this reaches the tap's `ready.send`, not just `join`'s own return value.
 struct ExitsWithASpecificErrorPlugin;
 
@@ -180,10 +219,9 @@ impl ChainPlugin for ExitsWithASpecificErrorPlugin {
 }
 
 /// Sends a specific `StartError::BindConflict` on its own readiness channel
-/// then exits — the shape that used to collapse to a bare
-/// `ExitedBeforeReady` through the tap's inner-exit race arm before it
-/// recovered a delivered error the same way the chain aggregator does. See
-/// `TapPlugin::run`'s inner-exit race doc comment.
+/// then exits — pins that the tap's inner-exit race recovers a delivered
+/// error the same way the chain aggregator does. See `TapPlugin::run`'s
+/// inner-exit race doc comment.
 struct BindConflictPlugin;
 
 #[async_trait::async_trait]
@@ -582,4 +620,35 @@ async fn counting_stream_smoke() {
     counted.read_exact(&mut buf).await.unwrap();
     assert_eq!(counters.read(), 3);
     server.await.unwrap();
+}
+
+// Regression test for a real, previously-reproduced deadlock (see
+// `scan_for_delivered_error`'s and `TapPlugin::run`'s doc comments): the
+// join arm must use a point-in-time `try_recv` snapshot, never an
+// await-to-resolution drain, on `inner_ready_rx`. `ProbeModeLikePlugin`
+// reproduces `BinaryPlugin::run`'s `ReadinessMode::Probe` shape exactly —
+// its readiness sender lives in a detached task gated on `shutdown`, which
+// nothing but the tap's own eventual exit would ever cancel. If this arm
+// were changed back to an await-based drain, this test would hang past its
+// bound instead of returning promptly.
+#[skuld::test]
+async fn tap_join_arm_does_not_deadlock_on_a_probe_mode_inner_with_no_external_shutdown() {
+    let local = pick_local().await;
+    let remote = unused_remote();
+    let shutdown = CancellationToken::new(); // never cancelled by this test
+    let inner = Box::new(ProbeModeLikePlugin) as Box<dyn ChainPlugin>;
+    let tap = Box::new(TapPlugin::wrap(inner));
+
+    let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+    // The timeout here is a failure bound surfaced to the test, not a
+    // synchronization primitive: `tap.run` genuinely might never return if
+    // this arm regresses to an await-based drain, and there is no other
+    // event to wait on that would prove that. A generous, hang-detecting
+    // bound, not a race with the correct outcome.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), tap.run(local, remote, shutdown, ready_tx)).await;
+    assert!(
+        outcome.is_ok(),
+        "TapPlugin::run's join arm deadlocked on a Probe-mode inner with no external shutdown trigger \
+         — it must scan (try_recv) inner_ready_rx, never await it"
+    );
 }
